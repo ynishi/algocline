@@ -1,0 +1,21 @@
+[package]
+name = "algocline-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "algocline MCP server adapter — thin tool/handler layer over algocline-app"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+algocline-app = { workspace = true }
+algocline-engine = { workspace = true }
+
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+
+serde = { workspace = true }
+serde_json = { workspace = true }

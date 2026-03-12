@@ -1,0 +1,21 @@
+[package]
+name = "algocline-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "algocline domain model and metrics — pure execution state machine"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+indexmap = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,600 @@
+//! Layer 0: Runtime Primitives
+//!
+//! Registers Rust-backed functions into the `alc.*` Lua namespace.
+//! These provide capabilities that cannot be expressed in Pure Lua:
+//! I/O (state), serialization (json), host communication (llm),
+//! and text processing (chunk).
+//!
+//! All functions registered here are available in every Lua session
+//! without explicit `require()`.
+
+use std::sync::{Arc, Mutex};
+
+use algocline_core::{CustomMetrics, QueryId};
+use mlua::prelude::*;
+
+use crate::llm_bridge::{LlmRequest, QueryRequest};
+use crate::state;
+
+/// Register all Layer 0 runtime primitives onto the given table.
+///
+/// - `llm_tx`: if provided, registers `alc.llm()` with MCP Sampling bridge.
+/// - `ns`: namespace for alc.state (from ctx._ns or "default").
+/// - `custom_metrics`: custom metrics handle for alc.stats.record/get.
+pub fn register(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    llm_tx: Option<tokio::sync::mpsc::Sender<LlmRequest>>,
+    ns: String,
+    custom_metrics: Arc<Mutex<CustomMetrics>>,
+) -> LuaResult<()> {
+    register_json(lua, alc_table)?;
+    register_log(lua, alc_table)?;
+    register_state(lua, alc_table, ns)?;
+    register_chunk(lua, alc_table)?;
+    register_stats(lua, alc_table, custom_metrics)?;
+    if let Some(tx) = llm_tx {
+        register_llm(lua, alc_table, tx.clone())?;
+        register_llm_batch(lua, alc_table, tx)?;
+    }
+    Ok(())
+}
+
+/// Register `alc.chunk(text, opts?)` — split text into chunks.
+///
+/// Lua usage:
+///   local chunks = alc.chunk(text, { mode = "lines", size = 50 })
+///   local chunks = alc.chunk(text, { mode = "lines", size = 50, overlap = 10 })
+///   local chunks = alc.chunk(text, { mode = "chars", size = 2000 })
+///
+/// Returns: array of strings.
+fn register_chunk(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let chunk_fn = _lua.create_function(|lua, (text, opts): (String, Option<LuaTable>)| {
+        let mode = opts
+            .as_ref()
+            .and_then(|o| o.get::<String>("mode").ok())
+            .unwrap_or_else(|| "lines".into());
+        let size = opts
+            .as_ref()
+            .and_then(|o| o.get::<usize>("size").ok())
+            .unwrap_or(50);
+        let overlap = opts
+            .as_ref()
+            .and_then(|o| o.get::<usize>("overlap").ok())
+            .unwrap_or(0);
+
+        let chunks: Vec<String> = match mode.as_str() {
+            "chars" => chunk_by_chars(&text, size, overlap),
+            _ => chunk_by_lines(&text, size, overlap),
+        };
+
+        lua.to_value(&chunks)
+    })?;
+
+    alc_table.set("chunk", chunk_fn)?;
+    Ok(())
+}
+
+fn chunk_by_lines(text: &str, size: usize, overlap: usize) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() || size == 0 {
+        return vec![];
+    }
+    let step = if overlap < size { size - overlap } else { 1 };
+    let mut chunks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let end = (i + size).min(lines.len());
+        chunks.push(lines[i..end].join("\n"));
+        i += step;
+        if end == lines.len() {
+            break;
+        }
+    }
+    chunks
+}
+
+fn chunk_by_chars(text: &str, size: usize, overlap: usize) -> Vec<String> {
+    if text.is_empty() || size == 0 {
+        return vec![];
+    }
+    let step = if overlap < size { size - overlap } else { 1 };
+    let chars: Vec<char> = text.chars().collect();
+    let mut chunks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + size).min(chars.len());
+        chunks.push(chars[i..end].iter().collect());
+        i += step;
+        if end == chars.len() {
+            break;
+        }
+    }
+    chunks
+}
+
+fn register_json(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let encode = lua.create_function(|lua, value: LuaValue| {
+        let json: serde_json::Value = lua.from_value(value)?;
+        serde_json::to_string(&json).map_err(LuaError::external)
+    })?;
+
+    let decode = lua.create_function(|lua, s: String| {
+        let value: serde_json::Value = serde_json::from_str(&s).map_err(LuaError::external)?;
+        lua.to_value(&value)
+    })?;
+
+    alc_table.set("json_encode", encode)?;
+    alc_table.set("json_decode", decode)?;
+    Ok(())
+}
+
+fn register_log(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let log = _lua.create_function(|_, (level, msg): (String, String)| {
+        match level.as_str() {
+            "error" => tracing::error!("{}", msg),
+            "warn" => tracing::warn!("{}", msg),
+            "info" => tracing::info!("{}", msg),
+            "debug" => tracing::debug!("{}", msg),
+            _ => tracing::info!("{}", msg),
+        }
+        Ok(())
+    })?;
+
+    alc_table.set("log", log)?;
+    Ok(())
+}
+
+/// Register `alc.state` table with get/set/keys/delete.
+///
+/// Lua usage:
+///   alc.state.set("score", 42)
+///   local v = alc.state.get("score")       -- 42
+///   local v = alc.state.get("missing", 0)  -- 0 (default)
+///   local k = alc.state.keys()             -- {"score"}
+///   alc.state.delete("score")
+fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> LuaResult<()> {
+    let state_table = lua.create_table()?;
+
+    // alc.state.get(key, default?)
+    let ns_get = ns.clone();
+    let get =
+        lua.create_function(
+            move |lua, (key, default): (String, Option<LuaValue>)| match state::get(&ns_get, &key) {
+                Ok(Some(v)) => lua.to_value(&v),
+                Ok(None) => Ok(default.unwrap_or(LuaValue::Nil)),
+                Err(e) => Err(LuaError::external(e)),
+            },
+        )?;
+
+    // alc.state.set(key, value)
+    let ns_set = ns.clone();
+    let set = lua.create_function(move |lua, (key, value): (String, LuaValue)| {
+        let json: serde_json::Value = lua.from_value(value)?;
+        state::set(&ns_set, &key, json).map_err(LuaError::external)
+    })?;
+
+    // alc.state.keys()
+    let ns_keys = ns.clone();
+    let keys = lua.create_function(move |lua, ()| {
+        let k = state::keys(&ns_keys).map_err(LuaError::external)?;
+        lua.to_value(&k)
+    })?;
+
+    // alc.state.delete(key)
+    let ns_del = ns.clone();
+    let delete = lua.create_function(move |_, key: String| {
+        state::delete(&ns_del, &key).map_err(LuaError::external)
+    })?;
+
+    state_table.set("get", get)?;
+    state_table.set("set", set)?;
+    state_table.set("keys", keys)?;
+    state_table.set("delete", delete)?;
+
+    alc_table.set("state", state_table)?;
+    Ok(())
+}
+
+/// Register `alc.stats` table with record/get.
+///
+/// Lua usage:
+///   alc.stats.record("accuracy", 0.95)
+///   local v = alc.stats.get("accuracy")  -- 0.95
+fn register_stats(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    custom_metrics: Arc<Mutex<CustomMetrics>>,
+) -> LuaResult<()> {
+    let stats_table = lua.create_table()?;
+
+    // alc.stats.record(key, value)
+    let cm_record = Arc::clone(&custom_metrics);
+    let record = lua.create_function(move |lua, (key, value): (String, LuaValue)| {
+        let json: serde_json::Value = lua.from_value(value)?;
+        if let Ok(mut cm) = cm_record.lock() {
+            cm.record(key, json);
+        }
+        Ok(())
+    })?;
+
+    // alc.stats.get(key)
+    let cm_get = Arc::clone(&custom_metrics);
+    let get = lua.create_function(move |lua, key: String| {
+        let value = cm_get.lock().ok().and_then(|cm| cm.get(&key).cloned());
+        match value {
+            Some(v) => lua.to_value(&v),
+            None => Ok(LuaValue::Nil),
+        }
+    })?;
+
+    stats_table.set("record", record)?;
+    stats_table.set("get", get)?;
+
+    alc_table.set("stats", stats_table)?;
+    Ok(())
+}
+
+/// Register `alc.llm(prompt, opts?)` — calls Host LLM via coroutine yield.
+///
+/// Registered as an async function so the Lua coroutine yields while
+/// waiting for the LLM response, allowing other coroutines to progress.
+///
+/// Lua usage:
+///   local response = alc.llm("What is 2+2?")
+///   local response = alc.llm("Explain X", { system = "You are an expert.", max_tokens = 500 })
+fn register_llm(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
+) -> LuaResult<()> {
+    let llm = lua.create_async_function(move |_, (prompt, opts): (String, Option<LuaTable>)| {
+        let tx = llm_tx.clone();
+        async move {
+            let system = opts.as_ref().and_then(|o| o.get::<String>("system").ok());
+            let max_tokens = opts
+                .as_ref()
+                .and_then(|o| o.get::<u32>("max_tokens").ok())
+                .unwrap_or(1024);
+
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+            tx.send(LlmRequest {
+                queries: vec![QueryRequest {
+                    id: QueryId::single(),
+                    prompt,
+                    system,
+                    max_tokens,
+                    resp_tx,
+                }],
+            })
+            .await
+            .map_err(|e| LuaError::external(format!("LLM bridge send failed: {e}")))?;
+
+            resp_rx
+                .await
+                .map_err(|e| LuaError::external(format!("LLM bridge recv failed: {e}")))?
+                .map_err(LuaError::external)
+        }
+    })?;
+
+    alc_table.set("llm", llm)?;
+    Ok(())
+}
+
+/// Register `alc.llm_batch(items)` — parallel LLM calls via coroutine yield.
+///
+/// All queries are sent as a single batch, then the coroutine yields
+/// while awaiting all responses concurrently.
+///
+/// Lua usage:
+///   local responses = alc.llm_batch({
+///       { prompt = "Analyze A" },
+///       { prompt = "Analyze B", system = "expert", max_tokens = 500 },
+///   })
+///   -- responses[1], responses[2] in same order as input
+fn register_llm_batch(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
+) -> LuaResult<()> {
+    let llm_batch = lua.create_async_function(move |_, items: LuaTable| {
+        let tx = llm_tx.clone();
+        async move {
+            let len = items.len()? as usize;
+            if len == 0 {
+                return Err(LuaError::external("alc.llm_batch: empty items array"));
+            }
+
+            let mut query_requests = Vec::with_capacity(len);
+            let mut resp_rxs = Vec::with_capacity(len);
+
+            for i in 1..=len {
+                let item: LuaTable = items.get(i)?;
+                let prompt: String = item.get("prompt")?;
+                let system: Option<String> = item.get::<LuaValue>("system").ok().and_then(|v| {
+                    if let LuaValue::String(s) = v {
+                        Some(s.to_str().ok()?.to_string())
+                    } else {
+                        None
+                    }
+                });
+                let max_tokens: u32 = item.get::<u32>("max_tokens").unwrap_or(1024);
+
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                resp_rxs.push(resp_rx);
+
+                query_requests.push(QueryRequest {
+                    id: QueryId::batch(i - 1), // 0-indexed
+                    prompt,
+                    system,
+                    max_tokens,
+                    resp_tx,
+                });
+            }
+
+            // Send all queries as a single batch
+            tx.send(LlmRequest {
+                queries: query_requests,
+            })
+            .await
+            .map_err(|e| LuaError::external(format!("LLM bridge send failed: {e}")))?;
+
+            // Await all responses concurrently (order matches input)
+            let mut responses = Vec::with_capacity(len);
+            for (i, rx) in resp_rxs.into_iter().enumerate() {
+                let resp = rx
+                    .await
+                    .map_err(|e| {
+                        LuaError::external(format!("LLM bridge recv failed for q-{i}: {e}"))
+                    })?
+                    .map_err(LuaError::external)?;
+                responses.push(resp);
+            }
+
+            Ok(responses)
+        }
+    })?;
+
+    alc_table.set("llm_batch", llm_batch)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_custom_metrics() -> Arc<Mutex<CustomMetrics>> {
+        Arc::new(Mutex::new(CustomMetrics::new()))
+    }
+
+    #[test]
+    fn json_roundtrip() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, None, "default".into(), test_custom_metrics()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: String = lua
+            .load(r#"return alc.json_encode({hello = "world", n = 42})"#)
+            .eval()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["hello"], "world");
+        assert_eq!(parsed["n"], 42);
+    }
+
+    #[test]
+    fn json_decode_encode() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, None, "default".into(), test_custom_metrics()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: String = lua
+            .load(
+                r#"
+                local val = alc.json_decode('{"a":1,"b":"two"}')
+                val.c = true
+                return alc.json_encode(val)
+            "#,
+            )
+            .eval()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], "two");
+        assert_eq!(parsed["c"], true);
+    }
+
+    #[test]
+    fn state_get_set() {
+        let ns = "_test_bridge_state";
+        // Clean up
+        let _ = crate::state::delete(ns, "x");
+
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, None, ns.into(), test_custom_metrics()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Set and get
+        lua.load(r#"alc.state.set("x", 99)"#).exec().unwrap();
+        let result: i64 = lua.load(r#"return alc.state.get("x")"#).eval().unwrap();
+        assert_eq!(result, 99);
+
+        // Default value
+        let result: i64 = lua
+            .load(r#"return alc.state.get("missing", 0)"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, 0);
+
+        // Nil for missing without default
+        let result: LuaValue = lua
+            .load(r#"return alc.state.get("missing")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+
+        // Clean up
+        let _ = crate::state::delete(ns, "x");
+    }
+
+    #[test]
+    fn stats_record_get() {
+        let custom = test_custom_metrics();
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, None, "default".into(), Arc::clone(&custom)).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Record from Lua
+        lua.load(r#"alc.stats.record("score", 42)"#).exec().unwrap();
+        let result: i64 = lua.load(r#"return alc.stats.get("score")"#).eval().unwrap();
+        assert_eq!(result, 42);
+
+        // Verify via Rust side
+        assert_eq!(
+            custom.lock().unwrap().get("score"),
+            Some(&serde_json::json!(42))
+        );
+
+        // Missing key returns nil
+        let result: LuaValue = lua
+            .load(r#"return alc.stats.get("missing")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    // ─── chunk_by_lines tests ───
+
+    #[test]
+    fn chunk_lines_empty_text() {
+        assert_eq!(chunk_by_lines("", 5, 0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn chunk_lines_single_line_exact_size() {
+        let result = chunk_by_lines("hello", 1, 0);
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn chunk_lines_single_line_size_larger() {
+        let result = chunk_by_lines("hello", 10, 0);
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn chunk_lines_exact_division() {
+        let text = "a\nb\nc\nd";
+        let result = chunk_by_lines(text, 2, 0);
+        assert_eq!(result, vec!["a\nb", "c\nd"]);
+    }
+
+    #[test]
+    fn chunk_lines_remainder() {
+        let text = "a\nb\nc\nd\ne";
+        let result = chunk_by_lines(text, 2, 0);
+        assert_eq!(result, vec!["a\nb", "c\nd", "e"]);
+    }
+
+    #[test]
+    fn chunk_lines_size_larger_than_total() {
+        let text = "a\nb\nc";
+        let result = chunk_by_lines(text, 100, 0);
+        assert_eq!(result, vec!["a\nb\nc"]);
+    }
+
+    #[test]
+    fn chunk_lines_with_overlap() {
+        let text = "a\nb\nc\nd\ne";
+        // size=3, overlap=1 → step=2
+        let result = chunk_by_lines(text, 3, 1);
+        assert_eq!(result, vec!["a\nb\nc", "c\nd\ne"]);
+    }
+
+    #[test]
+    fn chunk_lines_overlap_equals_size_minus_one() {
+        let text = "a\nb\nc\nd";
+        // size=2, overlap=1 → step=1 (sliding window)
+        let result = chunk_by_lines(text, 2, 1);
+        assert_eq!(result, vec!["a\nb", "b\nc", "c\nd"]);
+    }
+
+    #[test]
+    fn chunk_lines_overlap_ge_size_step_is_one() {
+        let text = "a\nb\nc";
+        // overlap >= size → step=1
+        let result = chunk_by_lines(text, 2, 5);
+        assert_eq!(result, vec!["a\nb", "b\nc"]);
+    }
+
+    #[test]
+    fn chunk_lines_size_zero_returns_empty() {
+        // size=0 should not produce infinite chunks
+        let result = chunk_by_lines("a\nb\nc", 0, 0);
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    // ─── chunk_by_chars tests ───
+
+    #[test]
+    fn chunk_chars_empty_text() {
+        assert_eq!(chunk_by_chars("", 5, 0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn chunk_chars_exact_division() {
+        let result = chunk_by_chars("abcdef", 3, 0);
+        assert_eq!(result, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn chunk_chars_remainder() {
+        let result = chunk_by_chars("abcde", 3, 0);
+        assert_eq!(result, vec!["abc", "de"]);
+    }
+
+    #[test]
+    fn chunk_chars_size_larger_than_text() {
+        let result = chunk_by_chars("abc", 100, 0);
+        assert_eq!(result, vec!["abc"]);
+    }
+
+    #[test]
+    fn chunk_chars_with_overlap() {
+        // size=4, overlap=2 → step=2
+        let result = chunk_by_chars("abcdef", 4, 2);
+        assert_eq!(result, vec!["abcd", "cdef"]);
+    }
+
+    #[test]
+    fn chunk_chars_overlap_ge_size_step_is_one() {
+        // overlap >= size → step=1
+        let result = chunk_by_chars("abc", 2, 3);
+        assert_eq!(result, vec!["ab", "bc"]);
+    }
+
+    #[test]
+    fn chunk_chars_multibyte() {
+        // multibyte chars (3 bytes each in UTF-8, but split by char boundary)
+        let result = chunk_by_chars("あいうえお", 2, 0);
+        assert_eq!(result, vec!["あい", "うえ", "お"]);
+    }
+
+    #[test]
+    fn chunk_chars_size_one() {
+        let result = chunk_by_chars("abc", 1, 0);
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn chunk_chars_size_zero_returns_empty() {
+        // size=0 should not produce infinite chunks
+        let result = chunk_by_chars("abc", 0, 0);
+        assert_eq!(result, Vec::<String>::new());
+    }
+}

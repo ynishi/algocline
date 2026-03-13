@@ -14,10 +14,10 @@ keywords = ["llm", "mcp", "lua", "reasoning", "ai"]
 categories = ["development-tools", "science"]
 
 [workspace.dependencies]
-algocline-core = { path = "crates/algocline-core" }
-algocline-engine = { path = "crates/algocline-engine" }
-algocline-app = { path = "crates/algocline-app" }
-algocline-mcp = { path = "crates/algocline-mcp" }
+algocline-core = { path = "crates/algocline-core", version = "0.1.0" }
+algocline-engine = { path = "crates/algocline-engine", version = "0.1.0" }
+algocline-app = { path = "crates/algocline-app", version = "0.1.0" }
+algocline-mcp = { path = "crates/algocline-mcp", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

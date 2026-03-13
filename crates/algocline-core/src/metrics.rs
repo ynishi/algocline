@@ -10,6 +10,9 @@ pub(crate) struct AutoMetrics {
     ended_at: Option<Instant>,
     llm_calls: u64,
     pauses: u64,
+    rounds: u64,
+    total_prompt_chars: u64,
+    total_response_chars: u64,
 }
 
 impl AutoMetrics {
@@ -19,6 +22,9 @@ impl AutoMetrics {
             ended_at: None,
             llm_calls: 0,
             pauses: 0,
+            rounds: 0,
+            total_prompt_chars: 0,
+            total_response_chars: 0,
         }
     }
 
@@ -32,6 +38,9 @@ impl AutoMetrics {
             "elapsed_ms": elapsed_ms,
             "llm_calls": self.llm_calls,
             "pauses": self.pauses,
+            "rounds": self.rounds,
+            "total_prompt_chars": self.total_prompt_chars,
+            "total_response_chars": self.total_response_chars,
         })
     }
 }
@@ -102,6 +111,24 @@ impl ExecutionObserver for MetricsObserver {
         if let Ok(mut m) = self.auto.lock() {
             m.pauses += 1;
             m.llm_calls += queries.len() as u64;
+            for q in queries {
+                m.total_prompt_chars += q.prompt.len() as u64;
+                if let Some(ref sys) = q.system {
+                    m.total_prompt_chars += sys.len() as u64;
+                }
+            }
+        }
+    }
+
+    fn on_response_fed(&self, response_chars: u64) {
+        if let Ok(mut m) = self.auto.lock() {
+            m.total_response_chars += response_chars;
+        }
+    }
+
+    fn on_resumed(&self) {
+        if let Ok(mut m) = self.auto.lock() {
+            m.rounds += 1;
         }
     }
 
@@ -171,5 +198,77 @@ mod tests {
         let auto = json.get("auto").unwrap();
         assert_eq!(auto.get("llm_calls").unwrap(), 1);
         assert_eq!(auto.get("pauses").unwrap(), 1);
+        assert_eq!(auto.get("rounds").unwrap(), 0);
+        assert_eq!(auto.get("total_prompt_chars").unwrap(), 4); // "test" = 4 chars
+        assert_eq!(auto.get("total_response_chars").unwrap(), 0);
+    }
+
+    #[test]
+    fn observer_tracks_prompt_and_response_chars() {
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+
+        let queries = vec![
+            LlmQuery {
+                id: QueryId::batch(0),
+                prompt: "hello".into(),     // 5 chars
+                system: Some("sys".into()), // 3 chars
+                max_tokens: 100,
+            },
+            LlmQuery {
+                id: QueryId::batch(1),
+                prompt: "world".into(), // 5 chars
+                system: None,
+                max_tokens: 100,
+            },
+        ];
+
+        observer.on_paused(&queries);
+        observer.on_response_fed(42);
+        observer.on_response_fed(58);
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        let json = metrics.to_json();
+        let auto = json.get("auto").unwrap();
+        assert_eq!(auto.get("total_prompt_chars").unwrap(), 13); // 5+3+5
+        assert_eq!(auto.get("total_response_chars").unwrap(), 100); // 42+58
+        assert_eq!(auto.get("rounds").unwrap(), 1);
+    }
+
+    #[test]
+    fn observer_tracks_multiple_rounds() {
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+
+        let q = vec![LlmQuery {
+            id: QueryId::single(),
+            prompt: "p".into(),
+            system: None,
+            max_tokens: 10,
+        }];
+
+        // Round 1
+        observer.on_paused(&q);
+        observer.on_response_fed(10);
+        observer.on_resumed();
+        // Round 2
+        observer.on_paused(&q);
+        observer.on_response_fed(20);
+        observer.on_resumed();
+        // Round 3
+        observer.on_paused(&q);
+        observer.on_response_fed(30);
+        observer.on_resumed();
+
+        observer.on_completed(&serde_json::json!(null));
+
+        let json = metrics.to_json();
+        let auto = json.get("auto").unwrap();
+        assert_eq!(auto.get("rounds").unwrap(), 3);
+        assert_eq!(auto.get("pauses").unwrap(), 3);
+        assert_eq!(auto.get("llm_calls").unwrap(), 3);
+        assert_eq!(auto.get("total_prompt_chars").unwrap(), 3); // "p" x 3
+        assert_eq!(auto.get("total_response_chars").unwrap(), 60); // 10+20+30
     }
 }

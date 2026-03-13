@@ -181,6 +181,9 @@ impl Session {
     ///
     /// Returns Ok(true) if all queries are now complete, Ok(false) if still waiting.
     fn feed_one(&mut self, query_id: &QueryId, response: String) -> Result<bool, SessionError> {
+        // Track response size before ownership transfer.
+        self.observer.on_response_fed(response.len() as u64);
+
         // Runtime: send response to Lua thread (unblocks resp_rx.recv())
         if let Some(tx) = self.resp_txs.remove(query_id) {
             let _ = tx.send(Ok(response.clone()));

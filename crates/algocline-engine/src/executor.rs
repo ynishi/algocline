@@ -5,7 +5,7 @@
 //!
 //! 1. **Layer 0** — [`bridge::register`] injects Rust-backed `alc.*` primitives
 //! 2. **Layer 1** — [`PRELUDE`] adds Lua-based combinators (`alc.map`, etc.)
-//! 3. **Layer 2** — [`mlua_pkg::Registry`] makes `require("explore")` etc.
+//! 3. **Layer 2** — [`mlua_pkg::Registry`] makes `require("ucb")` etc.
 //!    resolve from `~/.algocline/packages/`
 //!
 //! ## Execution models

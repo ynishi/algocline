@@ -4,6 +4,25 @@ use std::sync::Arc;
 use algocline_core::QueryId;
 use algocline_engine::{Executor, SessionRegistry};
 
+// ─── Helpers ────────────────────────────────────────────────────
+
+/// Recursively copy a directory tree (follows symlinks).
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        // Use metadata() (follows symlinks) instead of file_type() (does not)
+        let meta = entry.metadata()?;
+        let dest_path = dst.join(entry.file_name());
+        if meta.is_dir() {
+            copy_dir(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
+    Ok(())
+}
+
 // ─── Parameter types (MCP-independent) ──────────────────────────
 
 /// A single query response in a batch feed.
@@ -195,23 +214,6 @@ return pkg.meta or {{ name = "{name}" }}"#
         let pkg_dir = packages_dir()?;
         let _ = std::fs::create_dir_all(&pkg_dir);
 
-        let name = name.unwrap_or_else(|| {
-            url.trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("unknown")
-                .trim_end_matches(".git")
-                .to_string()
-        });
-
-        let dest = pkg_dir.join(&name);
-        if dest.exists() {
-            return Err(format!(
-                "Package '{name}' already exists at {}. Remove it first.",
-                dest.display()
-            ));
-        }
-
         // Normalize URL: add https:// only for bare domain-style URLs
         let git_url = if url.starts_with("http://")
             || url.starts_with("https://")
@@ -224,8 +226,17 @@ return pkg.meta or {{ name = "{name}" }}"#
             format!("https://{url}")
         };
 
+        // Clone to temp directory first to detect single vs collection
+        let staging = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
+
         let output = tokio::process::Command::new("git")
-            .args(["clone", "--depth", "1", &git_url, &dest.to_string_lossy()])
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                &git_url,
+                &staging.path().to_string_lossy(),
+            ])
             .output()
             .await
             .map_err(|e| format!("Failed to run git: {e}"))?;
@@ -235,22 +246,87 @@ return pkg.meta or {{ name = "{name}" }}"#
             return Err(format!("git clone failed: {stderr}"));
         }
 
-        // Verify init.lua exists
-        if !dest.join("init.lua").exists() {
-            let _ = std::fs::remove_dir_all(&dest);
-            return Err(format!(
-                "Package '{name}' has no init.lua at root. Not a valid algocline package."
-            ));
+        // Remove .git dir from staging
+        let _ = std::fs::remove_dir_all(staging.path().join(".git"));
+
+        // Detect: single package (init.lua at root) vs collection (subdirs with init.lua)
+        if staging.path().join("init.lua").exists() {
+            // Single package mode
+            let name = name.unwrap_or_else(|| {
+                url.trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("unknown")
+                    .trim_end_matches(".git")
+                    .to_string()
+            });
+
+            let dest = pkg_dir.join(&name);
+            if dest.exists() {
+                return Err(format!(
+                    "Package '{name}' already exists at {}. Remove it first.",
+                    dest.display()
+                ));
+            }
+
+            copy_dir(staging.path(), &dest).map_err(|e| format!("Failed to copy package: {e}"))?;
+
+            Ok(serde_json::json!({
+                "installed": [name],
+                "mode": "single",
+            })
+            .to_string())
+        } else {
+            // Collection mode: scan for subdirs containing init.lua
+            if name.is_some() {
+                // name parameter is only meaningful for single-package repos
+                return Err(
+                    "The 'name' parameter is only supported for single-package repos (init.lua at root). \
+                     This repository is a collection (subdirs with init.lua)."
+                        .to_string(),
+                );
+            }
+
+            let mut installed = Vec::new();
+            let mut skipped = Vec::new();
+
+            let entries = std::fs::read_dir(staging.path())
+                .map_err(|e| format!("Failed to read staging dir: {e}"))?;
+
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if !path.join("init.lua").exists() {
+                    continue;
+                }
+                let pkg_name = entry.file_name().to_string_lossy().to_string();
+                let dest = pkg_dir.join(&pkg_name);
+                if dest.exists() {
+                    skipped.push(pkg_name);
+                    continue;
+                }
+                copy_dir(&path, &dest)
+                    .map_err(|e| format!("Failed to copy package '{pkg_name}': {e}"))?;
+                installed.push(pkg_name);
+            }
+
+            if installed.is_empty() && skipped.is_empty() {
+                return Err(
+                    "No packages found. Expected init.lua at root (single) or */init.lua (collection)."
+                        .to_string(),
+                );
+            }
+
+            Ok(serde_json::json!({
+                "installed": installed,
+                "skipped": skipped,
+                "mode": "collection",
+            })
+            .to_string())
         }
-
-        // Remove .git dir to save space
-        let _ = std::fs::remove_dir_all(dest.join(".git"));
-
-        Ok(serde_json::json!({
-            "installed": name,
-            "path": dest.to_string_lossy(),
-        })
-        .to_string())
     }
 
     /// Remove an installed package.
@@ -340,14 +416,14 @@ mod tests {
 
     #[test]
     fn make_require_code_basic() {
-        let code = make_require_code("explore");
-        assert!(code.contains(r#"require("explore")"#), "code: {code}");
+        let code = make_require_code("ucb");
+        assert!(code.contains(r#"require("ucb")"#), "code: {code}");
         assert!(code.contains("pkg.run(ctx)"), "code: {code}");
     }
 
     #[test]
     fn make_require_code_different_names() {
-        for name in &["panel", "chain", "ensemble", "verify"] {
+        for name in &["panel", "cot", "sc", "cove", "reflect", "calibrate"] {
             let code = make_require_code(name);
             assert!(
                 code.contains(&format!(r#"require("{name}")"#)),

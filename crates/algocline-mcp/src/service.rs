@@ -46,11 +46,13 @@ pub struct McpQueryResponse {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgInstallParams {
-    /// Git URL or local path of the package (e.g. "github.com/user/my-strategy",
-    /// "file:///path/to/local/pkg", or "/absolute/path").
-    /// Cloned into ~/.algocline/packages/{name}/.
+    /// Git URL or local path of a package or collection
+    /// (e.g. "github.com/user/my-pkg", "file:///path/to/local/pkg").
+    /// Single package: repo has init.lua at root → installed as one package.
+    /// Collection: repo has subdirs with init.lua → each subdir installed as a package.
     pub url: String,
-    /// Optional package name override. Defaults to the last segment of the URL.
+    /// Optional package name override (single package mode only).
+    /// Defaults to the last segment of the URL. Ignored for collections.
     pub name: Option<String>,
 }
 
@@ -62,9 +64,9 @@ pub struct PkgRemoveParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AdviceParams {
-    /// Package name: "explore" (UCB1 hypothesis exploration), "panel" (multi-perspective),
-    /// "chain" (chain-of-thought), "ensemble" (majority vote), "verify" (draft-verify-revise).
-    /// Loaded via require("{name}").
+    /// Package name: "ucb" (UCB1 hypothesis exploration), "panel" (multi-perspective),
+    /// "cot" (chain-of-thought), "sc" (self-consistency), "cove" (chain-of-verification),
+    /// or any installed package. Loaded via require("{name}").
     pub strategy: String,
     /// The task or question to process.
     pub task: String,
@@ -102,8 +104,9 @@ impl AlcService {
 
     /// Apply a built-in strategy to a task.
     ///
-    /// Strategies: "explore" (UCB1 hypothesis exploration), "panel" (multi-perspective),
-    /// "chain" (chain-of-thought), "ensemble" (majority vote), "verify" (draft-verify-revise).
+    /// Applies any installed package by name. Official packages include:
+    /// "ucb", "panel", "cot", "sc", "cove", "calibrate", "cod", "decompose",
+    /// "distill", "factscore", "maieutic", "rank", "reflect", "review", "sot", "triad".
     /// Uses require("{name}") to load the package.
     #[tool(name = "alc_advice", annotations(open_world_hint = false))]
     async fn advice(&self, Parameters(params): Parameters<AdviceParams>) -> Result<String, String> {
@@ -166,7 +169,7 @@ impl AlcService {
     /// The package must have an init.lua at its root.
     #[tool(
         name = "alc_pkg_install",
-        annotations(destructive_hint = false, open_world_hint = true)
+        annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn pkg_install(
         &self,
@@ -199,12 +202,12 @@ impl ServerHandler for AlcService {
                  Tools:\n\
                  - alc_run: Execute Lua code with optional JSON context. Returns result as JSON.\n\
                  - alc_continue: Continue a paused execution by providing the LLM response.\n\
-                 - alc_advice: Apply a built-in strategy (explore, panel, chain, ensemble, verify) to a task.\n\n\
+                 - alc_advice: Apply an installed package (ucb, panel, cot, sc, cove, reflect, etc.) to a task.\n\n\
                  When Lua calls alc.llm(prompt), execution pauses and returns the prompt.\n\
                  The host processes it and calls alc_continue with the response to resume.\n\n\
                  Package Management:\n\
                  - alc_pkg_list: List installed packages with metadata.\n\
-                 - alc_pkg_install: Install a package from a Git URL (e.g. github.com/user/strategy).\n\
+                 - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
                  - alc_pkg_remove: Remove an installed package."
                     .into(),
             ),

@@ -46,7 +46,7 @@ cargo install algocline
 }
 ```
 
-### 3. Install std packages
+### 3. Install official packages
 
 ```bash
 alc init
@@ -54,10 +54,10 @@ alc init
 
 ### 4. Use
 
-One-liner with a built-in strategy:
+One-liner with an installed package:
 
 ```
-alc_advice({ strategy: "explore", task: "Design a rate limiter for a REST API" })
+alc_advice({ strategy: "ucb", task: "Design a rate limiter for a REST API" })
 ```
 
 Or write your own Lua:
@@ -88,14 +88,25 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.filter(items, fn)         — conditional selection
 │
 Layer 2: Packages (require() from ~/.algocline/packages/)
-   explore  — UCB1 hypothesis space exploration     [selection]
-   panel    — multi-perspective deliberation         [synthesis]
-   chain    — iterative chain-of-thought             [reasoning]
-   ensemble — independent sampling + majority vote   [aggregation]
-   verify   — draft-verify-revise cycle              [validation]
+   cot        — chain-of-thought                    [reasoning]
+   maieutic   — maieutic prompting                  [reasoning]
+   reflect    — self-reflection                     [reasoning]
+   calibrate  — confidence calibration              [reasoning]
+   sc         — self-consistency (majority vote)     [selection]
+   rank       — pairwise ranking                    [selection]
+   triad      — triad comparison                    [selection]
+   ucb        — UCB1 hypothesis exploration          [selection]
+   sot        — skeleton-of-thought                 [generation]
+   decompose  — task decomposition                  [generation]
+   distill    — knowledge distillation              [extraction]
+   cod        — chain-of-density                    [extraction]
+   cove       — chain-of-verification               [validation]
+   factscore  — factual precision scoring           [validation]
+   review     — structured code/text review         [validation]
+   panel      — multi-perspective deliberation      [synthesis]
 ```
 
-Layer 0/1 are always available. Layer 2 packages are opt-in via `require()`.
+Layer 0/1 are always available. Layer 2 packages are installed separately from [algocline-packages](https://github.com/ynishi/algocline-packages) and loaded via `require()`.
 
 ### Crate structure
 
@@ -126,9 +137,9 @@ alc_continue({ session_id, response })
 |---|---|
 | `alc_run` | Execute Lua code with optional JSON context |
 | `alc_continue` | Resume a paused execution with the host LLM's response |
-| `alc_advice` | Apply a built-in strategy by name |
+| `alc_advice` | Apply an installed package by name |
 | `alc_pkg_list` | List installed packages |
-| `alc_pkg_install` | Install a package from Git URL or local path |
+| `alc_pkg_install` | Install a package or collection from Git URL |
 | `alc_pkg_remove` | Remove an installed package |
 
 ## Writing strategies
@@ -173,21 +184,30 @@ alc_advice({ strategy: "my-strategy", task: "..." })
 
 ## Package management
 
-### Standard packages
+### Official packages
+
+Official packages are maintained in [algocline-packages](https://github.com/ynishi/algocline-packages).
 
 ```bash
-alc init                  # Install std packages (from GitHub Releases)
-alc init --force          # Overwrite existing std packages
-alc init --dev            # Install from local std/ (development)
+alc init                  # Install official packages (from GitHub Releases)
+alc init --force          # Overwrite existing packages
+alc init --dev            # Install from local algocline-packages/ (development)
 ```
 
-### Installing third-party packages
+### Installing packages
 
 Via MCP tool:
 
 ```
 alc_pkg_install({ url: "github.com/user/my-strategy" })
 ```
+
+`alc_pkg_install` automatically detects the repository layout:
+
+| Layout | Detection | Behavior |
+|---|---|---|
+| **Single package** | `init.lua` at repo root | Installed as one package |
+| **Collection** | Subdirs containing `init.lua` | Each subdir installed as a separate package |
 
 Supported URL formats:
 
@@ -199,7 +219,7 @@ Supported URL formats:
 | Local path (file://) | `file:///path/to/my-strategy` |
 | Local path (absolute) | `/path/to/my-strategy` |
 
-Optional name override:
+Optional name override (single package mode only):
 
 ```
 alc_pkg_install({ url: "/path/to/repo", name: "custom-name" })

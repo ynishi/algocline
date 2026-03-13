@@ -142,6 +142,72 @@ alc_continue({ session_id, response })
 | `alc_pkg_install` | Install a package or collection from Git URL |
 | `alc_pkg_remove` | Remove an installed package |
 
+## Host integration patterns
+
+algocline's `alc.llm()` is a cooperative yield — it pauses the Lua VM and returns a prompt to the host. How the host handles this determines performance and quality.
+
+### Pattern 1: Manual loop (baseline)
+
+The host LLM reads each prompt, generates a response, and calls `alc_continue`. Simple but requires one round-trip per `alc.llm()` call.
+
+```
+Host LLM → alc_advice → needs_response → Host reads prompt → Host generates response → alc_continue → repeat
+```
+
+**Best for**: Interactive exploration where you want to inspect each step.
+
+### Pattern 2: Autonomous agent delegation (recommended)
+
+Delegate the entire strategy execution to a single agent that has MCP tool access. The agent calls `alc_advice`, handles every `needs_response` internally, and returns only the final result.
+
+```
+Host LLM → Agent(MCP-capable) → [alc_advice → needs_response → self-respond → alc_continue → ...] → final result
+```
+
+**Best for**: Production use. Zero host intervention. Fastest execution.
+
+Example (Claude Code):
+
+```
+Agent(general-purpose) with prompt:
+  1. Call alc_advice(strategy="explore", task="...")
+  2. For each needs_response: generate a response following the system/prompt instructions
+  3. Call alc_continue with your response
+  4. Repeat until status="completed"
+  5. Return the final result
+```
+
+### Pattern 3: MCP Sampling (future)
+
+When the MCP host supports server-initiated sampling, `alc.llm()` will resolve automatically without pausing. No agent delegation needed — the host responds inline.
+
+### Performance comparison
+
+Benchmarked on the same task (UCB1 explore, 11 LLM calls):
+
+| Pattern | Time | Host interventions | Notes |
+|---|---|---|---|
+| Manual (Opus) | 152s | 9 | High quality, manual effort |
+| SubAgent relay (Haiku) | 224s | 9 | Agent startup overhead per call |
+| SubAgent relay (Opus) | 442s | 9 | Same overhead, better quality |
+| **Autonomous agent** | **69s** | **0** | Single agent, full MCP access, no relay overhead |
+
+The autonomous agent pattern eliminates relay overhead entirely. The agent handles the full `alc_advice → alc_continue` loop in-process, resulting in ~2x faster execution than even manual operation.
+
+### Strategy selection guide
+
+| Strategy | Structure | Best for |
+|---|---|---|
+| `explore` / `ucb` | Generate hypotheses → UCB1 score → refine best | Open-ended questions, design decisions |
+| `triad` | 3-role debate (proponent/opponent/judge) | Comparative analysis, pro/con evaluation |
+| `panel` | Multi-perspective deliberation + moderator | Complex problems needing diverse viewpoints |
+| `verify` / `cove` | Draft → verify → revise | Factual accuracy, reducing hallucination |
+| `reflect` | Generate → critique → revise loop | Iterative improvement |
+| `ensemble` / `sc` | Multiple answers → majority vote | When consistency matters more than novelty |
+| `rank` | Pairwise tournament ranking | Selecting best among candidates |
+| `factscore` | Atomic claim decomposition + verification | Fact-checking, claim validation |
+| `cod` | Iterative information densification | Summarization, compression |
+
 ## Writing strategies
 
 A strategy is a Lua file with an `init.lua` entry point:

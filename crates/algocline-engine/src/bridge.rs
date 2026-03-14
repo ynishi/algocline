@@ -598,3 +598,92 @@ mod tests {
         assert_eq!(result, Vec::<String>::new());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// chunk_by_lines never panics regardless of input.
+        #[test]
+        fn chunk_lines_never_panics(text in "\\PC{0,500}", size in 0usize..50, overlap in 0usize..50) {
+            let _ = chunk_by_lines(&text, size, overlap);
+        }
+
+        /// chunk_by_chars never panics regardless of input.
+        #[test]
+        fn chunk_chars_never_panics(text in "\\PC{0,500}", size in 0usize..50, overlap in 0usize..50) {
+            let _ = chunk_by_chars(&text, size, overlap);
+        }
+
+        /// All chars from the original text appear in at least one chunk (no data loss).
+        #[test]
+        fn chunk_chars_covers_all_input(text in "[a-z]{1,100}", size in 1usize..20) {
+            let chunks = chunk_by_chars(&text, size, 0);
+            let reconstructed: String = if chunks.len() <= 1 {
+                chunks.into_iter().collect()
+            } else {
+                // Without overlap, concatenation should reproduce the original
+                chunks.join("")
+            };
+            prop_assert_eq!(&reconstructed, &text);
+        }
+
+        /// All lines from the original text appear in at least one chunk (no data loss).
+        #[test]
+        fn chunk_lines_covers_all_input(
+            lines in proptest::collection::vec("[a-z]{1,20}", 1..20),
+            size in 1usize..10,
+        ) {
+            let text = lines.join("\n");
+            let chunks = chunk_by_lines(&text, size, 0);
+            let reconstructed = chunks.join("\n");
+            prop_assert_eq!(&reconstructed, &text);
+        }
+
+        /// Each chunk has at most `size` characters.
+        #[test]
+        fn chunk_chars_respects_size(text in "[a-z]{1,200}", size in 1usize..50) {
+            let chunks = chunk_by_chars(&text, size, 0);
+            for chunk in &chunks {
+                prop_assert!(chunk.chars().count() <= size,
+                    "chunk length {} exceeds size {}", chunk.chars().count(), size);
+            }
+        }
+
+        /// Each chunk has at most `size` lines.
+        #[test]
+        fn chunk_lines_respects_size(
+            lines in proptest::collection::vec("[a-z]{1,10}", 1..30),
+            size in 1usize..10,
+        ) {
+            let text = lines.join("\n");
+            let chunks = chunk_by_lines(&text, size, 0);
+            for chunk in &chunks {
+                let line_count = chunk.lines().count();
+                prop_assert!(line_count <= size,
+                    "chunk has {} lines, exceeds size {}", line_count, size);
+            }
+        }
+
+        /// With overlap, adjacent chunks share `overlap` characters.
+        #[test]
+        fn chunk_chars_overlap_shared(
+            text in "[a-z]{10,100}",
+            size in 3usize..15,
+            overlap in 1usize..3,
+        ) {
+            prop_assume!(overlap < size);
+            let chunks = chunk_by_chars(&text, size, overlap);
+            if chunks.len() >= 2 {
+                for i in 0..chunks.len() - 1 {
+                    let suffix: String = chunks[i].chars().rev().take(overlap).collect::<Vec<_>>().into_iter().rev().collect();
+                    let prefix: String = chunks[i + 1].chars().take(overlap).collect();
+                    prop_assert_eq!(&suffix, &prefix,
+                        "chunk[{}] suffix != chunk[{}] prefix", i, i + 1);
+                }
+            }
+        }
+    }
+}

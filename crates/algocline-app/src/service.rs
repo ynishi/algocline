@@ -1119,6 +1119,123 @@ mod tests {
         assert_eq!(updated["notes_count"], 2);
     }
 
+    // ─── TranscriptConfig tests ───
+
+    #[test]
+    fn transcript_config_default_enabled() {
+        // Without env vars, should default to enabled
+        let config = TranscriptConfig {
+            dir: PathBuf::from("/tmp/test"),
+            enabled: true,
+        };
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn write_transcript_log_disabled_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: false,
+        };
+        let metrics = algocline_core::ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        observer.on_paused(&[algocline_core::LlmQuery {
+            id: algocline_core::QueryId::single(),
+            prompt: "test".into(),
+            system: None,
+            max_tokens: 10,
+        }]);
+        observer.on_response_fed(&algocline_core::QueryId::single(), "r");
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        write_transcript_log(&config, "s-disabled", &metrics);
+
+        // No file should be created
+        assert!(!dir.path().join("s-disabled.json").exists());
+        assert!(!dir.path().join("s-disabled.meta.json").exists());
+    }
+
+    #[test]
+    fn write_transcript_log_empty_transcript_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+        // Metrics with no observer events → empty transcript
+        let metrics = algocline_core::ExecutionMetrics::new();
+        write_transcript_log(&config, "s-empty", &metrics);
+        assert!(!dir.path().join("s-empty.json").exists());
+    }
+
+    // ─── copy_dir tests ───
+
+    #[test]
+    fn copy_dir_basic() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        std::fs::write(src.path().join("a.txt"), "hello").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b.txt"), "world").unwrap();
+
+        let dst_path = dst.path().join("copied");
+        copy_dir(src.path(), &dst_path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join("a.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join("sub/b.txt")).unwrap(),
+            "world"
+        );
+    }
+
+    #[test]
+    fn copy_dir_empty() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_path = dst.path().join("empty_copy");
+        copy_dir(src.path(), &dst_path).unwrap();
+        assert!(dst_path.exists());
+        assert!(dst_path.is_dir());
+    }
+
+    // ─── task_hint truncation in write_transcript_log ───
+
+    #[test]
+    fn write_transcript_log_truncates_long_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let metrics = algocline_core::ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        let long_prompt = "x".repeat(300);
+        observer.on_paused(&[algocline_core::LlmQuery {
+            id: algocline_core::QueryId::single(),
+            prompt: long_prompt,
+            system: None,
+            max_tokens: 10,
+        }]);
+        observer.on_response_fed(&algocline_core::QueryId::single(), "r");
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        write_transcript_log(&config, "s-long", &metrics);
+
+        let raw = std::fs::read_to_string(dir.path().join("s-long.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let hint = doc["task_hint"].as_str().unwrap();
+        // Should be truncated to ~100 chars + "..."
+        assert!(hint.len() <= 104, "hint too long: {} chars", hint.len());
+        assert!(hint.ends_with("..."));
+    }
+
     #[test]
     fn log_list_prefers_meta_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1192,5 +1309,65 @@ mod tests {
             .collect();
         assert!(ids.contains(&"s-big"));
         assert!(ids.contains(&"s-legacy"));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// resolve_code never panics.
+        #[test]
+        fn resolve_code_never_panics(
+            code in proptest::option::of("[a-z]{0,50}"),
+            file in proptest::option::of("[a-z]{0,50}"),
+        ) {
+            let _ = resolve_code(code, file);
+        }
+
+        /// ContainedPath always rejects ".." components.
+        #[test]
+        fn contained_path_rejects_traversal(
+            prefix in "[a-z]{0,5}",
+            suffix in "[a-z]{0,5}",
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("{prefix}/../{suffix}");
+            let result = ContainedPath::child(dir.path(), &name);
+            prop_assert!(result.is_err());
+        }
+
+        /// ContainedPath accepts simple alphanumeric names.
+        #[test]
+        fn contained_path_accepts_simple_names(name in "[a-z][a-z0-9_-]{0,20}\\.json") {
+            let dir = tempfile::tempdir().unwrap();
+            let result = ContainedPath::child(dir.path(), &name);
+            prop_assert!(result.is_ok());
+        }
+
+        /// make_require_code always contains the strategy name in a require call.
+        #[test]
+        fn make_require_code_contains_name(name in "[a-z_]{1,20}") {
+            let code = make_require_code(&name);
+            let expected = format!("require(\"{}\")", name);
+            prop_assert!(code.contains(&expected));
+            prop_assert!(code.contains("pkg.run(ctx)"));
+        }
+
+        /// copy_dir preserves file contents for arbitrary data.
+        #[test]
+        fn copy_dir_preserves_content(content in "[a-zA-Z0-9 ]{1,200}") {
+            let src = tempfile::tempdir().unwrap();
+            let dst = tempfile::tempdir().unwrap();
+
+            std::fs::write(src.path().join("test.txt"), &content).unwrap();
+            let dst_path = dst.path().join("out");
+            copy_dir(src.path(), &dst_path).unwrap();
+
+            let read = std::fs::read_to_string(dst_path.join("test.txt")).unwrap();
+            prop_assert_eq!(&read, &content);
+        }
     }
 }

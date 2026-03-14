@@ -26,3 +26,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = "1"
 dirs = "6"
+
+[dev-dependencies]
+proptest = "1"

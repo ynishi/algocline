@@ -203,3 +203,114 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_packages_is_non_empty() {
+        assert!(!BUNDLED_PACKAGES.is_empty());
+    }
+
+    #[test]
+    fn bundled_packages_have_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for name in BUNDLED_PACKAGES {
+            assert!(seen.insert(name), "duplicate package: {name}");
+        }
+    }
+
+    #[test]
+    fn bundled_packages_names_are_valid() {
+        for name in BUNDLED_PACKAGES {
+            assert!(!name.is_empty(), "empty package name");
+            assert!(
+                !name.contains('/') && !name.contains('\\') && !name.contains(".."),
+                "invalid package name: {name}"
+            );
+            // Must be alphanumeric + underscore (valid Lua module names)
+            assert!(
+                name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "non-alphanumeric package name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_package_creates_init_lua() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        // Create a source package
+        let pkg_dir = source.path().join("mypkg");
+        std::fs::create_dir(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+        let installed = copy_package("mypkg", source.path(), dest.path(), false).unwrap();
+        assert!(installed);
+        assert!(dest.path().join("mypkg/init.lua").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("mypkg/init.lua")).unwrap(),
+            "return {}"
+        );
+    }
+
+    #[test]
+    fn copy_package_skips_existing() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        // Create source and dest
+        let src_pkg = source.path().join("mypkg");
+        std::fs::create_dir(&src_pkg).unwrap();
+        std::fs::write(src_pkg.join("init.lua"), "return {}").unwrap();
+
+        let dst_pkg = dest.path().join("mypkg");
+        std::fs::create_dir(&dst_pkg).unwrap();
+        std::fs::write(dst_pkg.join("init.lua"), "return {old=true}").unwrap();
+
+        let installed = copy_package("mypkg", source.path(), dest.path(), false).unwrap();
+        assert!(!installed); // Should skip
+                             // Content should NOT be overwritten
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("mypkg/init.lua")).unwrap(),
+            "return {old=true}"
+        );
+    }
+
+    #[test]
+    fn copy_package_force_overwrites() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        let src_pkg = source.path().join("mypkg");
+        std::fs::create_dir(&src_pkg).unwrap();
+        std::fs::write(src_pkg.join("init.lua"), "return {new=true}").unwrap();
+
+        let dst_pkg = dest.path().join("mypkg");
+        std::fs::create_dir(&dst_pkg).unwrap();
+        std::fs::write(dst_pkg.join("init.lua"), "return {old=true}").unwrap();
+
+        let installed = copy_package("mypkg", source.path(), dest.path(), true).unwrap();
+        assert!(installed);
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("mypkg/init.lua")).unwrap(),
+            "return {new=true}"
+        );
+    }
+
+    #[test]
+    fn copy_package_missing_source_errors() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        let result = copy_package("nonexistent", source.path(), dest.path(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn version_is_set() {
+        assert!(!VERSION.is_empty());
+    }
+}

@@ -21,3 +21,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 dirs = "6"
 tempfile = "3"
+
+[dev-dependencies]
+proptest = "1"
+algocline-core = { workspace = true }

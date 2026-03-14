@@ -120,4 +120,84 @@ mod tests {
         assert!(state_path("").is_err());
         assert!(state_path("foo\0bar").is_err());
     }
+
+    #[test]
+    fn get_nonexistent_namespace_returns_empty() {
+        let result = get("_test_nonexistent_ns_12345", "any_key").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn keys_nonexistent_namespace_returns_empty() {
+        let result = keys("_test_nonexistent_ns_12345").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn delete_nonexistent_key_returns_false() {
+        let ns = "_test_delete_nonexistent";
+        let _ = std::fs::remove_file(state_path(ns).unwrap());
+        assert!(!delete(ns, "nope").unwrap());
+    }
+
+    #[test]
+    fn set_overwrites_existing_value() {
+        let ns = "_test_overwrite";
+        let _ = std::fs::remove_file(state_path(ns).unwrap());
+
+        set(ns, "k", serde_json::json!(1)).unwrap();
+        set(ns, "k", serde_json::json!(2)).unwrap();
+        assert_eq!(get(ns, "k").unwrap(), Some(serde_json::json!(2)));
+
+        let _ = std::fs::remove_file(state_path(ns).unwrap());
+    }
+
+    #[test]
+    fn state_path_valid_namespaces() {
+        assert!(state_path("default").is_ok());
+        assert!(state_path("my-app").is_ok());
+        assert!(state_path("test_123").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any valid namespace (alphanumeric + hyphen/underscore) round-trips through set/get.
+        #[test]
+        fn roundtrip_arbitrary_values(
+            key in "[a-z]{1,20}",
+            val in any::<i64>(),
+        ) {
+            let ns = "_proptest_rt";
+            let json_val = serde_json::json!(val);
+            set(ns, &key, json_val.clone()).unwrap();
+            let got = get(ns, &key).unwrap();
+            prop_assert_eq!(got, Some(json_val));
+            let _ = delete(ns, &key);
+        }
+
+        /// Path traversal patterns are always rejected.
+        #[test]
+        fn traversal_always_rejected(
+            prefix in "[a-z]{0,5}",
+            suffix in "[a-z]{0,5}",
+        ) {
+            let evil = format!("{prefix}/../{suffix}");
+            prop_assert!(state_path(&evil).is_err());
+        }
+
+        /// state_path rejects NUL bytes anywhere in the namespace.
+        #[test]
+        fn nul_byte_always_rejected(
+            prefix in "[a-z]{0,10}",
+            suffix in "[a-z]{0,10}",
+        ) {
+            let evil = format!("{prefix}\0{suffix}");
+            prop_assert!(state_path(&evil).is_err());
+        }
+    }
 }

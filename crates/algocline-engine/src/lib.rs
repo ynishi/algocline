@@ -6,4 +6,4 @@ mod state;
 
 pub use executor::Executor;
 pub use llm_bridge::{LlmRequest, QueryRequest};
-pub use session::{Session, SessionRegistry};
+pub use session::{ExecutionResult, FeedResult, Session, SessionRegistry};

@@ -7,7 +7,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use algocline_app::AppService;
+use algocline_app::{AppService, TranscriptConfig};
 use algocline_engine::Executor;
 
 // ─── MCP Parameter types (schemars-annotated) ───────────────────
@@ -63,6 +63,24 @@ pub struct PkgRemoveParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoteParams {
+    /// Session ID of the execution to annotate.
+    pub session_id: String,
+    /// Note content (free text).
+    pub content: String,
+    /// Short label for what this note refers to (e.g. "Step 2", "overall").
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LogViewParams {
+    /// Session ID to view in detail. Omit to list all sessions.
+    pub session_id: Option<String>,
+    /// Max sessions to return in list mode (default: 50). Ignored when session_id is provided.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AdviceParams {
     /// Package name: "ucb" (UCB1 hypothesis exploration), "panel" (multi-perspective),
     /// "cot" (chain-of-thought), "sc" (self-consistency), "cove" (chain-of-verification),
@@ -84,10 +102,10 @@ pub struct AlcService {
 
 #[tool_router]
 impl AlcService {
-    pub fn new(executor: Arc<Executor>) -> Self {
+    pub fn new(executor: Arc<Executor>, log_config: TranscriptConfig) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            app: AppService::new(executor),
+            app: AppService::new(executor, log_config),
         }
     }
 
@@ -189,6 +207,36 @@ impl AlcService {
     ) -> Result<String, String> {
         self.app.pkg_remove(&params.name).await
     }
+
+    // ─── Logging ─────────────────────────────────────────────
+
+    /// Add a note to a completed session's log.
+    ///
+    /// Appends free-text feedback or observations to the transcript log file.
+    /// The session must have completed and have logging enabled.
+    #[tool(name = "alc_note", annotations(open_world_hint = false))]
+    async fn note(&self, Parameters(params): Parameters<NoteParams>) -> Result<String, String> {
+        self.app
+            .add_note(&params.session_id, &params.content, params.title.as_deref())
+            .await
+    }
+
+    /// View session logs.
+    ///
+    /// Without session_id: returns a summary list of all logged sessions.
+    /// With session_id: returns the full log (stats, transcript, notes).
+    #[tool(
+        name = "alc_log_view",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn log_view(
+        &self,
+        Parameters(params): Parameters<LogViewParams>,
+    ) -> Result<String, String> {
+        self.app
+            .log_view(params.session_id.as_deref(), params.limit)
+            .await
+    }
 }
 
 #[tool_handler]
@@ -208,7 +256,10 @@ impl ServerHandler for AlcService {
                  Package Management:\n\
                  - alc_pkg_list: List installed packages with metadata.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
-                 - alc_pkg_remove: Remove an installed package."
+                 - alc_pkg_remove: Remove an installed package.\n\n\
+                 Logging:\n\
+                 - alc_note: Add a note to a completed session's log (feedback, observations).\n\
+                 - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

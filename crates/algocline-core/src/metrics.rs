@@ -55,9 +55,6 @@ impl AutoMetrics {
             .map(|end| end.duration_since(self.started_at).as_millis() as u64)
             .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64);
 
-        let transcript: Vec<serde_json::Value> =
-            self.transcript.iter().map(|e| e.to_json()).collect();
-
         serde_json::json!({
             "elapsed_ms": elapsed_ms,
             "llm_calls": self.llm_calls,
@@ -65,7 +62,6 @@ impl AutoMetrics {
             "rounds": self.rounds,
             "total_prompt_chars": self.total_prompt_chars,
             "total_response_chars": self.total_response_chars,
-            "transcript": transcript,
         })
     }
 }
@@ -102,6 +98,14 @@ impl ExecutionMetrics {
             "auto": auto_json,
             "custom": custom_json,
         })
+    }
+
+    /// Transcript entries as JSON array.
+    pub fn transcript_to_json(&self) -> Vec<serde_json::Value> {
+        self.auto
+            .lock()
+            .map(|m| m.transcript.iter().map(|e| e.to_json()).collect())
+            .unwrap_or_default()
     }
 
     /// Handle for custom metrics, passed to the Lua bridge.
@@ -329,13 +333,30 @@ mod tests {
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
-        let json = metrics.to_json();
-        let transcript = json["auto"]["transcript"].as_array().unwrap();
+        let transcript = metrics.transcript_to_json();
         assert_eq!(transcript.len(), 1);
         assert_eq!(transcript[0]["query_id"], "q-0");
         assert_eq!(transcript[0]["prompt"], "What is 2+2?");
         assert_eq!(transcript[0]["system"], "You are a calculator.");
         assert_eq!(transcript[0]["response"], "4");
+    }
+
+    #[test]
+    fn transcript_not_in_stats() {
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        observer.on_paused(&[LlmQuery {
+            id: QueryId::single(),
+            prompt: "p".into(),
+            system: None,
+            max_tokens: 10,
+        }]);
+        observer.on_response_fed(&QueryId::single(), "r");
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        let json = metrics.to_json();
+        assert!(json["auto"].get("transcript").is_none());
     }
 
     #[test]
@@ -365,8 +386,7 @@ mod tests {
 
         observer.on_completed(&serde_json::json!(null));
 
-        let json = metrics.to_json();
-        let transcript = json["auto"]["transcript"].as_array().unwrap();
+        let transcript = metrics.transcript_to_json();
         assert_eq!(transcript.len(), 2);
 
         assert_eq!(transcript[0]["prompt"], "step1");
@@ -404,8 +424,7 @@ mod tests {
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
-        let json = metrics.to_json();
-        let transcript = json["auto"]["transcript"].as_array().unwrap();
+        let transcript = metrics.transcript_to_json();
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0]["query_id"], "q-0");
         assert_eq!(transcript[0]["response"], "r0");

@@ -18,5 +18,6 @@ algocline-engine = { workspace = true }
 
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 dirs = "6"
 tempfile = "3"

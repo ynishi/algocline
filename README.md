@@ -1,10 +1,12 @@
 # algocline
 
-**Algorithm + LLM + Human.** State-of-the-art reasoning algorithms — UCB1 exploration, multi-agent debate, ensemble voting — available to anyone, instantly, as an MCP server.
+**Research-grade reasoning for your LLM — as Pure Lua you can read, edit, and ship.**
+
+UCB1 exploration, self-reflection, multi-agent debate, chain-of-verification — each strategy is a single Lua file. Install with `cargo install`, customize anything, no framework lock-in.
 
 ## What it does
 
-Research papers describe powerful techniques for improving LLM reasoning: Monte Carlo Tree Search, multi-perspective deliberation, iterative refinement. But using them today means Python environments, framework lock-in, and API key management.
+LLMs are single-shot by default. Ask a question, get one answer, hope it's right. Research papers describe techniques that do better — iterating, scoring, selecting — but using them today means Python, framework lock-in, and API key management.
 
 algocline makes these techniques **immediately usable**. Each algorithm is a Pure Lua file (100-350 lines) that runs inside your existing MCP host. No infrastructure. No setup beyond `alc init`.
 
@@ -17,7 +19,18 @@ Human ──→ LLM (MCP host) ──→ algocline ──→ Algorithm (Lua) ─
 
 **Use** existing algorithms with one call. **Build** your own by writing Lua. **Share** them via Git.
 
-## Why
+## When to use
+
+| What you want to do | What happens | Strategy |
+|---|---|---|
+| Catch what your code review missed | Draft → self-critique → revise. Found that `std::fs::write` is non-atomic (crash = data loss) after the first draft said "no issues" | `reflect` |
+| Make design decisions structurally, not by gut | Advocate, critic, and pragmatist debate. Resolved "do we need log rotation?" → "no, but add a display limit" in 4 rounds | `panel` |
+| Fact-check LLM claims before trusting them | Auto-generates verification questions → checks each one. Escalated a path traversal from medium to high severity after confirming `PathBuf::join()` does zero validation | `cove` |
+| Break down a complex problem step by step | Builds reasoning chain incrementally. Structured Vec vs HashMap trade-offs into cache locality → memory overhead → API ergonomics | `cot` |
+| Pick the best option from multiple candidates | Scores each candidate on your criteria, pairwise comparison | `rank` |
+| Get a reliable answer, not a lucky one | Generates N answers → majority vote picks the most consistent one | `sc` |
+
+## Why algocline
 
 | Approach | Limitation |
 |---|---|
@@ -33,7 +46,19 @@ Human ──→ LLM (MCP host) ──→ algocline ──→ Algorithm (Lua) ─
 cargo install algocline
 ```
 
-### 2. Add to your MCP config
+### 2. Initialize packages
+
+```bash
+alc init
+```
+
+This downloads the bundled package collection (UCB1, chain-of-thought, self-consistency, etc.) into `~/.algocline/packages/`. Run `alc init --force` to overwrite existing packages.
+
+> **Note**: If you skip this step, packages are auto-installed on first `alc_advice` call via MCP. But running `alc init` upfront is recommended for faster first use and offline availability.
+
+### 3. Add to your MCP config
+
+Add algocline as an MCP server in your host's configuration (e.g. Claude Code's `~/.claude.json`, Cursor's MCP settings, etc.):
 
 ```json
 {
@@ -46,13 +71,11 @@ cargo install algocline
 }
 ```
 
-### 3. Install official packages
-
-```bash
-alc init
-```
+After adding the config, restart your MCP host session so it picks up the new server.
 
 ### 4. Use
+
+Call algocline tools from your MCP host. The host LLM calls these tools on your behalf:
 
 One-liner with an installed package:
 
@@ -87,7 +110,7 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.vote(answers)             — majority aggregation
 │  alc.filter(items, fn)         — conditional selection
 │
-Layer 2: Packages (require() from ~/.algocline/packages/)
+Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
    cot        — chain-of-thought                    [reasoning]
    maieutic   — maieutic prompting                  [reasoning]
    reflect    — self-reflection                     [reasoning]
@@ -106,7 +129,7 @@ Layer 2: Packages (require() from ~/.algocline/packages/)
    panel      — multi-perspective deliberation      [synthesis]
 ```
 
-Layer 0/1 are always available. Layer 2 packages are installed separately from [algocline-packages](https://github.com/ynishi/algocline-packages) and loaded via `require()`.
+Layer 0/1 are always available. Layer 2 packages are installed via `alc init` or `alc_pkg_install` from [algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages) and loaded via `require()`.
 
 ### Crate structure
 
@@ -139,8 +162,10 @@ alc_continue({ session_id, response })
 | `alc_continue` | Resume a paused execution with the host LLM's response |
 | `alc_advice` | Apply an installed package by name |
 | `alc_pkg_list` | List installed packages |
-| `alc_pkg_install` | Install a package or collection from Git URL |
+| `alc_pkg_install` | Install a package or collection from Git URL or local path |
 | `alc_pkg_remove` | Remove an installed package |
+| `alc_note` | Add a note to a completed session's log |
+| `alc_log_view` | View session logs (list or detail) |
 
 ## Host integration patterns
 
@@ -250,19 +275,30 @@ alc_advice({ strategy: "my-strategy", task: "..." })
 
 ## Package management
 
-### Official packages
+### Bundled packages
 
-Official packages are maintained in [algocline-packages](https://github.com/ynishi/algocline-packages).
+Bundled packages are maintained in [algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages). Install them via CLI:
 
 ```bash
-alc init                  # Install official packages (from GitHub Releases)
-alc init --force          # Overwrite existing packages
-alc init --dev            # Install from local algocline-packages/ (development)
+alc init            # Download and install all bundled packages
+alc init --force    # Overwrite existing packages
 ```
 
-### Installing packages
+If you call `alc_advice` with a package that isn't installed, algocline **automatically downloads the bundled collection** from GitHub. But `alc init` upfront is recommended.
 
-Via MCP tool:
+To install or update via MCP:
+
+```
+alc_pkg_install({ url: "github.com/ynishi/algocline-bundled-packages" })
+```
+
+For local development (installs from a local checkout, supports uncommitted changes):
+
+```
+alc_pkg_install({ url: "/path/to/algocline-bundled-packages" })
+```
+
+### Installing third-party packages
 
 ```
 alc_pkg_install({ url: "github.com/user/my-strategy" })

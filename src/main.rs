@@ -28,7 +28,7 @@
 //! │  alc.vote(answers)           — majority aggregation
 //! │  alc.filter(items, fn)       — conditional selection
 //! │
-//! Layer 2: First-Party Packages (require() from std/)
+//! Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
 //!    Installed to ~/.algocline/packages/ via `alc init`.
 //!    Each is a self-contained Lua module built on Layer 0/1.
 //!    Loaded explicitly via require("{name}").
@@ -40,8 +40,8 @@
 //!    verify   — draft-verify-revise cycle            [validation]
 //! ```
 //!
-//! **Design rationale**: Layer 0/1 form the "standard library" — always
-//! available, no explicit import needed. Layer 2 packages are first-party
+//! **Design rationale**: Layer 0/1 form the built-in library — always
+//! available, no explicit import needed. Layer 2 packages are bundled
 //! but opt-in via `require()`, analogous to how `tokio` relates to `std`
 //! in the Rust ecosystem.
 
@@ -53,7 +53,7 @@ use rmcp::{transport::stdio, ServiceExt};
 use tracing_subscriber::{self, EnvFilter};
 
 use algocline_engine::Executor;
-use algocline_mcp::AlcService;
+use algocline_mcp::{AlcService, TranscriptConfig};
 
 fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
@@ -84,7 +84,7 @@ fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // `alc init` — install std packages
+    // `alc init` — install bundled packages
     if args.get(1).is_some_and(|a| a == "init") {
         return init::run(&args[2..]).await;
     }
@@ -99,8 +99,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("algocline server starting");
 
     let lib_paths = resolve_lib_paths();
+    let log_config = TranscriptConfig::from_env();
     let executor = Arc::new(Executor::new(lib_paths).await?);
-    let server = AlcService::new(executor);
+    let server = AlcService::new(executor, log_config);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

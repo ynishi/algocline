@@ -1,6 +1,6 @@
-//! `alc init` — Install official packages from algocline-packages.
+//! `alc init` — Install bundled packages from algocline-bundled-packages.
 //!
-//! Downloads the official package collection from GitHub Releases
+//! Downloads the bundled package collection from GitHub Releases
 //! and installs all packages into `~/.algocline/packages/`.
 //!
 //! Sources (checked in order):
@@ -8,7 +8,7 @@
 //! 2. Local packages directory (development): copies directly
 //!
 //! Usage:
-//!   alc init           — Install official packages (from release asset or local)
+//!   alc init           — Install bundled packages (from release asset or local)
 //!   alc init --force   — Overwrite existing packages
 //!   alc init --dev     — Force local source (development)
 
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Official package names shipped with algocline.
-const OFFICIAL_PACKAGES: &[&str] = &[
+/// Bundled package names shipped with algocline.
+const BUNDLED_PACKAGES: &[&str] = &[
     // Reasoning
     "cot",
     "maieutic",
@@ -50,13 +50,13 @@ fn packages_dir() -> anyhow::Result<PathBuf> {
 
 /// Find a local packages source directory (development).
 ///
-/// Searches for a sibling `algocline-packages/` directory relative to CWD
+/// Searches for a sibling `algocline-bundled-packages/` directory relative to CWD
 /// or the binary location. This supports the development workflow where
 /// both repositories are checked out side by side.
 fn find_local_packages() -> Option<PathBuf> {
-    // Check CWD/../algocline-packages/
+    // Check CWD/../algocline-bundled-packages/
     let cwd = std::env::current_dir().ok()?;
-    let sibling = cwd.parent()?.join("algocline-packages");
+    let sibling = cwd.parent()?.join("algocline-bundled-packages");
     if sibling.is_dir() {
         return Some(sibling);
     }
@@ -68,7 +68,7 @@ fn find_local_packages() -> Option<PathBuf> {
             .parent()?
             .parent()?
             .parent()?
-            .join("algocline-packages");
+            .join("algocline-bundled-packages");
         if dev_pkg.is_dir() {
             return Some(dev_pkg);
         }
@@ -99,10 +99,10 @@ fn copy_package(name: &str, source: &Path, dest_root: &Path, force: bool) -> any
 /// Download official packages from GitHub Releases.
 async fn install_from_release(dest: &Path, _force: bool) -> anyhow::Result<()> {
     let url = format!(
-        "https://github.com/yutakanishimura/algocline-packages/releases/download/v{VERSION}/alc-packages-{VERSION}.tar.gz"
+        "https://github.com/ynishi/algocline-bundled-packages/releases/download/v{VERSION}/alc-packages-{VERSION}.tar.gz"
     );
 
-    eprintln!("Downloading algocline-packages v{VERSION} from GitHub Releases...");
+    eprintln!("Downloading bundled packages v{VERSION} from GitHub Releases...");
 
     let output = tokio::process::Command::new("curl")
         .args(["-fsSL", &url])
@@ -135,7 +135,7 @@ async fn install_from_release(dest: &Path, _force: bool) -> anyhow::Result<()> {
 
     // Report
     let mut count = 0;
-    for name in OFFICIAL_PACKAGES {
+    for name in BUNDLED_PACKAGES {
         let pkg = dest.join(name).join("init.lua");
         if pkg.exists() {
             count += 1;
@@ -154,7 +154,7 @@ fn install_from_local(source: &Path, dest: &Path, force: bool) -> anyhow::Result
     let mut installed = 0;
     let mut skipped = 0;
 
-    for name in OFFICIAL_PACKAGES {
+    for name in BUNDLED_PACKAGES {
         match copy_package(name, source, dest, force) {
             Ok(true) => {
                 eprintln!("  + {name}");
@@ -183,8 +183,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
 
     if dev {
         // --dev: force local packages directory
-        let source = find_local_packages()
-            .ok_or_else(|| anyhow::anyhow!("No local algocline-packages/ directory found"))?;
+        let source = find_local_packages().ok_or_else(|| {
+            anyhow::anyhow!("No local algocline-bundled-packages/ directory found")
+        })?;
         return install_from_local(&source, &dest, force);
     }
 
@@ -194,7 +195,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         Err(e) => {
             eprintln!("Release download failed: {e}");
             if let Some(source) = find_local_packages() {
-                eprintln!("Falling back to local algocline-packages/...");
+                eprintln!("Falling back to local algocline-bundled-packages/...");
                 install_from_local(&source, &dest, force)
             } else {
                 Err(e)

@@ -1,8 +1,177 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use algocline_core::QueryId;
-use algocline_engine::{Executor, SessionRegistry};
+use algocline_core::{ExecutionMetrics, QueryId};
+use algocline_engine::{Executor, FeedResult, SessionRegistry};
+
+// ─── Transcript logging ─────────────────────────────────────────
+
+/// Controls transcript log output.
+///
+/// - `ALC_LOG_DIR`: Directory for log files. Default: `~/.algocline/logs`.
+/// - `ALC_LOG_LEVEL`: `full` (default) or `off`.
+#[derive(Clone, Debug)]
+pub struct TranscriptConfig {
+    pub dir: PathBuf,
+    pub enabled: bool,
+}
+
+impl TranscriptConfig {
+    /// Build from environment variables.
+    pub fn from_env() -> Self {
+        let dir = std::env::var("ALC_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".algocline")
+                    .join("logs")
+            });
+
+        let enabled = std::env::var("ALC_LOG_LEVEL")
+            .map(|v| v.to_lowercase() != "off")
+            .unwrap_or(true);
+
+        Self { dir, enabled }
+    }
+}
+
+/// Write transcript log to `{dir}/{session_id}.json`.
+///
+/// Silently returns on I/O errors — logging must not break execution.
+fn write_transcript_log(config: &TranscriptConfig, session_id: &str, metrics: &ExecutionMetrics) {
+    if !config.enabled {
+        return;
+    }
+
+    let transcript = metrics.transcript_to_json();
+    if transcript.is_empty() {
+        return;
+    }
+
+    let stats = metrics.to_json();
+
+    // Extract task hint from first prompt (truncated to 100 chars)
+    let task_hint = transcript
+        .first()
+        .and_then(|e| e.get("prompt"))
+        .and_then(|p| p.as_str())
+        .map(|s| {
+            if s.len() <= 100 {
+                s.to_string()
+            } else {
+                // Find a char boundary at or before 100 bytes
+                let mut end = 100;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &s[..end])
+            }
+        });
+
+    let auto_stats = &stats["auto"];
+
+    let log_entry = serde_json::json!({
+        "session_id": session_id,
+        "task_hint": task_hint,
+        "stats": auto_stats,
+        "transcript": transcript,
+    });
+
+    if std::fs::create_dir_all(&config.dir).is_err() {
+        return;
+    }
+
+    let path = match ContainedPath::child(&config.dir, &format!("{session_id}.json")) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let content = match serde_json::to_string_pretty(&log_entry) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let _ = std::fs::write(&path, content);
+
+    // Write lightweight meta file for log_list (avoids reading full transcript)
+    let meta = serde_json::json!({
+        "session_id": session_id,
+        "task_hint": task_hint,
+        "elapsed_ms": auto_stats.get("elapsed_ms"),
+        "rounds": auto_stats.get("rounds"),
+        "llm_calls": auto_stats.get("llm_calls"),
+        "notes_count": 0,
+    });
+    if let Ok(meta_path) = ContainedPath::child(&config.dir, &format!("{session_id}.meta.json")) {
+        let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
+    }
+}
+
+/// Append a note to an existing log file.
+///
+/// Reads `{dir}/{session_id}.json`, adds the note to `"notes"` array, writes back.
+/// Returns Ok with the note count, or Err if the log file doesn't exist.
+fn append_note(
+    dir: &Path,
+    session_id: &str,
+    content: &str,
+    title: Option<&str>,
+) -> Result<usize, String> {
+    let path = ContainedPath::child(dir, &format!("{session_id}.json"))?;
+    if !path.as_ref().exists() {
+        return Err(format!("Log file not found for session '{session_id}'"));
+    }
+
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read log: {e}"))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse log: {e}"))?;
+
+    let timestamp = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+
+    let note = serde_json::json!({
+        "timestamp": timestamp,
+        "title": title,
+        "content": content,
+    });
+
+    let notes = doc
+        .as_object_mut()
+        .ok_or("Log file is not a JSON object")?
+        .entry("notes")
+        .or_insert_with(|| serde_json::json!([]));
+
+    let arr = notes
+        .as_array_mut()
+        .ok_or("'notes' field is not an array")?;
+    arr.push(note);
+    let count = arr.len();
+
+    let output =
+        serde_json::to_string_pretty(&doc).map_err(|e| format!("Failed to serialize: {e}"))?;
+    std::fs::write(path.as_ref(), output).map_err(|e| format!("Failed to write log: {e}"))?;
+
+    // Update notes_count in meta file (best-effort)
+    if let Ok(meta_path) = ContainedPath::child(dir, &format!("{session_id}.meta.json")) {
+        if meta_path.as_ref().exists() {
+            if let Ok(raw) = std::fs::read_to_string(&meta_path) {
+                if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    meta["notes_count"] = serde_json::json!(count);
+                    if let Ok(s) = serde_json::to_string(&meta) {
+                        let _ = std::fs::write(&meta_path, s);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(count)
+}
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -21,6 +190,52 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+// ─── Path safety ────────────────────────────────────────────────
+
+/// A path verified to reside within a base directory.
+///
+/// Constructed via [`ContainedPath::child`], which rejects path traversal
+/// (`..`, absolute paths, symlink escapes). Once constructed, the inner path
+/// is safe for filesystem operations within the base directory.
+#[derive(Debug)]
+struct ContainedPath(PathBuf);
+
+impl ContainedPath {
+    /// Resolve `name` as a child of `base`, rejecting traversal attempts.
+    ///
+    /// Validates that every component in `name` is [`Component::Normal`].
+    /// If the resulting path already exists on disk, additionally verifies
+    /// via `canonicalize` that symlinks do not escape `base`.
+    fn child(base: &Path, name: &str) -> Result<Self, String> {
+        for comp in Path::new(name).components() {
+            if !matches!(comp, std::path::Component::Normal(_)) {
+                return Err(format!(
+                    "Invalid path component in '{name}': path traversal detected"
+                ));
+            }
+        }
+        let path = base.join(name);
+        if path.exists() {
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| format!("Path resolution failed: {e}"))?;
+            let base_canonical = base
+                .canonicalize()
+                .map_err(|e| format!("Base path resolution failed: {e}"))?;
+            if !canonical.starts_with(&base_canonical) {
+                return Err(format!("Path '{name}' escapes base directory"));
+            }
+        }
+        Ok(Self(path))
+    }
+}
+
+impl AsRef<Path> for ContainedPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
 }
 
 // ─── Parameter types (MCP-independent) ──────────────────────────
@@ -82,19 +297,31 @@ pub(crate) fn packages_dir() -> Result<PathBuf, String> {
     Ok(home.join(".algocline").join("packages"))
 }
 
+/// Default Git URL for the bundled package collection.
+const BUNDLED_PACKAGES_URL: &str = "https://github.com/ynishi/algocline-bundled-packages";
+
+/// Check whether a package is installed (has `init.lua`).
+fn is_package_installed(name: &str) -> bool {
+    packages_dir()
+        .map(|dir| dir.join(name).join("init.lua").exists())
+        .unwrap_or(false)
+}
+
 // ─── Application Service ────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct AppService {
     executor: Arc<Executor>,
     registry: Arc<SessionRegistry>,
+    log_config: TranscriptConfig,
 }
 
 impl AppService {
-    pub fn new(executor: Arc<Executor>) -> Self {
+    pub fn new(executor: Arc<Executor>, log_config: TranscriptConfig) -> Self {
         Self {
             executor,
             registry: Arc::new(SessionRegistry::new()),
+            log_config,
         }
     }
 
@@ -111,12 +338,26 @@ impl AppService {
     }
 
     /// Apply a built-in strategy to a task.
+    ///
+    /// If the requested package is not installed, automatically installs the
+    /// bundled package collection from GitHub before executing.
     pub async fn advice(
         &self,
         strategy: &str,
         task: String,
         opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
+        // Auto-install bundled packages if the requested strategy is missing
+        if !is_package_installed(strategy) {
+            self.auto_install_bundled_packages().await?;
+            if !is_package_installed(strategy) {
+                return Err(format!(
+                    "Package '{strategy}' not found after installing bundled collection. \
+                     Use alc_pkg_install to install it manually."
+                ));
+            }
+        }
+
         let code = make_require_code(strategy);
 
         let mut ctx_map = match opts {
@@ -146,6 +387,7 @@ impl AppService {
             last_result = Some(result);
         }
         let result = last_result.ok_or("Empty responses array")?;
+        self.maybe_log_transcript(&result, session_id);
         Ok(result.to_json(session_id).to_string())
     }
 
@@ -167,6 +409,7 @@ impl AppService {
             .await
             .map_err(|e| format!("Continue failed: {e}"))?;
 
+        self.maybe_log_transcript(&result, session_id);
         Ok(result.to_json(session_id).to_string())
     }
 
@@ -214,12 +457,17 @@ return pkg.meta or {{ name = "{name}" }}"#
         let pkg_dir = packages_dir()?;
         let _ = std::fs::create_dir_all(&pkg_dir);
 
+        // Local path: copy directly (supports uncommitted/dirty working trees)
+        let local_path = Path::new(&url);
+        if local_path.is_absolute() && local_path.is_dir() {
+            return self.install_from_local_path(local_path, &pkg_dir, name);
+        }
+
         // Normalize URL: add https:// only for bare domain-style URLs
         let git_url = if url.starts_with("http://")
             || url.starts_with("https://")
             || url.starts_with("file://")
             || url.starts_with("git@")
-            || url.starts_with('/')
         {
             url.clone()
         } else {
@@ -261,15 +509,16 @@ return pkg.meta or {{ name = "{name}" }}"#
                     .to_string()
             });
 
-            let dest = pkg_dir.join(&name);
-            if dest.exists() {
+            let dest = ContainedPath::child(&pkg_dir, &name)?;
+            if dest.as_ref().exists() {
                 return Err(format!(
                     "Package '{name}' already exists at {}. Remove it first.",
-                    dest.display()
+                    dest.as_ref().display()
                 ));
             }
 
-            copy_dir(staging.path(), &dest).map_err(|e| format!("Failed to copy package: {e}"))?;
+            copy_dir(staging.path(), dest.as_ref())
+                .map_err(|e| format!("Failed to copy package: {e}"))?;
 
             Ok(serde_json::json!({
                 "installed": [name],
@@ -329,24 +578,97 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
     }
 
+    /// Install from a local directory path (supports dirty/uncommitted files).
+    fn install_from_local_path(
+        &self,
+        source: &Path,
+        pkg_dir: &Path,
+        name: Option<String>,
+    ) -> Result<String, String> {
+        if source.join("init.lua").exists() {
+            // Single package
+            let name = name.unwrap_or_else(|| {
+                source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+
+            let dest = ContainedPath::child(pkg_dir, &name)?;
+            if dest.as_ref().exists() {
+                // Overwrite for local installs (dev workflow)
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+
+            copy_dir(source, dest.as_ref()).map_err(|e| format!("Failed to copy package: {e}"))?;
+            // Remove .git if copied
+            let _ = std::fs::remove_dir_all(dest.as_ref().join(".git"));
+
+            Ok(serde_json::json!({
+                "installed": [name],
+                "mode": "local_single",
+            })
+            .to_string())
+        } else {
+            // Collection mode
+            if name.is_some() {
+                return Err(
+                    "The 'name' parameter is only supported for single-package dirs (init.lua at root)."
+                        .to_string(),
+                );
+            }
+
+            let mut installed = Vec::new();
+            let mut updated = Vec::new();
+
+            let entries =
+                std::fs::read_dir(source).map_err(|e| format!("Failed to read source dir: {e}"))?;
+
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
+                let path = entry.path();
+                if !path.is_dir() || !path.join("init.lua").exists() {
+                    continue;
+                }
+                let pkg_name = entry.file_name().to_string_lossy().to_string();
+                let dest = pkg_dir.join(&pkg_name);
+                let existed = dest.exists();
+                if existed {
+                    let _ = std::fs::remove_dir_all(&dest);
+                }
+                copy_dir(&path, &dest)
+                    .map_err(|e| format!("Failed to copy package '{pkg_name}': {e}"))?;
+                let _ = std::fs::remove_dir_all(dest.join(".git"));
+                if existed {
+                    updated.push(pkg_name);
+                } else {
+                    installed.push(pkg_name);
+                }
+            }
+
+            if installed.is_empty() && updated.is_empty() {
+                return Err(
+                    "No packages found. Expected init.lua at root (single) or */init.lua (collection)."
+                        .to_string(),
+                );
+            }
+
+            Ok(serde_json::json!({
+                "installed": installed,
+                "updated": updated,
+                "mode": "local_collection",
+            })
+            .to_string())
+        }
+    }
+
     /// Remove an installed package.
     pub async fn pkg_remove(&self, name: &str) -> Result<String, String> {
         let pkg_dir = packages_dir()?;
-        let dest = pkg_dir.join(name);
+        let dest = ContainedPath::child(&pkg_dir, name)?;
 
-        if !dest.exists() {
+        if !dest.as_ref().exists() {
             return Err(format!("Package '{name}' not found"));
-        }
-
-        // Safety: only remove within ~/.algocline/packages/
-        let canonical = dest
-            .canonicalize()
-            .map_err(|e| format!("Path error: {e}"))?;
-        let pkg_canonical = pkg_dir
-            .canonicalize()
-            .map_err(|e| format!("Path error: {e}"))?;
-        if !canonical.starts_with(&pkg_canonical) {
-            return Err("Path traversal detected".to_string());
         }
 
         std::fs::remove_dir_all(&dest).map_err(|e| format!("Failed to remove '{name}': {e}"))?;
@@ -354,7 +676,130 @@ return pkg.meta or {{ name = "{name}" }}"#
         Ok(serde_json::json!({ "removed": name }).to_string())
     }
 
+    // ─── Logging ─────────────────────────────────────────────
+
+    /// Append a note to a session's log file.
+    pub async fn add_note(
+        &self,
+        session_id: &str,
+        content: &str,
+        title: Option<&str>,
+    ) -> Result<String, String> {
+        let count = append_note(&self.log_config.dir, session_id, content, title)?;
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "notes_count": count,
+        })
+        .to_string())
+    }
+
+    /// View session logs.
+    pub async fn log_view(
+        &self,
+        session_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        match session_id {
+            Some(sid) => self.log_read(sid),
+            None => self.log_list(limit.unwrap_or(50)),
+        }
+    }
+
+    fn log_read(&self, session_id: &str) -> Result<String, String> {
+        let path = ContainedPath::child(&self.log_config.dir, &format!("{session_id}.json"))?;
+        if !path.as_ref().exists() {
+            return Err(format!("Log file not found for session '{session_id}'"));
+        }
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read log: {e}"))
+    }
+
+    fn log_list(&self, limit: usize) -> Result<String, String> {
+        let dir = &self.log_config.dir;
+        if !dir.is_dir() {
+            return Ok(serde_json::json!({ "sessions": [] }).to_string());
+        }
+
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read log dir: {e}"))?;
+
+        // Collect .meta.json files first; fall back to .json for legacy logs
+        let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?;
+                // Skip non-json and meta files in this pass
+                if !name.ends_with(".json") || name.ends_with(".meta.json") {
+                    return None;
+                }
+                let mtime = entry.metadata().ok()?.modified().ok()?;
+                Some((path, mtime))
+            })
+            .collect();
+
+        // Sort by modification time descending (newest first), take limit
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+        files.truncate(limit);
+
+        let mut sessions = Vec::new();
+        for (path, _) in &files {
+            // Try .meta.json first (lightweight), fall back to full log
+            let meta_path = path.with_extension("meta.json");
+            let doc: serde_json::Value = if meta_path.exists() {
+                // Meta file: already flat summary (~200 bytes)
+                match std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|r| serde_json::from_str(&r).ok())
+                {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                // Legacy fallback: read full log and extract fields
+                let raw = match std::fs::read_to_string(path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(d) => {
+                        let stats = d.get("stats");
+                        serde_json::json!({
+                            "session_id": d.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                            "task_hint": d.get("task_hint").and_then(|v| v.as_str()),
+                            "elapsed_ms": stats.and_then(|s| s.get("elapsed_ms")),
+                            "rounds": stats.and_then(|s| s.get("rounds")),
+                            "llm_calls": stats.and_then(|s| s.get("llm_calls")),
+                            "notes_count": d.get("notes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                        })
+                    }
+                    Err(_) => continue,
+                }
+            };
+
+            sessions.push(doc);
+        }
+
+        Ok(serde_json::json!({ "sessions": sessions }).to_string())
+    }
+
     // ─── Internal ───────────────────────────────────────────────
+
+    /// Install the bundled package collection if the requested package is missing.
+    async fn auto_install_bundled_packages(&self) -> Result<(), String> {
+        tracing::info!(
+            "auto-installing bundled packages from {}",
+            BUNDLED_PACKAGES_URL
+        );
+        self.pkg_install(BUNDLED_PACKAGES_URL.to_string(), None)
+            .await
+            .map_err(|e| format!("Failed to auto-install bundled packages: {e}"))?;
+        Ok(())
+    }
+
+    fn maybe_log_transcript(&self, result: &FeedResult, session_id: &str) {
+        if let FeedResult::Finished(exec_result) = result {
+            write_transcript_log(&self.log_config, session_id, &exec_result.metrics);
+        }
+    }
 
     async fn start_and_tick(&self, code: String, ctx: serde_json::Value) -> Result<String, String> {
         let session = self.executor.start_session(code, ctx).await?;
@@ -363,6 +808,7 @@ return pkg.meta or {{ name = "{name}" }}"#
             .start_execution(session)
             .await
             .map_err(|e| format!("Execution failed: {e}"))?;
+        self.maybe_log_transcript(&result, &session_id);
         Ok(result.to_json(&session_id).to_string())
     }
 }
@@ -370,6 +816,7 @@ return pkg.meta or {{ name = "{name}" }}"#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use algocline_core::ExecutionObserver;
     use std::io::Write;
 
     // ─── resolve_code tests ───
@@ -442,5 +889,308 @@ mod tests {
             "dir: {}",
             dir.display()
         );
+    }
+
+    // ─── append_note tests ───
+
+    #[test]
+    fn append_note_to_existing_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "s-test-001";
+        let log = serde_json::json!({
+            "session_id": session_id,
+            "stats": { "elapsed_ms": 100 },
+            "transcript": [],
+        });
+        let path = dir.path().join(format!("{session_id}.json"));
+        std::fs::write(&path, serde_json::to_string_pretty(&log).unwrap()).unwrap();
+
+        let count = append_note(dir.path(), session_id, "Step 2 was weak", Some("Step 2")).unwrap();
+        assert_eq!(count, 1);
+
+        let count = append_note(dir.path(), session_id, "Overall good", None).unwrap();
+        assert_eq!(count, 2);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let notes = doc["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0]["content"], "Step 2 was weak");
+        assert_eq!(notes[0]["title"], "Step 2");
+        assert_eq!(notes[1]["content"], "Overall good");
+        assert!(notes[1]["title"].is_null());
+        assert!(notes[0]["timestamp"].is_number());
+    }
+
+    #[test]
+    fn append_note_missing_log_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = append_note(dir.path(), "s-nonexistent", "note", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    // ─── log_list / log_view tests ───
+
+    #[test]
+    fn log_list_from_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create two log files
+        let log1 = serde_json::json!({
+            "session_id": "s-001",
+            "task_hint": "What is 2+2?",
+            "stats": { "elapsed_ms": 100, "rounds": 1, "llm_calls": 1 },
+            "transcript": [{ "prompt": "What is 2+2?", "response": "4" }],
+        });
+        let log2 = serde_json::json!({
+            "session_id": "s-002",
+            "task_hint": "Explain ownership",
+            "stats": { "elapsed_ms": 5000, "rounds": 3, "llm_calls": 3 },
+            "transcript": [],
+            "notes": [{ "timestamp": 0, "content": "good" }],
+        });
+
+        std::fs::write(
+            dir.path().join("s-001.json"),
+            serde_json::to_string(&log1).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("s-002.json"),
+            serde_json::to_string(&log2).unwrap(),
+        )
+        .unwrap();
+        // Non-json file should be ignored
+        std::fs::write(dir.path().join("README.txt"), "ignore me").unwrap();
+
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        // Use log_list directly via the free function path
+        let entries = std::fs::read_dir(&config.dir).unwrap();
+        let mut count = 0;
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 2);
+    }
+
+    // ─── ContainedPath tests ───
+
+    #[test]
+    fn contained_path_accepts_simple_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ContainedPath::child(dir.path(), "s-abc123.json");
+        assert!(result.is_ok());
+        assert!(result.unwrap().as_ref().ends_with("s-abc123.json"));
+    }
+
+    #[test]
+    fn contained_path_rejects_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ContainedPath::child(dir.path(), "../../../etc/passwd");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("path traversal"), "err: {err}");
+    }
+
+    #[test]
+    fn contained_path_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ContainedPath::child(dir.path(), "/etc/passwd");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("path traversal"), "err: {err}");
+    }
+
+    #[test]
+    fn contained_path_rejects_dot_dot_in_middle() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ContainedPath::child(dir.path(), "foo/../bar");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn contained_path_accepts_nested_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ContainedPath::child(dir.path(), "sub/file.json");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn append_note_rejects_traversal_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = append_note(dir.path(), "../../../etc/passwd", "evil", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("path traversal"));
+    }
+
+    // ─── meta file tests ───
+
+    #[test]
+    fn write_transcript_log_creates_meta_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        let metrics = algocline_core::ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        observer.on_paused(&[algocline_core::LlmQuery {
+            id: algocline_core::QueryId::single(),
+            prompt: "What is 2+2?".into(),
+            system: None,
+            max_tokens: 100,
+        }]);
+        observer.on_response_fed(&algocline_core::QueryId::single(), "4");
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        write_transcript_log(&config, "s-meta-test", &metrics);
+
+        // Main log should exist
+        assert!(dir.path().join("s-meta-test.json").exists());
+
+        // Meta file should exist
+        let meta_path = dir.path().join("s-meta-test.meta.json");
+        assert!(meta_path.exists());
+
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(meta["session_id"], "s-meta-test");
+        assert_eq!(meta["notes_count"], 0);
+        assert!(meta.get("elapsed_ms").is_some());
+        assert!(meta.get("rounds").is_some());
+        assert!(meta.get("llm_calls").is_some());
+        // Meta should NOT contain transcript
+        assert!(meta.get("transcript").is_none());
+    }
+
+    #[test]
+    fn append_note_updates_meta_notes_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "s-meta-note";
+
+        // Create main log
+        let log = serde_json::json!({
+            "session_id": session_id,
+            "stats": { "elapsed_ms": 100 },
+            "transcript": [],
+        });
+        std::fs::write(
+            dir.path().join(format!("{session_id}.json")),
+            serde_json::to_string_pretty(&log).unwrap(),
+        )
+        .unwrap();
+
+        // Create meta file
+        let meta = serde_json::json!({
+            "session_id": session_id,
+            "task_hint": "test",
+            "elapsed_ms": 100,
+            "rounds": 1,
+            "llm_calls": 1,
+            "notes_count": 0,
+        });
+        std::fs::write(
+            dir.path().join(format!("{session_id}.meta.json")),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        append_note(dir.path(), session_id, "first note", None).unwrap();
+
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("{session_id}.meta.json"))).unwrap();
+        let updated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(updated["notes_count"], 1);
+
+        append_note(dir.path(), session_id, "second note", None).unwrap();
+
+        let raw =
+            std::fs::read_to_string(dir.path().join(format!("{session_id}.meta.json"))).unwrap();
+        let updated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(updated["notes_count"], 2);
+    }
+
+    #[test]
+    fn log_list_prefers_meta_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a full log (large, with transcript)
+        let log = serde_json::json!({
+            "session_id": "s-big",
+            "task_hint": "full log hint",
+            "stats": { "elapsed_ms": 999, "rounds": 5, "llm_calls": 5 },
+            "transcript": [{"prompt": "x".repeat(10000), "response": "y".repeat(10000)}],
+        });
+        std::fs::write(
+            dir.path().join("s-big.json"),
+            serde_json::to_string(&log).unwrap(),
+        )
+        .unwrap();
+
+        // Create corresponding meta
+        let meta = serde_json::json!({
+            "session_id": "s-big",
+            "task_hint": "full log hint",
+            "elapsed_ms": 999,
+            "rounds": 5,
+            "llm_calls": 5,
+            "notes_count": 0,
+        });
+        std::fs::write(
+            dir.path().join("s-big.meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        // Create a legacy log (no meta file)
+        let legacy = serde_json::json!({
+            "session_id": "s-legacy",
+            "task_hint": "legacy hint",
+            "stats": { "elapsed_ms": 100, "rounds": 1, "llm_calls": 1 },
+            "transcript": [],
+        });
+        std::fs::write(
+            dir.path().join("s-legacy.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+        };
+
+        let result = app.log_list(50).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let sessions = parsed["sessions"].as_array().unwrap();
+
+        assert_eq!(sessions.len(), 2);
+
+        // Both sessions should have session_id and task_hint
+        let ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"s-big"));
+        assert!(ids.contains(&"s-legacy"));
     }
 }

@@ -1,20 +1,26 @@
 //! `alc init` — Install bundled packages from algocline-bundled-packages.
 //!
-//! Downloads the bundled package collection from GitHub Releases
+//! Clones the bundled package collection from GitHub (tag-based)
 //! and installs all packages into `~/.algocline/packages/`.
 //!
 //! Sources (checked in order):
-//! 1. GitHub Releases asset (production): downloads alc-packages-{version}.tar.gz
-//! 2. Local packages directory (development): copies directly
+//! 1. Git clone with tag `v{BUNDLED_VERSION}` (production)
+//! 2. Local packages directory (development fallback)
 //!
 //! Usage:
-//!   alc init           — Install bundled packages (from release asset or local)
+//!   alc init           — Install bundled packages
 //!   alc init --force   — Overwrite existing packages
 //!   alc init --dev     — Force local source (development)
 
 use std::path::{Path, PathBuf};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Supported bundled packages version.
+///
+/// Independent of algocline's own CARGO_PKG_VERSION.
+/// Updated when a new bundled-packages release is validated.
+const BUNDLED_VERSION: &str = "0.1.0";
+
+const BUNDLED_PACKAGES_URL: &str = "https://github.com/ynishi/algocline-bundled-packages";
 
 /// Bundled package names shipped with algocline.
 const BUNDLED_PACKAGES: &[&str] = &[
@@ -37,7 +43,6 @@ const BUNDLED_PACKAGES: &[&str] = &[
     // Validation / Analysis
     "cove",
     "factscore",
-    "review",
     // Synthesis
     "panel",
 ];
@@ -96,55 +101,33 @@ fn copy_package(name: &str, source: &Path, dest_root: &Path, force: bool) -> any
     Ok(true)
 }
 
-/// Download official packages from GitHub Releases.
-async fn install_from_release(dest: &Path, _force: bool) -> anyhow::Result<()> {
-    let url = format!(
-        "https://github.com/ynishi/algocline-bundled-packages/releases/download/v{VERSION}/alc-packages-{VERSION}.tar.gz"
-    );
+/// Clone the bundled packages repo at a specific tag and install.
+async fn install_from_git(dest: &Path, force: bool) -> anyhow::Result<()> {
+    let tag = format!("v{BUNDLED_VERSION}");
 
-    eprintln!("Downloading bundled packages v{VERSION} from GitHub Releases...");
+    eprintln!("Cloning bundled packages {tag} from {BUNDLED_PACKAGES_URL}...");
 
-    let output = tokio::process::Command::new("curl")
-        .args(["-fsSL", &url])
+    let staging = tempfile::tempdir()?;
+
+    let output = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            &tag,
+            BUNDLED_PACKAGES_URL,
+            &staging.path().to_string_lossy(),
+        ])
         .output()
         .await?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Failed to download {url}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git clone failed (tag {tag}): {stderr}");
     }
 
-    // Extract tarball: pipe curl stdout into tar stdin
-    let mut tar_child = tokio::process::Command::new("tar")
-        .args(["xzf", "-", "-C", &dest.to_string_lossy()])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = tar_child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        stdin.write_all(&output.stdout).await?;
-        // Drop stdin to close pipe and signal EOF to tar
-    }
-
-    let tar_status = tar_child.wait().await?;
-    if !tar_status.success() {
-        anyhow::bail!("Failed to extract tarball");
-    }
-
-    // Report
-    let mut count = 0;
-    for name in BUNDLED_PACKAGES {
-        let pkg = dest.join(name).join("init.lua");
-        if pkg.exists() {
-            count += 1;
-            eprintln!("  + {name}");
-        }
-    }
-    eprintln!("Installed {count} packages.");
-
-    Ok(())
+    install_from_local(staging.path(), dest, force)
 }
 
 /// Install from local packages directory.
@@ -189,11 +172,11 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         return install_from_local(&source, &dest, force);
     }
 
-    // Try GitHub Releases first, fall back to local
-    match install_from_release(&dest, force).await {
+    // Try git clone first, fall back to local
+    match install_from_git(&dest, force).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            eprintln!("Release download failed: {e}");
+            eprintln!("Git clone failed: {e}");
             if let Some(source) = find_local_packages() {
                 eprintln!("Falling back to local algocline-bundled-packages/...");
                 install_from_local(&source, &dest, force)
@@ -207,6 +190,14 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_version_is_valid_semver() {
+        assert!(
+            BUNDLED_VERSION.split('.').all(|p| p.parse::<u32>().is_ok()),
+            "BUNDLED_VERSION must be valid semver: {BUNDLED_VERSION}"
+        );
+    }
 
     #[test]
     fn bundled_packages_is_non_empty() {
@@ -307,10 +298,5 @@ mod tests {
 
         let result = copy_package("nonexistent", source.path(), dest.path(), false);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn version_is_set() {
-        assert!(!VERSION.is_empty());
     }
 }

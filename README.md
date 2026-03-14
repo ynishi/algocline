@@ -125,7 +125,6 @@ Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
    cod        — chain-of-density                    [extraction]
    cove       — chain-of-verification               [validation]
    factscore  — factual precision scoring           [validation]
-   review     — structured code/text review         [validation]
    panel      — multi-perspective deliberation      [synthesis]
 ```
 

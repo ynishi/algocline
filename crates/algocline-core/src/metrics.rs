@@ -234,6 +234,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }];
 
         observer.on_paused(&queries);
@@ -260,6 +261,7 @@ mod tests {
                 system: Some("sys".into()), // 3 chars
                 max_tokens: 100,
                 grounded: false,
+                underspecified: false,
             },
             LlmQuery {
                 id: QueryId::batch(1),
@@ -267,6 +269,7 @@ mod tests {
                 system: None,
                 max_tokens: 100,
                 grounded: false,
+                underspecified: false,
             },
         ];
 
@@ -294,6 +297,7 @@ mod tests {
             system: None,
             max_tokens: 10,
             grounded: false,
+            underspecified: false,
         }];
 
         // Round 1
@@ -331,6 +335,7 @@ mod tests {
             system: Some("You are a calculator.".into()),
             max_tokens: 50,
             grounded: false,
+            underspecified: false,
         }];
 
         observer.on_paused(&queries);
@@ -356,6 +361,7 @@ mod tests {
             system: None,
             max_tokens: 10,
             grounded: false,
+            underspecified: false,
         }]);
         observer.on_response_fed(&QueryId::single(), "r");
         observer.on_resumed();
@@ -377,6 +383,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer1");
         observer.on_resumed();
@@ -388,6 +395,7 @@ mod tests {
             system: Some("expert".into()),
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer2");
         observer.on_resumed();
@@ -418,6 +426,7 @@ mod tests {
                 system: None,
                 max_tokens: 50,
                 grounded: false,
+                underspecified: false,
             },
             LlmQuery {
                 id: QueryId::batch(1),
@@ -425,6 +434,7 @@ mod tests {
                 system: None,
                 max_tokens: 50,
                 grounded: false,
+                underspecified: false,
             },
         ];
 

@@ -47,6 +47,12 @@ pub struct LlmQuery {
     /// solely on LLM internal knowledge. The host decides the means.
     #[serde(default, skip_serializing_if = "is_false")]
     pub grounded: bool,
+    /// When true, the prompt's preconditions depend on intent/goal definitions
+    /// that exist outside the current context and cannot be inferred by the LLM.
+    /// The host decides the resolution means (user query, RAG, DB lookup,
+    /// delegated agent, etc.).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub underspecified: bool,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -107,11 +113,16 @@ mod tests {
             system: Some("system".into()),
             max_tokens: 1024,
             grounded: false,
+            underspecified: false,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert!(
             json.get("grounded").is_none(),
             "grounded key must be absent when false (skip_serializing_if)"
+        );
+        assert!(
+            json.get("underspecified").is_none(),
+            "underspecified key must be absent when false (skip_serializing_if)"
         );
         let restored: LlmQuery = serde_json::from_value(json).unwrap();
         assert_eq!(restored.id, query.id);
@@ -119,6 +130,7 @@ mod tests {
         assert_eq!(restored.system, query.system);
         assert_eq!(restored.max_tokens, query.max_tokens);
         assert!(!restored.grounded);
+        assert!(!restored.underspecified);
     }
 
     #[test]
@@ -129,6 +141,7 @@ mod tests {
             system: None,
             max_tokens: 200,
             grounded: true,
+            underspecified: false,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(
@@ -152,6 +165,52 @@ mod tests {
             !query.grounded,
             "grounded must default to false when key absent"
         );
+        assert!(
+            !query.underspecified,
+            "underspecified must default to false when key absent"
+        );
+    }
+
+    #[test]
+    fn llm_query_underspecified_serde() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "what format do you want?".into(),
+            system: None,
+            max_tokens: 200,
+            grounded: false,
+            underspecified: true,
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(
+            json["underspecified"], true,
+            "underspecified key must be present when true"
+        );
+        assert!(
+            json.get("grounded").is_none(),
+            "grounded must be absent when false"
+        );
+        let restored: LlmQuery = serde_json::from_value(json).unwrap();
+        assert!(restored.underspecified);
+        assert!(!restored.grounded);
+    }
+
+    #[test]
+    fn llm_query_both_flags_serde() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "clarify and verify".into(),
+            system: None,
+            max_tokens: 300,
+            grounded: true,
+            underspecified: true,
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(json["grounded"], true);
+        assert_eq!(json["underspecified"], true);
+        let restored: LlmQuery = serde_json::from_value(json).unwrap();
+        assert!(restored.grounded);
+        assert!(restored.underspecified);
     }
 }
 

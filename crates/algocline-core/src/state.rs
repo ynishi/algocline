@@ -266,6 +266,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }
     }
 
@@ -506,6 +507,7 @@ mod proptests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }
     }
 

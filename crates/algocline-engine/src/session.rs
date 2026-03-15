@@ -67,6 +67,9 @@ impl FeedResult {
                     if q.grounded {
                         obj["grounded"] = json!(true);
                     }
+                    if q.underspecified {
+                        obj["underspecified"] = json!(true);
+                    }
                     obj
                 } else {
                     let qs: Vec<_> = queries
@@ -80,6 +83,9 @@ impl FeedResult {
                             });
                             if q.grounded {
                                 obj["grounded"] = json!(true);
+                            }
+                            if q.underspecified {
+                                obj["underspecified"] = json!(true);
                             }
                             obj
                         })
@@ -171,6 +177,7 @@ impl Session {
                     system: qr.system.clone(),
                     max_tokens: qr.max_tokens,
                     grounded: qr.grounded,
+                    underspecified: qr.underspecified,
                 }).collect();
 
                 for qr in req.queries {
@@ -358,6 +365,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }
     }
 
@@ -379,6 +387,7 @@ mod tests {
             system: Some("You are a calculator.".into()),
             max_tokens: 50,
             grounded: false,
+            underspecified: false,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -397,6 +406,11 @@ mod tests {
             json.get("grounded").is_none(),
             "grounded key must be absent when false"
         );
+        // underspecified=false must be absent
+        assert!(
+            json.get("underspecified").is_none(),
+            "underspecified key must be absent when false"
+        );
     }
 
     #[test]
@@ -407,6 +421,7 @@ mod tests {
             system: None,
             max_tokens: 200,
             grounded: true,
+            underspecified: false,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -421,6 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn to_json_paused_single_query_underspecified() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "what output format do you need?".into(),
+            system: None,
+            max_tokens: 200,
+            grounded: false,
+            underspecified: true,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![query],
+        };
+        let json = result.to_json("s-underspec");
+
+        assert_eq!(json["status"], "needs_response");
+        assert_eq!(
+            json["underspecified"], true,
+            "underspecified must appear in single-query MCP JSON"
+        );
+        assert!(
+            json.get("grounded").is_none(),
+            "grounded must be absent when false"
+        );
+    }
+
+    #[test]
     fn to_json_paused_multiple_queries_mixed_grounded() {
         let grounded_query = LlmQuery {
             id: QueryId::batch(0),
@@ -428,6 +469,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: true,
+            underspecified: false,
         };
         let normal_query = LlmQuery {
             id: QueryId::batch(1),
@@ -435,6 +477,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         };
         let result = FeedResult::Paused {
             queries: vec![grounded_query, normal_query],
@@ -453,6 +496,40 @@ mod tests {
     }
 
     #[test]
+    fn to_json_paused_multiple_queries_mixed_underspecified() {
+        let underspec_query = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "clarify intent".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: true,
+        };
+        let normal_query = LlmQuery {
+            id: QueryId::batch(1),
+            prompt: "generate".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![underspec_query, normal_query],
+        };
+        let json = result.to_json("s-batch-us");
+
+        let qs = json["queries"].as_array().expect("queries should be array");
+        assert_eq!(
+            qs[0]["underspecified"], true,
+            "underspecified query must have underspecified=true"
+        );
+        assert!(
+            qs[1].get("underspecified").is_none(),
+            "non-underspecified query must omit underspecified key"
+        );
+    }
+
+    #[test]
     fn to_json_paused_single_query_no_system() {
         let query = LlmQuery {
             id: QueryId::single(),
@@ -460,6 +537,7 @@ mod tests {
             system: None,
             max_tokens: 1024,
             grounded: false,
+            underspecified: false,
         };
         let result = FeedResult::Paused {
             queries: vec![query],

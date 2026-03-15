@@ -260,6 +260,10 @@ fn register_llm(
                 .as_ref()
                 .and_then(|o| o.get::<bool>("grounded").ok())
                 .unwrap_or(false);
+            let underspecified = opts
+                .as_ref()
+                .and_then(|o| o.get::<bool>("underspecified").ok())
+                .unwrap_or(false);
 
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
@@ -270,6 +274,7 @@ fn register_llm(
                     system,
                     max_tokens,
                     grounded,
+                    underspecified,
                     resp_tx,
                 }],
             })
@@ -326,6 +331,7 @@ fn register_llm_batch(
                 });
                 let max_tokens: u32 = item.get::<u32>("max_tokens").unwrap_or(1024);
                 let grounded: bool = item.get::<bool>("grounded").unwrap_or(false);
+                let underspecified: bool = item.get::<bool>("underspecified").unwrap_or(false);
 
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                 resp_rxs.push(resp_rx);
@@ -336,6 +342,7 @@ fn register_llm_batch(
                     system,
                     max_tokens,
                     grounded,
+                    underspecified,
                     resp_tx,
                 });
             }

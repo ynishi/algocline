@@ -1047,6 +1047,7 @@ mod tests {
             prompt: "What is 2+2?".into(),
             system: None,
             max_tokens: 100,
+            grounded: false,
         }]);
         observer.on_response_fed(&algocline_core::QueryId::single(), "4");
         observer.on_resumed();
@@ -1145,6 +1146,7 @@ mod tests {
             prompt: "test".into(),
             system: None,
             max_tokens: 10,
+            grounded: false,
         }]);
         observer.on_response_fed(&algocline_core::QueryId::single(), "r");
         observer.on_resumed();
@@ -1221,6 +1223,7 @@ mod tests {
             prompt: long_prompt,
             system: None,
             max_tokens: 10,
+            grounded: false,
         }]);
         observer.on_response_fed(&algocline_core::QueryId::single(), "r");
         observer.on_resumed();

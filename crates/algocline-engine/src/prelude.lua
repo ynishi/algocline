@@ -93,6 +93,21 @@ function alc.filter(items, fn)
     return result
 end
 
+--- alc.ground(claim, opts?) -> string
+--- Convenience wrapper: calls alc.llm with grounded = true.
+--- The host should ground the response in external evidence
+--- (web search, code reading, documentation, etc.).
+---
+--- Usage:
+---   local verified = alc.ground("rmcp is tokio-only")
+---   local verified = alc.ground("claim", { system = "expert" })
+function alc.ground(claim, opts)
+    local merged = {}
+    for k, v in pairs(opts or {}) do merged[k] = v end
+    merged.grounded = true
+    return alc.llm(claim, merged)
+end
+
 --- alc.parse_score(str, default?) -> number
 --- Extract the first integer from a string. Returns default (or 5) on failure.
 --- Clamps result to 1-10 range.

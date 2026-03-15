@@ -42,6 +42,15 @@ pub struct LlmQuery {
     pub prompt: String,
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// When true, the host should ground the response in external evidence
+    /// (web search, code reading, documentation, etc.) rather than relying
+    /// solely on LLM internal knowledge. The host decides the means.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub grounded: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !v
 }
 
 #[cfg(test)]
@@ -97,13 +106,52 @@ mod tests {
             prompt: "test prompt".into(),
             system: Some("system".into()),
             max_tokens: 1024,
+            grounded: false,
         };
         let json = serde_json::to_value(&query).unwrap();
+        assert!(
+            json.get("grounded").is_none(),
+            "grounded key must be absent when false (skip_serializing_if)"
+        );
         let restored: LlmQuery = serde_json::from_value(json).unwrap();
         assert_eq!(restored.id, query.id);
         assert_eq!(restored.prompt, query.prompt);
         assert_eq!(restored.system, query.system);
         assert_eq!(restored.max_tokens, query.max_tokens);
+        assert!(!restored.grounded);
+    }
+
+    #[test]
+    fn llm_query_grounded_serde() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "verify this".into(),
+            system: None,
+            max_tokens: 200,
+            grounded: true,
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(
+            json["grounded"], true,
+            "grounded key must be present when true"
+        );
+        let restored: LlmQuery = serde_json::from_value(json).unwrap();
+        assert!(restored.grounded);
+    }
+
+    #[test]
+    fn llm_query_grounded_default_on_missing_key() {
+        let json = serde_json::json!({
+            "id": "q-single",
+            "prompt": "test",
+            "system": null,
+            "max_tokens": 100
+        });
+        let query: LlmQuery = serde_json::from_value(json).unwrap();
+        assert!(
+            !query.grounded,
+            "grounded must default to false when key absent"
+        );
     }
 }
 

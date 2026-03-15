@@ -233,6 +233,7 @@ mod tests {
             prompt: "test".into(),
             system: None,
             max_tokens: 100,
+            grounded: false,
         }];
 
         observer.on_paused(&queries);
@@ -258,12 +259,14 @@ mod tests {
                 prompt: "hello".into(),     // 5 chars
                 system: Some("sys".into()), // 3 chars
                 max_tokens: 100,
+                grounded: false,
             },
             LlmQuery {
                 id: QueryId::batch(1),
                 prompt: "world".into(), // 5 chars
                 system: None,
                 max_tokens: 100,
+                grounded: false,
             },
         ];
 
@@ -290,6 +293,7 @@ mod tests {
             prompt: "p".into(),
             system: None,
             max_tokens: 10,
+            grounded: false,
         }];
 
         // Round 1
@@ -326,6 +330,7 @@ mod tests {
             prompt: "What is 2+2?".into(),
             system: Some("You are a calculator.".into()),
             max_tokens: 50,
+            grounded: false,
         }];
 
         observer.on_paused(&queries);
@@ -350,6 +355,7 @@ mod tests {
             prompt: "p".into(),
             system: None,
             max_tokens: 10,
+            grounded: false,
         }]);
         observer.on_response_fed(&QueryId::single(), "r");
         observer.on_resumed();
@@ -370,6 +376,7 @@ mod tests {
             prompt: "step1".into(),
             system: None,
             max_tokens: 100,
+            grounded: false,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer1");
         observer.on_resumed();
@@ -380,6 +387,7 @@ mod tests {
             prompt: "step2".into(),
             system: Some("expert".into()),
             max_tokens: 100,
+            grounded: false,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer2");
         observer.on_resumed();
@@ -409,12 +417,14 @@ mod tests {
                 prompt: "q0".into(),
                 system: None,
                 max_tokens: 50,
+                grounded: false,
             },
             LlmQuery {
                 id: QueryId::batch(1),
                 prompt: "q1".into(),
                 system: None,
                 max_tokens: 50,
+                grounded: false,
             },
         ];
 

@@ -57,23 +57,31 @@ impl FeedResult {
             Self::Paused { queries } => {
                 if queries.len() == 1 {
                     let q = &queries[0];
-                    json!({
+                    let mut obj = json!({
                         "status": "needs_response",
                         "session_id": session_id,
                         "prompt": q.prompt,
                         "system": q.system,
                         "max_tokens": q.max_tokens,
-                    })
+                    });
+                    if q.grounded {
+                        obj["grounded"] = json!(true);
+                    }
+                    obj
                 } else {
                     let qs: Vec<_> = queries
                         .iter()
                         .map(|q| {
-                            json!({
+                            let mut obj = json!({
                                 "id": q.id.as_str(),
                                 "prompt": q.prompt,
                                 "system": q.system,
                                 "max_tokens": q.max_tokens,
-                            })
+                            });
+                            if q.grounded {
+                                obj["grounded"] = json!(true);
+                            }
+                            obj
                         })
                         .collect();
                     json!({
@@ -162,6 +170,7 @@ impl Session {
                     prompt: qr.prompt.clone(),
                     system: qr.system.clone(),
                     max_tokens: qr.max_tokens,
+                    grounded: qr.grounded,
                 }).collect();
 
                 for qr in req.queries {
@@ -348,6 +357,7 @@ mod tests {
             prompt: format!("prompt-{index}"),
             system: None,
             max_tokens: 100,
+            grounded: false,
         }
     }
 
@@ -368,6 +378,7 @@ mod tests {
             prompt: "What is 2+2?".into(),
             system: Some("You are a calculator.".into()),
             max_tokens: 50,
+            grounded: false,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -381,6 +392,64 @@ mod tests {
         assert_eq!(json["max_tokens"], 50);
         // single query mode: no "queries" array
         assert!(json.get("queries").is_none());
+        // grounded=false must be absent
+        assert!(
+            json.get("grounded").is_none(),
+            "grounded key must be absent when false"
+        );
+    }
+
+    #[test]
+    fn to_json_paused_single_query_grounded() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "verify this claim".into(),
+            system: None,
+            max_tokens: 200,
+            grounded: true,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![query],
+        };
+        let json = result.to_json("s-grounded");
+
+        assert_eq!(json["status"], "needs_response");
+        assert_eq!(
+            json["grounded"], true,
+            "grounded must appear in single-query MCP JSON"
+        );
+    }
+
+    #[test]
+    fn to_json_paused_multiple_queries_mixed_grounded() {
+        let grounded_query = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "verify".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: true,
+        };
+        let normal_query = LlmQuery {
+            id: QueryId::batch(1),
+            prompt: "generate".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![grounded_query, normal_query],
+        };
+        let json = result.to_json("s-batch");
+
+        let qs = json["queries"].as_array().expect("queries should be array");
+        assert_eq!(
+            qs[0]["grounded"], true,
+            "grounded query must have grounded=true"
+        );
+        assert!(
+            qs[1].get("grounded").is_none(),
+            "non-grounded query must omit grounded key"
+        );
     }
 
     #[test]
@@ -390,6 +459,7 @@ mod tests {
             prompt: "hello".into(),
             system: None,
             max_tokens: 1024,
+            grounded: false,
         };
         let result = FeedResult::Paused {
             queries: vec![query],

@@ -21,6 +21,8 @@ pub struct QueryRequest {
     pub prompt: String,
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// When true, the host should ground the response in external evidence.
+    pub grounded: bool,
     /// Channel to send the response back to the yielded Lua coroutine.
     pub resp_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
 }

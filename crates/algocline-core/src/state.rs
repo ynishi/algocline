@@ -265,6 +265,7 @@ mod tests {
             prompt: format!("prompt-{index}"),
             system: None,
             max_tokens: 100,
+            grounded: false,
         }
     }
 
@@ -504,6 +505,7 @@ mod proptests {
             prompt: format!("prompt-{index}"),
             system: None,
             max_tokens: 100,
+            grounded: false,
         }
     }
 

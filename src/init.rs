@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Independent of algocline's own CARGO_PKG_VERSION.
 /// Updated when a new bundled-packages release is validated.
-const BUNDLED_VERSION: &str = "0.1.0";
+const BUNDLED_VERSION: &str = "0.2.0";
 
 const BUNDLED_PACKAGES_URL: &str = "https://github.com/ynishi/algocline-bundled-packages";
 

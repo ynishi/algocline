@@ -92,3 +92,19 @@ function alc.filter(items, fn)
     end
     return result
 end
+
+--- alc.parse_score(str, default?) -> number
+--- Extract the first integer from a string. Returns default (or 5) on failure.
+--- Clamps result to 1-10 range.
+---
+--- Usage:
+---   local score = alc.parse_score(llm_response)       -- default 5
+---   local score = alc.parse_score(llm_response, 3)    -- default 3
+function alc.parse_score(str, default)
+    default = default or 5
+    local n = tonumber(tostring(str):match("%d+"))
+    if n == nil then return default end
+    if n < 1 then return 1 end
+    if n > 10 then return 10 end
+    return n
+end

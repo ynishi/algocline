@@ -84,9 +84,14 @@ fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // `alc init` — install bundled packages
+    // `alc init` — install bundled packages (skip existing)
     if args.get(1).is_some_and(|a| a == "init") {
-        return init::run(&args[2..]).await;
+        return init::run(&args[2..], false).await;
+    }
+
+    // `alc update` — update all bundled packages (alias for init --force)
+    if args.get(1).is_some_and(|a| a == "update") {
+        return init::run(&args[2..], true).await;
     }
 
     // Default: MCP server mode

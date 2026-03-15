@@ -108,6 +108,22 @@ function alc.ground(claim, opts)
     return alc.llm(claim, merged)
 end
 
+--- alc.specify(prompt, opts?) -> string
+--- Convenience wrapper: calls alc.llm with underspecified = true.
+--- Signals that the prompt's preconditions depend on intent/goal
+--- definitions outside the current context. The host decides the
+--- resolution means (user query, RAG, DB lookup, delegated agent, etc.).
+---
+--- Usage:
+---   local answer = alc.specify("What output format do you need?")
+---   local answer = alc.specify("Which module?", { system = "concise" })
+function alc.specify(prompt, opts)
+    local merged = {}
+    for k, v in pairs(opts or {}) do merged[k] = v end
+    merged.underspecified = true
+    return alc.llm(prompt, merged)
+end
+
 --- alc.parse_score(str, default?) -> number
 --- Extract the first integer from a string. Returns default (or 5) on failure.
 --- Clamps result to 1-10 range.

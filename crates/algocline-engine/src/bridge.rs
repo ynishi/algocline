@@ -33,10 +33,30 @@ pub fn register(
     register_state(lua, alc_table, ns)?;
     register_chunk(lua, alc_table)?;
     register_stats(lua, alc_table, custom_metrics)?;
+    register_time(lua, alc_table)?;
     if let Some(tx) = llm_tx {
         register_llm(lua, alc_table, tx.clone())?;
         register_llm_batch(lua, alc_table, tx)?;
     }
+    Ok(())
+}
+
+/// Register `alc.time()` — wall-clock time in fractional seconds.
+///
+/// Lua usage:
+///   local start = alc.time()
+///   -- ... work ...
+///   local elapsed_secs = alc.time() - start
+///
+/// Returns: f64 seconds since Unix epoch (sub-millisecond precision).
+fn register_time(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let time_fn = lua.create_function(|_, ()| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(mlua::Error::external)?;
+        Ok(now.as_secs_f64())
+    })?;
+    alc_table.set("time", time_fn)?;
     Ok(())
 }
 

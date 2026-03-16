@@ -370,6 +370,94 @@ impl AppService {
         self.start_and_tick(code, ctx).await
     }
 
+    /// Run an evalframe evaluation suite.
+    ///
+    /// Accepts a scenario (bindings + cases) and a strategy name.
+    /// Automatically wires the strategy as the provider and executes
+    /// the evalframe suite, returning the report (summary, scores, failures).
+    ///
+    /// Injects a `std` global (mlua-batteries compatible shim) so evalframe's
+    /// `std.lua` can resolve json/fs/time from algocline's built-in primitives.
+    pub async fn eval(
+        &self,
+        scenario: Option<String>,
+        scenario_file: Option<String>,
+        strategy: &str,
+        strategy_opts: Option<serde_json::Value>,
+    ) -> Result<String, String> {
+        // Verify evalframe is installed
+        if !is_package_installed("evalframe") {
+            return Err("Package 'evalframe' is not installed. \
+                 Install it with: alc_pkg_install({ url: \"/path/to/evalframe\" })"
+                .into());
+        }
+
+        let scenario_code = resolve_code(scenario, scenario_file)?;
+
+        // Build strategy opts Lua table literal
+        let opts_lua = match &strategy_opts {
+            Some(v) if !v.is_null() => format!("alc.json_decode('{}')", v),
+            _ => "{}".to_string(),
+        };
+
+        // Inject `std` global as a mlua-batteries compatible shim.
+        //
+        // evalframe.std expects the host to provide a `std` global with:
+        //   std.json.decode/encode  — JSON serialization
+        //   std.fs.read/is_file     — filesystem access
+        //   std.time.now            — wall-clock time (epoch seconds, f64)
+        //
+        // We bridge these from algocline's alc.* primitives and Lua's io stdlib.
+        let wrapped = format!(
+            r#"
+std = {{
+  json = {{
+    decode = alc.json_decode,
+    encode = alc.json_encode,
+  }},
+  fs = {{
+    read = function(path)
+      local f, err = io.open(path, "r")
+      if not f then error("std.fs.read: " .. (err or path), 2) end
+      local content = f:read("*a")
+      f:close()
+      return content
+    end,
+    is_file = function(path)
+      local f = io.open(path, "r")
+      if f then f:close(); return true end
+      return false
+    end,
+  }},
+  time = {{
+    now = alc.time,
+  }},
+}}
+
+local ef = require("evalframe")
+
+-- Load scenario (bindings + cases, no provider)
+local spec = (function()
+{scenario_code}
+end)()
+
+-- Inject strategy as provider
+spec.provider = ef.providers.algocline {{
+  strategy = "{strategy}",
+  opts = {opts_lua},
+}}
+
+-- Build and run suite
+local s = ef.suite "eval" (spec)
+local report = s:run()
+return report:to_table()
+"#
+        );
+
+        let ctx = serde_json::Value::Null;
+        self.start_and_tick(wrapped, ctx).await
+    }
+
     /// Continue a paused execution — batch feed.
     pub async fn continue_batch(
         &self,
@@ -1048,6 +1136,7 @@ mod tests {
             system: None,
             max_tokens: 100,
             grounded: false,
+            underspecified: false,
         }]);
         observer.on_response_fed(&algocline_core::QueryId::single(), "4");
         observer.on_resumed();
@@ -1147,6 +1236,7 @@ mod tests {
             system: None,
             max_tokens: 10,
             grounded: false,
+            underspecified: false,
         }]);
         observer.on_response_fed(&algocline_core::QueryId::single(), "r");
         observer.on_resumed();
@@ -1224,6 +1314,7 @@ mod tests {
             system: None,
             max_tokens: 10,
             grounded: false,
+            underspecified: false,
         }]);
         observer.on_response_fed(&algocline_core::QueryId::single(), "r");
         observer.on_resumed();
@@ -1372,5 +1463,46 @@ mod proptests {
             let read = std::fs::read_to_string(dst_path.join("test.txt")).unwrap();
             prop_assert_eq!(&read, &content);
         }
+    }
+
+    // ─── eval tests ───
+
+    #[test]
+    fn eval_rejects_no_scenario() {
+        let result = resolve_code(None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eval_rejects_missing_evalframe() {
+        // Skip if evalframe is already installed globally
+        if is_package_installed("evalframe") {
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_pkg_dir = tmp.path().join("empty_packages");
+        std::fs::create_dir_all(&fake_pkg_dir).unwrap();
+
+        let executor = Arc::new(rt.block_on(async {
+            algocline_engine::Executor::new(vec![fake_pkg_dir])
+                .await
+                .unwrap()
+        }));
+        let config = TranscriptConfig {
+            dir: tmp.path().join("logs"),
+            enabled: false,
+        };
+        let svc = AppService::new(executor, config);
+
+        let scenario = r#"return { cases = {} }"#;
+        let result = rt.block_on(svc.eval(Some(scenario.into()), None, "cove", None));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("evalframe"));
     }
 }

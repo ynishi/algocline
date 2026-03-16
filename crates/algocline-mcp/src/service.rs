@@ -92,6 +92,31 @@ pub struct AdviceParams {
     pub opts: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EvalParams {
+    /// Scenario definition as inline Lua code. Returns a table with bindings and cases.
+    /// Provide either `scenario` or `scenario_file`, not both.
+    ///
+    /// Example:
+    /// ```lua
+    /// local ef = require("evalframe")
+    /// return {
+    ///   ef.bind { ef.graders.contains },
+    ///   cases = {
+    ///     ef.case { input = "What is 2+2?", expected = "4" },
+    ///   },
+    /// }
+    /// ```
+    pub scenario: Option<String>,
+    /// Path to a scenario Lua file. Provide either `scenario` or `scenario_file`, not both.
+    pub scenario_file: Option<String>,
+    /// Strategy package name to evaluate (e.g. "cove", "reflect", "ucb").
+    /// Loaded via `ef.providers.algocline { strategy = "..." }`.
+    pub strategy: String,
+    /// Additional strategy-specific options (merged into provider opts).
+    pub strategy_opts: Option<serde_json::Value>,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -165,6 +190,28 @@ impl AlcService {
 
         self.app
             .continue_single(sid, response, params.query_id.as_deref())
+            .await
+    }
+
+    // ─── Evaluation ────────────────────────────────────────────
+
+    /// Run an evalframe evaluation suite.
+    ///
+    /// Evaluates a strategy against a scenario (cases + graders).
+    /// The evalframe package must be installed (`alc_pkg_install`).
+    /// The strategy is automatically wired as the provider via
+    /// `ef.providers.algocline { strategy = "..." }`.
+    ///
+    /// Returns the suite report (summary, scores, failures).
+    #[tool(name = "alc_eval", annotations(open_world_hint = false))]
+    async fn eval(&self, Parameters(params): Parameters<EvalParams>) -> Result<String, String> {
+        self.app
+            .eval(
+                params.scenario,
+                params.scenario_file,
+                &params.strategy,
+                params.strategy_opts,
+            )
             .await
     }
 
@@ -253,6 +300,8 @@ impl ServerHandler for AlcService {
                  - alc_advice: Apply an installed package (ucb, panel, cot, sc, cove, reflect, etc.) to a task.\n\n\
                  When Lua calls alc.llm(prompt), execution pauses and returns the prompt.\n\
                  The host processes it and calls alc_continue with the response to resume.\n\n\
+                 Evaluation:\n\
+                 - alc_eval: Evaluate a strategy against a scenario. Pass scenario (cases + graders) and strategy name.\n\n\
                  Package Management:\n\
                  - alc_pkg_list: List installed packages with metadata.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\

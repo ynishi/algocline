@@ -365,16 +365,63 @@ fn is_package_installed(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Per-entry I/O failures collected during resilient batch operations.
+///
+/// **Resilience pattern:** Directory iteration and file operations may encounter
+/// per-entry I/O errors (permission denied, broken symlinks, etc.) that should
+/// not abort the entire operation. Failures are collected and returned alongside
+/// successful results so the caller has both the available data and diagnostics.
+///
+/// Included in JSON responses as `"failures": [...]`.
+type DirEntryFailures = Vec<String>;
+
+/// Extract a display name from a path: file_stem if available, otherwise file_name.
+fn display_name(path: &Path, file_name: &str) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| file_name.to_string())
+}
+
+/// Determine the scenario source directory within a cloned/downloaded tree.
+///
+/// Prefers a `scenarios/` subdirectory when present, falling back to the root.
+///
+/// # `.git` and other non-Lua entries
+///
+/// When falling back to the root, the directory may contain `.git/`, `README.md`,
+/// `LICENSE`, etc. This is safe because [`install_scenarios_from_dir`] applies two
+/// filters: `is_file()` (excludes `.git/` and other subdirectories) and
+/// `.lua` extension check (excludes non-Lua files). No explicit `.git` exclusion
+/// is needed.
+fn resolve_scenario_source(clone_root: &Path) -> PathBuf {
+    let subdir = clone_root.join("scenarios");
+    if subdir.is_dir() {
+        subdir
+    } else {
+        clone_root.to_path_buf()
+    }
+}
+
 /// Copy all `.lua` files from `source` directory into `dest` (scenarios dir).
-/// Skips files that already exist. Returns summary of installed/skipped.
+/// Skips files that already exist. Collects per-entry I/O errors as `failures`
+/// rather than aborting.
 fn install_scenarios_from_dir(source: &Path, dest: &Path) -> Result<String, String> {
     let entries =
         std::fs::read_dir(source).map_err(|e| format!("Failed to read source dir: {e}"))?;
 
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
+    let mut failures: DirEntryFailures = Vec::new();
 
-    for entry in entries.flatten() {
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                failures.push(format!("readdir entry: {e}"));
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -388,30 +435,25 @@ fn install_scenarios_from_dir(source: &Path, dest: &Path) -> Result<String, Stri
             Ok(p) => p,
             Err(_) => continue,
         };
+        let name = display_name(&path, &file_name);
         if dest_path.as_ref().exists() {
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or(file_name);
             skipped.push(name);
             continue;
         }
-        std::fs::copy(&path, dest_path.as_ref())
-            .map_err(|e| format!("Failed to copy {}: {e}", path.display()))?;
-        let name = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or(file_name);
-        installed.push(name);
+        match std::fs::copy(&path, dest_path.as_ref()) {
+            Ok(_) => installed.push(name),
+            Err(e) => failures.push(format!("{}: {e}", path.display())),
+        }
     }
 
-    if installed.is_empty() && skipped.is_empty() {
+    if installed.is_empty() && skipped.is_empty() && failures.is_empty() {
         return Err("No .lua scenario files found in source.".into());
     }
 
     Ok(serde_json::json!({
         "installed": installed,
         "skipped": skipped,
+        "failures": failures,
     })
     .to_string())
 }
@@ -1128,16 +1170,26 @@ return pkg.meta or {{ name = "{name}" }}"#
                 installed.push(pkg_name);
             }
 
-            // Also install bundled scenarios if a `scenarios/` subdir exists
+            // Install bundled scenarios only when an explicit `scenarios/` subdir exists.
+            // Unlike `scenario_install` (which falls back to root via `resolve_scenario_source`),
+            // bundled scenarios are optional — we don't scan the package root for .lua files.
             let scenarios_subdir = staging.path().join("scenarios");
             let mut scenarios_installed: Vec<String> = Vec::new();
+            let mut scenarios_failures: DirEntryFailures = Vec::new();
             if scenarios_subdir.is_dir() {
                 if let Ok(sc_dir) = scenarios_dir() {
-                    let _ = std::fs::create_dir_all(&sc_dir);
+                    std::fs::create_dir_all(&sc_dir)
+                        .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
                     if let Ok(result) = install_scenarios_from_dir(&scenarios_subdir, &sc_dir) {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
                             if let Some(arr) = parsed.get("installed").and_then(|v| v.as_array()) {
                                 scenarios_installed = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                            }
+                            if let Some(arr) = parsed.get("failures").and_then(|v| v.as_array()) {
+                                scenarios_failures = arr
                                     .iter()
                                     .filter_map(|v| v.as_str().map(String::from))
                                     .collect();
@@ -1158,6 +1210,7 @@ return pkg.meta or {{ name = "{name}" }}"#
                 "installed": installed,
                 "skipped": skipped,
                 "scenarios_installed": scenarios_installed,
+                "scenarios_failures": scenarios_failures,
                 "mode": "collection",
             })
             .to_string())
@@ -1370,17 +1423,27 @@ return pkg.meta or {{ name = "{name}" }}"#
     // ─── Scenario Management ────────────────────────────────────
 
     /// List available scenarios in `~/.algocline/scenarios/`.
+    ///
+    /// Per-entry I/O errors are collected in `"failures"` rather than aborting.
     pub fn scenario_list(&self) -> Result<String, String> {
         let dir = scenarios_dir()?;
         if !dir.exists() {
-            return Ok(serde_json::json!({ "scenarios": [] }).to_string());
+            return Ok(serde_json::json!({ "scenarios": [], "failures": [] }).to_string());
         }
 
         let entries =
             std::fs::read_dir(&dir).map_err(|e| format!("Failed to read scenarios dir: {e}"))?;
 
         let mut scenarios: Vec<serde_json::Value> = Vec::new();
-        for entry in entries.flatten() {
+        let mut failures: DirEntryFailures = Vec::new();
+        for entry_result in entries {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(e) => {
+                    failures.push(format!("readdir entry: {e}"));
+                    continue;
+                }
+            };
             let path = entry.path();
             let name = match path.file_stem().and_then(|s| s.to_str()) {
                 Some(s) => s.to_string(),
@@ -1405,7 +1468,11 @@ return pkg.meta or {{ name = "{name}" }}"#
                 .cmp(&b.get("name").and_then(|v| v.as_str()))
         });
 
-        Ok(serde_json::json!({ "scenarios": scenarios }).to_string())
+        Ok(serde_json::json!({
+            "scenarios": scenarios,
+            "failures": failures,
+        })
+        .to_string())
     }
 
     /// Show the content of a named scenario.
@@ -1431,7 +1498,8 @@ return pkg.meta or {{ name = "{name}" }}"#
     /// Expects the source to contain `.lua` files (at root or in a `scenarios/` subdirectory).
     pub async fn scenario_install(&self, url: String) -> Result<String, String> {
         let dest_dir = scenarios_dir()?;
-        let _ = std::fs::create_dir_all(&dest_dir);
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
 
         // Local path: copy .lua files directly
         let local_path = Path::new(&url);
@@ -1469,13 +1537,7 @@ return pkg.meta or {{ name = "{name}" }}"#
             return Err(format!("git clone failed: {stderr}"));
         }
 
-        // Prefer `scenarios/` subdirectory if it exists, otherwise use root
-        let source = if staging.path().join("scenarios").is_dir() {
-            staging.path().join("scenarios")
-        } else {
-            staging.path().to_path_buf()
-        };
-
+        let source = resolve_scenario_source(staging.path());
         install_scenarios_from_dir(&source, &dest_dir)
     }
 
@@ -2125,16 +2187,11 @@ mod proptests {
 
     #[test]
     fn resolve_scenario_code_rejects_multiple() {
-        let result =
-            resolve_scenario_code(Some("code".into()), Some("file".into()), None);
+        let result = resolve_scenario_code(Some("code".into()), Some("file".into()), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("only one"));
 
-        let result2 = resolve_scenario_code(
-            Some("code".into()),
-            None,
-            Some("name".into()),
-        );
+        let result2 = resolve_scenario_code(Some("code".into()), None, Some("name".into()));
         assert!(result2.is_err());
     }
 
@@ -2176,6 +2233,7 @@ mod proptests {
         assert!(dest.path().join("math_basic.lua").exists());
         assert!(dest.path().join("safety.lua").exists());
         assert!(!dest.path().join("README.md").exists());
+        assert_eq!(parsed["failures"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -2190,6 +2248,7 @@ mod proptests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["skipped"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["installed"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["failures"].as_array().unwrap().len(), 0);
 
         // Original file should be preserved
         let content = std::fs::read_to_string(dest.path().join("existing.lua")).unwrap();
@@ -2204,6 +2263,57 @@ mod proptests {
         let result = install_scenarios_from_dir(source.path(), dest.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No .lua"));
+    }
+
+    #[test]
+    fn install_scenarios_from_dir_collects_copy_failures() {
+        let source = tempfile::tempdir().unwrap();
+        // dest is a non-existent path inside a read-only dir to force copy failure
+        let dest = tempfile::tempdir().unwrap();
+        let bad_dest = dest.path().join("nonexistent_subdir");
+        // Don't create bad_dest — copy will fail
+
+        std::fs::write(source.path().join("ok.lua"), "return 1").unwrap();
+
+        let result = install_scenarios_from_dir(source.path(), &bad_dest);
+        // ContainedPath::child won't fail, but fs::copy to nonexistent dir will
+        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        let failures = parsed["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "expected 1 copy failure");
+        assert_eq!(parsed["installed"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn display_name_prefers_stem() {
+        let path = Path::new("/tmp/math_basic.lua");
+        assert_eq!(display_name(path, "math_basic.lua"), "math_basic");
+    }
+
+    #[test]
+    fn display_name_falls_back_to_file_name() {
+        // file_stem returns None only for paths like "" or "/"
+        let path = Path::new("");
+        assert_eq!(display_name(path, "fallback"), "fallback");
+    }
+
+    #[test]
+    fn resolve_scenario_source_prefers_subdir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("scenarios")).unwrap();
+        std::fs::write(root.path().join("scenarios").join("a.lua"), "").unwrap();
+        std::fs::write(root.path().join("root.lua"), "").unwrap();
+
+        let source = resolve_scenario_source(root.path());
+        assert_eq!(source, root.path().join("scenarios"));
+    }
+
+    #[test]
+    fn resolve_scenario_source_falls_back_to_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.lua"), "").unwrap();
+
+        let source = resolve_scenario_source(root.path());
+        assert_eq!(source, root.path());
     }
 
     #[test]

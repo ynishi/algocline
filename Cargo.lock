@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "algocline"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "algocline-engine",
  "algocline-mcp",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "algocline-core",
  "algocline-engine",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "indexmap",
  "proptest",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "algocline-core",
  "anyhow",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "algocline-app",
  "algocline-engine",

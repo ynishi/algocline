@@ -311,6 +311,15 @@ const AUTO_INSTALL_SOURCES: &[&str] = &[
     "https://github.com/ynishi/evalframe",
 ];
 
+/// System packages: installed alongside user packages but not user-facing strategies.
+/// Excluded from `pkg_list` and not loaded via `require` for meta extraction.
+const SYSTEM_PACKAGES: &[&str] = &["evalframe"];
+
+/// Check whether a package is a system (non-user-facing) package.
+fn is_system_package(name: &str) -> bool {
+    SYSTEM_PACKAGES.contains(&name)
+}
+
 /// Check whether a package is installed (has `init.lua`).
 fn is_package_installed(name: &str) -> bool {
     packages_dir()
@@ -899,6 +908,10 @@ return {{
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
+            // Skip system packages (not user-facing strategies)
+            if is_system_package(&name) {
+                continue;
+            }
             let code = format!(
                 r#"local pkg = require("{name}")
 return pkg.meta or {{ name = "{name}" }}"#

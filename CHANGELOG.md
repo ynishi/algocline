@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-18
+
+### Added
+
+- **Scenario management**: `alc_scenario_list`, `alc_scenario_show`, `alc_scenario_install` tools for managing reusable eval scenarios in `~/.algocline/scenarios/`
+- **`scenario_name` parameter**: `alc_eval` now accepts `scenario_name` to load installed scenarios by name (e.g. `"math_basic"`), in addition to existing `scenario` (inline) and `scenario_file` (path)
+- **Bundled scenarios**: `alc init` / `alc_pkg_install` automatically installs scenarios from `scenarios/` subdirectory in package collections
+- **Resilience pattern**: `DirEntryFailures` type alias for batch I/O operations that collect per-entry failures instead of aborting. JSON responses include `"failures"` field for diagnostics
+
+### Changed
+
+- **`BUNDLED_VERSION`**: Updated from `0.2.0` to `v0.3.0` (includes 9 new strategy packages, robust_qa, and 3 bundled eval scenarios)
+
 ## [0.4.0] - 2026-03-17
 
 ### Added

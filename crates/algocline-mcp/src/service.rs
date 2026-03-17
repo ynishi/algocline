@@ -131,6 +131,14 @@ pub struct EvalDetailParams {
     pub eval_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EvalCompareParams {
+    /// First eval ID to compare.
+    pub eval_id_a: String,
+    /// Second eval ID to compare.
+    pub eval_id_b: String,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -255,6 +263,24 @@ impl AlcService {
         self.app.eval_detail(&params.eval_id)
     }
 
+    /// Compare two eval results with Welch's t-test for statistical significance.
+    ///
+    /// Returns per-strategy descriptive statistics (mean, std_dev, median),
+    /// score delta, Welch's t-test result (t-stat, df, significant),
+    /// winner determination, and a human-readable summary.
+    #[tool(
+        name = "alc_eval_compare",
+        annotations(read_only_hint = false, open_world_hint = false)
+    )]
+    async fn eval_compare(
+        &self,
+        Parameters(params): Parameters<EvalCompareParams>,
+    ) -> Result<String, String> {
+        self.app
+            .eval_compare(&params.eval_id_a, &params.eval_id_b)
+            .await
+    }
+
     // ─── Package Management ─────────────────────────────────────
 
     /// List installed packages with metadata.
@@ -343,7 +369,8 @@ impl ServerHandler for AlcService {
                  Evaluation:\n\
                  - alc_eval: Evaluate a strategy against a scenario. Pass scenario (cases + graders) and strategy name.\n\
                  - alc_eval_history: List past eval results. Filter by strategy, sorted newest-first.\n\
-                 - alc_eval_detail: View a specific eval result in full detail.\n\n\
+                 - alc_eval_detail: View a specific eval result in full detail.\n\
+                 - alc_eval_compare: Compare two eval results with Welch's t-test for statistical significance.\n\n\
                  Package Management:\n\
                  - alc_pkg_list: List installed packages with metadata.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\

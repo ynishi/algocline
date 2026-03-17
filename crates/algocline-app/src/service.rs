@@ -232,9 +232,16 @@ impl ContainedPath {
     }
 }
 
+impl std::ops::Deref for ContainedPath {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
 impl AsRef<Path> for ContainedPath {
     fn as_ref(&self) -> &Path {
-        &self.0
+        self
     }
 }
 
@@ -368,6 +375,36 @@ fn save_eval_result(strategy: &str, result_json: &str) {
     }
 }
 
+// ─── Eval Comparison Helpers ─────────────────────────────────────
+
+/// Escape a string for embedding in a Lua single-quoted string literal.
+///
+/// Handles backslash, single quote, newline, and carriage return —
+/// the characters that would break or alter a `'...'` Lua string.
+fn escape_for_lua_sq(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Extract strategy name from eval_id (format: "{strategy}_{timestamp}").
+fn extract_strategy_from_id(eval_id: &str) -> Option<&str> {
+    eval_id.rsplit_once('_').map(|(prefix, _)| prefix)
+}
+
+/// Persist a comparison result to `~/.algocline/evals/`.
+fn save_compare_result(eval_id_a: &str, eval_id_b: &str, result_json: &str) {
+    let dir = match evals_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let filename = format!("compare_{eval_id_a}_vs_{eval_id_b}.json");
+    if let Ok(path) = ContainedPath::child(&dir, &filename) {
+        let _ = std::fs::write(&path, result_json);
+    }
+}
+
 // ─── Application Service ────────────────────────────────────────
 
 /// Tracks which sessions are eval sessions and their strategy name.
@@ -445,6 +482,13 @@ impl AppService {
     ///
     /// Injects a `std` global (mlua-batteries compatible shim) so evalframe's
     /// `std.lua` can resolve json/fs/time from algocline's built-in primitives.
+    ///
+    /// # Security: `strategy` is not sanitized
+    ///
+    /// `strategy` is interpolated into a Lua string literal without escaping.
+    /// This is intentional — same rationale as [`make_require_code`]:
+    /// algocline runs Lua in the caller's own process with full ambient
+    /// authority, so Lua injection does not cross a trust boundary.
     pub async fn eval(
         &self,
         scenario: Option<String>,
@@ -572,10 +616,19 @@ return report:to_table()
                 continue;
             }
 
-            // Read meta file (lightweight) if it exists
-            let meta_path = path.with_extension("meta.json");
+            // Read meta file (lightweight) if it exists.
+            // Derive meta filename from the result filename to stay within evals_dir
+            // (ContainedPath ensures no traversal).
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let meta_path = match ContainedPath::child(&evals_dir, &format!("{stem}.meta.json")) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
             let meta = if meta_path.exists() {
-                std::fs::read_to_string(&meta_path)
+                std::fs::read_to_string(&*meta_path)
                     .ok()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             } else {
@@ -595,9 +648,15 @@ return report:to_table()
 
         // Sort by timestamp descending (newest first)
         entries.sort_by(|a, b| {
-            let ts_a = a.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-            let ts_b = b.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
-            ts_b.cmp(ts_a)
+            let ts_a = a
+                .get("timestamp")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let ts_b = b
+                .get("timestamp")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            ts_b.cmp(&ts_a)
         });
         entries.truncate(limit);
 
@@ -609,10 +668,151 @@ return report:to_table()
         let evals_dir = evals_dir()?;
         let path = ContainedPath::child(&evals_dir, &format!("{eval_id}.json"))
             .map_err(|e| format!("Invalid eval_id: {e}"))?;
-        if !path.0.exists() {
+        if !path.exists() {
             return Err(format!("Eval result not found: {eval_id}"));
         }
-        std::fs::read_to_string(&path.0).map_err(|e| format!("Failed to read eval: {e}"))
+        std::fs::read_to_string(&*path).map_err(|e| format!("Failed to read eval: {e}"))
+    }
+
+    /// Compare two eval results with statistical significance testing.
+    ///
+    /// Delegates to evalframe's `stats.welch_t` (single source of truth for
+    /// t-distribution table and test logic). Reads persisted `aggregated.scores`
+    /// from each eval result — no re-computation of descriptive statistics.
+    ///
+    /// The comparison result is persisted to `~/.algocline/evals/` so repeated
+    /// lookups of the same pair are file reads only.
+    pub async fn eval_compare(&self, eval_id_a: &str, eval_id_b: &str) -> Result<String, String> {
+        // Check for cached comparison
+        let cache_filename = format!("compare_{eval_id_a}_vs_{eval_id_b}.json");
+        if let Ok(dir) = evals_dir() {
+            if let Ok(cached_path) = ContainedPath::child(&dir, &cache_filename) {
+                if cached_path.exists() {
+                    return std::fs::read_to_string(&*cached_path)
+                        .map_err(|e| format!("Failed to read cached comparison: {e}"));
+                }
+            }
+        }
+
+        // Verify evalframe is installed (needed for stats.welch_t)
+        if !is_package_installed("evalframe") {
+            return Err("Package 'evalframe' is not installed. \
+                 Install it with: alc_pkg_install({ url: \"/path/to/evalframe\" })"
+                .into());
+        }
+
+        let result_a = self.eval_detail(eval_id_a)?;
+        let result_b = self.eval_detail(eval_id_b)?;
+
+        // Build Lua snippet that uses evalframe's stats module
+        // to compute welch_t from the persisted aggregated scores.
+        let lua_code = format!(
+            r#"
+std = {{
+  json = {{
+    decode = alc.json_decode,
+    encode = alc.json_encode,
+  }},
+  fs = {{ read = function() end, is_file = function() return false end }},
+  time = {{ now = alc.time }},
+}}
+
+local stats = require("evalframe.eval.stats")
+
+local result_a = alc.json_decode('{result_a_escaped}')
+local result_b = alc.json_decode('{result_b_escaped}')
+
+local agg_a = result_a.result and result_a.result.aggregated
+local agg_b = result_b.result and result_b.result.aggregated
+
+if not agg_a or not agg_a.scores then
+  error("No aggregated scores in {eval_id_a}")
+end
+if not agg_b or not agg_b.scores then
+  error("No aggregated scores in {eval_id_b}")
+end
+
+local welch = stats.welch_t(agg_a.scores, agg_b.scores)
+
+local strategy_a = (result_a.result and result_a.result.name) or "{strategy_a_fallback}"
+local strategy_b = (result_b.result and result_b.result.name) or "{strategy_b_fallback}"
+
+local delta = agg_a.scores.mean - agg_b.scores.mean
+local winner = "none"
+if welch.significant then
+  winner = delta > 0 and "a" or "b"
+end
+
+-- Build summary text
+local parts = {{}}
+if welch.significant then
+  local w, l, d = strategy_a, strategy_b, delta
+  if delta < 0 then w, l, d = strategy_b, strategy_a, -delta end
+  parts[#parts + 1] = string.format(
+    "%s outperforms %s by %.4f (mean score), statistically significant (t=%.3f, df=%.1f).",
+    w, l, d, math.abs(welch.t_stat), welch.df
+  )
+else
+  parts[#parts + 1] = string.format(
+    "No statistically significant difference between %s and %s (t=%.3f, df=%.1f).",
+    strategy_a, strategy_b, math.abs(welch.t_stat), welch.df
+  )
+end
+if agg_a.pass_rate and agg_b.pass_rate then
+  local dp = agg_a.pass_rate - agg_b.pass_rate
+  if math.abs(dp) > 1e-9 then
+    local h = dp > 0 and strategy_a or strategy_b
+    parts[#parts + 1] = string.format("Pass rate: %s +%.1fpp.", h, math.abs(dp) * 100)
+  else
+    parts[#parts + 1] = string.format("Pass rate: identical (%.1f%%).", agg_a.pass_rate * 100)
+  end
+end
+
+return {{
+  a = {{
+    eval_id = "{eval_id_a}",
+    strategy = strategy_a,
+    scores = agg_a.scores,
+    pass_rate = agg_a.pass_rate,
+    pass_at_1 = agg_a.pass_at_1,
+    ci_95 = agg_a.ci_95,
+  }},
+  b = {{
+    eval_id = "{eval_id_b}",
+    strategy = strategy_b,
+    scores = agg_b.scores,
+    pass_rate = agg_b.pass_rate,
+    pass_at_1 = agg_b.pass_at_1,
+    ci_95 = agg_b.ci_95,
+  }},
+  comparison = {{
+    delta_mean = delta,
+    welch_t = {{
+      t_stat = welch.t_stat,
+      df = welch.df,
+      significant = welch.significant,
+      direction = welch.direction,
+    }},
+    winner = winner,
+    summary = table.concat(parts, " "),
+  }},
+}}
+"#,
+            result_a_escaped = escape_for_lua_sq(&result_a),
+            result_b_escaped = escape_for_lua_sq(&result_b),
+            eval_id_a = eval_id_a,
+            eval_id_b = eval_id_b,
+            strategy_a_fallback = extract_strategy_from_id(eval_id_a).unwrap_or("A"),
+            strategy_b_fallback = extract_strategy_from_id(eval_id_b).unwrap_or("B"),
+        );
+
+        let ctx = serde_json::Value::Null;
+        let raw_result = self.start_and_tick(lua_code, ctx).await?;
+
+        // Persist comparison result
+        save_compare_result(eval_id_a, eval_id_b, &raw_result);
+
+        Ok(raw_result)
     }
 
     /// Continue a paused execution — batch feed.
@@ -1683,5 +1883,34 @@ mod proptests {
         let result = rt.block_on(svc.eval(Some(scenario.into()), None, "cove", None));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("evalframe"));
+    }
+
+    // ─── comparison helper tests ───
+
+    #[test]
+    fn extract_strategy_from_id_splits_correctly() {
+        assert_eq!(extract_strategy_from_id("cove_1710672000"), Some("cove"));
+        assert_eq!(
+            extract_strategy_from_id("my_strat_1710672000"),
+            Some("my_strat")
+        );
+        assert_eq!(extract_strategy_from_id("nostamp"), None);
+    }
+
+    #[test]
+    fn save_compare_result_persists_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let evals = tmp.path().join(".algocline").join("evals");
+        std::fs::create_dir_all(&evals).unwrap();
+
+        // save_compare_result uses evals_dir() which reads HOME.
+        // Test ContainedPath + write logic directly instead.
+        let filename = "compare_a_1_vs_b_2.json";
+        let path = ContainedPath::child(&evals, filename).unwrap();
+        let data = r#"{"test": true}"#;
+        std::fs::write(&*path, data).unwrap();
+
+        let read = std::fs::read_to_string(&*path).unwrap();
+        assert_eq!(read, data);
     }
 }

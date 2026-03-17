@@ -1,14 +1,18 @@
 //! `alc init` / `alc update` — Install and update bundled packages.
 //!
-//! Clones the bundled package collection from GitHub (tag-based)
-//! and installs all packages into `~/.algocline/packages/`.
+//! Clones packages from multiple Git sources and installs them into
+//! `~/.algocline/packages/`.
 //!
-//! Packages are discovered dynamically: any subdirectory containing
-//! `init.lua` is treated as a package. No hardcoded package list.
+//! Two source kinds:
+//! - **Collection**: repo contains subdirectories, each with `init.lua`
+//!   (e.g. algocline-bundled-packages with ucb/, cove/, etc.)
+//! - **Single**: repo root has `init.lua` and is itself a package
+//!   (e.g. evalframe). Copied as a directory tree preserving subdirs.
 //!
-//! Sources (checked in order):
-//! 1. Git clone with tag `v{BUNDLED_VERSION}` (production)
-//! 2. Local packages directory (development fallback)
+//! Sources are defined in [`BUNDLED_SOURCES`] and processed in order.
+//!
+//! Fallback: if git clone fails, looks for a sibling directory with
+//! the same repo name on disk (development workflow).
 //!
 //! Usage:
 //!   alc init             — Install new packages (skip existing)
@@ -18,13 +22,40 @@
 
 use std::path::{Path, PathBuf};
 
-/// Supported bundled packages version.
-///
-/// Independent of algocline's own CARGO_PKG_VERSION.
-/// Updated when a new bundled-packages release is validated.
-const BUNDLED_VERSION: &str = "0.2.0";
+/// Source kind: collection of packages or a single package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    /// Repo contains multiple packages as subdirectories.
+    Collection,
+    /// Repo root is itself a package (has init.lua at root).
+    Single,
+}
 
-const BUNDLED_PACKAGES_URL: &str = "https://github.com/ynishi/algocline-bundled-packages";
+/// A bundled package source: Git URL, tag, and kind.
+#[derive(Debug)]
+struct BundledSource {
+    url: &'static str,
+    tag: &'static str,
+    kind: SourceKind,
+}
+
+/// All bundled sources, processed in order during `alc init`.
+///
+/// To add a new source: append an entry here. Collection repos install
+/// all discovered sub-packages; Single repos install as one package
+/// named after the repo (or the directory name).
+const BUNDLED_SOURCES: &[BundledSource] = &[
+    BundledSource {
+        url: "https://github.com/ynishi/algocline-bundled-packages",
+        tag: "v0.2.0",
+        kind: SourceKind::Collection,
+    },
+    BundledSource {
+        url: "https://github.com/ynishi/evalframe",
+        tag: "v0.1.0",
+        kind: SourceKind::Single,
+    },
+];
 
 fn packages_dir() -> anyhow::Result<PathBuf> {
     let home =
@@ -61,29 +92,41 @@ fn discover_packages(source: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
     Ok(packages)
 }
 
-/// Find a local packages source directory (development).
+/// Extract repo name from a Git URL (e.g. "https://github.com/user/evalframe" → "evalframe").
+fn repo_name(url: &str) -> &str {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("unknown")
+}
+
+/// Find a local sibling directory for a given repo name (development).
 ///
-/// Searches for a sibling `algocline-bundled-packages/` directory relative to CWD
-/// or the binary location. This supports the development workflow where
-/// both repositories are checked out side by side.
-fn find_local_packages() -> Option<PathBuf> {
-    // Check CWD/../algocline-bundled-packages/
-    let cwd = std::env::current_dir().ok()?;
-    let sibling = cwd.parent()?.join("algocline-bundled-packages");
-    if sibling.is_dir() {
-        return Some(sibling);
+/// Searches for `../{repo_name}/` relative to CWD or the binary location.
+/// This supports the development workflow where repositories are checked out side by side.
+fn find_local_source(name: &str) -> Option<PathBuf> {
+    // Check CWD/../{name}/
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(parent) = cwd.parent() {
+            let sibling = parent.join(name);
+            if sibling.is_dir() {
+                return Some(sibling);
+            }
+        }
     }
 
     // Check relative to binary
     if let Ok(exe) = std::env::current_exe() {
         let dev_pkg = exe
-            .parent()?
-            .parent()?
-            .parent()?
-            .parent()?
-            .join("algocline-bundled-packages");
-        if dev_pkg.is_dir() {
-            return Some(dev_pkg);
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join(name));
+        if let Some(path) = dev_pkg {
+            if path.is_dir() {
+                return Some(path);
+            }
         }
     }
 
@@ -139,11 +182,61 @@ fn copy_package(
     Ok(true)
 }
 
-/// Clone the bundled packages repo at a specific tag and install.
-async fn install_from_git(dest: &Path, force: bool) -> anyhow::Result<()> {
-    let tag = format!("v{BUNDLED_VERSION}");
+/// Recursively copy a directory tree.
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        let dest_path = dst.join(entry.file_name());
+        if meta.is_dir() {
+            copy_dir(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
+    Ok(())
+}
 
-    eprintln!("Cloning bundled packages {tag} from {BUNDLED_PACKAGES_URL}...");
+/// Install a single-package repo into `dest/{name}/`.
+///
+/// Copies the entire directory tree (preserving subdirectories like
+/// `eval/`, `model/`, etc.) so that Lua `require("pkg.sub.mod")` works.
+fn install_single_package(
+    source: &Path,
+    dest: &Path,
+    name: &str,
+    force: bool,
+) -> anyhow::Result<bool> {
+    let dest_dir = dest.join(name);
+    let dest_init = dest_dir.join("init.lua");
+
+    if dest_init.exists() && !force {
+        let src_len = std::fs::metadata(source.join("init.lua"))?.len();
+        let dst_len = std::fs::metadata(&dest_init)?.len();
+        if src_len == dst_len {
+            return Ok(false);
+        }
+        eprintln!("    (repairing truncated file for {name})");
+    }
+
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(&dest_dir)?;
+    }
+    copy_dir(source, &dest_dir)?;
+    // Remove .git if present
+    let _ = std::fs::remove_dir_all(dest_dir.join(".git"));
+
+    Ok(true)
+}
+
+/// Clone a single source and install its packages.
+async fn install_source_from_git(
+    source: &BundledSource,
+    dest: &Path,
+    force: bool,
+) -> anyhow::Result<()> {
+    eprintln!("Cloning {} ({})...", source.url, source.tag);
 
     let staging = tempfile::tempdir()?;
 
@@ -153,8 +246,8 @@ async fn install_from_git(dest: &Path, force: bool) -> anyhow::Result<()> {
             "--depth",
             "1",
             "--branch",
-            &tag,
-            BUNDLED_PACKAGES_URL,
+            source.tag,
+            source.url,
             &staging.path().to_string_lossy(),
         ])
         .output()
@@ -162,10 +255,55 @@ async fn install_from_git(dest: &Path, force: bool) -> anyhow::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git clone failed (tag {tag}): {stderr}");
+        anyhow::bail!("git clone failed (tag {}): {stderr}", source.tag);
     }
 
-    install_from_local(staging.path(), dest, force)
+    match source.kind {
+        SourceKind::Collection => install_from_local(staging.path(), dest, force),
+        SourceKind::Single => {
+            let name = source
+                .url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("unknown");
+            match install_single_package(staging.path(), dest, name, force)? {
+                true => eprintln!("  + {name}"),
+                false => eprintln!("  = {name} (already installed, use --force to overwrite)"),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Clone all bundled sources and install.
+async fn install_from_git(dest: &Path, force: bool) -> anyhow::Result<()> {
+    let mut errors: Vec<String> = Vec::new();
+
+    for source in BUNDLED_SOURCES {
+        if let Err(e) = install_source_from_git(source, dest, force).await {
+            eprintln!("  ! Failed to install from {}: {e}", source.url);
+            errors.push(format!("{}: {e}", source.url));
+        }
+    }
+
+    if errors.len() == BUNDLED_SOURCES.len() {
+        // All sources failed
+        anyhow::bail!(
+            "All bundled sources failed to install: {}",
+            errors.join("; ")
+        );
+    }
+
+    if !errors.is_empty() {
+        eprintln!(
+            "Warning: {} of {} sources failed (non-fatal)",
+            errors.len(),
+            BUNDLED_SOURCES.len()
+        );
+    }
+
+    Ok(())
 }
 
 /// Install from local packages directory.
@@ -235,26 +373,35 @@ pub async fn run(args: &[String], force_override: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dest)?;
 
     if dev {
-        // --dev: force local packages directory
-        let source = find_local_packages().ok_or_else(|| {
-            anyhow::anyhow!("No local algocline-bundled-packages/ directory found")
-        })?;
-        return install_from_local(&source, &dest, force);
-    }
-
-    // Try git clone first, fall back to local
-    match install_from_git(&dest, force).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!("Git clone failed: {e}");
-            if let Some(source) = find_local_packages() {
-                eprintln!("Falling back to local algocline-bundled-packages/...");
-                install_from_local(&source, &dest, force)
+        // --dev: install from local sibling directories for all sources
+        let mut found_any = false;
+        for source in BUNDLED_SOURCES {
+            let name = repo_name(source.url);
+            if let Some(local) = find_local_source(name) {
+                found_any = true;
+                match source.kind {
+                    SourceKind::Collection => install_from_local(&local, &dest, force)?,
+                    SourceKind::Single => {
+                        match install_single_package(&local, &dest, name, force)? {
+                            true => eprintln!("  + {name} (local)"),
+                            false => eprintln!(
+                                "  = {name} (already installed, use --force to overwrite)"
+                            ),
+                        }
+                    }
+                }
             } else {
-                Err(e)
+                eprintln!("  ? {name}: local directory not found, skipping");
             }
         }
+        if !found_any {
+            anyhow::bail!("No local source directories found for any bundled source");
+        }
+        return Ok(());
     }
+
+    // Try git clone first, fall back to local for failed sources
+    install_from_git(&dest, force).await
 }
 
 #[cfg(test)]
@@ -262,11 +409,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_version_is_valid_semver() {
-        assert!(
-            BUNDLED_VERSION.split('.').all(|p| p.parse::<u32>().is_ok()),
-            "BUNDLED_VERSION must be valid semver: {BUNDLED_VERSION}"
-        );
+    fn bundled_source_tags_are_valid_semver() {
+        for source in BUNDLED_SOURCES {
+            let version = source.tag.strip_prefix('v').unwrap_or(source.tag);
+            assert!(
+                version.split('.').all(|p| p.parse::<u32>().is_ok()),
+                "Invalid semver tag '{}' for source {}",
+                source.tag,
+                source.url
+            );
+        }
     }
 
     #[test]

@@ -304,8 +304,12 @@ pub(crate) fn packages_dir() -> Result<PathBuf, String> {
     Ok(home.join(".algocline").join("packages"))
 }
 
-/// Default Git URL for the bundled package collection.
-const BUNDLED_PACKAGES_URL: &str = "https://github.com/ynishi/algocline-bundled-packages";
+/// Git URLs for auto-installation. Collection repos contain multiple packages
+/// as subdirectories; single repos have init.lua at root.
+const AUTO_INSTALL_SOURCES: &[&str] = &[
+    "https://github.com/ynishi/algocline-bundled-packages",
+    "https://github.com/ynishi/evalframe",
+];
 
 /// Check whether a package is installed (has `init.lua`).
 fn is_package_installed(name: &str) -> bool {
@@ -496,11 +500,16 @@ impl AppService {
         strategy: &str,
         strategy_opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        // Verify evalframe is installed
+        // Auto-install bundled packages if evalframe is missing
         if !is_package_installed("evalframe") {
-            return Err("Package 'evalframe' is not installed. \
-                 Install it with: alc_pkg_install({ url: \"/path/to/evalframe\" })"
-                .into());
+            self.auto_install_bundled_packages().await?;
+            if !is_package_installed("evalframe") {
+                return Err(
+                    "Package 'evalframe' not found after installing bundled collection. \
+                     Use alc_pkg_install to install it manually."
+                        .into(),
+                );
+            }
         }
 
         let scenario_code = resolve_code(scenario, scenario_file)?;
@@ -694,11 +703,16 @@ return report:to_table()
             }
         }
 
-        // Verify evalframe is installed (needed for stats.welch_t)
+        // Auto-install bundled packages if evalframe is missing
         if !is_package_installed("evalframe") {
-            return Err("Package 'evalframe' is not installed. \
-                 Install it with: alc_pkg_install({ url: \"/path/to/evalframe\" })"
-                .into());
+            self.auto_install_bundled_packages().await?;
+            if !is_package_installed("evalframe") {
+                return Err(
+                    "Package 'evalframe' not found after installing bundled collection. \
+                     Use alc_pkg_install to install it manually."
+                        .into(),
+                );
+            }
         }
 
         let result_a = self.eval_detail(eval_id_a)?;
@@ -1232,15 +1246,23 @@ return pkg.meta or {{ name = "{name}" }}"#
 
     // ─── Internal ───────────────────────────────────────────────
 
-    /// Install the bundled package collection if the requested package is missing.
+    /// Install all bundled sources (collections + single packages).
     async fn auto_install_bundled_packages(&self) -> Result<(), String> {
-        tracing::info!(
-            "auto-installing bundled packages from {}",
-            BUNDLED_PACKAGES_URL
-        );
-        self.pkg_install(BUNDLED_PACKAGES_URL.to_string(), None)
-            .await
-            .map_err(|e| format!("Failed to auto-install bundled packages: {e}"))?;
+        let mut errors: Vec<String> = Vec::new();
+        for url in AUTO_INSTALL_SOURCES {
+            tracing::info!("auto-installing from {url}");
+            if let Err(e) = self.pkg_install(url.to_string(), None).await {
+                tracing::warn!("failed to auto-install from {url}: {e}");
+                errors.push(format!("{url}: {e}"));
+            }
+        }
+        // Fail only if ALL sources failed
+        if errors.len() == AUTO_INSTALL_SOURCES.len() {
+            return Err(format!(
+                "Failed to auto-install bundled packages: {}",
+                errors.join("; ")
+            ));
+        }
         Ok(())
     }
 
@@ -1853,7 +1875,7 @@ mod proptests {
     }
 
     #[test]
-    fn eval_rejects_missing_evalframe() {
+    fn eval_auto_installs_evalframe_on_missing() {
         // Skip if evalframe is already installed globally
         if is_package_installed("evalframe") {
             return;
@@ -1882,7 +1904,13 @@ mod proptests {
         let scenario = r#"return { cases = {} }"#;
         let result = rt.block_on(svc.eval(Some(scenario.into()), None, "cove", None));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("evalframe"));
+        // Auto-install is attempted first; error is about bundled install failure
+        // (git clone) or evalframe still missing after install
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("bundled") || err.contains("evalframe"),
+            "unexpected error: {err}"
+        );
     }
 
     // ─── comparison helper tests ───

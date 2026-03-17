@@ -117,6 +117,20 @@ pub struct EvalParams {
     pub strategy_opts: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EvalHistoryParams {
+    /// Filter by strategy name (e.g. "cove", "reflect"). Omit to list all.
+    pub strategy: Option<String>,
+    /// Max results to return (default: 20).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EvalDetailParams {
+    /// Eval ID (e.g. "cove_1710672000"). Returned in eval history listing.
+    pub eval_id: String,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -215,6 +229,32 @@ impl AlcService {
             .await
     }
 
+    /// List past eval results. Filter by strategy, sorted newest-first.
+    /// Results are persisted in ~/.algocline/evals/.
+    #[tool(
+        name = "alc_eval_history",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn eval_history(
+        &self,
+        Parameters(params): Parameters<EvalHistoryParams>,
+    ) -> Result<String, String> {
+        self.app
+            .eval_history(params.strategy.as_deref(), params.limit.unwrap_or(20))
+    }
+
+    /// View a specific eval result in full detail.
+    #[tool(
+        name = "alc_eval_detail",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn eval_detail(
+        &self,
+        Parameters(params): Parameters<EvalDetailParams>,
+    ) -> Result<String, String> {
+        self.app.eval_detail(&params.eval_id)
+    }
+
     // ─── Package Management ─────────────────────────────────────
 
     /// List installed packages with metadata.
@@ -301,7 +341,9 @@ impl ServerHandler for AlcService {
                  When Lua calls alc.llm(prompt), execution pauses and returns the prompt.\n\
                  The host processes it and calls alc_continue with the response to resume.\n\n\
                  Evaluation:\n\
-                 - alc_eval: Evaluate a strategy against a scenario. Pass scenario (cases + graders) and strategy name.\n\n\
+                 - alc_eval: Evaluate a strategy against a scenario. Pass scenario (cases + graders) and strategy name.\n\
+                 - alc_eval_history: List past eval results. Filter by strategy, sorted newest-first.\n\
+                 - alc_eval_detail: View a specific eval result in full detail.\n\n\
                  Package Management:\n\
                  - alc_pkg_list: List installed packages with metadata.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\

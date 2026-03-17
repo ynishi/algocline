@@ -307,13 +307,79 @@ fn is_package_installed(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ─── Eval Result Store ──────────────────────────────────────────
+
+fn evals_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(home.join(".algocline").join("evals"))
+}
+
+/// Persist eval result to `~/.algocline/evals/{strategy}_{timestamp}.json`.
+///
+/// Silently returns on I/O errors — storage must not break eval execution.
+fn save_eval_result(strategy: &str, result_json: &str) {
+    let dir = match evals_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let timestamp = now.as_secs();
+    let eval_id = format!("{strategy}_{timestamp}");
+
+    // Parse result to extract summary fields for meta file
+    let parsed: serde_json::Value = match serde_json::from_str(result_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Write full result
+    let path = match ContainedPath::child(&dir, &format!("{eval_id}.json")) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let _ = std::fs::write(&path, result_json);
+
+    // Write lightweight meta file for listing
+    let result_obj = parsed.get("result");
+    let stats_obj = parsed.get("stats");
+    let aggregated = result_obj.and_then(|r| r.get("aggregated"));
+
+    let meta = serde_json::json!({
+        "eval_id": eval_id,
+        "strategy": strategy,
+        "timestamp": timestamp,
+        "pass_rate": aggregated.and_then(|a| a.get("pass_rate")),
+        "mean_score": aggregated.and_then(|a| a.get("scores")).and_then(|s| s.get("mean")),
+        "total_cases": aggregated.and_then(|a| a.get("total")),
+        "passed": aggregated.and_then(|a| a.get("passed")),
+        "llm_calls": stats_obj.and_then(|s| s.get("auto")).and_then(|a| a.get("llm_calls")),
+        "elapsed_ms": stats_obj.and_then(|s| s.get("auto")).and_then(|a| a.get("elapsed_ms")),
+        "summary": result_obj.and_then(|r| r.get("summary")),
+    });
+
+    if let Ok(meta_path) = ContainedPath::child(&dir, &format!("{eval_id}.meta.json")) {
+        let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
+    }
+}
+
 // ─── Application Service ────────────────────────────────────────
+
+/// Tracks which sessions are eval sessions and their strategy name.
+type EvalSessions = std::sync::Mutex<std::collections::HashMap<String, String>>;
 
 #[derive(Clone)]
 pub struct AppService {
     executor: Arc<Executor>,
     registry: Arc<SessionRegistry>,
     log_config: TranscriptConfig,
+    /// session_id → strategy name for eval sessions (cleared on completion).
+    eval_sessions: Arc<EvalSessions>,
 }
 
 impl AppService {
@@ -322,6 +388,7 @@ impl AppService {
             executor,
             registry: Arc::new(SessionRegistry::new()),
             log_config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -455,7 +522,97 @@ return report:to_table()
         );
 
         let ctx = serde_json::Value::Null;
-        self.start_and_tick(wrapped, ctx).await
+        let result = self.start_and_tick(wrapped, ctx).await?;
+
+        // Register this session for eval result saving on completion.
+        // start_and_tick returns the first pause (needs_response) or completed.
+        // If completed immediately, save now. Otherwise, save when continue_* finishes.
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+            match parsed.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => {
+                    save_eval_result(strategy, &result);
+                }
+                Some("needs_response") => {
+                    if let Some(sid) = parsed.get("session_id").and_then(|s| s.as_str()) {
+                        if let Ok(mut map) = self.eval_sessions.lock() {
+                            map.insert(sid.to_string(), strategy.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// List eval history, optionally filtered by strategy.
+    pub fn eval_history(&self, strategy: Option<&str>, limit: usize) -> Result<String, String> {
+        let evals_dir = evals_dir()?;
+        if !evals_dir.exists() {
+            return Ok(serde_json::json!({ "evals": [] }).to_string());
+        }
+
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+
+        let read_dir =
+            std::fs::read_dir(&evals_dir).map_err(|e| format!("Failed to read evals dir: {e}"))?;
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // Skip meta files
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".meta."))
+            {
+                continue;
+            }
+
+            // Read meta file (lightweight) if it exists
+            let meta_path = path.with_extension("meta.json");
+            let meta = if meta_path.exists() {
+                std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            } else {
+                None
+            };
+
+            if let Some(meta) = meta {
+                // Filter by strategy if specified
+                if let Some(filter) = strategy {
+                    if meta.get("strategy").and_then(|s| s.as_str()) != Some(filter) {
+                        continue;
+                    }
+                }
+                entries.push(meta);
+            }
+        }
+
+        // Sort by timestamp descending (newest first)
+        entries.sort_by(|a, b| {
+            let ts_a = a.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+            let ts_b = b.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+            ts_b.cmp(ts_a)
+        });
+        entries.truncate(limit);
+
+        Ok(serde_json::json!({ "evals": entries }).to_string())
+    }
+
+    /// View a specific eval result by ID.
+    pub fn eval_detail(&self, eval_id: &str) -> Result<String, String> {
+        let evals_dir = evals_dir()?;
+        let path = ContainedPath::child(&evals_dir, &format!("{eval_id}.json"))
+            .map_err(|e| format!("Invalid eval_id: {e}"))?;
+        if !path.0.exists() {
+            return Err(format!("Eval result not found: {eval_id}"));
+        }
+        std::fs::read_to_string(&path.0).map_err(|e| format!("Failed to read eval: {e}"))
     }
 
     /// Continue a paused execution — batch feed.
@@ -476,7 +633,9 @@ return report:to_table()
         }
         let result = last_result.ok_or("Empty responses array")?;
         self.maybe_log_transcript(&result, session_id);
-        Ok(result.to_json(session_id).to_string())
+        let json = result.to_json(session_id).to_string();
+        self.maybe_save_eval(&result, session_id, &json);
+        Ok(json)
     }
 
     /// Continue a paused execution — single response (with optional query_id).
@@ -498,7 +657,9 @@ return report:to_table()
             .map_err(|e| format!("Continue failed: {e}"))?;
 
         self.maybe_log_transcript(&result, session_id);
-        Ok(result.to_json(session_id).to_string())
+        let json = result.to_json(session_id).to_string();
+        self.maybe_save_eval(&result, session_id, &json);
+        Ok(json)
     }
 
     // ─── Package Management ─────────────────────────────────────
@@ -886,6 +1047,23 @@ return pkg.meta or {{ name = "{name}" }}"#
     fn maybe_log_transcript(&self, result: &FeedResult, session_id: &str) {
         if let FeedResult::Finished(exec_result) = result {
             write_transcript_log(&self.log_config, session_id, &exec_result.metrics);
+        }
+    }
+
+    /// If this session was an eval, save the final result to the eval store.
+    fn maybe_save_eval(&self, result: &FeedResult, session_id: &str, result_json: &str) {
+        if !matches!(result, FeedResult::Finished(_)) {
+            return;
+        }
+        let strategy = {
+            let mut map = match self.eval_sessions.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            map.remove(session_id)
+        };
+        if let Some(strategy) = strategy {
+            save_eval_result(&strategy, result_json);
         }
     }
 
@@ -1388,6 +1566,7 @@ mod tests {
             ),
             registry: Arc::new(algocline_engine::SessionRegistry::new()),
             log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let result = app.log_list(50).unwrap();

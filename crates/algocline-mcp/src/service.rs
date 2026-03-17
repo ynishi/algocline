@@ -95,7 +95,7 @@ pub struct AdviceParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EvalParams {
     /// Scenario definition as inline Lua code. Returns a table with bindings and cases.
-    /// Provide either `scenario` or `scenario_file`, not both.
+    /// Provide exactly one of: `scenario`, `scenario_file`, or `scenario_name`.
     ///
     /// Example:
     /// ```lua
@@ -108,13 +108,30 @@ pub struct EvalParams {
     /// }
     /// ```
     pub scenario: Option<String>,
-    /// Path to a scenario Lua file. Provide either `scenario` or `scenario_file`, not both.
+    /// Path to a scenario Lua file. Provide exactly one of: `scenario`, `scenario_file`, or `scenario_name`.
     pub scenario_file: Option<String>,
+    /// Name of an installed scenario (e.g. "math_basic").
+    /// Resolved from `~/.algocline/scenarios/{name}.lua`.
+    /// Provide exactly one of: `scenario`, `scenario_file`, or `scenario_name`.
+    pub scenario_name: Option<String>,
     /// Strategy package name to evaluate (e.g. "cove", "reflect", "ucb").
     /// Loaded via `ef.providers.algocline { strategy = "..." }`.
     pub strategy: String,
     /// Additional strategy-specific options (merged into provider opts).
     pub strategy_opts: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScenarioShowParams {
+    /// Scenario name (e.g. "math_basic"). Resolved from `~/.algocline/scenarios/{name}.lua`.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScenarioInstallParams {
+    /// Git URL or local absolute path containing scenario `.lua` files.
+    /// If the source contains a `scenarios/` subdirectory, files are read from there.
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -231,6 +248,7 @@ impl AlcService {
             .eval(
                 params.scenario,
                 params.scenario_file,
+                params.scenario_name,
                 &params.strategy,
                 params.strategy_opts,
             )
@@ -279,6 +297,39 @@ impl AlcService {
         self.app
             .eval_compare(&params.eval_id_a, &params.eval_id_b)
             .await
+    }
+
+    // ─── Scenario Management ───────────────────────────────────
+
+    /// List available scenarios in ~/.algocline/scenarios/.
+    #[tool(
+        name = "alc_scenario_list",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn scenario_list(&self) -> Result<String, String> {
+        self.app.scenario_list()
+    }
+
+    /// Show the content of an installed scenario by name.
+    #[tool(
+        name = "alc_scenario_show",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn scenario_show(
+        &self,
+        Parameters(params): Parameters<ScenarioShowParams>,
+    ) -> Result<String, String> {
+        self.app.scenario_show(&params.name)
+    }
+
+    /// Install scenarios from a Git URL or local path into ~/.algocline/scenarios/.
+    /// Expects the source to contain `.lua` files at root or in a `scenarios/` subdirectory.
+    #[tool(name = "alc_scenario_install", annotations(open_world_hint = false))]
+    async fn scenario_install(
+        &self,
+        Parameters(params): Parameters<ScenarioInstallParams>,
+    ) -> Result<String, String> {
+        self.app.scenario_install(params.url).await
     }
 
     // ─── Package Management ─────────────────────────────────────
@@ -371,6 +422,10 @@ impl ServerHandler for AlcService {
                  - alc_eval_history: List past eval results. Filter by strategy, sorted newest-first.\n\
                  - alc_eval_detail: View a specific eval result in full detail.\n\
                  - alc_eval_compare: Compare two eval results with Welch's t-test for statistical significance.\n\n\
+                 Scenario Management:\n\
+                 - alc_scenario_list: List available scenarios in ~/.algocline/scenarios/.\n\
+                 - alc_scenario_show: Show the content of an installed scenario by name.\n\
+                 - alc_scenario_install: Install scenarios from a Git URL or local path.\n\n\
                  Package Management:\n\
                  - alc_pkg_list: List installed packages with metadata.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\

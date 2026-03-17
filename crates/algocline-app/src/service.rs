@@ -304,6 +304,44 @@ pub(crate) fn packages_dir() -> Result<PathBuf, String> {
     Ok(home.join(".algocline").join("packages"))
 }
 
+pub(crate) fn scenarios_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(home.join(".algocline").join("scenarios"))
+}
+
+/// Resolve scenario code from one of three mutually exclusive sources:
+/// inline code, file path, or scenario name (looked up in `~/.algocline/scenarios/`).
+pub(crate) fn resolve_scenario_code(
+    scenario: Option<String>,
+    scenario_file: Option<String>,
+    scenario_name: Option<String>,
+) -> Result<String, String> {
+    match (scenario, scenario_file, scenario_name) {
+        (Some(c), None, None) => Ok(c),
+        (None, Some(path), None) => std::fs::read_to_string(Path::new(&path))
+            .map_err(|e| format!("Failed to read {path}: {e}")),
+        (None, None, Some(name)) => {
+            let dir = scenarios_dir()?;
+            let path = ContainedPath::child(&dir, &format!("{name}.lua"))
+                .map_err(|e| format!("Invalid scenario name: {e}"))?;
+            if !path.as_ref().exists() {
+                return Err(format!(
+                    "Scenario '{name}' not found at {}",
+                    path.as_ref().display()
+                ));
+            }
+            std::fs::read_to_string(path.as_ref())
+                .map_err(|e| format!("Failed to read scenario '{name}': {e}"))
+        }
+        (None, None, None) => {
+            Err("Provide one of: scenario, scenario_file, or scenario_name.".into())
+        }
+        _ => Err(
+            "Provide only one of: scenario, scenario_file, or scenario_name (not multiple).".into(),
+        ),
+    }
+}
+
 /// Git URLs for auto-installation. Collection repos contain multiple packages
 /// as subdirectories; single repos have init.lua at root.
 const AUTO_INSTALL_SOURCES: &[&str] = &[
@@ -325,6 +363,57 @@ fn is_package_installed(name: &str) -> bool {
     packages_dir()
         .map(|dir| dir.join(name).join("init.lua").exists())
         .unwrap_or(false)
+}
+
+/// Copy all `.lua` files from `source` directory into `dest` (scenarios dir).
+/// Skips files that already exist. Returns summary of installed/skipped.
+fn install_scenarios_from_dir(source: &Path, dest: &Path) -> Result<String, String> {
+    let entries =
+        std::fs::read_dir(source).map_err(|e| format!("Failed to read source dir: {e}"))?;
+
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|s| s.to_str());
+        if ext != Some("lua") {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let dest_path = match ContainedPath::child(dest, &file_name) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if dest_path.as_ref().exists() {
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(file_name);
+            skipped.push(name);
+            continue;
+        }
+        std::fs::copy(&path, dest_path.as_ref())
+            .map_err(|e| format!("Failed to copy {}: {e}", path.display()))?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(file_name);
+        installed.push(name);
+    }
+
+    if installed.is_empty() && skipped.is_empty() {
+        return Err("No .lua scenario files found in source.".into());
+    }
+
+    Ok(serde_json::json!({
+        "installed": installed,
+        "skipped": skipped,
+    })
+    .to_string())
 }
 
 // ─── Eval Result Store ──────────────────────────────────────────
@@ -506,6 +595,7 @@ impl AppService {
         &self,
         scenario: Option<String>,
         scenario_file: Option<String>,
+        scenario_name: Option<String>,
         strategy: &str,
         strategy_opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
@@ -521,7 +611,7 @@ impl AppService {
             }
         }
 
-        let scenario_code = resolve_code(scenario, scenario_file)?;
+        let scenario_code = resolve_scenario_code(scenario, scenario_file, scenario_name)?;
 
         // Build strategy opts Lua table literal
         let opts_lua = match &strategy_opts {
@@ -1038,6 +1128,25 @@ return pkg.meta or {{ name = "{name}" }}"#
                 installed.push(pkg_name);
             }
 
+            // Also install bundled scenarios if a `scenarios/` subdir exists
+            let scenarios_subdir = staging.path().join("scenarios");
+            let mut scenarios_installed: Vec<String> = Vec::new();
+            if scenarios_subdir.is_dir() {
+                if let Ok(sc_dir) = scenarios_dir() {
+                    let _ = std::fs::create_dir_all(&sc_dir);
+                    if let Ok(result) = install_scenarios_from_dir(&scenarios_subdir, &sc_dir) {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
+                            if let Some(arr) = parsed.get("installed").and_then(|v| v.as_array()) {
+                                scenarios_installed = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                            }
+                        }
+                    }
+                }
+            }
+
             if installed.is_empty() && skipped.is_empty() {
                 return Err(
                     "No packages found. Expected init.lua at root (single) or */init.lua (collection)."
@@ -1048,6 +1157,7 @@ return pkg.meta or {{ name = "{name}" }}"#
             Ok(serde_json::json!({
                 "installed": installed,
                 "skipped": skipped,
+                "scenarios_installed": scenarios_installed,
                 "mode": "collection",
             })
             .to_string())
@@ -1255,6 +1365,118 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
 
         Ok(serde_json::json!({ "sessions": sessions }).to_string())
+    }
+
+    // ─── Scenario Management ────────────────────────────────────
+
+    /// List available scenarios in `~/.algocline/scenarios/`.
+    pub fn scenario_list(&self) -> Result<String, String> {
+        let dir = scenarios_dir()?;
+        if !dir.exists() {
+            return Ok(serde_json::json!({ "scenarios": [] }).to_string());
+        }
+
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("Failed to read scenarios dir: {e}"))?;
+
+        let mut scenarios: Vec<serde_json::Value> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let ext = path.extension().and_then(|s| s.to_str());
+            if ext != Some("lua") {
+                continue;
+            }
+            let metadata = std::fs::metadata(&path);
+            let size_bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            scenarios.push(serde_json::json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "size_bytes": size_bytes,
+            }));
+        }
+
+        scenarios.sort_by(|a, b| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("name").and_then(|v| v.as_str()))
+        });
+
+        Ok(serde_json::json!({ "scenarios": scenarios }).to_string())
+    }
+
+    /// Show the content of a named scenario.
+    pub fn scenario_show(&self, name: &str) -> Result<String, String> {
+        let dir = scenarios_dir()?;
+        let path = ContainedPath::child(&dir, &format!("{name}.lua"))
+            .map_err(|e| format!("Invalid scenario name: {e}"))?;
+        if !path.as_ref().exists() {
+            return Err(format!("Scenario '{name}' not found"));
+        }
+        let content = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| format!("Failed to read scenario '{name}': {e}"))?;
+        Ok(serde_json::json!({
+            "name": name,
+            "path": path.as_ref().to_string_lossy(),
+            "content": content,
+        })
+        .to_string())
+    }
+
+    /// Install scenarios from a Git URL or local path into `~/.algocline/scenarios/`.
+    ///
+    /// Expects the source to contain `.lua` files (at root or in a `scenarios/` subdirectory).
+    pub async fn scenario_install(&self, url: String) -> Result<String, String> {
+        let dest_dir = scenarios_dir()?;
+        let _ = std::fs::create_dir_all(&dest_dir);
+
+        // Local path: copy .lua files directly
+        let local_path = Path::new(&url);
+        if local_path.is_absolute() && local_path.is_dir() {
+            return install_scenarios_from_dir(local_path, &dest_dir);
+        }
+
+        // Normalize URL
+        let git_url = if url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("file://")
+            || url.starts_with("git@")
+        {
+            url.clone()
+        } else {
+            format!("https://{url}")
+        };
+
+        let staging = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
+
+        let output = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                &git_url,
+                &staging.path().to_string_lossy(),
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git clone failed: {stderr}"));
+        }
+
+        // Prefer `scenarios/` subdirectory if it exists, otherwise use root
+        let source = if staging.path().join("scenarios").is_dir() {
+            staging.path().join("scenarios")
+        } else {
+            staging.path().to_path_buf()
+        };
+
+        install_scenarios_from_dir(&source, &dest_dir)
     }
 
     // ─── Internal ───────────────────────────────────────────────
@@ -1883,8 +2105,105 @@ mod proptests {
 
     #[test]
     fn eval_rejects_no_scenario() {
-        let result = resolve_code(None, None);
+        let result = resolve_scenario_code(None, None, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_scenario_code_inline() {
+        let result = resolve_scenario_code(Some("return 1".into()), None, None);
+        assert_eq!(result.unwrap(), "return 1");
+    }
+
+    #[test]
+    fn resolve_scenario_code_from_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"return 42").unwrap();
+        let result = resolve_scenario_code(None, Some(tmp.path().to_string_lossy().into()), None);
+        assert_eq!(result.unwrap(), "return 42");
+    }
+
+    #[test]
+    fn resolve_scenario_code_rejects_multiple() {
+        let result =
+            resolve_scenario_code(Some("code".into()), Some("file".into()), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("only one"));
+
+        let result2 = resolve_scenario_code(
+            Some("code".into()),
+            None,
+            Some("name".into()),
+        );
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn resolve_scenario_code_by_name_not_found() {
+        // scenario_name resolves from ~/.algocline/scenarios/ which won't have this
+        let result = resolve_scenario_code(None, None, Some("nonexistent_test_xyz".into()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    // ─── scenario management tests ───
+
+    #[test]
+    fn scenarios_dir_ends_with_expected_path() {
+        let dir = scenarios_dir().unwrap();
+        assert!(
+            dir.ends_with(".algocline/scenarios"),
+            "dir: {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn install_scenarios_from_dir_copies_lua_files() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        // Create test .lua files
+        std::fs::write(source.path().join("math_basic.lua"), "return {}").unwrap();
+        std::fs::write(source.path().join("safety.lua"), "return {}").unwrap();
+        // Non-lua file should be skipped
+        std::fs::write(source.path().join("README.md"), "# docs").unwrap();
+
+        let result = install_scenarios_from_dir(source.path(), dest.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let installed = parsed["installed"].as_array().unwrap();
+        assert_eq!(installed.len(), 2);
+        assert!(dest.path().join("math_basic.lua").exists());
+        assert!(dest.path().join("safety.lua").exists());
+        assert!(!dest.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn install_scenarios_from_dir_skips_existing() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        std::fs::write(source.path().join("existing.lua"), "return {new=true}").unwrap();
+        std::fs::write(dest.path().join("existing.lua"), "return {old=true}").unwrap();
+
+        let result = install_scenarios_from_dir(source.path(), dest.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["installed"].as_array().unwrap().len(), 0);
+
+        // Original file should be preserved
+        let content = std::fs::read_to_string(dest.path().join("existing.lua")).unwrap();
+        assert!(content.contains("old=true"));
+    }
+
+    #[test]
+    fn install_scenarios_from_dir_empty_source_errors() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        let result = install_scenarios_from_dir(source.path(), dest.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No .lua"));
     }
 
     #[test]
@@ -1915,7 +2234,7 @@ mod proptests {
         let svc = AppService::new(executor, config);
 
         let scenario = r#"return { cases = {} }"#;
-        let result = rt.block_on(svc.eval(Some(scenario.into()), None, "cove", None));
+        let result = rt.block_on(svc.eval(Some(scenario.into()), None, None, "cove", None));
         assert!(result.is_err());
         // Auto-install is attempted first; error is about bundled install failure
         // (git clone) or evalframe still missing after install

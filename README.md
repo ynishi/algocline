@@ -163,6 +163,10 @@ alc_continue({ session_id, response })
 | `alc_pkg_list` | List installed packages |
 | `alc_pkg_install` | Install a package or collection from Git URL or local path |
 | `alc_pkg_remove` | Remove an installed package |
+| `alc_eval` | Evaluate a strategy against a scenario (cases + graders) |
+| `alc_eval_history` | List past eval results, filter by strategy |
+| `alc_eval_detail` | View a specific eval result in full detail |
+| `alc_eval_compare` | Compare two eval results with Welch's t-test |
 | `alc_note` | Add a note to a completed session's log |
 | `alc_log_view` | View session logs (list or detail) |
 
@@ -231,6 +235,52 @@ The autonomous agent pattern eliminates relay overhead entirely. The agent handl
 | `rank` | Pairwise tournament ranking | Selecting best among candidates |
 | `factscore` | Atomic claim decomposition + verification | Fact-checking, claim validation |
 | `cod` | Iterative information densification | Summarization, compression |
+
+## Evaluating strategies
+
+algocline includes a built-in evaluation framework powered by [evalframe](https://github.com/ynishi/evalframe). Define scenarios with test cases and graders, then run them against any strategy to measure quality.
+
+### Define a scenario
+
+A scenario is a Lua table with bindings (graders) and cases (input/expected pairs):
+
+```lua
+-- scenario.lua
+local ef = require("evalframe")
+return {
+  ef.bind { ef.graders.contains },
+  cases = {
+    ef.case { input = "What is 2+2?", expected = "4" },
+    ef.case { input = "Capital of France?", expected = "Paris" },
+  },
+}
+```
+
+### Run an eval
+
+```
+alc_eval({ scenario: "...", strategy: "cove" })
+```
+
+Or point to a file:
+
+```
+alc_eval({ scenario_file: "/path/to/scenario.lua", strategy: "cove" })
+```
+
+The strategy is automatically wired as the provider — no boilerplate needed. Results include per-case scores, pass/fail status, and aggregate metrics.
+
+### Track and compare results
+
+Eval results are persisted to `~/.algocline/evals/` automatically.
+
+```
+alc_eval_history({ strategy: "cove", limit: 10 })   # List past results
+alc_eval_detail({ eval_id: "cove_1710672000" })      # Full result detail
+alc_eval_compare({ eval_id_a: "...", eval_id_b: "..." })  # Welch's t-test
+```
+
+`alc_eval_compare` performs a Welch's t-test on the score distributions, reporting whether the difference between two runs is statistically significant.
 
 ## Writing strategies
 

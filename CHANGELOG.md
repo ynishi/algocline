@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-17
+
+### Added
+
+- **`alc_eval`**: Evaluate a strategy against a scenario with test cases and graders. Accepts inline Lua (`scenario`) or file path (`scenario_file`) with a strategy name. Strategy is auto-wired as provider via `ef.providers.algocline`
+- **`alc_eval_history`**: List past eval results with optional strategy filter, sorted newest-first
+- **`alc_eval_detail`**: View a specific eval result by ID in full detail
+- **`alc_eval_compare`**: Compare two eval results with Welch's t-test for statistical significance via evalframe's `stats.welch_t`
+- **Eval persistence**: Results automatically saved to `~/.algocline/evals/` with full JSON result + lightweight meta files for fast listing
+- **`alc.time()`**: Wall-clock primitive for evalframe latency tracking
+- **evalframe**: Bundled as a system dependency, auto-installed on first `alc_eval` / `alc_eval_compare` use
+- **Multi-source bundled installation**: `alc init` now supports multiple source repositories (Collection and Single kinds) instead of a single URL. `--dev` mode searches local sibling directories
+
+### Changed
+
+- **`alc_pkg_list`**: System packages (evalframe) excluded from listing to avoid require errors and declutter output
+- **Lua string escaping**: Fixed escaping for newlines/carriage returns in bridge layer
+
 ## [0.3.0] - 2026-03-15
 
 ### Added

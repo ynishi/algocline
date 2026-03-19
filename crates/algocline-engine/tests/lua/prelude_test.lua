@@ -323,6 +323,30 @@ describe("alc.json_extract", function()
         expect(result).to.equal(nil)
         alc.json_decode = real_decode
     end)
+
+    it("skips non-JSON balanced braces and finds valid JSON", function()
+        alc.json_decode = function(s)
+            if s == '{"real": true}' then return { real = true } end
+            error("decode error")
+        end
+        local input = 'text {not json} then {"real": true} end'
+        local result = alc.json_extract(input)
+        expect(type(result)).to.equal("table")
+        expect(result.real).to.equal(true)
+        alc.json_decode = real_decode
+    end)
+
+    it("skips non-JSON balanced brackets and finds valid array", function()
+        alc.json_decode = function(s)
+            if s == '[1, 2]' then return { 1, 2 } end
+            error("decode error")
+        end
+        local input = 'see [broken then [1, 2] done'
+        local result = alc.json_extract(input)
+        expect(type(result)).to.equal("table")
+        expect(result[1]).to.equal(1)
+        alc.json_decode = real_decode
+    end)
 end)
 
 -- ─── alc.state.update ───
@@ -574,5 +598,15 @@ describe("alc.tuning", function()
         local ctx = { mode = 42 }
         local cfg = alc.tuning(defaults, ctx)
         expect(cfg.mode).to.equal(42)
+    end)
+
+    it("prefix with non-table value logs warning and uses defaults", function()
+        log_entries = {}
+        local defaults = { threshold = 3.0 }
+        local ctx = { biz = "not a table", threshold = 99 }
+        local cfg = alc.tuning(defaults, ctx, { prefix = "biz" })
+        expect(cfg.threshold).to.equal(3.0)  -- defaults, not 99
+        expect(#log_entries).to.equal(1)
+        expect(log_entries[1].level).to.equal("warn")
     end)
 end)

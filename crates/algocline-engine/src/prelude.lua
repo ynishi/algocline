@@ -161,9 +161,12 @@ function alc.json_extract(raw)
         ok, result = pcall(alc.json_decode, stripped)
         if ok and type(result) == "table" then return result end
     end
-    -- Balanced brace/bracket extraction
-    local json_str = raw:match("%b{}") or raw:match("%b[]")
-    if json_str then
+    -- Balanced brace/bracket extraction (try all matches)
+    for json_str in raw:gmatch("%b{}") do
+        ok, result = pcall(alc.json_decode, json_str)
+        if ok and type(result) == "table" then return result end
+    end
+    for json_str in raw:gmatch("%b[]") do
         ok, result = pcall(alc.json_decode, json_str)
         if ok and type(result) == "table" then return result end
     end
@@ -171,7 +174,7 @@ function alc.json_extract(raw)
 end
 
 --- alc.state.update(key, fn, default?) -> updated_value
---- Read current value, apply fn, write back. Atomic read-modify-write.
+--- Read current value, apply fn, write back. Single-operation read-modify-write.
 --- If key doesn't exist, uses default (or nil) as initial value.
 --- fn receives current value and must return new value.
 ---
@@ -219,7 +222,7 @@ function alc.fingerprint(str)
     local s = tostring(str):lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
     local hash = 5381
     for i = 1, #s do
-        hash = ((hash * 33) + s:byte(i)) % 0xFFFFFFFF
+        hash = ((hash * 33) + s:byte(i)) % 0x100000000
     end
     return string.format("%08x", hash)
 end
@@ -250,8 +253,15 @@ function alc.tuning(defaults, ctx, opts)
     if type(defaults) ~= "table" then return defaults end
     opts = opts or {}
     local source = ctx or {}
-    if opts.prefix and type(source[opts.prefix]) == "table" then
-        source = source[opts.prefix]
+    if opts.prefix then
+        local ns = source[opts.prefix]
+        if type(ns) == "table" then
+            source = ns
+        elseif ns ~= nil then
+            alc.log("warn", "alc.tuning: prefix '" .. opts.prefix
+                .. "' exists but is not a table, ignoring")
+            source = {}
+        end
     end
     local result = {}
     for k, v in pairs(defaults) do

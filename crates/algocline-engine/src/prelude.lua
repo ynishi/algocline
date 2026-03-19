@@ -139,3 +139,87 @@ function alc.parse_score(str, default)
     if n > 10 then return 10 end
     return n
 end
+
+--- alc.json_extract(raw) -> table | nil
+--- Extract JSON object or array from LLM output.
+--- Handles raw JSON, markdown fences (```json ... ```), and
+--- embedded JSON within surrounding text.
+--- Returns nil if no valid JSON found.
+---
+--- Usage:
+---   local data = alc.json_extract(llm_response)
+---   if data then process(data) end
+function alc.json_extract(raw)
+    if type(raw) ~= "string" then return nil end
+    -- Direct parse
+    local ok, result = pcall(alc.json_decode, raw)
+    if ok and type(result) == "table" then return result end
+    -- Markdown fences
+    local stripped = raw:match("```json%s*(.-)%s*```")
+        or raw:match("```%s*(.-)%s*```")
+    if stripped then
+        ok, result = pcall(alc.json_decode, stripped)
+        if ok and type(result) == "table" then return result end
+    end
+    -- Balanced brace/bracket extraction
+    local json_str = raw:match("%b{}") or raw:match("%b[]")
+    if json_str then
+        ok, result = pcall(alc.json_decode, json_str)
+        if ok and type(result) == "table" then return result end
+    end
+    return nil
+end
+
+--- alc.state.update(key, fn, default?) -> updated_value
+--- Read current value, apply fn, write back. Atomic read-modify-write.
+--- If key doesn't exist, uses default (or nil) as initial value.
+--- fn receives current value and must return new value.
+---
+--- Usage:
+---   alc.state.update("counter", function(n) return n + 1 end, 0)
+---
+---   alc.state.update("portfolio", function(p)
+---       p.updated_at = alc.time()
+---       table.insert(p.arms, new_arm)
+---       return p
+---   end, { arms = {}, history = {} })
+function alc.state.update(key, fn, default)
+    local current = alc.state.get(key, default)
+    local updated = fn(current)
+    alc.state.set(key, updated)
+    return updated
+end
+
+--- alc.llm_safe(prompt, opts, default) -> string
+--- Call alc.llm, returning default on failure instead of raising.
+--- Logs the error at warn level. Use for optional LLM enrichment
+--- where failure should not abort the pipeline.
+---
+--- Usage:
+---   local summary = alc.llm_safe(
+---       "Summarize: " .. text,
+---       { max_tokens = 200 },
+---       "(summary unavailable)"
+---   )
+function alc.llm_safe(prompt, opts, default)
+    local ok, result = pcall(alc.llm, prompt, opts)
+    if ok then return result end
+    alc.log("warn", "alc.llm_safe: " .. tostring(result))
+    return default
+end
+
+--- alc.fingerprint(str) -> string
+--- Normalize text (lowercase, collapse whitespace, trim) and
+--- return 8-char hex hash (DJB2). For deduplication, not cryptography.
+---
+--- Usage:
+---   local fp = alc.fingerprint("  Fix the Login Bug  ")
+---   -- fp == alc.fingerprint("fix the login bug")  -- true
+function alc.fingerprint(str)
+    local s = tostring(str):lower():gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    local hash = 5381
+    for i = 1, #s do
+        hash = ((hash * 33) + s:byte(i)) % 0xFFFFFFFF
+    end
+    return string.format("%08x", hash)
+end

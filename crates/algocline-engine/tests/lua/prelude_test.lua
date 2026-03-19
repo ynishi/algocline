@@ -471,3 +471,108 @@ describe("alc.fingerprint", function()
         expect(fp1).to.equal(fp2)
     end)
 end)
+
+-- ─── alc.tuning ───
+
+describe("alc.tuning", function()
+    it("returns defaults when ctx is empty", function()
+        local defaults = { threshold = 3.0, name = "test" }
+        local cfg = alc.tuning(defaults, {})
+        expect(cfg.threshold).to.equal(3.0)
+        expect(cfg.name).to.equal("test")
+    end)
+
+    it("overrides scalar with ctx value", function()
+        local defaults = { threshold = 3.0, rounds = 5 }
+        local ctx = { threshold = 4.5 }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(cfg.threshold).to.equal(4.5)
+        expect(cfg.rounds).to.equal(5)
+    end)
+
+    it("deep merges dict-like nested tables", function()
+        local defaults = { exponents = { alpha = 1.0, beta = 1.0, gamma = 2.0 } }
+        local ctx = { exponents = { alpha = 2.5 } }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(cfg.exponents.alpha).to.equal(2.5)
+        expect(cfg.exponents.beta).to.equal(1.0)
+        expect(cfg.exponents.gamma).to.equal(2.0)
+    end)
+
+    it("shallow replaces array-like tables", function()
+        local defaults = { gates = { {min = 3}, {min = 5} } }
+        local ctx = { gates = { {min = 7} } }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(#cfg.gates).to.equal(1)
+        expect(cfg.gates[1].min).to.equal(7)
+    end)
+
+    it("strips _schema key", function()
+        local defaults = {
+            threshold = 3.0,
+            _schema = { threshold = { type = "number", range = {1, 10} } },
+        }
+        local cfg = alc.tuning(defaults, {})
+        expect(cfg.threshold).to.equal(3.0)
+        expect(cfg._schema).to.equal(nil)
+    end)
+
+    it("supports prefix namespace", function()
+        local defaults = { threshold = 3.0, rounds = 5 }
+        local ctx = { biz = { threshold = 6.0 } }
+        local cfg = alc.tuning(defaults, ctx, { prefix = "biz" })
+        expect(cfg.threshold).to.equal(6.0)
+        expect(cfg.rounds).to.equal(5)
+    end)
+
+    it("prefix ignores top-level ctx keys", function()
+        local defaults = { threshold = 3.0 }
+        local ctx = { threshold = 99, biz = {} }
+        local cfg = alc.tuning(defaults, ctx, { prefix = "biz" })
+        expect(cfg.threshold).to.equal(3.0)  -- not 99
+    end)
+
+    it("handles nil ctx gracefully", function()
+        local defaults = { x = 1 }
+        local cfg = alc.tuning(defaults, nil)
+        expect(cfg.x).to.equal(1)
+    end)
+
+    it("handles non-table defaults", function()
+        local result = alc.tuning("not a table", {})
+        expect(result).to.equal("not a table")
+    end)
+
+    it("ctx false value overrides default", function()
+        local defaults = { enabled = true }
+        local ctx = { enabled = false }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(cfg.enabled).to.equal(false)
+    end)
+
+    it("does not include ctx keys absent from defaults", function()
+        local defaults = { a = 1 }
+        local ctx = { a = 2, extra = "leak" }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(cfg.a).to.equal(2)
+        expect(cfg.extra).to.equal(nil)
+    end)
+
+    it("deep merge two levels", function()
+        local defaults = {
+            outer = { inner = { x = 1, y = 2 }, keep = "yes" },
+        }
+        local ctx = { outer = { inner = { x = 10 } } }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(cfg.outer.inner.x).to.equal(10)
+        expect(cfg.outer.inner.y).to.equal(2)
+        expect(cfg.outer.keep).to.equal("yes")
+    end)
+
+    it("ctx can change type of value", function()
+        local defaults = { mode = "auto" }
+        local ctx = { mode = 42 }
+        local cfg = alc.tuning(defaults, ctx)
+        expect(cfg.mode).to.equal(42)
+    end)
+end)

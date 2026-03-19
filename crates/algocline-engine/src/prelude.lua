@@ -223,3 +223,51 @@ function alc.fingerprint(str)
     end
     return string.format("%08x", hash)
 end
+
+--- alc.tuning(defaults, ctx, opts?) -> table
+--- Merge tuning defaults with ctx overrides. Deep-merges dict-like
+--- nested tables; shallow-replaces arrays and scalars.
+--- Strips _schema key (reserved for Layer 2 parameter metadata).
+---
+--- Override priority: ctx values > tuning.lua defaults
+---
+--- opts.prefix: namespace key in ctx (e.g. "biz_kernel" reads
+---   ctx.biz_kernel.kill_threshold instead of ctx.kill_threshold)
+---
+--- Usage:
+---   local cfg = alc.tuning(require("my_pkg.tuning"), ctx)
+---   -- cfg.kill_threshold uses ctx.kill_threshold if present
+---
+---   -- With prefix (namespaced):
+---   local cfg = alc.tuning(require("my_pkg.tuning"), ctx, { prefix = "my_pkg" })
+---   -- reads from ctx.my_pkg.kill_threshold
+---
+---   -- Deep merge example:
+---   -- defaults: { exponents = { alpha = 1.0, beta = 1.0 } }
+---   -- ctx:      { exponents = { alpha = 2.0 } }
+---   -- result:   { exponents = { alpha = 2.0, beta = 1.0 } }
+function alc.tuning(defaults, ctx, opts)
+    if type(defaults) ~= "table" then return defaults end
+    opts = opts or {}
+    local source = ctx or {}
+    if opts.prefix and type(source[opts.prefix]) == "table" then
+        source = source[opts.prefix]
+    end
+    local result = {}
+    for k, v in pairs(defaults) do
+        if k == "_schema" then
+            -- reserved for parameter metadata, skip
+        elseif source[k] ~= nil then
+            if type(v) == "table" and type(source[k]) == "table" and v[1] == nil then
+                -- deep merge dict-like tables (no integer key 1)
+                result[k] = alc.tuning(v, source[k])
+            else
+                -- shallow replace: scalars, arrays, type changes
+                result[k] = source[k]
+            end
+        else
+            result[k] = v
+        end
+    end
+    return result
+end

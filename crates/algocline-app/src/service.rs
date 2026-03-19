@@ -39,7 +39,12 @@ impl TranscriptConfig {
 /// Write transcript log to `{dir}/{session_id}.json`.
 ///
 /// Silently returns on I/O errors — logging must not break execution.
-fn write_transcript_log(config: &TranscriptConfig, session_id: &str, metrics: &ExecutionMetrics) {
+fn write_transcript_log(
+    config: &TranscriptConfig,
+    session_id: &str,
+    metrics: &ExecutionMetrics,
+    strategy: Option<&str>,
+) {
     if !config.enabled {
         return;
     }
@@ -73,6 +78,7 @@ fn write_transcript_log(config: &TranscriptConfig, session_id: &str, metrics: &E
 
     let log_entry = serde_json::json!({
         "session_id": session_id,
+        "strategy": strategy,
         "task_hint": task_hint,
         "stats": auto_stats,
         "transcript": transcript,
@@ -96,10 +102,13 @@ fn write_transcript_log(config: &TranscriptConfig, session_id: &str, metrics: &E
     // Write lightweight meta file for log_list (avoids reading full transcript)
     let meta = serde_json::json!({
         "session_id": session_id,
+        "strategy": strategy,
         "task_hint": task_hint,
         "elapsed_ms": auto_stats.get("elapsed_ms"),
         "rounds": auto_stats.get("rounds"),
         "llm_calls": auto_stats.get("llm_calls"),
+        "total_prompt_chars": auto_stats.get("total_prompt_chars"),
+        "total_response_chars": auto_stats.get("total_response_chars"),
         "notes_count": 0,
     });
     if let Ok(meta_path) = ContainedPath::child(&config.dir, &format!("{session_id}.meta.json")) {
@@ -554,6 +563,9 @@ fn save_compare_result(eval_id_a: &str, eval_id_b: &str, result_json: &str) {
 /// Tracks which sessions are eval sessions and their strategy name.
 type EvalSessions = std::sync::Mutex<std::collections::HashMap<String, String>>;
 
+/// Tracks session_id → strategy name for all strategy-based sessions (advice, eval).
+type SessionStrategies = std::sync::Mutex<std::collections::HashMap<String, String>>;
+
 #[derive(Clone)]
 pub struct AppService {
     executor: Arc<Executor>,
@@ -561,6 +573,8 @@ pub struct AppService {
     log_config: TranscriptConfig,
     /// session_id → strategy name for eval sessions (cleared on completion).
     eval_sessions: Arc<EvalSessions>,
+    /// session_id → strategy name for log/stats tracking (cleared on session completion).
+    session_strategies: Arc<SessionStrategies>,
 }
 
 impl AppService {
@@ -570,6 +584,7 @@ impl AppService {
             registry: Arc::new(SessionRegistry::new()),
             log_config,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -582,7 +597,7 @@ impl AppService {
     ) -> Result<String, String> {
         let code = resolve_code(code, code_file)?;
         let ctx = ctx.unwrap_or(serde_json::Value::Null);
-        self.start_and_tick(code, ctx).await
+        self.start_and_tick(code, ctx, None).await
     }
 
     /// Apply a built-in strategy to a task.
@@ -615,7 +630,7 @@ impl AppService {
         ctx_map.insert("task".into(), serde_json::Value::String(task));
         let ctx = serde_json::Value::Object(ctx_map);
 
-        self.start_and_tick(code, ctx).await
+        self.start_and_tick(code, ctx, Some(strategy)).await
     }
 
     /// Run an evalframe evaluation suite.
@@ -716,7 +731,7 @@ return report:to_table()
         );
 
         let ctx = serde_json::Value::Null;
-        let result = self.start_and_tick(wrapped, ctx).await?;
+        let result = self.start_and_tick(wrapped, ctx, Some(strategy)).await?;
 
         // Register this session for eval result saving on completion.
         // start_and_tick returns the first pause (needs_response) or completed.
@@ -962,7 +977,7 @@ return {{
         );
 
         let ctx = serde_json::Value::Null;
-        let raw_result = self.start_and_tick(lua_code, ctx).await?;
+        let raw_result = self.start_and_tick(lua_code, ctx, None).await?;
 
         // Persist comparison result
         save_compare_result(eval_id_a, eval_id_b, &raw_result);
@@ -1420,6 +1435,170 @@ return pkg.meta or {{ name = "{name}" }}"#
         Ok(serde_json::json!({ "sessions": sessions }).to_string())
     }
 
+    // ─── Stats ──────────────────────────────────────────────────
+
+    /// Aggregate stats across all logged sessions.
+    ///
+    /// Scans `.meta.json` files (with `.json` fallback for legacy logs).
+    /// Optional filters: `strategy` (exact match), `days` (last N days).
+    pub fn stats(
+        &self,
+        strategy_filter: Option<&str>,
+        days: Option<u64>,
+    ) -> Result<String, String> {
+        let dir = &self.log_config.dir;
+        if !dir.is_dir() {
+            return Ok(serde_json::json!({
+                "total_sessions": 0,
+                "strategies": {},
+            })
+            .to_string());
+        }
+
+        let cutoff = days.map(|d| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+                - d * 86_400_000
+        });
+
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read log dir: {e}"))?;
+
+        #[derive(Default)]
+        struct StrategyAcc {
+            count: u64,
+            sum_elapsed_ms: u64,
+            sum_llm_calls: u64,
+            sum_rounds: u64,
+            sum_prompt_chars: u64,
+            sum_response_chars: u64,
+        }
+
+        let mut acc: std::collections::HashMap<String, StrategyAcc> =
+            std::collections::HashMap::new();
+        let mut total: u64 = 0;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Read meta from .meta.json or fall back to .json
+            let doc: serde_json::Value = if name.ends_with(".meta.json") {
+                match std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|r| serde_json::from_str(&r).ok())
+                {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else if name.ends_with(".json") && !name.ends_with(".meta.json") {
+                // Skip full logs if meta exists
+                let meta_name =
+                    format!("{}.meta.json", name.strip_suffix(".json").unwrap_or(&name));
+                let meta_path = dir.join(meta_name);
+                if meta_path.exists() {
+                    continue;
+                }
+                // Legacy fallback
+                match std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+                {
+                    Some(d) => {
+                        let stats = d.get("stats");
+                        serde_json::json!({
+                            "strategy": d.get("strategy").and_then(|v| v.as_str()),
+                            "elapsed_ms": stats.and_then(|s| s.get("elapsed_ms")),
+                            "llm_calls": stats.and_then(|s| s.get("llm_calls")),
+                            "rounds": stats.and_then(|s| s.get("rounds")),
+                            "total_prompt_chars": stats.and_then(|s| s.get("total_prompt_chars")),
+                            "total_response_chars": stats.and_then(|s| s.get("total_response_chars")),
+                        })
+                    }
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+
+            // Apply time filter via elapsed_ms proxy (file mtime would be better but
+            // meta files don't store timestamps; use mtime as approximation)
+            if let Some(cutoff_ms) = cutoff {
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if mtime < cutoff_ms {
+                    continue;
+                }
+            }
+
+            let strat = doc
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Apply strategy filter
+            if let Some(filter) = strategy_filter {
+                if strat != filter {
+                    continue;
+                }
+            }
+
+            let elapsed = doc.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let llm = doc.get("llm_calls").and_then(|v| v.as_u64()).unwrap_or(0);
+            let rounds = doc.get("rounds").and_then(|v| v.as_u64()).unwrap_or(0);
+            let prompt_chars = doc
+                .get("total_prompt_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let response_chars = doc
+                .get("total_response_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let a = acc.entry(strat).or_default();
+            a.count += 1;
+            a.sum_elapsed_ms += elapsed;
+            a.sum_llm_calls += llm;
+            a.sum_rounds += rounds;
+            a.sum_prompt_chars += prompt_chars;
+            a.sum_response_chars += response_chars;
+            total += 1;
+        }
+
+        // Build response
+        let mut strategies = serde_json::Map::new();
+        for (strat, a) in &acc {
+            let c = a.count.max(1); // avoid division by zero
+            strategies.insert(
+                strat.clone(),
+                serde_json::json!({
+                    "count": a.count,
+                    "avg_elapsed_ms": (a.sum_elapsed_ms + c / 2) / c,
+                    "avg_llm_calls": (a.sum_llm_calls + c / 2) / c,
+                    "avg_rounds": (a.sum_rounds + c / 2) / c,
+                    "total_prompt_chars": a.sum_prompt_chars,
+                    "total_response_chars": a.sum_response_chars,
+                }),
+            );
+        }
+
+        Ok(serde_json::json!({
+            "total_sessions": total,
+            "strategies": strategies,
+        })
+        .to_string())
+    }
+
     // ─── Scenario Management ────────────────────────────────────
 
     /// List available scenarios in `~/.algocline/scenarios/`.
@@ -1565,7 +1744,17 @@ return pkg.meta or {{ name = "{name}" }}"#
 
     fn maybe_log_transcript(&self, result: &FeedResult, session_id: &str) {
         if let FeedResult::Finished(exec_result) = result {
-            write_transcript_log(&self.log_config, session_id, &exec_result.metrics);
+            let strategy = self
+                .session_strategies
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(session_id));
+            write_transcript_log(
+                &self.log_config,
+                session_id,
+                &exec_result.metrics,
+                strategy.as_deref(),
+            );
         }
     }
 
@@ -1586,13 +1775,23 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
     }
 
-    async fn start_and_tick(&self, code: String, ctx: serde_json::Value) -> Result<String, String> {
+    async fn start_and_tick(
+        &self,
+        code: String,
+        ctx: serde_json::Value,
+        strategy: Option<&str>,
+    ) -> Result<String, String> {
         let session = self.executor.start_session(code, ctx).await?;
         let (session_id, result) = self
             .registry
             .start_execution(session)
             .await
             .map_err(|e| format!("Execution failed: {e}"))?;
+        if let Some(s) = strategy {
+            if let Ok(mut map) = self.session_strategies.lock() {
+                map.insert(session_id.clone(), s.to_string());
+            }
+        }
         self.maybe_log_transcript(&result, &session_id);
         Ok(result.to_json(&session_id).to_string())
     }
@@ -1839,7 +2038,7 @@ mod tests {
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
-        write_transcript_log(&config, "s-meta-test", &metrics);
+        write_transcript_log(&config, "s-meta-test", &metrics, Some("ucb"));
 
         // Main log should exist
         assert!(dir.path().join("s-meta-test.json").exists());
@@ -1855,8 +2054,46 @@ mod tests {
         assert!(meta.get("elapsed_ms").is_some());
         assert!(meta.get("rounds").is_some());
         assert!(meta.get("llm_calls").is_some());
+        assert_eq!(meta["strategy"], "ucb");
+        assert!(meta.get("total_prompt_chars").is_some());
+        assert!(meta.get("total_response_chars").is_some());
         // Meta should NOT contain transcript
         assert!(meta.get("transcript").is_none());
+
+        // Full log should also contain strategy
+        let log_raw = std::fs::read_to_string(dir.path().join("s-meta-test.json")).unwrap();
+        let log: serde_json::Value = serde_json::from_str(&log_raw).unwrap();
+        assert_eq!(log["strategy"], "ucb");
+    }
+
+    #[test]
+    fn write_transcript_log_strategy_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+
+        let metrics = algocline_core::ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        observer.on_paused(&[algocline_core::LlmQuery {
+            id: algocline_core::QueryId::single(),
+            prompt: "hello".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+        }]);
+        observer.on_response_fed(&algocline_core::QueryId::single(), "world");
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        write_transcript_log(&config, "s-no-strat", &metrics, None);
+
+        let meta_path = dir.path().join("s-no-strat.meta.json");
+        let raw = std::fs::read_to_string(&meta_path).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(meta["strategy"].is_null());
     }
 
     #[test]
@@ -1939,7 +2176,7 @@ mod tests {
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
-        write_transcript_log(&config, "s-disabled", &metrics);
+        write_transcript_log(&config, "s-disabled", &metrics, None);
 
         // No file should be created
         assert!(!dir.path().join("s-disabled.json").exists());
@@ -1955,7 +2192,7 @@ mod tests {
         };
         // Metrics with no observer events → empty transcript
         let metrics = algocline_core::ExecutionMetrics::new();
-        write_transcript_log(&config, "s-empty", &metrics);
+        write_transcript_log(&config, "s-empty", &metrics, None);
         assert!(!dir.path().join("s-empty.json").exists());
     }
 
@@ -2017,7 +2254,7 @@ mod tests {
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
-        write_transcript_log(&config, "s-long", &metrics);
+        write_transcript_log(&config, "s-long", &metrics, None);
 
         let raw = std::fs::read_to_string(dir.path().join("s-long.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -2086,6 +2323,7 @@ mod tests {
             registry: Arc::new(algocline_engine::SessionRegistry::new()),
             log_config: config,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let result = app.log_list(50).unwrap();
@@ -2101,6 +2339,140 @@ mod tests {
             .collect();
         assert!(ids.contains(&"s-big"));
         assert!(ids.contains(&"s-legacy"));
+    }
+
+    // ─── stats tests ───
+
+    #[test]
+    fn stats_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = app.stats(None, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_sessions"], 0);
+    }
+
+    #[test]
+    fn stats_aggregates_by_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create meta files for different strategies
+        let meta1 = serde_json::json!({
+            "session_id": "s-001", "strategy": "ucb",
+            "elapsed_ms": 1000, "llm_calls": 10, "rounds": 5,
+            "total_prompt_chars": 500, "total_response_chars": 300,
+        });
+        let meta2 = serde_json::json!({
+            "session_id": "s-002", "strategy": "ucb",
+            "elapsed_ms": 2000, "llm_calls": 12, "rounds": 6,
+            "total_prompt_chars": 600, "total_response_chars": 400,
+        });
+        let meta3 = serde_json::json!({
+            "session_id": "s-003", "strategy": "cove",
+            "elapsed_ms": 500, "llm_calls": 4, "rounds": 2,
+            "total_prompt_chars": 200, "total_response_chars": 150,
+        });
+
+        for (name, meta) in [("s-001", &meta1), ("s-002", &meta2), ("s-003", &meta3)] {
+            std::fs::write(
+                dir.path().join(format!("{name}.meta.json")),
+                serde_json::to_string(meta).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        // All strategies
+        let result = app.stats(None, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_sessions"], 3);
+        assert_eq!(parsed["strategies"]["ucb"]["count"], 2);
+        assert_eq!(parsed["strategies"]["ucb"]["avg_elapsed_ms"], 1500);
+        assert_eq!(parsed["strategies"]["ucb"]["avg_llm_calls"], 11);
+        assert_eq!(parsed["strategies"]["cove"]["count"], 1);
+
+        // Filter by strategy
+        let result = app.stats(Some("ucb"), None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_sessions"], 2);
+        assert!(parsed["strategies"]["cove"].is_null());
+
+        // Filter by nonexistent strategy
+        let result = app.stats(Some("nonexistent"), None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_sessions"], 0);
+    }
+
+    #[test]
+    fn stats_legacy_logs_without_strategy() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Legacy log without strategy field (pre-0.6.0)
+        let legacy = serde_json::json!({
+            "session_id": "s-legacy",
+            "stats": { "elapsed_ms": 300, "llm_calls": 2, "rounds": 1,
+                        "total_prompt_chars": 100, "total_response_chars": 50 },
+            "transcript": [],
+        });
+        std::fs::write(
+            dir.path().join("s-legacy.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let config = TranscriptConfig {
+            dir: dir.path().to_path_buf(),
+            enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = app.stats(None, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_sessions"], 1);
+        assert_eq!(parsed["strategies"]["unknown"]["count"], 1);
     }
 }
 

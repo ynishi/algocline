@@ -81,6 +81,14 @@ pub struct LogViewParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatsParams {
+    /// Filter by strategy name (e.g. "ucb", "cove"). Omit to see all strategies.
+    pub strategy: Option<String>,
+    /// Show only sessions from the last N days. Omit for all time.
+    pub days: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AdviceParams {
     /// Package name: "ucb" (UCB1 hypothesis exploration), "panel" (multi-perspective),
     /// "cot" (chain-of-thought), "sc" (self-consistency), "cove" (chain-of-verification),
@@ -400,6 +408,18 @@ impl AlcService {
         self.app
             .log_view(params.session_id.as_deref(), params.limit)
             .await
+    }
+
+    /// Aggregate usage stats across all logged sessions.
+    ///
+    /// Returns per-strategy counts, averages, and totals.
+    /// Filter by strategy name or time window (last N days).
+    #[tool(
+        name = "alc_stats",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn stats(&self, Parameters(params): Parameters<StatsParams>) -> Result<String, String> {
+        self.app.stats(params.strategy.as_deref(), params.days)
     }
 }
 

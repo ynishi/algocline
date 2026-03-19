@@ -109,6 +109,11 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.reduce(items, fn, init)   — fold to single value
 │  alc.vote(answers)             — majority aggregation
 │  alc.filter(items, fn)         — conditional selection
+│  alc.json_extract(raw)         — extract JSON from LLM output
+│  alc.state.update(key, fn)     — read-modify-write for state
+│  alc.llm_safe(prompt, opts, d) — non-throwing LLM wrapper
+│  alc.fingerprint(str)          — normalize + DJB2 hash (dedup)
+│  alc.tuning(defaults, ctx)     — config merge with deep merge
 │
 Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
    cot        — chain-of-thought                    [reasoning]
@@ -204,6 +209,16 @@ Agent(general-purpose) with prompt:
   4. Repeat until status="completed"
   5. Return the final result
 ```
+
+> **Known limitation: MCP tool permissions in subagents**
+>
+> Claude Code subagents may not inherit MCP tool permissions from the parent session's `settings.json`. If `alc_run`/`alc_continue` calls fail with permission errors inside a subagent, add the following to your `~/.claude/settings.json` under `permissions.allow`:
+>
+> ```json
+> "mcp__alc__*"
+> ```
+>
+> If the issue persists, run the `alc_run`/`alc_continue` loop directly from the main agent instead of delegating to a subagent.
 
 ### Pattern 3: MCP Sampling (future)
 

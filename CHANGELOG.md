@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-20
+
+### Added
+
+- **`alc.json_extract(raw)`**: Extract JSON object/array from LLM output. Handles raw JSON, markdown fences (` ```json ``` `), and embedded JSON within surrounding text via balanced brace/bracket iteration
+- **`alc.state.update(key, fn, default?)`**: Single-operation read-modify-write for state. Reads current value, applies transform function, writes back
+- **`alc.llm_safe(prompt, opts, default)`**: Non-throwing LLM wrapper. Returns default on failure instead of raising, logs warning. For optional enrichment where failure should not abort the pipeline
+- **`alc.fingerprint(str)`**: Text normalization + DJB2 hash (8-char hex). For deduplication, not cryptography
+- **`alc.tuning(defaults, ctx, opts?)`**: Config merge with deep-merge support for dict-like nested tables, shallow-replace for arrays/scalars. Supports `opts.prefix` for namespaced overrides, strips `_schema` key (reserved for Layer 2 parameter metadata)
+
+### Changed
+
+- **`BUNDLED_VERSION`**: Updated from `v0.3.0` to `v0.4.0` (6 new strategy packages: s2a, plan_solve, rstar, faithful, moa, bot)
+
+### Fixed
+
+- **`alc.json_extract`**: Iterate all balanced brace/bracket pairs via `gmatch` instead of first-match-only. Fixes false-negative when non-JSON balanced text precedes valid JSON
+- **`alc.fingerprint`**: DJB2 modulo corrected from `0xFFFFFFFF` (2^32-1) to `0x100000000` (2^32) per standard specification
+- **`alc.tuning`**: Warn and fall back to defaults when `opts.prefix` value exists but is not a table, preventing silent unintended overrides from top-level ctx keys
+
 ## [0.5.0] - 2026-03-18
 
 ### Added

@@ -63,6 +63,10 @@ When `status` is `completed`, return the `result` to the caller.
 4. **Be honest** — If you don't know something, say so. Mark uncertain claims as UNCERTAIN rather than guessing.
 5. **Use tools when relevant** — If the caller's prompt or the strategy's prompts reference codebases or files, use Grep/Read to ground your responses in facts.
 
+## Known Limitation: MCP Permissions
+
+This agent requires `mcp__alc__alc_run` and `mcp__alc__alc_continue` tools. Claude Code subagents may not inherit MCP tool permissions from the parent session. If MCP calls fail with permission errors, ensure `"mcp__alc__*"` is in `~/.claude/settings.json` under `permissions.allow`. If the issue persists, run the alc_run/alc_continue loop from the main agent directly.
+
 ## Common Strategies
 
 | Package | What it does | Typical LLM call count |

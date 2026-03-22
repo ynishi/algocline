@@ -73,6 +73,29 @@ Add algocline as an MCP server in your host's configuration (e.g. Claude Code's 
 
 After adding the config, restart your MCP host session so it picks up the new server.
 
+#### Environment variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `ALC_LOG_DIR` | Directory for session transcript logs | `~/.algocline/logs` |
+| `ALC_LOG_LEVEL` | `full` (enable logging) or `off` (disable) | `full` |
+| `ALC_PACKAGES_PATH` | Additional package search paths (colon-separated). Takes priority over `~/.algocline/packages/` | (none) |
+
+Example: writing logs to a custom directory:
+
+```json
+{
+  "mcpServers": {
+    "algocline": {
+      "command": "alc",
+      "env": {
+        "ALC_LOG_DIR": "/path/to/custom/logs"
+      }
+    }
+  }
+}
+```
+
 ### 4. Use
 
 Call algocline tools from your MCP host. The host LLM calls these tools on your behalf:

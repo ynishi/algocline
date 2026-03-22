@@ -1,3 +1,3 @@
 mod service;
 
-pub use service::{AppService, QueryResponse, TranscriptConfig};
+pub use service::{AppConfig, AppService, LogDirSource, QueryResponse};

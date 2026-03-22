@@ -49,11 +49,34 @@ mod init;
 
 use std::sync::Arc;
 
-use rmcp::{transport::stdio, ServiceExt};
-use tracing_subscriber::{self, EnvFilter};
-
+use algocline_app::{AppConfig, AppService};
 use algocline_engine::Executor;
-use algocline_mcp::{AlcService, TranscriptConfig};
+use algocline_mcp::AlcService;
+use rmcp::{transport::stdio, ServiceExt};
+
+fn setup_tracing(log_dir: Option<&std::path::Path>) -> anyhow::Result<()> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false);
+
+    let registry = tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(stderr_layer);
+
+    if let Some(dir) = log_dir {
+        let file_appender = tracing_appender::rolling::daily(dir, "tracing.log");
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file_appender)
+            .with_ansi(false);
+        registry.with(file_layer).try_init()?;
+    } else {
+        registry.try_init()?;
+    }
+
+    Ok(())
+}
 
 fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
@@ -95,18 +118,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Default: MCP server mode
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
+    let config = AppConfig::from_env();
+    setup_tracing(config.log_dir.as_deref())?;
 
     tracing::info!("algocline server starting");
 
     let lib_paths = resolve_lib_paths();
-    let log_config = TranscriptConfig::from_env();
     let executor = Arc::new(Executor::new(lib_paths).await?);
-    let server = AlcService::new(executor, log_config);
+    let app = AppService::new(executor, config);
+    let server = AlcService::new(app);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

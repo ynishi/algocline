@@ -4,35 +4,129 @@ use std::sync::Arc;
 use algocline_core::{ExecutionMetrics, QueryId};
 use algocline_engine::{Executor, FeedResult, SessionRegistry};
 
-// ─── Transcript logging ─────────────────────────────────────────
+// ─── Application Config ─────────────────────────────────────────
 
-/// Controls transcript log output.
-///
-/// - `ALC_LOG_DIR`: Directory for log files. Default: `~/.algocline/logs`.
-/// - `ALC_LOG_LEVEL`: `full` (default) or `off`.
-#[derive(Clone, Debug)]
-pub struct TranscriptConfig {
-    pub dir: PathBuf,
-    pub enabled: bool,
+/// How the log directory was resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogDirSource {
+    /// `ALC_LOG_DIR` environment variable.
+    EnvVar,
+    /// `~/.algocline/logs` (home-based default).
+    Home,
+    /// `$XDG_STATE_HOME/algocline/logs` or `~/.local/state/algocline/logs`.
+    StateDir,
+    /// Current working directory fallback.
+    CurrentDir,
+    /// No writable directory found — file logging disabled.
+    None,
 }
 
-impl TranscriptConfig {
-    /// Build from environment variables.
-    pub fn from_env() -> Self {
-        let dir = std::env::var("ALC_LOG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".algocline")
-                    .join("logs")
-            });
+impl std::fmt::Display for LogDirSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvVar => write!(f, "ALC_LOG_DIR"),
+            Self::Home => write!(f, "~/.algocline/logs"),
+            Self::StateDir => write!(f, "state_dir"),
+            Self::CurrentDir => write!(f, "current_dir"),
+            Self::None => write!(f, "none (stderr only)"),
+        }
+    }
+}
 
-        let enabled = std::env::var("ALC_LOG_LEVEL")
+/// Application-wide configuration resolved from environment variables.
+///
+/// Log directory resolution order:
+/// 1. `ALC_LOG_DIR` env var (explicit override)
+/// 2. `~/.algocline/logs` (home-based default)
+/// 3. `$XDG_STATE_HOME/algocline/logs` or `~/.local/state/algocline/logs`
+/// 4. Current working directory (sandbox fallback)
+/// 5. `None` — stderr-only mode (no file logging)
+///
+/// - `ALC_LOG_LEVEL`: `full` (default) or `off`.
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    /// Resolved log directory, or `None` if no writable directory is available.
+    pub log_dir: Option<PathBuf>,
+    pub log_dir_source: LogDirSource,
+    pub log_enabled: bool,
+}
+
+impl AppConfig {
+    /// Build from environment variables (single resolution point).
+    pub fn from_env() -> Self {
+        let (log_dir, log_dir_source) = Self::resolve_log_dir();
+
+        let log_enabled = std::env::var("ALC_LOG_LEVEL")
             .map(|v| v.to_lowercase() != "off")
             .unwrap_or(true);
 
-        Self { dir, enabled }
+        Self {
+            log_dir,
+            log_dir_source,
+            log_enabled,
+        }
+    }
+
+    /// Resolve log directory with fallback chain.
+    ///
+    /// Tries each candidate in order, creating the directory if needed via
+    /// [`ensure_dir`](Self::ensure_dir). Returns `(Some(path), source)` on
+    /// the first writable candidate, or `(None, LogDirSource::None)` if every
+    /// candidate fails.
+    ///
+    /// ## Fallback order
+    ///
+    /// 1. `ALC_LOG_DIR` env var — explicit user/operator override.
+    /// 2. `~/.algocline/logs` — home-based default (most common).
+    /// 3. `$XDG_STATE_HOME/algocline/logs` (or `~/.local/state/…`).
+    /// 4. `<cwd>/algocline-logs` — **sandbox fallback**.
+    ///    In containerised / sandbox environments (Docker, CI runners,
+    ///    restricted shells) the home directory and XDG paths may not
+    ///    exist or may be read-only. The current working directory is
+    ///    often the only writable location available, so we fall back
+    ///    to it to preserve file logging in those environments.
+    /// 5. `None` — no writable directory found; file logging is disabled
+    ///    and the server operates in stderr-only tracing mode.
+    fn resolve_log_dir() -> (Option<PathBuf>, LogDirSource) {
+        // 1. ALC_LOG_DIR env (explicit override — highest priority)
+        if let Ok(dir) = std::env::var("ALC_LOG_DIR") {
+            let path = PathBuf::from(dir);
+            if Self::ensure_dir(&path) {
+                return (Some(path), LogDirSource::EnvVar);
+            }
+        }
+
+        // 2. ~/.algocline/logs (home-based default)
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".algocline").join("logs");
+            if Self::ensure_dir(&path) {
+                return (Some(path), LogDirSource::Home);
+            }
+        }
+
+        // 3. state_dir (XDG_STATE_HOME or ~/.local/state)
+        if let Some(state) = dirs::state_dir() {
+            let path = state.join("algocline").join("logs");
+            if Self::ensure_dir(&path) {
+                return (Some(path), LogDirSource::StateDir);
+            }
+        }
+
+        // 4. Current working directory (sandbox fallback — see doc above)
+        if let Ok(cwd) = std::env::current_dir() {
+            let path = cwd.join("algocline-logs");
+            if Self::ensure_dir(&path) {
+                return (Some(path), LogDirSource::CurrentDir);
+            }
+        }
+
+        // 5. No writable directory — stderr-only
+        (None, LogDirSource::None)
+    }
+
+    /// Try to create the directory. Returns true if it exists and is writable.
+    fn ensure_dir(path: &Path) -> bool {
+        std::fs::create_dir_all(path).is_ok() && path.is_dir()
     }
 }
 
@@ -40,14 +134,15 @@ impl TranscriptConfig {
 ///
 /// Silently returns on I/O errors — logging must not break execution.
 fn write_transcript_log(
-    config: &TranscriptConfig,
+    config: &AppConfig,
     session_id: &str,
     metrics: &ExecutionMetrics,
     strategy: Option<&str>,
 ) {
-    if !config.enabled {
-        return;
-    }
+    let log_dir = match (&config.log_dir, config.log_enabled) {
+        (Some(dir), true) => dir,
+        _ => return,
+    };
 
     let transcript = metrics.transcript_to_json();
     if transcript.is_empty() {
@@ -84,11 +179,11 @@ fn write_transcript_log(
         "transcript": transcript,
     });
 
-    if std::fs::create_dir_all(&config.dir).is_err() {
+    if std::fs::create_dir_all(log_dir).is_err() {
         return;
     }
 
-    let path = match ContainedPath::child(&config.dir, &format!("{session_id}.json")) {
+    let path = match ContainedPath::child(log_dir, &format!("{session_id}.json")) {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -111,7 +206,7 @@ fn write_transcript_log(
         "total_response_chars": auto_stats.get("total_response_chars"),
         "notes_count": 0,
     });
-    if let Ok(meta_path) = ContainedPath::child(&config.dir, &format!("{session_id}.meta.json")) {
+    if let Ok(meta_path) = ContainedPath::child(log_dir, &format!("{session_id}.meta.json")) {
         let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
     }
 }
@@ -570,7 +665,7 @@ type SessionStrategies = std::sync::Mutex<std::collections::HashMap<String, Stri
 pub struct AppService {
     executor: Arc<Executor>,
     registry: Arc<SessionRegistry>,
-    log_config: TranscriptConfig,
+    log_config: AppConfig,
     /// session_id → strategy name for eval sessions (cleared on completion).
     eval_sessions: Arc<EvalSessions>,
     /// session_id → strategy name for log/stats tracking (cleared on session completion).
@@ -578,7 +673,7 @@ pub struct AppService {
 }
 
 impl AppService {
-    pub fn new(executor: Arc<Executor>, log_config: TranscriptConfig) -> Self {
+    pub fn new(executor: Arc<Executor>, log_config: AppConfig) -> Self {
         Self {
             executor,
             registry: Arc::new(SessionRegistry::new()),
@@ -586,6 +681,14 @@ impl AppService {
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Returns the log directory, or an error if file logging is unavailable.
+    fn require_log_dir(&self) -> Result<&Path, String> {
+        self.log_config
+            .log_dir
+            .as_deref()
+            .ok_or_else(|| "File logging is not available (no writable log directory)".to_string())
     }
 
     /// Execute Lua code with optional JSON context.
@@ -1339,7 +1442,7 @@ return pkg.meta or {{ name = "{name}" }}"#
         content: &str,
         title: Option<&str>,
     ) -> Result<String, String> {
-        let count = append_note(&self.log_config.dir, session_id, content, title)?;
+        let count = append_note(self.require_log_dir()?, session_id, content, title)?;
         Ok(serde_json::json!({
             "session_id": session_id,
             "notes_count": count,
@@ -1360,7 +1463,8 @@ return pkg.meta or {{ name = "{name}" }}"#
     }
 
     fn log_read(&self, session_id: &str) -> Result<String, String> {
-        let path = ContainedPath::child(&self.log_config.dir, &format!("{session_id}.json"))?;
+        let log_dir = self.require_log_dir()?;
+        let path = ContainedPath::child(log_dir, &format!("{session_id}.json"))?;
         if !path.as_ref().exists() {
             return Err(format!("Log file not found for session '{session_id}'"));
         }
@@ -1368,10 +1472,10 @@ return pkg.meta or {{ name = "{name}" }}"#
     }
 
     fn log_list(&self, limit: usize) -> Result<String, String> {
-        let dir = &self.log_config.dir;
-        if !dir.is_dir() {
-            return Ok(serde_json::json!({ "sessions": [] }).to_string());
-        }
+        let dir = match self.log_config.log_dir.as_deref() {
+            Some(d) if d.is_dir() => d,
+            _ => return Ok(serde_json::json!({ "sessions": [] }).to_string()),
+        };
 
         let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read log dir: {e}"))?;
 
@@ -1437,6 +1541,29 @@ return pkg.meta or {{ name = "{name}" }}"#
 
     // ─── Stats ──────────────────────────────────────────────────
 
+    /// Return diagnostic info about the current configuration (mise doctor style).
+    pub fn info(&self) -> String {
+        let mut info = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "log_dir": {
+                "resolved": self.log_config.log_dir.as_ref().map(|p| p.display().to_string()),
+                "source": self.log_config.log_dir_source.to_string(),
+            },
+            "log_enabled": self.log_config.log_enabled,
+            "tracing": if self.log_config.log_dir.is_some() { "file + stderr" } else { "stderr only" },
+        });
+
+        // packages dir
+        if let Some(home) = dirs::home_dir() {
+            let packages = home.join(".algocline").join("packages");
+            if packages.is_dir() {
+                info["packages_dir"] = serde_json::json!(packages.display().to_string());
+            }
+        }
+
+        serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())
+    }
+
     /// Aggregate stats across all logged sessions.
     ///
     /// Scans `.meta.json` files (with `.json` fallback for legacy logs).
@@ -1446,14 +1573,16 @@ return pkg.meta or {{ name = "{name}" }}"#
         strategy_filter: Option<&str>,
         days: Option<u64>,
     ) -> Result<String, String> {
-        let dir = &self.log_config.dir;
-        if !dir.is_dir() {
-            return Ok(serde_json::json!({
-                "total_sessions": 0,
-                "strategies": {},
-            })
-            .to_string());
-        }
+        let dir = match self.log_config.log_dir.as_deref() {
+            Some(d) if d.is_dir() => d,
+            _ => {
+                return Ok(serde_json::json!({
+                    "total_sessions": 0,
+                    "strategies": {},
+                })
+                .to_string());
+            }
+        };
 
         let cutoff = days.map(|d| {
             std::time::SystemTime::now()
@@ -1948,13 +2077,14 @@ mod tests {
         // Non-json file should be ignored
         std::fs::write(dir.path().join("README.txt"), "ignore me").unwrap();
 
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
 
         // Use log_list directly via the free function path
-        let entries = std::fs::read_dir(&config.dir).unwrap();
+        let entries = std::fs::read_dir(config.log_dir.as_ref().unwrap()).unwrap();
         let mut count = 0;
         for entry in entries.flatten() {
             if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
@@ -2019,9 +2149,10 @@ mod tests {
     #[test]
     fn write_transcript_log_creates_meta_file() {
         let dir = tempfile::tempdir().unwrap();
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
 
         let metrics = algocline_core::ExecutionMetrics::new();
@@ -2069,9 +2200,10 @@ mod tests {
     #[test]
     fn write_transcript_log_strategy_none() {
         let dir = tempfile::tempdir().unwrap();
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
 
         let metrics = algocline_core::ExecutionMetrics::new();
@@ -2148,19 +2280,21 @@ mod tests {
     #[test]
     fn transcript_config_default_enabled() {
         // Without env vars, should default to enabled
-        let config = TranscriptConfig {
-            dir: PathBuf::from("/tmp/test"),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(PathBuf::from("/tmp/test")),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
-        assert!(config.enabled);
+        assert!(config.log_enabled);
     }
 
     #[test]
     fn write_transcript_log_disabled_is_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: false,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: false,
         };
         let metrics = algocline_core::ExecutionMetrics::new();
         let observer = metrics.create_observer();
@@ -2186,9 +2320,10 @@ mod tests {
     #[test]
     fn write_transcript_log_empty_transcript_is_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
         // Metrics with no observer events → empty transcript
         let metrics = algocline_core::ExecutionMetrics::new();
@@ -2235,9 +2370,10 @@ mod tests {
     #[test]
     fn write_transcript_log_truncates_long_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
         let metrics = algocline_core::ExecutionMetrics::new();
         let observer = metrics.create_observer();
@@ -2309,9 +2445,10 @@ mod tests {
         )
         .unwrap();
 
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
         let app = AppService {
             executor: Arc::new(
@@ -2346,9 +2483,10 @@ mod tests {
     #[test]
     fn stats_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
         let app = AppService {
             executor: Arc::new(
@@ -2397,9 +2535,10 @@ mod tests {
             .unwrap();
         }
 
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
         let app = AppService {
             executor: Arc::new(
@@ -2452,9 +2591,10 @@ mod tests {
         )
         .unwrap();
 
-        let config = TranscriptConfig {
-            dir: dir.path().to_path_buf(),
-            enabled: true,
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
         };
         let app = AppService {
             executor: Arc::new(
@@ -2473,6 +2613,206 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["total_sessions"], 1);
         assert_eq!(parsed["strategies"]["unknown"]["count"], 1);
+    }
+
+    // ─── info / require_log_dir / LogDirSource tests ───
+
+    #[test]
+    fn info_returns_valid_json_with_expected_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            log_dir: Some(dir.path().to_path_buf()),
+            log_dir_source: LogDirSource::Home,
+            log_enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = app.info();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert!(parsed["version"].is_string());
+        assert!(parsed["log_dir"]["resolved"].is_string());
+        assert_eq!(
+            parsed["log_dir"]["source"].as_str().unwrap(),
+            "~/.algocline/logs"
+        );
+        assert_eq!(parsed["log_enabled"].as_bool().unwrap(), true);
+        assert_eq!(parsed["tracing"].as_str().unwrap(), "file + stderr");
+    }
+
+    #[test]
+    fn info_stderr_only_when_no_log_dir() {
+        let config = AppConfig {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = app.info();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert!(parsed["log_dir"]["resolved"].is_null());
+        assert_eq!(
+            parsed["log_dir"]["source"].as_str().unwrap(),
+            "none (stderr only)"
+        );
+        assert_eq!(parsed["tracing"].as_str().unwrap(), "stderr only");
+    }
+
+    #[test]
+    fn require_log_dir_returns_path_when_present() {
+        let config = AppConfig {
+            log_dir: Some(PathBuf::from("/tmp/test-logs")),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        assert_eq!(app.require_log_dir().unwrap(), Path::new("/tmp/test-logs"));
+    }
+
+    #[test]
+    fn require_log_dir_returns_err_when_none() {
+        let config = AppConfig {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        assert!(app.require_log_dir().is_err());
+    }
+
+    #[test]
+    fn write_transcript_log_noop_when_log_dir_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: true,
+        };
+        let metrics = algocline_core::ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        observer.on_paused(&[algocline_core::LlmQuery {
+            id: algocline_core::QueryId::single(),
+            prompt: "test".into(),
+            system: None,
+            max_tokens: 10,
+            grounded: false,
+            underspecified: false,
+        }]);
+        observer.on_response_fed(&algocline_core::QueryId::single(), "r");
+        observer.on_resumed();
+        observer.on_completed(&serde_json::json!(null));
+
+        write_transcript_log(&config, "s-none-dir", &metrics, None);
+
+        // No file anywhere — dir is unused, just verifying no panic
+        assert!(!dir.path().join("s-none-dir.json").exists());
+    }
+
+    #[test]
+    fn log_dir_source_display_all_variants() {
+        assert_eq!(LogDirSource::EnvVar.to_string(), "ALC_LOG_DIR");
+        assert_eq!(LogDirSource::Home.to_string(), "~/.algocline/logs");
+        assert_eq!(LogDirSource::StateDir.to_string(), "state_dir");
+        assert_eq!(LogDirSource::CurrentDir.to_string(), "current_dir");
+        assert_eq!(LogDirSource::None.to_string(), "none (stderr only)");
+    }
+
+    #[test]
+    fn log_list_returns_empty_when_no_log_dir() {
+        let config = AppConfig {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = app.log_list(50).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stats_returns_zero_when_no_log_dir() {
+        let config = AppConfig {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: true,
+        };
+        let app = AppService {
+            executor: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+            ),
+            registry: Arc::new(algocline_engine::SessionRegistry::new()),
+            log_config: config,
+            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let result = app.stats(None, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["total_sessions"].as_u64().unwrap(), 0);
     }
 }
 
@@ -2709,9 +3049,10 @@ mod proptests {
                 .await
                 .unwrap()
         }));
-        let config = TranscriptConfig {
-            dir: tmp.path().join("logs"),
-            enabled: false,
+        let config = AppConfig {
+            log_dir: Some(tmp.path().join("logs")),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: false,
         };
         let svc = AppService::new(executor, config);
 

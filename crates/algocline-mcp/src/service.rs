@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -7,8 +5,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use algocline_app::{AppService, TranscriptConfig};
-use algocline_engine::Executor;
+use algocline_app::AppService;
 
 // ─── MCP Parameter types (schemars-annotated) ───────────────────
 
@@ -174,10 +171,10 @@ pub struct AlcService {
 
 #[tool_router]
 impl AlcService {
-    pub fn new(executor: Arc<Executor>, log_config: TranscriptConfig) -> Self {
+    pub fn new(app: AppService) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            app: AppService::new(executor, log_config),
+            app,
         }
     }
 
@@ -421,6 +418,20 @@ impl AlcService {
     async fn stats(&self, Parameters(params): Parameters<StatsParams>) -> Result<String, String> {
         self.app.stats(params.strategy.as_deref(), params.days)
     }
+
+    // ─── Diagnostics ────────────────────────────────────────────
+
+    /// Show algocline server configuration and diagnostic info.
+    ///
+    /// Returns resolved log directory (with source), tracing mode,
+    /// packages directory, and version. Similar to `mise doctor`.
+    #[tool(
+        name = "alc_info",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn info(&self) -> Result<String, String> {
+        Ok(self.app.info())
+    }
 }
 
 #[tool_handler]
@@ -452,7 +463,9 @@ impl ServerHandler for AlcService {
                  - alc_pkg_remove: Remove an installed package.\n\n\
                  Logging:\n\
                  - alc_note: Add a note to a completed session's log (feedback, observations).\n\
-                 - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail."
+                 - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail.\n\n\
+                 Diagnostics:\n\
+                 - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

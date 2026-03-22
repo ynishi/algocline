@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-03-22
+
+### Added
+
+- **`alc_stats`**: Aggregate usage stats across all logged sessions. Per-strategy counts, averages (elapsed_ms, llm_calls, rounds), and totals. Optional `strategy` filter and `days` time window
+- **`alc_info`**: Diagnostic tool showing server configuration — resolved log directory (with source), tracing mode, packages directory, and version. Similar to `mise doctor`
+- **Strategy tracking**: Session logs (`.json` and `.meta.json`) now record `strategy` name for all advice/eval sessions, enabling per-strategy analytics
+
+### Changed
+
+- **`AppConfig`**: Replaced `TranscriptConfig` with centralized `AppConfig` resolved from environment variables. Single resolution point for all configuration
+- **Log directory fallback chain**: `ALC_LOG_DIR` env → `~/.algocline/logs` → `$XDG_STATE_HOME/algocline/logs` → `<cwd>/algocline-logs` → None (stderr-only). Sandbox/container environments now preserve file logging via cwd fallback
+- **Tracing**: Unified `setup_tracing` into single function accepting `Option<&Path>`. File + stderr when log dir available, stderr-only otherwise
+- **Crate dependencies**: Removed `algocline-engine` dependency from `algocline-mcp` — accepts `AppService` directly
+
+### Refactored
+
+- **`algocline-app::service`**: Split 3099-line monolithic `service.rs` into domain-based module directory (`service/config.rs`, `path.rs`, `resolve.rs`, `transcript.rs`, `eval_store.rs`, `run.rs`, `eval.rs`, `pkg.rs`, `logging.rs`, `scenario.rs`, `tests/`). No API changes
+
 ## [0.6.0] - 2026-03-20
 
 ### Added

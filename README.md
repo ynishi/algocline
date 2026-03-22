@@ -169,16 +169,18 @@ algocline (bin: alc)
 
 ### Execution model
 
+Each `alc_run` / `alc_advice` call spawns a **dedicated Lua VM** (OS thread + mlua instance). Concurrent sessions are fully isolated — each session's `alc`, `ctx`, and `package.loaded` live in their own VM, so parallel executions cannot interfere with each other.
+
 `alc.llm()` is a **cooperative yield**. When Lua calls it, the VM pauses and returns the prompt to the MCP host. The host processes the prompt with its own LLM, then calls `alc_continue` with the response to resume execution.
 
 ```
 alc_run(code)
-  → Lua executes → alc.llm("prompt") → VM pauses
+  → Spawn dedicated VM → Lua executes → alc.llm("prompt") → VM pauses
   → returns { status: "needs_response", prompt: "...", session_id: "..." }
 
 alc_continue({ session_id, response })
   → Lua resumes → ... → alc.llm("next prompt") → VM pauses again
-  → ...repeat until Lua returns a final value
+  → ...repeat until Lua returns a final value → VM cleaned up
 ```
 
 ## MCP Tools

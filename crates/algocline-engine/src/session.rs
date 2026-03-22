@@ -10,7 +10,7 @@ use algocline_core::{
     ExecutionMetrics, ExecutionObserver, ExecutionState, LlmQuery, MetricsObserver, QueryId,
     TerminalState,
 };
-use mlua_isle::AsyncTask;
+use mlua_isle::{AsyncIsleDriver, AsyncTask};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -119,6 +119,10 @@ impl FeedResult {
 // ─── Session ─────────────────────────────────────────────────
 
 /// A Lua execution session with domain state tracking.
+///
+/// Each session owns a dedicated Lua VM via `_vm_driver`. The VM's OS thread
+/// stays alive as long as the driver is held, and exits cleanly when the
+/// session is dropped (channel closes → Lua thread drains and exits).
 pub struct Session {
     state: ExecutionState,
     metrics: ExecutionMetrics,
@@ -127,6 +131,9 @@ pub struct Session {
     exec_task: AsyncTask,
     /// QueryId → resp_tx. Populated on Paused, cleared on resume.
     resp_txs: HashMap<QueryId, tokio::sync::oneshot::Sender<Result<String, String>>>,
+    /// Per-session VM lifecycle driver. Keeps the Lua thread alive.
+    /// Dropped when the session completes or is abandoned.
+    _vm_driver: AsyncIsleDriver,
 }
 
 impl Session {
@@ -134,6 +141,7 @@ impl Session {
         llm_rx: tokio::sync::mpsc::Receiver<LlmRequest>,
         exec_task: AsyncTask,
         metrics: ExecutionMetrics,
+        vm_driver: AsyncIsleDriver,
     ) -> Self {
         let observer = metrics.create_observer();
         Self {
@@ -143,6 +151,7 @@ impl Session {
             llm_rx,
             exec_task,
             resp_txs: HashMap::new(),
+            _vm_driver: vm_driver,
         }
     }
 

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-03-22
+
+### Fixed
+
+- **Per-session VM isolation**: Each `alc_run` / `alc_advice` call now spawns a dedicated Lua VM. Previously, all sessions shared a single VM, causing global namespace pollution (`alc`, `ctx`, `package.loaded`) between concurrent sessions. This eliminates coroutine cross-contamination when running multiple strategies in parallel
+
+### Changed
+
+- **`package.loaded` clearing removed**: No longer needed since each session starts with a fresh VM
+
 ## [0.7.0] - 2026-03-22
 
 ### Added

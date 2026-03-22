@@ -1,7 +1,6 @@
 //! Lua execution engine.
 //!
-//! Manages the mlua-isle VM and orchestrates StdLib injection
-//! for each session:
+//! Orchestrates StdLib injection and Lua execution for each session:
 //!
 //! 1. **Layer 0** — [`bridge::register`] injects Rust-backed `alc.*` primitives
 //! 2. **Layer 1** — [`PRELUDE`] adds Lua-based combinators (`alc.map`, etc.)
@@ -10,11 +9,13 @@
 //!
 //! ## Execution models
 //!
-//! - **`eval_simple`** — sync eval (no LLM bridge). For lightweight ops
-//!   like reading package metadata.
-//! - **`start_session`** — coroutine-based execution. `alc.llm()` yields
-//!   the coroutine instead of blocking the Lua thread, allowing other
-//!   requests to proceed while waiting for LLM responses.
+//! - **`eval_simple`** — sync eval on a shared VM (no LLM bridge).
+//!   For lightweight ops like reading package metadata.
+//! - **`start_session`** — spawns a **dedicated VM per session**.
+//!   Each session gets an isolated Lua VM so concurrent sessions
+//!   cannot interfere with each other's globals (`alc`, `ctx`).
+//!   `alc.llm()` yields the coroutine, and the VM is cleaned up
+//!   when the session completes or is abandoned.
 
 use std::path::PathBuf;
 
@@ -33,20 +34,26 @@ const PRELUDE: &str = include_str!("prelude.lua");
 
 /// Lua execution engine.
 ///
-/// Wraps mlua-isle AsyncIsle (Handle/Driver pattern) to provide
-/// non-blocking, cancellable Lua execution with alc StdLib injected.
+/// Holds a **shared VM** for lightweight stateless operations (`eval_simple`)
+/// and spawns **per-session VMs** for coroutine-based execution (`start_session`).
+///
+/// Per-session VMs eliminate global namespace pollution between concurrent
+/// sessions — each session's `alc`, `ctx`, and `package.loaded` are fully
+/// isolated.
 pub struct Executor {
+    /// Shared VM for eval_simple (stateless, no session globals).
     isle: AsyncIsle,
     _driver: AsyncIsleDriver,
+    /// Package resolver paths, cloned into each per-session VM.
+    lib_paths: Vec<PathBuf>,
 }
 
 impl Executor {
     pub async fn new(lib_paths: Vec<PathBuf>) -> anyhow::Result<Self> {
+        let paths_for_shared = lib_paths.clone();
         let (isle, driver) = AsyncIsle::spawn(move |lua| {
-            // Install mlua-pkg Registry once during VM initialization.
-            // This survives across sessions since mlua-isle reuses the VM.
             let mut reg = Registry::new();
-            for path in &lib_paths {
+            for path in &paths_for_shared {
                 if let Ok(resolver) = FsResolver::new(path) {
                     reg.add(resolver);
                 }
@@ -59,6 +66,7 @@ impl Executor {
         Ok(Self {
             isle,
             _driver: driver,
+            lib_paths,
         })
     }
 
@@ -80,12 +88,12 @@ impl Executor {
         serde_json::from_str(&json_str).map_err(|e| format!("JSON parse: {e}"))
     }
 
-    /// Start a new Lua execution session.
+    /// Start a new Lua execution session on a **dedicated VM**.
     ///
-    /// Phase 1 (sync exec): registers alc.* StdLib, ctx, prelude.
-    /// Phase 2 (coroutine): executes user Lua code. When `alc.llm()`
-    /// is called, the coroutine yields instead of blocking the Lua
-    /// thread, allowing other requests to proceed.
+    /// Each session gets its own Lua VM (OS thread + mlua instance) so
+    /// concurrent sessions cannot interfere with each other's globals.
+    /// The VM is cleaned up automatically when the session completes or
+    /// is abandoned (all senders drop → channel closes → thread exits).
     pub async fn start_session(
         &self,
         code: String,
@@ -101,53 +109,51 @@ impl Executor {
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();
 
-        // Phase 1: Setup (sync exec on Lua thread)
-        // Registers alc.* with async LLM bridge, sets ctx, loads prelude,
-        // clears package.loaded cache.
-        self.isle
+        // 1. Spawn a dedicated VM for this session.
+        let lib_paths = self.lib_paths.clone();
+        let (session_isle, session_driver) = AsyncIsle::spawn(move |lua| {
+            let mut reg = Registry::new();
+            for path in &lib_paths {
+                if let Ok(resolver) = FsResolver::new(path) {
+                    reg.add(resolver);
+                }
+            }
+            reg.install(lua)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Session VM spawn failed: {e}"))?;
+
+        // 2. Setup: register alc.* StdLib, set ctx, load prelude.
+        //    Safe to set globals — this VM is exclusively ours.
+        session_isle
             .exec(move |lua| {
-                // 1. Create alc StdLib table with async LLM bridge + state + stats
                 let alc_table = lua.create_table()?;
                 bridge::register(lua, &alc_table, Some(llm_tx), ns, custom_handle)?;
                 lua.globals().set("alc", alc_table)?;
 
-                // 2. Set ctx global
                 let ctx_value = lua.to_value(&lua_ctx)?;
                 lua.globals().set("ctx", ctx_value)?;
 
-                // 3. Load prelude (alc.map, alc.reduce, alc.vote, alc.filter)
                 lua.load(PRELUDE)
                     .exec()
                     .map_err(|e| IsleError::Lua(format!("Prelude load failed: {e}")))?;
 
-                // 4. Clear package.loaded cache so each session gets fresh modules
-                let loaded: mlua::Table =
-                    lua.globals().get::<mlua::Table>("package")?.get("loaded")?;
-                let keys: Vec<String> = loaded
-                    .pairs::<String, mlua::Value>()
-                    .filter_map(|r| r.ok().map(|(k, _)| k))
-                    .collect();
-                for key in keys {
-                    loaded.set(key, mlua::Value::Nil)?;
-                }
+                // No need to clear package.loaded — fresh VM.
 
                 Ok("ok".to_string())
             })
             .await
             .map_err(|e| format!("Session setup failed: {e}"))?;
 
-        // Phase 2: Execute user code as a coroutine.
-        // alc.llm() is an async function — when called, the coroutine
-        // yields and other coroutines/requests can make progress.
-        //
-        // The user code is wrapped so its return value is JSON-serialized
-        // via alc.json_encode. This matches the old spawn_exec behavior
-        // where the closure did serde_json::to_string. coroutine_eval's
-        // lua_value_to_string only does tostring(), which loses structure
-        // for tables.
+        // 3. Execute user code as a coroutine on the session VM.
         let wrapped_code = format!("return alc.json_encode((function()\n{lua_code}\nend)())");
-        let exec_task = self.isle.spawn_coroutine_eval(&wrapped_code);
+        let exec_task = session_isle.spawn_coroutine_eval(&wrapped_code);
 
-        Ok(Session::new(llm_rx, exec_task, metrics))
+        // Handle no longer needed — all requests have been sent.
+        // The driver keeps the channel alive until the session completes.
+        drop(session_isle);
+
+        Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
     }
 }

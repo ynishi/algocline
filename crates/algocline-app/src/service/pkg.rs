@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::path::{copy_dir, ContainedPath};
@@ -8,45 +9,110 @@ use super::resolve::{
 use super::AppService;
 
 impl AppService {
-    /// List installed packages with metadata.
+    /// List installed packages with metadata, showing the full override chain.
+    ///
+    /// Scans all search paths in priority order. For each package:
+    /// - `source`: the path it was found in
+    /// - `active`: whether this is the effective version (highest priority wins)
+    /// - `overrides`: if active and a lower-priority copy exists, shows what it overrides
     pub async fn pkg_list(&self) -> Result<String, String> {
-        let pkg_dir = packages_dir()?;
-        if !pkg_dir.is_dir() {
-            return Ok(serde_json::json!({ "packages": [] }).to_string());
+        // Collect packages from all search paths in priority order.
+        // Key: package name, Value: list of (search_path_index, source_display)
+        let mut seen: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        let mut all_packages: Vec<serde_json::Value> = Vec::new();
+
+        for (idx, sp) in self.search_paths.iter().enumerate() {
+            if !sp.path.is_dir() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&sp.path) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if !path.join("init.lua").exists() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_system_package(&name) {
+                    continue;
+                }
+
+                let source_display = sp.path.display().to_string();
+                seen.entry(name.clone())
+                    .or_default()
+                    .push((idx, source_display.clone()));
+
+                let occurrences = &seen[&name];
+                let active = occurrences.len() == 1; // first occurrence = highest priority
+
+                let code = format!(
+                    r#"local pkg = require("{name}")
+return pkg.meta or {{ name = "{name}" }}"#
+                );
+                let mut pkg_json = match self.executor.eval_simple(code).await {
+                    Ok(meta) => meta,
+                    Err(_) => serde_json::json!({ "name": name, "error": "failed to load meta" }),
+                };
+
+                if let Some(obj) = pkg_json.as_object_mut() {
+                    obj.insert(
+                        "source".to_string(),
+                        serde_json::Value::String(source_display),
+                    );
+                    obj.insert("active".to_string(), serde_json::Value::Bool(active));
+                }
+
+                all_packages.push(pkg_json);
+            }
         }
 
-        let mut packages = Vec::new();
-        let entries =
-            std::fs::read_dir(&pkg_dir).map_err(|e| format!("Failed to read packages dir: {e}"))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
+        // Second pass: add `overrides` field to active packages that shadow lower-priority ones.
+        for pkg in &mut all_packages {
+            let Some(obj) = pkg.as_object_mut() else {
+                continue;
+            };
+            let is_active = obj.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !is_active {
                 continue;
             }
-            let init_lua = path.join("init.lua");
-            if !init_lua.exists() {
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
                 continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip system packages (not user-facing strategies)
-            if is_system_package(&name) {
-                continue;
-            }
-            let code = format!(
-                r#"local pkg = require("{name}")
-return pkg.meta or {{ name = "{name}" }}"#
-            );
-            match self.executor.eval_simple(code).await {
-                Ok(meta) => packages.push(meta),
-                Err(_) => {
-                    packages
-                        .push(serde_json::json!({ "name": name, "error": "failed to load meta" }));
+            };
+            if let Some(occurrences) = seen.get(name) {
+                if occurrences.len() > 1 {
+                    // The overridden sources (all except the first/active one)
+                    let overridden: Vec<&str> = occurrences
+                        .iter()
+                        .skip(1)
+                        .map(|(_, s)| s.as_str())
+                        .collect();
+                    obj.insert("overrides".to_string(), serde_json::json!(overridden));
                 }
             }
         }
 
-        Ok(serde_json::json!({ "packages": packages }).to_string())
+        let search_paths_json: Vec<serde_json::Value> = self
+            .search_paths
+            .iter()
+            .map(|sp| {
+                serde_json::json!({
+                    "path": sp.path.display().to_string(),
+                    "source": sp.source.to_string(),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "packages": all_packages,
+            "search_paths": search_paths_json,
+        })
+        .to_string())
     }
 
     /// Install a package from a Git URL or local path.

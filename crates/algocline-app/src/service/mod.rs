@@ -4,7 +4,7 @@ mod eval_store;
 mod logging;
 pub(crate) mod path;
 mod pkg;
-pub(crate) mod resolve;
+pub mod resolve;
 mod run;
 mod scenario;
 mod transcript;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use algocline_engine::{Executor, SessionRegistry};
 
 pub use config::{AppConfig, LogDirSource};
-pub use resolve::QueryResponse;
+pub use resolve::{QueryResponse, SearchPath};
 
 // ─── Application Service ────────────────────────────────────────
 
@@ -33,6 +33,8 @@ pub struct AppService {
     executor: Arc<Executor>,
     registry: Arc<SessionRegistry>,
     log_config: AppConfig,
+    /// Package search paths in priority order (first = highest).
+    search_paths: Vec<resolve::SearchPath>,
     /// session_id → strategy name for eval sessions (cleared on completion).
     eval_sessions: Arc<EvalSessions>,
     /// session_id → strategy name for log/stats tracking (cleared on session completion).
@@ -40,11 +42,16 @@ pub struct AppService {
 }
 
 impl AppService {
-    pub fn new(executor: Arc<Executor>, log_config: AppConfig) -> Self {
+    pub fn new(
+        executor: Arc<Executor>,
+        log_config: AppConfig,
+        search_paths: Vec<resolve::SearchPath>,
+    ) -> Self {
         Self {
             executor,
             registry: Arc::new(SessionRegistry::new()),
             log_config,
+            search_paths,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }

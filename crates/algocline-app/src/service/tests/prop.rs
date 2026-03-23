@@ -245,7 +245,7 @@ fn eval_auto_installs_evalframe_on_missing() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: false,
     };
-    let svc = AppService::new(executor, config);
+    let svc = AppService::new(executor, config, vec![]);
 
     let scenario = r#"return { cases = {} }"#;
     let result = rt.block_on(svc.eval(Some(scenario.into()), None, None, "cove", None));

@@ -121,7 +121,20 @@ impl AppService {
             "tracing": if self.log_config.log_dir.is_some() { "file + stderr" } else { "stderr only" },
         });
 
-        // packages dir
+        // search paths (package resolution chain, priority order)
+        let search_paths_json: Vec<serde_json::Value> = self
+            .search_paths
+            .iter()
+            .map(|sp| {
+                serde_json::json!({
+                    "path": sp.path.display().to_string(),
+                    "source": sp.source.to_string(),
+                })
+            })
+            .collect();
+        info["search_paths"] = serde_json::json!(search_paths_json);
+
+        // packages dir (kept for backward compatibility)
         if let Some(home) = dirs::home_dir() {
             let packages = home.join(".algocline").join("packages");
             if packages.is_dir() {

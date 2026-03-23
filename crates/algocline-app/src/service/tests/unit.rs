@@ -537,6 +537,7 @@ fn log_list_prefers_meta_file() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.log_list(50).unwrap();
@@ -575,6 +576,7 @@ fn stats_empty_dir() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.stats(None, None).unwrap();
@@ -627,6 +629,7 @@ fn stats_aggregates_by_strategy() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     // All strategies
@@ -683,6 +686,7 @@ fn stats_legacy_logs_without_strategy() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.stats(None, None).unwrap();
@@ -712,6 +716,7 @@ fn info_returns_valid_json_with_expected_keys() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.info();
@@ -745,6 +750,7 @@ fn info_stderr_only_when_no_log_dir() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.info();
@@ -776,6 +782,7 @@ fn require_log_dir_returns_path_when_present() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     assert_eq!(app.require_log_dir().unwrap(), Path::new("/tmp/test-logs"));
@@ -799,6 +806,7 @@ fn require_log_dir_returns_err_when_none() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     assert!(app.require_log_dir().is_err());
@@ -859,6 +867,7 @@ fn log_list_returns_empty_when_no_log_dir() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.log_list(50).unwrap();
@@ -884,6 +893,7 @@ fn stats_returns_zero_when_no_log_dir() {
         log_config: config,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
     };
 
     let result = app.stats(None, None).unwrap();

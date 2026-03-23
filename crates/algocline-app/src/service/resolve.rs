@@ -2,6 +2,49 @@ use std::path::{Path, PathBuf};
 
 use super::path::ContainedPath;
 
+// ─── Search path (package resolution chain) ─────────────────────
+
+/// Source of a package search path entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchPathSource {
+    /// From `ALC_PACKAGES_PATH` environment variable.
+    Env,
+    /// Default `~/.algocline/packages/`.
+    Default,
+}
+
+impl std::fmt::Display for SearchPathSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Env => write!(f, "ALC_PACKAGES_PATH"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+/// A package search path with its origin, ordered by priority (first = highest).
+#[derive(Clone, Debug)]
+pub struct SearchPath {
+    pub path: PathBuf,
+    pub source: SearchPathSource,
+}
+
+impl SearchPath {
+    pub fn env(path: PathBuf) -> Self {
+        Self {
+            path,
+            source: SearchPathSource::Env,
+        }
+    }
+
+    pub fn default_global(path: PathBuf) -> Self {
+        Self {
+            path,
+            source: SearchPathSource::Default,
+        }
+    }
+}
+
 // ─── Parameter types (MCP-independent) ──────────────────────────
 
 /// A single query response in a batch feed.

@@ -78,7 +78,8 @@ fn setup_tracing(log_dir: Option<&std::path::Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
+fn resolve_lib_paths() -> Vec<algocline_app::SearchPath> {
+    use algocline_app::SearchPath;
     let mut paths = Vec::new();
 
     // 1. ALC_PACKAGES_PATH env (colon-separated, highest priority)
@@ -87,7 +88,7 @@ fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
         for p in env_paths.split(':') {
             let path = std::path::PathBuf::from(p);
             if path.is_dir() {
-                paths.push(path);
+                paths.push(SearchPath::env(path));
             }
         }
     }
@@ -96,7 +97,7 @@ fn resolve_lib_paths() -> Vec<std::path::PathBuf> {
     if let Some(home) = dirs::home_dir() {
         let packages = home.join(".algocline").join("packages");
         if packages.is_dir() {
-            paths.push(packages);
+            paths.push(SearchPath::default_global(packages));
         }
     }
 
@@ -123,9 +124,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("algocline server starting");
 
-    let lib_paths = resolve_lib_paths();
+    let search_paths = resolve_lib_paths();
+    let lib_paths: Vec<_> = search_paths.iter().map(|sp| sp.path.clone()).collect();
     let executor = Arc::new(Executor::new(lib_paths).await?);
-    let app = AppService::new(executor, config);
+    let app = AppService::new(executor, config, search_paths);
     let server = AlcService::new(app);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;

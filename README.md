@@ -123,6 +123,8 @@ return { result = final }
 ```
 Layer 0: Runtime Primitives (Rust → alc.*)
 │  alc.llm(prompt, opts?)        — Host LLM call via MCP Sampling
+│  alc.llm_batch(items)          — parallel LLM calls (single round-trip)
+│  alc.fork(strategies, ctx, o?) — parallel multi-VM strategy execution
 │  alc.json_encode/json_decode   — serde_json bridge
 │  alc.log(level, msg)           — tracing bridge
 │  alc.state.get/set/keys/delete — persistent key-value store
@@ -130,6 +132,8 @@ Layer 0: Runtime Primitives (Rust → alc.*)
 │  alc.progress(step, total, m?) — structured progress reporting
 │
 Layer 1: Prelude Combinators (Lua → alc.*)
+│  alc.cache(prompt, opts?)      — memoized LLM call (session-scoped)
+│  alc.parallel(items, fn, o?)   — batch-parallel LLM over array
 │  alc.map(items, fn)            — transform each element
 │  alc.reduce(items, fn, init)   — fold to single value
 │  alc.vote(answers)             — majority aggregation

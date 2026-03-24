@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-03-24
+
+### Added
+
+- **Budget control**: `ctx.budget` with `max_llm_calls` and `max_elapsed_ms` limits. `alc.budget_remaining()` (Layer 0) returns remaining capacity, `alc.budget_check()` (Layer 1) provides boolean guard for optional LLM calls. Budget is enforced at `alc.llm()` / `alc.llm_batch()` call time
+- **Token estimation**: `TokenCount` and `TokenSource` types for prompt/response token tracking in `ExecutionMetrics`
+- **Progress reporting**: `alc.progress(step, total, msg?)` for structured step tracking, readable via `alc_status`
+- **`alc_status`**: MCP tool to query active session status — state, metrics snapshot, progress, and strategy name. Omit `session_id` to list all active sessions
+- **`alc.pipe(strategies, ctx, opts?)`**: Sequential pipeline combinator. Chains multiple strategies, passing each stage's result as the next stage's `ctx.task`. Supports both `require()`-based strategies and inline functions. Records `pipe_history` for debugging
+
+### Changed
+
+- **`BridgeConfig` struct**: Replaced growing parameter list in `bridge::register()` with a single config struct holding `llm_tx`, `ns`, `custom_metrics`, `budget`, and `progress` handles
+- **Handle-based metrics access**: `CustomMetrics`, `Budget`, `Progress` now accessed via cloneable Handle types instead of `Arc<Mutex<T>>` directly
+
 ## [0.8.0] - 2026-03-24
 
 ### Changed

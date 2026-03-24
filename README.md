@@ -126,6 +126,8 @@ Layer 0: Runtime Primitives (Rust → alc.*)
 │  alc.json_encode/json_decode   — serde_json bridge
 │  alc.log(level, msg)           — tracing bridge
 │  alc.state.get/set/keys/delete — persistent key-value store
+│  alc.budget_remaining()        — remaining budget (calls/time)
+│  alc.progress(step, total, m?) — structured progress reporting
 │
 Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.map(items, fn)            — transform each element
@@ -137,6 +139,8 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.llm_safe(prompt, opts, d) — non-throwing LLM wrapper
 │  alc.fingerprint(str)          — normalize + DJB2 hash (dedup)
 │  alc.tuning(defaults, ctx)     — config merge with deep merge
+│  alc.budget_check()            — boolean budget guard
+│  alc.pipe(strategies, ctx)     — sequential strategy pipeline
 │
 Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
    cot        — chain-of-thought                    [reasoning]
@@ -199,6 +203,12 @@ alc_continue({ session_id, response })
 | `alc_eval_compare` | Compare two eval results with Welch's t-test |
 | `alc_note` | Add a note to a completed session's log |
 | `alc_log_view` | View session logs (list or detail) |
+| `alc_stats` | Aggregate usage stats across sessions (per-strategy) |
+| `alc_status` | Query active session status, progress, and metrics |
+| `alc_info` | Show server configuration and diagnostics |
+| `alc_scenario_list` | List installed eval scenarios |
+| `alc_scenario_show` | Show an installed scenario's content |
+| `alc_scenario_install` | Install scenarios from Git URL or local path |
 
 ## Host integration patterns
 

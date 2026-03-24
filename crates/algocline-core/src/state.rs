@@ -230,7 +230,7 @@ pub enum ResumeOutcome {
 }
 
 /// Terminal execution state. Only Completed, Failed, or Cancelled.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum TerminalState {
     Completed { result: serde_json::Value },
     Failed { error: String },

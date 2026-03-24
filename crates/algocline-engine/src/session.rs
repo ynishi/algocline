@@ -31,12 +31,14 @@ pub enum SessionError {
 // ─── Result types (Runtime layer) ────────────────────────────
 
 /// Session completion data: terminal state + metrics.
+#[derive(serde::Serialize)]
 pub struct ExecutionResult {
     pub state: TerminalState,
     pub metrics: ExecutionMetrics,
 }
 
 /// Result of a session interaction (start or feed).
+#[derive(serde::Serialize)]
 pub enum FeedResult {
     /// Partial feed accepted, still waiting for more responses.
     Accepted { remaining: usize },

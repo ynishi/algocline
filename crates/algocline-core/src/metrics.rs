@@ -276,6 +276,12 @@ impl Default for ExecutionMetrics {
     }
 }
 
+impl serde::Serialize for ExecutionMetrics {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
 /// Updates SessionStatus via the ExecutionObserver trait.
 pub struct MetricsObserver {
     auto: Arc<Mutex<SessionStatus>>,

@@ -45,16 +45,8 @@ impl SearchPath {
     }
 }
 
-// ─── Parameter types (MCP-independent) ──────────────────────────
-
-/// A single query response in a batch feed.
-#[derive(Debug)]
-pub struct QueryResponse {
-    /// Query ID (e.g. "q-0", "q-1").
-    pub query_id: String,
-    /// The host LLM's response for this query.
-    pub response: String,
-}
+// Re-export from core for backward compatibility.
+pub use algocline_core::QueryResponse;
 
 // ─── Code resolution ────────────────────────────────────────────
 

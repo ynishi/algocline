@@ -5,7 +5,9 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use algocline_app::AppService;
+use std::sync::Arc;
+
+use algocline_app::{EngineApi, QueryResponse};
 
 // ─── MCP Parameter types (schemars-annotated) ───────────────────
 
@@ -172,12 +174,12 @@ pub struct StatusParams {
 #[derive(Clone)]
 pub struct AlcService {
     tool_router: ToolRouter<Self>,
-    app: AppService,
+    app: Arc<dyn EngineApi>,
 }
 
 #[tool_router]
 impl AlcService {
-    pub fn new(app: AppService) -> Self {
+    pub fn new(app: Arc<dyn EngineApi>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             app,
@@ -225,7 +227,7 @@ impl AlcService {
         if let Some(responses) = params.responses {
             let app_responses = responses
                 .into_iter()
-                .map(|r| algocline_app::QueryResponse {
+                .map(|r| QueryResponse {
                     query_id: r.query_id,
                     response: r.response,
                 })
@@ -278,6 +280,7 @@ impl AlcService {
     ) -> Result<String, String> {
         self.app
             .eval_history(params.strategy.as_deref(), params.limit.unwrap_or(20))
+            .await
     }
 
     /// View a specific eval result in full detail.
@@ -289,7 +292,7 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<EvalDetailParams>,
     ) -> Result<String, String> {
-        self.app.eval_detail(&params.eval_id)
+        self.app.eval_detail(&params.eval_id).await
     }
 
     /// Compare two eval results with Welch's t-test for statistical significance.
@@ -318,7 +321,7 @@ impl AlcService {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn scenario_list(&self) -> Result<String, String> {
-        self.app.scenario_list()
+        self.app.scenario_list().await
     }
 
     /// Show the content of an installed scenario by name.
@@ -330,7 +333,7 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<ScenarioShowParams>,
     ) -> Result<String, String> {
-        self.app.scenario_show(&params.name)
+        self.app.scenario_show(&params.name).await
     }
 
     /// Install scenarios from a Git URL or local path into ~/.algocline/scenarios/.
@@ -422,7 +425,9 @@ impl AlcService {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn stats(&self, Parameters(params): Parameters<StatsParams>) -> Result<String, String> {
-        self.app.stats(params.strategy.as_deref(), params.days)
+        self.app
+            .stats(params.strategy.as_deref(), params.days)
+            .await
     }
 
     // ─── Session Status ─────────────────────────────────────────
@@ -455,7 +460,7 @@ impl AlcService {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn info(&self) -> Result<String, String> {
-        Ok(self.app.info())
+        Ok(self.app.info().await)
     }
 }
 

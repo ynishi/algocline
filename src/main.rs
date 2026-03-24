@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     let lib_paths: Vec<_> = search_paths.iter().map(|sp| sp.path.clone()).collect();
     let executor = Arc::new(Executor::new(lib_paths).await?);
     let app = AppService::new(executor, config, search_paths);
-    let server = AlcService::new(app);
+    let server = AlcService::new(Arc::new(app));
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

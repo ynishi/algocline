@@ -1,6 +1,7 @@
 mod budget;
 mod custom;
 pub mod domain;
+mod engine_api;
 pub mod metrics;
 mod observer;
 mod progress;
@@ -11,6 +12,7 @@ mod tokens;
 
 pub use budget::{Budget, BudgetHandle};
 pub use custom::{CustomMetrics, CustomMetricsHandle};
+pub use engine_api::{EngineApi, QueryResponse};
 pub use metrics::{ExecutionMetrics, MetricsObserver};
 pub use observer::ExecutionObserver;
 pub use progress::{ProgressHandle, ProgressInfo};

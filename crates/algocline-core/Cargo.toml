@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 indexmap = { version = "2", features = ["serde"] }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

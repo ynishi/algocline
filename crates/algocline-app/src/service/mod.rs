@@ -1,4 +1,5 @@
 mod config;
+mod engine_api_impl;
 mod eval;
 mod eval_store;
 mod logging;
@@ -18,6 +19,7 @@ use std::sync::Arc;
 
 use algocline_engine::{Executor, SessionRegistry};
 
+pub use algocline_core::EngineApi;
 pub use config::{AppConfig, LogDirSource};
 pub use resolve::{QueryResponse, SearchPath};
 

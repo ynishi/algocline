@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-03-25
+
+### Added
+
+- **`alc.fork(strategies, ctx, opts?)`**: Parallel multi-VM strategy execution (Layer 0). Spawns N independent Lua VMs, each running one strategy with the same context. LLM requests from all children are batched through the parent's channel for true LLM parallelism. Strategy names validated (alphanumeric + underscore only)
+- **`alc.cache(prompt, opts?)`**: Session-scoped memoized LLM call (Layer 1). Returns cached response for repeated identical prompts. FIFO eviction at 256 entries. Supports `cache_key` override and `cache_skip` bypass. `alc.cache_info()` / `alc.cache_clear()` for introspection
+- **`alc.parallel(items, prompt_fn, opts?)`**: Batch-parallel LLM calls over an array (Layer 1). Transforms each item into a prompt via `prompt_fn`, sends all as a single `alc.llm_batch()` call. Optional `post_fn` for response post-processing
+- **`QueryId::fork(vm_index, seq)`**: Fork-specific query ID format (`f-{vm}-{seq}`) for child VM LLM request tracking
+- **`query_id` auto-resolve**: `alc_continue` without explicit `query_id` now auto-resolves when exactly one query is pending. Returns error for zero or multiple pending queries
+- **`query_id` in response**: Single-query `needs_response` now includes `query_id` field for explicit identification
+
+### Changed
+
+- **`BridgeConfig`**: Added `lib_paths` field for package search paths (needed by `alc.fork` to setup child VMs)
+- **`bridge` module split**: Extracted `ForkEvent`, `ForkQuery`, `register_fork` into `bridge/fork.rs` submodule (bridge.rs 1249 → mod.rs 934 + fork.rs 345)
+
 ## [0.9.0] - 2026-03-24
 
 ### Added

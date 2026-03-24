@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`EngineApi` trait**: Extracted transport-independent API trait from `AppService` into `algocline-core`. MCP handler now operates through `Arc<dyn EngineApi>`, enabling future remote (socket/HTTP) implementations without depending on the concrete `AppService`
+- **`FeedResult`, `ExecutionResult`, `TerminalState`**: Added `Serialize` derive for future transport serialization (HTTP/gRPC)
 - **`BridgeConfig`**: Added `lib_paths` field for package search paths (needed by `alc.fork` to setup child VMs)
 - **`bridge` module split**: Extracted `ForkEvent`, `ForkQuery`, `register_fork` into `bridge/fork.rs` submodule (bridge.rs 1249 → mod.rs 934 + fork.rs 345)
 

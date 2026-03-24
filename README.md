@@ -170,7 +170,7 @@ Layer 0/1 are always available. Layer 2 packages are installed via `alc init` or
 
 ```
 algocline (bin: alc)
-├── algocline-core      — Domain types (SessionId, QueryId, TickResult)
+├── algocline-core      — Domain types, EngineApi trait (transport-independent API surface)
 ├── algocline-engine    — Lua VM executor, session registry, bridge
 └── algocline-mcp       — MCP tool handlers (alc_run, alc_advice, etc.)
 ```

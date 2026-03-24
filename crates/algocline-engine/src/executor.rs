@@ -115,6 +115,7 @@ impl Executor {
             custom_metrics: metrics.custom_metrics_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
+            lib_paths: self.lib_paths.clone(),
         };
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();

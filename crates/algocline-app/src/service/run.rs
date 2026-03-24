@@ -83,7 +83,11 @@ impl AppService {
     ) -> Result<String, String> {
         let query_id = match query_id {
             Some(qid) => QueryId::parse(qid),
-            None => QueryId::single(),
+            None => self
+                .registry
+                .resolve_sole_pending_id(session_id)
+                .await
+                .map_err(|e| format!("Continue failed: {e}"))?,
         };
 
         let result = self

@@ -5,6 +5,7 @@
 //! insta snapshots.
 
 use std::borrow::Cow;
+use std::io::Write;
 
 use rmcp::{model::CallToolRequestParams, transport::TokioChildProcess, ServiceExt};
 use serde_json::{json, Map, Value};
@@ -75,6 +76,20 @@ fn redact_paths(text: &str) -> String {
 /// Apply all redactions.
 fn redact(text: &str) -> String {
     redact_paths(&redact_uuids(text))
+}
+
+/// Call a tool, extract text, parse as JSON.
+async fn call_json(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    args: Value,
+) -> Value {
+    let result = client
+        .call_tool(call_params(name, args))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("JSON parse failed: {e}\nraw: {text}"))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────
@@ -189,6 +204,314 @@ async fn test_alc_continue_invalid_session() {
             || text.to_lowercase().contains("unknown"),
         "expected 'not found' error, got: {text}"
     );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+// ─── LLM round-trip tests ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_alc_llm_single_roundtrip() {
+    let client = connect().await;
+
+    // 1. Run code that calls alc.llm()
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": "return alc.llm('What is 2+2?')" }),
+    )
+    .await;
+    assert_eq!(resp["status"], "needs_response");
+    let session_id = resp["session_id"].as_str().expect("session_id missing");
+    assert!(resp["prompt"].as_str().is_some(), "prompt missing");
+    assert!(
+        resp.get("query_id").is_some(),
+        "query_id missing in response"
+    );
+
+    // 2. Continue with response (no explicit query_id — tests auto-resolve)
+    let resp = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "4" }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed");
+    assert_eq!(resp["result"], "4");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_llm_batch_roundtrip() {
+    let client = connect().await;
+
+    // 1. Run code that calls alc.llm_batch()
+    let code = r#"
+        local results = alc.llm_batch({
+            { prompt = "Say A" },
+            { prompt = "Say B" },
+        })
+        return results
+    "#;
+    let resp = call_json(&client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "needs_response");
+    let session_id = resp["session_id"].as_str().expect("session_id missing");
+    let queries = resp["queries"].as_array().expect("queries array missing");
+    assert_eq!(queries.len(), 2);
+
+    let q0_id = queries[0]["id"].as_str().expect("q-0 id missing");
+    let q1_id = queries[1]["id"].as_str().expect("q-1 id missing");
+
+    // 2. Feed responses via batch
+    let resp = call_json(
+        &client,
+        "alc_continue",
+        json!({
+            "session_id": session_id,
+            "responses": [
+                { "query_id": q0_id, "response": "Alpha" },
+                { "query_id": q1_id, "response": "Beta" },
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed");
+    let result = resp["result"].as_array().expect("result should be array");
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], "Alpha");
+    assert_eq!(result[1], "Beta");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_cache_hit_miss() {
+    let client = connect().await;
+
+    // Code: call alc.cache twice with same prompt, return cache_info
+    let code = r#"
+        local r1 = alc.cache("cached prompt")
+        local r2 = alc.cache("cached prompt")
+        local info = alc.cache_info()
+        return { r1 = r1, r2 = r2, info = info }
+    "#;
+
+    // 1. First call pauses (cache miss)
+    let resp = call_json(&client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "needs_response");
+    let session_id = resp["session_id"].as_str().expect("session_id missing");
+
+    // 2. Continue — cache miss resolved, second call hits cache
+    let resp = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "cached_value" }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed");
+    let result = &resp["result"];
+    assert_eq!(result["r1"], "cached_value");
+    assert_eq!(
+        result["r2"], "cached_value",
+        "cache hit should return same value"
+    );
+    assert_eq!(result["info"]["hits"], 1);
+    assert_eq!(result["info"]["misses"], 1);
+    assert_eq!(result["info"]["entries"], 1);
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_parallel_roundtrip() {
+    let client = connect().await;
+
+    // alc.parallel sends items as llm_batch
+    let code = r#"
+        local items = {"apple", "banana"}
+        local results = alc.parallel(items, function(item, i)
+            return "Describe " .. item
+        end)
+        return results
+    "#;
+
+    // 1. Pauses with batch queries
+    let resp = call_json(&client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "needs_response");
+    let session_id = resp["session_id"].as_str().expect("session_id missing");
+    let queries = resp["queries"].as_array().expect("queries missing");
+    assert_eq!(queries.len(), 2);
+
+    let q0_id = queries[0]["id"].as_str().expect("id missing");
+    let q1_id = queries[1]["id"].as_str().expect("id missing");
+
+    // 2. Feed batch
+    let resp = call_json(
+        &client,
+        "alc_continue",
+        json!({
+            "session_id": session_id,
+            "responses": [
+                { "query_id": q0_id, "response": "A red fruit" },
+                { "query_id": q1_id, "response": "A yellow fruit" },
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed");
+    let result = resp["result"].as_array().expect("result array");
+    assert_eq!(result[0], "A red fruit");
+    assert_eq!(result[1], "A yellow fruit");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_fork_roundtrip() {
+    let client = connect().await;
+
+    // 1. Create temp packages and install them
+    let tmp_dir = tempfile::tempdir().expect("failed to create tempdir");
+
+    let pkg_a_dir = tmp_dir.path().join("e2e_fork_a");
+    std::fs::create_dir_all(&pkg_a_dir).expect("mkdir");
+    let mut f = std::fs::File::create(pkg_a_dir.join("init.lua")).expect("create init.lua");
+    write!(
+        f,
+        r#"local M = {{}}
+M.meta = {{ name = "e2e_fork_a", version = "0.1.0", description = "E2E fork A" }}
+function M.run(ctx)
+    return alc.llm("Fork A: " .. (ctx.task or ""))
+end
+return M"#
+    )
+    .expect("write init.lua");
+
+    let pkg_b_dir = tmp_dir.path().join("e2e_fork_b");
+    std::fs::create_dir_all(&pkg_b_dir).expect("mkdir");
+    let mut f = std::fs::File::create(pkg_b_dir.join("init.lua")).expect("create init.lua");
+    write!(
+        f,
+        r#"local M = {{}}
+M.meta = {{ name = "e2e_fork_b", version = "0.1.0", description = "E2E fork B" }}
+function M.run(ctx)
+    return alc.llm("Fork B: " .. (ctx.task or ""))
+end
+return M"#
+    )
+    .expect("write init.lua");
+
+    // Install via MCP
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_a_dir.to_string_lossy() }),
+    )
+    .await;
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_b_dir.to_string_lossy() }),
+    )
+    .await;
+
+    // 2. Run alc.fork
+    let code = r#"
+        local results = alc.fork({"e2e_fork_a", "e2e_fork_b"}, ctx)
+        return results
+    "#;
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": code, "ctx": { "task": "test" } }),
+    )
+    .await;
+    assert_eq!(resp["status"], "needs_response");
+    let session_id = resp["session_id"]
+        .as_str()
+        .expect("session_id missing")
+        .to_string();
+
+    // Fork yields one query at a time (or batched) — collect all
+    // The multiplexer may batch queries from multiple child VMs
+    let mut completed = false;
+    let mut final_resp = resp;
+    let mut iterations = 0;
+    const MAX_ITERATIONS: usize = 20;
+    while !completed {
+        iterations += 1;
+        assert!(
+            iterations <= MAX_ITERATIONS,
+            "fork test exceeded {MAX_ITERATIONS} iterations — possible infinite loop"
+        );
+        if final_resp["status"] == "needs_response" {
+            let session = final_resp["session_id"]
+                .as_str()
+                .unwrap_or(&session_id)
+                .to_string();
+
+            if let Some(queries) = final_resp["queries"].as_array() {
+                // Batch: respond to all queries
+                let responses: Vec<Value> = queries
+                    .iter()
+                    .map(|q| {
+                        let qid = q["id"].as_str().expect("query id");
+                        let prompt = q["prompt"].as_str().unwrap_or("");
+                        let answer = if prompt.contains("Fork A") {
+                            "Answer A"
+                        } else {
+                            "Answer B"
+                        };
+                        json!({ "query_id": qid, "response": answer })
+                    })
+                    .collect();
+                final_resp = call_json(
+                    &client,
+                    "alc_continue",
+                    json!({ "session_id": session, "responses": responses }),
+                )
+                .await;
+            } else {
+                // Single query
+                let prompt = final_resp["prompt"].as_str().unwrap_or("");
+                let answer = if prompt.contains("Fork A") {
+                    "Answer A"
+                } else {
+                    "Answer B"
+                };
+                final_resp = call_json(
+                    &client,
+                    "alc_continue",
+                    json!({ "session_id": session, "response": answer }),
+                )
+                .await;
+            }
+        } else {
+            completed = true;
+        }
+    }
+
+    assert_eq!(final_resp["status"], "completed");
+    let result = final_resp["result"]
+        .as_array()
+        .expect("result should be array");
+    assert_eq!(result.len(), 2);
+
+    // Verify both strategies returned results
+    let strategy_a = &result[0];
+    assert_eq!(strategy_a["strategy"], "e2e_fork_a");
+    assert_eq!(strategy_a["ok"], true);
+    assert_eq!(strategy_a["result"], "Answer A");
+
+    let strategy_b = &result[1];
+    assert_eq!(strategy_b["strategy"], "e2e_fork_b");
+    assert_eq!(strategy_b["ok"], true);
+    assert_eq!(strategy_b["result"], "Answer B");
+
+    // 3. Cleanup packages
+    call_json(&client, "alc_pkg_remove", json!({ "name": "e2e_fork_a" })).await;
+    call_json(&client, "alc_pkg_remove", json!({ "name": "e2e_fork_b" })).await;
 
     client.cancel().await.expect("cancel failed");
 }

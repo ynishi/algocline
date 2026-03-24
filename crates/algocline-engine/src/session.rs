@@ -60,6 +60,7 @@ impl FeedResult {
                     let mut obj = json!({
                         "status": "needs_response",
                         "session_id": session_id,
+                        "query_id": q.id.as_str(),
                         "prompt": q.prompt,
                         "system": q.system,
                         "max_tokens": q.max_tokens,
@@ -394,6 +395,29 @@ impl SessionRegistry {
         }
 
         Ok(result)
+    }
+
+    /// Resolve the sole pending query ID for a session.
+    ///
+    /// When `alc_continue` is called without an explicit `query_id`, this
+    /// method checks if exactly one query is pending and returns its ID.
+    /// Returns an error if zero or multiple queries are pending.
+    pub async fn resolve_sole_pending_id(&self, session_id: &str) -> Result<QueryId, SessionError> {
+        let map = self.sessions.lock().await;
+        let session = map
+            .get(session_id)
+            .ok_or_else(|| SessionError::NotFound(session_id.into()))?;
+        let keys: Vec<QueryId> = session.resp_txs.keys().cloned().collect();
+        match keys.len() {
+            0 => Err(SessionError::InvalidTransition("no pending queries".into())),
+            1 => keys
+                .into_iter()
+                .next()
+                .ok_or_else(|| SessionError::InvalidTransition("unexpected empty keys".into())),
+            n => Err(SessionError::InvalidTransition(format!(
+                "{n} queries pending; specify query_id explicitly"
+            ))),
+        }
     }
 
     /// Snapshot all active sessions for external observation (alc_status).

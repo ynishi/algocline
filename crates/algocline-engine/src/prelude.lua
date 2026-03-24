@@ -4,6 +4,80 @@
 --- Loaded automatically into every session (embedded via include_str!).
 --- These extend the alc.* namespace alongside Rust-backed Layer 0 functions.
 
+--- alc.cache(prompt, opts?) -> string
+--- Memoized LLM call. Returns cached response if the same prompt+opts
+--- combination was seen before in this session. Drop-in replacement
+--- for alc.llm() when repeated identical calls are expected.
+---
+--- Cache is session-scoped (in-memory table, cleared on session end).
+--- Key is computed via alc.fingerprint(prompt + system + max_tokens).
+---
+--- opts: same as alc.llm() + cache control:
+---   opts.cache_key:  explicit cache key (overrides auto-fingerprint)
+---   opts.cache_skip: if true, bypass cache and always call LLM
+---
+--- Usage:
+---   local resp = alc.cache("Summarize: " .. text)  -- first call: LLM
+---   local resp = alc.cache("Summarize: " .. text)  -- second call: instant
+---
+---   local resp = alc.cache("Analyze", { system = "expert", cache_skip = true })
+do
+    local _cache = {}      -- key -> value
+    local _order = {}      -- insertion order (array of keys)
+    local _hits = 0
+    local _misses = 0
+    local _max_entries = 256
+
+    function alc.cache(prompt, opts)
+        opts = opts or {}
+        if opts.cache_skip then
+            return alc.llm(prompt, opts)
+        end
+
+        local key = opts.cache_key
+        if not key then
+            local sig = prompt
+            if opts.system then sig = sig .. "\0" .. opts.system end
+            if opts.max_tokens then sig = sig .. "\0" .. tostring(opts.max_tokens) end
+            key = alc.fingerprint(sig)
+        end
+
+        if _cache[key] ~= nil then
+            _hits = _hits + 1
+            alc.log("debug", "alc.cache: hit " .. key)
+            return _cache[key]
+        end
+
+        local resp = alc.llm(prompt, opts)
+        _cache[key] = resp
+        _order[#_order + 1] = key
+        _misses = _misses + 1
+        alc.log("debug", "alc.cache: miss " .. key)
+
+        -- Evict oldest entries when over capacity
+        while #_order > _max_entries do
+            local evict_key = table.remove(_order, 1)
+            _cache[evict_key] = nil
+        end
+
+        return resp
+    end
+
+    --- alc.cache_info() -> { entries, hits, misses, max_entries }
+    --- Return cache statistics for the current session.
+    function alc.cache_info()
+        return { entries = #_order, hits = _hits, misses = _misses, max_entries = _max_entries }
+    end
+
+    --- alc.cache_clear()
+    --- Clear all cached responses and reset counters.
+    function alc.cache_clear()
+        _cache = {}
+        _hits = 0
+        _misses = 0
+    end
+end
+
 --- alc.map(items, fn) -> results
 --- Apply fn(item, index) to each item, return array of results.
 --- fn receives (item, index) and should return a value.
@@ -304,6 +378,81 @@ function alc.tuning(defaults, ctx, opts)
         end
     end
     return result
+end
+
+--- alc.parallel(items, prompt_fn, opts?) -> results
+--- Batch-parallel LLM calls over an array of items. Each item is
+--- transformed into a prompt by prompt_fn, then all prompts are sent
+--- as a single alc.llm_batch() call (one round-trip instead of N).
+---
+--- prompt_fn(item, index) must return:
+---   - string: used as prompt (opts.system/max_tokens applied)
+---   - table:  used as-is for llm_batch (must have .prompt field)
+---
+--- opts:
+---   opts.system:     shared system prompt for all items
+---   opts.max_tokens: shared max_tokens for all items
+---   opts.post_fn:    post_fn(response, item, index) -> value
+---
+--- Usage:
+---   -- Before (sequential: N round-trips)
+---   local out = alc.map(chunks, function(c)
+---       return alc.llm("Summarize:\n" .. c)
+---   end)
+---
+---   -- After (parallel: 1 round-trip)
+---   local out = alc.parallel(chunks, function(c)
+---       return "Summarize:\n" .. c
+---   end)
+---
+---   -- With post-processing
+---   local scores = alc.parallel(candidates, function(c)
+---       return "Rate 1-10:\n" .. c
+---   end, {
+---       post_fn = function(resp) return alc.parse_score(resp) end,
+---   })
+function alc.parallel(items, prompt_fn, opts)
+    if type(items) ~= "table" or #items == 0 then
+        error("alc.parallel: items must be a non-empty array", 2)
+    end
+    if type(prompt_fn) ~= "function" then
+        error("alc.parallel: prompt_fn must be a function", 2)
+    end
+    opts = opts or {}
+
+    -- Phase 1: build batch from prompt_fn (no LLM calls)
+    local batch = {}
+    for i, item in ipairs(items) do
+        local p = prompt_fn(item, i)
+        if type(p) == "string" then
+            local entry = { prompt = p }
+            if opts.system then entry.system = opts.system end
+            if opts.max_tokens then entry.max_tokens = opts.max_tokens end
+            batch[i] = entry
+        elseif type(p) == "table" then
+            if type(p.prompt) ~= "string" then
+                error("alc.parallel: prompt_fn returned table without .prompt at index " .. i, 2)
+            end
+            batch[i] = p
+        else
+            error("alc.parallel: prompt_fn must return string or table, got "
+                .. type(p) .. " at index " .. i, 2)
+        end
+    end
+
+    -- Phase 2: single batch LLM call
+    local responses = alc.llm_batch(batch)
+
+    -- Phase 3: optional post-processing
+    if opts.post_fn then
+        local results = {}
+        for i, resp in ipairs(responses) do
+            results[i] = opts.post_fn(resp, items[i], i)
+        end
+        return results
+    end
+
+    return responses
 end
 
 --- alc.pipe(strategies, ctx, opts?) -> ctx

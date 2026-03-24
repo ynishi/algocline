@@ -18,6 +18,11 @@ impl QueryId {
         Self(format!("q-{index}"))
     }
 
+    /// For alc.fork() — identifies queries by child VM index and sequence.
+    pub fn fork(vm_index: usize, seq: usize) -> Self {
+        Self(format!("f-{vm_index}-{seq}"))
+    }
+
     /// Construct from an arbitrary string (e.g. MCP parameters).
     pub fn parse(s: &str) -> Self {
         Self(s.to_string())
@@ -95,6 +100,21 @@ mod tests {
     fn parse_arbitrary() {
         let id = QueryId::parse("custom-id");
         assert_eq!(id.as_str(), "custom-id");
+    }
+
+    #[test]
+    fn fork_query_id() {
+        let id = QueryId::fork(2, 3);
+        assert_eq!(id.as_str(), "f-2-3");
+    }
+
+    #[test]
+    fn fork_query_ids_are_unique() {
+        let ids: Vec<QueryId> = (0..3)
+            .flat_map(|vm| (0..2).map(move |seq| QueryId::fork(vm, seq)))
+            .collect();
+        let set: std::collections::HashSet<&QueryId> = ids.iter().collect();
+        assert_eq!(set.len(), 6);
     }
 
     #[test]

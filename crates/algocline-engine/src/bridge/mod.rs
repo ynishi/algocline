@@ -8,11 +8,19 @@
 //! All functions registered here are available in every Lua session
 //! without explicit `require()`.
 
+use std::path::PathBuf;
+
 use algocline_core::{BudgetHandle, CustomMetricsHandle, ProgressHandle, QueryId};
 use mlua::prelude::*;
+use mlua::LuaSerdeExt;
+
+mod fork;
 
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 use crate::state;
+
+/// Layer 1 prelude (also used by fork to setup child VMs).
+const PRELUDE: &str = include_str!("../prelude.lua");
 
 /// All handles needed by Layer 0 runtime primitives.
 ///
@@ -29,6 +37,8 @@ pub struct BridgeConfig {
     pub budget: BudgetHandle,
     /// Progress reporter for alc.progress().
     pub progress: ProgressHandle,
+    /// Package search paths (needed by alc.fork to setup child VMs).
+    pub lib_paths: Vec<PathBuf>,
 }
 
 /// Register all Layer 0 runtime primitives onto the given table.
@@ -43,7 +53,8 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {
         register_llm(lua, alc_table, tx.clone(), config.budget.clone())?;
-        register_llm_batch(lua, alc_table, tx, config.budget)?;
+        register_llm_batch(lua, alc_table, tx.clone(), config.budget.clone())?;
+        fork::register_fork(lua, alc_table, tx, config.budget, config.lib_paths)?;
     }
     Ok(())
 }
@@ -455,6 +466,7 @@ mod tests {
             custom_metrics: metrics.custom_metrics_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
+            lib_paths: vec![],
         }
     }
 
@@ -466,6 +478,7 @@ mod tests {
             custom_metrics: metrics.custom_metrics_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
+            lib_paths: vec![],
         }
     }
 
@@ -557,6 +570,7 @@ mod tests {
                 custom_metrics: custom_handle.clone(),
                 budget: metrics.budget_handle(),
                 progress: metrics.progress_handle(),
+                lib_paths: vec![],
             },
         )
         .unwrap();
@@ -706,6 +720,124 @@ mod tests {
         // size=0 should not produce infinite chunks
         let result = chunk_by_chars("abc", 0, 0);
         assert_eq!(result, Vec::<String>::new());
+    }
+
+    // ─── Prelude helpers ───
+
+    /// Setup Lua VM with Layer 0 bridge + Layer 1 prelude loaded.
+    fn setup_with_prelude() -> Lua {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+        lua.load(PRELUDE).exec().unwrap();
+        lua
+    }
+
+    // ─── alc.cache tests (non-LLM parts) ───
+
+    #[test]
+    fn cache_info_initial_state() {
+        let lua = setup_with_prelude();
+        let result: LuaValue = lua.load("return alc.cache_info()").eval().unwrap();
+        let tbl = result.as_table().unwrap();
+        assert_eq!(tbl.get::<i64>("entries").unwrap(), 0);
+        assert_eq!(tbl.get::<i64>("hits").unwrap(), 0);
+        assert_eq!(tbl.get::<i64>("misses").unwrap(), 0);
+    }
+
+    #[test]
+    fn cache_clear_resets_state() {
+        let lua = setup_with_prelude();
+        lua.load(
+            r#"
+            -- Simulate cache state by calling cache_info before/after clear
+            local info1 = alc.cache_info()
+            alc.cache_clear()
+            local info2 = alc.cache_info()
+            assert(info2.entries == 0)
+            assert(info2.hits == 0)
+            assert(info2.misses == 0)
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    // ─── alc.parallel tests (validation) ───
+
+    #[test]
+    fn parallel_rejects_empty_items() {
+        let lua = setup_with_prelude();
+        let result: Result<LuaValue, _> = lua
+            .load(r#"return alc.parallel({}, function(x) return x end)"#)
+            .eval();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("non-empty array"),
+            "expected non-empty array error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parallel_rejects_non_function_prompt_fn() {
+        let lua = setup_with_prelude();
+        let result: Result<LuaValue, _> = lua
+            .load(r#"return alc.parallel({"a", "b"}, "not a function")"#)
+            .eval();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("prompt_fn must be a function"),
+            "expected function error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parallel_rejects_invalid_prompt_fn_return() {
+        let lua = setup_with_prelude();
+        let result: Result<LuaValue, _> = lua
+            .load(r#"return alc.parallel({"a"}, function(x) return 42 end)"#)
+            .eval();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must return string or table"),
+            "expected type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parallel_rejects_table_without_prompt() {
+        let lua = setup_with_prelude();
+        let result: Result<LuaValue, _> = lua
+            .load(r#"return alc.parallel({"a"}, function(x) return { system = "hi" } end)"#)
+            .eval();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("without .prompt"),
+            "expected prompt field error, got: {err}"
+        );
+    }
+
+    // ─── alc.fingerprint tests (used by cache) ───
+
+    #[test]
+    fn fingerprint_deterministic() {
+        let lua = setup_with_prelude();
+        let result: bool = lua
+            .load(r#"return alc.fingerprint("hello") == alc.fingerprint("hello")"#)
+            .eval()
+            .unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn fingerprint_normalized() {
+        let lua = setup_with_prelude();
+        let result: bool = lua
+            .load(r#"return alc.fingerprint("  Hello  World  ") == alc.fingerprint("hello world")"#)
+            .eval()
+            .unwrap();
+        assert!(result);
     }
 }
 

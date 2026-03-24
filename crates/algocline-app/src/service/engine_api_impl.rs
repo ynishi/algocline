@@ -3,6 +3,12 @@ use async_trait::async_trait;
 
 use super::AppService;
 
+/// Delegates each [`EngineApi`] method to the corresponding `AppService`
+/// inherent method via fully-qualified syntax (`AppService::method(self, …)`).
+///
+/// This avoids ambiguity between the trait method and the inherent method
+/// of the same name, preventing accidental infinite recursion if the
+/// inherent method is ever removed or renamed.
 #[async_trait]
 impl EngineApi for AppService {
     // ─── Core execution ──────────────────────────────────────
@@ -13,7 +19,7 @@ impl EngineApi for AppService {
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        self.run(code, code_file, ctx).await
+        AppService::run(self, code, code_file, ctx).await
     }
 
     async fn advice(
@@ -22,7 +28,7 @@ impl EngineApi for AppService {
         task: String,
         opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        self.advice(strategy, task, opts).await
+        AppService::advice(self, strategy, task, opts).await
     }
 
     async fn continue_single(
@@ -31,7 +37,7 @@ impl EngineApi for AppService {
         response: String,
         query_id: Option<&str>,
     ) -> Result<String, String> {
-        self.continue_single(session_id, response, query_id).await
+        AppService::continue_single(self, session_id, response, query_id).await
     }
 
     async fn continue_batch(
@@ -39,13 +45,13 @@ impl EngineApi for AppService {
         session_id: &str,
         responses: Vec<QueryResponse>,
     ) -> Result<String, String> {
-        self.continue_batch(session_id, responses).await
+        AppService::continue_batch(self, session_id, responses).await
     }
 
     // ─── Session status ──────────────────────────────────────
 
     async fn status(&self, session_id: Option<&str>) -> Result<String, String> {
-        self.status(session_id).await
+        AppService::status(self, session_id).await
     }
 
     // ─── Evaluation ──────────────────────────────────────────
@@ -58,7 +64,8 @@ impl EngineApi for AppService {
         strategy: &str,
         strategy_opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        self.eval(
+        AppService::eval(
+            self,
             scenario,
             scenario_file,
             scenario_name,
@@ -69,43 +76,43 @@ impl EngineApi for AppService {
     }
 
     async fn eval_history(&self, strategy: Option<&str>, limit: usize) -> Result<String, String> {
-        self.eval_history(strategy, limit)
+        AppService::eval_history(self, strategy, limit)
     }
 
     async fn eval_detail(&self, eval_id: &str) -> Result<String, String> {
-        self.eval_detail(eval_id)
+        AppService::eval_detail(self, eval_id)
     }
 
     async fn eval_compare(&self, eval_id_a: &str, eval_id_b: &str) -> Result<String, String> {
-        self.eval_compare(eval_id_a, eval_id_b).await
+        AppService::eval_compare(self, eval_id_a, eval_id_b).await
     }
 
     // ─── Scenarios ───────────────────────────────────────────
 
     async fn scenario_list(&self) -> Result<String, String> {
-        self.scenario_list()
+        AppService::scenario_list(self)
     }
 
     async fn scenario_show(&self, name: &str) -> Result<String, String> {
-        self.scenario_show(name)
+        AppService::scenario_show(self, name)
     }
 
     async fn scenario_install(&self, url: String) -> Result<String, String> {
-        self.scenario_install(url).await
+        AppService::scenario_install(self, url).await
     }
 
     // ─── Packages ────────────────────────────────────────────
 
     async fn pkg_list(&self) -> Result<String, String> {
-        self.pkg_list().await
+        AppService::pkg_list(self).await
     }
 
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {
-        self.pkg_install(url, name).await
+        AppService::pkg_install(self, url, name).await
     }
 
     async fn pkg_remove(&self, name: &str) -> Result<String, String> {
-        self.pkg_remove(name).await
+        AppService::pkg_remove(self, name).await
     }
 
     // ─── Logging ─────────────────────────────────────────────
@@ -116,7 +123,7 @@ impl EngineApi for AppService {
         content: &str,
         title: Option<&str>,
     ) -> Result<String, String> {
-        self.add_note(session_id, content, title).await
+        AppService::add_note(self, session_id, content, title).await
     }
 
     async fn log_view(
@@ -124,7 +131,7 @@ impl EngineApi for AppService {
         session_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<String, String> {
-        self.log_view(session_id, limit).await
+        AppService::log_view(self, session_id, limit).await
     }
 
     async fn stats(
@@ -132,12 +139,12 @@ impl EngineApi for AppService {
         strategy_filter: Option<&str>,
         days: Option<u64>,
     ) -> Result<String, String> {
-        self.stats(strategy_filter, days)
+        AppService::stats(self, strategy_filter, days)
     }
 
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {
-        self.info()
+        AppService::info(self)
     }
 }

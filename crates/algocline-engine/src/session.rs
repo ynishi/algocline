@@ -440,6 +440,19 @@ impl SessionRegistry {
 /// MCP spec requires "secure, non-deterministic session IDs" to prevent
 /// session hijacking. Uses timestamp + random bytes for uniqueness and
 /// unpredictability.
+///
+/// # `unwrap_or_default` on `duration_since(UNIX_EPOCH)`
+///
+/// `SystemTime::now().duration_since(UNIX_EPOCH)` can fail if the system
+/// clock is set before 1970-01-01 (e.g. NTP drift, misconfigured VM).
+/// The Rust std docs recommend `expect()` or `match` for explicit handling,
+/// but `expect` would panic in library code (prohibited by project policy).
+///
+/// `unwrap_or_default` returns `Duration::ZERO` on failure, yielding
+/// timestamp `0`. This is acceptable here because the 8-byte random
+/// suffix (16 hex chars of entropy) independently guarantees uniqueness
+/// and unpredictability — the timestamp is a convenience prefix, not
+/// a security-critical component.
 fn gen_session_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()

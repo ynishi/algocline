@@ -248,11 +248,70 @@ impl Session {
     fn take_metrics(&mut self) -> ExecutionMetrics {
         std::mem::take(&mut self.metrics)
     }
+
+    /// Lightweight snapshot for external observation (alc_status).
+    ///
+    /// Returns session state label and running metrics without consuming
+    /// or modifying the session.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let state_label = match &self.state {
+            ExecutionState::Running => "running",
+            ExecutionState::Paused(_) => "paused",
+            _ => "terminal",
+        };
+
+        let mut json = serde_json::json!({
+            "state": state_label,
+        });
+
+        let metrics = self.metrics.snapshot();
+        if !metrics.is_null() {
+            json["metrics"] = metrics;
+        }
+
+        // Include pending query count when paused
+        if let ExecutionState::Paused(_) = &self.state {
+            json["pending_queries"] = self.state.remaining().into();
+        }
+
+        json
+    }
 }
 
 // ─── Registry ────────────────────────────────────────────────
 
-/// Manages active sessions. Replaces the raw SessionMap.
+/// Manages active sessions.
+///
+/// # Locking design (lock **C**)
+///
+/// Uses `tokio::sync::Mutex` because `feed_response` holds the lock
+/// while calling `Session::feed_one()` (which itself acquires the
+/// per-session `std::sync::Mutex<SessionStatus>`, lock **A**). The lock
+/// ordering invariant is always **C → A** — no code path acquires A
+/// then C, so deadlock is structurally impossible.
+///
+/// `tokio::sync::Mutex` is chosen here (rather than `std::sync::Mutex`)
+/// because `feed_response` must take the session out of the map for
+/// the async `wait_event()` call. The two-phase pattern (lock → remove
+/// → unlock → await → lock → reinsert) requires an async-aware mutex
+/// to avoid holding the lock across the `wait_event().await`.
+///
+/// ## Contention
+///
+/// `list_snapshots()` (from `alc_status`) holds lock C while iterating
+/// all sessions. During this time, `feed_response` for any session is
+/// blocked. Given that snapshot iteration is O(n) with n = active
+/// sessions (typically 1–3) and each snapshot takes microseconds, this
+/// is acceptable. If session count grows significantly, consider
+/// switching to a concurrent map or per-session locks.
+///
+/// ## Interaction with lock A
+///
+/// `Session::snapshot()` (called under lock C in `list_snapshots`)
+/// acquires lock A via `ExecutionMetrics::snapshot()`. This is safe:
+/// - Lock order: C → A (consistent with `feed_response`)
+/// - Lock A hold time: microseconds (JSON field reads)
+/// - Lock A is per-session (no cross-session contention)
 pub struct SessionRegistry {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
 }
@@ -335,6 +394,18 @@ impl SessionRegistry {
         }
 
         Ok(result)
+    }
+
+    /// Snapshot all active sessions for external observation (alc_status).
+    ///
+    /// Returns a map of session_id → snapshot JSON. Only includes sessions
+    /// currently held in the registry (i.e. paused, awaiting responses).
+    /// Sessions that have completed are already removed from the registry.
+    pub async fn list_snapshots(&self) -> HashMap<String, serde_json::Value> {
+        let map = self.sessions.lock().await;
+        map.iter()
+            .map(|(id, session)| (id.clone(), session.snapshot()))
+            .collect()
     }
 }
 

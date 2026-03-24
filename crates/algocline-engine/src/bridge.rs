@@ -8,35 +8,42 @@
 //! All functions registered here are available in every Lua session
 //! without explicit `require()`.
 
-use std::sync::{Arc, Mutex};
-
-use algocline_core::{CustomMetrics, QueryId};
+use algocline_core::{BudgetHandle, CustomMetricsHandle, ProgressHandle, QueryId};
 use mlua::prelude::*;
 
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 use crate::state;
 
-/// Register all Layer 0 runtime primitives onto the given table.
+/// All handles needed by Layer 0 runtime primitives.
 ///
-/// - `llm_tx`: if provided, registers `alc.llm()` with MCP Sampling bridge.
-/// - `ns`: namespace for alc.state (from ctx._ns or "default").
-/// - `custom_metrics`: custom metrics handle for alc.stats.record/get.
-pub fn register(
-    lua: &Lua,
-    alc_table: &LuaTable,
-    llm_tx: Option<tokio::sync::mpsc::Sender<LlmRequest>>,
-    ns: String,
-    custom_metrics: Arc<Mutex<CustomMetrics>>,
-) -> LuaResult<()> {
+/// Collects the various per-session handles into a single config,
+/// avoiding a growing parameter list on `register()`.
+pub struct BridgeConfig {
+    /// Channel for LLM requests (None for eval_simple sessions).
+    pub llm_tx: Option<tokio::sync::mpsc::Sender<LlmRequest>>,
+    /// Namespace for alc.state (from ctx._ns or "default").
+    pub ns: String,
+    /// Custom metrics handle for alc.stats.record/get.
+    pub custom_metrics: CustomMetricsHandle,
+    /// Budget checker for LLM call limits.
+    pub budget: BudgetHandle,
+    /// Progress reporter for alc.progress().
+    pub progress: ProgressHandle,
+}
+
+/// Register all Layer 0 runtime primitives onto the given table.
+pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaResult<()> {
     register_json(lua, alc_table)?;
     register_log(lua, alc_table)?;
-    register_state(lua, alc_table, ns)?;
+    register_state(lua, alc_table, config.ns)?;
     register_chunk(lua, alc_table)?;
-    register_stats(lua, alc_table, custom_metrics)?;
+    register_stats(lua, alc_table, config.custom_metrics)?;
     register_time(lua, alc_table)?;
-    if let Some(tx) = llm_tx {
-        register_llm(lua, alc_table, tx.clone())?;
-        register_llm_batch(lua, alc_table, tx)?;
+    register_budget_remaining(lua, alc_table, config.budget.clone())?;
+    register_progress(lua, alc_table, config.progress)?;
+    if let Some(tx) = config.llm_tx {
+        register_llm(lua, alc_table, tx.clone(), config.budget.clone())?;
+        register_llm_batch(lua, alc_table, tx, config.budget)?;
     }
     Ok(())
 }
@@ -224,28 +231,23 @@ fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> LuaResult<()> 
 fn register_stats(
     lua: &Lua,
     alc_table: &LuaTable,
-    custom_metrics: Arc<Mutex<CustomMetrics>>,
+    custom_metrics: CustomMetricsHandle,
 ) -> LuaResult<()> {
     let stats_table = lua.create_table()?;
 
     // alc.stats.record(key, value)
-    let cm_record = Arc::clone(&custom_metrics);
+    let cm_record = custom_metrics.clone();
     let record = lua.create_function(move |lua, (key, value): (String, LuaValue)| {
         let json: serde_json::Value = lua.from_value(value)?;
-        if let Ok(mut cm) = cm_record.lock() {
-            cm.record(key, json);
-        }
+        cm_record.record(key, json);
         Ok(())
     })?;
 
     // alc.stats.get(key)
-    let cm_get = Arc::clone(&custom_metrics);
-    let get = lua.create_function(move |lua, key: String| {
-        let value = cm_get.lock().ok().and_then(|cm| cm.get(&key).cloned());
-        match value {
-            Some(v) => lua.to_value(&v),
-            None => Ok(LuaValue::Nil),
-        }
+    let cm_get = custom_metrics;
+    let get = lua.create_function(move |lua, key: String| match cm_get.get(&key) {
+        Some(v) => lua.to_value(&v),
+        None => Ok(LuaValue::Nil),
     })?;
 
     stats_table.set("record", record)?;
@@ -267,10 +269,13 @@ fn register_llm(
     lua: &Lua,
     alc_table: &LuaTable,
     llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
+    budget: BudgetHandle,
 ) -> LuaResult<()> {
     let llm = lua.create_async_function(move |_, (prompt, opts): (String, Option<LuaTable>)| {
         let tx = llm_tx.clone();
+        let bh = budget.clone();
         async move {
+            bh.check().map_err(LuaError::external)?;
             let system = opts.as_ref().and_then(|o| o.get::<String>("system").ok());
             let max_tokens = opts
                 .as_ref()
@@ -323,14 +328,56 @@ fn register_llm(
 ///       { prompt = "Analyze B", system = "expert", max_tokens = 500 },
 ///   })
 ///   -- responses[1], responses[2] in same order as input
+/// Register `alc.budget_remaining()` — query remaining budget.
+///
+/// Lua return type:
+/// - `nil` if no budget was set (ctx.budget absent)
+/// - `{ llm_calls = N|nil, elapsed_ms = N|nil }` where each field is
+///   present only if the corresponding limit was set. Values are
+///   remaining capacity (saturating at 0).
+fn register_budget_remaining(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    budget: BudgetHandle,
+) -> LuaResult<()> {
+    let budget_fn = lua.create_function(move |lua, ()| {
+        let remaining = budget.remaining();
+        lua.to_value(&remaining)
+    })?;
+    alc_table.set("budget_remaining", budget_fn)?;
+    Ok(())
+}
+
+/// Register `alc.progress(step, total, msg?)` — report structured progress.
+///
+/// Writes progress info into SessionStatus, readable via `alc_status` MCP tool.
+/// Not all strategies need to call this — it is opt-in for strategies that
+/// benefit from structured step tracking.
+///
+/// Lua usage:
+///   alc.progress(1, 5, "Analyzing chunk 1")
+///   alc.progress(2, 5)  -- message is optional
+fn register_progress(lua: &Lua, alc_table: &LuaTable, progress: ProgressHandle) -> LuaResult<()> {
+    let progress_fn =
+        lua.create_function(move |_, (step, total, msg): (u64, u64, Option<String>)| {
+            progress.set(step, total, msg);
+            Ok(())
+        })?;
+    alc_table.set("progress", progress_fn)?;
+    Ok(())
+}
+
 fn register_llm_batch(
     lua: &Lua,
     alc_table: &LuaTable,
     llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
+    budget: BudgetHandle,
 ) -> LuaResult<()> {
     let llm_batch = lua.create_async_function(move |_, items: LuaTable| {
         let tx = llm_tx.clone();
+        let bh = budget.clone();
         async move {
+            bh.check().map_err(LuaError::external)?;
             let len = items.len()? as usize;
             if len == 0 {
                 return Err(LuaError::external("alc.llm_batch: empty items array"));
@@ -398,15 +445,35 @@ fn register_llm_batch(
 mod tests {
     use super::*;
 
-    fn test_custom_metrics() -> Arc<Mutex<CustomMetrics>> {
-        Arc::new(Mutex::new(CustomMetrics::new()))
+    use algocline_core::ExecutionMetrics;
+
+    fn test_config() -> BridgeConfig {
+        let metrics = ExecutionMetrics::new();
+        BridgeConfig {
+            llm_tx: None,
+            ns: "default".into(),
+            custom_metrics: metrics.custom_metrics_handle(),
+            budget: metrics.budget_handle(),
+            progress: metrics.progress_handle(),
+        }
+    }
+
+    fn test_config_with_ns(ns: &str) -> BridgeConfig {
+        let metrics = ExecutionMetrics::new();
+        BridgeConfig {
+            llm_tx: None,
+            ns: ns.into(),
+            custom_metrics: metrics.custom_metrics_handle(),
+            budget: metrics.budget_handle(),
+            progress: metrics.progress_handle(),
+        }
     }
 
     #[test]
     fn json_roundtrip() {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
-        register(&lua, &t, None, "default".into(), test_custom_metrics()).unwrap();
+        register(&lua, &t, test_config()).unwrap();
         lua.globals().set("alc", t).unwrap();
 
         let result: String = lua
@@ -422,7 +489,7 @@ mod tests {
     fn json_decode_encode() {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
-        register(&lua, &t, None, "default".into(), test_custom_metrics()).unwrap();
+        register(&lua, &t, test_config()).unwrap();
         lua.globals().set("alc", t).unwrap();
 
         let result: String = lua
@@ -449,7 +516,7 @@ mod tests {
 
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
-        register(&lua, &t, None, ns.into(), test_custom_metrics()).unwrap();
+        register(&lua, &t, test_config_with_ns(ns)).unwrap();
         lua.globals().set("alc", t).unwrap();
 
         // Set and get
@@ -477,10 +544,22 @@ mod tests {
 
     #[test]
     fn stats_record_get() {
-        let custom = test_custom_metrics();
+        let metrics = ExecutionMetrics::new();
+        let custom_handle = metrics.custom_metrics_handle();
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
-        register(&lua, &t, None, "default".into(), Arc::clone(&custom)).unwrap();
+        register(
+            &lua,
+            &t,
+            BridgeConfig {
+                llm_tx: None,
+                ns: "default".into(),
+                custom_metrics: custom_handle.clone(),
+                budget: metrics.budget_handle(),
+                progress: metrics.progress_handle(),
+            },
+        )
+        .unwrap();
         lua.globals().set("alc", t).unwrap();
 
         // Record from Lua
@@ -488,11 +567,8 @@ mod tests {
         let result: i64 = lua.load(r#"return alc.stats.get("score")"#).eval().unwrap();
         assert_eq!(result, 42);
 
-        // Verify via Rust side
-        assert_eq!(
-            custom.lock().unwrap().get("score"),
-            Some(&serde_json::json!(42))
-        );
+        // Verify via Handle
+        assert_eq!(custom_handle.get("score"), Some(serde_json::json!(42)));
 
         // Missing key returns nil
         let result: LuaValue = lua

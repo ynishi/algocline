@@ -1,0 +1,24 @@
+---
+source: tests/e2e.rs
+expression: names
+---
+[
+  "alc_advice",
+  "alc_continue",
+  "alc_eval",
+  "alc_eval_compare",
+  "alc_eval_detail",
+  "alc_eval_history",
+  "alc_info",
+  "alc_log_view",
+  "alc_note",
+  "alc_pkg_install",
+  "alc_pkg_list",
+  "alc_pkg_remove",
+  "alc_run",
+  "alc_scenario_install",
+  "alc_scenario_list",
+  "alc_scenario_show",
+  "alc_stats",
+  "alc_status"
+]

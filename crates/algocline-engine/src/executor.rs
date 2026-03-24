@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use algocline_core::{ExecutionMetrics, ExecutionSpec};
+use algocline_core::{Budget, ExecutionMetrics, ExecutionSpec};
 use mlua::LuaSerdeExt;
 use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
 use mlua_pkg::{resolvers::FsResolver, Registry};
@@ -101,11 +101,21 @@ impl Executor {
     ) -> Result<Session, String> {
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
-        let custom_handle = metrics.custom_handle();
+
+        // Extract and apply budget from ctx.budget
+        if let Some(budget) = Budget::from_ctx(&spec.ctx) {
+            metrics.set_budget(budget);
+        }
 
         let (llm_tx, llm_rx) = tokio::sync::mpsc::channel::<LlmRequest>(16);
 
-        let ns = spec.namespace.clone();
+        let bridge_config = bridge::BridgeConfig {
+            llm_tx: Some(llm_tx),
+            ns: spec.namespace.clone(),
+            custom_metrics: metrics.custom_metrics_handle(),
+            budget: metrics.budget_handle(),
+            progress: metrics.progress_handle(),
+        };
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();
 
@@ -129,7 +139,7 @@ impl Executor {
         session_isle
             .exec(move |lua| {
                 let alc_table = lua.create_table()?;
-                bridge::register(lua, &alc_table, Some(llm_tx), ns, custom_handle)?;
+                bridge::register(lua, &alc_table, bridge_config)?;
                 lua.globals().set("alc", alc_table)?;
 
                 let ctx_value = lua.to_value(&lua_ctx)?;

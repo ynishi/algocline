@@ -60,3 +60,8 @@ dirs = "6"
 tempfile = "3"
 
 [dev-dependencies]
+insta = { version = "1", features = ["json", "redactions"] }
+regex = "1"
+rmcp = { version = "0.16", features = ["client", "transport-child-process"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }

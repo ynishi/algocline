@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// KV store written from Lua via alc.stats.record(key, value).
 pub struct CustomMetrics {
@@ -28,6 +29,38 @@ impl CustomMetrics {
 impl Default for CustomMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Cheap, cloneable handle for custom metrics from the Lua bridge.
+///
+/// Wraps `Arc<Mutex<CustomMetrics>>` to match the Handle pattern
+/// used by `BudgetHandle` and `ProgressHandle`.
+///
+/// # Poison policy
+///
+/// Silently skips on poison. Custom metrics are observational —
+/// a missed record degrades stats but does not affect execution.
+#[derive(Clone)]
+pub struct CustomMetricsHandle {
+    inner: Arc<Mutex<CustomMetrics>>,
+}
+
+impl CustomMetricsHandle {
+    pub(crate) fn new(inner: Arc<Mutex<CustomMetrics>>) -> Self {
+        Self { inner }
+    }
+
+    /// Record a key-value pair. Silently skips on mutex poison.
+    pub fn record(&self, key: String, value: serde_json::Value) {
+        if let Ok(mut m) = self.inner.lock() {
+            m.record(key, value);
+        }
+    }
+
+    /// Get a value by key. Returns None on mutex poison or missing key.
+    pub fn get(&self, key: &str) -> Option<serde_json::Value> {
+        self.inner.lock().ok().and_then(|m| m.get(key).cloned())
     }
 }
 

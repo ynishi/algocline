@@ -161,6 +161,12 @@ pub struct EvalCompareParams {
     pub eval_id_b: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatusParams {
+    /// Session ID to inspect. Omit to list all active sessions.
+    pub session_id: Option<String>,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -419,6 +425,25 @@ impl AlcService {
         self.app.stats(params.strategy.as_deref(), params.days)
     }
 
+    // ─── Session Status ─────────────────────────────────────────
+
+    /// Query active session status for external observation.
+    ///
+    /// Without session_id: lists all active (paused) sessions with state,
+    /// metrics snapshot, progress, and strategy name.
+    /// With session_id: returns detailed status for one session.
+    ///
+    /// Only shows sessions currently held in the registry (paused, awaiting
+    /// host LLM responses). Completed sessions are not listed — use
+    /// `alc_log_view` for historical data.
+    #[tool(
+        name = "alc_status",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn status(&self, Parameters(params): Parameters<StatusParams>) -> Result<String, String> {
+        self.app.status(params.session_id.as_deref()).await
+    }
+
     // ─── Diagnostics ────────────────────────────────────────────
 
     /// Show algocline server configuration and diagnostic info.
@@ -464,6 +489,8 @@ impl ServerHandler for AlcService {
                  Logging:\n\
                  - alc_note: Add a note to a completed session's log (feedback, observations).\n\
                  - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail.\n\n\
+                 Session Status:\n\
+                 - alc_status: Query active session status. Omit session_id to list all, provide it for detail.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

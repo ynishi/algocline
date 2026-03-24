@@ -1,0 +1,20 @@
+---
+source: tests/e2e.rs
+expression: redacted
+---
+{
+  "log_dir": {
+    "resolved": "<HOME>/.algocline/logs",
+    "source": "~/.algocline/logs"
+  },
+  "log_enabled": true,
+  "packages_dir": "<HOME>/.algocline/packages",
+  "search_paths": [
+    {
+      "path": "<HOME>/.algocline/packages",
+      "source": "default"
+    }
+  ],
+  "tracing": "file + stderr",
+  "version": "0.8.0"
+}

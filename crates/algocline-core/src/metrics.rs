@@ -1,8 +1,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::budget::Budget;
 use crate::observer::ExecutionObserver;
-use crate::{CustomMetrics, LlmQuery, QueryId};
+use crate::progress::ProgressInfo;
+use crate::tokens::{estimate_tokens, TokenCount, TokenSource};
+use crate::{BudgetHandle, CustomMetrics, CustomMetricsHandle, LlmQuery, ProgressHandle, QueryId};
+
+// ─── Transcript ─────────────────────────────────────────────
 
 /// A single prompt/response exchange in the transcript.
 struct TranscriptEntry {
@@ -24,18 +29,74 @@ impl TranscriptEntry {
 }
 
 /// Metrics automatically derived from the execution lifecycle.
-pub(crate) struct AutoMetrics {
+///
+/// # Locking design
+///
+/// `SessionStatus` is wrapped in `Arc<std::sync::Mutex>` and shared across:
+///
+/// | Consumer | Thread | Access | Via |
+/// |---|---|---|---|
+/// | `MetricsObserver` | tokio async task | write (on_paused, on_response_fed, etc.) | `Arc<Mutex<SessionStatus>>` |
+/// | `BudgetHandle` | Lua OS thread | read (check, remaining) | `Arc<Mutex<SessionStatus>>` |
+/// | `ProgressHandle` | Lua OS thread | write (set) | `Arc<Mutex<SessionStatus>>` |
+/// | `ExecutionMetrics` | tokio async task | read (to_json, snapshot, transcript_to_json) | `Arc<Mutex<SessionStatus>>` |
+///
+/// ## Why `std::sync::Mutex` (not `tokio::sync::Mutex`)
+///
+/// All lock holders complete within microseconds (field reads, arithmetic,
+/// small JSON construction) and **never hold the lock across `.await` points**.
+/// Per tokio guidance, `std::sync::Mutex` is preferred when the critical
+/// section is short and synchronous.
+///
+/// ## Lock ordering
+///
+/// When nested with `SessionRegistry`'s `tokio::sync::Mutex` (lock **C**),
+/// the invariant is always **C → A** (registry lock acquired first).
+/// No code path acquires A then C, so deadlock is structurally impossible.
+///
+/// ## Contention analysis
+///
+/// Each session creates its own `ExecutionMetrics` instance (see
+/// `Executor::start_session`), so the `SessionStatus` mutex is **not shared
+/// across sessions**. Within a single session, the Lua thread and the
+/// tokio async task alternate via mpsc channel handoff:
+///
+/// 1. Lua calls `alc.llm()` → `BudgetHandle::check()` locks A (Lua thread)
+/// 2. Lock released, then `tx.send(LlmRequest)` (mpsc)
+/// 3. `Session::wait_event()` receives request → `on_paused()` locks A (async task)
+///
+/// Steps 1 and 3 are sequenced by the mpsc channel, so they never contend.
+/// The only true contention is `snapshot()` (from `alc_status`) vs. observer
+/// methods, which is harmless given microsecond hold times.
+///
+/// ## Poison policy
+///
+/// Poison can only occur if a thread panics while holding this lock.
+/// The only panic-capable code under the lock is `Vec::push` and
+/// `serde_json::json!` (both panic only on OOM). On OOM the process
+/// is unrecoverable, so poison handling is academic.
+///
+/// Policy: `BudgetHandle::check()` propagates poison as `Err` (because
+/// it gates Lua control flow). All other consumers silently skip on
+/// poison (observation/recording — degraded but non-fatal).
+/// If you encounter a poison error in production, it indicates either
+/// OOM or a bug in code executed under the lock.
+pub(crate) struct SessionStatus {
     started_at: Instant,
     ended_at: Option<Instant>,
-    llm_calls: u64,
+    pub(crate) llm_calls: u64,
     pauses: u64,
     rounds: u64,
     total_prompt_chars: u64,
     total_response_chars: u64,
+    prompt_tokens: TokenCount,
+    response_tokens: TokenCount,
     transcript: Vec<TranscriptEntry>,
+    pub(crate) budget: Option<Budget>,
+    pub(crate) progress: Option<ProgressInfo>,
 }
 
-impl AutoMetrics {
+impl SessionStatus {
     fn new() -> Self {
         Self {
             started_at: Instant::now(),
@@ -45,37 +106,102 @@ impl AutoMetrics {
             rounds: 0,
             total_prompt_chars: 0,
             total_response_chars: 0,
+            prompt_tokens: TokenCount::new(TokenSource::Estimated),
+            response_tokens: TokenCount::new(TokenSource::Estimated),
             transcript: Vec::new(),
+            budget: None,
+            progress: None,
         }
     }
 
-    fn to_json(&self) -> serde_json::Value {
-        let elapsed_ms = self
-            .ended_at
+    /// Wall-clock elapsed milliseconds since session start.
+    fn elapsed_ms(&self) -> u64 {
+        self.ended_at
             .map(|end| end.duration_since(self.started_at).as_millis() as u64)
-            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64);
+            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64)
+    }
 
-        serde_json::json!({
-            "elapsed_ms": elapsed_ms,
+    fn to_json(&self) -> serde_json::Value {
+        let total_tokens = TokenCount {
+            tokens: self.prompt_tokens.tokens + self.response_tokens.tokens,
+            source: self
+                .prompt_tokens
+                .source
+                .weaker(self.response_tokens.source),
+        };
+        let mut json = serde_json::json!({
+            "elapsed_ms": self.elapsed_ms(),
             "llm_calls": self.llm_calls,
             "pauses": self.pauses,
             "rounds": self.rounds,
             "total_prompt_chars": self.total_prompt_chars,
             "total_response_chars": self.total_response_chars,
-        })
+            "prompt_tokens": self.prompt_tokens.to_json(),
+            "response_tokens": self.response_tokens.to_json(),
+            "total_tokens": total_tokens.to_json(),
+        });
+        if let Some(ref b) = self.budget {
+            json["budget"] = b.to_json();
+        }
+        json
+    }
+
+    pub(crate) fn check_budget(&self) -> Result<(), String> {
+        match self.budget {
+            Some(ref b) => b.check(self.llm_calls, self.elapsed_ms()),
+            None => Ok(()),
+        }
+    }
+
+    /// Lightweight snapshot for external observation (alc_status).
+    ///
+    /// Returns running metrics without transcript (which can be large).
+    fn snapshot(&self) -> serde_json::Value {
+        let mut json = serde_json::json!({
+            "elapsed_ms": self.elapsed_ms(),
+            "llm_calls": self.llm_calls,
+            "rounds": self.rounds,
+        });
+
+        if let Some(ref p) = self.progress {
+            json["progress"] = serde_json::json!({
+                "step": p.step,
+                "total": p.total,
+                "message": p.message,
+            });
+        }
+
+        if let Some(ref b) = self.budget {
+            json["budget_remaining"] = b.remaining_json(self.llm_calls, self.elapsed_ms());
+        }
+
+        json
+    }
+
+    pub(crate) fn budget_remaining(&self) -> serde_json::Value {
+        match self.budget {
+            None => serde_json::Value::Null,
+            Some(ref b) => b.remaining_json(self.llm_calls, self.elapsed_ms()),
+        }
     }
 }
 
 /// Measurement data for a single execution.
+///
+/// Created per-session in `Executor::start_session()`. The `auto` and
+/// `custom` mutexes are **not shared across sessions** — each session
+/// gets independent instances. Handles (`BudgetHandle`, `ProgressHandle`,
+/// `MetricsObserver`) are cloned from the same `Arc` and handed to the
+/// Lua bridge and observer respectively.
 pub struct ExecutionMetrics {
-    auto: Arc<Mutex<AutoMetrics>>,
+    auto: Arc<Mutex<SessionStatus>>,
     custom: Arc<Mutex<CustomMetrics>>,
 }
 
 impl ExecutionMetrics {
     pub fn new() -> Self {
         Self {
-            auto: Arc::new(Mutex::new(AutoMetrics::new())),
+            auto: Arc::new(Mutex::new(SessionStatus::new())),
             custom: Arc::new(Mutex::new(CustomMetrics::new())),
         }
     }
@@ -109,8 +235,34 @@ impl ExecutionMetrics {
     }
 
     /// Handle for custom metrics, passed to the Lua bridge.
-    pub fn custom_handle(&self) -> Arc<Mutex<CustomMetrics>> {
-        Arc::clone(&self.custom)
+    pub fn custom_metrics_handle(&self) -> CustomMetricsHandle {
+        CustomMetricsHandle::new(Arc::clone(&self.custom))
+    }
+
+    /// Set session budget limits.
+    pub fn set_budget(&self, budget: Budget) {
+        if let Ok(mut m) = self.auto.lock() {
+            m.budget = Some(budget);
+        }
+    }
+
+    /// Create a budget handle for the Lua bridge to check limits.
+    pub fn budget_handle(&self) -> BudgetHandle {
+        BudgetHandle::new(Arc::clone(&self.auto))
+    }
+
+    /// Create a progress handle for the Lua bridge to report progress.
+    pub fn progress_handle(&self) -> ProgressHandle {
+        ProgressHandle::new(Arc::clone(&self.auto))
+    }
+
+    /// Lightweight snapshot for external observation (alc_status).
+    /// Returns metrics without transcript.
+    pub fn snapshot(&self) -> serde_json::Value {
+        self.auto
+            .lock()
+            .map(|m| m.snapshot())
+            .unwrap_or(serde_json::Value::Null)
     }
 
     pub fn create_observer(&self) -> MetricsObserver {
@@ -124,13 +276,13 @@ impl Default for ExecutionMetrics {
     }
 }
 
-/// Updates AutoMetrics via the ExecutionObserver trait.
+/// Updates SessionStatus via the ExecutionObserver trait.
 pub struct MetricsObserver {
-    auto: Arc<Mutex<AutoMetrics>>,
+    auto: Arc<Mutex<SessionStatus>>,
 }
 
 impl MetricsObserver {
-    pub(crate) fn new(auto: Arc<Mutex<AutoMetrics>>) -> Self {
+    pub(crate) fn new(auto: Arc<Mutex<SessionStatus>>) -> Self {
         Self { auto }
     }
 }
@@ -142,8 +294,12 @@ impl ExecutionObserver for MetricsObserver {
             m.llm_calls += queries.len() as u64;
             for q in queries {
                 m.total_prompt_chars += q.prompt.len() as u64;
+                m.prompt_tokens
+                    .accumulate(estimate_tokens(&q.prompt), TokenSource::Estimated);
                 if let Some(ref sys) = q.system {
                     m.total_prompt_chars += sys.len() as u64;
+                    m.prompt_tokens
+                        .accumulate(estimate_tokens(sys), TokenSource::Estimated);
                 }
                 m.transcript.push(TranscriptEntry {
                     query_id: q.id.as_str().to_string(),
@@ -158,6 +314,8 @@ impl ExecutionObserver for MetricsObserver {
     fn on_response_fed(&self, query_id: &QueryId, response: &str) {
         if let Ok(mut m) = self.auto.lock() {
             m.total_response_chars += response.len() as u64;
+            m.response_tokens
+                .accumulate(estimate_tokens(response), TokenSource::Estimated);
             // Fill response into matching transcript entry (last match for this query_id).
             if let Some(entry) = m
                 .transcript
@@ -211,12 +369,9 @@ mod tests {
     #[test]
     fn custom_handle_shares_state() {
         let metrics = ExecutionMetrics::new();
-        let handle = metrics.custom_handle();
+        let handle = metrics.custom_metrics_handle();
 
-        handle
-            .lock()
-            .unwrap()
-            .record("key".into(), serde_json::json!("value"));
+        handle.record("key".into(), serde_json::json!("value"));
 
         let json = metrics.to_json();
         let custom = json.get("custom").unwrap();

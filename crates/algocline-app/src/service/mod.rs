@@ -7,6 +7,7 @@ mod pkg;
 pub mod resolve;
 mod run;
 mod scenario;
+mod status;
 mod transcript;
 
 #[cfg(test)]
@@ -23,9 +24,19 @@ pub use resolve::{QueryResponse, SearchPath};
 // ─── Application Service ────────────────────────────────────────
 
 /// Tracks which sessions are eval sessions and their strategy name.
+///
+/// `std::sync::Mutex` is used (not tokio) because all operations are
+/// single HashMap insert/remove/get completing in microseconds, and no
+/// `.await` is held across the lock. Called from async context but never
+/// held across yield points. Poison is silently skipped — eval tracking
+/// is non-critical metadata.
 type EvalSessions = std::sync::Mutex<std::collections::HashMap<String, String>>;
 
 /// Tracks session_id → strategy name for all strategy-based sessions (advice, eval).
+///
+/// Same locking rationale as `EvalSessions`. Used by `alc_status` and
+/// transcript logging. Poison is silently skipped — strategy name is
+/// non-critical metadata for observability.
 type SessionStrategies = std::sync::Mutex<std::collections::HashMap<String, String>>;
 
 #[derive(Clone)]

@@ -227,6 +227,30 @@ function alc.fingerprint(str)
     return string.format("%08x", hash)
 end
 
+--- alc.budget_check() -> boolean
+--- Returns true if budget has remaining capacity (safe to continue).
+--- Returns true if no budget is set (no limits).
+--- Checks elapsed_ms at call time (wall-clock snapshot).
+--- Use before optional LLM calls to skip gracefully when budget is low.
+---
+--- Note: even if budget_check() returns true, a subsequent alc.llm()
+--- may still fail with "budget_exceeded" if another call consumed the
+--- last remaining budget between the check and the call.
+---
+--- Usage:
+---   if alc.budget_check() then
+---       local extra = alc.llm("Optional enrichment: " .. data)
+---   end
+function alc.budget_check()
+    local r = alc.budget_remaining()
+    if r == nil then return true end
+    -- Use type() check: JSON null from serde becomes userdata in mlua,
+    -- not Lua nil. Comparing userdata with number would error.
+    if type(r.llm_calls) == "number" and r.llm_calls <= 0 then return false end
+    if type(r.elapsed_ms) == "number" and r.elapsed_ms <= 0 then return false end
+    return true
+end
+
 --- alc.tuning(defaults, ctx, opts?) -> table
 --- Merge tuning defaults with ctx overrides. Deep-merges dict-like
 --- nested tables; shallow-replaces arrays and scalars.
@@ -280,4 +304,109 @@ function alc.tuning(defaults, ctx, opts)
         end
     end
     return result
+end
+
+--- alc.pipe(strategies, ctx, opts?) -> ctx
+--- Sequential pipeline: run multiple strategies in order, passing
+--- each stage's result as the next stage's task.
+---
+--- Each strategy is loaded via require() and must have M.run(ctx).
+--- The pipeline shallow-copies ctx, then for each strategy:
+---   1. Sets ctx.task to the previous stage's result (stringified)
+---   2. Calls strategy.run(ctx)
+---   3. Extracts ctx.result for the next stage
+---
+--- opts.on_stage(i, name, ctx): optional callback after each stage.
+--- ctx.pipe_history: array of { strategy, result } for debugging.
+---
+--- Inter-stage data flow:
+--- Between stages, ctx.result is converted to ctx.task as a **string**:
+--- - table results: serialized via alc.json_encode() (JSON string)
+--- - all other types: converted via tostring()
+--- This means the next stage always receives ctx.task as a string.
+--- Type information is intentionally discarded — each stage treats
+--- ctx.task as raw text (prompt material), not structured data.
+--- If a stage needs structured input, it should json_decode(ctx.task).
+---
+--- Limitations:
+--- - Strategies must be pre-installed (require() is used, not alc_advice's
+---   auto-install). Use alc_pkg_install or alc init beforehand.
+--- - Budget (ctx.budget) is shared across all pipeline stages. A 3-stage
+---   pipeline with max_llm_calls=10 gives ~3 calls per stage, not 10 each.
+--- - Shallow copy: nested tables in ctx are shared by reference.
+---   Stages that mutate nested ctx fields affect subsequent stages.
+---
+--- Usage:
+---   local result = alc.pipe({"cot", "cove", "reflect"}, ctx)
+---   -- result.pipe_history has intermediate results
+---
+---   -- With inline functions:
+---   local result = alc.pipe({
+---       "cot",
+---       function(c) c.result = alc.llm("Verify: " .. c.task); return c end,
+---       "reflect",
+---   }, ctx)
+function alc.pipe(strategies, ctx, opts)
+    if type(strategies) ~= "table" or #strategies == 0 then
+        error("alc.pipe: strategies must be a non-empty array", 2)
+    end
+    if type(ctx) ~= "table" then
+        error("alc.pipe: ctx must be a table", 2)
+    end
+    opts = opts or {}
+
+    -- Shallow-copy ctx to avoid mutating the original
+    local pipe_ctx = {}
+    for k, v in pairs(ctx) do pipe_ctx[k] = v end
+    pipe_ctx.pipe_history = {}
+
+    for i, entry in ipairs(strategies) do
+        local name, run_fn
+
+        if type(entry) == "string" then
+            name = entry
+            local ok, pkg = pcall(require, entry)
+            if not ok then
+                error("alc.pipe: failed to load strategy '" .. entry .. "': " .. tostring(pkg), 2)
+            end
+            if type(pkg) ~= "table" or type(pkg.run) ~= "function" then
+                error("alc.pipe: strategy '" .. entry .. "' must export run(ctx)", 2)
+            end
+            run_fn = pkg.run
+        elseif type(entry) == "function" then
+            name = "(inline-" .. i .. ")"
+            run_fn = entry
+        else
+            error("alc.pipe: strategy[" .. i .. "] must be a string or function", 2)
+        end
+
+        pipe_ctx = run_fn(pipe_ctx)
+
+        if type(pipe_ctx) ~= "table" then
+            error("alc.pipe: strategy '" .. name .. "' must return a table (ctx)", 2)
+        end
+
+        -- Record history
+        local result_snapshot = pipe_ctx.result
+        pipe_ctx.pipe_history[#pipe_ctx.pipe_history + 1] = {
+            strategy = name,
+            result = result_snapshot,
+        }
+
+        -- Transfer result → task for next stage
+        if pipe_ctx.result ~= nil and i < #strategies then
+            if type(pipe_ctx.result) == "table" then
+                pipe_ctx.task = alc.json_encode(pipe_ctx.result)
+            else
+                pipe_ctx.task = tostring(pipe_ctx.result)
+            end
+        end
+
+        -- Optional callback
+        if opts.on_stage then
+            opts.on_stage(i, name, pipe_ctx)
+        end
+    end
+
+    return pipe_ctx
 end

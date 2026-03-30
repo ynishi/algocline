@@ -728,7 +728,7 @@ fn info_returns_valid_json_with_expected_keys() {
         parsed["log_dir"]["source"].as_str().unwrap(),
         "~/.algocline/logs"
     );
-    assert_eq!(parsed["log_enabled"].as_bool().unwrap(), true);
+    assert!(parsed["log_enabled"].as_bool().unwrap());
     assert_eq!(parsed["tracing"].as_str().unwrap(), "file + stderr");
 }
 

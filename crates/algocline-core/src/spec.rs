@@ -79,7 +79,7 @@ mod proptests {
             Just(serde_json::Value::Null),
             any::<bool>().prop_map(serde_json::Value::Bool),
             any::<i64>().prop_map(|n| serde_json::json!(n)),
-            "\\PC{0,50}".prop_map(|s| serde_json::Value::String(s)),
+            "\\PC{0,50}".prop_map(serde_json::Value::String),
             Just(serde_json::json!([])),
             Just(serde_json::json!({})),
             Just(serde_json::json!({"key": "value"})),

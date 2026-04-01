@@ -77,6 +77,10 @@ pub struct LogViewParams {
     pub session_id: Option<String>,
     /// Max sessions to return in list mode (default: 50). Ignored when session_id is provided.
     pub limit: Option<usize>,
+    /// Max response size in characters for detail mode (default: 100000).
+    /// When exceeded, transcript is truncated from oldest rounds.
+    /// Set to 0 for unlimited.
+    pub max_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -412,7 +416,7 @@ impl AlcService {
         Parameters(params): Parameters<LogViewParams>,
     ) -> Result<String, String> {
         self.app
-            .log_view(params.session_id.as_deref(), params.limit)
+            .log_view(params.session_id.as_deref(), params.limit, params.max_chars)
             .await
     }
 

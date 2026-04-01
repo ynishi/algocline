@@ -130,8 +130,9 @@ impl EngineApi for AppService {
         &self,
         session_id: Option<&str>,
         limit: Option<usize>,
+        max_chars: Option<usize>,
     ) -> Result<String, String> {
-        AppService::log_view(self, session_id, limit).await
+        AppService::log_view(self, session_id, limit, max_chars).await
     }
 
     async fn stats(

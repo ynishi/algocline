@@ -18,25 +18,91 @@ impl AppService {
         .to_string())
     }
 
+    /// Default max response size for detail mode (100 KB).
+    const DEFAULT_MAX_CHARS: usize = 100_000;
+
     /// View session logs.
     pub async fn log_view(
         &self,
         session_id: Option<&str>,
         limit: Option<usize>,
+        max_chars: Option<usize>,
     ) -> Result<String, String> {
         match session_id {
-            Some(sid) => self.log_read(sid),
+            Some(sid) => self.log_read(sid, max_chars.unwrap_or(Self::DEFAULT_MAX_CHARS)),
             None => self.log_list(limit.unwrap_or(50)),
         }
     }
 
-    fn log_read(&self, session_id: &str) -> Result<String, String> {
+    fn log_read(&self, session_id: &str, max_chars: usize) -> Result<String, String> {
         let log_dir = self.require_log_dir()?;
         let path = ContainedPath::child(log_dir, &format!("{session_id}.json"))?;
         if !path.as_ref().exists() {
             return Err(format!("Log file not found for session '{session_id}'"));
         }
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read log: {e}"))
+        let raw = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read log: {e}"))?;
+
+        // 0 means unlimited
+        if max_chars == 0 || raw.len() <= max_chars {
+            return Ok(raw);
+        }
+
+        // Parse and truncate transcript (oldest rounds first) to fit within max_chars
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("Failed to parse log: {e}"))?;
+
+        let original_rounds = doc
+            .get("transcript")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        if original_rounds == 0 {
+            // No transcript to truncate; return as-is
+            return Ok(raw);
+        }
+
+        // Binary-search: keep the maximum number of newest rounds that fit
+        let transcript = doc
+            .get("transcript")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut kept = original_rounds;
+        loop {
+            if kept == 0 {
+                // Even with empty transcript it might still be too large (unlikely)
+                doc["transcript"] = serde_json::json!([]);
+                break;
+            }
+            // Keep the newest `kept` rounds
+            let slice = &transcript[original_rounds - kept..];
+            doc["transcript"] = serde_json::Value::Array(slice.to_vec());
+            let serialized =
+                serde_json::to_string(&doc).map_err(|e| format!("Failed to serialize: {e}"))?;
+            if serialized.len() <= max_chars {
+                break;
+            }
+            // Halve for speed, then linear scan
+            if kept > 8 {
+                kept /= 2;
+            } else {
+                kept -= 1;
+            }
+        }
+
+        let returned_rounds = doc
+            .get("transcript")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        doc["truncated"] = serde_json::json!(true);
+        doc["original_rounds"] = serde_json::json!(original_rounds);
+        doc["returned_rounds"] = serde_json::json!(returned_rounds);
+
+        serde_json::to_string_pretty(&doc).map_err(|e| format!("Failed to serialize: {e}"))
     }
 
     pub(super) fn log_list(&self, limit: usize) -> Result<String, String> {

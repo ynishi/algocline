@@ -119,6 +119,7 @@ pub trait EngineApi: Send + Sync {
         &self,
         session_id: Option<&str>,
         limit: Option<usize>,
+        max_chars: Option<usize>,
     ) -> Result<String, String>;
 
     /// Aggregate stats across all logged sessions.

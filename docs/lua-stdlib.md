@@ -5,12 +5,13 @@ API reference for the `alc.*` namespace available in every Lua session.
 ## Architecture
 
 ```
-Layer 0: Runtime Primitives (Rust-backed)
-  Injected by bridge.rs. Capabilities that cannot be expressed in Pure Lua.
+Layer 0: Runtime Primitives (host-provided)
+  Built into the runtime. Capabilities that require host interaction
+  or cannot be expressed in Pure Lua (LLM calls, I/O, serialization).
 
 Layer 1: Prelude Combinators (Pure Lua)
-  Loaded from prelude.lua (embedded via include_str!).
   Higher-order functions that compose Layer 0 primitives.
+  Auto-loaded into every session.
 
 Layer 2: Packages (require() from ~/.algocline/packages/)
   Not part of StdLib. Loaded explicitly via require().
@@ -96,7 +97,7 @@ local results = alc.fork({"cot", "reflect"}, ctx, { on_error = "skip" })
 
 #### `alc.json_encode(value) -> string`
 
-Serialize a Lua value to JSON string via serde_json.
+Serialize a Lua value to a JSON string.
 
 ```lua
 local s = alc.json_encode({ hello = "world", n = 42 })
@@ -116,7 +117,7 @@ local data = alc.json_decode('{"a":1,"b":"two"}')
 
 #### `alc.log(level, msg)`
 
-Emit a log message via tracing.
+Emit a structured log message.
 
 **Parameters:**
 
@@ -266,7 +267,7 @@ alc.progress(2, 5)  -- message is optional
 
 Memoized LLM call. Returns cached response if the same prompt+opts combination was seen before in this session. Drop-in replacement for `alc.llm()`.
 
-Cache is session-scoped (in-memory, max 256 entries, LRU eviction).
+Cache is session-scoped (in-memory, max 256 entries, oldest-first eviction).
 
 **Parameters:** Same as `alc.llm()`, plus:
 
@@ -305,7 +306,7 @@ local summary = alc.llm_safe(
 Convenience wrapper: calls `alc.llm()` with `grounded = true`. The host should ground the response in external evidence.
 
 ```lua
-local verified = alc.ground("rmcp is tokio-only")
+local verified = alc.ground("Lua 5.4 supports integers natively")
 ```
 
 #### `alc.specify(prompt, opts?) -> string`

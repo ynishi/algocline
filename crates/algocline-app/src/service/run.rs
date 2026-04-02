@@ -25,7 +25,7 @@ impl AppService {
     pub async fn advice(
         &self,
         strategy: &str,
-        task: String,
+        task: Option<String>,
         opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
         // Auto-install bundled packages if the requested strategy is missing
@@ -45,7 +45,9 @@ impl AppService {
             Some(serde_json::Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
-        ctx_map.insert("task".into(), serde_json::Value::String(task));
+        if let Some(task) = task {
+            ctx_map.insert("task".into(), serde_json::Value::String(task));
+        }
         let ctx = serde_json::Value::Object(ctx_map);
 
         self.start_and_tick(code, ctx, Some(strategy)).await

@@ -35,11 +35,11 @@ pub trait EngineApi: Send + Sync {
         ctx: Option<serde_json::Value>,
     ) -> Result<String, String>;
 
-    /// Apply an installed strategy package to a task.
+    /// Apply an installed strategy package. Task is optional.
     async fn advice(
         &self,
         strategy: &str,
-        task: String,
+        task: Option<String>,
         opts: Option<serde_json::Value>,
     ) -> Result<String, String>;
 

@@ -120,8 +120,8 @@ pub struct AdviceParams {
     /// "cot" (chain-of-thought), "sc" (self-consistency), "cove" (chain-of-verification),
     /// or any installed package. Loaded via require("{name}").
     pub strategy: String,
-    /// The task or question to process.
-    pub task: String,
+    /// The task or question to process (optional).
+    pub task: Option<String>,
     /// Additional strategy-specific options (merged into ctx).
     pub opts: Option<serde_json::Value>,
 }
@@ -224,7 +224,7 @@ impl AlcService {
             .await
     }
 
-    /// Apply a built-in strategy to a task.
+    /// Apply a built-in strategy to a task (task is optional).
     ///
     /// Applies any installed package by name. Official packages include:
     /// "ucb", "panel", "cot", "sc", "cove", "calibrate", "cod", "decompose",
@@ -508,7 +508,7 @@ impl ServerHandler for AlcService {
                  Tools:\n\
                  - alc_run: Execute Lua code with optional JSON context. Returns result as JSON.\n\
                  - alc_continue: Continue a paused execution by providing the LLM response.\n\
-                 - alc_advice: Apply an installed package (ucb, panel, cot, sc, cove, reflect, etc.) to a task.\n\n\
+                 - alc_advice: Apply an installed package (ucb, panel, cot, sc, cove, reflect, etc.) to a task. Task is optional — if omitted, opts alone are passed as context.\n\n\
                  When Lua calls alc.llm(prompt), execution pauses and returns the prompt.\n\
                  The host processes it and calls alc_continue with the response to resume.\n\n\
                  Evaluation:\n\

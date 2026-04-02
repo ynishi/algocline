@@ -25,7 +25,7 @@ impl EngineApi for AppService {
     async fn advice(
         &self,
         strategy: &str,
-        task: String,
+        task: Option<String>,
         opts: Option<serde_json::Value>,
     ) -> Result<String, String> {
         AppService::advice(self, strategy, task, opts).await

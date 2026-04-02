@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-04-02
+
+### Fixed
+
+- **`alc.match_bool`**: Add word boundary check to prevent false positives (e.g. `"ok"` in `"token"`, `"pass"` in `"bypass"`, `"no"` in `"innovation"`)
+- **`alc.match_enum`**: Fuzzy fallback now splits text into words and compares per-word instead of whole-text, enabling typo detection in long LLM responses
+
+### Added
+
+- **`docs/lua-stdlib.md`**: Type Support section — LuaCats setup and `lua-language-server --check` CI integration guide
+
 ## [0.12.0] - 2026-04-02
 
 ### Added

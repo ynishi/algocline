@@ -748,8 +748,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn alc_type_stub_starts_with_meta() {
         assert!(

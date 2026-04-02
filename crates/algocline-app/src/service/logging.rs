@@ -215,6 +215,15 @@ impl AppService {
     ///
     /// Scans `.meta.json` files (with `.json` fallback for legacy logs).
     /// Optional filters: `strategy` (exact match), `days` (last N days).
+    ///
+    /// # Legacy log compatibility
+    ///
+    /// Token fields (`prompt_tokens`, `response_tokens`) were introduced in v0.12.
+    /// Logs written by earlier versions lack these fields entirely. When absent,
+    /// the aggregation treats them as **0** (via `unwrap_or(0)`) — the same
+    /// pattern used for other numeric fields (`elapsed_ms`, `total_prompt_chars`,
+    /// etc.). This means per-strategy `total_tokens` may under-report if the
+    /// dataset includes pre-v0.12 sessions.
     pub fn stats(
         &self,
         strategy_filter: Option<&str>,
@@ -249,6 +258,8 @@ impl AppService {
             sum_rounds: u64,
             sum_prompt_chars: u64,
             sum_response_chars: u64,
+            sum_prompt_tokens: u64,
+            sum_response_tokens: u64,
         }
 
         let mut acc: std::collections::HashMap<String, StrategyAcc> =
@@ -341,6 +352,18 @@ impl AppService {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
 
+            // Token counts: nested {"tokens": N, "source": "..."} or legacy absent
+            let prompt_tokens = doc
+                .get("prompt_tokens")
+                .and_then(|v| v.get("tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let response_tokens = doc
+                .get("response_tokens")
+                .and_then(|v| v.get("tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
             let a = acc.entry(strat).or_default();
             a.count += 1;
             a.sum_elapsed_ms += elapsed;
@@ -348,6 +371,8 @@ impl AppService {
             a.sum_rounds += rounds;
             a.sum_prompt_chars += prompt_chars;
             a.sum_response_chars += response_chars;
+            a.sum_prompt_tokens += prompt_tokens;
+            a.sum_response_tokens += response_tokens;
             total += 1;
         }
 
@@ -364,6 +389,9 @@ impl AppService {
                     "avg_rounds": (a.sum_rounds + c / 2) / c,
                     "total_prompt_chars": a.sum_prompt_chars,
                     "total_response_chars": a.sum_response_chars,
+                    "total_prompt_tokens": a.sum_prompt_tokens,
+                    "total_response_tokens": a.sum_response_tokens,
+                    "total_tokens": a.sum_prompt_tokens + a.sum_response_tokens,
                 }),
             );
         }

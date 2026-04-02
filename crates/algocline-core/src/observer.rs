@@ -1,4 +1,4 @@
-use crate::{ExecutionSpec, LlmQuery, QueryId};
+use crate::{ExecutionSpec, LlmQuery, QueryId, TokenUsage};
 
 /// Observer for execution state transitions.
 ///
@@ -11,7 +11,8 @@ pub trait ExecutionObserver: Send + Sync {
     /// Partial response arrived (not yet complete).
     fn on_partial_feed(&self, _query_id: &QueryId, _remaining: usize) {}
     /// A single LLM response has been fed back.
-    fn on_response_fed(&self, _query_id: &QueryId, _response: &str) {}
+    /// `usage` contains host-provided token counts when available.
+    fn on_response_fed(&self, _query_id: &QueryId, _response: &str, _usage: Option<&TokenUsage>) {}
     /// All responses arrived, Lua resuming (transition to Running).
     fn on_resumed(&self) {}
     fn on_completed(&self, _result: &serde_json::Value) {}

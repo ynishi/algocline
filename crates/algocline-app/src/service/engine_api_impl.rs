@@ -36,8 +36,9 @@ impl EngineApi for AppService {
         session_id: &str,
         response: String,
         query_id: Option<&str>,
+        usage: Option<algocline_core::TokenUsage>,
     ) -> Result<String, String> {
-        AppService::continue_single(self, session_id, response, query_id).await
+        AppService::continue_single(self, session_id, response, query_id, usage).await
     }
 
     async fn continue_batch(

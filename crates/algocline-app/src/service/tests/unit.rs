@@ -243,7 +243,7 @@ fn write_transcript_log_creates_meta_file() {
         grounded: false,
         underspecified: false,
     }]);
-    observer.on_response_fed(&algocline_core::QueryId::single(), "4");
+    observer.on_response_fed(&algocline_core::QueryId::single(), "4", None);
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
@@ -294,7 +294,7 @@ fn write_transcript_log_strategy_none() {
         grounded: false,
         underspecified: false,
     }]);
-    observer.on_response_fed(&algocline_core::QueryId::single(), "world");
+    observer.on_response_fed(&algocline_core::QueryId::single(), "world", None);
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
@@ -382,7 +382,7 @@ fn write_transcript_log_disabled_is_noop() {
         grounded: false,
         underspecified: false,
     }]);
-    observer.on_response_fed(&algocline_core::QueryId::single(), "r");
+    observer.on_response_fed(&algocline_core::QueryId::single(), "r", None);
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
@@ -462,7 +462,7 @@ fn write_transcript_log_truncates_long_prompt() {
         grounded: false,
         underspecified: false,
     }]);
-    observer.on_response_fed(&algocline_core::QueryId::single(), "r");
+    observer.on_response_fed(&algocline_core::QueryId::single(), "r", None);
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
@@ -830,7 +830,7 @@ fn write_transcript_log_noop_when_log_dir_none() {
         grounded: false,
         underspecified: false,
     }]);
-    observer.on_response_fed(&algocline_core::QueryId::single(), "r");
+    observer.on_response_fed(&algocline_core::QueryId::single(), "r", None);
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 

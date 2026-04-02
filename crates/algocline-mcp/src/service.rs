@@ -21,6 +21,24 @@ pub struct RunParams {
     pub ctx: Option<serde_json::Value>,
 }
 
+/// Host-reported token usage for an LLM call (MCP schema).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpTokenUsage {
+    /// Prompt tokens consumed by this LLM call.
+    pub prompt_tokens: Option<u64>,
+    /// Completion (response) tokens produced by this LLM call.
+    pub completion_tokens: Option<u64>,
+}
+
+impl From<McpTokenUsage> for algocline_app::TokenUsage {
+    fn from(u: McpTokenUsage) -> Self {
+        Self {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ContinueParams {
     /// Session ID returned by alc_run.
@@ -32,6 +50,9 @@ pub struct ContinueParams {
     pub query_id: Option<String>,
     /// Batch responses. Feed multiple query responses at once.
     pub responses: Option<Vec<McpQueryResponse>>,
+    /// Token usage reported by the host for this response.
+    /// Provides accurate token counts instead of character-based estimates.
+    pub usage: Option<McpTokenUsage>,
 }
 
 /// A single query response in a batch feed (MCP schema).
@@ -41,6 +62,8 @@ pub struct McpQueryResponse {
     pub query_id: String,
     /// The host LLM's response for this query.
     pub response: String,
+    /// Token usage reported by the host for this query.
+    pub usage: Option<McpTokenUsage>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -234,6 +257,7 @@ impl AlcService {
                 .map(|r| QueryResponse {
                     query_id: r.query_id,
                     response: r.response,
+                    usage: r.usage.map(Into::into),
                 })
                 .collect();
             return self.app.continue_batch(sid, app_responses).await;
@@ -245,7 +269,12 @@ impl AlcService {
             .ok_or("Either 'response' or 'responses' must be provided")?;
 
         self.app
-            .continue_single(sid, response, params.query_id.as_deref())
+            .continue_single(
+                sid,
+                response,
+                params.query_id.as_deref(),
+                params.usage.map(Into::into),
+            )
             .await
     }
 

@@ -1,3 +1,18 @@
+// ─── Token usage (host-provided) ─────────────────────────────
+
+/// Token usage reported by the host LLM alongside its response.
+///
+/// When the host includes usage data in `alc_continue`, these counts
+/// replace the character-based estimates for that specific response,
+/// upgrading `TokenSource` from `Estimated` to `Provided`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TokenUsage {
+    /// Prompt tokens consumed by this LLM call, as reported by the host.
+    pub prompt_tokens: Option<u64>,
+    /// Completion (response) tokens produced by this LLM call.
+    pub completion_tokens: Option<u64>,
+}
+
 // ─── Token tracking ─────────────────────────────────────────
 
 /// How a token count was obtained.
@@ -198,7 +213,7 @@ mod tests {
             underspecified: false,
         }];
         observer.on_paused(&queries);
-        observer.on_response_fed(&QueryId::single(), "4"); // 1 ASCII → ceil(1/4) = 1
+        observer.on_response_fed(&QueryId::single(), "4", None); // 1 ASCII → ceil(1/4) = 1
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
@@ -229,7 +244,7 @@ mod tests {
         // 3 rounds
         for _ in 0..3 {
             observer.on_paused(&q);
-            observer.on_response_fed(&QueryId::single(), "reply here"); // 10 → ceil(10/4) = 3
+            observer.on_response_fed(&QueryId::single(), "reply here", None); // 10 → ceil(10/4) = 3
             observer.on_resumed();
         }
         observer.on_completed(&serde_json::json!(null));

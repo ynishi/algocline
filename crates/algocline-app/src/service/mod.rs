@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use algocline_engine::{Executor, SessionRegistry};
 
-pub use algocline_core::EngineApi;
+pub use algocline_core::{EngineApi, TokenUsage};
 pub use config::{AppConfig, LogDirSource};
 pub use resolve::{QueryResponse, SearchPath};
 

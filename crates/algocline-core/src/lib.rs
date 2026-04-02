@@ -21,4 +21,4 @@ pub use spec::ExecutionSpec;
 pub use state::{
     ExecutionState, FeedError, PendingQueries, ResumeOutcome, TerminalState, TransitionError,
 };
-pub use tokens::{TokenCount, TokenSource};
+pub use tokens::{TokenCount, TokenSource, TokenUsage};

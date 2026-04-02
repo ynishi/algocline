@@ -10,11 +10,23 @@ use crate::{BudgetHandle, CustomMetrics, CustomMetricsHandle, LlmQuery, Progress
 // ─── Transcript ─────────────────────────────────────────────
 
 /// A single prompt/response exchange in the transcript.
+///
+/// Each entry is the authoritative token record for one LLM call.
+/// Token counts start as character-based estimates (`on_paused`) and
+/// are upgraded to host-provided values when available (`on_response_fed`).
+/// Session-level totals are computed by summing across all entries.
 struct TranscriptEntry {
     query_id: String,
     prompt: String,
     system: Option<String>,
     response: Option<String>,
+    /// Prompt token count for this query (Estimated or Provided).
+    prompt_tokens: u64,
+    prompt_source: TokenSource,
+    /// Response token count for this query (Estimated or Provided).
+    /// Zero until `on_response_fed` is called.
+    response_tokens: u64,
+    response_source: TokenSource,
 }
 
 impl TranscriptEntry {
@@ -89,8 +101,6 @@ pub(crate) struct SessionStatus {
     rounds: u64,
     total_prompt_chars: u64,
     total_response_chars: u64,
-    prompt_tokens: TokenCount,
-    response_tokens: TokenCount,
     transcript: Vec<TranscriptEntry>,
     pub(crate) budget: Option<Budget>,
     pub(crate) progress: Option<ProgressInfo>,
@@ -106,12 +116,36 @@ impl SessionStatus {
             rounds: 0,
             total_prompt_chars: 0,
             total_response_chars: 0,
-            prompt_tokens: TokenCount::new(TokenSource::Estimated),
-            response_tokens: TokenCount::new(TokenSource::Estimated),
             transcript: Vec::new(),
             budget: None,
             progress: None,
         }
+    }
+
+    /// Aggregate prompt tokens from all transcript entries.
+    fn prompt_token_count(&self) -> TokenCount {
+        let mut tc = TokenCount::new(TokenSource::Definite);
+        for e in &self.transcript {
+            tc.accumulate(e.prompt_tokens, e.prompt_source);
+        }
+        tc
+    }
+
+    /// Aggregate response tokens from all transcript entries.
+    fn response_token_count(&self) -> TokenCount {
+        let mut tc = TokenCount::new(TokenSource::Definite);
+        for e in &self.transcript {
+            tc.accumulate(e.response_tokens, e.response_source);
+        }
+        tc
+    }
+
+    /// Total tokens (prompt + response) across all transcript entries.
+    fn total_tokens(&self) -> u64 {
+        self.transcript
+            .iter()
+            .map(|e| e.prompt_tokens + e.response_tokens)
+            .sum()
     }
 
     /// Wall-clock elapsed milliseconds since session start.
@@ -122,12 +156,11 @@ impl SessionStatus {
     }
 
     fn to_json(&self) -> serde_json::Value {
-        let total_tokens = TokenCount {
-            tokens: self.prompt_tokens.tokens + self.response_tokens.tokens,
-            source: self
-                .prompt_tokens
-                .source
-                .weaker(self.response_tokens.source),
+        let prompt_tc = self.prompt_token_count();
+        let response_tc = self.response_token_count();
+        let total_tc = TokenCount {
+            tokens: prompt_tc.tokens + response_tc.tokens,
+            source: prompt_tc.source.weaker(response_tc.source),
         };
         let mut json = serde_json::json!({
             "elapsed_ms": self.elapsed_ms(),
@@ -136,9 +169,9 @@ impl SessionStatus {
             "rounds": self.rounds,
             "total_prompt_chars": self.total_prompt_chars,
             "total_response_chars": self.total_response_chars,
-            "prompt_tokens": self.prompt_tokens.to_json(),
-            "response_tokens": self.response_tokens.to_json(),
-            "total_tokens": total_tokens.to_json(),
+            "prompt_tokens": prompt_tc.to_json(),
+            "response_tokens": response_tc.to_json(),
+            "total_tokens": total_tc.to_json(),
         });
         if let Some(ref b) = self.budget {
             json["budget"] = b.to_json();
@@ -148,7 +181,7 @@ impl SessionStatus {
 
     pub(crate) fn check_budget(&self) -> Result<(), String> {
         match self.budget {
-            Some(ref b) => b.check(self.llm_calls, self.elapsed_ms()),
+            Some(ref b) => b.check(self.llm_calls, self.elapsed_ms(), self.total_tokens()),
             None => Ok(()),
         }
     }
@@ -172,7 +205,8 @@ impl SessionStatus {
         }
 
         if let Some(ref b) = self.budget {
-            json["budget_remaining"] = b.remaining_json(self.llm_calls, self.elapsed_ms());
+            json["budget_remaining"] =
+                b.remaining_json(self.llm_calls, self.elapsed_ms(), self.total_tokens());
         }
 
         json
@@ -181,7 +215,7 @@ impl SessionStatus {
     pub(crate) fn budget_remaining(&self) -> serde_json::Value {
         match self.budget {
             None => serde_json::Value::Null,
-            Some(ref b) => b.remaining_json(self.llm_calls, self.elapsed_ms()),
+            Some(ref b) => b.remaining_json(self.llm_calls, self.elapsed_ms(), self.total_tokens()),
         }
     }
 }
@@ -300,29 +334,34 @@ impl ExecutionObserver for MetricsObserver {
             m.llm_calls += queries.len() as u64;
             for q in queries {
                 m.total_prompt_chars += q.prompt.len() as u64;
-                m.prompt_tokens
-                    .accumulate(estimate_tokens(&q.prompt), TokenSource::Estimated);
+                let mut est = estimate_tokens(&q.prompt);
                 if let Some(ref sys) = q.system {
                     m.total_prompt_chars += sys.len() as u64;
-                    m.prompt_tokens
-                        .accumulate(estimate_tokens(sys), TokenSource::Estimated);
+                    est += estimate_tokens(sys);
                 }
                 m.transcript.push(TranscriptEntry {
                     query_id: q.id.as_str().to_string(),
                     prompt: q.prompt.clone(),
                     system: q.system.clone(),
                     response: None,
+                    prompt_tokens: est,
+                    prompt_source: TokenSource::Estimated,
+                    response_tokens: 0,
+                    response_source: TokenSource::Estimated,
                 });
             }
         }
     }
 
-    fn on_response_fed(&self, query_id: &QueryId, response: &str) {
+    fn on_response_fed(
+        &self,
+        query_id: &QueryId,
+        response: &str,
+        usage: Option<&crate::TokenUsage>,
+    ) {
         if let Ok(mut m) = self.auto.lock() {
             m.total_response_chars += response.len() as u64;
-            m.response_tokens
-                .accumulate(estimate_tokens(response), TokenSource::Estimated);
-            // Fill response into matching transcript entry (last match for this query_id).
+
             if let Some(entry) = m
                 .transcript
                 .iter_mut()
@@ -330,6 +369,24 @@ impl ExecutionObserver for MetricsObserver {
                 .find(|e| e.query_id == query_id.as_str())
             {
                 entry.response = Some(response.to_string());
+
+                // Prompt tokens: upgrade to Provided if host reported them.
+                if let Some(pt) = usage.and_then(|u| u.prompt_tokens) {
+                    entry.prompt_tokens = pt;
+                    entry.prompt_source = TokenSource::Provided;
+                }
+
+                // Response tokens: Provided if available, else Estimated.
+                match usage.and_then(|u| u.completion_tokens) {
+                    Some(ct) => {
+                        entry.response_tokens = ct;
+                        entry.response_source = TokenSource::Provided;
+                    }
+                    None => {
+                        entry.response_tokens = estimate_tokens(response);
+                        entry.response_source = TokenSource::Estimated;
+                    }
+                }
             }
         }
     }
@@ -435,8 +492,8 @@ mod tests {
         ];
 
         observer.on_paused(&queries);
-        observer.on_response_fed(&QueryId::batch(0), &"x".repeat(42));
-        observer.on_response_fed(&QueryId::batch(1), &"y".repeat(58));
+        observer.on_response_fed(&QueryId::batch(0), &"x".repeat(42), None);
+        observer.on_response_fed(&QueryId::batch(1), &"y".repeat(58), None);
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
@@ -463,15 +520,15 @@ mod tests {
 
         // Round 1
         observer.on_paused(&q);
-        observer.on_response_fed(&QueryId::single(), &"x".repeat(10));
+        observer.on_response_fed(&QueryId::single(), &"x".repeat(10), None);
         observer.on_resumed();
         // Round 2
         observer.on_paused(&q);
-        observer.on_response_fed(&QueryId::single(), &"y".repeat(20));
+        observer.on_response_fed(&QueryId::single(), &"y".repeat(20), None);
         observer.on_resumed();
         // Round 3
         observer.on_paused(&q);
-        observer.on_response_fed(&QueryId::single(), &"z".repeat(30));
+        observer.on_response_fed(&QueryId::single(), &"z".repeat(30), None);
         observer.on_resumed();
 
         observer.on_completed(&serde_json::json!(null));
@@ -500,7 +557,7 @@ mod tests {
         }];
 
         observer.on_paused(&queries);
-        observer.on_response_fed(&QueryId::single(), "4");
+        observer.on_response_fed(&QueryId::single(), "4", None);
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
@@ -524,7 +581,7 @@ mod tests {
             grounded: false,
             underspecified: false,
         }]);
-        observer.on_response_fed(&QueryId::single(), "r");
+        observer.on_response_fed(&QueryId::single(), "r", None);
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 
@@ -546,7 +603,7 @@ mod tests {
             grounded: false,
             underspecified: false,
         }]);
-        observer.on_response_fed(&QueryId::single(), "answer1");
+        observer.on_response_fed(&QueryId::single(), "answer1", None);
         observer.on_resumed();
 
         // Round 2
@@ -558,7 +615,7 @@ mod tests {
             grounded: false,
             underspecified: false,
         }]);
-        observer.on_response_fed(&QueryId::single(), "answer2");
+        observer.on_response_fed(&QueryId::single(), "answer2", None);
         observer.on_resumed();
 
         observer.on_completed(&serde_json::json!(null));
@@ -600,8 +657,8 @@ mod tests {
         ];
 
         observer.on_paused(&queries);
-        observer.on_response_fed(&QueryId::batch(0), "r0");
-        observer.on_response_fed(&QueryId::batch(1), "r1");
+        observer.on_response_fed(&QueryId::batch(0), "r0", None);
+        observer.on_response_fed(&QueryId::batch(1), "r1", None);
         observer.on_resumed();
         observer.on_completed(&serde_json::json!(null));
 

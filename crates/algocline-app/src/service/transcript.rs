@@ -79,6 +79,9 @@ pub(super) fn write_transcript_log(
         "llm_calls": auto_stats.get("llm_calls"),
         "total_prompt_chars": auto_stats.get("total_prompt_chars"),
         "total_response_chars": auto_stats.get("total_response_chars"),
+        "prompt_tokens": auto_stats.get("prompt_tokens"),
+        "response_tokens": auto_stats.get("response_tokens"),
+        "total_tokens": auto_stats.get("total_tokens"),
         "notes_count": 0,
     });
     if let Ok(meta_path) = ContainedPath::child(log_dir, &format!("{session_id}.meta.json")) {

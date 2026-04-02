@@ -23,6 +23,11 @@ pub struct Budget {
     /// Note: this is wall-clock, not CPU time. Includes time spent
     /// waiting for host LLM responses.
     pub max_elapsed_ms: Option<u64>,
+    /// Maximum total tokens (prompt + response) allowed in this session.
+    /// Checked against accumulated `prompt_tokens + response_tokens`.
+    /// Token counts may be estimated (±30%) or host-provided depending
+    /// on `TokenSource`. Budget check uses whatever is available.
+    pub max_tokens: Option<u64>,
 }
 
 impl Budget {
@@ -31,18 +36,20 @@ impl Budget {
         let obj = ctx.as_object()?.get("budget")?.as_object()?;
         let max_llm_calls = obj.get("max_llm_calls").and_then(|v| v.as_u64());
         let max_elapsed_ms = obj.get("max_elapsed_ms").and_then(|v| v.as_u64());
-        if max_llm_calls.is_none() && max_elapsed_ms.is_none() {
+        let max_tokens = obj.get("max_tokens").and_then(|v| v.as_u64());
+        if max_llm_calls.is_none() && max_elapsed_ms.is_none() && max_tokens.is_none() {
             return None;
         }
         Some(Self {
             max_llm_calls,
             max_elapsed_ms,
+            max_tokens,
         })
     }
 
     /// Check if the session is within budget given current counters.
     /// Returns Err with a structured message if any limit is exceeded.
-    pub fn check(&self, llm_calls: u64, elapsed_ms: u64) -> Result<(), String> {
+    pub fn check(&self, llm_calls: u64, elapsed_ms: u64, total_tokens: u64) -> Result<(), String> {
         if let Some(max) = self.max_llm_calls {
             if llm_calls >= max {
                 return Err(format!(
@@ -57,15 +64,28 @@ impl Budget {
                 ));
             }
         }
+        if let Some(max) = self.max_tokens {
+            if total_tokens >= max {
+                return Err(format!(
+                    "budget_exceeded: max_tokens ({max}) reached ({total_tokens} used)"
+                ));
+            }
+        }
         Ok(())
     }
 
     /// Remaining budget as JSON given current counters.
-    /// Returns `{ llm_calls: N|null, elapsed_ms: N|null }`.
-    pub fn remaining_json(&self, llm_calls: u64, elapsed_ms: u64) -> serde_json::Value {
+    /// Returns `{ llm_calls: N|null, elapsed_ms: N|null, tokens: N|null }`.
+    pub fn remaining_json(
+        &self,
+        llm_calls: u64,
+        elapsed_ms: u64,
+        total_tokens: u64,
+    ) -> serde_json::Value {
         serde_json::json!({
             "llm_calls": self.max_llm_calls.map(|max| max.saturating_sub(llm_calls)),
             "elapsed_ms": self.max_elapsed_ms.map(|max| max.saturating_sub(elapsed_ms)),
+            "tokens": self.max_tokens.map(|max| max.saturating_sub(total_tokens)),
         })
     }
 
@@ -77,6 +97,9 @@ impl Budget {
         }
         if let Some(max) = self.max_elapsed_ms {
             map.insert("max_elapsed_ms".into(), max.into());
+        }
+        if let Some(max) = self.max_tokens {
+            map.insert("max_tokens".into(), max.into());
         }
         serde_json::Value::Object(map)
     }
@@ -195,6 +218,7 @@ mod tests {
         metrics.set_budget(Budget {
             max_llm_calls: Some(5),
             max_elapsed_ms: None,
+            max_tokens: None,
         });
         let handle = metrics.budget_handle();
         assert!(handle.check().is_ok());
@@ -206,6 +230,7 @@ mod tests {
         metrics.set_budget(Budget {
             max_llm_calls: Some(2),
             max_elapsed_ms: None,
+            max_tokens: None,
         });
         let observer = metrics.create_observer();
         let handle = metrics.budget_handle();
@@ -220,7 +245,7 @@ mod tests {
             underspecified: false,
         }];
         observer.on_paused(&q);
-        observer.on_response_fed(&QueryId::single(), "r");
+        observer.on_response_fed(&QueryId::single(), "r", None);
         observer.on_resumed();
         observer.on_paused(&q);
 
@@ -228,6 +253,100 @@ mod tests {
         let result = handle.check();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("budget_exceeded"));
+    }
+
+    #[test]
+    fn budget_check_fails_when_tokens_exceeded() {
+        let metrics = ExecutionMetrics::new();
+        metrics.set_budget(Budget {
+            max_llm_calls: None,
+            max_elapsed_ms: None,
+            max_tokens: Some(10),
+        });
+        let observer = metrics.create_observer();
+        let handle = metrics.budget_handle();
+
+        // Simulate an LLM call with a prompt that estimates to ≥10 tokens.
+        // "abcdefghijklmnopqrstuvwxyz0123456789abcd" = 40 ASCII chars → ceil(40/4) = 10 tokens
+        let q = vec![LlmQuery {
+            id: QueryId::single(),
+            prompt: "abcdefghijklmnopqrstuvwxyz0123456789abcd".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+        }];
+        observer.on_paused(&q);
+        observer.on_response_fed(&QueryId::single(), "r", None);
+        observer.on_resumed();
+
+        let result = handle.check();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max_tokens"));
+    }
+
+    #[test]
+    fn budget_check_passes_when_tokens_within_limit() {
+        let metrics = ExecutionMetrics::new();
+        metrics.set_budget(Budget {
+            max_llm_calls: None,
+            max_elapsed_ms: None,
+            max_tokens: Some(1000),
+        });
+        let observer = metrics.create_observer();
+        let handle = metrics.budget_handle();
+
+        let q = vec![LlmQuery {
+            id: QueryId::single(),
+            prompt: "short".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+        }];
+        observer.on_paused(&q);
+        observer.on_response_fed(&QueryId::single(), "reply", None);
+        observer.on_resumed();
+
+        assert!(handle.check().is_ok());
+    }
+
+    #[test]
+    fn budget_remaining_tracks_tokens() {
+        let metrics = ExecutionMetrics::new();
+        metrics.set_budget(Budget {
+            max_llm_calls: None,
+            max_elapsed_ms: None,
+            max_tokens: Some(100),
+        });
+        let observer = metrics.create_observer();
+        let handle = metrics.budget_handle();
+
+        // "test" = 4 chars → ceil(4/4) = 1 token prompt, "r" → 1 token response
+        let q = vec![LlmQuery {
+            id: QueryId::single(),
+            prompt: "test".into(),
+            system: None,
+            max_tokens: 10,
+            grounded: false,
+            underspecified: false,
+        }];
+        observer.on_paused(&q);
+        observer.on_response_fed(&QueryId::single(), "r", None);
+        observer.on_resumed();
+
+        let remaining = handle.remaining();
+        // 100 - (1 prompt + 1 response) = 98
+        assert_eq!(remaining["tokens"], 98);
+    }
+
+    #[test]
+    fn budget_from_ctx_extracts_max_tokens() {
+        let ctx = serde_json::json!({"budget": {"max_tokens": 5000}});
+        let budget = Budget::from_ctx(&ctx).expect("should parse");
+        assert_eq!(budget.max_llm_calls, None);
+        assert_eq!(budget.max_elapsed_ms, None);
+        assert_eq!(budget.max_tokens, Some(5000));
     }
 
     #[test]
@@ -243,6 +362,7 @@ mod tests {
         metrics.set_budget(Budget {
             max_llm_calls: Some(5),
             max_elapsed_ms: None,
+            max_tokens: None,
         });
         let observer = metrics.create_observer();
         let handle = metrics.budget_handle();
@@ -267,6 +387,7 @@ mod tests {
         metrics.set_budget(Budget {
             max_llm_calls: Some(10),
             max_elapsed_ms: Some(60000),
+            max_tokens: None,
         });
         let observer = metrics.create_observer();
         observer.on_completed(&serde_json::json!(null));

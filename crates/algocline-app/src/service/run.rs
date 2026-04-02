@@ -62,7 +62,7 @@ impl AppService {
             let qid = QueryId::parse(&qr.query_id);
             let result = self
                 .registry
-                .feed_response(session_id, &qid, qr.response)
+                .feed_response(session_id, &qid, qr.response, qr.usage.as_ref())
                 .await
                 .map_err(|e| format!("Continue failed: {e}"))?;
             last_result = Some(result);
@@ -80,6 +80,7 @@ impl AppService {
         session_id: &str,
         response: String,
         query_id: Option<&str>,
+        usage: Option<algocline_core::TokenUsage>,
     ) -> Result<String, String> {
         let query_id = match query_id {
             Some(qid) => QueryId::parse(qid),
@@ -92,7 +93,7 @@ impl AppService {
 
         let result = self
             .registry
-            .feed_response(session_id, &query_id, response)
+            .feed_response(session_id, &query_id, response, usage.as_ref())
             .await
             .map_err(|e| format!("Continue failed: {e}"))?;
 

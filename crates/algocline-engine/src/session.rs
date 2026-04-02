@@ -208,9 +208,14 @@ impl Session {
     /// Feed one response by query_id.
     ///
     /// Returns Ok(true) if all queries are now complete, Ok(false) if still waiting.
-    fn feed_one(&mut self, query_id: &QueryId, response: String) -> Result<bool, SessionError> {
+    fn feed_one(
+        &mut self,
+        query_id: &QueryId,
+        response: String,
+        usage: Option<&algocline_core::TokenUsage>,
+    ) -> Result<bool, SessionError> {
         // Track response before ownership transfer.
-        self.observer.on_response_fed(query_id, &response);
+        self.observer.on_response_fed(query_id, &response, usage);
 
         // Runtime: send response to Lua thread (unblocks resp_rx.recv())
         if let Some(tx) = self.resp_txs.remove(query_id) {
@@ -360,6 +365,7 @@ impl SessionRegistry {
         session_id: &str,
         query_id: &QueryId,
         response: String,
+        usage: Option<&algocline_core::TokenUsage>,
     ) -> Result<FeedResult, SessionError> {
         // 1. Feed under lock
         let complete = {
@@ -368,7 +374,7 @@ impl SessionRegistry {
                 .get_mut(session_id)
                 .ok_or_else(|| SessionError::NotFound(session_id.into()))?;
 
-            let complete = session.feed_one(query_id, response)?;
+            let complete = session.feed_one(query_id, response, usage)?;
 
             if !complete {
                 return Ok(FeedResult::Accepted {

@@ -9,6 +9,8 @@ pub struct QueryResponse {
     pub query_id: String,
     /// The host LLM's response for this query.
     pub response: String,
+    /// Token usage reported by the host for this query.
+    pub usage: Option<crate::TokenUsage>,
 }
 
 // ─── Engine API trait ────────────────────────────────────────────
@@ -47,6 +49,7 @@ pub trait EngineApi: Send + Sync {
         session_id: &str,
         response: String,
         query_id: Option<&str>,
+        usage: Option<crate::TokenUsage>,
     ) -> Result<String, String>;
 
     /// Continue a paused execution — batch feed.

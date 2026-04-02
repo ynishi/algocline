@@ -44,6 +44,7 @@ pub struct BridgeConfig {
 /// Register all Layer 0 runtime primitives onto the given table.
 pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaResult<()> {
     register_json(lua, alc_table)?;
+    register_fuzzy(lua, alc_table)?;
     register_log(lua, alc_table)?;
     register_state(lua, alc_table, config.ns)?;
     register_chunk(lua, alc_table)?;
@@ -452,6 +453,121 @@ fn register_llm_batch(
     Ok(())
 }
 
+/// Register `alc.match_enum(text, candidates, opts?)` — fuzzy enum matcher for LLM output.
+///
+/// Finds which candidate string appears in `text` (case-insensitive substring match).
+/// If multiple candidates match, returns the one whose last occurrence is latest
+/// (LLMs tend to state conclusions last).
+/// If no substring match, falls back to fuzzy matching via `fuzzy_parser::distance`.
+///
+/// Lua usage:
+///   local verdict = alc.match_enum(response, {"PASS", "BLOCKED"})
+///   -- returns "PASS", "BLOCKED", or nil
+///
+/// opts (optional table):
+///   threshold: minimum similarity for fuzzy fallback (default 0.7)
+fn register_fuzzy(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let match_enum = _lua.create_function(
+        |_, (text, candidates, opts): (String, Vec<String>, Option<LuaTable>)| {
+            let threshold = opts
+                .as_ref()
+                .and_then(|t| t.get::<f64>("threshold").ok())
+                .unwrap_or(0.7);
+
+            let text_lower = text.to_lowercase();
+
+            // Phase 1: case-insensitive substring match.
+            // If multiple candidates match, pick the one whose last occurrence is latest.
+            let mut best: Option<(usize, &str)> = None; // (last_pos, candidate)
+            for c in &candidates {
+                let c_lower = c.to_lowercase();
+                if let Some(pos) = text_lower.rfind(&c_lower) {
+                    match best {
+                        Some((prev_pos, _)) if pos > prev_pos => best = Some((pos, c)),
+                        None => best = Some((pos, c)),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some((_, matched)) = best {
+                return Ok(Some(matched.to_string()));
+            }
+
+            // Phase 2: fuzzy fallback — handle typos in LLM output.
+            let candidate_strs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+            if let Some(m) = fuzzy_parser::distance::find_closest(
+                &text_lower,
+                candidate_strs
+                    .into_iter()
+                    .map(|s| s.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(|s| s.as_str()),
+                threshold,
+                fuzzy_parser::distance::Algorithm::JaroWinkler,
+            ) {
+                // Return the original-cased candidate that matched.
+                for c in &candidates {
+                    if c.to_lowercase() == m.candidate {
+                        return Ok(Some(c.clone()));
+                    }
+                }
+            }
+
+            Ok(None)
+        },
+    )?;
+
+    alc_table.set("match_enum", match_enum)?;
+
+    // alc.match_bool(text) -> true | false | nil
+    //
+    // Normalizes yes/no-style LLM responses.
+    // Scans for affirmative/negative keywords (case-insensitive substring).
+    // Returns the polarity of the last-occurring keyword, or nil if ambiguous/absent.
+    //
+    // Lua usage:
+    //   local ok = alc.match_bool("Approved. The plan looks good.")  -- true
+    //   local ok = alc.match_bool("rejected: missing tests")         -- false
+    //   local ok = alc.match_bool("I need more information")         -- nil
+    let match_bool = _lua.create_function(|_, text: String| {
+        const TRUE_WORDS: &[&str] = &[
+            "approved", "yes", "ok", "accept", "pass", "confirm", "agree", "true", "lgtm",
+        ];
+        const FALSE_WORDS: &[&str] = &[
+            "rejected", "no", "deny", "block", "fail", "refuse", "disagree", "false",
+        ];
+
+        let text_lower = text.to_lowercase();
+
+        // Find the last occurrence of any keyword from either group.
+        let mut last_pos: Option<(usize, bool)> = None; // (pos, is_true)
+        for word in TRUE_WORDS {
+            if let Some(pos) = text_lower.rfind(word) {
+                match last_pos {
+                    Some((prev, _)) if pos > prev => last_pos = Some((pos, true)),
+                    None => last_pos = Some((pos, true)),
+                    _ => {}
+                }
+            }
+        }
+        for word in FALSE_WORDS {
+            if let Some(pos) = text_lower.rfind(word) {
+                match last_pos {
+                    Some((prev, _)) if pos > prev => last_pos = Some((pos, false)),
+                    None => last_pos = Some((pos, false)),
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(last_pos.map(|(_, v)| v))
+    })?;
+
+    alc_table.set("match_bool", match_bool)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +954,176 @@ mod tests {
             .eval()
             .unwrap();
         assert!(result);
+    }
+
+    // ─── alc.match_enum tests ───
+
+    #[test]
+    fn match_enum_exact_substring() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: String = lua
+            .load(r#"return alc.match_enum("Verdict: BLOCKED. Fix the issues.", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "BLOCKED");
+    }
+
+    #[test]
+    fn match_enum_case_insensitive() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: String = lua
+            .load(r#"return alc.match_enum("verdict: pass. all good.", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "PASS");
+    }
+
+    #[test]
+    fn match_enum_last_wins() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Both appear, but PASS is last → PASS wins
+        let result: String = lua
+            .load(r#"return alc.match_enum("Initially BLOCKED, but after review: PASS", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "PASS");
+    }
+
+    #[test]
+    fn match_enum_no_match_returns_nil() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: LuaValue = lua
+            .load(r#"return alc.match_enum("something unrelated", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    // ─── alc.match_bool tests ───
+
+    #[test]
+    fn match_bool_approved() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: bool = lua
+            .load(r#"return alc.match_bool("Approved. The plan looks good.")"#)
+            .eval()
+            .unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn match_bool_rejected() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: bool = lua
+            .load(r#"return alc.match_bool("rejected: missing test coverage")"#)
+            .eval()
+            .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn match_bool_nil_on_ambiguous() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        let result: LuaValue = lua
+            .load(r#"return alc.match_bool("I need more information about the design")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    #[test]
+    fn match_bool_last_keyword_wins() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "no" appears, then "approved" later → true
+        let result: bool = lua
+            .load(r#"return alc.match_bool("No issues found. Approved.")"#)
+            .eval()
+            .unwrap();
+        assert!(result);
+    }
+
+    // ─── alc.parse_number tests ───
+
+    #[test]
+    fn parse_number_basic() {
+        let lua = setup_with_prelude();
+        let result: f64 = lua
+            .load(r#"return alc.parse_number("Found 3 subtasks to implement")"#)
+            .eval()
+            .unwrap();
+        assert!((result - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_number_decimal() {
+        let lua = setup_with_prelude();
+        let result: f64 = lua
+            .load(r#"return alc.parse_number("Score: 7.5/10")"#)
+            .eval()
+            .unwrap();
+        assert!((result - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_number_with_pattern() {
+        let lua = setup_with_prelude();
+        let result: f64 = lua
+            .load(r#"return alc.parse_number("Created 3 subtasks for implementation", "(%d+)%s+subtask")"#)
+            .eval()
+            .unwrap();
+        assert!((result - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_number_nil_on_no_match() {
+        let lua = setup_with_prelude();
+        let result: LuaValue = lua
+            .load(r#"return alc.parse_number("no numbers here")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    #[test]
+    fn parse_number_negative() {
+        let lua = setup_with_prelude();
+        let result: f64 = lua
+            .load(r#"return alc.parse_number("Temperature: -5 degrees")"#)
+            .eval()
+            .unwrap();
+        assert!((result - (-5.0)).abs() < f64::EPSILON);
     }
 }
 

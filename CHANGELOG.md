@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc.match_enum(text, candidates, opts?)`**: Fuzzy enum matcher for LLM output. Case-insensitive substring match with Jaro-Winkler fuzzy fallback (Layer 0, powered by `fuzzy-parser` crate)
+- **`alc.match_bool(text)`**: Yes/no normalizer for LLM responses. Returns `true`, `false`, or `nil` based on last-occurring affirmative/negative keyword (Layer 0)
+- **`alc.parse_number(text, pattern?)`**: Extract numbers from LLM output with optional Lua pattern (Layer 1 Prelude)
 - **`alc init` / `alc update`**: Distributes `alc.d.lua` LuaCats type stub to `~/.algocline/types/alc.d.lua` on every run. Enables editor completion (Lua Language Server, `lua_ls`) for all `alc.*` StdLib functions. If `.luarc.json` is absent from the current directory, a setup tip is printed to stderr
 - **MCP server startup**: Automatically distributes `alc.d.lua` on each server start, so the type stub is always up-to-date after `cargo install`
 - **`alc_pkg_install` response**: Added `types_path` field — absolute path to the installed `alc.d.lua` stub — so MCP clients can surface the location without an extra tool call

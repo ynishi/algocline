@@ -214,6 +214,25 @@ function alc.parse_score(str, default)
     return n
 end
 
+--- alc.parse_number(text, pattern?) -> number | nil
+--- Extract a number from LLM output.
+--- If pattern is given, uses it as a Lua pattern with a capture group.
+--- Otherwise extracts the first number (integer or decimal, optionally negative).
+---
+--- Usage:
+---   alc.parse_number("Found 3 subtasks")              -- 3
+---   alc.parse_number("Score: 7.5/10")                  -- 7.5
+---   alc.parse_number(response, "(%d+)%s+subtask")      -- 3
+---   alc.parse_number("no numbers here")                -- nil
+function alc.parse_number(text, pattern)
+    if type(text) ~= "string" then return nil end
+    if pattern then
+        local m = text:match(pattern)
+        return tonumber(m)
+    end
+    return tonumber(text:match("%-?%d+%.?%d*"))
+end
+
 --- alc.json_extract(raw) -> table | nil
 --- Extract JSON object or array from LLM output.
 --- Handles raw JSON, markdown fences (```json ... ```), and

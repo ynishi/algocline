@@ -22,6 +22,7 @@ mlua-pkg = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+fuzzy-parser = "0.1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = "1"

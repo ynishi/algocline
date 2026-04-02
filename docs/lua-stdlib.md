@@ -113,6 +113,41 @@ local data = alc.json_decode('{"a":1,"b":"two"}')
 -- data.a == 1, data.b == "two"
 ```
 
+### Fuzzy Matching
+
+#### `alc.match_enum(text, candidates, opts?) -> string | nil`
+
+Find which candidate string appears in LLM output (case-insensitive substring match).
+If multiple candidates match, returns the one whose last occurrence is latest
+(LLMs tend to state conclusions last). Falls back to fuzzy matching for typos.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `text` | string | yes | LLM response text to search |
+| `candidates` | string[] | yes | List of valid values |
+| `opts` | table | no | `{ threshold = 0.7 }` — min similarity for fuzzy fallback |
+
+```lua
+local verdict = alc.match_enum(response, {"PASS", "BLOCKED"})
+local decision = alc.match_enum(response, {"SCAFFOLD", "KILL", "DEFER"})
+```
+
+#### `alc.match_bool(text) -> boolean | nil`
+
+Normalize yes/no-style LLM responses. Scans for affirmative/negative keywords
+(case-insensitive) and returns the polarity of the last-occurring keyword.
+
+Affirmative: `approved`, `yes`, `ok`, `accept`, `pass`, `confirm`, `agree`, `true`, `lgtm`
+Negative: `rejected`, `no`, `deny`, `block`, `fail`, `refuse`, `disagree`, `false`
+
+```lua
+alc.match_bool("Approved. The plan looks good.")    -- true
+alc.match_bool("rejected: missing test coverage")   -- false
+alc.match_bool("I need more information")            -- nil
+```
+
 ### Logging
 
 #### `alc.log(level, msg)`
@@ -407,6 +442,26 @@ Extract the first integer from a string. Clamps to 1-10 range. Returns `default`
 ```lua
 local score = alc.parse_score(llm_response)       -- default 5
 local score = alc.parse_score(llm_response, 3)    -- default 3
+```
+
+#### `alc.parse_number(text, pattern?) -> number | nil`
+
+Extract a number from LLM output. If `pattern` is given, uses it as a Lua pattern
+with a capture group. Otherwise extracts the first number (integer or decimal, optionally negative).
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `text` | string | yes | Text to extract from |
+| `pattern` | string | no | Lua pattern with capture group |
+
+```lua
+alc.parse_number("Found 3 subtasks")              -- 3
+alc.parse_number("Score: 7.5/10")                  -- 7.5
+alc.parse_number("Temperature: -5 degrees")        -- -5
+alc.parse_number(response, "(%d+)%s+subtask")      -- 3
+alc.parse_number("no numbers here")                -- nil
 ```
 
 ### JSON

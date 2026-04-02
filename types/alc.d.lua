@@ -69,6 +69,26 @@ function alc.json_encode(value) end
 ---@return any value Lua value
 function alc.json_decode(str) end
 
+-- Fuzzy Matching ---
+
+---@class AlcMatchEnumOpts
+---@field threshold? number Minimum similarity for fuzzy fallback (default: 0.7)
+
+--- Find which candidate appears in LLM output (case-insensitive substring).
+--- If multiple match, returns the one whose last occurrence is latest.
+--- Falls back to fuzzy matching (Jaro-Winkler) for typos.
+---@param text string LLM response text
+---@param candidates string[] Valid values to search for
+---@param opts? AlcMatchEnumOpts Options
+---@return string|nil matched Matched candidate or nil
+function alc.match_enum(text, candidates, opts) end
+
+--- Normalize yes/no-style LLM responses.
+--- Scans for affirmative/negative keywords and returns the polarity of the last-occurring keyword.
+---@param text string LLM response text
+---@return boolean|nil result true (affirmative), false (negative), or nil (ambiguous)
+function alc.match_bool(text) end
+
 -- Logging ---
 
 --- Emit a log message via tracing.
@@ -253,6 +273,14 @@ function alc.vote(answers) end
 ---@param default? integer Fallback value (default: 5)
 ---@return integer score Score in 1-10 range
 function alc.parse_score(str, default) end
+
+--- Extract a number from LLM output.
+--- If pattern is given, uses it as a Lua pattern with a capture group.
+--- Otherwise extracts the first number (integer or decimal, optionally negative).
+---@param text string Text to extract from
+---@param pattern? string Lua pattern with capture group
+---@return number|nil value Extracted number or nil
+function alc.parse_number(text, pattern) end
 
 -- JSON ---
 

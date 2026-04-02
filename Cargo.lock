@@ -65,6 +65,7 @@ dependencies = [
  "algocline-core",
  "anyhow",
  "dirs",
+ "fuzzy-parser",
  "mlua",
  "mlua-isle",
  "mlua-pkg",
@@ -493,6 +494,18 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "fuzzy-parser"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f76a3c3a1bfb60924fded82f72b5e71d375ffc48e9a2f4dc2ae226b89e4a8f89"
+dependencies = [
+ "serde",
+ "serde_json",
+ "strsim",
+ "thiserror",
 ]
 
 [[package]]

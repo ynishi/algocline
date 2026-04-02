@@ -610,3 +610,37 @@ describe("alc.tuning", function()
         expect(log_entries[1].level).to.equal("warn")
     end)
 end)
+
+-- ─── alc.parse_number ───
+
+describe("alc.parse_number", function()
+    it("extracts first integer", function()
+        expect(alc.parse_number("Found 3 subtasks")).to.equal(3)
+    end)
+
+    it("extracts decimal", function()
+        expect(alc.parse_number("Score: 7.5/10")).to.equal(7.5)
+    end)
+
+    it("extracts negative number", function()
+        expect(alc.parse_number("Temperature: -5 degrees")).to.equal(-5)
+    end)
+
+    it("uses pattern with capture group", function()
+        expect(alc.parse_number("Created 3 subtasks for impl", "(%d+)%s+subtask")).to.equal(3)
+    end)
+
+    it("returns nil for non-string", function()
+        expect(alc.parse_number(nil)).to.equal(nil)
+        expect(alc.parse_number(42)).to.equal(nil)
+        expect(alc.parse_number(true)).to.equal(nil)
+    end)
+
+    it("returns nil when no number found", function()
+        expect(alc.parse_number("no numbers here")).to.equal(nil)
+    end)
+
+    it("returns nil when pattern does not match", function()
+        expect(alc.parse_number("hello world", "(%d+)%s+subtask")).to.equal(nil)
+    end)
+end)

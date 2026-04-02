@@ -130,6 +130,8 @@ Layer 0: Runtime Primitives (Rust → alc.*)
 │  alc.json_encode/json_decode   — serde_json bridge
 │  alc.log(level, msg)           — tracing bridge
 │  alc.state.get/set/keys/delete — persistent key-value store
+│  alc.match_enum(text, cs, o?)  — fuzzy enum match from LLM output
+│  alc.match_bool(text)          — yes/no normalizer for LLM output
 │  alc.budget_remaining()        — remaining budget (calls/time)
 │  alc.progress(step, total, m?) — structured progress reporting
 │
@@ -141,6 +143,7 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.vote(answers)             — majority aggregation
 │  alc.filter(items, fn)         — conditional selection
 │  alc.json_extract(raw)         — extract JSON from LLM output
+│  alc.parse_number(text, pat?)  — extract number from LLM output
 │  alc.state.update(key, fn)     — read-modify-write for state
 │  alc.llm_safe(prompt, opts, d) — non-throwing LLM wrapper
 │  alc.fingerprint(str)          — normalize + DJB2 hash (dedup)

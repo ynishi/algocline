@@ -21,6 +21,34 @@ Layer 0 and Layer 1 are always available without `require()`.
 
 ---
 
+## Type Support
+
+algocline distributes `types/alc.d.lua` — a [LuaCats](https://luals.github.io/wiki/annotations/) type definition file covering all `alc.*` functions. This enables editor completion and static analysis via [lua-language-server](https://github.com/LuaLS/lua-language-server).
+
+### Setup
+
+The type stub is installed to `~/.algocline/types/alc.d.lua` automatically on `alc init` and on every MCP server startup.
+
+Add the types directory to your `.luarc.json`:
+
+```json
+{
+  "workspace": { "library": ["~/.algocline/types"] },
+  "diagnostics": { "globals": ["alc"] },
+  "runtime": { "version": "Lua 5.4" }
+}
+```
+
+### CI Integration
+
+```bash
+lua-language-server --check src/ --configpath .luarc.json --checklevel=Warning
+```
+
+Non-zero exit on diagnostics. Detects undefined `alc.*` calls not covered by `alc.d.lua`.
+
+---
+
 ## Layer 0: Runtime Primitives
 
 ### LLM

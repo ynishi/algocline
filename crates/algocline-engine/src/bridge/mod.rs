@@ -493,25 +493,37 @@ fn register_fuzzy(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
                 return Ok(Some(matched.to_string()));
             }
 
-            // Phase 2: fuzzy fallback — handle typos in LLM output.
-            let candidate_strs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-            if let Some(m) = fuzzy_parser::distance::find_closest(
-                &text_lower,
-                candidate_strs
-                    .into_iter()
-                    .map(|s| s.to_lowercase())
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .map(|s| s.as_str()),
-                threshold,
-                fuzzy_parser::distance::Algorithm::JaroWinkler,
-            ) {
-                // Return the original-cased candidate that matched.
-                for c in &candidates {
-                    if c.to_lowercase() == m.candidate {
-                        return Ok(Some(c.clone()));
+            // Phase 2: fuzzy fallback — split text into words, compare each
+            // word against candidates. Jaro-Winkler is designed for short strings,
+            // so per-word comparison is more effective than whole-text comparison.
+            let candidates_lower: Vec<String> =
+                candidates.iter().map(|c| c.to_lowercase()).collect();
+            let mut best_match: Option<(f64, usize)> = None; // (similarity, candidate_index)
+            for token in text_lower.split_whitespace() {
+                // Strip surrounding punctuation from the token for cleaner matching.
+                let token = token.trim_matches(|c: char| !c.is_alphanumeric());
+                if token.is_empty() {
+                    continue;
+                }
+                for (i, cl) in candidates_lower.iter().enumerate() {
+                    let sim = fuzzy_parser::distance::similarity(
+                        token,
+                        cl,
+                        fuzzy_parser::distance::Algorithm::JaroWinkler,
+                    );
+                    if sim >= threshold {
+                        match best_match {
+                            Some((prev_sim, _)) if sim > prev_sim => {
+                                best_match = Some((sim, i));
+                            }
+                            None => best_match = Some((sim, i)),
+                            _ => {}
+                        }
                     }
                 }
+            }
+            if let Some((_, idx)) = best_match {
+                return Ok(Some(candidates[idx].clone()));
             }
 
             Ok(None)
@@ -539,25 +551,48 @@ fn register_fuzzy(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
         ];
 
         let text_lower = text.to_lowercase();
+        let bytes = text_lower.as_bytes();
 
-        // Find the last occurrence of any keyword from either group.
+        // Check that the character at the given byte position is not alphanumeric (ASCII).
+        // Returns true if pos is out of bounds or the character is a word boundary.
+        let is_boundary =
+            |pos: usize| -> bool { pos >= bytes.len() || !bytes[pos].is_ascii_alphanumeric() };
+
+        // Find the last whole-word occurrence of any keyword from either group.
         let mut last_pos: Option<(usize, bool)> = None; // (pos, is_true)
         for word in TRUE_WORDS {
-            if let Some(pos) = text_lower.rfind(word) {
-                match last_pos {
-                    Some((prev, _)) if pos > prev => last_pos = Some((pos, true)),
-                    None => last_pos = Some((pos, true)),
-                    _ => {}
+            // Scan all occurrences (rfind only gives the last, but we need boundary check)
+            let w = word.as_bytes();
+            let mut start = 0;
+            while let Some(rel) = text_lower[start..].find(word) {
+                let pos = start + rel;
+                let before_ok = pos == 0 || is_boundary(pos - 1);
+                let after_ok = is_boundary(pos + w.len());
+                if before_ok && after_ok {
+                    match last_pos {
+                        Some((prev, _)) if pos > prev => last_pos = Some((pos, true)),
+                        None => last_pos = Some((pos, true)),
+                        _ => {}
+                    }
                 }
+                start = pos + 1;
             }
         }
         for word in FALSE_WORDS {
-            if let Some(pos) = text_lower.rfind(word) {
-                match last_pos {
-                    Some((prev, _)) if pos > prev => last_pos = Some((pos, false)),
-                    None => last_pos = Some((pos, false)),
-                    _ => {}
+            let w = word.as_bytes();
+            let mut start = 0;
+            while let Some(rel) = text_lower[start..].find(word) {
+                let pos = start + rel;
+                let before_ok = pos == 0 || is_boundary(pos - 1);
+                let after_ok = is_boundary(pos + w.len());
+                if before_ok && after_ok {
+                    match last_pos {
+                        Some((prev, _)) if pos > prev => last_pos = Some((pos, false)),
+                        None => last_pos = Some((pos, false)),
+                        _ => {}
+                    }
                 }
+                start = pos + 1;
             }
         }
 
@@ -1015,6 +1050,51 @@ mod tests {
         assert!(result.is_nil());
     }
 
+    #[test]
+    fn match_enum_fuzzy_typo_in_short_response() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "BLOKED" is a typo for "BLOCKED" — fuzzy should catch it
+        let result: String = lua
+            .load(r#"return alc.match_enum("BLOKED", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "BLOCKED");
+    }
+
+    #[test]
+    fn match_enum_fuzzy_works_in_long_text() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Long sentence with a typo "BLCKED" buried in it — per-word fuzzy should find it
+        let result: String = lua
+            .load(r#"return alc.match_enum("After careful review of all the evidence and considering multiple factors, the final verdict is BLCKED due to missing tests.", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "BLOCKED");
+    }
+
+    #[test]
+    fn match_enum_fuzzy_nil_when_no_close_word() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // No word is close enough to any candidate
+        let result: LuaValue = lua
+            .load(r#"return alc.match_enum("The weather is nice today", {"PASS", "BLOCKED"})"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
     // ─── alc.match_bool tests ───
 
     #[test]
@@ -1072,6 +1152,82 @@ mod tests {
             .eval()
             .unwrap();
         assert!(result);
+    }
+
+    #[test]
+    fn match_bool_rejects_partial_word_ok_in_bypass() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "ok" should NOT match inside "token" or "okay" without boundary
+        let result: LuaValue = lua
+            .load(r#"return alc.match_bool("This is a broken token")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    #[test]
+    fn match_bool_rejects_pass_in_bypass() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "pass" should NOT match inside "bypass"
+        let result: LuaValue = lua
+            .load(r#"return alc.match_bool("We need to bypass the filter")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    #[test]
+    fn match_bool_rejects_no_in_innovation() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "no" should NOT match inside "innovation"
+        let result: LuaValue = lua
+            .load(r#"return alc.match_bool("Great innovation in technology")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
+    }
+
+    #[test]
+    fn match_bool_word_boundary_with_punctuation() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "yes" followed by punctuation should match
+        let result: bool = lua
+            .load(r#"return alc.match_bool("yes, that works")"#)
+            .eval()
+            .unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn match_bool_fail_in_failed_matches() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // "fail" at word boundary within "failed" — "fail" + "ed" where 'e' is alphanumeric
+        // should NOT match
+        let result: LuaValue = lua
+            .load(r#"return alc.match_bool("The process failed gracefully")"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil());
     }
 
     // ─── alc.parse_number tests ───

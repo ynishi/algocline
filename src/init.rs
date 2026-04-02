@@ -748,13 +748,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn alc_type_stub_is_not_empty() {
-        assert!(
-            !ALC_TYPE_STUB.is_empty(),
-            "ALC_TYPE_STUB should not be empty"
-        );
-    }
+
 
     #[test]
     fn alc_type_stub_starts_with_meta() {

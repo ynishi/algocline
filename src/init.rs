@@ -63,6 +63,55 @@ fn packages_dir() -> anyhow::Result<PathBuf> {
     Ok(home.join(".algocline").join("packages"))
 }
 
+fn types_dir() -> anyhow::Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(home.join(".algocline").join("types"))
+}
+
+/// LuaCats type definitions for editor completion (alc.d.lua).
+/// Embedded at compile time, distributed to ~/.algocline/types/ on init.
+const ALC_TYPE_STUB: &str = include_str!("../types/alc.d.lua");
+
+/// Distribute alc.d.lua type stub to ~/.algocline/types/.
+/// Always overwrites (version upgrade support).
+/// Returns the path to the installed type stub file.
+pub fn distribute_types() -> anyhow::Result<PathBuf> {
+    let dir = types_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join("alc.d.lua");
+    std::fs::write(&dest, ALC_TYPE_STUB)?;
+    Ok(dest)
+}
+
+/// Print .luarc.json setup guidance if not present in current directory.
+fn print_luarc_guidance(types_path: &Path) {
+    let luarc = std::env::current_dir().map(|d| d.join(".luarc.json")).ok();
+    if luarc.as_ref().is_some_and(|p| p.exists()) {
+        return;
+    }
+    let types_dir = types_path.parent().unwrap_or(types_path);
+    eprintln!();
+    eprintln!("Tip: To enable editor completion, create .luarc.json with:");
+    eprintln!(
+        r#"  {{ "workspace": {{ "library": ["{}"] }} }}"#,
+        types_dir.display()
+    );
+}
+
+/// Distribute type stubs and print guidance. Non-fatal: warnings only on error.
+fn finalize_init() {
+    match distribute_types() {
+        Ok(path) => {
+            eprintln!("Types installed: {}", path.display());
+            print_luarc_guidance(&path);
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to install type stubs: {e}");
+        }
+    }
+}
+
 /// Discover package directories in a source directory.
 ///
 /// Returns sorted list of (name, path) for each subdirectory containing `init.lua`.
@@ -397,11 +446,14 @@ pub async fn run(args: &[String], force_override: bool) -> anyhow::Result<()> {
         if !found_any {
             anyhow::bail!("No local source directories found for any bundled source");
         }
+        finalize_init();
         return Ok(());
     }
 
     // Try git clone first, fall back to local for failed sources
-    install_from_git(&dest, force).await
+    install_from_git(&dest, force).await?;
+    finalize_init();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -694,5 +746,29 @@ mod tests {
             // Restore permissions for cleanup
             std::fs::set_permissions(dest2.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn alc_type_stub_is_not_empty() {
+        assert!(
+            !ALC_TYPE_STUB.is_empty(),
+            "ALC_TYPE_STUB should not be empty"
+        );
+    }
+
+    #[test]
+    fn alc_type_stub_starts_with_meta() {
+        assert!(
+            ALC_TYPE_STUB.starts_with("---@meta"),
+            "ALC_TYPE_STUB should start with ---@meta (LuaCats format)"
+        );
+    }
+
+    #[test]
+    fn alc_type_stub_contains_llm_function() {
+        assert!(
+            ALC_TYPE_STUB.contains("function alc.llm"),
+            "ALC_TYPE_STUB should contain function alc.llm definition"
+        );
     }
 }

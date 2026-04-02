@@ -515,3 +515,49 @@ return M"#
 
     client.cancel().await.expect("cancel failed");
 }
+
+#[tokio::test]
+async fn test_pkg_install_returns_types_path() {
+    let client = connect().await;
+
+    // Create a temporary package
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let pkg_dir = tmp_dir.path().join("e2e_types_test");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_types_test", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    // Install and check response
+    let resp = call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_dir.to_string_lossy() }),
+    )
+    .await;
+
+    assert_eq!(resp["installed"], json!(["e2e_types_test"]));
+    assert!(
+        resp["types_path"].is_string(),
+        "types_path should be present in pkg_install response"
+    );
+    let types_path = resp["types_path"].as_str().unwrap();
+    assert!(
+        types_path.ends_with("types/alc.d.lua"),
+        "types_path should end with types/alc.d.lua, got: {types_path}"
+    );
+
+    // Cleanup
+    call_json(
+        &client,
+        "alc_pkg_remove",
+        json!({ "name": "e2e_types_test" }),
+    )
+    .await;
+    client.cancel().await.expect("cancel failed");
+}

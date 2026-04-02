@@ -54,6 +54,8 @@ alc init
 
 This downloads the bundled package collection (UCB1, chain-of-thought, self-consistency, etc.) into `~/.algocline/packages/`. Run `alc init --force` to overwrite existing packages.
 
+It also distributes `alc.d.lua` — LuaCats type definitions for all `alc.*` StdLib functions — to `~/.algocline/types/alc.d.lua`. This enables editor completion in any editor backed by [lua-language-server](https://github.com/LuaLS/lua-language-server). If `.luarc.json` is not present in the current directory, a setup tip is printed.
+
 > **Note**: If you skip this step, packages are auto-installed on first `alc_advice` call via MCP. But running `alc init` upfront is recommended for faster first use and offline availability.
 
 ### 3. Add to your MCP config
@@ -199,7 +201,7 @@ alc_continue({ session_id, response })
 | `alc_continue` | Resume a paused execution with the host LLM's response |
 | `alc_advice` | Apply an installed package by name |
 | `alc_pkg_list` | List installed packages |
-| `alc_pkg_install` | Install a package or collection from Git URL or local path |
+| `alc_pkg_install` | Install a package or collection from Git URL or local path. Response includes `types_path` (absolute path to `alc.d.lua`) |
 | `alc_pkg_remove` | Remove an installed package |
 | `alc_eval` | Evaluate a strategy against a scenario (cases + graders) |
 | `alc_eval_history` | List past eval results, filter by strategy |

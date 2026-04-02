@@ -183,11 +183,14 @@ return pkg.meta or {{ name = "{name}" }}"#
             copy_dir(staging.path(), dest.as_ref())
                 .map_err(|e| format!("Failed to copy package: {e}"))?;
 
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "installed": [name],
                 "mode": "single",
-            })
-            .to_string())
+            });
+            if let Some(tp) = super::resolve::types_stub_path() {
+                response["types_path"] = serde_json::Value::String(tp);
+            }
+            Ok(response.to_string())
         } else {
             // Collection mode: scan for subdirs containing init.lua
             if name.is_some() {
@@ -261,14 +264,17 @@ return pkg.meta or {{ name = "{name}" }}"#
                 );
             }
 
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "installed": installed,
                 "skipped": skipped,
                 "scenarios_installed": scenarios_installed,
                 "scenarios_failures": scenarios_failures,
                 "mode": "collection",
-            })
-            .to_string())
+            });
+            if let Some(tp) = super::resolve::types_stub_path() {
+                response["types_path"] = serde_json::Value::String(tp);
+            }
+            Ok(response.to_string())
         }
     }
 
@@ -298,11 +304,14 @@ return pkg.meta or {{ name = "{name}" }}"#
             // Remove .git if copied
             let _ = std::fs::remove_dir_all(dest.as_ref().join(".git"));
 
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "installed": [name],
                 "mode": "local_single",
-            })
-            .to_string())
+            });
+            if let Some(tp) = super::resolve::types_stub_path() {
+                response["types_path"] = serde_json::Value::String(tp);
+            }
+            Ok(response.to_string())
         } else {
             // Collection mode
             if name.is_some() {
@@ -347,12 +356,15 @@ return pkg.meta or {{ name = "{name}" }}"#
                 );
             }
 
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "installed": installed,
                 "updated": updated,
                 "mode": "local_collection",
-            })
-            .to_string())
+            });
+            if let Some(tp) = super::resolve::types_stub_path() {
+                response["types_path"] = serde_json::Value::String(tp);
+            }
+            Ok(response.to_string())
         }
     }
 

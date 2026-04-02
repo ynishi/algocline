@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`alc init` / `alc update`**: Distributes `alc.d.lua` LuaCats type stub to `~/.algocline/types/alc.d.lua` on every run. Enables editor completion (Lua Language Server, `lua_ls`) for all `alc.*` StdLib functions. If `.luarc.json` is absent from the current directory, a setup tip is printed to stderr
+- **MCP server startup**: Automatically distributes `alc.d.lua` on each server start, so the type stub is always up-to-date after `cargo install`
+- **`alc_pkg_install` response**: Added `types_path` field — absolute path to the installed `alc.d.lua` stub — so MCP clients can surface the location without an extra tool call
+
 ## [0.11.1] - 2026-04-01
 
 ### Changed

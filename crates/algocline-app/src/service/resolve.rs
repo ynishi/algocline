@@ -91,6 +91,13 @@ return pkg.run(ctx)"#
     )
 }
 
+pub(crate) fn types_stub_path() -> Option<String> {
+    dirs::home_dir()
+        .map(|h| h.join(".algocline").join("types").join("alc.d.lua"))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+}
+
 pub(crate) fn packages_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     Ok(home.join(".algocline").join("packages"))

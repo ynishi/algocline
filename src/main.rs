@@ -122,6 +122,12 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::from_env();
     setup_tracing(config.log_dir.as_deref())?;
 
+    // Distribute type stubs (non-fatal: log warning on failure)
+    match init::distribute_types() {
+        Ok(path) => tracing::debug!("types installed: {}", path.display()),
+        Err(e) => tracing::warn!("failed to install type stubs: {e}"),
+    }
+
     tracing::info!("algocline server starting");
 
     let search_paths = resolve_lib_paths();

@@ -3,6 +3,7 @@ mod engine_api_impl;
 mod eval;
 mod eval_store;
 mod logging;
+pub(crate) mod manifest;
 pub(crate) mod path;
 mod pkg;
 pub mod resolve;

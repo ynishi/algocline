@@ -41,11 +41,27 @@ pub(super) fn save_eval_result(strategy: &str, result_json: &str) {
     let _ = std::fs::write(&path, result_json);
 
     // Write lightweight meta file for listing
+    let meta = build_meta(&eval_id, strategy, timestamp, &parsed);
+
+    if let Ok(meta_path) = ContainedPath::child(&dir, &format!("{eval_id}.meta.json")) {
+        let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
+    }
+}
+
+/// Build the lightweight meta JSON from a full eval result.
+///
+/// Pure function — no I/O, no side effects. Testable independently.
+pub(super) fn build_meta(
+    eval_id: &str,
+    strategy: &str,
+    timestamp: u64,
+    parsed: &serde_json::Value,
+) -> serde_json::Value {
     let result_obj = parsed.get("result");
     let stats_obj = parsed.get("stats");
     let aggregated = result_obj.and_then(|r| r.get("aggregated"));
 
-    let meta = serde_json::json!({
+    serde_json::json!({
         "eval_id": eval_id,
         "strategy": strategy,
         "timestamp": timestamp,
@@ -56,11 +72,81 @@ pub(super) fn save_eval_result(strategy: &str, result_json: &str) {
         "llm_calls": stats_obj.and_then(|s| s.get("auto")).and_then(|a| a.get("llm_calls")),
         "elapsed_ms": stats_obj.and_then(|s| s.get("auto")).and_then(|a| a.get("elapsed_ms")),
         "summary": result_obj.and_then(|r| r.get("summary")),
-    });
+    })
+}
 
-    if let Ok(meta_path) = ContainedPath::child(&dir, &format!("{eval_id}.meta.json")) {
-        let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
+/// List eval history from a given directory, optionally filtered by strategy.
+///
+/// Pure directory-scanning function — testable with tmpdir.
+pub(super) fn list_eval_history(
+    dir: &std::path::Path,
+    strategy: Option<&str>,
+    limit: usize,
+) -> Result<String, String> {
+    if !dir.exists() {
+        return Ok(serde_json::json!({ "evals": [] }).to_string());
     }
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    let read_dir = std::fs::read_dir(dir).map_err(|e| format!("Failed to read evals dir: {e}"))?;
+
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // Skip meta files
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".meta."))
+        {
+            continue;
+        }
+
+        // Read meta file (lightweight) if it exists.
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let meta_path = match ContainedPath::child(dir, &format!("{stem}.meta.json")) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let meta = if meta_path.exists() {
+            std::fs::read_to_string(&*meta_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        } else {
+            None
+        };
+
+        if let Some(meta) = meta {
+            if let Some(filter) = strategy {
+                if meta.get("strategy").and_then(|s| s.as_str()) != Some(filter) {
+                    continue;
+                }
+            }
+            entries.push(meta);
+        }
+    }
+
+    // Sort by timestamp descending (newest first)
+    entries.sort_by(|a, b| {
+        let ts_a = a
+            .get("timestamp")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let ts_b = b
+            .get("timestamp")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        ts_b.cmp(&ts_a)
+    });
+    entries.truncate(limit);
+
+    Ok(serde_json::json!({ "evals": entries }).to_string())
 }
 
 // ─── Eval Comparison Helpers ─────────────────────────────────────

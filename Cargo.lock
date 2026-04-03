@@ -40,6 +40,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "proptest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

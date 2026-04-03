@@ -4,7 +4,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use crate::service::config::{AppConfig, LogDirSource};
-use crate::service::eval_store::extract_strategy_from_id;
+use crate::service::eval_store::{build_meta, extract_strategy_from_id, list_eval_history};
 use crate::service::path::{copy_dir, ContainedPath};
 use crate::service::resolve::{
     display_name, install_scenarios_from_dir, is_package_installed, make_require_code,
@@ -286,4 +286,163 @@ fn save_compare_result_persists_file() {
 
     let read = std::fs::read_to_string(&*path).unwrap();
     assert_eq!(read, data);
+}
+
+// ─── build_meta tests ───
+
+#[test]
+fn build_meta_extracts_aggregated_fields() {
+    let result_json = serde_json::json!({
+        "result": {
+            "aggregated": {
+                "pass_rate": 0.75,
+                "scores": { "mean": 8.5 },
+                "total": 4,
+                "passed": 3
+            },
+            "summary": "3/4 passed"
+        },
+        "stats": {
+            "auto": {
+                "llm_calls": 12,
+                "elapsed_ms": 5000
+            }
+        }
+    });
+
+    let meta = build_meta("cot_1700000000", "cot", 1700000000, &result_json);
+
+    assert_eq!(meta["eval_id"], "cot_1700000000");
+    assert_eq!(meta["strategy"], "cot");
+    assert_eq!(meta["timestamp"], 1700000000_u64);
+    assert_eq!(meta["pass_rate"], 0.75);
+    assert_eq!(meta["mean_score"], 8.5);
+    assert_eq!(meta["total_cases"], 4);
+    assert_eq!(meta["passed"], 3);
+    assert_eq!(meta["llm_calls"], 12);
+    assert_eq!(meta["elapsed_ms"], 5000);
+    assert_eq!(meta["summary"], "3/4 passed");
+}
+
+#[test]
+fn build_meta_handles_missing_fields() {
+    // Minimal result with no aggregated/stats
+    let result_json = serde_json::json!({});
+    let meta = build_meta("sc_1700000000", "sc", 1700000000, &result_json);
+
+    assert_eq!(meta["eval_id"], "sc_1700000000");
+    assert_eq!(meta["strategy"], "sc");
+    assert!(meta["pass_rate"].is_null());
+    assert!(meta["mean_score"].is_null());
+    assert!(meta["llm_calls"].is_null());
+}
+
+// ─── list_eval_history tests ───
+
+/// Helper: write a meta file + corresponding result file into a tmpdir.
+fn write_eval_files(dir: &Path, eval_id: &str, strategy: &str, timestamp: u64) {
+    let meta = serde_json::json!({
+        "eval_id": eval_id,
+        "strategy": strategy,
+        "timestamp": timestamp,
+        "pass_rate": 1.0,
+    });
+    let meta_path = dir.join(format!("{eval_id}.meta.json"));
+    std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+    // list_eval_history skips meta files and looks for *.json (non-meta) files
+    // that have a corresponding .meta.json. So we need the result file too.
+    let result_path = dir.join(format!("{eval_id}.json"));
+    std::fs::write(&result_path, r#"{"result":{}}"#).unwrap();
+}
+
+#[test]
+fn eval_history_empty_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = list_eval_history(tmp.path(), None, 10).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["evals"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn eval_history_nonexistent_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nonexistent");
+    let result = list_eval_history(&missing, None, 10).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["evals"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn eval_history_sorts_newest_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    write_eval_files(dir, "cot_1000", "cot", 1000);
+    write_eval_files(dir, "cot_3000", "cot", 3000);
+    write_eval_files(dir, "cot_2000", "cot", 2000);
+
+    let result = list_eval_history(dir, None, 10).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let evals = parsed["evals"].as_array().unwrap();
+
+    assert_eq!(evals.len(), 3);
+    assert_eq!(evals[0]["timestamp"], 3000);
+    assert_eq!(evals[1]["timestamp"], 2000);
+    assert_eq!(evals[2]["timestamp"], 1000);
+}
+
+#[test]
+fn eval_history_filters_by_strategy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    write_eval_files(dir, "cot_1000", "cot", 1000);
+    write_eval_files(dir, "sc_2000", "sc", 2000);
+    write_eval_files(dir, "cot_3000", "cot", 3000);
+
+    let result = list_eval_history(dir, Some("cot"), 10).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let evals = parsed["evals"].as_array().unwrap();
+
+    assert_eq!(evals.len(), 2);
+    assert!(evals.iter().all(|e| e["strategy"] == "cot"));
+}
+
+#[test]
+fn eval_history_respects_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    write_eval_files(dir, "cot_1000", "cot", 1000);
+    write_eval_files(dir, "cot_2000", "cot", 2000);
+    write_eval_files(dir, "cot_3000", "cot", 3000);
+
+    let result = list_eval_history(dir, None, 2).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let evals = parsed["evals"].as_array().unwrap();
+
+    assert_eq!(evals.len(), 2);
+    // Should be newest first, so 3000 and 2000
+    assert_eq!(evals[0]["timestamp"], 3000);
+    assert_eq!(evals[1]["timestamp"], 2000);
+}
+
+#[test]
+fn eval_history_skips_entries_without_meta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Only result file, no meta file
+    std::fs::write(dir.join("orphan_1000.json"), r#"{"result":{}}"#).unwrap();
+
+    // This one has both
+    write_eval_files(dir, "cot_2000", "cot", 2000);
+
+    let result = list_eval_history(dir, None, 10).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let evals = parsed["evals"].as_array().unwrap();
+
+    assert_eq!(evals.len(), 1);
+    assert_eq!(evals[0]["eval_id"], "cot_2000");
 }

@@ -1,5 +1,6 @@
 use super::eval_store::{
-    escape_for_lua_sq, evals_dir, extract_strategy_from_id, save_compare_result, save_eval_result,
+    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, save_compare_result,
+    save_eval_result,
 };
 use super::path::ContainedPath;
 use super::resolve::{is_package_installed, resolve_scenario_code};
@@ -130,75 +131,8 @@ return report:to_table()
 
     /// List eval history, optionally filtered by strategy.
     pub fn eval_history(&self, strategy: Option<&str>, limit: usize) -> Result<String, String> {
-        let evals_dir = evals_dir()?;
-        if !evals_dir.exists() {
-            return Ok(serde_json::json!({ "evals": [] }).to_string());
-        }
-
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-
-        let read_dir =
-            std::fs::read_dir(&evals_dir).map_err(|e| format!("Failed to read evals dir: {e}"))?;
-
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            // Skip meta files
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains(".meta."))
-            {
-                continue;
-            }
-
-            // Read meta file (lightweight) if it exists.
-            // Derive meta filename from the result filename to stay within evals_dir
-            // (ContainedPath ensures no traversal).
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let meta_path = match ContainedPath::child(&evals_dir, &format!("{stem}.meta.json")) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let meta = if meta_path.exists() {
-                std::fs::read_to_string(&*meta_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            } else {
-                None
-            };
-
-            if let Some(meta) = meta {
-                // Filter by strategy if specified
-                if let Some(filter) = strategy {
-                    if meta.get("strategy").and_then(|s| s.as_str()) != Some(filter) {
-                        continue;
-                    }
-                }
-                entries.push(meta);
-            }
-        }
-
-        // Sort by timestamp descending (newest first)
-        entries.sort_by(|a, b| {
-            let ts_a = a
-                .get("timestamp")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let ts_b = b
-                .get("timestamp")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            ts_b.cmp(&ts_a)
-        });
-        entries.truncate(limit);
-
-        Ok(serde_json::json!({ "evals": entries }).to_string())
+        let dir = evals_dir()?;
+        list_eval_history(&dir, strategy, limit)
     }
 
     /// View a specific eval result by ID.

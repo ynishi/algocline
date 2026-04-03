@@ -17,6 +17,7 @@ algocline-core = { workspace = true }
 algocline-engine = { workspace = true }
 
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

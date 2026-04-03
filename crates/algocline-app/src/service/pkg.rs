@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::manifest;
 use super::path::{copy_dir, ContainedPath};
 use super::resolve::{
     install_scenarios_from_dir, is_system_package, packages_dir, scenarios_dir, DirEntryFailures,
@@ -97,6 +98,31 @@ return pkg.meta or {{ name = "{name}" }}"#
             }
         }
 
+        // Merge manifest info (installed_at, updated_at, install_source) into each package.
+        let manifest_data = manifest::load_manifest().unwrap_or_default();
+        for pkg in &mut all_packages {
+            let Some(obj) = pkg.as_object_mut() else {
+                continue;
+            };
+            let Some(name) = obj.get("name").and_then(|v| v.as_str()).map(String::from) else {
+                continue;
+            };
+            if let Some(entry) = manifest_data.packages.get(&name) {
+                obj.insert(
+                    "installed_at".to_string(),
+                    serde_json::Value::String(entry.installed_at.clone()),
+                );
+                obj.insert(
+                    "updated_at".to_string(),
+                    serde_json::Value::String(entry.updated_at.clone()),
+                );
+                obj.insert(
+                    "install_source".to_string(),
+                    serde_json::Value::String(entry.source.clone()),
+                );
+            }
+        }
+
         let search_paths_json: Vec<serde_json::Value> = self
             .search_paths
             .iter()
@@ -183,6 +209,9 @@ return pkg.meta or {{ name = "{name}" }}"#
             copy_dir(staging.path(), dest.as_ref())
                 .map_err(|e| format!("Failed to copy package: {e}"))?;
 
+            // Record in manifest (best-effort; install itself already succeeded)
+            let _ = manifest::record_install(&name, None, &url);
+
             let mut response = serde_json::json!({
                 "installed": [name],
                 "mode": "single",
@@ -264,6 +293,9 @@ return pkg.meta or {{ name = "{name}" }}"#
                 );
             }
 
+            // Record in manifest (best-effort)
+            let _ = manifest::record_install_batch(&installed, &url);
+
             let mut response = serde_json::json!({
                 "installed": installed,
                 "skipped": skipped,
@@ -303,6 +335,9 @@ return pkg.meta or {{ name = "{name}" }}"#
             copy_dir(source, dest.as_ref()).map_err(|e| format!("Failed to copy package: {e}"))?;
             // Remove .git if copied
             let _ = std::fs::remove_dir_all(dest.as_ref().join(".git"));
+
+            // Record in manifest (best-effort)
+            let _ = manifest::record_install(&name, None, &source.display().to_string());
 
             let mut response = serde_json::json!({
                 "installed": [name],
@@ -356,6 +391,11 @@ return pkg.meta or {{ name = "{name}" }}"#
                 );
             }
 
+            // Record in manifest (best-effort)
+            let source_str = source.display().to_string();
+            let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
+            let _ = manifest::record_install_batch(&all_names, &source_str);
+
             let mut response = serde_json::json!({
                 "installed": installed,
                 "updated": updated,
@@ -378,6 +418,9 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
 
         std::fs::remove_dir_all(&dest).map_err(|e| format!("Failed to remove '{name}': {e}"))?;
+
+        // Remove from manifest (best-effort)
+        let _ = manifest::record_remove(name);
 
         Ok(serde_json::json!({ "removed": name }).to_string())
     }

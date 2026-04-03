@@ -301,7 +301,8 @@ function alc.state.update(key, fn, default) end
 -- Pipeline ---
 
 ---@class AlcPipeOpts
----@field on_stage? fun(i: integer, name: string, ctx: table) Callback after each stage
+---@field on_stage? fun(i: integer, name: string, ctx: table) Callback after each stage (not called on error)
+---@field on_error? "abort"|"skip"|"continue" Error handling mode (default: "abort"). "abort": propagate error; "skip"/"continue": log and advance to next stage
 
 --- Sequential pipeline: run multiple strategies in order.
 ---@param strategies (string|fun(ctx: table): table)[] Package names or inline functions

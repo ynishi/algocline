@@ -60,9 +60,13 @@ impl AppService {
         log_config: AppConfig,
         search_paths: Vec<resolve::SearchPath>,
     ) -> Self {
+        let registry = Arc::new(SessionRegistry::new());
+        // TTL = 3 hours. Complex strategies may run 30–60 min; 3h covers
+        // legitimate paused sessions while eventually reclaiming abandoned ones.
+        registry.spawn_gc_task(std::time::Duration::from_secs(10800));
         Self {
             executor,
-            registry: Arc::new(SessionRegistry::new()),
+            registry,
             log_config,
             search_paths,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

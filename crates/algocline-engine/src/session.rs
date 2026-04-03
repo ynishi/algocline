@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use algocline_core::{
     ExecutionMetrics, ExecutionObserver, ExecutionState, LlmQuery, MetricsObserver, QueryId,
@@ -137,6 +138,9 @@ pub struct Session {
     /// Per-session VM lifecycle driver. Keeps the Lua thread alive.
     /// Dropped when the session completes or is abandoned.
     _vm_driver: AsyncIsleDriver,
+    /// Last activity timestamp. Updated on creation and each feed_one().
+    /// Used by GC to identify idle sessions for cleanup.
+    last_active: std::time::Instant,
 }
 
 impl Session {
@@ -155,6 +159,7 @@ impl Session {
             exec_task,
             resp_txs: HashMap::new(),
             _vm_driver: vm_driver,
+            last_active: std::time::Instant::now(),
         }
     }
 
@@ -214,6 +219,9 @@ impl Session {
         response: String,
         usage: Option<&algocline_core::TokenUsage>,
     ) -> Result<bool, SessionError> {
+        // Update activity timestamp on each feed.
+        self.last_active = std::time::Instant::now();
+
         // Track response before ownership transfer.
         self.observer.on_response_fed(query_id, &response, usage);
 
@@ -284,6 +292,19 @@ impl Session {
 
         json
     }
+
+    /// Returns true if the session has been idle longer than `ttl`.
+    ///
+    /// Uses `saturating_duration_since` to avoid panics if the clock drifts
+    /// backwards (though this is extremely rare with monotonic clocks).
+    pub fn is_expired(&self, ttl: Duration) -> bool {
+        is_expired_impl(self.last_active, ttl)
+    }
+}
+
+/// Core expiry check, extracted for testability.
+fn is_expired_impl(last_active: std::time::Instant, ttl: Duration) -> bool {
+    std::time::Instant::now().saturating_duration_since(last_active) >= ttl
 }
 
 // ─── Registry ────────────────────────────────────────────────
@@ -438,6 +459,31 @@ impl SessionRegistry {
         map.iter()
             .map(|(id, session)| (id.clone(), session.snapshot()))
             .collect()
+    }
+
+    /// Spawn a background GC task that reaps sessions idle longer than `ttl`.
+    ///
+    /// The task runs every 60 seconds. When the process exits, the task is
+    /// naturally terminated. No `JoinHandle` is retained — process exit is
+    /// sufficient for cleanup in MCP server deployments.
+    pub fn spawn_gc_task(&self, ttl: Duration) {
+        let sessions = Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let mut map = sessions.lock().await;
+                let expired: Vec<String> = map
+                    .iter()
+                    .filter(|(_, s)| s.is_expired(ttl))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in &expired {
+                    tracing::info!(session_id = %id, "GC: reaping expired session");
+                    map.remove(id);
+                }
+            }
+        });
     }
 }
 
@@ -744,5 +790,45 @@ mod tests {
         let ids: Vec<String> = (0..10).map(|_| gen_session_id()).collect();
         let set: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(set.len(), 10, "10 IDs should all be unique");
+    }
+
+    // ─── is_expired_impl tests ───
+    //
+    // Session::is_expired delegates to is_expired_impl. Testing the impl
+    // directly avoids the need to construct a full Session (which requires
+    // a real Lua VM + channels).
+
+    #[test]
+    fn is_expired_impl_fresh_instant_not_expired() {
+        // A just-created instant should not be expired with a non-zero TTL
+        let now = std::time::Instant::now();
+        assert!(!is_expired_impl(now, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn is_expired_impl_old_instant_expired() {
+        // Simulate a session idle for 2 hours by backdating last_active
+        let two_hours_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(7200))
+            .expect("checked_sub should succeed with sane duration");
+        // TTL = 1 hour: should be expired
+        assert!(is_expired_impl(two_hours_ago, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn is_expired_impl_not_yet_expired() {
+        // Simulate a session idle for 1 hour
+        let one_hour_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("checked_sub should succeed with sane duration");
+        // TTL = 3 hours: should NOT be expired yet
+        assert!(!is_expired_impl(one_hour_ago, Duration::from_secs(10800)));
+    }
+
+    #[test]
+    fn is_expired_impl_zero_ttl_always_expired() {
+        // TTL = 0: any instant is immediately expired (edge case)
+        let now = std::time::Instant::now();
+        assert!(is_expired_impl(now, Duration::ZERO));
     }
 }

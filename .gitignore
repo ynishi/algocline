@@ -1,5 +1,6 @@
 /target
 /workspace
+/.worktrees/
 .mcp.json
 .claude
 .ryo/

@@ -610,3 +610,199 @@ if alc.budget_check() then
     local extra = alc.llm("Optional enrichment: " .. data)
 end
 ```
+
+---
+
+## alc.math — Numeric Computing
+
+Re-exported from [mlua-mathlib](https://crates.io/crates/mlua-mathlib) v0.2. Provides RNG, distribution sampling, descriptive statistics, CDF/PPF, and special functions backed by Rust (`rand`, `statrs`, `nalgebra`). Available as `alc.math.*` without `require()`.
+
+### RNG
+
+All sampling functions require a `LuaRng` object created via `rng_create`. RNG state is independent per instance (ChaCha12, passes TestU01).
+
+#### `alc.math.rng_create(seed) -> LuaRng`
+
+Create a new seeded RNG instance.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `seed` | integer | yes | 64-bit seed value |
+
+```lua
+local rng = alc.math.rng_create(42)
+```
+
+#### `alc.math.rng_float(rng) -> number`
+
+Sample a uniform float in [0, 1).
+
+```lua
+local f = alc.math.rng_float(rng)  -- e.g. 0.5427
+```
+
+#### `alc.math.rng_int(rng, min, max) -> integer`
+
+Sample a uniform integer in [min, max].
+
+```lua
+local n = alc.math.rng_int(rng, 1, 100)  -- e.g. 53
+```
+
+### Distribution Sampling
+
+All sampling functions take `rng` as the first argument.
+
+#### Continuous
+
+| Function | Parameters | Description |
+|----------|-----------|-------------|
+| `normal_sample(rng, mean, stddev)` | mean: number, stddev: number | Normal (Gaussian) distribution |
+| `beta_sample(rng, alpha, beta)` | alpha: number, beta: number | Beta distribution |
+| `gamma_sample(rng, shape, scale)` | shape: number, scale: number | Gamma distribution |
+| `exp_sample(rng, lambda)` | lambda: number | Exponential distribution |
+| `uniform_sample(rng, low, high)` | low: number, high: number | Continuous uniform [low, high) |
+| `lognormal_sample(rng, mu, sigma)` | mu: number, sigma: number | Log-normal distribution |
+| `student_t_sample(rng, df)` | df: number | Student's t-distribution |
+| `chi_squared_sample(rng, df)` | df: number | Chi-squared distribution |
+
+```lua
+local rng = alc.math.rng_create(42)
+local x = alc.math.normal_sample(rng, 0, 1)
+local b = alc.math.beta_sample(rng, 2, 5)
+```
+
+#### Discrete
+
+| Function | Parameters | Description |
+|----------|-----------|-------------|
+| `poisson_sample(rng, lambda)` | lambda: number | Poisson distribution (returns integer) |
+| `binomial_sample(rng, n, p)` | n: integer, p: number | Binomial distribution (returns integer) |
+
+#### Multivariate
+
+| Function | Parameters | Description |
+|----------|-----------|-------------|
+| `dirichlet_sample(rng, alphas)` | alphas: number[] (≥2 elements) | Dirichlet distribution (returns number[]) |
+| `categorical_sample(rng, weights)` | weights: number[] (≥1 element) | Weighted categorical (returns 1-based index) |
+
+```lua
+local probs = alc.math.dirichlet_sample(rng, {1, 1, 1})  -- e.g. {0.33, 0.45, 0.22}
+local idx = alc.math.categorical_sample(rng, {0.7, 0.2, 0.1})  -- e.g. 1
+```
+
+### Descriptive Statistics
+
+All functions take a non-empty `number[]` array. NaN/Infinity values are rejected.
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `mean(data)` | data: number[] | number | Arithmetic mean |
+| `variance(data)` | data: number[] | number | Sample variance (Welford's algorithm) |
+| `stddev(data)` | data: number[] | number | Sample standard deviation |
+| `median(data)` | data: number[] | number | Median (linear interpolation) |
+| `percentile(data, p)` | data: number[], p: 0-100 | number | p-th percentile |
+| `iqr(data)` | data: number[] | number | Interquartile range (Q3 - Q1) |
+
+```lua
+local avg = alc.math.mean({10, 20, 30, 40, 50})      -- 30.0
+local sd = alc.math.stddev({10, 20, 30, 40, 50})      -- 15.81...
+local p90 = alc.math.percentile({1,2,3,4,5,6,7,8,9,10}, 90)
+```
+
+### Bivariate Statistics
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `covariance(xs, ys)` | xs: number[], ys: number[] | number | Sample covariance (equal-length, ≥2) |
+| `correlation(xs, ys)` | xs: number[], ys: number[] | number | Pearson correlation coefficient |
+
+```lua
+local r = alc.math.correlation({1,2,3,4,5}, {2,4,6,8,10})  -- 1.0
+```
+
+### Transforms & Utilities
+
+#### `alc.math.softmax(data) -> number[]`
+
+Numerically stable softmax (subtracts max before exp).
+
+```lua
+local probs = alc.math.softmax({1, 2, 3})  -- {0.090, 0.245, 0.665}
+```
+
+#### `alc.math.log_normalize(data) -> number[]`
+
+Log-normalize positive values to [0, 100] scale. All values must be > 0.
+
+```lua
+local normed = alc.math.log_normalize({1, 10, 100, 1000})
+```
+
+#### `alc.math.histogram(data, bins) -> table`
+
+Compute histogram bin counts and edges.
+
+**Returns:** `{ counts = integer[], edges = number[] }` where `#edges == bins + 1`.
+
+```lua
+local h = alc.math.histogram({1,2,2,3,3,3,4,4,5}, 5)
+-- h.counts = {1, 2, 3, 2, 1}, h.edges = {1.0, 1.8, 2.6, 3.4, 4.2, 5.0}
+```
+
+#### `alc.math.wilson_ci(successes, total, confidence) -> table`
+
+Wilson score confidence interval for binomial proportions.
+
+**Returns:** `{ lower = number, upper = number, center = number }`
+
+```lua
+local ci = alc.math.wilson_ci(50, 100, 0.95)
+-- ci.center ≈ 0.5, ci.lower ≈ 0.404, ci.upper ≈ 0.596
+```
+
+### CDF & PPF (Inverse CDF)
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `normal_cdf(x, mu, sigma)` | x, mu, sigma: number | number | Normal CDF |
+| `beta_cdf(x, alpha, beta)` | x, alpha, beta: number | number | Beta CDF |
+| `gamma_cdf(x, shape, scale)` | x, shape, scale: number | number | Gamma CDF (scale param, not rate) |
+| `poisson_cdf(k, lambda)` | k: integer, lambda: number | number | Poisson CDF |
+| `normal_inverse_cdf(p, mu, sigma)` | p, mu, sigma: number | number | Normal PPF (p ∈ [0,1]) |
+| `normal_ppf(p)` | p: number | number | Standard normal PPF (N(0,1), p ∈ [0,1]) |
+| `beta_ppf(p, alpha, beta)` | p, alpha, beta: number | number | Beta PPF (p ∈ [0,1]) |
+
+```lua
+local p = alc.math.normal_cdf(0, 0, 1)            -- 0.5
+local z = alc.math.normal_ppf(0.975)              -- ≈ 1.96
+local x = alc.math.normal_inverse_cdf(0.975, 0, 1) -- ≈ 1.96
+```
+
+### Distribution Utilities
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `beta_mean(alpha, beta)` | alpha, beta: number (> 0) | number | Mean of Beta distribution |
+| `beta_variance(alpha, beta)` | alpha, beta: number (> 0) | number | Variance of Beta distribution |
+
+### Special Functions
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `erf(x)` | x: number | number | Error function |
+| `erfc(x)` | x: number | number | Complementary error function |
+| `lgamma(x)` | x: number | number | Log-gamma (ln Γ(x)) |
+| `beta(a, b)` | a, b: number | number | Beta function B(a,b) |
+| `ln_beta(a, b)` | a, b: number | number | Log-beta function |
+| `regularized_incomplete_beta(x, a, b)` | x, a, b: number | number | Regularized incomplete beta I_x(a,b) |
+| `regularized_incomplete_gamma(a, x)` | a, x: number | number | Regularized lower incomplete gamma P(a,x) |
+| `digamma(x)` | x: number | number | Digamma function ψ(x) |
+| `factorial(n)` | n: integer (0-170) | number | n! (overflows f64 for n > 170) |
+| `ln_factorial(n)` | n: integer | number | ln(n!) |
+
+```lua
+local e = alc.math.erf(1.0)          -- ≈ 0.8427
+local f = alc.math.factorial(10)      -- 3628800
+local lf = alc.math.ln_factorial(100) -- ≈ 363.74
+```

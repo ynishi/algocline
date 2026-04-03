@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc.math`**: Numeric computing namespace (44 functions) via mlua-mathlib v0.2.0 — RNG, distribution sampling (Normal, Beta, Gamma, Poisson, Binomial, etc.), descriptive statistics, CDF/PPF, special functions (erf, gamma, beta, digamma, factorial), transforms (softmax, histogram, Wilson CI)
+- **`docs/lua-stdlib.md`**: `alc.math` section with full API reference
+- **`types/alc.d.lua`**: LuaCats type definitions for all `alc.math.*` functions
+
+### Changed
+
+- **`BUNDLED_VERSION`**: Updated bundled-packages from `v0.7.0` to `v0.9.0`, evalframe from `v0.1.0` to `v0.3.0`
+- **Dependencies**: mlua-mathlib `0.1` → `0.2`
+
 ## [0.12.1] - 2026-04-02
 
 ### Fixed

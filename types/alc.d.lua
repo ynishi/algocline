@@ -332,3 +332,316 @@ function alc.fingerprint(str) end
 --- Returns true if budget has remaining capacity.
 ---@return boolean ok True if safe to continue
 function alc.budget_check() end
+
+-- ============================================================
+-- alc.math — Numeric Computing (mlua-mathlib v0.2)
+-- ============================================================
+
+---@class alc.math
+alc.math = {}
+
+---@class LuaRng
+--- Opaque RNG handle (ChaCha12). Created via alc.math.rng_create().
+
+-- RNG ---
+
+--- Create a new seeded RNG instance.
+---@param seed integer 64-bit seed value
+---@return LuaRng rng New RNG instance
+function alc.math.rng_create(seed) end
+
+--- Sample a uniform float in [0, 1).
+---@param rng LuaRng RNG instance
+---@return number value Random float
+function alc.math.rng_float(rng) end
+
+--- Sample a uniform integer in [min, max].
+---@param rng LuaRng RNG instance
+---@param min integer Minimum value (inclusive)
+---@param max integer Maximum value (inclusive)
+---@return integer value Random integer
+function alc.math.rng_int(rng, min, max) end
+
+-- Distribution Sampling: Continuous ---
+
+--- Sample from Normal (Gaussian) distribution.
+---@param rng LuaRng RNG instance
+---@param mean number Mean
+---@param stddev number Standard deviation
+---@return number value Sampled value
+function alc.math.normal_sample(rng, mean, stddev) end
+
+--- Sample from Beta distribution.
+---@param rng LuaRng RNG instance
+---@param alpha number Alpha parameter (> 0)
+---@param beta number Beta parameter (> 0)
+---@return number value Sampled value in (0, 1)
+function alc.math.beta_sample(rng, alpha, beta) end
+
+--- Sample from Gamma distribution.
+---@param rng LuaRng RNG instance
+---@param shape number Shape parameter (> 0)
+---@param scale number Scale parameter (> 0)
+---@return number value Sampled value
+function alc.math.gamma_sample(rng, shape, scale) end
+
+--- Sample from Exponential distribution.
+---@param rng LuaRng RNG instance
+---@param lambda number Rate parameter (> 0)
+---@return number value Sampled value
+function alc.math.exp_sample(rng, lambda) end
+
+--- Sample from continuous Uniform distribution [low, high).
+---@param rng LuaRng RNG instance
+---@param low number Lower bound (inclusive)
+---@param high number Upper bound (exclusive)
+---@return number value Sampled value
+function alc.math.uniform_sample(rng, low, high) end
+
+--- Sample from Log-normal distribution.
+---@param rng LuaRng RNG instance
+---@param mu number Mean of the underlying normal
+---@param sigma number Std dev of the underlying normal
+---@return number value Sampled value
+function alc.math.lognormal_sample(rng, mu, sigma) end
+
+--- Sample from Student's t-distribution.
+---@param rng LuaRng RNG instance
+---@param df number Degrees of freedom (> 0)
+---@return number value Sampled value
+function alc.math.student_t_sample(rng, df) end
+
+--- Sample from Chi-squared distribution.
+---@param rng LuaRng RNG instance
+---@param df number Degrees of freedom (> 0)
+---@return number value Sampled value
+function alc.math.chi_squared_sample(rng, df) end
+
+-- Distribution Sampling: Discrete ---
+
+--- Sample from Poisson distribution.
+---@param rng LuaRng RNG instance
+---@param lambda number Rate parameter (> 0)
+---@return integer value Sampled count
+function alc.math.poisson_sample(rng, lambda) end
+
+--- Sample from Binomial distribution.
+---@param rng LuaRng RNG instance
+---@param n integer Number of trials
+---@param p number Success probability [0, 1]
+---@return integer value Sampled count
+function alc.math.binomial_sample(rng, n, p) end
+
+-- Distribution Sampling: Multivariate ---
+
+--- Sample from Dirichlet distribution.
+---@param rng LuaRng RNG instance
+---@param alphas number[] Alpha parameters (≥ 2 elements, all > 0)
+---@return number[] values Probability vector summing to 1
+function alc.math.dirichlet_sample(rng, alphas) end
+
+--- Sample from weighted categorical distribution.
+---@param rng LuaRng RNG instance
+---@param weights number[] Non-negative weights (≥ 1 element)
+---@return integer index 1-based sampled index
+function alc.math.categorical_sample(rng, weights) end
+
+-- Descriptive Statistics ---
+
+--- Arithmetic mean.
+---@param data number[] Non-empty array
+---@return number mean
+function alc.math.mean(data) end
+
+--- Sample variance (Welford's algorithm).
+---@param data number[] Non-empty array
+---@return number variance
+function alc.math.variance(data) end
+
+--- Sample standard deviation.
+---@param data number[] Non-empty array
+---@return number stddev
+function alc.math.stddev(data) end
+
+--- Median (linear interpolation).
+---@param data number[] Non-empty array
+---@return number median
+function alc.math.median(data) end
+
+--- Percentile with linear interpolation.
+---@param data number[] Non-empty array
+---@param p number Percentile in [0, 100]
+---@return number value
+function alc.math.percentile(data, p) end
+
+--- Interquartile range (Q3 - Q1).
+---@param data number[] Non-empty array
+---@return number iqr
+function alc.math.iqr(data) end
+
+-- Bivariate Statistics ---
+
+--- Sample covariance.
+---@param xs number[] First variable (≥ 2 elements)
+---@param ys number[] Second variable (same length as xs)
+---@return number covariance
+function alc.math.covariance(xs, ys) end
+
+--- Pearson correlation coefficient.
+---@param xs number[] First variable (≥ 2 elements)
+---@param ys number[] Second variable (same length as xs)
+---@return number correlation In [-1, 1]
+function alc.math.correlation(xs, ys) end
+
+-- Transforms & Utilities ---
+
+--- Numerically stable softmax.
+---@param data number[] Input values
+---@return number[] probabilities Sum to 1.0
+function alc.math.softmax(data) end
+
+--- Log-normalize positive values to [0, 100] scale.
+---@param data number[] All values must be > 0
+---@return number[] normalized Values in [0, 100]
+function alc.math.log_normalize(data) end
+
+---@class AlcHistogramResult
+---@field counts integer[] Bin counts
+---@field edges number[] Bin edges (#edges == bins + 1)
+
+--- Compute histogram.
+---@param data number[] Non-empty array
+---@param bins integer Number of bins (> 0)
+---@return AlcHistogramResult result
+function alc.math.histogram(data, bins) end
+
+---@class AlcWilsonCiResult
+---@field lower number Lower bound
+---@field upper number Upper bound
+---@field center number Center value
+
+--- Wilson score confidence interval for binomial proportions.
+---@param successes number Number of successes
+---@param total number Total trials (> 0)
+---@param confidence number Confidence level in [0, 1]
+---@return AlcWilsonCiResult result
+function alc.math.wilson_ci(successes, total, confidence) end
+
+-- CDF & PPF ---
+
+--- Normal CDF.
+---@param x number Value
+---@param mu number Mean
+---@param sigma number Standard deviation
+---@return number probability
+function alc.math.normal_cdf(x, mu, sigma) end
+
+--- Beta CDF.
+---@param x number Value in [0, 1]
+---@param alpha number Alpha parameter
+---@param beta number Beta parameter
+---@return number probability
+function alc.math.beta_cdf(x, alpha, beta) end
+
+--- Gamma CDF (scale parameterization).
+---@param x number Value
+---@param shape number Shape parameter
+---@param scale number Scale parameter (> 0)
+---@return number probability
+function alc.math.gamma_cdf(x, shape, scale) end
+
+--- Poisson CDF.
+---@param k integer Value
+---@param lambda number Rate parameter
+---@return number probability P(X ≤ k)
+function alc.math.poisson_cdf(k, lambda) end
+
+--- Normal inverse CDF (PPF) for N(mu, sigma).
+---@param p number Probability in [0, 1]
+---@param mu number Mean
+---@param sigma number Standard deviation
+---@return number value
+function alc.math.normal_inverse_cdf(p, mu, sigma) end
+
+--- Standard normal PPF (N(0,1)).
+---@param p number Probability in [0, 1]
+---@return number value
+function alc.math.normal_ppf(p) end
+
+--- Beta inverse CDF (PPF).
+---@param p number Probability in [0, 1]
+---@param alpha number Alpha parameter
+---@param beta number Beta parameter
+---@return number value
+function alc.math.beta_ppf(p, alpha, beta) end
+
+-- Distribution Utilities ---
+
+--- Mean of Beta distribution.
+---@param alpha number Alpha (> 0)
+---@param beta number Beta (> 0)
+---@return number mean
+function alc.math.beta_mean(alpha, beta) end
+
+--- Variance of Beta distribution.
+---@param alpha number Alpha (> 0)
+---@param beta number Beta (> 0)
+---@return number variance
+function alc.math.beta_variance(alpha, beta) end
+
+-- Special Functions ---
+
+--- Error function.
+---@param x number Input
+---@return number value erf(x)
+function alc.math.erf(x) end
+
+--- Complementary error function.
+---@param x number Input
+---@return number value erfc(x) = 1 - erf(x)
+function alc.math.erfc(x) end
+
+--- Log-gamma function.
+---@param x number Input
+---@return number value ln(Γ(x))
+function alc.math.lgamma(x) end
+
+--- Beta function B(a, b).
+---@param a number Parameter a
+---@param b number Parameter b
+---@return number value
+function alc.math.beta(a, b) end
+
+--- Log-beta function.
+---@param a number Parameter a
+---@param b number Parameter b
+---@return number value ln(B(a, b))
+function alc.math.ln_beta(a, b) end
+
+--- Regularized incomplete beta function I_x(a, b).
+---@param x number Value in [0, 1]
+---@param a number Parameter a
+---@param b number Parameter b
+---@return number value
+function alc.math.regularized_incomplete_beta(x, a, b) end
+
+--- Regularized lower incomplete gamma P(a, x).
+---@param a number Shape parameter
+---@param x number Value
+---@return number value
+function alc.math.regularized_incomplete_gamma(a, x) end
+
+--- Digamma function ψ(x).
+---@param x number Input
+---@return number value
+function alc.math.digamma(x) end
+
+--- Factorial n! (max n=170, overflows f64 beyond).
+---@param n integer Non-negative integer (0-170)
+---@return number value
+function alc.math.factorial(n) end
+
+--- Natural log of factorial ln(n!).
+---@param n integer Non-negative integer
+---@return number value
+function alc.math.ln_factorial(n) end

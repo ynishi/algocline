@@ -50,6 +50,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     register_chunk(lua, alc_table)?;
     register_stats(lua, alc_table, config.custom_metrics)?;
     register_time(lua, alc_table)?;
+    register_math(lua, alc_table)?;
     register_budget_remaining(lua, alc_table, config.budget.clone())?;
     register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {
@@ -57,6 +58,13 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
         register_llm_batch(lua, alc_table, tx.clone(), config.budget.clone())?;
         fork::register_fork(lua, alc_table, tx, config.budget, config.lib_paths)?;
     }
+    Ok(())
+}
+
+/// Register `alc.math` — mlua-mathlib (RNG, distributions, statistics).
+fn register_math(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let math_table = mlua_mathlib::module(lua)?;
+    alc_table.set("math", math_table)?;
     Ok(())
 }
 

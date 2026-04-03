@@ -47,12 +47,12 @@ struct BundledSource {
 const BUNDLED_SOURCES: &[BundledSource] = &[
     BundledSource {
         url: "https://github.com/ynishi/algocline-bundled-packages",
-        tag: "v0.7.0",
+        tag: "v0.9.0",
         kind: SourceKind::Collection,
     },
     BundledSource {
         url: "https://github.com/ynishi/evalframe",
-        tag: "v0.1.0",
+        tag: "v0.3.0",
         kind: SourceKind::Single,
     },
 ];

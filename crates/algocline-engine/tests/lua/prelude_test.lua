@@ -439,6 +439,85 @@ describe("alc.llm_safe", function()
     end)
 end)
 
+-- ─── alc.llm_json ───
+
+describe("alc.llm_json", function()
+    it("returns parsed table and raw on valid JSON response", function()
+        alc.llm = function() return '{"name":"Alice","age":30}' end
+        log_entries = {}
+        local data, raw = alc.llm_json("Return JSON")
+        expect(data).to_not.equal(nil)
+        expect(data.name).to.equal("Alice")
+        expect(data.age).to.equal(30)
+        expect(raw).to.equal('{"name":"Alice","age":30}')
+        expect(#log_entries).to.equal(0)
+    end)
+
+    it("extracts JSON from markdown fences on first attempt", function()
+        alc.llm = function() return '```json\n{"ok":true}\n```' end
+        log_entries = {}
+        local data, raw = alc.llm_json("Return JSON")
+        expect(data).to_not.equal(nil)
+        expect(data.ok).to.equal(true)
+        expect(#log_entries).to.equal(0)
+    end)
+
+    it("retries on parse failure and succeeds", function()
+        local call_count = 0
+        alc.llm = function()
+            call_count = call_count + 1
+            if call_count == 1 then return "not json at all" end
+            return '{"fixed":true}'
+        end
+        log_entries = {}
+        local data, raw = alc.llm_json("Return JSON")
+        expect(data).to_not.equal(nil)
+        expect(data.fixed).to.equal(true)
+        expect(call_count).to.equal(2)
+        expect(#log_entries).to.equal(1)
+        expect(log_entries[1].level).to.equal("warn")
+    end)
+
+    it("returns nil and raw after retry failure", function()
+        alc.llm = function() return "still not json" end
+        log_entries = {}
+        local data, raw = alc.llm_json("Return JSON")
+        expect(data).to.equal(nil)
+        expect(raw).to.equal("still not json")
+        expect(#log_entries).to.equal(2)
+    end)
+
+    it("passes opts to alc.llm and overrides system on retry", function()
+        local calls = {}
+        alc.llm = function(prompt, opts)
+            table.insert(calls, { prompt = prompt, opts = opts })
+            if #calls == 1 then return "bad" end
+            return '{"ok":true}'
+        end
+        log_entries = {}
+        alc.llm_json("test", { max_tokens = 200 })
+        expect(#calls).to.equal(2)
+        expect(calls[1].opts.max_tokens).to.equal(200)
+        expect(calls[1].opts.system).to.equal(nil)
+        expect(calls[2].opts.max_tokens).to.equal(200)
+        expect(calls[2].opts.system).to_not.equal(nil)
+    end)
+
+    it("includes previous output in retry prompt", function()
+        local calls = {}
+        alc.llm = function(prompt, opts)
+            table.insert(calls, { prompt = prompt, opts = opts })
+            if #calls == 1 then return "broken output here" end
+            return '{"ok":true}'
+        end
+        log_entries = {}
+        alc.llm_json("original request")
+        expect(#calls).to.equal(2)
+        expect(calls[2].prompt:find("broken output here", 1, true)).to_not.equal(nil)
+        expect(calls[2].prompt:find("original request", 1, true)).to_not.equal(nil)
+    end)
+end)
+
 -- ─── alc.fingerprint ───
 
 describe("alc.fingerprint", function()

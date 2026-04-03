@@ -146,6 +146,7 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.parse_number(text, pat?)  — extract number from LLM output
 │  alc.state.update(key, fn)     — read-modify-write for state
 │  alc.llm_safe(prompt, opts, d) — non-throwing LLM wrapper
+│  alc.llm_json(prompt, opts?)   — LLM call with JSON parse + retry
 │  alc.fingerprint(str)          — normalize + DJB2 hash (dedup)
 │  alc.tuning(defaults, ctx)     — config merge with deep merge
 │  alc.budget_check()            — boolean budget guard

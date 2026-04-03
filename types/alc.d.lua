@@ -208,6 +208,13 @@ function alc.cache_clear() end
 ---@return string response LLM response or default
 function alc.llm_safe(prompt, opts, default) end
 
+--- Call alc.llm and parse response as JSON. Retries once on parse failure.
+---@param prompt string The prompt to send
+---@param opts? AlcLlmOpts Options
+---@return table|nil data Parsed JSON table or nil
+---@return string raw Raw LLM response
+function alc.llm_json(prompt, opts) end
+
 --- Convenience wrapper: calls alc.llm with grounded = true.
 ---@param claim string Claim to ground
 ---@param opts? AlcLlmOpts Options

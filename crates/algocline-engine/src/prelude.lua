@@ -304,6 +304,46 @@ function alc.llm_safe(prompt, opts, default)
     return default
 end
 
+--- alc.llm_json(prompt, opts?) -> table|nil, string
+--- Call alc.llm and parse the response as JSON. On parse failure,
+--- retries once with a repair prompt that includes the previous output.
+--- Uses alc.json_extract (3-stage fallback) for parsing.
+---
+--- Returns (parsed_table, raw_string) on success,
+--- or (nil, raw_string) if JSON extraction fails after retry.
+---
+--- Usage:
+---   local data, raw = alc.llm_json("Return a JSON object with fields: name, age")
+---   if data then
+---       print(data.name)
+---   else
+---       alc.log("error", "Failed to get JSON: " .. raw)
+---   end
+function alc.llm_json(prompt, opts)
+    opts = opts or {}
+    local raw = alc.llm(prompt, opts)
+    local parsed = alc.json_extract(raw)
+    if parsed then return parsed, raw end
+
+    alc.log("warn", "alc.llm_json: JSON parse failed, retrying")
+    local retry_opts = {}
+    for k, v in pairs(opts) do retry_opts[k] = v end
+    retry_opts.system = "Output ONLY valid JSON. No markdown fences, no explanation."
+
+    raw = alc.llm(
+        "The previous response was not valid JSON.\n\n"
+            .. "Previous output:\n" .. raw .. "\n\n"
+            .. "Fix the JSON and return ONLY valid JSON.\n\n"
+            .. "Original request:\n" .. prompt,
+        retry_opts
+    )
+    parsed = alc.json_extract(raw)
+    if not parsed then
+        alc.log("warn", "alc.llm_json: JSON parse failed after retry")
+    end
+    return parsed, raw
+end
+
 --- alc.fingerprint(str) -> string
 --- Normalize text (lowercase, collapse whitespace, trim) and
 --- return 8-char hex hash (DJB2). For deduplication, not cryptography.

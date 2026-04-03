@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc.llm_json(prompt, opts?)`**: LLM call with automatic JSON parsing and 1-retry repair. Uses `alc.json_extract` for 3-stage fallback parsing; on failure, retries with previous output included so the model can fix rather than regenerate
 - **`alc.math`**: Numeric computing namespace (44 functions) via mlua-mathlib v0.2.0 — RNG, distribution sampling (Normal, Beta, Gamma, Poisson, Binomial, etc.), descriptive statistics, CDF/PPF, special functions (erf, gamma, beta, digamma, factorial), transforms (softmax, histogram, Wilson CI)
 - **`docs/lua-stdlib.md`**: `alc.math` section with full API reference
 - **`types/alc.d.lua`**: LuaCats type definitions for all `alc.math.*` functions

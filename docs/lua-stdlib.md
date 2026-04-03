@@ -364,6 +364,21 @@ local summary = alc.llm_safe(
 )
 ```
 
+#### `alc.llm_json(prompt, opts?) -> table|nil, string`
+
+Call `alc.llm()` and parse the response as JSON via `alc.json_extract()`. On parse failure, retries once with a repair prompt that includes the previous (broken) output, allowing the model to fix rather than regenerate.
+
+Returns `(parsed_table, raw_string)` on success, or `(nil, raw_string)` if extraction fails after retry.
+
+```lua
+local data, raw = alc.llm_json("Return a JSON object with fields: name, age")
+if data then
+    print(data.name)
+else
+    alc.log("error", "Failed to get JSON: " .. raw)
+end
+```
+
 #### `alc.ground(claim, opts?) -> string`
 
 Convenience wrapper: calls `alc.llm()` with `grounded = true`. The host should ground the response in external evidence.

@@ -723,3 +723,101 @@ describe("alc.parse_number", function()
         expect(alc.parse_number("hello world", "(%d+)%s+subtask")).to.equal(nil)
     end)
 end)
+
+-- ─── alc.pipe on_error ───
+
+describe("alc.pipe on_error", function()
+    -- Helper: inline stage that always errors
+    local function failing_stage(ctx)
+        error("stage error: deliberate failure")
+    end
+
+    -- Helper: inline stage that appends a mark to ctx.task
+    local function append_stage(mark)
+        return function(ctx)
+            ctx.task = (ctx.task or "") .. mark
+            ctx.result = ctx.task
+            return ctx
+        end
+    end
+
+    it("abort mode propagates error (default behaviour)", function()
+        local ctx = { task = "input" }
+        expect(function()
+            alc.pipe({ failing_stage }, ctx)
+        end).to.fail()
+    end)
+
+    it("abort mode propagates error when opts.on_error='abort'", function()
+        local ctx = { task = "input" }
+        expect(function()
+            alc.pipe({ failing_stage }, ctx, { on_error = "abort" })
+        end).to.fail()
+    end)
+
+    it("skip mode skips failing stage and continues pipeline", function()
+        log_entries = {}
+        local ctx = { task = "a" }
+        local result = alc.pipe(
+            { append_stage("1"), failing_stage, append_stage("2") },
+            ctx,
+            { on_error = "skip" }
+        )
+        -- append_stage("1") succeeds: task = "a1"
+        -- failing_stage skipped
+        -- append_stage("2") receives ctx from before failing_stage
+        -- because pipe_ctx was not updated on error; task = "a12"
+        expect(result.result).to.equal("a12")
+        -- Error recorded in pipe_history
+        local found_error = false
+        for _, h in ipairs(result.pipe_history) do
+            if h.error ~= nil then
+                found_error = true
+                break
+            end
+        end
+        expect(found_error).to.equal(true)
+        -- alc.log("warn", ...) called once for the failed stage
+        expect(#log_entries >= 1).to.equal(true)
+    end)
+
+    it("continue mode skips failing stage and continues with unchanged pipe_ctx", function()
+        log_entries = {}
+        local ctx = { task = "b" }
+        local result = alc.pipe(
+            { append_stage("1"), failing_stage, append_stage("2") },
+            ctx,
+            { on_error = "continue" }
+        )
+        -- Same semantics as "skip" for pipe_ctx: previous ctx is preserved
+        expect(result.result).to.equal("b12")
+        local found_error = false
+        for _, h in ipairs(result.pipe_history) do
+            if h.error ~= nil then
+                found_error = true
+                break
+            end
+        end
+        expect(found_error).to.equal(true)
+    end)
+
+    it("skip mode with all stages failing returns initial ctx", function()
+        log_entries = {}
+        local ctx = { task = "original" }
+        local result = alc.pipe(
+            { failing_stage, failing_stage },
+            ctx,
+            { on_error = "skip" }
+        )
+        -- No successful stages, so ctx.task remains "original"
+        expect(result.task).to.equal("original")
+        -- Two errors in history
+        local error_count = 0
+        for _, h in ipairs(result.pipe_history) do
+            if h.error ~= nil then
+                error_count = error_count + 1
+            end
+        end
+        expect(error_count).to.equal(2)
+    end)
+end)

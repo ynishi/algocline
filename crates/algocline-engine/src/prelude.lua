@@ -562,6 +562,7 @@ function alc.pipe(strategies, ctx, opts)
         error("alc.pipe: ctx must be a table", 2)
     end
     opts = opts or {}
+    local on_error = opts.on_error or "abort"
 
     -- Shallow-copy ctx to avoid mutating the original
     local pipe_ctx = {}
@@ -588,13 +589,34 @@ function alc.pipe(strategies, ctx, opts)
             error("alc.pipe: strategy[" .. i .. "] must be a string or function", 2)
         end
 
-        pipe_ctx = run_fn(pipe_ctx)
+        if on_error == "abort" then
+            -- Default: propagate error with full stack trace (backward compatible)
+            pipe_ctx = run_fn(pipe_ctx)
 
-        if type(pipe_ctx) ~= "table" then
-            error("alc.pipe: strategy '" .. name .. "' must return a table (ctx)", 2)
+            if type(pipe_ctx) ~= "table" then
+                error("alc.pipe: strategy '" .. name .. "' must return a table (ctx)", 2)
+            end
+        else
+            local ok, result = pcall(run_fn, pipe_ctx)
+            if not ok then
+                -- Record error in history; pipe_ctx remains unchanged (previous value)
+                alc.log("warn", "alc.pipe: stage '" .. name .. "' failed: " .. tostring(result))
+                pipe_ctx.pipe_history[#pipe_ctx.pipe_history + 1] = {
+                    strategy = name,
+                    error = tostring(result),
+                }
+                -- "skip": ctx.task unchanged, advance to next stage
+                -- "continue": pipe_ctx (including task) unchanged, advance to next stage
+                goto next_stage
+            end
+
+            pipe_ctx = result
+            if type(pipe_ctx) ~= "table" then
+                error("alc.pipe: strategy '" .. name .. "' must return a table (ctx)", 2)
+            end
         end
 
-        -- Record history
+        -- Record history (success path only)
         local result_snapshot = pipe_ctx.result
         pipe_ctx.pipe_history[#pipe_ctx.pipe_history + 1] = {
             strategy = name,
@@ -610,10 +632,12 @@ function alc.pipe(strategies, ctx, opts)
             end
         end
 
-        -- Optional callback
+        -- Optional callback (success path only)
         if opts.on_stage then
             opts.on_stage(i, name, pipe_ctx)
         end
+
+        ::next_stage::
     end
 
     return pipe_ctx

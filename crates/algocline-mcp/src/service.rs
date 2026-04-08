@@ -231,6 +231,24 @@ pub struct StatusParams {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InitParams {
+    /// Optional absolute path to the project root. Falls back to ALC_PROJECT_ROOT or cwd.
+    pub project_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateParams {
+    /// Optional absolute path to the project root. Falls back to ALC_PROJECT_ROOT or ancestor walk.
+    pub project_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MigrateParams {
+    /// Optional absolute path to the project root. Falls back to ALC_PROJECT_ROOT or cwd.
+    pub project_root: Option<String>,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -563,6 +581,43 @@ impl AlcService {
         self.app.status(params.session_id.as_deref()).await
     }
 
+    // ─── Project lifecycle ──────────────────────────────────────
+
+    /// Initialize `alc.toml` in the project root.
+    ///
+    /// Creates a minimal `alc.toml` with an empty `[packages]` section.
+    /// Fails if `alc.toml` already exists (no overwrite).
+    #[tool(
+        name = "alc_init",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn init(&self, Parameters(params): Parameters<InitParams>) -> Result<String, String> {
+        self.app.init(params.project_root).await
+    }
+
+    /// Re-resolve all `alc.toml` entries and rewrite `alc.lock`.
+    ///
+    /// Reads `alc.toml`, resolves each package against the installed cache,
+    /// and writes a new `alc.lock`. Requires `alc.toml` to exist.
+    /// Returns `{ "resolved": N, "errors": [...], "alc_lock": path }`.
+    #[tool(name = "alc_update", annotations(open_world_hint = false))]
+    async fn update(&self, Parameters(params): Parameters<UpdateParams>) -> Result<String, String> {
+        self.app.update(params.project_root).await
+    }
+
+    /// Migrate a legacy `alc.lock` to `alc.toml` + new `alc.lock` format.
+    ///
+    /// Detects legacy format via `linked_at` or `local_dir` fields.
+    /// Creates `alc.toml` from `local_dir` entries and renames `alc.lock` → `alc.lock.bak`.
+    /// Run `alc_update` afterwards to generate the new `alc.lock`.
+    #[tool(name = "alc_migrate", annotations(open_world_hint = false))]
+    async fn migrate(
+        &self,
+        Parameters(params): Parameters<MigrateParams>,
+    ) -> Result<String, String> {
+        self.app.migrate(params.project_root).await
+    }
+
     // ─── Diagnostics ────────────────────────────────────────────
 
     /// Show algocline server configuration and diagnostic info.
@@ -605,7 +660,10 @@ impl ServerHandler for AlcService {
                  - alc_pkg_link: Link a local directory as a package (symlink to cache). Changes reflect immediately on next alc_run.\n\
                  - alc_pkg_list: List installed packages with metadata. Pass project_root to include project-local packages.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
-                 - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\n\
+                 - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
+                 - alc_init: Initialize alc.toml in the project root.\n\
+                 - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\
+                 - alc_migrate: Migrate legacy alc.lock to alc.toml + new alc.lock format.\n\n\
                  Logging:\n\
                  - alc_note: Add a note to a completed session's log (feedback, observations).\n\
                  - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail.\n\n\

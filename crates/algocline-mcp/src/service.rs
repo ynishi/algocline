@@ -95,6 +95,12 @@ pub struct PkgLinkParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PkgUnlinkParams {
+    /// Name of the linked package to remove from `~/.algocline/packages/`.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgListParams {
     /// Optional absolute path to project root.
     /// When provided, project-local packages from alc.lock are included
@@ -518,6 +524,21 @@ impl AlcService {
             .await
     }
 
+    /// Remove a symlinked package from `~/.algocline/packages/`.
+    ///
+    /// Only removes symlinks created by `alc_pkg_link`. For installed (copied)
+    /// packages, use `alc_pkg_remove` instead.
+    #[tool(
+        name = "alc_pkg_unlink",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn pkg_unlink(
+        &self,
+        Parameters(params): Parameters<PkgUnlinkParams>,
+    ) -> Result<String, String> {
+        self.app.pkg_unlink(params.name).await
+    }
+
     // ─── Logging ─────────────────────────────────────────────
 
     /// Add a note to a completed session's log.
@@ -661,6 +682,7 @@ impl ServerHandler for AlcService {
                  - alc_pkg_list: List installed packages with metadata. Pass project_root to include project-local packages.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
+                 - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
                  - alc_init: Initialize alc.toml in the project root.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\
                  - alc_migrate: Migrate legacy alc.lock to alc.toml + new alc.lock format.\n\n\

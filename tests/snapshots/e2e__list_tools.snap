@@ -18,6 +18,7 @@ expression: names
   "alc_pkg_link",
   "alc_pkg_list",
   "alc_pkg_remove",
+  "alc_pkg_unlink",
   "alc_run",
   "alc_scenario_install",
   "alc_scenario_list",

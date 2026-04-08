@@ -119,6 +119,11 @@ pub trait EngineApi: Send + Sync {
     /// Install a package from a Git URL or local path.
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String>;
 
+    /// Remove a symlinked package from `~/.algocline/packages/`.
+    ///
+    /// Only removes symlinks; for installed (copied) packages, use `pkg_remove`.
+    async fn pkg_unlink(&self, name: String) -> Result<String, String>;
+
     /// Remove a package declaration from `alc.toml` and `alc.lock`.
     ///
     /// Requires an `alc.toml` to be found (via `project_root` or ancestor walk).

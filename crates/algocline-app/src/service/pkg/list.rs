@@ -42,6 +42,12 @@ struct PackageListEntry {
     overrides: Option<Vec<String>>,
     meta: serde_json::Value,
     error: Option<String>,
+    /// `Some(true)` when this package directory is a symlink (linked package).
+    linked: Option<bool>,
+    /// Resolved symlink target path (only present when `linked` is `Some(true)`).
+    link_target: Option<String>,
+    /// `Some(true)` when the symlink target does not exist (dangling symlink).
+    broken: Option<bool>,
 }
 
 impl PackageListEntry {
@@ -98,6 +104,16 @@ impl PackageListEntry {
 
         if let Some(err) = self.error {
             map.insert("error".to_string(), serde_json::Value::String(err));
+        }
+
+        if let Some(linked) = self.linked {
+            map.insert("linked".to_string(), serde_json::Value::Bool(linked));
+        }
+        if let Some(target) = self.link_target {
+            map.insert("link_target".to_string(), serde_json::Value::String(target));
+        }
+        if let Some(broken) = self.broken {
+            map.insert("broken".to_string(), serde_json::Value::Bool(broken));
         }
 
         serde_json::Value::Object(map)
@@ -205,6 +221,9 @@ impl AppService {
                             overrides: None,
                             meta: serde_json::Value::Object(serde_json::Map::new()),
                             error: None,
+                            linked: None,
+                            link_target: None,
+                            broken: None,
                         });
                     }
                 }
@@ -233,6 +252,9 @@ impl AppService {
                                 overrides: None,
                                 meta: serde_json::Value::Object(serde_json::Map::new()),
                                 error: None,
+                                linked: None,
+                                link_target: None,
+                                broken: None,
                             });
                         }
                     }
@@ -260,12 +282,39 @@ impl AppService {
 
             for dir_entry in read_entries.flatten() {
                 let path = dir_entry.path();
-                if !path.is_dir() {
+
+                // Detect symlink status before is_dir() check so dangling symlinks
+                // are also enumerated (dangling symlinks have is_dir() == false).
+                let is_symlink = path
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+
+                let link_target = if is_symlink {
+                    path.read_link().ok().map(|t| t.display().to_string())
+                } else {
+                    None
+                };
+
+                // broken = symlink exists but target does not.
+                let broken = if is_symlink {
+                    Some(!path.exists())
+                } else {
+                    None
+                };
+
+                // For dangling symlinks: init.lua check will fail, so we allow
+                // them through (they show as broken: true without init.lua check).
+                // For non-symlinks and live symlinks: require is_dir().
+                if !is_symlink && !path.is_dir() {
                     continue;
                 }
-                if !path.join("init.lua").exists() {
+
+                // Skip if no init.lua (only for non-broken entries).
+                if broken != Some(true) && !path.join("init.lua").exists() {
                     continue;
                 }
+
                 let name = dir_entry.file_name().to_string_lossy().to_string();
                 if is_system_package(&name) {
                     continue;
@@ -339,6 +388,9 @@ return pkg.meta or {{ name = "{name}" }}"#
                     overrides: None,
                     meta,
                     error: eval_error,
+                    linked: if is_symlink { Some(true) } else { None },
+                    link_target,
+                    broken,
                 });
             }
         }

@@ -6,12 +6,12 @@
 //! `mlua_isle::FsResolver`s. When `alc_run` / `alc_advice` starts a session,
 //! the executor registers resolvers in the following priority (high → low):
 //!
-//! 1. **Project-local** (`alc.lock` `local_dir` entries) — zero-copy links to
-//!    on-disk directories within the project tree. Resolved via
+//! 1. **Project-local** (`alc.toml` path entries, resolved via `alc.lock`) —
+//!    zero-copy references to on-disk directories. Resolved via
 //!    [`super::lockfile::resolve_local_dir_paths`].
 //! 2. **`ALC_PACKAGES_PATH`** — colon-separated search paths from the env var.
 //! 3. **Global default** (`~/.algocline/packages/`) — packages installed by
-//!    `alc_pkg_install` or `alc init`.
+//!    `alc_pkg_install`.
 //!
 //! A higher-priority package **shadows** a lower-priority one with the same
 //! name. `pkg_list` reports both, marking the effective one as `active: true`.
@@ -21,36 +21,31 @@
 //! Each package belongs to a scope:
 //!
 //! - **`"global"`** — installed in `~/.algocline/packages/` via `pkg_install`.
-//!   Physical directory managed by algocline (clone/copy/delete).
-//! - **`"project"`** — declared in `alc.lock` via [`super::pkg_link`].
-//!   Only a path reference is stored; algocline never copies or deletes the
-//!   source files.
+//!   Physical directory managed by algocline (clone/copy).
+//! - **`"project"`** — declared in `alc.toml` via `pkg_install` or manual entry.
+//!   Recorded in `alc.lock`. algocline never copies or deletes the source files.
 //!
-//! `pkg_remove` with `scope: "project"` removes the `alc.lock` entry only.
-//! `scope: "global"` deletes the directory from `~/.algocline/packages/`.
-//! When omitted, project scope is tried first, then global fallback.
+//! # `alc.toml` / `alc.lock` lifecycle
 //!
-//! # `alc.lock` lifecycle
+//! `alc.toml` is the package declaration file (user-authored).
+//! `alc.lock` is the resolved lockfile (tool-managed).
 //!
-//! `alc.lock` is a TOML file at the project root (see [`super::lockfile`]).
-//! Created on first `pkg_link` call. Updated atomically via temp-file + rename.
+//! - `pkg_install` updates both `alc.toml` (adds entry) and `alc.lock` (records version/source).
+//! - `pkg_remove` removes the entry from both `alc.toml` and `alc.lock`.
+//! - Physical files in `~/.algocline/packages/` are never deleted by `pkg_remove`.
+//!
+//! `alc.lock` is updated atomically via temp-file + rename.
 //! Read at session start to build extra `FsResolver` entries.
-//!
-//! Path entries are **containment-checked**: canonicalized paths that escape
-//! the project root are rejected at both write time (`pkg_link`) and read
-//! time (`resolve_local_dir_paths`).
 //!
 //! # Project root resolution
 //!
 //! See [`super::project`] for the 3-tier priority (explicit arg →
-//! `ALC_PROJECT_ROOT` env → ancestor walk from cwd).
+//! `ALC_PROJECT_ROOT` env → ancestor walk from cwd looking for `alc.toml`).
 //!
 //! # Security invariants
 //!
 //! - Package names are whitelist-validated (`[a-zA-Z0-9_-]`) before Lua
 //!   interpolation in `pkg_list` meta evaluation.
-//! - `LocalDir` paths are canonicalized and containment-checked against
-//!   `project_root` to prevent path traversal via hand-edited `alc.lock`.
 //! - Lockfile writes are serialized in-process (`SAVE_GUARD` mutex)
 //!   and use atomic rename to prevent half-written reads.
 //!
@@ -58,7 +53,7 @@
 //!
 //! - [`list`] — `pkg_list` and its intermediate DTOs.
 //! - [`install`] — `pkg_install`, local-path variant, and bundled auto-install.
-//! - [`remove`] — `pkg_remove` and scope resolution.
+//! - [`remove`] — `pkg_remove` (alc.toml + alc.lock deletion).
 
 mod install;
 mod list;

@@ -106,8 +106,13 @@ impl EngineApi for AppService {
 
     // ─── Packages ────────────────────────────────────────────
 
-    async fn pkg_link(&self, path: String, project_root: Option<String>) -> Result<String, String> {
-        AppService::pkg_link(self, path, project_root).await
+    async fn pkg_link(
+        &self,
+        path: String,
+        name: Option<String>,
+        force: Option<bool>,
+    ) -> Result<String, String> {
+        AppService::pkg_link(self, path, name, force).await
     }
 
     async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String> {
@@ -122,9 +127,9 @@ impl EngineApi for AppService {
         &self,
         name: &str,
         project_root: Option<String>,
-        scope: Option<String>,
+        version: Option<String>,
     ) -> Result<String, String> {
-        AppService::pkg_remove(self, name, project_root, scope).await
+        AppService::pkg_remove(self, name, project_root, version).await
     }
 
     // ─── Logging ─────────────────────────────────────────────

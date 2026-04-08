@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::super::alc_toml::load_alc_toml;
 use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
 use super::super::project::resolve_project_root;
@@ -32,7 +33,8 @@ struct PackageListEntry {
     /// Search-path directory — global packages only.
     source: Option<String>,
     active: bool,
-    linked_at: Option<String>,
+    /// Package version from alc.lock or meta evaluation.
+    version: Option<String>,
     installed_at: Option<String>,
     updated_at: Option<String>,
     /// Legacy source string from `installed.json` (the raw URL/path).
@@ -70,8 +72,8 @@ impl PackageListEntry {
 
         map.insert("active".to_string(), serde_json::Value::Bool(self.active));
 
-        if let Some(la) = self.linked_at {
-            map.insert("linked_at".to_string(), serde_json::Value::String(la));
+        if let Some(v) = self.version {
+            map.insert("version".to_string(), serde_json::Value::String(v));
         }
         if let Some(ia) = self.installed_at {
             map.insert("installed_at".to_string(), serde_json::Value::String(ia));
@@ -106,15 +108,15 @@ impl AppService {
     /// List installed packages with metadata, showing the full override chain.
     ///
     /// When `project_root` is provided (or resolvable), project-local packages
-    /// from `alc.lock` are prepended with `scope: "project"`. Global packages
-    /// carry `scope: "global"`. If a project package and a global package share
-    /// the same name, the project one is `active: true` and the global one
-    /// `active: false`.
+    /// from `alc.toml` are prepended with `scope: "project"`, merged with
+    /// version/source info from `alc.lock`. Global packages carry `scope: "global"`.
+    /// If a project package and a global package share the same name, the project
+    /// one is `active: true` and the global one `active: false`.
     pub async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String> {
         // ── Load manifest once upfront ─────────────────────────────────────
         let manifest_data = manifest::load_manifest().unwrap_or_default();
 
-        // ── Project-local packages (from alc.lock) ─────────────────────────
+        // ── Project-local packages (from alc.toml + alc.lock) ─────────────
         let resolved_root = resolve_project_root(project_root.as_deref());
 
         let mut project_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -126,30 +128,77 @@ impl AppService {
             project_root_str = Some(root.display().to_string());
             lockfile_path_str = Some(lockfile_path(root).display().to_string());
 
-            match load_lockfile(root) {
-                Ok(Some(lock)) => {
-                    for pkg in &lock.packages {
-                        let PackageSource::Path { path: ref raw_path } = pkg.source else {
-                            continue;
-                        };
-                        let abs_path = {
-                            let p = Path::new(raw_path);
-                            if p.is_absolute() {
-                                p.to_path_buf()
-                            } else {
-                                root.join(p)
-                            }
-                        };
+            // Load alc.lock for version/source lookup (may not exist yet).
+            let lock_map: HashMap<String, (Option<String>, PackageSource)> =
+                match load_lockfile(root) {
+                    Ok(Some(lock)) => lock
+                        .packages
+                        .into_iter()
+                        .map(|p| (p.name, (p.version, p.source)))
+                        .collect(),
+                    Ok(None) => HashMap::new(),
+                    Err(e) => {
+                        tracing::warn!("failed to load alc.lock: {e}");
+                        HashMap::new()
+                    }
+                };
 
-                        project_names.insert(pkg.name.clone());
+            // Enumerate project packages from alc.toml declarations.
+            match load_alc_toml(root) {
+                Ok(Some(alc_toml)) => {
+                    for (name, dep) in &alc_toml.packages {
+                        // Determine path/source_type from alc.lock merge.
+                        let (version, source_type, abs_path) =
+                            if let Some((ver, source)) = lock_map.get(name) {
+                                match source {
+                                    PackageSource::Path { path: raw_path } => {
+                                        let p = Path::new(raw_path);
+                                        let abs = if p.is_absolute() {
+                                            p.to_path_buf()
+                                        } else {
+                                            root.join(p)
+                                        };
+                                        (
+                                            ver.clone(),
+                                            Some("path".to_string()),
+                                            Some(abs.display().to_string()),
+                                        )
+                                    }
+                                    PackageSource::Installed => {
+                                        (ver.clone(), Some("installed".to_string()), None)
+                                    }
+                                    PackageSource::Git { .. } => {
+                                        (ver.clone(), Some("git".to_string()), None)
+                                    }
+                                    PackageSource::Bundled { .. } => {
+                                        (ver.clone(), Some("bundled".to_string()), None)
+                                    }
+                                }
+                            } else {
+                                // alc.lock entry absent — derive source_type from alc.toml dep kind.
+                                let st = match dep {
+                                    super::super::alc_toml::PackageDep::Version(_) => {
+                                        Some("installed".to_string())
+                                    }
+                                    super::super::alc_toml::PackageDep::Path { .. } => {
+                                        Some("path".to_string())
+                                    }
+                                    super::super::alc_toml::PackageDep::Git { .. } => {
+                                        Some("git".to_string())
+                                    }
+                                };
+                                (None, st, None)
+                            };
+
+                        project_names.insert(name.clone());
                         entries.push(PackageListEntry {
-                            name: pkg.name.clone(),
+                            name: name.clone(),
                             scope: Scope::Project,
-                            source_type: Some("path".to_string()),
-                            path: Some(abs_path.display().to_string()),
+                            source_type,
+                            path: abs_path,
                             source: None,
                             active: true,
-                            linked_at: None,
+                            version,
                             installed_at: None,
                             updated_at: None,
                             install_source: None,
@@ -159,9 +208,37 @@ impl AppService {
                         });
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // No alc.toml — fall back to alc.lock Path entries for backward compat.
+                    for (name, (version, source)) in &lock_map {
+                        if let PackageSource::Path { path: raw_path } = source {
+                            let p = Path::new(raw_path);
+                            let abs = if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                root.join(p)
+                            };
+                            project_names.insert(name.clone());
+                            entries.push(PackageListEntry {
+                                name: name.clone(),
+                                scope: Scope::Project,
+                                source_type: Some("path".to_string()),
+                                path: Some(abs.display().to_string()),
+                                source: None,
+                                active: true,
+                                version: version.clone(),
+                                installed_at: None,
+                                updated_at: None,
+                                install_source: None,
+                                overrides: None,
+                                meta: serde_json::Value::Object(serde_json::Map::new()),
+                                error: None,
+                            });
+                        }
+                    }
+                }
                 Err(e) => {
-                    tracing::warn!("failed to load alc.lock: {e}");
+                    tracing::warn!("failed to load alc.toml: {e}");
                 }
             }
         }
@@ -204,11 +281,6 @@ impl AppService {
                 let global_active = seen[&name].len() == 1 && !project_names.contains(&name);
 
                 // Evaluate Lua meta (best-effort; error captured in entry).
-                // Only interpolate the name into Lua source when it matches a
-                // strict whitelist (alnum / `_` / `-`). Names outside this set
-                // cannot be `require`d by Lua anyway; refusing them here also
-                // forecloses any Lua string-injection via crafted directory
-                // names under search paths.
                 let (meta, eval_error) = if is_safe_pkg_name(&name) {
                     let code = format!(
                         r#"package.loaded["{name}"] = nil
@@ -232,14 +304,18 @@ return pkg.meta or {{ name = "{name}" }}"#
                 // Look up manifest to determine source_type at collection time.
                 let (source_type, installed_at, updated_at, install_source) =
                     if let Some(entry) = manifest_data.packages.get(&name) {
-                        let st = match infer_from_legacy_source_string(&entry.source) {
-                            PackageSource::Git { .. } => "git",
-                            PackageSource::Installed => "installed",
-                            PackageSource::Path { .. } => "path",
-                            PackageSource::Bundled { .. } => "bundled",
+                        let inferred = infer_from_legacy_source_string(&entry.source);
+                        let st = match &inferred {
+                            PackageSource::Git { .. } => "git".to_string(),
+                            PackageSource::Installed => {
+                                // I-6: supplement with original path/URL from installed.json
+                                format!("installed (from: {})", entry.source)
+                            }
+                            PackageSource::Path { .. } => "path".to_string(),
+                            PackageSource::Bundled { .. } => "bundled".to_string(),
                         };
                         (
-                            Some(st.to_string()),
+                            Some(st),
                             Some(entry.installed_at.clone()),
                             Some(entry.updated_at.clone()),
                             Some(entry.source.clone()),
@@ -256,7 +332,7 @@ return pkg.meta or {{ name = "{name}" }}"#
                     path: None,
                     source: Some(source_display),
                     active: global_active,
-                    linked_at: None,
+                    version: None,
                     installed_at,
                     updated_at,
                     install_source,
@@ -318,8 +394,6 @@ return pkg.meta or {{ name = "{name}" }}"#
 /// Returns `true` iff `name` is safe to interpolate into a Lua source string.
 ///
 /// Accepts ASCII alphanumerics, `_` and `-`. Empty strings are rejected.
-/// This matches the set of names that Lua's `require` can actually resolve
-/// against `FsResolver`, so nothing legitimate is excluded.
 fn is_safe_pkg_name(name: &str) -> bool {
     !name.is_empty()
         && name

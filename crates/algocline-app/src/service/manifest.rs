@@ -158,6 +158,7 @@ pub(crate) fn record_install_batch(names: &[String], source: &str) -> Result<(),
 }
 
 /// Remove a package from the manifest.
+#[allow(dead_code)]
 pub(crate) fn record_remove(name: &str) -> Result<(), String> {
     let mut manifest = load_manifest()?;
     manifest.packages.remove(name);

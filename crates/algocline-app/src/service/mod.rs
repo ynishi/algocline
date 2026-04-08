@@ -2,6 +2,7 @@ mod config;
 mod engine_api_impl;
 mod eval;
 mod eval_store;
+pub(crate) mod lockfile;
 mod logging;
 pub(crate) mod manifest;
 pub(crate) mod path;
@@ -9,6 +10,7 @@ mod pkg;
 pub mod resolve;
 mod run;
 mod scenario;
+pub(crate) mod source;
 mod status;
 mod transcript;
 

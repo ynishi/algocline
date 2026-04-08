@@ -53,7 +53,8 @@ impl AppService {
                 let active = occurrences.len() == 1; // first occurrence = highest priority
 
                 let code = format!(
-                    r#"local pkg = require("{name}")
+                    r#"package.loaded["{name}"] = nil
+local pkg = require("{name}")
 return pkg.meta or {{ name = "{name}" }}"#
                 );
                 let mut pkg_json = match self.executor.eval_simple(code).await {

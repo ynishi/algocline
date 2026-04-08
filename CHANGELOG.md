@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc_pkg_link`**: Link a local directory as a project-local package without copying. Records the path in `alc.lock`. Supports single package and collection layouts. Idempotent — re-linking updates the existing entry
+- **`alc.lock`**: Project-local lockfile schema (version=1) for managing project-scoped package references. Stores `local_dir` entries pointing to on-disk paths
+- **Project-local package resolution**: `alc.lock` `local_dir` entries are resolved as high-priority `FsResolver`s, taking precedence over `ALC_PACKAGES_PATH` and global `~/.algocline/packages/`. Enables per-project package overrides without modifying global state
+- **`project_root` parameter**: `alc_run`, `alc_advice`, `alc_pkg_list`, `alc_pkg_remove` accept optional `project_root` to activate project-local package resolution. Auto-detected via `ALC_PROJECT_ROOT` env or `alc.lock` ancestor walk when omitted
+- **`scope` parameter**: `alc_pkg_list` and `alc_pkg_remove` accept `scope` (`"project"` / `"global"`) for explicit scope targeting
+- **`PackageSource` enum**: Type-safe representation of package origins (Git / LocalCopy / LocalDir / Bundled) with legacy string inference for backward compatibility
+
+### Changed
+
+- **`BUNDLED_VERSION`**: Updated bundled-packages from `v0.9.0` to `v0.11.0`
+- **`EngineApi` trait**: `run` and `advice` gain `project_root: Option<String>` parameter; `pkg_list` gains `project_root`; `pkg_remove` gains `project_root` and `scope` (breaking for trait implementors)
+- **`pkg.rs` → `pkg/` module**: Split monolithic `pkg.rs` into `pkg/install.rs`, `pkg/list.rs`, `pkg/remove.rs`, `pkg/tests.rs` submodules
+
+### Fixed
+
+- **Lua injection prevention**: Package names are whitelist-validated before interpolation into Lua source in `pkg_list` meta evaluation
+- **Path containment**: `pkg_link` canonicalizes and containment-checks `LocalDir` paths so `alc.lock` cannot reference paths outside `project_root`
+- **Atomic lockfile writes**: `save_lockfile` uses `NamedTempFile` + `persist` to prevent readers from observing half-written `alc.lock`
+- **`eval_simple` require cache**: Clears `package.loaded[name]` before meta evaluation to avoid stale cached modules across calls
+
 ## [0.13.0] - 2026-04-04
 
 ### Added

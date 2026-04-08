@@ -82,6 +82,7 @@ After adding the config, restart your MCP host session so it picks up the new se
 | `ALC_LOG_DIR` | Directory for session transcript logs | `~/.algocline/logs` |
 | `ALC_LOG_LEVEL` | `full` (enable logging) or `off` (disable) | `full` |
 | `ALC_PACKAGES_PATH` | Additional package search paths (colon-separated). Takes priority over `~/.algocline/packages/` | (none) |
+| `ALC_PROJECT_ROOT` | Project root directory for project-local package resolution via `alc.lock`. When omitted, auto-detected by walking up from cwd | (auto-detect) |
 
 Example: writing logs to a custom directory:
 
@@ -204,9 +205,10 @@ alc_continue({ session_id, response })
 | `alc_run` | Execute Lua code with optional JSON context |
 | `alc_continue` | Resume a paused execution with the host LLM's response |
 | `alc_advice` | Apply an installed package by name |
-| `alc_pkg_list` | List installed packages |
+| `alc_pkg_link` | Link a local directory as a project-local package (no copy). Records path in `alc.lock` |
+| `alc_pkg_list` | List installed packages. Pass `project_root` to include project-local packages |
 | `alc_pkg_install` | Install a package or collection from Git URL or local path. Response includes `types_path` (absolute path to `alc.d.lua`) |
-| `alc_pkg_remove` | Remove an installed package |
+| `alc_pkg_remove` | Remove an installed package. Pass `project_root` to remove from `alc.lock` only |
 | `alc_eval` | Evaluate a strategy against a scenario (cases + graders) |
 | `alc_eval_history` | List past eval results, filter by strategy |
 | `alc_eval_detail` | View a specific eval result in full detail |
@@ -444,6 +446,37 @@ alc_pkg_remove({ name: "my-strategy" }) # Remove a package
 ```
 
 Packages live in `~/.algocline/packages/`. Each package is a directory with an `init.lua`.
+
+### Project-local packages
+
+Link a local directory as a project-scoped package without copying. The path is recorded in `alc.lock` at the project root:
+
+```
+alc_pkg_link({ path: "/path/to/my-strategy" })
+```
+
+This creates (or updates) `alc.lock` in the project root:
+
+```toml
+version = 1
+
+[packages.my-strategy]
+source = "local_dir"
+path = "relative/to/project-root"
+```
+
+Project-local packages take priority over global packages. Resolution order:
+
+1. `alc.lock` `local_dir` entries (project-local)
+2. `ALC_PACKAGES_PATH` (environment)
+3. `~/.algocline/packages/` (global default)
+
+Use `project_root` parameter to activate project scope in other tools:
+
+```
+alc_pkg_list({ project_root: "/path/to/project" })    # Lists both project and global packages
+alc_pkg_remove({ name: "my-strategy", scope: "project" })  # Removes from alc.lock only
+```
 
 ## Strategy development
 

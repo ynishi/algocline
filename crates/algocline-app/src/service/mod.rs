@@ -11,6 +11,7 @@ mod migrate;
 pub(crate) mod path;
 mod pkg;
 mod pkg_link;
+mod pkg_unlink;
 pub(crate) mod project;
 pub mod resolve;
 mod run;

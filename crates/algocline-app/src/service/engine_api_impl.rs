@@ -115,6 +115,10 @@ impl EngineApi for AppService {
         AppService::pkg_link(self, path, name, force).await
     }
 
+    async fn pkg_unlink(&self, name: String) -> Result<String, String> {
+        AppService::pkg_unlink(self, name).await
+    }
+
     async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String> {
         AppService::pkg_list(self, project_root).await
     }

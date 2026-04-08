@@ -160,6 +160,20 @@ impl EngineApi for AppService {
         AppService::stats(self, strategy_filter, days)
     }
 
+    // ─── Project lifecycle ────────────────────────────────────
+
+    async fn init(&self, project_root: Option<String>) -> Result<String, String> {
+        AppService::init(self, project_root).await
+    }
+
+    async fn update(&self, project_root: Option<String>) -> Result<String, String> {
+        AppService::update(self, project_root).await
+    }
+
+    async fn migrate(&self, project_root: Option<String>) -> Result<String, String> {
+        AppService::migrate(self, project_root).await
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

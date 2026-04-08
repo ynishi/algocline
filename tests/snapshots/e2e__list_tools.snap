@@ -10,7 +10,9 @@ expression: names
   "alc_eval_detail",
   "alc_eval_history",
   "alc_info",
+  "alc_init",
   "alc_log_view",
+  "alc_migrate",
   "alc_note",
   "alc_pkg_install",
   "alc_pkg_link",
@@ -21,5 +23,6 @@ expression: names
   "alc_scenario_list",
   "alc_scenario_show",
   "alc_stats",
-  "alc_status"
+  "alc_status",
+  "alc_update"
 ]

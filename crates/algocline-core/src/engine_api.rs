@@ -155,6 +155,25 @@ pub trait EngineApi: Send + Sync {
         days: Option<u64>,
     ) -> Result<String, String>;
 
+    // ─── Project lifecycle ────────────────────────────────────
+
+    /// Initialize `alc.toml` in the given project root.
+    ///
+    /// Creates a minimal `alc.toml` (`[packages]` section only).
+    /// Fails if `alc.toml` already exists (no overwrite).
+    async fn init(&self, project_root: Option<String>) -> Result<String, String>;
+
+    /// Re-resolve all `alc.toml` entries and rewrite `alc.lock`.
+    ///
+    /// Requires an `alc.toml` to be present. Returns resolved count and errors.
+    async fn update(&self, project_root: Option<String>) -> Result<String, String>;
+
+    /// Migrate a legacy `alc.lock` to `alc.toml` + new `alc.lock` format.
+    ///
+    /// Detects legacy format via `linked_at` / `local_dir` fields.
+    /// Backs up the old lock file as `alc.lock.bak`.
+    async fn migrate(&self, project_root: Option<String>) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

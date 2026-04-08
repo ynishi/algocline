@@ -3,9 +3,11 @@ mod config;
 mod engine_api_impl;
 mod eval;
 mod eval_store;
+mod init;
 pub(crate) mod lockfile;
 mod logging;
 pub(crate) mod manifest;
+mod migrate;
 pub(crate) mod path;
 mod pkg;
 mod pkg_link;
@@ -16,6 +18,7 @@ mod scenario;
 pub(crate) mod source;
 mod status;
 mod transcript;
+mod update;
 
 #[cfg(test)]
 mod tests;

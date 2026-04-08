@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc_init` MCP tool**: Initialize project — creates `alc.toml` in the project root if absent. Equivalent to `alc init` for project-scoped setup via MCP
+- **`alc_update` MCP tool**: Update installed packages declared in `alc.toml` — re-installs each entry from its recorded source URL and updates `alc.lock`
+- **`alc_migrate` MCP tool**: Migrate legacy `alc.lock` (v1 `local_dir` entries) to the new `alc.toml` + `alc.lock` schema. Generates `alc.toml` from existing lock entries and rewrites `alc.lock` to the new format
+- **`alc_pkg_unlink` MCP tool**: Remove a symlink created by `alc_pkg_link`. Rejects real directories (only symlinks are removed) to prevent accidental deletion of installed packages
+- **`alc.toml`**: New project-level package declaration file. Declares packages with `name`, `source`, and optional `version`. Used as the source of truth for project-local package management
+- **`alc.toml`-based project discovery**: Project root is now detected by walking up the directory tree to find `alc.toml` (previously `alc.lock`). `alc.lock` remains the resolved lockfile written by install/link operations
+- **Lock mismatch warning**: Detects drift between `alc.toml` declarations and `alc.lock` resolved entries. Warns when packages declared in `alc.toml` are absent from `alc.lock` or vice versa
+- **`PackageSource::Installed` / `PackageSource::Path`**: Renamed variants replacing `LocalCopy` and `LocalDir` respectively. `Installed` = package installed to cache from a URL; `Path` = symlinked local directory
+- **`alc.toml` auto-append on install**: `alc_pkg_install` automatically appends the installed package to `alc.toml` when a project root is detected
+- **Symlink-based `alc_pkg_link`**: Rewrites `pkg_link` to create a symlink inside `~/.algocline/packages/` pointing to the local directory. Removes the containment check entirely. `pkg_list` reports `linked`, `link_target`, and `broken` fields for symlink entries
+- **Source provenance in `alc_pkg_list`**: Each entry now shows a `from` field indicating the install source (URL, path, or bundled)
+
+### Changed
+
+- **`alc_pkg_remove`**: Unified to remove from `alc.toml` + `alc.lock` only — cache directory is never deleted. The `scope` parameter is removed; removal always targets the project-local declaration
+- **`alc_pkg_list`**: Project scope now reads from `alc.toml` (declarations) merged with `alc.lock` (resolved version/source), instead of reading `local_dir` entries directly from `alc.lock`
+- **`PkgRemoveParams`**: `scope` field replaced by `version` (optional, for disambiguation)
+- **`PkgLinkParams`**: `project_root` field removed; project root is auto-detected via `alc.toml` walk
+- **`EngineApi` trait**: Removed `scope` from `pkg_remove`; added `alc_init`, `alc_update`, `alc_migrate`, `pkg_unlink` methods
+- **`lockfile.rs`**: `LockPackage` loses `linked_at` field; gains `version: Option<String>`. `resolve_local_dir_paths` renamed to `resolve_path_entries` with containment check removed
+- **`project.rs`**: `walk_up_for_lockfile` renamed to `walk_up_for_alc_toml`
+
 ## [0.14.0] - 2026-04-09
 
 ### Added

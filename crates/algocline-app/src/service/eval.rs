@@ -105,7 +105,9 @@ return report:to_table()
         );
 
         let ctx = serde_json::Value::Null;
-        let result = self.start_and_tick(wrapped, ctx, Some(strategy)).await?;
+        let result = self
+            .start_and_tick(wrapped, ctx, Some(strategy), vec![])
+            .await?;
 
         // Register this session for eval result saving on completion.
         // start_and_tick returns the first pause (needs_response) or completed.
@@ -284,7 +286,7 @@ return {{
         );
 
         let ctx = serde_json::Value::Null;
-        let raw_result = self.start_and_tick(lua_code, ctx, None).await?;
+        let raw_result = self.start_and_tick(lua_code, ctx, None, vec![]).await?;
 
         // Persist comparison result
         save_compare_result(eval_id_a, eval_id_b, &raw_result);

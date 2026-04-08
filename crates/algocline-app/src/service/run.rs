@@ -7,26 +7,35 @@ use super::AppService;
 
 impl AppService {
     /// Execute Lua code with optional JSON context.
+    ///
+    /// `project_root` — optional absolute path to the project root containing
+    /// `alc.lock`. Falls back to `ALC_PROJECT_ROOT` env or ancestor walk.
     pub async fn run(
         &self,
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
+        project_root: Option<String>,
     ) -> Result<String, String> {
         let code = resolve_code(code, code_file)?;
         let ctx = ctx.unwrap_or(serde_json::Value::Null);
-        self.start_and_tick(code, ctx, None).await
+        let extra = self.resolve_extra_lib_paths(project_root.as_deref());
+        self.start_and_tick(code, ctx, None, extra).await
     }
 
     /// Apply a built-in strategy to a task.
     ///
     /// If the requested package is not installed, automatically installs the
     /// bundled package collection from GitHub before executing.
+    ///
+    /// `project_root` — optional absolute path to the project root containing
+    /// `alc.lock`. Falls back to `ALC_PROJECT_ROOT` env or ancestor walk.
     pub async fn advice(
         &self,
         strategy: &str,
         task: Option<String>,
         opts: Option<serde_json::Value>,
+        project_root: Option<String>,
     ) -> Result<String, String> {
         // Auto-install bundled packages if the requested strategy is missing
         if !is_package_installed(strategy) {
@@ -50,7 +59,8 @@ impl AppService {
         }
         let ctx = serde_json::Value::Object(ctx_map);
 
-        self.start_and_tick(code, ctx, Some(strategy)).await
+        let extra = self.resolve_extra_lib_paths(project_root.as_deref());
+        self.start_and_tick(code, ctx, Some(strategy), extra).await
     }
 
     /// Continue a paused execution — batch feed.
@@ -144,8 +154,12 @@ impl AppService {
         code: String,
         ctx: serde_json::Value,
         strategy: Option<&str>,
+        extra_lib_paths: Vec<std::path::PathBuf>,
     ) -> Result<String, String> {
-        let session = self.executor.start_session(code, ctx).await?;
+        let session = self
+            .executor
+            .start_session(code, ctx, extra_lib_paths)
+            .await?;
         let (session_id, result) = self
             .registry
             .start_execution(session)

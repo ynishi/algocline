@@ -7,6 +7,7 @@ mod logging;
 pub(crate) mod manifest;
 pub(crate) mod path;
 mod pkg;
+pub(crate) mod project;
 pub mod resolve;
 mod run;
 mod scenario;
@@ -83,5 +84,32 @@ impl AppService {
             .log_dir
             .as_deref()
             .ok_or_else(|| "File logging is not available (no writable log directory)".to_string())
+    }
+
+    /// Resolve extra lib paths for a request.
+    ///
+    /// 1. Determines the project root from `project_root` (explicit) or
+    ///    `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
+    /// 2. Reads `alc.lock` from that root.
+    /// 3. Returns the resolved absolute paths of all `local_dir` entries.
+    ///
+    /// Returns an empty `Vec` if no project root is found, if `alc.lock`
+    /// does not exist, or if no `local_dir` entries are present.
+    pub(crate) fn resolve_extra_lib_paths(
+        &self,
+        project_root: Option<&str>,
+    ) -> Vec<std::path::PathBuf> {
+        let Some(root) = project::resolve_project_root(project_root) else {
+            return vec![];
+        };
+
+        match lockfile::load_lockfile(&root) {
+            Ok(Some(lock)) => lockfile::resolve_local_dir_paths(&root, &lock),
+            Ok(None) => vec![],
+            Err(e) => {
+                eprintln!("alc: failed to load alc.lock at {}: {e}", root.display());
+                vec![]
+            }
+        }
     }
 }

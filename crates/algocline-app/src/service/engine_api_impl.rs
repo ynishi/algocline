@@ -18,8 +18,9 @@ impl EngineApi for AppService {
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
+        project_root: Option<String>,
     ) -> Result<String, String> {
-        AppService::run(self, code, code_file, ctx).await
+        AppService::run(self, code, code_file, ctx, project_root).await
     }
 
     async fn advice(
@@ -27,8 +28,9 @@ impl EngineApi for AppService {
         strategy: &str,
         task: Option<String>,
         opts: Option<serde_json::Value>,
+        project_root: Option<String>,
     ) -> Result<String, String> {
-        AppService::advice(self, strategy, task, opts).await
+        AppService::advice(self, strategy, task, opts, project_root).await
     }
 
     async fn continue_single(

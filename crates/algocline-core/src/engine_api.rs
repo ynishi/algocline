@@ -33,6 +33,7 @@ pub trait EngineApi: Send + Sync {
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
+        project_root: Option<String>,
     ) -> Result<String, String>;
 
     /// Apply an installed strategy package. Task is optional.
@@ -41,6 +42,7 @@ pub trait EngineApi: Send + Sync {
         strategy: &str,
         task: Option<String>,
         opts: Option<serde_json::Value>,
+        project_root: Option<String>,
     ) -> Result<String, String>;
 
     /// Continue a paused execution — single response (with optional query_id).

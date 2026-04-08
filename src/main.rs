@@ -49,7 +49,7 @@ mod init;
 
 use std::sync::Arc;
 
-use algocline_app::{AppConfig, AppService};
+use algocline_app::{AppConfig, AppService, EngineApi};
 use algocline_engine::Executor;
 use algocline_mcp::AlcService;
 use rmcp::{transport::stdio, ServiceExt};
@@ -133,8 +133,8 @@ async fn main() -> anyhow::Result<()> {
     let search_paths = resolve_lib_paths();
     let lib_paths: Vec<_> = search_paths.iter().map(|sp| sp.path.clone()).collect();
     let executor = Arc::new(Executor::new(lib_paths).await?);
-    let app = AppService::new(executor, config, search_paths);
-    let server = AlcService::new(Arc::new(app));
+    let app = Arc::new(AppService::new(executor, config, search_paths));
+    let server = AlcService::new(app as Arc<dyn EngineApi>);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

@@ -19,6 +19,9 @@ pub struct RunParams {
     pub code_file: Option<String>,
     /// Context passed to Lua as the `ctx` global (JSON object).
     pub ctx: Option<serde_json::Value>,
+    /// Optional absolute path to the project root containing `alc.lock`.
+    /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
+    pub project_root: Option<String>,
 }
 
 /// Host-reported token usage for an LLM call (MCP schema).
@@ -124,6 +127,9 @@ pub struct AdviceParams {
     pub task: Option<String>,
     /// Additional strategy-specific options (merged into ctx).
     pub opts: Option<serde_json::Value>,
+    /// Optional absolute path to the project root containing `alc.lock`.
+    /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -220,7 +226,12 @@ impl AlcService {
     #[tool(name = "alc_run", annotations(open_world_hint = false))]
     async fn run(&self, Parameters(params): Parameters<RunParams>) -> Result<String, String> {
         self.app
-            .run(params.code, params.code_file, params.ctx)
+            .run(
+                params.code,
+                params.code_file,
+                params.ctx,
+                params.project_root,
+            )
             .await
     }
 
@@ -233,7 +244,12 @@ impl AlcService {
     #[tool(name = "alc_advice", annotations(open_world_hint = false))]
     async fn advice(&self, Parameters(params): Parameters<AdviceParams>) -> Result<String, String> {
         self.app
-            .advice(&params.strategy, params.task, params.opts)
+            .advice(
+                &params.strategy,
+                params.task,
+                params.opts,
+                params.project_root,
+            )
             .await
     }
 

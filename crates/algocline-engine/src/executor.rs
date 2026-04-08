@@ -72,8 +72,59 @@ impl Executor {
 
     /// Evaluate Lua code without LLM bridge. For lightweight operations
     /// like reading package metadata.
+    ///
+    /// Uses the shared VM. `extra_lib_paths` must be empty — use
+    /// [`eval_simple_with_paths`] when project-local paths are needed.
     pub async fn eval_simple(&self, code: String) -> Result<serde_json::Value, String> {
-        let task = self.isle.spawn_exec(move |lua| {
+        self.eval_simple_with_paths(code, vec![]).await
+    }
+
+    /// Evaluate Lua code without LLM bridge, with optional extra package paths.
+    ///
+    /// When `extra_lib_paths` is empty, reuses the shared VM (cheap).
+    /// When non-empty, spawns a dedicated VM so the extra resolvers are active
+    /// (slightly more expensive, but `pkg_list` is the only caller and it is
+    /// low-frequency).
+    pub async fn eval_simple_with_paths(
+        &self,
+        code: String,
+        extra_lib_paths: Vec<PathBuf>,
+    ) -> Result<serde_json::Value, String> {
+        if extra_lib_paths.is_empty() {
+            // Fast path: reuse the long-lived shared VM.
+            let task = self.isle.spawn_exec(move |lua| {
+                let result: mlua::Value = lua
+                    .load(&code)
+                    .eval()
+                    .map_err(|e| IsleError::Lua(e.to_string()))?;
+                let json: serde_json::Value = lua
+                    .from_value(result)
+                    .map_err(|e| IsleError::Lua(e.to_string()))?;
+                serde_json::to_string(&json)
+                    .map_err(|e| IsleError::Lua(format!("JSON serialize: {e}")))
+            });
+            let json_str = task.await.map_err(|e| e.to_string())?;
+            return serde_json::from_str(&json_str).map_err(|e| format!("JSON parse: {e}"));
+        }
+
+        // Slow path: spawn a dedicated VM with extra resolvers prepended.
+        let mut effective = extra_lib_paths;
+        effective.extend(self.lib_paths.iter().cloned());
+
+        let (tmp_isle, _tmp_driver) = AsyncIsle::spawn(move |lua| {
+            let mut reg = Registry::new();
+            for path in &effective {
+                if let Ok(resolver) = FsResolver::new(path) {
+                    reg.add(resolver);
+                }
+            }
+            reg.install(lua)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("eval_simple VM spawn failed: {e}"))?;
+
+        let task = tmp_isle.spawn_exec(move |lua| {
             let result: mlua::Value = lua
                 .load(&code)
                 .eval()
@@ -94,10 +145,14 @@ impl Executor {
     /// concurrent sessions cannot interfere with each other's globals.
     /// The VM is cleaned up automatically when the session completes or
     /// is abandoned (all senders drop → channel closes → thread exits).
+    ///
+    /// `extra_lib_paths` are prepended to `self.lib_paths` so project-local
+    /// packages take precedence over the global package directory.
     pub async fn start_session(
         &self,
         code: String,
         ctx: serde_json::Value,
+        extra_lib_paths: Vec<PathBuf>,
     ) -> Result<Session, String> {
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
@@ -109,22 +164,26 @@ impl Executor {
 
         let (llm_tx, llm_rx) = tokio::sync::mpsc::channel::<LlmRequest>(16);
 
+        // Build effective lib_paths: extra (project-local) first, then defaults.
+        // Priority: extra_lib_paths > self.lib_paths (ALC_PACKAGES_PATH + global default).
+        let mut effective = extra_lib_paths;
+        effective.extend(self.lib_paths.iter().cloned());
+
         let bridge_config = bridge::BridgeConfig {
             llm_tx: Some(llm_tx),
             ns: spec.namespace.clone(),
             custom_metrics: metrics.custom_metrics_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
-            lib_paths: self.lib_paths.clone(),
+            lib_paths: effective.clone(), // fork child VMs inherit project paths
         };
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();
 
         // 1. Spawn a dedicated VM for this session.
-        let lib_paths = self.lib_paths.clone();
         let (session_isle, session_driver) = AsyncIsle::spawn(move |lua| {
             let mut reg = Registry::new();
-            for path in &lib_paths {
+            for path in &effective {
                 if let Ok(resolver) = FsResolver::new(path) {
                     reg.add(resolver);
                 }
@@ -166,5 +225,83 @@ impl Executor {
         drop(session_isle);
 
         Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create a temporary package directory with the given name and `init.lua` content.
+    fn make_pkg_dir(parent: &std::path::Path, pkg_name: &str, init_lua: &str) -> PathBuf {
+        let pkg_dir = parent.join(pkg_name);
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("init.lua"), init_lua).unwrap();
+        parent.to_path_buf()
+    }
+
+    /// `extra_lib_paths=vec![]` — eval_simple must work as before.
+    #[tokio::test]
+    async fn no_extra_lib_paths_eval_simple() {
+        let executor = Executor::new(vec![]).await.unwrap();
+        let result = executor.eval_simple("return 42".to_string()).await.unwrap();
+        assert_eq!(result, serde_json::json!(42));
+    }
+
+    /// `eval_simple_with_paths` with a project-local package.
+    ///
+    /// Creates a temp dir with `test_pkg/init.lua` returning `{value = 99}`,
+    /// then verifies `require("test_pkg").value` == 99 via the extra resolver.
+    #[tokio::test]
+    async fn extra_lib_paths_reachable_via_eval_simple_with_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_root = make_pkg_dir(tmp.path(), "test_pkg", "return { value = 99 }");
+
+        let executor = Executor::new(vec![]).await.unwrap();
+        let code = r#"
+            local pkg = require("test_pkg")
+            return pkg.value
+        "#
+        .to_string();
+
+        let result = executor
+            .eval_simple_with_paths(code, vec![pkg_root])
+            .await
+            .unwrap();
+
+        assert_eq!(result, serde_json::json!(99));
+    }
+
+    /// When `extra_lib_paths` has a pkg with the same name as one in global paths,
+    /// the extra one takes priority (it is prepended).
+    #[tokio::test]
+    async fn extra_lib_paths_priority_over_default() {
+        let global_tmp = tempfile::tempdir().unwrap();
+        let extra_tmp = tempfile::tempdir().unwrap();
+
+        // Global: test_pkg returns 1
+        make_pkg_dir(global_tmp.path(), "test_pkg", "return { value = 1 }");
+        // Extra (project-local): test_pkg returns 2
+        let extra_root = make_pkg_dir(extra_tmp.path(), "test_pkg", "return { value = 2 }");
+
+        // Executor has global as its lib_paths.
+        let executor = Executor::new(vec![global_tmp.path().to_path_buf()])
+            .await
+            .unwrap();
+
+        let code = r#"
+            local pkg = require("test_pkg")
+            return pkg.value
+        "#
+        .to_string();
+
+        let result = executor
+            .eval_simple_with_paths(code, vec![extra_root])
+            .await
+            .unwrap();
+
+        // extra (2) must win over global (1)
+        assert_eq!(result, serde_json::json!(2));
     }
 }

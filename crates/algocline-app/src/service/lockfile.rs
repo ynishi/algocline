@@ -1,6 +1,4 @@
 //! `alc.lock` — project-local package declarations.
-// These items will be used in Subtask 2 (project root integration).
-#![allow(dead_code)]
 //!
 //! ## File location
 //! `alc.lock` lives at the project root (the directory passed as `project_root`).
@@ -93,6 +91,8 @@ pub(crate) fn load_lockfile(project_root: &Path) -> Result<Option<LockFile>, Str
 /// Write `alc.lock` to disk (pretty-printed TOML).
 ///
 /// Creates the parent directory if necessary.
+// Used in Subtask 3 (alc_pkg_link).
+#[allow(dead_code)]
 pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), String> {
     let path = lockfile_path(project_root);
     if let Some(parent) = path.parent() {

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-04-09
+
 ### Added
 
 - **`alc_pkg_link`**: Link a local directory as a project-local package without copying. Records the path in `alc.lock`. Supports single package and collection layouts. Idempotent — re-linking updates the existing entry

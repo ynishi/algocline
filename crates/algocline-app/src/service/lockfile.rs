@@ -25,8 +25,17 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+
+/// Process-wide guard serialising `save_lockfile` callers.
+///
+/// Cross-process races (an external editor writing while we rename) remain
+/// possible — the rename itself is atomic, but concurrent read-modify-write
+/// sequences across processes can still lose changes. Within the MCP daemon
+/// this mutex guarantees no in-process concurrent writers trample each other.
+static SAVE_GUARD: Mutex<()> = Mutex::new(());
 
 use super::source::PackageSource;
 
@@ -94,12 +103,15 @@ pub(crate) fn load_lockfile(project_root: &Path) -> Result<Option<LockFile>, Str
 /// readers never observe a half-written file. Creates the parent directory
 /// if necessary.
 ///
-/// Note: this is not a cross-process lock — concurrent `save_lockfile` calls
-/// on a shared root can still race. The single-process MCP daemon does not
-/// currently run these calls concurrently, but an external editor writing
-/// while we rename can still lose changes. For the intended use-case
-/// (interactive `alc_pkg_link`) this is acceptable.
+/// In-process concurrent writers are serialised through [`SAVE_GUARD`]. This
+/// is **not** a cross-process lock: an external editor writing concurrently
+/// can still cause lost updates. For the intended use-case (interactive
+/// `alc_pkg_link` inside a single MCP daemon) the in-process guard suffices.
 pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), String> {
+    // Held for the duration of the write. `unwrap_or_else` on poison keeps
+    // progress — the mutex protects only serialisation, not shared state.
+    let _guard = SAVE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
     let path = lockfile_path(project_root);
     let parent = path.parent().ok_or_else(|| {
         format!(
@@ -144,7 +156,7 @@ pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> V
     let canon_root = match std::fs::canonicalize(project_root) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "alc.lock: cannot canonicalize project_root {}: {e}",
                 project_root.display()
             );
@@ -167,7 +179,7 @@ pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> V
         };
 
         if !resolved.exists() {
-            eprintln!(
+            tracing::warn!(
                 "alc.lock: local_dir path for '{}' does not exist, skipping: {}",
                 pkg.name,
                 resolved.display()
@@ -178,7 +190,7 @@ pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> V
         let canon = match std::fs::canonicalize(&resolved) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "alc.lock: cannot canonicalize path for '{}' ({}): {e}",
                     pkg.name,
                     resolved.display()
@@ -188,7 +200,7 @@ pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> V
         };
 
         if !canon.starts_with(&canon_root) {
-            eprintln!(
+            tracing::warn!(
                 "alc.lock: local_dir path for '{}' escapes project_root ({}), refusing: {}",
                 pkg.name,
                 canon_root.display(),

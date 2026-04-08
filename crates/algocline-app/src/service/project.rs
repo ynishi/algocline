@@ -31,7 +31,7 @@ pub(crate) fn resolve_project_root(explicit: Option<&str>) -> Option<PathBuf> {
             return Some(p);
         }
         // Explicit path exists but is not a directory — warn and fall through.
-        eprintln!("alc: project_root '{}' is not a directory, falling back", s);
+        tracing::warn!("project_root '{}' is not a directory, falling back", s);
     }
 
     // 2. ALC_PROJECT_ROOT environment variable.

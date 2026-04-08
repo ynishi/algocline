@@ -108,7 +108,7 @@ impl AppService {
             Ok(Some(lock)) => lockfile::resolve_local_dir_paths(&root, &lock),
             Ok(None) => vec![],
             Err(e) => {
-                eprintln!("alc: failed to load alc.lock at {}: {e}", root.display());
+                tracing::warn!("failed to load alc.lock at {}: {e}", root.display());
                 vec![]
             }
         }

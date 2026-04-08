@@ -509,9 +509,12 @@ return M"#
     assert_eq!(strategy_b["ok"], true);
     assert_eq!(strategy_b["result"], "Answer B");
 
-    // 3. Cleanup packages
-    call_json(&client, "alc_pkg_remove", json!({ "name": "e2e_fork_a" })).await;
-    call_json(&client, "alc_pkg_remove", json!({ "name": "e2e_fork_b" })).await;
+    // 3. Cleanup packages (physical delete from cache — pkg_remove no longer does this)
+    if let Some(home) = dirs::home_dir() {
+        let pkg_cache = home.join(".algocline").join("packages");
+        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_fork_a"));
+        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_fork_b"));
+    }
 
     client.cancel().await.expect("cancel failed");
 }
@@ -552,12 +555,10 @@ return M"#,
         "types_path should end with types/alc.d.lua, got: {types_path}"
     );
 
-    // Cleanup
-    call_json(
-        &client,
-        "alc_pkg_remove",
-        json!({ "name": "e2e_types_test" }),
-    )
-    .await;
+    // Cleanup (physical delete from cache — pkg_remove no longer does this)
+    if let Some(home) = dirs::home_dir() {
+        let pkg_cache = home.join(".algocline").join("packages");
+        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_types_test"));
+    }
     client.cancel().await.expect("cancel failed");
 }

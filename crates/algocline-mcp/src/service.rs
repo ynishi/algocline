@@ -83,13 +83,15 @@ pub struct PkgInstallParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgLinkParams {
-    /// Absolute or project-relative path to link.
+    /// Absolute or relative path to the directory to link as a package.
     /// If the directory contains init.lua: single package mode.
     /// If subdirectories contain init.lua: collection mode (each subdir becomes a package).
     pub path: String,
-    /// Optional absolute path to project root (where alc.lock lives).
-    /// Falls back to ALC_PROJECT_ROOT env or ancestor walk from cwd.
-    pub project_root: Option<String>,
+    /// Optional name override for the package (single package mode only).
+    /// Defaults to the directory name.
+    pub name: Option<String>,
+    /// Force overwrite of existing symlinks. Default: false.
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -105,14 +107,13 @@ pub struct PkgListParams {
 pub struct PkgRemoveParams {
     /// Name of the package to remove.
     pub name: String,
-    /// Removal scope.
-    /// - "project": removes the entry from alc.lock (physical files are NOT deleted).
-    /// - "global": removes from ~/.algocline/packages/ (default behavior).
-    /// - Omit: auto-detect — project scope if found in alc.lock, otherwise global.
-    pub scope: Option<String>,
-    /// Optional absolute path to project root (for "project" scope).
+    /// Optional absolute path to project root containing alc.toml.
     /// Falls back to ALC_PROJECT_ROOT env or ancestor walk from cwd.
+    /// An alc.toml must be found — if not, the operation fails.
     pub project_root: Option<String>,
+    /// Optional version constraint. When specified, only the alc.lock entry
+    /// matching this version is removed. Omit to remove any version.
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -425,13 +426,12 @@ impl AlcService {
 
     // ─── Package Management ─────────────────────────────────────
 
-    /// Link a local directory as a project-local package (no copy).
+    /// Link a local directory as a package (symlink to cache).
     ///
-    /// Records the directory in `alc.lock` under the project root.
-    /// The directory is resolved at `alc_run` time via FsResolver — changes
-    /// to files are reflected immediately on the next `alc_run`.
+    /// Creates a symlink from `~/.algocline/packages/{name}` to the given path.
+    /// Changes to files in the source directory are reflected immediately on the next `alc_run`.
     ///
-    /// Single mode: directory has `init.lua` at root → one package (name = dirname).
+    /// Single mode: directory has `init.lua` at root → one package (name = dirname or `name` param).
     /// Collection mode: subdirectories have `init.lua` → each subdir is a package.
     #[tool(
         name = "alc_pkg_link",
@@ -445,7 +445,9 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<PkgLinkParams>,
     ) -> Result<String, String> {
-        self.app.pkg_link(params.path, params.project_root).await
+        self.app
+            .pkg_link(params.path, params.name, params.force)
+            .await
     }
 
     /// List installed packages with metadata.
@@ -480,11 +482,11 @@ impl AlcService {
         self.app.pkg_install(params.url, params.name).await
     }
 
-    /// Remove an installed package.
+    /// Remove a package declaration from `alc.toml` and `alc.lock`.
     ///
-    /// - `scope: "project"`: removes entry from `alc.lock` (files are NOT deleted).
-    /// - `scope: "global"`: removes from `~/.algocline/packages/`.
-    /// - Omit scope: auto-detect (project first, then global).
+    /// Physical files in `~/.algocline/packages/` are NOT deleted.
+    /// Requires an `alc.toml` to be found (via `project_root` or ancestor walk from cwd).
+    /// Pass `version` to remove only a specific version from `alc.lock`.
     #[tool(
         name = "alc_pkg_remove",
         annotations(destructive_hint = true, open_world_hint = false)
@@ -494,7 +496,7 @@ impl AlcService {
         Parameters(params): Parameters<PkgRemoveParams>,
     ) -> Result<String, String> {
         self.app
-            .pkg_remove(&params.name, params.project_root, params.scope)
+            .pkg_remove(&params.name, params.project_root, params.version)
             .await
     }
 
@@ -600,10 +602,10 @@ impl ServerHandler for AlcService {
                  - alc_scenario_show: Show the content of an installed scenario by name.\n\
                  - alc_scenario_install: Install scenarios from a Git URL or local path.\n\n\
                  Package Management:\n\
-                 - alc_pkg_link: Link a local directory as a project-local package (no copy). Records path in alc.lock.\n\
+                 - alc_pkg_link: Link a local directory as a package (symlink to cache). Changes reflect immediately on next alc_run.\n\
                  - alc_pkg_list: List installed packages with metadata. Pass project_root to include project-local packages.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
-                 - alc_pkg_remove: Remove an installed package. Pass project_root to remove from alc.lock only.\n\n\
+                 - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\n\
                  Logging:\n\
                  - alc_note: Add a note to a completed session's log (feedback, observations).\n\
                  - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail.\n\n\

@@ -1,12 +1,18 @@
 //! `pkg_install` — install a package from a Git URL or local path.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use super::super::alc_toml::{
+    add_package_entry, load_alc_toml_document, save_alc_toml, PackageDep,
+};
+use super::super::lockfile::{load_lockfile, save_lockfile, LockFile, LockPackage};
 use super::super::manifest;
 use super::super::path::{copy_dir, ContainedPath};
+use super::super::project::resolve_project_root;
 use super::super::resolve::{
     install_scenarios_from_dir, packages_dir, scenarios_dir, DirEntryFailures, AUTO_INSTALL_SOURCES,
 };
+use super::super::source::PackageSource;
 use super::super::AppService;
 
 impl AppService {
@@ -18,7 +24,9 @@ impl AppService {
         // Local path: copy directly (supports uncommitted/dirty working trees)
         let local_path = Path::new(&url);
         if local_path.is_absolute() && local_path.is_dir() {
-            return self.install_from_local_path(local_path, &pkg_dir, name);
+            return self
+                .install_from_local_path(local_path, &pkg_dir, name)
+                .await;
         }
 
         // Normalize URL: add https:// only for bare domain-style URLs
@@ -81,6 +89,10 @@ impl AppService {
             // Record in manifest (best-effort; install itself already succeeded)
             let _ = manifest::record_install(&name, None, &url);
 
+            // Update alc.toml + alc.lock if project root is found
+            self.update_project_files_for_install(std::slice::from_ref(&name))
+                .await;
+
             let mut response = serde_json::json!({
                 "installed": [name],
                 "mode": "single",
@@ -127,8 +139,6 @@ impl AppService {
             }
 
             // Install bundled scenarios only when an explicit `scenarios/` subdir exists.
-            // Unlike `scenario_install` (which falls back to root via `resolve_scenario_source`),
-            // bundled scenarios are optional — we don't scan the package root for .lua files.
             let scenarios_subdir = staging.path().join("scenarios");
             let mut scenarios_installed: Vec<String> = Vec::new();
             let mut scenarios_failures: DirEntryFailures = Vec::new();
@@ -165,6 +175,9 @@ impl AppService {
             // Record in manifest (best-effort)
             let _ = manifest::record_install_batch(&installed, &url);
 
+            // Update alc.toml + alc.lock if project root is found
+            self.update_project_files_for_install(&installed).await;
+
             let mut response = serde_json::json!({
                 "installed": installed,
                 "skipped": skipped,
@@ -180,7 +193,7 @@ impl AppService {
     }
 
     /// Install from a local directory path (supports dirty/uncommitted files).
-    fn install_from_local_path(
+    async fn install_from_local_path(
         &self,
         source: &Path,
         pkg_dir: &Path,
@@ -207,6 +220,10 @@ impl AppService {
 
             // Record in manifest (best-effort)
             let _ = manifest::record_install(&name, None, &source.display().to_string());
+
+            // Update alc.toml + alc.lock if project root is found
+            self.update_project_files_for_install(std::slice::from_ref(&name))
+                .await;
 
             let mut response = serde_json::json!({
                 "installed": [name],
@@ -265,6 +282,9 @@ impl AppService {
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
             let _ = manifest::record_install_batch(&all_names, &source_str);
 
+            // Update alc.toml + alc.lock for newly installed packages
+            self.update_project_files_for_install(&installed).await;
+
             let mut response = serde_json::json!({
                 "installed": installed,
                 "updated": updated,
@@ -274,6 +294,73 @@ impl AppService {
                 response["types_path"] = serde_json::Value::String(tp);
             }
             Ok(response.to_string())
+        }
+    }
+
+    /// After a successful cache install, update `alc.toml` and `alc.lock` if a project
+    /// root (containing `alc.toml`) is found.  Failures are logged but not propagated —
+    /// the install itself already succeeded.
+    async fn update_project_files_for_install(&self, names: &[String]) {
+        let root = match resolve_project_root(None) {
+            Some(r) => r,
+            None => return, // No project root → skip (current-compat)
+        };
+
+        // Load alc.toml document (preserving comments/formatting).
+        let mut doc = match load_alc_toml_document(&root) {
+            Ok(Some(d)) => d,
+            Ok(None) => return, // alc.toml not found → skip
+            Err(e) => {
+                tracing::warn!("pkg_install: failed to load alc.toml: {e}");
+                return;
+            }
+        };
+
+        // Load or create alc.lock.
+        let mut lock = match load_lockfile(&root) {
+            Ok(Some(l)) => l,
+            Ok(None) => LockFile {
+                version: 1,
+                packages: Vec::new(),
+            },
+            Err(e) => {
+                tracing::warn!("pkg_install: failed to load alc.lock: {e}");
+                return;
+            }
+        };
+
+        for name in names {
+            // Add to alc.toml (no-op if already present).
+            add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
+
+            // Resolve version via eval_simple (best-effort).
+            let version = self.fetch_pkg_version(name).await;
+
+            // Upsert into alc.lock.
+            upsert_lock_entry(&mut lock, name.clone(), version, PackageSource::Installed);
+        }
+
+        if let Err(e) = save_alc_toml(&root, &doc) {
+            tracing::warn!("pkg_install: failed to save alc.toml: {e}");
+        }
+        if let Err(e) = save_lockfile(&root, &lock) {
+            tracing::warn!("pkg_install: failed to save alc.lock: {e}");
+        }
+    }
+
+    /// Fetch package version via `eval_simple` (best-effort; returns `None` on failure).
+    async fn fetch_pkg_version(&self, name: &str) -> Option<String> {
+        if !is_safe_pkg_name(name) {
+            return None;
+        }
+        let code = format!(
+            r#"package.loaded["{name}"] = nil
+local pkg = require("{name}")
+return (pkg.meta or {{}}).version"#
+        );
+        match self.executor.eval_simple(code).await {
+            Ok(serde_json::Value::String(v)) if !v.is_empty() => Some(v),
+            _ => None,
         }
     }
 
@@ -295,5 +382,45 @@ impl AppService {
             ));
         }
         Ok(())
+    }
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Returns `true` iff `name` is safe to interpolate into a Lua source string.
+fn is_safe_pkg_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Insert or update a `LockPackage` entry in the lockfile.
+fn upsert_lock_entry(
+    lock: &mut LockFile,
+    name: String,
+    version: Option<String>,
+    source: PackageSource,
+) {
+    if let Some(existing) = lock.packages.iter_mut().find(|p| p.name == name) {
+        existing.version = version;
+        existing.source = source;
+    } else {
+        lock.packages.push(LockPackage {
+            name,
+            version,
+            source,
+        });
+    }
+}
+
+/// Convenience: resolve the absolute path for a given package `root` path.
+#[allow(dead_code)]
+fn resolve_abs(root: &Path, p: &str) -> PathBuf {
+    let path = Path::new(p);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
     }
 }

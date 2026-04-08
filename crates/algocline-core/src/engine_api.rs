@@ -100,28 +100,34 @@ pub trait EngineApi: Send + Sync {
 
     // ─── Packages ────────────────────────────────────────────
 
-    /// Link a local directory as a project-local package (no copy).
-    async fn pkg_link(&self, path: String, project_root: Option<String>) -> Result<String, String>;
+    /// Link a local directory as a project-local package (symlink to cache).
+    ///
+    /// Phase 2 (subtask 5) will implement the full symlink logic.
+    async fn pkg_link(
+        &self,
+        path: String,
+        name: Option<String>,
+        force: Option<bool>,
+    ) -> Result<String, String>;
 
     /// List installed packages with metadata.
     ///
-    /// When `project_root` is provided, project-local packages from `alc.lock`
+    /// When `project_root` is provided, project-local packages from `alc.toml`/`alc.lock`
     /// are included with `scope: "project"`. Global packages carry `scope: "global"`.
     async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String>;
 
     /// Install a package from a Git URL or local path.
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String>;
 
-    /// Remove an installed package.
+    /// Remove a package declaration from `alc.toml` and `alc.lock`.
     ///
-    /// - `project_root` provided or `scope == "project"`: removes from `alc.lock` only.
-    /// - `scope == "global"`: removes from `~/.algocline/packages/` regardless of project.
-    /// - Both `None`: auto-detect (project first, global fallback).
+    /// Requires an `alc.toml` to be found (via `project_root` or ancestor walk).
+    /// Does NOT delete physical files from `~/.algocline/packages/`.
     async fn pkg_remove(
         &self,
         name: &str,
         project_root: Option<String>,
-        scope: Option<String>,
+        version: Option<String>,
     ) -> Result<String, String>;
 
     // ─── Logging ─────────────────────────────────────────────

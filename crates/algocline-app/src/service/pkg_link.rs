@@ -12,25 +12,30 @@ use super::source::PackageSource;
 use super::AppService;
 
 impl AppService {
-    /// Link a local directory as a project-local package (no copy).
+    /// Link a local directory as a project-local package (symlink to cache).
     ///
-    /// `path`: source directory — single package (has `init.lua`) or collection
-    /// (subdirectories have `init.lua`). May be absolute or relative to `project_root`.
+    /// Phase 2 (subtask 5) will rewrite this with full symlink logic.
+    /// This version preserves minimal backward-compat using the legacy `project_root`-based
+    /// path recording (to be removed in Phase 2).
     ///
-    /// `project_root`: optional explicit project root (where `alc.lock` lives).
-    /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
+    /// `path`: source directory to link.
+    /// `name`: optional package name override.
+    /// `force`: optional flag to force overwrite of existing symlinks.
     pub async fn pkg_link(
         &self,
         path: String,
-        project_root: Option<String>,
+        _name: Option<String>,
+        _force: Option<bool>,
     ) -> Result<String, String> {
-        // 1. Resolve project root.
-        let root = resolve_project_root(project_root.as_deref()).ok_or_else(|| {
-            "Cannot determine project root: provide project_root or set ALC_PROJECT_ROOT"
+        // Phase 2 will implement symlink-to-cache logic.
+        // Interim: resolve project root from cwd/env ancestor walk.
+        let root = resolve_project_root(None).ok_or_else(|| {
+            "Cannot determine project root: alc.toml not found in current directory or any ancestor. \
+             Set ALC_PROJECT_ROOT or run from a project directory."
                 .to_string()
         })?;
 
-        // 2. Resolve path (absolute: use as-is, relative: join with project_root).
+        // 2. Resolve path (absolute: use as-is, relative: join with root).
         let raw_path = Path::new(&path);
         let canon_path = if raw_path.is_absolute() {
             raw_path.to_path_buf()
@@ -235,19 +240,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
-        // Create a single-package dir.
+        // Phase 2 note: pkg_link resolves project root via alc.toml ancestor walk.
+        // Create alc.toml so resolve_project_root finds this directory.
+        std::fs::write(project_root.join("alc.toml"), "[packages]\n").unwrap();
+
+        // Create a single-package dir inside the project root.
         let pkg_dir = project_root.join("my_pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+        // ALC_PROJECT_ROOT makes resolve_project_root deterministic without chdir.
+        std::env::set_var("ALC_PROJECT_ROOT", project_root.to_string_lossy().as_ref());
         let svc = make_app_service().await;
         let result = svc
-            .pkg_link(
-                pkg_dir.to_string_lossy().to_string(),
-                Some(project_root.to_string_lossy().to_string()),
-            )
+            .pkg_link(pkg_dir.to_string_lossy().to_string(), None, None)
             .await
             .unwrap();
+        std::env::remove_var("ALC_PROJECT_ROOT");
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["mode"], "single");
@@ -268,6 +277,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
+        std::fs::write(project_root.join("alc.toml"), "[packages]\n").unwrap();
+
         // Create a collection dir with two packages.
         let collection = project_root.join("collection");
         std::fs::create_dir_all(collection.join("pkg_a")).unwrap();
@@ -275,14 +286,13 @@ mod tests {
         std::fs::write(collection.join("pkg_a").join("init.lua"), "return {}").unwrap();
         std::fs::write(collection.join("pkg_b").join("init.lua"), "return {}").unwrap();
 
+        std::env::set_var("ALC_PROJECT_ROOT", project_root.to_string_lossy().as_ref());
         let svc = make_app_service().await;
         let result = svc
-            .pkg_link(
-                collection.to_string_lossy().to_string(),
-                Some(project_root.to_string_lossy().to_string()),
-            )
+            .pkg_link(collection.to_string_lossy().to_string(), None, None)
             .await
             .unwrap();
+        std::env::remove_var("ALC_PROJECT_ROOT");
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["mode"], "collection");
@@ -302,51 +312,47 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
+        std::fs::write(project_root.join("alc.toml"), "[packages]\n").unwrap();
+
         let pkg_dir = project_root.join("my_pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+        std::env::set_var("ALC_PROJECT_ROOT", project_root.to_string_lossy().as_ref());
         let svc = make_app_service().await;
 
         // Link once.
-        svc.pkg_link(
-            pkg_dir.to_string_lossy().to_string(),
-            Some(project_root.to_string_lossy().to_string()),
-        )
-        .await
-        .unwrap();
+        svc.pkg_link(pkg_dir.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
 
         let lock1 = load_lockfile(project_root).unwrap().unwrap();
         assert_eq!(lock1.packages.len(), 1);
 
         // Link again (same path).
-        svc.pkg_link(
-            pkg_dir.to_string_lossy().to_string(),
-            Some(project_root.to_string_lossy().to_string()),
-        )
-        .await
-        .unwrap();
+        svc.pkg_link(pkg_dir.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
 
         let lock2 = load_lockfile(project_root).unwrap().unwrap();
         // Only one entry (no duplicate).
         assert_eq!(lock2.packages.len(), 1);
+        std::env::remove_var("ALC_PROJECT_ROOT");
     }
 
     #[tokio::test]
-    async fn pkg_link_no_project_root_returns_error() {
-        // When no project_root is given AND there is no ALC_PROJECT_ROOT env
-        // AND cwd has no alc.lock ancestors, resolve_project_root may return
-        // Some(cwd). We explicitly pass an invalid dir to ensure we hit Err.
+    async fn pkg_link_path_not_found_returns_error() {
+        // When project root is set but the given path does not exist, expect an error.
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("alc.toml"), "[packages]\n").unwrap();
         let non_dir = tmp.path().join("does_not_exist");
 
+        std::env::set_var("ALC_PROJECT_ROOT", tmp.path().to_string_lossy().as_ref());
         let svc = make_app_service().await;
         let result = svc
-            .pkg_link(
-                non_dir.to_string_lossy().to_string(),
-                Some(tmp.path().to_string_lossy().to_string()),
-            )
+            .pkg_link(non_dir.to_string_lossy().to_string(), None, None)
             .await;
+        std::env::remove_var("ALC_PROJECT_ROOT");
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not a directory"));

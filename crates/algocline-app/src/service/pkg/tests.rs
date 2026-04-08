@@ -10,9 +10,7 @@ fn make_lock_with_pkg(name: &str) -> LockFile {
         packages: vec![LockPackage {
             name: name.to_string(),
             version: None,
-            source: PackageSource::Path {
-                path: format!("packages/{name}"),
-            },
+            source: PackageSource::Installed,
         }],
     }
 }
@@ -52,15 +50,21 @@ async fn pkg_list_with_project() {
     let tmp = tempfile::tempdir().unwrap();
     let project_root = tmp.path();
 
+    // Create alc.toml declaring the project-local package.
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nmy_local_pkg = \"*\"\n",
+    )
+    .unwrap();
+
     // Create a project-local package.
     let pkg_dir = project_root.join("my_local_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
-    // Write alc.lock.
-    let lock = make_lock_with_pkg("my_local_pkg");
-    // Adjust path to be relative.
+    // Write alc.lock with a Path entry for the package.
     let lock = LockFile {
+        version: 1,
         packages: vec![LockPackage {
             name: "my_local_pkg".to_string(),
             version: None,
@@ -68,7 +72,6 @@ async fn pkg_list_with_project() {
                 path: "my_local_pkg".to_string(),
             },
         }],
-        ..lock
     };
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
@@ -113,6 +116,13 @@ async fn pkg_remove_project_scope() {
     let tmp = tempfile::tempdir().unwrap();
     let project_root = tmp.path();
 
+    // Create alc.toml declaring the package to remove.
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nmy_local_pkg = \"*\"\n",
+    )
+    .unwrap();
+
     // Create the physical directory (should remain after removal).
     let pkg_dir = project_root.join("my_local_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -136,14 +146,16 @@ async fn pkg_remove_project_scope() {
         .pkg_remove(
             "my_local_pkg",
             Some(project_root.to_string_lossy().to_string()),
-            None,
+            None, // version
         )
         .await
         .unwrap();
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(json["removed"], "my_local_pkg");
-    assert_eq!(json["scope"], "project");
+    // New response has alc_toml and alc_lock fields (no scope field).
+    assert!(json["alc_toml"].is_string());
+    assert!(json["alc_lock"].is_string());
 
     // Physical directory must still exist.
     assert!(pkg_dir.exists(), "physical directory was deleted");
@@ -161,6 +173,13 @@ async fn pkg_remove_project_scope_not_found_returns_error() {
     let tmp = tempfile::tempdir().unwrap();
     let project_root = tmp.path();
 
+    // Create alc.toml with a different package (not the target).
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nother_pkg = \"*\"\n",
+    )
+    .unwrap();
+
     // Write an alc.lock without the target package.
     let lock = make_lock_with_pkg("other_pkg");
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
@@ -170,7 +189,7 @@ async fn pkg_remove_project_scope_not_found_returns_error() {
         .pkg_remove(
             "nonexistent_pkg",
             Some(project_root.to_string_lossy().to_string()),
-            None,
+            None, // version
         )
         .await;
 
@@ -215,8 +234,6 @@ async fn pkg_list_global_unregistered_has_no_source_type() {
         .expect("hand_copied_pkg not found in pkg_list output");
 
     // source_type must be absent (not "global" or any other invalid value).
-    // serde_json::Value's Index impl returns Null for missing keys; we check
-    // the underlying map directly to distinguish "absent" from "null".
     let pkg_map = pkg
         .as_object()
         .expect("package entry must be a JSON object");

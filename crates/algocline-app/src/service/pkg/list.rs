@@ -129,7 +129,7 @@ impl AppService {
             match load_lockfile(root) {
                 Ok(Some(lock)) => {
                     for pkg in &lock.packages {
-                        let PackageSource::LocalDir { path: ref raw_path } = pkg.source else {
+                        let PackageSource::Path { path: ref raw_path } = pkg.source else {
                             continue;
                         };
                         let abs_path = {
@@ -145,11 +145,11 @@ impl AppService {
                         entries.push(PackageListEntry {
                             name: pkg.name.clone(),
                             scope: Scope::Project,
-                            source_type: Some("local_dir".to_string()),
+                            source_type: Some("path".to_string()),
                             path: Some(abs_path.display().to_string()),
                             source: None,
                             active: true,
-                            linked_at: Some(pkg.linked_at.clone()),
+                            linked_at: None,
                             installed_at: None,
                             updated_at: None,
                             install_source: None,
@@ -234,8 +234,8 @@ return pkg.meta or {{ name = "{name}" }}"#
                     if let Some(entry) = manifest_data.packages.get(&name) {
                         let st = match infer_from_legacy_source_string(&entry.source) {
                             PackageSource::Git { .. } => "git",
-                            PackageSource::LocalCopy { .. } => "local_copy",
-                            PackageSource::LocalDir { .. } => "local_dir",
+                            PackageSource::Installed => "installed",
+                            PackageSource::Path { .. } => "path",
                             PackageSource::Bundled { .. } => "bundled",
                         };
                         (

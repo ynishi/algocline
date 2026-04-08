@@ -15,14 +15,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum PackageSource {
+    /// Package installed into `~/.algocline/packages/` (from Git or local copy).
+    Installed,
+    /// Package linked directly from a local path (no copy).
+    /// Changes to files in `path` are reflected immediately on next `alc_run`.
+    Path { path: String },
     /// Package cloned/fetched from a Git repository.
     Git { url: String, rev: Option<String> },
-    /// Package installed by copying from a local path.
-    /// The directory is a snapshot copy; changes to the original are not reflected.
-    LocalCopy { path: String },
-    /// Package linked directly from a local directory (no copy).
-    /// Changes to files in `path` are reflected immediately on next `alc_run`.
-    LocalDir { path: String },
     /// Bundled package shipped with algocline.
     Bundled { collection: Option<String> },
 }
@@ -31,7 +30,7 @@ pub(crate) enum PackageSource {
 ///
 /// Heuristics (evaluated in order):
 /// 1. `"bundled"` → `Bundled { collection: None }`
-/// 2. Absolute path that exists as a directory → `LocalCopy { path }`
+/// 2. Absolute path that exists as a directory → `Installed`
 /// 3. Anything else → `Git { url, rev: None }`
 pub(crate) fn infer_from_legacy_source_string(s: &str) -> PackageSource {
     if s == "bundled" {
@@ -40,9 +39,7 @@ pub(crate) fn infer_from_legacy_source_string(s: &str) -> PackageSource {
 
     let p = Path::new(s);
     if p.is_absolute() && p.is_dir() {
-        return PackageSource::LocalCopy {
-            path: s.to_string(),
-        };
+        return PackageSource::Installed;
     }
 
     PackageSource::Git {
@@ -75,7 +72,7 @@ mod tests {
         let path = tmp.path().to_str().unwrap().to_string();
 
         let result = infer_from_legacy_source_string(&path);
-        assert_eq!(result, PackageSource::LocalCopy { path });
+        assert_eq!(result, PackageSource::Installed);
     }
 
     #[test]

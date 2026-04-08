@@ -1,3 +1,4 @@
+pub(crate) mod alc_toml;
 mod config;
 mod engine_api_impl;
 mod eval;
@@ -105,7 +106,7 @@ impl AppService {
         };
 
         match lockfile::load_lockfile(&root) {
-            Ok(Some(lock)) => lockfile::resolve_local_dir_paths(&root, &lock),
+            Ok(Some(lock)) => lockfile::resolve_path_entries(&root, &lock),
             Ok(None) => vec![],
             Err(e) => {
                 tracing::warn!("failed to load alc.lock at {}: {e}", root.display());

@@ -4,9 +4,8 @@
 //! `alc.lock` lives at the project root (the directory passed as `project_root`).
 //!
 //! ## Path resolution base
-//! Relative paths in `PackageSource::LocalDir.path` and `PackageSource::LocalCopy.path`
-//! are resolved relative to the `alc.lock` file location (= project root).
-//! Absolute paths are used as-is.
+//! Relative paths in `PackageSource::Path.path` are resolved relative to the
+//! `alc.lock` file location (= project root). Absolute paths are used as-is.
 //!
 //! ## Version compatibility
 //! `version` must equal 1. Any other value causes `load_lockfile` to return `Err`.
@@ -17,10 +16,10 @@
 //!
 //! [[package]]
 //! name = "head_agent"
-//! linked_at = "2026-04-08T12:00:00Z"
+//! version = "0.3.0"
 //!
 //! [package.source]
-//! type = "local_dir"
+//! type = "path"
 //! path = "packages/head_agent"
 //! ```
 
@@ -56,10 +55,11 @@ pub(crate) struct LockFile {
 pub(crate) struct LockPackage {
     /// Package name (must match the Lua module name).
     pub name: String,
+    /// Package version (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// How the package is sourced.
     pub source: PackageSource,
-    /// ISO 8601 timestamp of when this entry was added/updated.
-    pub linked_at: String,
 }
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
@@ -143,29 +143,16 @@ pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), 
 
 // ─── Resolution ─────────────────────────────────────────────────────────────
 
-/// Extract resolved absolute paths for all `LocalDir` entries in the lock file.
+/// Extract resolved absolute paths for all `Path` entries in the lock file.
 ///
 /// - Relative paths are resolved against `project_root`.
 /// - Absolute paths are used as-is.
 /// - Entries whose resolved path does not exist are skipped with a warning.
-/// - Entries whose canonicalized path escapes `project_root` are **rejected**
-///   with a warning (defense in depth for hand-edited `alc.lock`).
-pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> Vec<PathBuf> {
+pub(crate) fn resolve_path_entries(project_root: &Path, lock: &LockFile) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    let canon_root = match std::fs::canonicalize(project_root) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                "alc.lock: cannot canonicalize project_root {}: {e}",
-                project_root.display()
-            );
-            return paths;
-        }
-    };
-
     for pkg in &lock.packages {
-        let PackageSource::LocalDir { path: ref raw } = pkg.source else {
+        let PackageSource::Path { path: ref raw } = pkg.source else {
             continue;
         };
 
@@ -180,38 +167,56 @@ pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> V
 
         if !resolved.exists() {
             tracing::warn!(
-                "alc.lock: local_dir path for '{}' does not exist, skipping: {}",
+                "alc.lock: path entry for '{}' does not exist, skipping: {}",
                 pkg.name,
                 resolved.display()
             );
             continue;
         }
 
-        let canon = match std::fs::canonicalize(&resolved) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    "alc.lock: cannot canonicalize path for '{}' ({}): {e}",
-                    pkg.name,
-                    resolved.display()
-                );
-                continue;
-            }
-        };
+        paths.push(resolved);
+    }
 
-        if !canon.starts_with(&canon_root) {
+    paths
+}
+
+/// Extract resolved absolute paths for all `Installed` entries in the lock file.
+// Used in subtask 2+ (resolve_extra_lib_paths for Installed packages)
+#[allow(dead_code)]
+///
+/// Derives the package path as `~/.algocline/packages/{name}` or
+/// `~/.algocline/packages/{name}@{version}` when a version is present.
+/// Entries whose resolved path does not exist are skipped with a warning.
+pub(crate) fn resolve_installed_paths(lock: &LockFile) -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("alc.lock: cannot determine home directory for Installed path resolution");
+        return vec![];
+    };
+    let packages_dir = home.join(".algocline").join("packages");
+
+    let mut paths = Vec::new();
+    for pkg in &lock.packages {
+        if !matches!(pkg.source, PackageSource::Installed) {
+            continue;
+        }
+
+        let dir_name = match &pkg.version {
+            Some(v) => format!("{}@{}", pkg.name, v),
+            None => pkg.name.clone(),
+        };
+        let resolved = packages_dir.join(&dir_name);
+
+        if !resolved.exists() {
             tracing::warn!(
-                "alc.lock: local_dir path for '{}' escapes project_root ({}), refusing: {}",
+                "alc.lock: installed path for '{}' does not exist, skipping: {}",
                 pkg.name,
-                canon_root.display(),
-                canon.display()
+                resolved.display()
             );
             continue;
         }
 
-        paths.push(canon);
+        paths.push(resolved);
     }
-
     paths
 }
 
@@ -222,15 +227,15 @@ mod tests {
     use super::*;
     use crate::service::source::PackageSource;
 
-    fn make_local_dir_lock(path: &str) -> LockFile {
+    fn make_path_lock(path: &str) -> LockFile {
         LockFile {
             version: 1,
             packages: vec![LockPackage {
                 name: "test_pkg".to_string(),
-                source: PackageSource::LocalDir {
+                version: None,
+                source: PackageSource::Path {
                     path: path.to_string(),
                 },
-                linked_at: "2026-04-08T12:00:00Z".to_string(),
             }],
         }
     }
@@ -244,10 +249,30 @@ mod tests {
             version: 1,
             packages: vec![LockPackage {
                 name: "head_agent".to_string(),
-                source: PackageSource::LocalDir {
+                version: Some("0.3.0".to_string()),
+                source: PackageSource::Path {
                     path: "packages/head_agent".to_string(),
                 },
-                linked_at: "2026-04-08T12:00:00Z".to_string(),
+            }],
+        };
+
+        save_lockfile(project_root, &original).unwrap();
+        let loaded = load_lockfile(project_root).unwrap();
+
+        assert_eq!(loaded, Some(original));
+    }
+
+    #[test]
+    fn lockfile_roundtrip_no_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+
+        let original = LockFile {
+            version: 1,
+            packages: vec![LockPackage {
+                name: "my_pkg".to_string(),
+                version: None,
+                source: PackageSource::Installed,
             }],
         };
 
@@ -268,10 +293,9 @@ mod tests {
 
 [[package]]
 name = "foo"
-linked_at = "2026-04-08T00:00:00Z"
 
 [package.source]
-type = "local_dir"
+type = "path"
 path = "packages/foo"
 "#,
         )
@@ -292,7 +316,7 @@ path = "packages/foo"
     }
 
     #[test]
-    fn resolve_local_dir_relative() {
+    fn resolve_path_relative() {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
@@ -300,71 +324,68 @@ path = "packages/foo"
         let pkg_dir = project_root.join("packages").join("my_pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
-        let lock = make_local_dir_lock("packages/my_pkg");
-        let paths = resolve_local_dir_paths(project_root, &lock);
+        let lock = make_path_lock("packages/my_pkg");
+        let paths = resolve_path_entries(project_root, &lock);
 
-        let expected = std::fs::canonicalize(&pkg_dir).unwrap();
+        let expected = project_root.join("packages").join("my_pkg");
         assert_eq!(paths, vec![expected]);
     }
 
     #[test]
-    fn resolve_local_dir_absolute_inside_project() {
+    fn resolve_path_absolute_inside_project() {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
-        // Absolute path pointing at a directory *inside* the project root
-        // must be accepted.
         let pkg_dir = project_root.join("abs_pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
-        let lock = make_local_dir_lock(pkg_dir.to_str().unwrap());
-        let paths = resolve_local_dir_paths(project_root, &lock);
+        let lock = make_path_lock(pkg_dir.to_str().unwrap());
+        let paths = resolve_path_entries(project_root, &lock);
 
-        // Compare canonicalized forms (macOS /var vs /private/var etc).
-        let expected = std::fs::canonicalize(&pkg_dir).unwrap();
-        assert_eq!(paths, vec![expected]);
+        assert_eq!(paths, vec![pkg_dir]);
     }
 
     #[test]
-    fn resolve_local_dir_absolute_outside_project_is_rejected() {
+    fn resolve_path_absolute_outside_project_accepted() {
+        // containment check なし — project外パスも許可
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
-        // Absolute path to a different tempdir (outside the project root).
         let abs_tmp = tempfile::tempdir().unwrap();
         let abs_path = abs_tmp.path().to_path_buf();
 
-        let lock = make_local_dir_lock(abs_path.to_str().unwrap());
-        let paths = resolve_local_dir_paths(project_root, &lock);
+        let lock = make_path_lock(abs_path.to_str().unwrap());
+        let paths = resolve_path_entries(project_root, &lock);
 
-        // Defense in depth: out-of-tree paths are dropped with a warning.
-        assert!(paths.is_empty());
+        // 存在するので受け入れる
+        assert_eq!(paths, vec![abs_path]);
     }
 
     #[test]
-    fn resolve_local_dir_relative_traversal_rejected() {
+    fn resolve_path_relative_traversal_accepted() {
+        // containment check なし — traversal も許可
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        // Sibling directory (reachable via ../sibling from project_root).
         let sibling = tmp.path().join("sibling");
         std::fs::create_dir_all(&sibling).unwrap();
 
-        let lock = make_local_dir_lock("../sibling");
-        let paths = resolve_local_dir_paths(&project_root, &lock);
+        let lock = make_path_lock("../sibling");
+        let paths = resolve_path_entries(&project_root, &lock);
 
-        assert!(paths.is_empty(), "traversal escape should be rejected");
+        let expected = project_root.join("../sibling");
+        assert_eq!(paths, vec![expected]);
     }
 
     #[test]
-    fn resolve_local_dir_skip_missing() {
+    fn resolve_path_skip_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
         // Path does not exist — should be skipped silently.
-        let lock = make_local_dir_lock("nonexistent/path");
-        let paths = resolve_local_dir_paths(project_root, &lock);
+        let lock = make_path_lock("nonexistent/path");
+        let paths = resolve_path_entries(project_root, &lock);
 
         assert!(paths.is_empty());
     }

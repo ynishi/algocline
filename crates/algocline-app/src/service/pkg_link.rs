@@ -7,7 +7,6 @@
 use std::path::Path;
 
 use super::lockfile::{load_lockfile, lockfile_path, save_lockfile, LockFile, LockPackage};
-use super::manifest::now_iso8601;
 use super::project::resolve_project_root;
 use super::source::PackageSource;
 use super::AppService;
@@ -73,7 +72,6 @@ impl AppService {
         };
 
         // 5. Build entries and upsert into lock.
-        let now = now_iso8601();
         let linked_names = match mode {
             PackageMode::Single => {
                 let name = canon_path
@@ -88,7 +86,7 @@ impl AppService {
                     .to_string();
 
                 let stored_path = relative_or_absolute_path(&canon_path, &canon_root);
-                upsert_lock_entry(&mut lock, name.clone(), stored_path, now);
+                upsert_lock_entry(&mut lock, name.clone(), stored_path);
                 vec![name]
             }
             PackageMode::Collection => {
@@ -109,7 +107,7 @@ impl AppService {
                     }
                     let name = entry.file_name().to_string_lossy().to_string();
                     let stored_path = relative_or_absolute_path(&pkg_path, &canon_root);
-                    upsert_lock_entry(&mut lock, name.clone(), stored_path, now.clone());
+                    upsert_lock_entry(&mut lock, name.clone(), stored_path);
                     names.push(name);
                 }
 
@@ -188,17 +186,16 @@ fn relative_or_absolute_path(path: &Path, base: &Path) -> String {
 
 /// Insert or update a `LockPackage` entry.
 ///
-/// If an entry with the same `name` already exists, updates `linked_at` and
-/// the `path` inside `PackageSource::LocalDir`. Otherwise appends a new entry.
-fn upsert_lock_entry(lock: &mut LockFile, name: String, path: String, linked_at: String) {
+/// If an entry with the same `name` already exists, updates the `path` inside
+/// `PackageSource::Path`. Otherwise appends a new entry.
+fn upsert_lock_entry(lock: &mut LockFile, name: String, path: String) {
     if let Some(existing) = lock.packages.iter_mut().find(|p| p.name == name) {
-        existing.source = PackageSource::LocalDir { path };
-        existing.linked_at = linked_at;
+        existing.source = PackageSource::Path { path };
     } else {
         lock.packages.push(LockPackage {
             name,
-            source: PackageSource::LocalDir { path },
-            linked_at,
+            version: None,
+            source: PackageSource::Path { path },
         });
     }
 }
@@ -262,7 +259,7 @@ mod tests {
         assert_eq!(lock.packages[0].name, "my_pkg");
         assert!(matches!(
             &lock.packages[0].source,
-            PackageSource::LocalDir { .. }
+            PackageSource::Path { .. }
         ));
     }
 
@@ -320,10 +317,7 @@ mod tests {
         .unwrap();
 
         let lock1 = load_lockfile(project_root).unwrap().unwrap();
-        let first_linked_at = lock1.packages[0].linked_at.clone();
-
-        // Small sleep to ensure timestamp can differ.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(lock1.packages.len(), 1);
 
         // Link again (same path).
         svc.pkg_link(
@@ -336,13 +330,6 @@ mod tests {
         let lock2 = load_lockfile(project_root).unwrap().unwrap();
         // Only one entry (no duplicate).
         assert_eq!(lock2.packages.len(), 1);
-        // linked_at must be updated.
-        // (In practice the timestamp has 1-second resolution; we just verify
-        // the field exists and is non-empty. A precise comparison would be
-        // flaky depending on system clock resolution.)
-        assert!(!lock2.packages[0].linked_at.is_empty());
-        // The field should be >= first_linked_at (monotonic).
-        assert!(lock2.packages[0].linked_at >= first_linked_at);
     }
 
     #[tokio::test]

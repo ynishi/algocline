@@ -9,10 +9,10 @@ fn make_lock_with_pkg(name: &str) -> LockFile {
         version: 1,
         packages: vec![LockPackage {
             name: name.to_string(),
-            source: PackageSource::LocalDir {
+            version: None,
+            source: PackageSource::Path {
                 path: format!("packages/{name}"),
             },
-            linked_at: "2026-04-08T12:00:00Z".to_string(),
         }],
     }
 }
@@ -63,10 +63,10 @@ async fn pkg_list_with_project() {
     let lock = LockFile {
         packages: vec![LockPackage {
             name: "my_local_pkg".to_string(),
-            source: PackageSource::LocalDir {
+            version: None,
+            source: PackageSource::Path {
                 path: "my_local_pkg".to_string(),
             },
-            linked_at: "2026-04-08T12:00:00Z".to_string(),
         }],
         ..lock
     };
@@ -88,7 +88,7 @@ async fn pkg_list_with_project() {
         .expect("my_local_pkg not found in pkg_list output");
 
     assert_eq!(project_pkg["scope"], "project");
-    assert_eq!(project_pkg["source_type"], "local_dir");
+    assert_eq!(project_pkg["source_type"], "path");
     assert_eq!(project_pkg["active"], true);
 
     // project_root and lockfile_path must be present.
@@ -123,10 +123,10 @@ async fn pkg_remove_project_scope() {
         version: 1,
         packages: vec![LockPackage {
             name: "my_local_pkg".to_string(),
-            source: PackageSource::LocalDir {
+            version: None,
+            source: PackageSource::Path {
                 path: "my_local_pkg".to_string(),
             },
-            linked_at: "2026-04-08T12:00:00Z".to_string(),
         }],
     };
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();

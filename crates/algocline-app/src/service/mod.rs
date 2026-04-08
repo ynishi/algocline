@@ -7,6 +7,7 @@ mod logging;
 pub(crate) mod manifest;
 pub(crate) mod path;
 mod pkg;
+mod pkg_link;
 pub(crate) mod project;
 pub mod resolve;
 mod run;

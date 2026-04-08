@@ -62,7 +62,7 @@ fn save_manifest(manifest: &Manifest) -> Result<(), String> {
 
 // ─── Operations ────────────────────────────────────────────────
 
-fn now_iso8601() -> String {
+pub(crate) fn now_iso8601() -> String {
     // Use SystemTime for a simple UTC timestamp without extra dependencies.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

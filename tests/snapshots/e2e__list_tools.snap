@@ -13,6 +13,7 @@ expression: names
   "alc_log_view",
   "alc_note",
   "alc_pkg_install",
+  "alc_pkg_link",
   "alc_pkg_list",
   "alc_pkg_remove",
   "alc_run",

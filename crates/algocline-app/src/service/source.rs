@@ -33,8 +33,6 @@ pub(crate) enum PackageSource {
 /// 1. `"bundled"` → `Bundled { collection: None }`
 /// 2. Absolute path that exists as a directory → `LocalCopy { path }`
 /// 3. Anything else → `Git { url, rev: None }`
-// Used in Subtask 3 (alc_pkg_list/remove project-awareness).
-#[allow(dead_code)]
 pub(crate) fn infer_from_legacy_source_string(s: &str) -> PackageSource {
     if s == "bundled" {
         return PackageSource::Bundled { collection: None };

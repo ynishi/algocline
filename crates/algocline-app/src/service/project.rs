@@ -74,15 +74,23 @@ mod tests {
     /// Helper: set ALC_PROJECT_ROOT for the duration of the closure, then restore.
     /// Uses a mutex so parallel tests don't race on the env var.
     fn with_env_var<F: FnOnce()>(key: &str, val: &str, f: F) {
-        // Safety: test-only, serialised via LOCK.
+        // Safety: test-only, serialised via LOCK. Rust 2024 will make
+        // `set_var`/`remove_var` `unsafe`; wrap the calls now so the later
+        // edition bump is a no-op.
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var(key).ok();
-        std::env::set_var(key, val);
+        // SAFETY: no other threads read the env var while LOCK is held.
+        unsafe {
+            std::env::set_var(key, val);
+        }
         f();
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
+        // SAFETY: same as above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 

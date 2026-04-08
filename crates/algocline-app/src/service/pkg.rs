@@ -205,18 +205,30 @@ impl AppService {
                 // by project-local if same name
                 let global_active = seen[&name].len() == 1 && !project_names.contains(&name);
 
-                // Evaluate Lua meta (best-effort; error captured in entry)
-                let code = format!(
-                    r#"package.loaded["{name}"] = nil
+                // Evaluate Lua meta (best-effort; error captured in entry).
+                // Only interpolate the name into Lua source when it matches a
+                // strict whitelist (alnum / `_` / `-`). Names outside this set
+                // cannot be `require`d by Lua anyway; refusing them here also
+                // forecloses any Lua string-injection via crafted directory
+                // names under search paths.
+                let (meta, eval_error) = if is_safe_pkg_name(&name) {
+                    let code = format!(
+                        r#"package.loaded["{name}"] = nil
 local pkg = require("{name}")
 return pkg.meta or {{ name = "{name}" }}"#
-                );
-                let (meta, eval_error) = match self.executor.eval_simple(code).await {
-                    Ok(v) => (v, None),
-                    Err(_) => (
+                    );
+                    match self.executor.eval_simple(code).await {
+                        Ok(v) => (v, None),
+                        Err(_) => (
+                            serde_json::Value::Object(serde_json::Map::new()),
+                            Some("failed to load meta".to_string()),
+                        ),
+                    }
+                } else {
+                    (
                         serde_json::Value::Object(serde_json::Map::new()),
-                        Some("failed to load meta".to_string()),
-                    ),
+                        Some("invalid package name".to_string()),
+                    )
                 };
 
                 // Look up manifest to determine source_type at collection time.
@@ -657,6 +669,20 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
         Ok(())
     }
+}
+
+// ─── Name validation ─────────────────────────────────────────────
+
+/// Returns `true` iff `name` is safe to interpolate into a Lua source string.
+///
+/// Accepts ASCII alphanumerics, `_` and `-`. Empty strings are rejected.
+/// This matches the set of names that Lua's `require` can actually resolve
+/// against `FsResolver`, so nothing legitimate is excluded.
+fn is_safe_pkg_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 // ─── Remove scope resolution ─────────────────────────────────────

@@ -90,19 +90,43 @@ pub(crate) fn load_lockfile(project_root: &Path) -> Result<Option<LockFile>, Str
 
 /// Write `alc.lock` to disk (pretty-printed TOML).
 ///
-/// Creates the parent directory if necessary.
+/// Writes via a temp file in the same directory and `rename`s into place so
+/// readers never observe a half-written file. Creates the parent directory
+/// if necessary.
+///
+/// Note: this is not a cross-process lock — concurrent `save_lockfile` calls
+/// on a shared root can still race. The single-process MCP daemon does not
+/// currently run these calls concurrently, but an external editor writing
+/// while we rename can still lose changes. For the intended use-case
+/// (interactive `alc_pkg_link`) this is acceptable.
 pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), String> {
     let path = lockfile_path(project_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory for alc.lock: {e}"))?;
-    }
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "Cannot determine parent directory for alc.lock at {}",
+            path.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create directory for alc.lock: {e}"))?;
 
     let content =
         toml::to_string_pretty(lock).map_err(|e| format!("Failed to serialize alc.lock: {e}"))?;
 
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write alc.lock at {}: {e}", path.display()))
+    // Write to a sibling temp file, then atomically rename.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Failed to create temp file for alc.lock: {e}"))?;
+    {
+        use std::io::Write;
+        tmp.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write alc.lock staging: {e}"))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| format!("Failed to fsync alc.lock staging: {e}"))?;
+    }
+    tmp.persist(&path)
+        .map_err(|e| format!("Failed to persist alc.lock at {}: {e}", path.display()))?;
+    Ok(())
 }
 
 // ─── Resolution ─────────────────────────────────────────────────────────────
@@ -112,8 +136,21 @@ pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), 
 /// - Relative paths are resolved against `project_root`.
 /// - Absolute paths are used as-is.
 /// - Entries whose resolved path does not exist are skipped with a warning.
+/// - Entries whose canonicalized path escapes `project_root` are **rejected**
+///   with a warning (defense in depth for hand-edited `alc.lock`).
 pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+
+    let canon_root = match std::fs::canonicalize(project_root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "alc.lock: cannot canonicalize project_root {}: {e}",
+                project_root.display()
+            );
+            return paths;
+        }
+    };
 
     for pkg in &lock.packages {
         let PackageSource::LocalDir { path: ref raw } = pkg.source else {
@@ -138,7 +175,29 @@ pub(crate) fn resolve_local_dir_paths(project_root: &Path, lock: &LockFile) -> V
             continue;
         }
 
-        paths.push(resolved);
+        let canon = match std::fs::canonicalize(&resolved) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "alc.lock: cannot canonicalize path for '{}' ({}): {e}",
+                    pkg.name,
+                    resolved.display()
+                );
+                continue;
+            }
+        };
+
+        if !canon.starts_with(&canon_root) {
+            eprintln!(
+                "alc.lock: local_dir path for '{}' escapes project_root ({}), refusing: {}",
+                pkg.name,
+                canon_root.display(),
+                canon.display()
+            );
+            continue;
+        }
+
+        paths.push(canon);
     }
 
     paths
@@ -232,22 +291,58 @@ path = "packages/foo"
         let lock = make_local_dir_lock("packages/my_pkg");
         let paths = resolve_local_dir_paths(project_root, &lock);
 
-        assert_eq!(paths, vec![pkg_dir]);
+        let expected = std::fs::canonicalize(&pkg_dir).unwrap();
+        assert_eq!(paths, vec![expected]);
     }
 
     #[test]
-    fn resolve_local_dir_absolute() {
+    fn resolve_local_dir_absolute_inside_project() {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
-        // Create the target directory at an absolute path (in a different tempdir).
+        // Absolute path pointing at a directory *inside* the project root
+        // must be accepted.
+        let pkg_dir = project_root.join("abs_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let lock = make_local_dir_lock(pkg_dir.to_str().unwrap());
+        let paths = resolve_local_dir_paths(project_root, &lock);
+
+        // Compare canonicalized forms (macOS /var vs /private/var etc).
+        let expected = std::fs::canonicalize(&pkg_dir).unwrap();
+        assert_eq!(paths, vec![expected]);
+    }
+
+    #[test]
+    fn resolve_local_dir_absolute_outside_project_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+
+        // Absolute path to a different tempdir (outside the project root).
         let abs_tmp = tempfile::tempdir().unwrap();
         let abs_path = abs_tmp.path().to_path_buf();
 
         let lock = make_local_dir_lock(abs_path.to_str().unwrap());
         let paths = resolve_local_dir_paths(project_root, &lock);
 
-        assert_eq!(paths, vec![abs_path]);
+        // Defense in depth: out-of-tree paths are dropped with a warning.
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn resolve_local_dir_relative_traversal_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        // Sibling directory (reachable via ../sibling from project_root).
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let lock = make_local_dir_lock("../sibling");
+        let paths = resolve_local_dir_paths(&project_root, &lock);
+
+        assert!(paths.is_empty(), "traversal escape should be rejected");
     }
 
     #[test]

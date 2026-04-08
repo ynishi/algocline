@@ -33,21 +33,35 @@ impl AppService {
 
         // 2. Resolve path (absolute: use as-is, relative: join with project_root).
         let raw_path = Path::new(&path);
-        let resolved_path = if raw_path.is_absolute() {
+        let canon_path = if raw_path.is_absolute() {
             raw_path.to_path_buf()
         } else {
             root.join(raw_path)
         };
 
-        if !resolved_path.is_dir() {
+        if !canon_path.is_dir() {
+            return Err(format!("Path is not a directory: {}", canon_path.display()));
+        }
+
+        // Containment check: the linked directory must live under the project
+        // root. Symlinks are resolved via `canonicalize` so an in-tree symlink
+        // pointing outside the project is also rejected. This prevents an
+        // `alc.lock` entry from exposing arbitrary filesystem paths (e.g.
+        // `/etc`, `../../..`) as Lua package search locations.
+        let canon_root = std::fs::canonicalize(&root)
+            .map_err(|e| format!("Cannot canonicalize project_root {}: {e}", root.display()))?;
+        let canon_path = std::fs::canonicalize(&canon_path)
+            .map_err(|e| format!("Cannot canonicalize path {}: {e}", canon_path.display()))?;
+        if !canon_path.starts_with(&canon_root) {
             return Err(format!(
-                "Path is not a directory: {}",
-                resolved_path.display()
+                "Path must be inside project_root ({}): {}",
+                canon_root.display(),
+                canon_path.display()
             ));
         }
 
         // 3. Determine mode: single (init.lua at root) or collection (subdirs with init.lua).
-        let mode = detect_mode(&resolved_path)?;
+        let mode = detect_mode(&canon_path)?;
 
         // 4. Load or create alc.lock.
         let mut lock = match load_lockfile(&root)? {
@@ -62,24 +76,24 @@ impl AppService {
         let now = now_iso8601();
         let linked_names = match mode {
             PackageMode::Single => {
-                let name = resolved_path
+                let name = canon_path
                     .file_name()
                     .ok_or_else(|| {
                         format!(
                             "Cannot determine package name from path: {}",
-                            resolved_path.display()
+                            canon_path.display()
                         )
                     })?
                     .to_string_lossy()
                     .to_string();
 
-                let stored_path = relative_or_absolute_path(&resolved_path, &root);
+                let stored_path = relative_or_absolute_path(&canon_path, &canon_root);
                 upsert_lock_entry(&mut lock, name.clone(), stored_path, now);
                 vec![name]
             }
             PackageMode::Collection => {
-                let entries = std::fs::read_dir(&resolved_path).map_err(|e| {
-                    format!("Failed to read directory {}: {e}", resolved_path.display())
+                let entries = std::fs::read_dir(&canon_path).map_err(|e| {
+                    format!("Failed to read directory {}: {e}", canon_path.display())
                 })?;
 
                 let mut names = Vec::new();
@@ -94,7 +108,7 @@ impl AppService {
                         continue;
                     }
                     let name = entry.file_name().to_string_lossy().to_string();
-                    let stored_path = relative_or_absolute_path(&pkg_path, &root);
+                    let stored_path = relative_or_absolute_path(&pkg_path, &canon_root);
                     upsert_lock_entry(&mut lock, name.clone(), stored_path, now.clone());
                     names.push(name);
                 }
@@ -102,7 +116,7 @@ impl AppService {
                 if names.is_empty() {
                     return Err(format!(
                         "No init.lua found in any subdirectory of: {}",
-                        resolved_path.display()
+                        canon_path.display()
                     ));
                 }
 

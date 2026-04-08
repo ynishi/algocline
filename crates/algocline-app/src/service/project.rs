@@ -1,11 +1,11 @@
 //! Project root resolution for algocline.
 //!
-//! Determines the "project root" — the directory that contains `alc.lock` —
+//! Determines the "project root" — the directory that contains `alc.toml` —
 //! using the following priority (high → low):
 //!
 //! 1. `explicit` argument (from MCP tool parameter `project_root`)
 //! 2. `ALC_PROJECT_ROOT` environment variable
-//! 3. Ancestor walk from `std::env::current_dir()` to find `alc.lock`
+//! 3. Ancestor walk from `std::env::current_dir()` to find `alc.toml`
 //!
 //! **Note on MCP server cwd**: algocline runs as a long-lived daemon process.
 //! `std::env::current_dir()` returns the cwd at server startup, not the
@@ -46,19 +46,19 @@ pub(crate) fn resolve_project_root(explicit: Option<&str>) -> Option<PathBuf> {
 
     // 3. Ancestor walk from current working directory.
     if let Ok(cwd) = std::env::current_dir() {
-        return walk_up_for_lockfile(&cwd);
+        return walk_up_for_alc_toml(&cwd);
     }
 
     None
 }
 
-/// Walk up from `start` toward the filesystem root, looking for `alc.lock`.
+/// Walk up from `start` toward the filesystem root, looking for `alc.toml`.
 ///
-/// Returns the directory that *contains* `alc.lock`, or `None` if not found.
-pub(crate) fn walk_up_for_lockfile(start: &Path) -> Option<PathBuf> {
+/// Returns the directory that *contains* `alc.toml`, or `None` if not found.
+pub(crate) fn walk_up_for_alc_toml(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
-        if current.join("alc.lock").is_file() {
+        if current.join("alc.toml").is_file() {
             return Some(current);
         }
         if !current.pop() {
@@ -124,34 +124,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path().to_path_buf();
 
-        // Create alc.lock at the project root.
-        std::fs::write(project_root.join("alc.lock"), "version = 1\n").unwrap();
+        // Create alc.toml at the project root.
+        std::fs::write(project_root.join("alc.toml"), "[packages]\n").unwrap();
 
         // Create a subdirectory and walk up from there.
         let sub = project_root.join("a").join("b");
         std::fs::create_dir_all(&sub).unwrap();
 
-        let result = walk_up_for_lockfile(&sub);
+        let result = walk_up_for_alc_toml(&sub);
         assert_eq!(result, Some(project_root));
     }
 
     #[test]
-    fn resolve_project_root_none_when_no_lockfile() {
+    fn resolve_project_root_none_when_no_alc_toml() {
         let tmp = tempfile::tempdir().unwrap();
-        // No alc.lock anywhere in tmp.
-        let result = walk_up_for_lockfile(tmp.path());
+        // No alc.toml anywhere in tmp.
+        let result = walk_up_for_alc_toml(tmp.path());
         // Should walk all the way up and return None.
         assert!(result.is_none());
     }
 
     #[test]
-    fn walk_up_stops_at_root_when_no_lockfile() {
+    fn walk_up_stops_at_root_when_no_alc_toml() {
         // Walk from filesystem root — should return None immediately.
         let root = PathBuf::from("/");
-        // We only call walk_up; if alc.lock exists at / on this machine the test
+        // We only call walk_up; if alc.toml exists at / on this machine the test
         // would be a false positive, but that is essentially impossible in CI.
-        let result = walk_up_for_lockfile(&root);
-        // Either None (normal) or Some("/") if someone placed alc.lock there.
+        let result = walk_up_for_alc_toml(&root);
+        // Either None (normal) or Some("/") if someone placed alc.toml there.
         // We assert it doesn't panic.
         drop(result);
     }

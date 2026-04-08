@@ -106,12 +106,35 @@ impl AppService {
         };
 
         match lockfile::load_lockfile(&root) {
-            Ok(Some(lock)) => lockfile::resolve_path_entries(&root, &lock),
+            Ok(Some(lock)) => {
+                self.warn_toml_lock_mismatch(&root, &lock);
+                lockfile::resolve_path_entries(&root, &lock)
+            }
             Ok(None) => vec![],
             Err(e) => {
                 tracing::warn!("failed to load alc.lock at {}: {e}", root.display());
                 vec![]
             }
+        }
+    }
+
+    fn warn_toml_lock_mismatch(&self, root: &Path, lock: &lockfile::LockFile) {
+        let toml = match alc_toml::load_alc_toml(root) {
+            Ok(Some(t)) => t,
+            _ => return,
+        };
+
+        use std::collections::BTreeSet;
+        let toml_names: BTreeSet<&str> = toml.packages.keys().map(|s| s.as_str()).collect();
+        let lock_names: BTreeSet<&str> = lock.packages.iter().map(|p| p.name.as_str()).collect();
+
+        for name in toml_names.difference(&lock_names) {
+            eprintln!(
+                "warning: '{name}' is declared in alc.toml but missing from alc.lock. Run `alc_update` to sync."
+            );
+        }
+        for name in lock_names.difference(&toml_names) {
+            eprintln!("warning: '{name}' is in alc.lock but not declared in alc.toml.");
         }
     }
 }

@@ -63,7 +63,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     Ok(())
 }
 
-/// Register `alc.math` — mlua-mathlib (RNG, distributions, statistics).
+/// Register `alc.math` — mlua-mathlib v0.3 (RNG, distributions, statistics, hypothesis testing, ranking, information theory, time series).
 fn register_math(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     let math_table = mlua_mathlib::module(lua)?;
     alc_table.set("math", math_table)?;

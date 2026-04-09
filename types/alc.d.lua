@@ -342,7 +342,7 @@ function alc.fingerprint(str) end
 function alc.budget_check() end
 
 -- ============================================================
--- alc.math — Numeric Computing (mlua-mathlib v0.2)
+-- alc.math — Numeric Computing (mlua-mathlib v0.3)
 -- ============================================================
 
 ---@class alc.math
@@ -653,3 +653,164 @@ function alc.math.factorial(n) end
 ---@param n integer Non-negative integer
 ---@return number value
 function alc.math.ln_factorial(n) end
+
+--- Log-sum-exp: log(Σ exp(x_i)), numerically stable.
+---@param values number[] Input values
+---@return number value
+function alc.math.logsumexp(values) end
+
+--- Logit function: log(p / (1 - p)).
+---@param p number Probability in (0, 1)
+---@return number value
+function alc.math.logit(p) end
+
+--- Expit (sigmoid) function: 1 / (1 + exp(-x)).
+---@param x number Input
+---@return number value In (0, 1)
+function alc.math.expit(x) end
+
+-- Hypothesis Testing ---
+
+---@class AlcWelchTTestResult
+---@field t_stat number Test statistic
+---@field df number Degrees of freedom (Welch-Satterthwaite)
+---@field p_value number Two-tailed p-value
+
+--- Welch's t-test for two independent samples.
+---@param xs number[] First sample
+---@param ys number[] Second sample
+---@return AlcWelchTTestResult result
+function alc.math.welch_t_test(xs, ys) end
+
+---@class AlcMannWhitneyOpts
+---@field continuity_correction? boolean Apply continuity correction (default true)
+
+---@class AlcMannWhitneyResult
+---@field u_stat number U statistic
+---@field z_score number Z-score (normal approximation)
+---@field p_value number Two-tailed p-value
+
+--- Mann-Whitney U test for two independent samples.
+---@param xs number[] First sample
+---@param ys number[] Second sample
+---@param opts? AlcMannWhitneyOpts Options
+---@return AlcMannWhitneyResult result
+function alc.math.mann_whitney_u(xs, ys, opts) end
+
+---@class AlcChiSquaredResult
+---@field chi2_stat number Chi-squared statistic
+---@field df number Degrees of freedom
+---@field p_value number P-value
+
+--- Chi-squared goodness-of-fit test.
+---@param observed number[] Observed frequencies
+---@param expected number[] Expected frequencies (same length)
+---@return AlcChiSquaredResult result
+function alc.math.chi_squared_test(observed, expected) end
+
+---@class AlcKsTestResult
+---@field d_stat number KS statistic (max difference)
+---@field p_value number Approximate p-value
+
+--- Kolmogorov-Smirnov two-sample test.
+---@param xs number[] First sample
+---@param ys number[] Second sample
+---@return AlcKsTestResult result
+function alc.math.ks_test(xs, ys) end
+
+-- Ranking & IR Metrics ---
+
+--- Rank data (average rank for ties).
+---@param data number[] Input values
+---@return number[] ranks 1-based ranks
+function alc.math.rank(data) end
+
+--- Spearman rank correlation coefficient.
+---@param xs number[] First variable
+---@param ys number[] Second variable (same length)
+---@return number rho In [-1, 1]
+function alc.math.spearman_correlation(xs, ys) end
+
+--- Kendall's tau-b rank correlation coefficient.
+---@param xs number[] First variable
+---@param ys number[] Second variable (same length)
+---@return number tau In [-1, 1]
+function alc.math.kendall_tau(xs, ys) end
+
+--- Normalized Discounted Cumulative Gain.
+---@param relevance number[] Relevance scores in ranked order
+---@param k integer Cutoff position (> 0)
+---@return number ndcg In [0, 1]
+function alc.math.ndcg(relevance, k) end
+
+--- Mean Reciprocal Rank.
+---@param rankings integer[] Rank of first relevant item per query (1-based, 0 = not found)
+---@return number mrr In [0, 1]
+function alc.math.mrr(rankings) end
+
+-- Information Theory ---
+
+--- Shannon entropy (base e).
+---@param probs number[] Probability distribution (sums to 1)
+---@return number bits Entropy in nats
+function alc.math.entropy(probs) end
+
+--- KL divergence D_KL(P || Q).
+---@param p number[] Distribution P
+---@param q number[] Distribution Q (same length, all > 0)
+---@return number divergence In [0, ∞)
+function alc.math.kl_divergence(p, q) end
+
+--- Jensen-Shannon divergence.
+---@param p number[] Distribution P
+---@param q number[] Distribution Q (same length)
+---@return number divergence In [0, ln(2)]
+function alc.math.js_divergence(p, q) end
+
+--- Cross entropy H(P, Q).
+---@param p number[] True distribution
+---@param q number[] Predicted distribution (same length, all > 0)
+---@return number value
+function alc.math.cross_entropy(p, q) end
+
+-- Time Series ---
+
+--- Simple moving average.
+---@param data number[] Time series data
+---@param window integer Window size (> 0)
+---@return number[] averages Length = #data - window + 1
+function alc.math.moving_average(data, window) end
+
+--- Exponentially weighted moving average.
+---@param data number[] Time series data
+---@param alpha number Smoothing factor in (0, 1]
+---@return number[] averages Same length as data
+function alc.math.ewma(data, alpha) end
+
+--- Autocorrelation at a given lag.
+---@param data number[] Time series data
+---@param lag integer Lag value (≥ 0)
+---@return number acf Autocorrelation coefficient
+function alc.math.autocorrelation(data, lag) end
+
+-- Combinatorics ---
+
+--- Generate all permutations of {1, ..., n}.
+---@param n integer Size (0-10 recommended; n! elements)
+---@return integer[][] permutations Each element is a permutation array
+function alc.math.permutations(n) end
+
+-- RNG Extensions ---
+
+--- Shuffle a table in-place (Fisher-Yates).
+---@param rng LuaRng RNG instance
+---@param tbl any[] Table to shuffle
+---@return any[] tbl Same table, shuffled
+function alc.math.shuffle(rng, tbl) end
+
+--- Sample with replacement from a table.
+---@param rng LuaRng RNG instance
+---@param tbl any[] Source table
+---@param n integer Number of samples
+---@return any[] samples Sampled elements
+function alc.math.sample_with_replacement(rng, tbl, n) end

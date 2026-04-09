@@ -630,7 +630,7 @@ end
 
 ## alc.math — Numeric Computing
 
-Re-exported from [mlua-mathlib](https://crates.io/crates/mlua-mathlib) v0.2. Provides RNG, distribution sampling, descriptive statistics, CDF/PPF, and special functions backed by Rust (`rand`, `statrs`, `nalgebra`). Available as `alc.math.*` without `require()`.
+Re-exported from [mlua-mathlib](https://crates.io/crates/mlua-mathlib) v0.3. Provides RNG, distribution sampling, descriptive statistics, CDF/PPF, special functions, hypothesis testing, ranking/IR metrics, information theory, and time series analysis backed by Rust (`rand`, `statrs`, `nalgebra`). Available as `alc.math.*` without `require()`.
 
 ### RNG
 
@@ -815,9 +815,133 @@ local x = alc.math.normal_inverse_cdf(0.975, 0, 1) -- ≈ 1.96
 | `digamma(x)` | x: number | number | Digamma function ψ(x) |
 | `factorial(n)` | n: integer (0-170) | number | n! (overflows f64 for n > 170) |
 | `ln_factorial(n)` | n: integer | number | ln(n!) |
+| `logsumexp(values)` | values: number[] | number | Log-sum-exp (numerically stable) |
+| `logit(p)` | p: number (0,1) | number | Logit: log(p / (1-p)) |
+| `expit(x)` | x: number | number | Expit (sigmoid): 1 / (1 + exp(-x)) |
 
 ```lua
 local e = alc.math.erf(1.0)          -- ≈ 0.8427
 local f = alc.math.factorial(10)      -- 3628800
 local lf = alc.math.ln_factorial(100) -- ≈ 363.74
+local lse = alc.math.logsumexp({1, 2, 3})  -- ≈ 3.408
+local sig = alc.math.expit(0)              -- 0.5
+```
+
+### Hypothesis Testing
+
+#### `alc.math.welch_t_test(xs, ys) -> table`
+
+Welch's t-test for two independent samples with unequal variances.
+
+**Returns:** `{ t_stat = number, df = number, p_value = number }`
+
+```lua
+local r = alc.math.welch_t_test({1,2,3,4,5}, {2,4,6,8,10})
+-- r.t_stat, r.df, r.p_value
+```
+
+#### `alc.math.mann_whitney_u(xs, ys [, opts]) -> table`
+
+Mann-Whitney U test (non-parametric). Optional `opts.continuity_correction` (default `true`).
+
+**Returns:** `{ u_stat = number, z_score = number, p_value = number }`
+
+```lua
+local r = alc.math.mann_whitney_u({1,2,3}, {4,5,6})
+```
+
+#### `alc.math.chi_squared_test(observed, expected) -> table`
+
+Chi-squared goodness-of-fit test.
+
+**Returns:** `{ chi2_stat = number, df = number, p_value = number }`
+
+```lua
+local r = alc.math.chi_squared_test({10, 20, 30}, {20, 20, 20})
+```
+
+#### `alc.math.ks_test(xs, ys) -> table`
+
+Kolmogorov-Smirnov two-sample test.
+
+**Returns:** `{ d_stat = number, p_value = number }`
+
+```lua
+local r = alc.math.ks_test({1,2,3,4,5}, {1,3,5,7,9})
+```
+
+### Ranking & IR Metrics
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `rank(data)` | data: number[] | number[] | Average rank (ties averaged) |
+| `spearman_correlation(xs, ys)` | xs, ys: number[] | number | Spearman rank correlation ρ |
+| `kendall_tau(xs, ys)` | xs, ys: number[] | number | Kendall's τ-b rank correlation |
+| `ndcg(relevance, k)` | relevance: number[], k: integer | number | Normalized DCG@k |
+| `mrr(rankings)` | rankings: integer[] | number | Mean Reciprocal Rank |
+
+```lua
+local ranks = alc.math.rank({30, 10, 20})   -- {3, 1, 2}
+local rho = alc.math.spearman_correlation({1,2,3}, {1,2,3})  -- 1.0
+local score = alc.math.ndcg({3, 2, 1, 0}, 4)
+local m = alc.math.mrr({1, 3, 2})  -- (1/1 + 1/3 + 1/2) / 3
+```
+
+### Information Theory
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `entropy(probs)` | probs: number[] | number | Shannon entropy (nats, base e) |
+| `kl_divergence(p, q)` | p, q: number[] | number | KL divergence D_KL(P \|\| Q) |
+| `js_divergence(p, q)` | p, q: number[] | number | Jensen-Shannon divergence |
+| `cross_entropy(p, q)` | p, q: number[] | number | Cross entropy H(P, Q) |
+
+```lua
+local h = alc.math.entropy({0.5, 0.5})          -- ln(2) ≈ 0.693
+local kl = alc.math.kl_divergence({0.5, 0.5}, {0.9, 0.1})
+local js = alc.math.js_divergence({0.5, 0.5}, {0.9, 0.1})
+```
+
+### Time Series
+
+| Function | Parameters | Returns | Description |
+|----------|-----------|---------|-------------|
+| `moving_average(data, window)` | data: number[], window: integer | number[] | Simple moving average |
+| `ewma(data, alpha)` | data: number[], alpha: number (0,1] | number[] | Exponentially weighted moving average |
+| `autocorrelation(data, lag)` | data: number[], lag: integer | number | Autocorrelation at given lag |
+
+```lua
+local ma = alc.math.moving_average({1,2,3,4,5}, 3)  -- {2, 3, 4}
+local ew = alc.math.ewma({1,2,3,4,5}, 0.3)
+local acf = alc.math.autocorrelation({1,2,3,4,5,4,3,2,1}, 1)
+```
+
+### Combinatorics
+
+#### `alc.math.permutations(n) -> table[]`
+
+Generate all permutations of `{1, ..., n}`. Returns `n!` arrays. Recommended `n ≤ 10`.
+
+```lua
+local perms = alc.math.permutations(3)
+-- {{1,2,3}, {1,3,2}, {2,1,3}, {2,3,1}, {3,1,2}, {3,2,1}}
+```
+
+### RNG Extensions
+
+#### `alc.math.shuffle(rng, tbl) -> table`
+
+Fisher-Yates shuffle (in-place). Returns the same table.
+
+```lua
+local rng = alc.math.rng_create(42)
+local t = alc.math.shuffle(rng, {1, 2, 3, 4, 5})
+```
+
+#### `alc.math.sample_with_replacement(rng, tbl, n) -> table`
+
+Sample `n` elements with replacement from `tbl`.
+
+```lua
+local samples = alc.math.sample_with_replacement(rng, {"a","b","c"}, 5)
 ```

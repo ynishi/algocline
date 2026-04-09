@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-04-09
+
+### Added
+
+- **mlua-mathlib v0.3.0**: Upgraded from v0.2. Adds 22 new `alc.math` functions:
+  - Hypothesis testing: `welch_t_test`, `mann_whitney_u`, `chi_squared_test`, `ks_test`
+  - Ranking & IR metrics: `rank`, `spearman_correlation`, `kendall_tau`, `ndcg`, `mrr`
+  - Information theory: `entropy`, `kl_divergence`, `js_divergence`, `cross_entropy`
+  - Special functions: `logsumexp`, `logit`, `expit`
+  - Time series: `moving_average`, `ewma`, `autocorrelation`
+  - Combinatorics: `permutations`
+  - RNG: `shuffle`, `sample_with_replacement`
+
 ## [0.15.0] - 2026-04-09
 
 ### Added

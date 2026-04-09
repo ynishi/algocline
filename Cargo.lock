@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "algocline"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "algocline-app",
  "algocline-engine",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-app"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "algocline-core",
  "algocline-engine",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-core"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "indexmap",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-engine"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "algocline-core",
  "anyhow",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-mcp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "algocline-app",
  "rmcp",
@@ -816,9 +816,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-mathlib"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abbca710c4789a4ddd69aeaafd6196379657974305de7808bda4a71af9a2984f"
+checksum = "d256b4e19bd198e896a75068b576f58dddacc57280ed6f224f57c825d9303237"
 dependencies = [
  "mlua",
  "rand 0.9.2",

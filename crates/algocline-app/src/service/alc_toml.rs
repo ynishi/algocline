@@ -1,6 +1,4 @@
 //! `alc.toml` — project package declaration file.
-// Functions here are used in subtask 2+ (pkg_install, alc_init, etc.)
-#![allow(dead_code)]
 //!
 //! ## File location
 //! `alc.toml` lives at the project root.

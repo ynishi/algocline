@@ -1,6 +1,6 @@
 //! `pkg_install` — install a package from a Git URL or local path.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::super::alc_toml::{
     add_package_entry, load_alc_toml_document, save_alc_toml, PackageDep,
@@ -411,16 +411,5 @@ fn upsert_lock_entry(
             version,
             source,
         });
-    }
-}
-
-/// Convenience: resolve the absolute path for a given package `root` path.
-#[allow(dead_code)]
-fn resolve_abs(root: &Path, p: &str) -> PathBuf {
-    let path = Path::new(p);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
     }
 }

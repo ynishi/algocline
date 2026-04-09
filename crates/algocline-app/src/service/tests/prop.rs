@@ -221,6 +221,9 @@ fn resolve_scenario_source_falls_back_to_root() {
 
 #[test]
 fn eval_auto_installs_evalframe_on_missing() {
+    // Serialize with FakeHome tests to prevent HOME env var races.
+    let _home_lock = super::super::test_support::lock_home();
+
     // Skip if evalframe is already installed globally
     if is_package_installed("evalframe") {
         return;
@@ -245,7 +248,12 @@ fn eval_auto_installs_evalframe_on_missing() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: false,
     };
-    let svc = AppService::new(executor, config, vec![]);
+    // AppService::new() calls spawn_gc_task() which requires a tokio runtime context.
+    // Scope the enter guard so it is dropped before rt.block_on() below.
+    let svc = {
+        let _guard = rt.enter();
+        AppService::new(executor, config, vec![])
+    };
 
     let scenario = r#"return { cases = {} }"#;
     let result = rt.block_on(svc.eval(Some(scenario.into()), None, None, "cove", None));

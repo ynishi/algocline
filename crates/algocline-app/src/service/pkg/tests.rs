@@ -2,7 +2,7 @@
 
 use crate::service::lockfile::{load_lockfile, LockFile, LockPackage};
 use crate::service::source::PackageSource;
-use crate::service::AppService;
+use crate::service::test_support::{make_app_service, make_app_service_with_search_paths};
 
 fn make_lock_with_pkg(name: &str) -> LockFile {
     LockFile {
@@ -12,34 +12,6 @@ fn make_lock_with_pkg(name: &str) -> LockFile {
             version: None,
             source: PackageSource::Installed,
         }],
-    }
-}
-
-async fn make_app_service() -> AppService {
-    make_app_service_with_search_paths(vec![]).await
-}
-
-async fn make_app_service_with_search_paths(
-    search_paths: Vec<crate::service::resolve::SearchPath>,
-) -> AppService {
-    use std::sync::Arc;
-
-    let executor = Arc::new(
-        algocline_engine::Executor::new(vec![])
-            .await
-            .expect("executor"),
-    );
-    AppService {
-        executor,
-        registry: Arc::new(algocline_engine::SessionRegistry::new()),
-        log_config: crate::service::config::AppConfig {
-            log_dir: None,
-            log_dir_source: crate::service::config::LogDirSource::None,
-            log_enabled: false,
-        },
-        search_paths,
-        eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 

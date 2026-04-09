@@ -29,29 +29,7 @@ impl AppService {
 
 #[cfg(test)]
 mod tests {
-    use super::super::AppService;
-    use crate::service::config::{AppConfig, LogDirSource};
-    use std::sync::Arc;
-
-    async fn make_service() -> AppService {
-        let executor = Arc::new(
-            algocline_engine::Executor::new(vec![])
-                .await
-                .expect("executor"),
-        );
-        AppService {
-            executor,
-            registry: Arc::new(algocline_engine::SessionRegistry::new()),
-            log_config: AppConfig {
-                log_dir: None,
-                log_dir_source: LogDirSource::None,
-                log_enabled: false,
-            },
-            search_paths: vec![],
-            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
-    }
+    use crate::service::test_support::make_app_service as make_service;
 
     #[tokio::test]
     async fn init_creates_alc_toml() {

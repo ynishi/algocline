@@ -213,196 +213,169 @@ fn create_symlink(source: &Path, dest: &Path, force: bool) -> Result<(), String>
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-
-    async fn make_app_service() -> AppService {
-        let executor = Arc::new(
-            algocline_engine::Executor::new(vec![])
-                .await
-                .expect("executor"),
-        );
-        AppService {
-            executor,
-            registry: Arc::new(algocline_engine::SessionRegistry::new()),
-            log_config: crate::service::config::AppConfig {
-                log_dir: None,
-                log_dir_source: crate::service::config::LogDirSource::None,
-                log_enabled: false,
-            },
-            search_paths: vec![],
-            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }
-    }
-
-    /// Temporarily redirect packages_dir to a tempdir by overriding HOME.
-    fn with_fake_home<F: FnOnce(&std::path::Path)>(f: F) {
-        let tmp = tempfile::tempdir().unwrap();
-        // packages_dir() uses dirs::home_dir() which reads HOME.
-        std::env::set_var("HOME", tmp.path());
-        f(tmp.path());
-        std::env::remove_var("HOME");
-    }
+    use crate::service::test_support::{make_app_service, FakeHome};
 
     #[tokio::test]
     async fn pkg_link_single_creates_symlink() {
-        with_fake_home(|home| {
-            let src = home.join("my_pkg");
-            std::fs::create_dir_all(&src).unwrap();
-            std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        let env = FakeHome::new();
+        let home = &env.home;
 
-            let svc = tokio::runtime::Handle::current().block_on(make_app_service());
+        let src = home.join("my_pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-            let result = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(src.to_string_lossy().to_string(), None, None))
-                .unwrap();
+        let svc = make_app_service().await;
+        let result = svc
+            .pkg_link(src.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
 
-            let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(json["mode"], "single");
-            assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
-            assert_eq!(json["targets"]["my_pkg"], src.to_string_lossy().as_ref());
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["mode"], "single");
+        assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
+        assert_eq!(json["targets"]["my_pkg"], src.to_string_lossy().as_ref());
 
-            let dest = home.join(".algocline").join("packages").join("my_pkg");
-            assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
-            assert_eq!(std::fs::read_link(&dest).unwrap(), src);
-        });
+        let dest = home.join(".algocline").join("packages").join("my_pkg");
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&dest).unwrap(), src);
     }
 
     #[tokio::test]
     async fn pkg_link_collection_creates_symlinks() {
-        with_fake_home(|home| {
-            let coll = home.join("collection");
-            std::fs::create_dir_all(coll.join("pkg_a")).unwrap();
-            std::fs::create_dir_all(coll.join("pkg_b")).unwrap();
-            std::fs::write(coll.join("pkg_a").join("init.lua"), "return {}").unwrap();
-            std::fs::write(coll.join("pkg_b").join("init.lua"), "return {}").unwrap();
+        let env = FakeHome::new();
+        let home = &env.home;
 
-            let svc = tokio::runtime::Handle::current().block_on(make_app_service());
+        let coll = home.join("collection");
+        std::fs::create_dir_all(coll.join("pkg_a")).unwrap();
+        std::fs::create_dir_all(coll.join("pkg_b")).unwrap();
+        std::fs::write(coll.join("pkg_a").join("init.lua"), "return {}").unwrap();
+        std::fs::write(coll.join("pkg_b").join("init.lua"), "return {}").unwrap();
 
-            let result = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(coll.to_string_lossy().to_string(), None, None))
-                .unwrap();
+        let svc = make_app_service().await;
+        let result = svc
+            .pkg_link(coll.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
 
-            let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(json["mode"], "collection");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["mode"], "collection");
 
-            let linked = json["linked"].as_array().unwrap();
-            let mut names: Vec<&str> = linked.iter().map(|v| v.as_str().unwrap()).collect();
-            names.sort();
-            assert_eq!(names, ["pkg_a", "pkg_b"]);
+        let linked = json["linked"].as_array().unwrap();
+        let mut names: Vec<&str> = linked.iter().map(|v| v.as_str().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["pkg_a", "pkg_b"]);
 
-            let pkgs = home.join(".algocline").join("packages");
-            assert!(pkgs
-                .join("pkg_a")
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink());
-            assert!(pkgs
-                .join("pkg_b")
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink());
-        });
+        let pkgs = home.join(".algocline").join("packages");
+        assert!(pkgs
+            .join("pkg_a")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(pkgs
+            .join("pkg_b")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[tokio::test]
     async fn pkg_link_overwrites_existing_symlink() {
-        with_fake_home(|home| {
-            let src = home.join("my_pkg");
-            std::fs::create_dir_all(&src).unwrap();
-            std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        let env = FakeHome::new();
+        let home = &env.home;
 
-            let pkgs = home.join(".algocline").join("packages");
-            std::fs::create_dir_all(&pkgs).unwrap();
-            // Create an existing symlink pointing somewhere.
-            let dest = pkgs.join("my_pkg");
-            symlink(&src, &dest).unwrap();
+        let src = home.join("my_pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-            let svc = tokio::runtime::Handle::current().block_on(make_app_service());
+        let pkgs = home.join(".algocline").join("packages");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        let dest = pkgs.join("my_pkg");
+        symlink(&src, &dest).unwrap();
 
-            // Should succeed without force (symlink always overwritten).
-            let result = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(src.to_string_lossy().to_string(), None, None))
-                .unwrap();
+        let svc = make_app_service().await;
+        let result = svc
+            .pkg_link(src.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
 
-            let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
-            assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
-        });
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[tokio::test]
     async fn pkg_link_real_dir_requires_force() {
-        with_fake_home(|home| {
-            let src = home.join("my_pkg");
-            std::fs::create_dir_all(&src).unwrap();
-            std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        let env = FakeHome::new();
+        let home = &env.home;
 
-            let pkgs = home.join(".algocline").join("packages");
-            let dest = pkgs.join("my_pkg");
-            std::fs::create_dir_all(&dest).unwrap();
+        let src = home.join("my_pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-            let svc = tokio::runtime::Handle::current().block_on(make_app_service());
+        let pkgs = home.join(".algocline").join("packages");
+        let dest = pkgs.join("my_pkg");
+        std::fs::create_dir_all(&dest).unwrap();
 
-            // Without force → error.
-            let err = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(src.to_string_lossy().to_string(), None, None))
-                .unwrap_err();
-            assert!(
-                err.contains("real directory"),
-                "expected real directory error, got: {err}"
-            );
+        let svc = make_app_service().await;
 
-            // With force → success.
-            let result = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(src.to_string_lossy().to_string(), None, Some(true)))
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
-            assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
-        });
+        let err = svc
+            .pkg_link(src.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("real directory"),
+            "expected real directory error, got: {err}"
+        );
+
+        let result = svc
+            .pkg_link(src.to_string_lossy().to_string(), None, Some(true))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[tokio::test]
     async fn pkg_link_dangling_symlink_overwritten() {
-        with_fake_home(|home| {
-            let src = home.join("my_pkg");
-            std::fs::create_dir_all(&src).unwrap();
-            std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        let env = FakeHome::new();
+        let home = &env.home;
 
-            let pkgs = home.join(".algocline").join("packages");
-            std::fs::create_dir_all(&pkgs).unwrap();
-            let dest = pkgs.join("my_pkg");
-            // Create a dangling symlink.
-            symlink(home.join("nonexistent"), &dest).unwrap();
-            assert!(!dest.exists()); // dangling
+        let src = home.join("my_pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-            let svc = tokio::runtime::Handle::current().block_on(make_app_service());
+        let pkgs = home.join(".algocline").join("packages");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        let dest = pkgs.join("my_pkg");
+        symlink(home.join("nonexistent"), &dest).unwrap();
+        assert!(!dest.exists()); // dangling
 
-            let result = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(src.to_string_lossy().to_string(), None, None))
-                .unwrap();
+        let svc = make_app_service().await;
+        let result = svc
+            .pkg_link(src.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap();
 
-            let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
-            assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
-            assert!(dest.exists()); // no longer dangling
-        });
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(dest.exists()); // no longer dangling
     }
 
     #[tokio::test]
     async fn pkg_link_path_not_found_returns_error() {
-        with_fake_home(|home| {
-            let nonexistent = home.join("does_not_exist");
-            let svc = tokio::runtime::Handle::current().block_on(make_app_service());
-            let err = tokio::runtime::Handle::current()
-                .block_on(svc.pkg_link(nonexistent.to_string_lossy().to_string(), None, None))
-                .unwrap_err();
-            assert!(err.contains("not a directory"), "got: {err}");
-        });
+        let env = FakeHome::new();
+        let nonexistent = env.home.join("does_not_exist");
+
+        let svc = make_app_service().await;
+        let err = svc
+            .pkg_link(nonexistent.to_string_lossy().to_string(), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a directory"), "got: {err}");
     }
 }

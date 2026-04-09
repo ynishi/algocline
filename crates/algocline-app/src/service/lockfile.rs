@@ -148,6 +148,13 @@ pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), 
 /// - Relative paths are resolved against `project_root`.
 /// - Absolute paths are used as-is.
 /// - Entries whose resolved path does not exist are skipped with a warning.
+///
+/// **No containment check**: unlike v0.14.0, paths outside `project_root` are
+/// intentionally allowed. The pkg-redesign (Phase 2) moved link management to
+/// symlink-based `pkg_link`, and `Path` entries in `alc.lock` are now generated
+/// exclusively by `alc_update` from `alc.toml` declarations. Hand-editing
+/// `alc.lock` is unsupported; the prior canonicalize + starts_with guard was
+/// removed to simplify resolution and support cross-project path references.
 pub(crate) fn resolve_path_entries(project_root: &Path, lock: &LockFile) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
@@ -177,46 +184,6 @@ pub(crate) fn resolve_path_entries(project_root: &Path, lock: &LockFile) -> Vec<
         paths.push(resolved);
     }
 
-    paths
-}
-
-/// Extract resolved absolute paths for all `Installed` entries in the lock file.
-// Used in subtask 2+ (resolve_extra_lib_paths for Installed packages)
-#[allow(dead_code)]
-///
-/// Derives the package path as `~/.algocline/packages/{name}` or
-/// `~/.algocline/packages/{name}@{version}` when a version is present.
-/// Entries whose resolved path does not exist are skipped with a warning.
-pub(crate) fn resolve_installed_paths(lock: &LockFile) -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("alc.lock: cannot determine home directory for Installed path resolution");
-        return vec![];
-    };
-    let packages_dir = home.join(".algocline").join("packages");
-
-    let mut paths = Vec::new();
-    for pkg in &lock.packages {
-        if !matches!(pkg.source, PackageSource::Installed) {
-            continue;
-        }
-
-        let dir_name = match &pkg.version {
-            Some(v) => format!("{}@{}", pkg.name, v),
-            None => pkg.name.clone(),
-        };
-        let resolved = packages_dir.join(&dir_name);
-
-        if !resolved.exists() {
-            tracing::warn!(
-                "alc.lock: installed path for '{}' does not exist, skipping: {}",
-                pkg.name,
-                resolved.display()
-            );
-            continue;
-        }
-
-        paths.push(resolved);
-    }
     paths
 }
 

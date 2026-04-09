@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-04-09
+
 ### Added
 
 - **`alc_init` MCP tool**: Initialize project — creates `alc.toml` in the project root if absent. Equivalent to `alc init` for project-scoped setup via MCP
@@ -30,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`EngineApi` trait**: Removed `scope` from `pkg_remove`; added `alc_init`, `alc_update`, `alc_migrate`, `pkg_unlink` methods
 - **`lockfile.rs`**: `LockPackage` loses `linked_at` field; gains `version: Option<String>`. `resolve_local_dir_paths` renamed to `resolve_path_entries` with containment check removed
 - **`project.rs`**: `walk_up_for_lockfile` renamed to `walk_up_for_alc_toml`
+- **`detect_legacy_format`**: Migrated from string-contains to TOML structural parsing to prevent false positives on package names containing `linked_at` or `local_dir`
+- **Test helper consolidation**: Extracted duplicated `make_app_service` / `with_fake_home` into shared `test_support` module
+
+### Fixed
+
+- **`pkg_link` / `pkg_unlink` tests**: Replaced `Handle::block_on()` inside `#[tokio::test]` (runtime nesting panic) with `FakeHome` RAII guard pattern that allows direct `.await`. All 10 previously broken tests now pass
+- **`eval_auto_installs_evalframe_on_missing` test**: Added `rt.enter()` guard for `AppService::new()` which calls `spawn_gc_task` requiring a runtime context; added `HOME_MUTEX` serialization to prevent env var races with `FakeHome` tests
+- **Dead code cleanup**: Removed unused `resolve_installed_paths`, `resolve_abs`, and `#[allow(dead_code)]` annotations
 
 ## [0.14.0] - 2026-04-09
 

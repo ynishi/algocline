@@ -32,8 +32,11 @@ impl AppService {
         let content = std::fs::read_to_string(&lock_path)
             .map_err(|e| format!("Failed to read alc.lock: {e}"))?;
 
-        // Detect legacy format: contains "linked_at" or source type "local_dir"
-        let is_legacy = content.contains("linked_at") || content.contains("local_dir");
+        // Detect legacy format by parsing TOML and checking for structural
+        // markers: `linked_at` fields on [[package]] entries or source
+        // `type = "local_dir"`.  String-contains was previously used but
+        // could false-positive on package names containing those strings.
+        let is_legacy = detect_legacy_format(&content);
         if !is_legacy {
             return Ok(serde_json::json!({
                 "status": "nothing to migrate",
@@ -115,31 +118,45 @@ impl AppService {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::AppService;
-    use crate::service::config::{AppConfig, LogDirSource};
-    use std::sync::Arc;
+/// Detect whether `alc.lock` content uses the legacy format.
+///
+/// Legacy indicators (checked via TOML parse, not string search):
+/// - Any `[[package]]` entry has a `linked_at` key
+/// - Any `[package.source]` has `type = "local_dir"`
+fn detect_legacy_format(content: &str) -> bool {
+    let parsed: toml::Value = match toml::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
-    async fn make_service() -> AppService {
-        let executor = Arc::new(
-            algocline_engine::Executor::new(vec![])
-                .await
-                .expect("executor"),
-        );
-        AppService {
-            executor,
-            registry: Arc::new(algocline_engine::SessionRegistry::new()),
-            log_config: AppConfig {
-                log_dir: None,
-                log_dir_source: LogDirSource::None,
-                log_enabled: false,
-            },
-            search_paths: vec![],
-            eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    let packages = match parsed.get("package").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    for pkg in packages {
+        let tbl = match pkg.as_table() {
+            Some(t) => t,
+            None => continue,
+        };
+
+        if tbl.contains_key("linked_at") {
+            return true;
+        }
+
+        if let Some(source) = tbl.get("source").and_then(|s| s.as_table()) {
+            if source.get("type").and_then(|t| t.as_str()) == Some("local_dir") {
+                return true;
+            }
         }
     }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::service::test_support::make_app_service as make_service;
 
     const LEGACY_LOCK: &str = r#"version = 1
 

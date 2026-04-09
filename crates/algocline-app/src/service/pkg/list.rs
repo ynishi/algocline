@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::super::alc_toml::load_alc_toml;
+use super::super::alc_toml::{self, load_alc_toml};
 use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
 use super::super::project::resolve_project_root;
@@ -163,101 +163,25 @@ impl AppService {
             match load_alc_toml(root) {
                 Ok(Some(alc_toml)) => {
                     for (name, dep) in &alc_toml.packages {
-                        // Determine path/source_type from alc.lock merge.
                         let (version, source_type, abs_path) =
-                            if let Some((ver, source)) = lock_map.get(name) {
-                                match source {
-                                    PackageSource::Path { path: raw_path } => {
-                                        let p = Path::new(raw_path);
-                                        let abs = if p.is_absolute() {
-                                            p.to_path_buf()
-                                        } else {
-                                            root.join(p)
-                                        };
-                                        (
-                                            ver.clone(),
-                                            Some("path".to_string()),
-                                            Some(abs.display().to_string()),
-                                        )
-                                    }
-                                    PackageSource::Installed => {
-                                        (ver.clone(), Some("installed".to_string()), None)
-                                    }
-                                    PackageSource::Git { .. } => {
-                                        (ver.clone(), Some("git".to_string()), None)
-                                    }
-                                    PackageSource::Bundled { .. } => {
-                                        (ver.clone(), Some("bundled".to_string()), None)
-                                    }
-                                }
-                            } else {
-                                // alc.lock entry absent — derive source_type from alc.toml dep kind.
-                                let st = match dep {
-                                    super::super::alc_toml::PackageDep::Version(_) => {
-                                        Some("installed".to_string())
-                                    }
-                                    super::super::alc_toml::PackageDep::Path { .. } => {
-                                        Some("path".to_string())
-                                    }
-                                    super::super::alc_toml::PackageDep::Git { .. } => {
-                                        Some("git".to_string())
-                                    }
-                                };
-                                (None, st, None)
-                            };
-
+                            resolve_project_pkg_info(name, dep, &lock_map, root);
                         project_names.insert(name.clone());
-                        entries.push(PackageListEntry {
-                            name: name.clone(),
-                            scope: Scope::Project,
-                            source_type,
-                            path: abs_path,
-                            source: None,
-                            active: true,
+                        entries.push(make_project_entry(
+                            name.clone(),
                             version,
-                            installed_at: None,
-                            updated_at: None,
-                            install_source: None,
-                            overrides: None,
-                            meta: serde_json::Value::Object(serde_json::Map::new()),
-                            error: None,
-                            linked: None,
-                            link_target: None,
-                            broken: None,
-                        });
+                            source_type,
+                            abs_path,
+                        ));
                     }
                 }
                 Ok(None) => {
                     // No alc.toml — fall back to alc.lock Path entries for backward compat.
-                    for (name, (version, source)) in &lock_map {
-                        if let PackageSource::Path { path: raw_path } = source {
-                            let p = Path::new(raw_path);
-                            let abs = if p.is_absolute() {
-                                p.to_path_buf()
-                            } else {
-                                root.join(p)
-                            };
-                            project_names.insert(name.clone());
-                            entries.push(PackageListEntry {
-                                name: name.clone(),
-                                scope: Scope::Project,
-                                source_type: Some("path".to_string()),
-                                path: Some(abs.display().to_string()),
-                                source: None,
-                                active: true,
-                                version: version.clone(),
-                                installed_at: None,
-                                updated_at: None,
-                                install_source: None,
-                                overrides: None,
-                                meta: serde_json::Value::Object(serde_json::Map::new()),
-                                error: None,
-                                linked: None,
-                                link_target: None,
-                                broken: None,
-                            });
-                        }
-                    }
+                    collect_path_entries_from_lock(
+                        &lock_map,
+                        root,
+                        &mut project_names,
+                        &mut entries,
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("failed to load alc.toml: {e}");
@@ -438,6 +362,98 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
 
         Ok(result.to_string())
+    }
+}
+
+// ─── Project package helpers ─────────────────────────────────────
+
+/// Resolve version, source_type, and absolute path for a project package entry
+/// by merging `alc.toml` dep declaration with `alc.lock` data.
+fn resolve_project_pkg_info(
+    name: &str,
+    dep: &alc_toml::PackageDep,
+    lock_map: &HashMap<String, (Option<String>, PackageSource)>,
+    root: &Path,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if let Some((ver, source)) = lock_map.get(name) {
+        match source {
+            PackageSource::Path { path: raw_path } => {
+                let p = Path::new(raw_path);
+                let abs = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    root.join(p)
+                };
+                (
+                    ver.clone(),
+                    Some("path".to_string()),
+                    Some(abs.display().to_string()),
+                )
+            }
+            PackageSource::Installed => (ver.clone(), Some("installed".to_string()), None),
+            PackageSource::Git { .. } => (ver.clone(), Some("git".to_string()), None),
+            PackageSource::Bundled { .. } => (ver.clone(), Some("bundled".to_string()), None),
+        }
+    } else {
+        let st = match dep {
+            alc_toml::PackageDep::Version(_) => Some("installed".to_string()),
+            alc_toml::PackageDep::Path { .. } => Some("path".to_string()),
+            alc_toml::PackageDep::Git { .. } => Some("git".to_string()),
+        };
+        (None, st, None)
+    }
+}
+
+/// Create a `PackageListEntry` for a project-scoped package.
+fn make_project_entry(
+    name: String,
+    version: Option<String>,
+    source_type: Option<String>,
+    abs_path: Option<String>,
+) -> PackageListEntry {
+    PackageListEntry {
+        name,
+        scope: Scope::Project,
+        source_type,
+        path: abs_path,
+        source: None,
+        active: true,
+        version,
+        installed_at: None,
+        updated_at: None,
+        install_source: None,
+        overrides: None,
+        meta: serde_json::Value::Object(serde_json::Map::new()),
+        error: None,
+        linked: None,
+        link_target: None,
+        broken: None,
+    }
+}
+
+/// Backward-compat fallback: collect `Path` entries from `alc.lock` when no `alc.toml` exists.
+fn collect_path_entries_from_lock(
+    lock_map: &HashMap<String, (Option<String>, PackageSource)>,
+    root: &Path,
+    project_names: &mut std::collections::HashSet<String>,
+    entries: &mut Vec<PackageListEntry>,
+) {
+    for (name, (version, source)) in lock_map {
+        if let PackageSource::Path { path: raw_path } = source {
+            let p = Path::new(raw_path);
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                root.join(p)
+            };
+            project_names.insert(name.clone());
+            entries.push(make_project_entry(
+                name.clone(),
+                version.clone(),
+                Some("path".to_string()),
+                Some(abs.display().to_string()),
+            ));
+        }
     }
 }
 

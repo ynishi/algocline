@@ -22,11 +22,30 @@ use std::path::PathBuf;
 use algocline_core::{Budget, ExecutionMetrics, ExecutionSpec};
 use mlua::LuaSerdeExt;
 use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
-use mlua_pkg::{resolvers::FsResolver, Registry};
+use mlua_pkg::{resolvers::FsResolver, sandbox::SymlinkAwareSandbox, Registry};
 
 use crate::bridge;
 use crate::llm_bridge::LlmRequest;
 use crate::session::Session;
+
+/// Build an `FsResolver` for the given path.
+///
+/// By default uses `SymlinkAwareSandbox` so that `alc_pkg_link` symlinks
+/// are followed. Set `ALC_PKG_STRICT=1` to use the strict `FsSandbox`
+/// (rejects all symlinks pointing outside the root).
+fn make_resolver(path: &std::path::Path) -> Option<FsResolver> {
+    let strict = std::env::var("ALC_PKG_STRICT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if strict {
+        FsResolver::new(path).ok()
+    } else {
+        SymlinkAwareSandbox::new(path)
+            .ok()
+            .map(FsResolver::with_sandbox)
+    }
+}
 
 /// Layer 1: Prelude combinators (map, reduce, vote, filter).
 /// Embedded at compile time and loaded into every session.
@@ -54,7 +73,7 @@ impl Executor {
         let (isle, driver) = AsyncIsle::spawn(move |lua| {
             let mut reg = Registry::new();
             for path in &paths_for_shared {
-                if let Ok(resolver) = FsResolver::new(path) {
+                if let Some(resolver) = make_resolver(path) {
                     reg.add(resolver);
                 }
             }
@@ -114,7 +133,7 @@ impl Executor {
         let (tmp_isle, _tmp_driver) = AsyncIsle::spawn(move |lua| {
             let mut reg = Registry::new();
             for path in &effective {
-                if let Ok(resolver) = FsResolver::new(path) {
+                if let Some(resolver) = make_resolver(path) {
                     reg.add(resolver);
                 }
             }
@@ -184,7 +203,7 @@ impl Executor {
         let (session_isle, session_driver) = AsyncIsle::spawn(move |lua| {
             let mut reg = Registry::new();
             for path in &effective {
-                if let Ok(resolver) = FsResolver::new(path) {
+                if let Some(resolver) = make_resolver(path) {
                     reg.add(resolver);
                 }
             }

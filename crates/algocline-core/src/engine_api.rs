@@ -205,6 +205,9 @@ pub trait EngineApi: Send + Sync {
     /// List aliases, optionally filtered by pkg.
     async fn card_alias_list(&self, pkg: Option<String>) -> Result<String, String>;
 
+    /// Resolve an alias name to its bound Card and return the full Card JSON.
+    async fn card_get_by_alias(&self, name: &str) -> Result<String, String>;
+
     /// Bind (or rebind) an alias to a Card.
     async fn card_alias_set(
         &self,

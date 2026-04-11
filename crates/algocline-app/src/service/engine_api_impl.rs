@@ -206,6 +206,10 @@ impl EngineApi for AppService {
         AppService::card_alias_list(self, pkg.as_deref())
     }
 
+    async fn card_get_by_alias(&self, name: &str) -> Result<String, String> {
+        AppService::card_get_by_alias(self, name)
+    }
+
     async fn card_alias_set(
         &self,
         name: &str,

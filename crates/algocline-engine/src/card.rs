@@ -652,6 +652,26 @@ pub fn alias_set(
     Ok(entry)
 }
 
+/// Resolve an alias name to its bound Card and return the full Card JSON.
+///
+/// Shortcut for `alias_list → filter → get`. Returns `None` when the alias
+/// does not exist. Errors when the alias points at a missing Card — that
+/// would indicate a corrupt alias table (the target was deleted out of band).
+pub fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
+    validate_name(name, "alias")?;
+    let aliases = read_aliases()?;
+    let Some(alias) = aliases.into_iter().find(|a| a.name == name) else {
+        return Ok(None);
+    };
+    match get(&alias.card_id)? {
+        Some(card) => Ok(Some(card)),
+        None => Err(format!(
+            "alc.card.get_by_alias: alias '{name}' points at missing card '{}'",
+            alias.card_id
+        )),
+    }
+}
+
 /// List aliases, optionally filtered by pkg.
 pub fn alias_list(pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
     let mut aliases = read_aliases()?;
@@ -1186,6 +1206,27 @@ mod tests {
         let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
         let got = read_samples(&id, 0, None).unwrap();
         assert!(got.is_empty());
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn get_by_alias_roundtrip() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.85 }
+        }))
+        .unwrap();
+
+        let alias_name = format!("best_{pkg}");
+        alias_set(&alias_name, &id, Some(&pkg), None).unwrap();
+
+        let card = get_by_alias(&alias_name).unwrap().unwrap();
+        assert_eq!(card["card_id"], json!(id));
+        assert_eq!(card["stats"]["pass_rate"], json!(0.85));
+
+        assert!(get_by_alias("nonexistent_alias_xyz").unwrap().is_none());
+
         cleanup(&pkg);
     }
 

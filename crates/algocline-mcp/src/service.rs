@@ -293,6 +293,12 @@ pub struct CardAliasListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardGetByAliasParams {
+    /// Alias name (e.g. "best_prompt_ab").
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardAliasSetParams {
     /// Alias name (unique; rebinding overwrites).
     pub name: String,
@@ -769,6 +775,19 @@ impl AlcService {
         self.app.card_alias_list(params.pkg).await
     }
 
+    /// Resolve an alias name to its bound Card and return the full Card JSON.
+    /// Shortcut for `alc_card_alias_list` → filter → `alc_card_get`.
+    #[tool(
+        name = "alc_card_get_by_alias",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_get_by_alias(
+        &self,
+        Parameters(params): Parameters<CardGetByAliasParams>,
+    ) -> Result<String, String> {
+        self.app.card_get_by_alias(&params.name).await
+    }
+
     /// Bind (or rebind) an alias to a Card. Aliases are mutable even
     /// though Cards are not.
     #[tool(
@@ -872,6 +891,7 @@ impl ServerHandler for AlcService {
                  - alc_card_get: Fetch a full Card by card_id.\n\
                  - alc_card_find: Filter/sort Cards by pkg/scenario/model/min_pass_rate with pass_rate or created_at sort.\n\
                  - alc_card_alias_list: List aliases from _aliases.toml.\n\
+                 - alc_card_get_by_alias: Resolve an alias name to the full Card JSON (shortcut for alias_list → filter → get).\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\n\

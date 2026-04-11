@@ -101,6 +101,7 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
 ///   alc.card.alias_set("best_on_gsm8k", "cot_...", { pkg = "cot", note = "..." })
 ///   alc.card.alias_list({ pkg = "cot" })
 ///   alc.card.find({ pkg = "cot", scenario = "gsm8k", sort = "pass_rate", limit = 5 })
+///   alc.card.get_by_alias("best_on_gsm8k")  -- resolve alias → full Card
 ///   alc.card.write_samples("cot_...", { {case="c0", passed=true}, ... })  -- write-once
 ///   alc.card.read_samples("cot_...", { offset = 0, limit = 100 })
 pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
@@ -138,6 +139,14 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
         let json: serde_json::Value = lua.from_value(fields)?;
         let merged = card::append(&card_id, json).map_err(LuaError::external)?;
         lua.to_value(&merged)
+    })?;
+
+    // alc.card.get_by_alias(name) -> table | nil
+    let get_by_alias = lua.create_function(|lua, name: String| {
+        match card::get_by_alias(&name).map_err(LuaError::external)? {
+            Some(v) => lua.to_value(&v),
+            None => Ok(LuaValue::Nil),
+        }
     })?;
 
     // alc.card.alias_set(name, card_id, opts?) -> alias
@@ -228,6 +237,7 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     card_table.set("get", get)?;
     card_table.set("list", list)?;
     card_table.set("append", append)?;
+    card_table.set("get_by_alias", get_by_alias)?;
     card_table.set("alias_set", alias_set)?;
     card_table.set("alias_list", alias_list)?;
     card_table.set("find", find)?;

@@ -37,6 +37,13 @@ impl AppService {
         Ok(card::summaries_to_json(&rows).to_string())
     }
 
+    pub fn card_get_by_alias(&self, name: &str) -> Result<String, String> {
+        match card::get_by_alias(name)? {
+            Some(v) => Ok(v.to_string()),
+            None => Err(format!("alias '{name}' not found")),
+        }
+    }
+
     pub fn card_alias_list(&self, pkg: Option<&str>) -> Result<String, String> {
         let rows = card::alias_list(pkg)?;
         Ok(card::aliases_to_json(&rows).to_string())

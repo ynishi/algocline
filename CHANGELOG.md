@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Card schema v0 (frozen)
+
+Immutable run-result snapshots stored as TOML under
+`~/.algocline/cards/{pkg}/{card_id}.toml`. The full v0 surface is now
+considered frozen — future additions land behind a `v1` schema bump.
+
+**v0 schema**:
+- REQUIRED: `schema_version`, `card_id`, `created_at`, `pkg.name`
+- Everything else is OPTIONAL and auto-injected when derivable
+- `card_id` format: `{pkg}_{model_short}_{YYYYMMDDTHHMMSS}_{hash6}`
+- Low-hex `hash6` (DJB2 last 6 chars) to avoid top-bit collisions
+- `param_fingerprint` auto-computed from `[params]` when present
+
+**Lua API (`alc.card.*`)**:
+- `create(table)` — write a new Card (immutable)
+- `get(card_id)` / `get_by_alias(name)` — fetch full Card
+- `list(filter?)` / `find(query?)` — summaries with sort / filter
+- `append(card_id, fields)` — additive-only annotation
+- `alias_set(name, card_id, opts?)` / `alias_list(filter?)` — mutable aliases
+- `write_samples(card_id, samples)` / `read_samples(card_id, opts?)` —
+  write-once per-case JSONL sidecar
+
+**MCP tools (host-side read surface)**:
+- `alc_card_list` / `alc_card_get` / `alc_card_find`
+- `alc_card_alias_list` / `alc_card_alias_set` / `alc_card_get_by_alias`
+- `alc_card_append`
+- `alc_card_samples` (per-case sidecar read with `offset` / `limit` paging)
+
+**`alc_eval` integration**: Opt-in `auto_card=true` emits a Card from
+the eval result on completion, and when per-case rows are present
+dumps them to a `{card_id}.samples.jsonl` sidecar.
+
+**Examples**: `examples/cards/prompt_ab_demo.lua` — a self-contained
+6-trial prompt sweep exercising create / find / alias_set / append
+end-to-end with no LLM calls.
+
 ## [0.15.1] - 2026-04-09
 
 ### Added

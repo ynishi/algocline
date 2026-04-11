@@ -194,6 +194,9 @@ pub struct EvalParams {
     pub strategy: String,
     /// Additional strategy-specific options (merged into provider opts).
     pub strategy_opts: Option<serde_json::Value>,
+    /// If true, also emit an immutable Card (`~/.algocline/cards/{strategy}/{card_id}.toml`)
+    /// summarizing this eval run. Default: false. Schema: `card/v0`.
+    pub auto_card: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -366,6 +369,7 @@ impl AlcService {
                 params.scenario_name,
                 &params.strategy,
                 params.strategy_opts,
+                params.auto_card.unwrap_or(false),
             )
             .await
     }

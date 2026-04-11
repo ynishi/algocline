@@ -256,7 +256,7 @@ fn eval_auto_installs_evalframe_on_missing() {
     };
 
     let scenario = r#"return { cases = {} }"#;
-    let result = rt.block_on(svc.eval(Some(scenario.into()), None, None, "cove", None));
+    let result = rt.block_on(svc.eval(Some(scenario.into()), None, None, "cove", None, false));
     assert!(result.is_err());
     // Auto-install is attempted first; error is about bundled install failure
     // (git clone) or evalframe still missing after install

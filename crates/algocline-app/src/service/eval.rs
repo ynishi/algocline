@@ -1,10 +1,10 @@
 use super::eval_store::{
-    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, save_compare_result,
-    save_eval_result,
+    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, maybe_save_card,
+    save_compare_result, save_eval_result,
 };
 use super::path::ContainedPath;
 use super::resolve::{is_package_installed, resolve_scenario_code};
-use super::AppService;
+use super::{AppService, EvalSessionInfo};
 
 impl AppService {
     /// Run an evalframe evaluation suite.
@@ -29,6 +29,7 @@ impl AppService {
         scenario_name: Option<String>,
         strategy: &str,
         strategy_opts: Option<serde_json::Value>,
+        auto_card: bool,
     ) -> Result<String, String> {
         // Auto-install bundled packages if evalframe is missing
         if !is_package_installed("evalframe") {
@@ -42,7 +43,8 @@ impl AppService {
             }
         }
 
-        let scenario_code = resolve_scenario_code(scenario, scenario_file, scenario_name)?;
+        let scenario_code =
+            resolve_scenario_code(scenario, scenario_file, scenario_name.clone())?;
 
         // Build strategy opts Lua table literal
         let opts_lua = match &strategy_opts {
@@ -116,11 +118,19 @@ return report:to_table()
             match parsed.get("status").and_then(|s| s.as_str()) {
                 Some("completed") => {
                     save_eval_result(strategy, &result);
+                    maybe_save_card(strategy, scenario_name.as_deref(), &result, auto_card);
                 }
                 Some("needs_response") => {
                     if let Some(sid) = parsed.get("session_id").and_then(|s| s.as_str()) {
                         if let Ok(mut map) = self.eval_sessions.lock() {
-                            map.insert(sid.to_string(), strategy.to_string());
+                            map.insert(
+                                sid.to_string(),
+                                EvalSessionInfo {
+                                    strategy: strategy.to_string(),
+                                    auto_card,
+                                    scenario_name: scenario_name.clone(),
+                                },
+                            );
                         }
                     }
                 }

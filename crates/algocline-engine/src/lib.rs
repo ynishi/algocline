@@ -1,5 +1,5 @@
 mod bridge;
-mod card;
+pub mod card;
 mod executor;
 mod llm_bridge;
 pub mod session;

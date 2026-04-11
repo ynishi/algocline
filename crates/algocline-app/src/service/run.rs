@@ -137,15 +137,21 @@ impl AppService {
         if !matches!(result, FeedResult::Finished(_)) {
             return;
         }
-        let strategy = {
+        let info = {
             let mut map = match self.eval_sessions.lock() {
                 Ok(m) => m,
                 Err(_) => return,
             };
             map.remove(session_id)
         };
-        if let Some(strategy) = strategy {
-            super::eval_store::save_eval_result(&strategy, result_json);
+        if let Some(info) = info {
+            super::eval_store::save_eval_result(&info.strategy, result_json);
+            super::eval_store::maybe_save_card(
+                &info.strategy,
+                info.scenario_name.as_deref(),
+                result_json,
+                info.auto_card,
+            );
         }
     }
 

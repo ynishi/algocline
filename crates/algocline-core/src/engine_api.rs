@@ -69,6 +69,9 @@ pub trait EngineApi: Send + Sync {
     // ─── Evaluation ──────────────────────────────────────────
 
     /// Run an evalframe evaluation suite.
+    ///
+    /// `auto_card`: when true, emit an immutable Card
+    /// (`~/.algocline/cards/{strategy}/{card_id}.toml`) summarizing the run.
     async fn eval(
         &self,
         scenario: Option<String>,
@@ -76,6 +79,7 @@ pub trait EngineApi: Send + Sync {
         scenario_name: Option<String>,
         strategy: &str,
         strategy_opts: Option<serde_json::Value>,
+        auto_card: bool,
     ) -> Result<String, String>;
 
     /// List eval history, optionally filtered by strategy.

@@ -66,6 +66,7 @@ impl EngineApi for AppService {
         scenario_name: Option<String>,
         strategy: &str,
         strategy_opts: Option<serde_json::Value>,
+        auto_card: bool,
     ) -> Result<String, String> {
         AppService::eval(
             self,
@@ -74,6 +75,7 @@ impl EngineApi for AppService {
             scenario_name,
             strategy,
             strategy_opts,
+            auto_card,
         )
         .await
     }

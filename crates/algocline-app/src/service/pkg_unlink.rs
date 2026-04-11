@@ -66,7 +66,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["unlinked"], "my_pkg");
-        assert!(!dest.symlink_metadata().is_ok());
+        assert!(dest.symlink_metadata().is_err());
     }
 
     #[tokio::test]
@@ -115,6 +115,6 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["unlinked"], "dangling_pkg");
-        assert!(!dest.symlink_metadata().is_ok());
+        assert!(dest.symlink_metadata().is_err());
     }
 }

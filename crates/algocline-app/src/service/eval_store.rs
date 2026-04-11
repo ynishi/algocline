@@ -48,6 +48,92 @@ pub(super) fn save_eval_result(strategy: &str, result_json: &str) {
     }
 }
 
+/// Optionally emit an immutable Card from an eval result.
+///
+/// Called after `save_eval_result` on the completion paths when the caller
+/// passed `auto_card = true` (via `EvalParams.auto_card`).
+///
+/// Silently swallows errors — Card emission is non-critical and must not
+/// break the eval response. Uses `algocline_engine::card::create` which
+/// writes `~/.algocline/cards/{strategy}/{card_id}.toml`.
+pub(super) fn maybe_save_card(
+    strategy: &str,
+    scenario_name: Option<&str>,
+    result_json: &str,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(result_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let result_obj = parsed.get("result");
+    let stats_obj = parsed.get("stats");
+    let aggregated = result_obj.and_then(|r| r.get("aggregated"));
+
+    let mut card = serde_json::json!({
+        "pkg": { "name": strategy },
+        "stats": {
+            "pass_rate": aggregated.and_then(|a| a.get("pass_rate")),
+            "mean_score": aggregated.and_then(|a| a.get("scores")).and_then(|s| s.get("mean")),
+            "n": aggregated.and_then(|a| a.get("total")),
+            "passed": aggregated.and_then(|a| a.get("passed")),
+        },
+        "cost": {
+            "llm_calls": stats_obj.and_then(|s| s.get("auto")).and_then(|a| a.get("llm_calls"))
+                .cloned().unwrap_or(serde_json::Value::Null),
+            "elapsed_ms": stats_obj.and_then(|s| s.get("auto")).and_then(|a| a.get("elapsed_ms"))
+                .cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "metadata": {
+            "source": "alc_eval",
+        },
+    });
+
+    // Strip null leaves so the resulting TOML stays compact.
+    prune_nulls(&mut card);
+
+    if let Some(name) = scenario_name {
+        card["scenario"] = serde_json::json!({ "name": name });
+    }
+
+    match algocline_engine::card::create(card) {
+        Ok((card_id, _path)) => {
+            tracing::info!("alc_eval auto_card=true: created card {card_id}");
+        }
+        Err(e) => {
+            tracing::warn!("alc_eval auto_card: failed to create card: {e}");
+        }
+    }
+}
+
+/// Recursively drop null leaves from a JSON object so they don't become
+/// TOML errors downstream (TOML has no null).
+fn prune_nulls(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                let child = map.get_mut(&k).unwrap();
+                prune_nulls(child);
+                if child.is_null() {
+                    map.remove(&k);
+                }
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for item in a.iter_mut() {
+                prune_nulls(item);
+            }
+            a.retain(|x| !x.is_null());
+        }
+        _ => {}
+    }
+}
+
 /// Build the lightweight meta JSON from a full eval result.
 ///
 /// Pure function — no I/O, no side effects. Testable independently.

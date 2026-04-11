@@ -37,14 +37,26 @@ pub use resolve::{QueryResponse, SearchPath};
 
 // ─── Application Service ────────────────────────────────────────
 
-/// Tracks which sessions are eval sessions and their strategy name.
+/// Info tracked for each in-flight eval session.
+///
+/// Kept around between `alc_eval` invocation and its eventual completion
+/// (which may arrive via `alc_continue` after LLM round-trips). Used by
+/// `run.rs::maybe_save_eval` to persist the result and optionally emit a Card.
+#[derive(Debug, Clone)]
+pub(super) struct EvalSessionInfo {
+    pub strategy: String,
+    pub auto_card: bool,
+    pub scenario_name: Option<String>,
+}
+
+/// Tracks which sessions are eval sessions and their session info.
 ///
 /// `std::sync::Mutex` is used (not tokio) because all operations are
 /// single HashMap insert/remove/get completing in microseconds, and no
 /// `.await` is held across the lock. Called from async context but never
 /// held across yield points. Poison is silently skipped — eval tracking
 /// is non-critical metadata.
-type EvalSessions = std::sync::Mutex<std::collections::HashMap<String, String>>;
+type EvalSessions = std::sync::Mutex<std::collections::HashMap<String, EvalSessionInfo>>;
 
 /// Tracks session_id → strategy name for all strategy-based sessions (advice, eval).
 ///

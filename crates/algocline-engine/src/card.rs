@@ -717,6 +717,89 @@ pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
     Ok(rows)
 }
 
+// ───────────────────────────────────────────────────────────────
+// Samples sidecar: per-case detail written alongside a Card as
+// `{pkg}/{card_id}.samples.jsonl`. Write-once to preserve Card
+// immutability: once a Card has a samples file, it cannot be
+// rewritten — mismatched per-case data would break auditability.
+// ───────────────────────────────────────────────────────────────
+
+/// Resolve the samples sidecar path for a Card.
+///
+/// Returns an error if the Card does not exist — samples without a
+/// parent Card are meaningless and we refuse to create orphans.
+fn samples_path(card_id: &str) -> Result<PathBuf, String> {
+    let card_path = find_card_path(card_id)?
+        .ok_or_else(|| format!("card '{card_id}' not found"))?;
+    let dir = card_path
+        .parent()
+        .ok_or_else(|| format!("card '{card_id}' has no parent directory"))?;
+    Ok(dir.join(format!("{card_id}.samples.jsonl")))
+}
+
+/// Write per-case samples to `{card_id}.samples.jsonl` (write-once).
+///
+/// Each `samples` entry is serialized as one compact JSON line.
+/// Fails if a samples file already exists for this card — mirrors
+/// the immutability guarantee of Cards themselves.
+pub fn write_samples(card_id: &str, samples: Vec<Json>) -> Result<PathBuf, String> {
+    let path = samples_path(card_id)?;
+    if path.exists() {
+        return Err(format!(
+            "alc.card.write_samples: samples already exist for card '{card_id}' (write-once)"
+        ));
+    }
+    let mut buf = String::new();
+    for (idx, s) in samples.iter().enumerate() {
+        let line = serde_json::to_string(s).map_err(|e| {
+            format!("alc.card.write_samples: failed to serialize sample #{idx}: {e}")
+        })?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    fs::write(&tmp, &buf)
+        .map_err(|e| format!("Failed to write samples tmp: {e}"))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to rename samples file: {e}"))?;
+    Ok(path)
+}
+
+/// Read per-case samples from `{card_id}.samples.jsonl`.
+///
+/// Returns an empty Vec if no samples file exists (Cards without
+/// per-case details are the common case, not an error).
+pub fn read_samples(
+    card_id: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<Vec<Json>, String> {
+    let path = samples_path(card_id)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read samples file: {e}"))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if i < offset {
+            continue;
+        }
+        if let Some(lim) = limit {
+            if out.len() >= lim {
+                break;
+            }
+        }
+        let val: Json = serde_json::from_str(line)
+            .map_err(|e| format!("Failed to parse sample line {i}: {e}"))?;
+        out.push(val);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,5 +1135,63 @@ mod tests {
         assert_eq!(rows[0].pass_rate, Some(1.0));
 
         cleanup(&pkg);
+    }
+
+    // ─── samples sidecar ───────────────────────────────────────
+
+    #[test]
+    fn write_and_read_samples_roundtrip() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.5 }
+        }))
+        .unwrap();
+
+        let samples = vec![
+            json!({ "case": "c0", "passed": true, "score": 1.0 }),
+            json!({ "case": "c1", "passed": false, "score": 0.0 }),
+            json!({ "case": "c2", "passed": true, "score": 0.75 }),
+        ];
+        let path = write_samples(&id, samples.clone()).unwrap();
+        assert!(path.exists());
+        assert!(path.to_string_lossy().ends_with(".samples.jsonl"));
+
+        let got = read_samples(&id, 0, None).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0]["case"], json!("c0"));
+        assert_eq!(got[2]["score"], json!(0.75));
+
+        // offset + limit
+        let slice = read_samples(&id, 1, Some(1)).unwrap();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0]["case"], json!("c1"));
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn write_samples_is_write_once() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+        write_samples(&id, vec![json!({ "x": 1 })]).unwrap();
+        let err = write_samples(&id, vec![json!({ "x": 2 })]).unwrap_err();
+        assert!(err.contains("already exist"), "got: {err}");
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn read_samples_empty_when_absent() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+        let got = read_samples(&id, 0, None).unwrap();
+        assert!(got.is_empty());
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn samples_errors_on_missing_card() {
+        let err = write_samples("does_not_exist_xyz_samples", vec![json!({})]).unwrap_err();
+        assert!(err.contains("not found"));
     }
 }

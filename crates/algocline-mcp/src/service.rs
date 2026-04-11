@@ -305,6 +305,16 @@ pub struct CardAliasSetParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardSamplesParams {
+    /// Card ID whose sidecar samples to read.
+    pub card_id: String,
+    /// Skip this many rows from the start of the JSONL file. Default 0.
+    pub offset: Option<usize>,
+    /// Max rows returned. Omit to return everything from `offset`.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardAppendParams {
     /// Card ID to append fields to.
     pub card_id: String,
@@ -789,6 +799,22 @@ impl AlcService {
             .await
     }
 
+    /// Read per-case samples from a Card's sidecar JSONL file.
+    /// Returns `[]` when the Card has no samples sidecar.
+    /// Use `offset` + `limit` to page through large suites.
+    #[tool(
+        name = "alc_card_samples",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_samples(
+        &self,
+        Parameters(params): Parameters<CardSamplesParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_samples(&params.card_id, params.offset, params.limit)
+            .await
+    }
+
     // ─── Diagnostics ────────────────────────────────────────────
 
     /// Show algocline server configuration and diagnostic info.
@@ -847,7 +873,8 @@ impl ServerHandler for AlcService {
                  - alc_card_find: Filter/sort Cards by pkg/scenario/model/min_pass_rate with pass_rate or created_at sort.\n\
                  - alc_card_alias_list: List aliases from _aliases.toml.\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
-                 - alc_card_append: Append new top-level fields to a Card (additive-only).\n\n\
+                 - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
+                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

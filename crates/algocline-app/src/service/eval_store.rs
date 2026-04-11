@@ -103,9 +103,35 @@ pub(super) fn maybe_save_card(
     match algocline_engine::card::create(card) {
         Ok((card_id, _path)) => {
             tracing::info!("alc_eval auto_card=true: created card {card_id}");
+            maybe_write_samples(&card_id, result_obj);
         }
         Err(e) => {
             tracing::warn!("alc_eval auto_card: failed to create card: {e}");
+        }
+    }
+}
+
+/// Emit a per-case samples sidecar alongside an auto-created Card.
+///
+/// Reads `result.results[]` from the eval response (evalframe format)
+/// and writes each row as one JSONL line to `{card_id}.samples.jsonl`.
+/// Silently no-ops when the result has no per-case rows, when
+/// serialization fails, or when write_samples rejects (e.g. duplicate).
+fn maybe_write_samples(card_id: &str, result_obj: Option<&serde_json::Value>) {
+    let rows = match result_obj.and_then(|r| r.get("results")).and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a.clone(),
+        _ => return,
+    };
+    let count = rows.len();
+    match algocline_engine::card::write_samples(card_id, rows) {
+        Ok(path) => {
+            tracing::info!(
+                "alc_eval auto_card=true: wrote {count} samples → {}",
+                path.display()
+            );
+        }
+        Err(e) => {
+            tracing::warn!("alc_eval auto_card: failed to write samples: {e}");
         }
     }
 }

@@ -221,6 +221,14 @@ pub trait EngineApi: Send + Sync {
         fields: serde_json::Value,
     ) -> Result<String, String>;
 
+    /// Read per-case samples from a Card's sidecar JSONL file.
+    async fn card_samples(
+        &self,
+        card_id: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

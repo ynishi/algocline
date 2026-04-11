@@ -66,4 +66,14 @@ impl AppService {
         let merged = card::append(card_id, fields)?;
         Ok(merged.to_string())
     }
+
+    pub fn card_samples(
+        &self,
+        card_id: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        let rows = card::read_samples(card_id, offset, limit)?;
+        Ok(serde_json::Value::Array(rows).to_string())
+    }
 }

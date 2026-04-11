@@ -10,6 +10,7 @@ expression: names
   "alc_card_find",
   "alc_card_get",
   "alc_card_list",
+  "alc_card_samples",
   "alc_continue",
   "alc_eval",
   "alc_eval_compare",

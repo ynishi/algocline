@@ -224,6 +224,15 @@ impl EngineApi for AppService {
         AppService::card_append(self, card_id, fields)
     }
 
+    async fn card_samples(
+        &self,
+        card_id: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        AppService::card_samples(self, card_id, offset.unwrap_or(0), limit)
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

@@ -146,14 +146,23 @@ fn now_rfc3339() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-/// YYYYMMDD for current UTC date.
-fn today_compact() -> String {
+/// YYYYMMDDTHHMMSS for current UTC time (compact, sortable).
+///
+/// Used in card_id generation so that:
+///   - rapid successive runs don't collide on the hash6 segment
+///   - string sort of card_id = chronological order
+fn now_compact() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as i64;
-    let (y, mo, d) = civil_from_days(secs.div_euclid(86400));
-    format!("{y:04}{mo:02}{d:02}")
+    let days = secs.div_euclid(86400);
+    let tod = secs.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    let hh = tod / 3600;
+    let mm = (tod % 3600) / 60;
+    let ss = tod % 60;
+    format!("{y:04}{mo:02}{d:02}T{hh:02}{mm:02}{ss:02}")
 }
 
 /// Howard Hinnant's civil_from_days algorithm.
@@ -274,10 +283,10 @@ pub fn create(mut input: Json) -> Result<(String, PathBuf), String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let model_short = short_model(model_id);
-            let date = today_compact();
+            let ts = now_compact();
             let fp_seed = stable_json(&Json::Object(obj.clone()));
             let h = hash6(&fp_seed);
-            format!("{pkg_name}_{model_short}_{date}_{h}")
+            format!("{pkg_name}_{model_short}_{ts}_{h}")
         }
     };
     validate_name(&card_id, "card_id")?;
@@ -443,7 +452,14 @@ pub fn list(pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
         }
     }
 
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // Sort newest first. card_id embeds a compact UTC timestamp so it's
+    // naturally chronological; we still prefer created_at when present
+    // (some callers may override it), falling back to card_id.
+    out.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.card_id.cmp(&a.card_id))
+    });
     Ok(out)
 }
 
@@ -567,6 +583,36 @@ mod tests {
     #[test]
     fn get_missing_returns_none() {
         assert!(get("does_not_exist_xyz").unwrap().is_none());
+    }
+
+    #[test]
+    fn card_id_embeds_compact_timestamp() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+        // Expect: {pkg}_{model}_{YYYYMMDDTHHMMSS}_{hash6}
+        // After removing the pkg prefix, there should be a segment
+        // containing 'T' separating date and time.
+        let tail = id.strip_prefix(&format!("{pkg}_")).unwrap();
+        let parts: Vec<&str> = tail.split('_').collect();
+        // parts = [model_short, YYYYMMDDTHHMMSS, hash6]
+        assert_eq!(parts.len(), 3, "unexpected card_id shape: {id}");
+        let ts = parts[1];
+        assert_eq!(ts.len(), 15, "timestamp segment wrong length: {ts}");
+        assert!(ts.chars().nth(8) == Some('T'), "missing T separator: {ts}");
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn now_compact_format() {
+        let s = now_compact();
+        assert_eq!(s.len(), 15);
+        assert_eq!(s.chars().nth(8), Some('T'));
+        // All other positions are digits
+        for (i, c) in s.chars().enumerate() {
+            if i != 8 {
+                assert!(c.is_ascii_digit(), "non-digit at pos {i}: {s}");
+            }
+        }
     }
 
     #[test]

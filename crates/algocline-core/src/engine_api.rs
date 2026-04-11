@@ -183,6 +183,44 @@ pub trait EngineApi: Send + Sync {
     /// Backs up the old lock file as `alc.lock.bak`.
     async fn migrate(&self, project_root: Option<String>) -> Result<String, String>;
 
+    // ─── Cards ───────────────────────────────────────────────
+
+    /// List Card summaries, optionally filtered by pkg.
+    async fn card_list(&self, pkg: Option<String>) -> Result<String, String>;
+
+    /// Fetch a full Card by id.
+    async fn card_get(&self, card_id: &str) -> Result<String, String>;
+
+    /// Filter/sort Cards with optional pkg / scenario / model / sort / limit / min_pass_rate.
+    async fn card_find(
+        &self,
+        pkg: Option<String>,
+        scenario: Option<String>,
+        model: Option<String>,
+        sort: Option<String>,
+        limit: Option<usize>,
+        min_pass_rate: Option<f64>,
+    ) -> Result<String, String>;
+
+    /// List aliases, optionally filtered by pkg.
+    async fn card_alias_list(&self, pkg: Option<String>) -> Result<String, String>;
+
+    /// Bind (or rebind) an alias to a Card.
+    async fn card_alias_set(
+        &self,
+        name: &str,
+        card_id: &str,
+        pkg: Option<String>,
+        note: Option<String>,
+    ) -> Result<String, String>;
+
+    /// Append new top-level fields to an existing Card (additive-only).
+    async fn card_append(
+        &self,
+        card_id: &str,
+        fields: serde_json::Value,
+    ) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

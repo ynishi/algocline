@@ -180,6 +180,50 @@ impl EngineApi for AppService {
         AppService::migrate(self, project_root).await
     }
 
+    // ─── Cards ───────────────────────────────────────────────
+
+    async fn card_list(&self, pkg: Option<String>) -> Result<String, String> {
+        AppService::card_list(self, pkg.as_deref())
+    }
+
+    async fn card_get(&self, card_id: &str) -> Result<String, String> {
+        AppService::card_get(self, card_id)
+    }
+
+    async fn card_find(
+        &self,
+        pkg: Option<String>,
+        scenario: Option<String>,
+        model: Option<String>,
+        sort: Option<String>,
+        limit: Option<usize>,
+        min_pass_rate: Option<f64>,
+    ) -> Result<String, String> {
+        AppService::card_find(self, pkg, scenario, model, sort, limit, min_pass_rate)
+    }
+
+    async fn card_alias_list(&self, pkg: Option<String>) -> Result<String, String> {
+        AppService::card_alias_list(self, pkg.as_deref())
+    }
+
+    async fn card_alias_set(
+        &self,
+        name: &str,
+        card_id: &str,
+        pkg: Option<String>,
+        note: Option<String>,
+    ) -> Result<String, String> {
+        AppService::card_alias_set(self, name, card_id, pkg.as_deref(), note.as_deref())
+    }
+
+    async fn card_append(
+        &self,
+        card_id: &str,
+        fields: serde_json::Value,
+    ) -> Result<String, String> {
+        AppService::card_append(self, card_id, fields)
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

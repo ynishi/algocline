@@ -258,6 +258,61 @@ pub struct MigrateParams {
     pub project_root: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardListParams {
+    /// Optional pkg filter — restrict listing to `~/.algocline/cards/{pkg}/`.
+    pub pkg: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardGetParams {
+    /// Card ID (e.g. "prompt_ab_demo_opus46_20260412T120000_abc123").
+    pub card_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardFindParams {
+    /// Optional pkg filter.
+    pub pkg: Option<String>,
+    /// Optional scenario.name filter.
+    pub scenario: Option<String>,
+    /// Optional model.id filter.
+    pub model: Option<String>,
+    /// Sort mode: "pass_rate" (desc), "pass_rate_asc", or "created_at" (desc, default).
+    pub sort: Option<String>,
+    /// Max rows returned.
+    pub limit: Option<usize>,
+    /// Drop rows with stats.pass_rate below this threshold.
+    pub min_pass_rate: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardAliasListParams {
+    /// Optional pkg filter.
+    pub pkg: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardAliasSetParams {
+    /// Alias name (unique; rebinding overwrites).
+    pub name: String,
+    /// Card ID to bind. Must exist on disk.
+    pub card_id: String,
+    /// Optional pkg tag stored on the alias row.
+    pub pkg: Option<String>,
+    /// Optional free-form note.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardAppendParams {
+    /// Card ID to append fields to.
+    pub card_id: String,
+    /// Top-level fields to merge. Existing keys are rejected (Cards are
+    /// immutable for already-present data).
+    pub fields: serde_json::Value,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -643,6 +698,97 @@ impl AlcService {
         self.app.migrate(params.project_root).await
     }
 
+    // ─── Cards ──────────────────────────────────────────────────
+
+    /// List Card summaries from `~/.algocline/cards/`. Newest-first.
+    /// Each row: card_id, pkg, created_at, model, scenario, pass_rate.
+    #[tool(
+        name = "alc_card_list",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_list(
+        &self,
+        Parameters(params): Parameters<CardListParams>,
+    ) -> Result<String, String> {
+        self.app.card_list(params.pkg).await
+    }
+
+    /// Fetch a full Card (all fields) by card_id.
+    #[tool(
+        name = "alc_card_get",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_get(
+        &self,
+        Parameters(params): Parameters<CardGetParams>,
+    ) -> Result<String, String> {
+        self.app.card_get(&params.card_id).await
+    }
+
+    /// Filter/sort Cards. Thin layer over `alc_card_list` with
+    /// pkg/scenario/model/min_pass_rate filters and pass_rate/created_at sort.
+    #[tool(
+        name = "alc_card_find",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_find(
+        &self,
+        Parameters(params): Parameters<CardFindParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_find(
+                params.pkg,
+                params.scenario,
+                params.model,
+                params.sort,
+                params.limit,
+                params.min_pass_rate,
+            )
+            .await
+    }
+
+    /// List aliases from `~/.algocline/cards/_aliases.toml`.
+    #[tool(
+        name = "alc_card_alias_list",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_alias_list(
+        &self,
+        Parameters(params): Parameters<CardAliasListParams>,
+    ) -> Result<String, String> {
+        self.app.card_alias_list(params.pkg).await
+    }
+
+    /// Bind (or rebind) an alias to a Card. Aliases are mutable even
+    /// though Cards are not.
+    #[tool(
+        name = "alc_card_alias_set",
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn card_alias_set(
+        &self,
+        Parameters(params): Parameters<CardAliasSetParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_alias_set(&params.name, &params.card_id, params.pkg, params.note)
+            .await
+    }
+
+    /// Append new top-level fields to an existing Card.
+    /// Additive only — attempting to overwrite an existing key fails.
+    #[tool(
+        name = "alc_card_append",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn card_append(
+        &self,
+        Parameters(params): Parameters<CardAppendParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_append(&params.card_id, params.fields)
+            .await
+    }
+
     // ─── Diagnostics ────────────────────────────────────────────
 
     /// Show algocline server configuration and diagnostic info.
@@ -695,6 +841,13 @@ impl ServerHandler for AlcService {
                  - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail.\n\n\
                  Session Status:\n\
                  - alc_status: Query active session status. Omit session_id to list all, provide it for detail.\n\n\
+                 Cards (immutable run snapshots in ~/.algocline/cards/):\n\
+                 - alc_card_list: List Card summaries (newest-first). Filter by pkg.\n\
+                 - alc_card_get: Fetch a full Card by card_id.\n\
+                 - alc_card_find: Filter/sort Cards by pkg/scenario/model/min_pass_rate with pass_rate or created_at sort.\n\
+                 - alc_card_alias_list: List aliases from _aliases.toml.\n\
+                 - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
+                 - alc_card_append: Append new top-level fields to a Card (additive-only).\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

@@ -4,6 +4,12 @@ expression: names
 ---
 [
   "alc_advice",
+  "alc_card_alias_list",
+  "alc_card_alias_set",
+  "alc_card_append",
+  "alc_card_find",
+  "alc_card_get",
+  "alc_card_list",
   "alc_continue",
   "alc_eval",
   "alc_eval_compare",

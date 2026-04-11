@@ -467,6 +467,249 @@ pub fn summaries_to_json(rows: &[Summary]) -> Json {
     Json::Array(rows.iter().map(|s| s.to_json()).collect())
 }
 
+// ───────────────────────────────────────────────────────────────
+// P1 API: append / alias_{set,list} / find
+// ───────────────────────────────────────────────────────────────
+
+/// Append new top-level fields to an existing Card.
+///
+/// Semantics: **additive only**. If any top-level key in `fields` already
+/// exists in the Card, the call fails — Cards are immutable w.r.t. existing
+/// data. New top-level keys are inserted and the Card file is rewritten
+/// atomically.
+///
+/// Returns the merged Card JSON.
+pub fn append(card_id: &str, fields: Json) -> Result<Json, String> {
+    let path = find_card_path(card_id)?
+        .ok_or_else(|| format!("alc.card.append: card '{card_id}' not found"))?;
+    let fields_obj = match fields {
+        Json::Object(m) => m,
+        _ => return Err("alc.card.append: fields must be a table".into()),
+    };
+
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
+    let existing: toml::Value = toml::from_str(&text)
+        .map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
+    let mut existing_json = toml_to_json(existing);
+    let existing_obj = existing_json
+        .as_object_mut()
+        .ok_or_else(|| format!("Card '{card_id}' is not a table"))?;
+
+    for (k, v) in fields_obj {
+        if existing_obj.contains_key(&k) {
+            return Err(format!(
+                "alc.card.append: key '{k}' already set on card '{card_id}' (immutable)"
+            ));
+        }
+        if !v.is_null() {
+            existing_obj.insert(k, v);
+        }
+    }
+
+    let toml_val = json_to_toml(existing_json.clone())?;
+    let text = toml::to_string_pretty(&toml_val)
+        .map_err(|e| format!("Failed to serialize card TOML: {e}"))?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, &text).map_err(|e| format!("Failed to write card tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename card file: {e}"))?;
+
+    Ok(existing_json)
+}
+
+/// Path of the global alias table: `~/.algocline/cards/_aliases.toml`.
+fn aliases_path() -> Result<PathBuf, String> {
+    Ok(cards_dir()?.join("_aliases.toml"))
+}
+
+#[derive(Debug, Clone)]
+pub struct Alias {
+    pub name: String,
+    pub card_id: String,
+    pub pkg: Option<String>,
+    pub set_at: String,
+    pub note: Option<String>,
+}
+
+impl Alias {
+    fn to_json(&self) -> Json {
+        let mut m = serde_json::Map::new();
+        m.insert("name".into(), json!(self.name));
+        m.insert("card_id".into(), json!(self.card_id));
+        if let Some(p) = &self.pkg {
+            m.insert("pkg".into(), json!(p));
+        }
+        m.insert("set_at".into(), json!(self.set_at));
+        if let Some(n) = &self.note {
+            m.insert("note".into(), json!(n));
+        }
+        Json::Object(m)
+    }
+}
+
+fn read_aliases() -> Result<Vec<Alias>, String> {
+    let path = aliases_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read aliases file: {e}"))?;
+    let val: toml::Value = toml::from_str(&text)
+        .map_err(|e| format!("Failed to parse aliases file: {e}"))?;
+    let arr = val
+        .get("alias")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let t = match entry {
+            toml::Value::Table(t) => t,
+            _ => continue,
+        };
+        let name = match t.get("name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let card_id = match t.get("card_id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        out.push(Alias {
+            name,
+            card_id,
+            pkg: t.get("pkg").and_then(|v| v.as_str()).map(String::from),
+            set_at: t
+                .get("set_at")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_default(),
+            note: t.get("note").and_then(|v| v.as_str()).map(String::from),
+        });
+    }
+    Ok(out)
+}
+
+fn write_aliases(aliases: &[Alias]) -> Result<(), String> {
+    let path = aliases_path()?;
+    let mut arr = Vec::with_capacity(aliases.len());
+    for a in aliases {
+        let mut t = toml::map::Map::new();
+        t.insert("name".into(), toml::Value::String(a.name.clone()));
+        t.insert("card_id".into(), toml::Value::String(a.card_id.clone()));
+        if let Some(p) = &a.pkg {
+            t.insert("pkg".into(), toml::Value::String(p.clone()));
+        }
+        t.insert("set_at".into(), toml::Value::String(a.set_at.clone()));
+        if let Some(n) = &a.note {
+            t.insert("note".into(), toml::Value::String(n.clone()));
+        }
+        arr.push(toml::Value::Table(t));
+    }
+    let mut root = toml::map::Map::new();
+    root.insert("alias".into(), toml::Value::Array(arr));
+    let text = toml::to_string_pretty(&toml::Value::Table(root))
+        .map_err(|e| format!("Failed to serialize aliases: {e}"))?;
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, &text).map_err(|e| format!("Failed to write aliases tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename aliases file: {e}"))?;
+    Ok(())
+}
+
+/// Bind (or rebind) an alias to a Card.
+///
+/// Validates that `card_id` exists. If an alias with the same `name` already
+/// exists it is overwritten — the alias table is intentionally mutable even
+/// though the Cards themselves are not.
+pub fn alias_set(
+    name: &str,
+    card_id: &str,
+    pkg: Option<&str>,
+    note: Option<&str>,
+) -> Result<Alias, String> {
+    validate_name(name, "alias")?;
+    if find_card_path(card_id)?.is_none() {
+        return Err(format!("alc.card.alias_set: card '{card_id}' not found"));
+    }
+    let mut aliases = read_aliases()?;
+    aliases.retain(|a| a.name != name);
+    let entry = Alias {
+        name: name.to_string(),
+        card_id: card_id.to_string(),
+        pkg: pkg.map(String::from),
+        set_at: now_rfc3339(),
+        note: note.map(String::from),
+    };
+    aliases.push(entry.clone());
+    write_aliases(&aliases)?;
+    Ok(entry)
+}
+
+/// List aliases, optionally filtered by pkg.
+pub fn alias_list(pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
+    let mut aliases = read_aliases()?;
+    if let Some(p) = pkg_filter {
+        aliases.retain(|a| a.pkg.as_deref() == Some(p));
+    }
+    Ok(aliases)
+}
+
+pub fn aliases_to_json(rows: &[Alias]) -> Json {
+    Json::Array(rows.iter().map(|a| a.to_json()).collect())
+}
+
+/// Query parameters for `find`. All filters are optional.
+#[derive(Debug, Default, Clone)]
+pub struct FindQuery {
+    pub pkg: Option<String>,
+    pub scenario: Option<String>,
+    pub model: Option<String>,
+    /// One of: `"pass_rate"` (desc), `"pass_rate_asc"`, `"created_at"` (desc, default).
+    pub sort: Option<String>,
+    pub limit: Option<usize>,
+    pub min_pass_rate: Option<f64>,
+}
+
+/// Filter/sort Cards across the store.
+///
+/// Thin layer over `list`: loads all summaries (optionally restricted to
+/// a pkg subdir), applies field filters, sorts, and truncates.
+pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
+    let mut rows = list(q.pkg.as_deref())?;
+    if let Some(s) = &q.scenario {
+        rows.retain(|r| r.scenario.as_deref() == Some(s.as_str()));
+    }
+    if let Some(m) = &q.model {
+        rows.retain(|r| r.model.as_deref() == Some(m.as_str()));
+    }
+    if let Some(min) = q.min_pass_rate {
+        rows.retain(|r| r.pass_rate.is_some_and(|v| v >= min));
+    }
+    match q.sort.as_deref() {
+        Some("pass_rate") => rows.sort_by(|a, b| {
+            b.pass_rate
+                .partial_cmp(&a.pass_rate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        Some("pass_rate_asc") => rows.sort_by(|a, b| {
+            a.pass_rate
+                .partial_cmp(&b.pass_rate)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        _ => {
+            rows.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.card_id.cmp(&a.card_id))
+            });
+        }
+    }
+    if let Some(lim) = q.limit {
+        rows.truncate(lim);
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +863,168 @@ mod tests {
         assert_eq!(short_model("claude-opus-4-6"), "opus46");
         assert_eq!(short_model("gpt-4o"), "4o");
         assert_eq!(short_model(""), "model");
+    }
+
+    // ─── P1: append ────────────────────────────────────────────
+
+    #[test]
+    fn append_adds_new_fields() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.5 }
+        }))
+        .unwrap();
+
+        let merged = append(
+            &id,
+            json!({
+                "caveats": { "notes": "rescored after fix" },
+                "metadata": { "reviewer": "yn" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(merged["caveats"]["notes"], json!("rescored after fix"));
+        assert_eq!(merged["metadata"]["reviewer"], json!("yn"));
+
+        // Persisted
+        let got = get(&id).unwrap().unwrap();
+        assert_eq!(got["caveats"]["notes"], json!("rescored after fix"));
+        // Existing field untouched
+        assert_eq!(got["stats"]["pass_rate"], json!(0.5));
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn append_rejects_existing_key() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.5 }
+        }))
+        .unwrap();
+
+        let err = append(&id, json!({ "stats": { "pass_rate": 0.9 } })).unwrap_err();
+        assert!(err.contains("already set"), "got: {err}");
+        // Verify original value still there
+        let got = get(&id).unwrap().unwrap();
+        assert_eq!(got["stats"]["pass_rate"], json!(0.5));
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn append_errors_on_missing_card() {
+        let err = append("does_not_exist_xyz", json!({ "x": 1 })).unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    // ─── P1: alias_set / alias_list ────────────────────────────
+
+    #[test]
+    fn alias_set_and_list_roundtrip() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+
+        let alias_name = format!("test_alias_{}", &pkg);
+        alias_set(&alias_name, &id, Some(&pkg), Some("smoke")).unwrap();
+
+        let rows = alias_list(Some(&pkg)).unwrap();
+        let a = rows.iter().find(|a| a.name == alias_name).unwrap();
+        assert_eq!(a.card_id, id);
+        assert_eq!(a.pkg.as_deref(), Some(pkg.as_str()));
+        assert_eq!(a.note.as_deref(), Some("smoke"));
+        assert!(!a.set_at.is_empty());
+
+        // Rebind to a new card
+        let (id2, _) = create(json!({
+            "card_id": format!("{pkg}_b"),
+            "pkg": { "name": pkg }
+        }))
+        .unwrap();
+        alias_set(&alias_name, &id2, Some(&pkg), None).unwrap();
+        let rows = alias_list(Some(&pkg)).unwrap();
+        let matching: Vec<&Alias> = rows.iter().filter(|a| a.name == alias_name).collect();
+        assert_eq!(matching.len(), 1, "alias should be unique by name");
+        assert_eq!(matching[0].card_id, id2);
+
+        // Cleanup: remove our alias from the file
+        let remaining: Vec<Alias> = read_aliases()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.name != alias_name)
+            .collect();
+        write_aliases(&remaining).unwrap();
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn alias_set_rejects_unknown_card() {
+        let err = alias_set("x", "does_not_exist_xyz", None, None).unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    // ─── P1: find ──────────────────────────────────────────────
+
+    #[test]
+    fn find_filters_and_sorts_by_pass_rate() {
+        let pkg = unique_pkg();
+        create(json!({
+            "card_id": format!("{pkg}_low"),
+            "pkg": { "name": pkg },
+            "scenario": { "name": "gsm8k" },
+            "stats": { "pass_rate": 0.4 }
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_high"),
+            "pkg": { "name": pkg },
+            "scenario": { "name": "gsm8k" },
+            "stats": { "pass_rate": 0.9 }
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_other"),
+            "pkg": { "name": pkg },
+            "scenario": { "name": "other" },
+            "stats": { "pass_rate": 1.0 }
+        }))
+        .unwrap();
+
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            scenario: Some("gsm8k".into()),
+            sort: Some("pass_rate".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pass_rate, Some(0.9));
+        assert_eq!(rows[1].pass_rate, Some(0.4));
+
+        // min_pass_rate filter
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            min_pass_rate: Some(0.8),
+            sort: Some("pass_rate".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.pass_rate.unwrap() >= 0.8));
+
+        // limit
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            sort: Some("pass_rate".into()),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pass_rate, Some(1.0));
+
+        cleanup(&pkg);
     }
 }

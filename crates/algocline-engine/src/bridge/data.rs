@@ -88,14 +88,19 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
     Ok(())
 }
 
-/// Register `alc.card` table with create/get/list (v0 P0 API).
+/// Register `alc.card` table with v0 P0+P1 API.
+///
+/// P0 (minimum viable): create / get / list
+/// P1 (observation-driven additions): append / alias_set / alias_list / find
 ///
 /// Lua usage:
 ///   local c = alc.card.create({ pkg = { name = "cot" }, model = {...}, stats = {...} })
-///   -- c = { card_id = "...", path = "..." }
-///
 ///   local card = alc.card.get("cot_opus46_20260412_a3f9c1")
-///   local rows = alc.card.list({ pkg = "cot" })  -- or alc.card.list()
+///   alc.card.list({ pkg = "cot" })
+///   alc.card.append("cot_...", { caveats = { notes = "rescored" } })
+///   alc.card.alias_set("best_on_gsm8k", "cot_...", { pkg = "cot", note = "..." })
+///   alc.card.alias_list({ pkg = "cot" })
+///   alc.card.find({ pkg = "cot", scenario = "gsm8k", sort = "pass_rate", limit = 5 })
 pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     let card_table = lua.create_table()?;
 
@@ -126,9 +131,68 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
         lua.to_value(&card::summaries_to_json(&rows))
     })?;
 
+    // alc.card.append(card_id, fields) -> merged_card
+    let append = lua.create_function(|lua, (card_id, fields): (String, LuaValue)| {
+        let json: serde_json::Value = lua.from_value(fields)?;
+        let merged = card::append(&card_id, json).map_err(LuaError::external)?;
+        lua.to_value(&merged)
+    })?;
+
+    // alc.card.alias_set(name, card_id, opts?) -> alias
+    let alias_set = lua.create_function(
+        |lua, (name, card_id, opts): (String, String, Option<LuaTable>)| {
+            let (pkg, note) = match opts {
+                Some(t) => (
+                    t.get::<Option<String>>("pkg")?,
+                    t.get::<Option<String>>("note")?,
+                ),
+                None => (None, None),
+            };
+            let a = card::alias_set(&name, &card_id, pkg.as_deref(), note.as_deref())
+                .map_err(LuaError::external)?;
+            let arr = card::aliases_to_json(&[a]);
+            let first = match arr {
+                serde_json::Value::Array(mut v) if !v.is_empty() => v.remove(0),
+                other => other,
+            };
+            lua.to_value(&first)
+        },
+    )?;
+
+    // alc.card.alias_list(filter?) -> [alias]
+    let alias_list = lua.create_function(|lua, filter: Option<LuaTable>| {
+        let pkg = match filter {
+            Some(t) => t.get::<Option<String>>("pkg")?,
+            None => None,
+        };
+        let rows = card::alias_list(pkg.as_deref()).map_err(LuaError::external)?;
+        lua.to_value(&card::aliases_to_json(&rows))
+    })?;
+
+    // alc.card.find(query?) -> [summary]
+    let find = lua.create_function(|lua, query: Option<LuaTable>| {
+        let q = match query {
+            Some(t) => card::FindQuery {
+                pkg: t.get::<Option<String>>("pkg")?,
+                scenario: t.get::<Option<String>>("scenario")?,
+                model: t.get::<Option<String>>("model")?,
+                sort: t.get::<Option<String>>("sort")?,
+                limit: t.get::<Option<usize>>("limit")?,
+                min_pass_rate: t.get::<Option<f64>>("min_pass_rate")?,
+            },
+            None => card::FindQuery::default(),
+        };
+        let rows = card::find(q).map_err(LuaError::external)?;
+        lua.to_value(&card::summaries_to_json(&rows))
+    })?;
+
     card_table.set("create", create)?;
     card_table.set("get", get)?;
     card_table.set("list", list)?;
+    card_table.set("append", append)?;
+    card_table.set("alias_set", alias_set)?;
+    card_table.set("alias_list", alias_list)?;
+    card_table.set("find", find)?;
 
     alc_table.set("card", card_table)?;
     Ok(())

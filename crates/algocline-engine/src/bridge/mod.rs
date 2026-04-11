@@ -49,6 +49,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     fuzzy::register_fuzzy(lua, alc_table)?;
     data::register_log(lua, alc_table)?;
     data::register_state(lua, alc_table, config.ns)?;
+    data::register_card(lua, alc_table)?;
     text::register_chunk(lua, alc_table)?;
     data::register_stats(lua, alc_table, config.custom_metrics)?;
     register_time(lua, alc_table)?;

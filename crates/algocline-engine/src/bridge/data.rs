@@ -2,6 +2,7 @@ use algocline_core::CustomMetricsHandle;
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 
+use crate::card;
 use crate::state;
 
 pub(super) fn register_json(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
@@ -84,6 +85,52 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
     state_table.set("delete", delete)?;
 
     alc_table.set("state", state_table)?;
+    Ok(())
+}
+
+/// Register `alc.card` table with create/get/list (v0 P0 API).
+///
+/// Lua usage:
+///   local c = alc.card.create({ pkg = { name = "cot" }, model = {...}, stats = {...} })
+///   -- c = { card_id = "...", path = "..." }
+///
+///   local card = alc.card.get("cot_opus46_20260412_a3f9c1")
+///   local rows = alc.card.list({ pkg = "cot" })  -- or alc.card.list()
+pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let card_table = lua.create_table()?;
+
+    // alc.card.create(table) -> { card_id, path }
+    let create = lua.create_function(|lua, input: LuaValue| {
+        let json: serde_json::Value = lua.from_value(input)?;
+        let (card_id, path) = card::create(json).map_err(LuaError::external)?;
+        let ret = lua.create_table()?;
+        ret.set("card_id", card_id)?;
+        ret.set("path", path.to_string_lossy().to_string())?;
+        Ok(ret)
+    })?;
+
+    // alc.card.get(card_id) -> table | nil
+    let get = lua.create_function(|lua, card_id: String| match card::get(&card_id) {
+        Ok(Some(v)) => lua.to_value(&v),
+        Ok(None) => Ok(LuaValue::Nil),
+        Err(e) => Err(LuaError::external(e)),
+    })?;
+
+    // alc.card.list(filter?) -> [summary]
+    let list = lua.create_function(|lua, filter: Option<LuaTable>| {
+        let pkg = match filter {
+            Some(t) => t.get::<Option<String>>("pkg")?,
+            None => None,
+        };
+        let rows = card::list(pkg.as_deref()).map_err(LuaError::external)?;
+        lua.to_value(&card::summaries_to_json(&rows))
+    })?;
+
+    card_table.set("create", create)?;
+    card_table.set("get", get)?;
+    card_table.set("list", list)?;
+
+    alc_table.set("card", card_table)?;
     Ok(())
 }
 
@@ -221,6 +268,55 @@ mod tests {
 
         // Clean up
         let _ = crate::state::delete(ns, "x");
+    }
+
+    #[test]
+    fn card_create_get_list_from_lua() {
+        // Use a unique pkg name per-run to avoid clobbering real cards.
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pkg = format!("_test_bridge_card_{ns}");
+
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        crate::bridge::register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // create
+        let create_script = format!(
+            r#"
+            local r = alc.card.create({{
+                pkg = {{ name = "{pkg}" }},
+                model = {{ id = "claude-opus-4-6" }},
+                stats = {{ pass_rate = 0.9 }},
+            }})
+            return r.card_id
+        "#
+        );
+        let card_id: String = lua.load(&create_script).eval().unwrap();
+        assert!(card_id.starts_with(&pkg));
+
+        // get
+        let get_script = format!(r#"return alc.card.get("{card_id}").stats.pass_rate"#);
+        let rate: f64 = lua.load(&get_script).eval().unwrap();
+        assert!((rate - 0.9).abs() < 1e-9);
+
+        // list (filtered by pkg)
+        let list_script = format!(
+            r#"
+            local rows = alc.card.list({{ pkg = "{pkg}" }})
+            return #rows
+        "#
+        );
+        let count: i64 = lua.load(&list_script).eval().unwrap();
+        assert_eq!(count, 1);
+
+        // Cleanup
+        if let Some(home) = dirs::home_dir() {
+            let _ = std::fs::remove_dir_all(home.join(".algocline").join("cards").join(&pkg));
+        }
     }
 
     #[test]

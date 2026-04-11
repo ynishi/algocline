@@ -59,9 +59,16 @@ fn djb2_hex(s: &str) -> String {
     format!("{h:016x}")
 }
 
-/// Short-hash: first 6 hex chars of djb2.
+/// Short-hash: last 6 hex chars of djb2.
+///
+/// DJB2's high bits are dominated by the `5381 * 33^n` term (same for any
+/// input of equal length), so the top hex digits collide easily for same-
+/// length inputs that differ only in a few byte positions. The low bits,
+/// driven by the most-recent bytes, mix well enough for short-hash use.
 fn hash6(s: &str) -> String {
-    djb2_hex(s).chars().take(6).collect()
+    let hex = djb2_hex(s);
+    let start = hex.len().saturating_sub(6);
+    hex[start..].to_string()
 }
 
 /// Stable serialization of a JSON value for hashing (sorted keys).
@@ -863,6 +870,25 @@ mod tests {
         assert_eq!(short_model("claude-opus-4-6"), "opus46");
         assert_eq!(short_model("gpt-4o"), "4o");
         assert_eq!(short_model(""), "model");
+    }
+
+    #[test]
+    fn two_cards_same_second_different_stats_get_distinct_ids() {
+        let pkg = unique_pkg();
+        let input1 = json!({
+            "pkg": { "name": pkg },
+            "scenario": { "name": "gsm8k" },
+            "stats": { "pass_rate": 0.4 }
+        });
+        let input2 = json!({
+            "pkg": { "name": pkg },
+            "scenario": { "name": "gsm8k" },
+            "stats": { "pass_rate": 0.9 }
+        });
+        let (id1, _) = create(input1).unwrap();
+        let (id2, _) = create(input2).unwrap();
+        assert_ne!(id1, id2, "distinct stats must yield distinct card_ids");
+        cleanup(&pkg);
     }
 
     // ─── P1: append ────────────────────────────────────────────

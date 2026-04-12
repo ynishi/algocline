@@ -1,19 +1,77 @@
-//! Hub — Remote Index search with local merge.
+//! Hub — package discovery, search, and index management.
 //!
-//! Discovers index URLs from four sources (in priority order):
-//!   0. Hub Collection URL (`~/.algocline/config.toml` `[hub]` section) —
-//!      aggregated index containing all known packages (Stage 3)
-//!   1. Hub registries (`~/.algocline/hub_registries.json`) — auto-populated
-//!      by `pkg_install` and `card_install`
-//!   2. Installed-packages manifest (`~/.algocline/installed.json`) — fallback
-//!      for sources registered before registries existed
-//!   3. `AUTO_INSTALL_SOURCES` — compiled-in seeds for first-run
+//! The Hub is algocline's package registry layer.  It aggregates remote
+//! index data with local install state so that users (via AI) can
+//! **discover** packages they haven't installed yet, and **inspect**
+//! installed packages with full Card and eval statistics.
 //!
-//! Fetches each remote index, merges with locally installed packages
-//! and cards, and returns search results with `installed: true/false`.
+//! ## Staged design
+//!
+//! | Stage | Scope | Status |
+//! |-------|-------|--------|
+//! | **1** | Card Collection install, Pkg-bundled cards | Done |
+//! | **2** | Hub MCP tools (`hub_search`, `hub_info`, `hub_reindex`), local index | Done |
+//! | **3** | Aggregated remote collection index, `hub_publish`, LP | Planned |
+//!
+//! ## MCP tools
+//!
+//! | Tool | Description |
+//! |------|-------------|
+//! | `alc_hub_search` | Discover packages across remote + local indices |
+//! | `alc_hub_info` | Detailed single-package view (meta + cards + aliases + stats) |
+//! | `alc_hub_reindex` | Rebuild index from local packages or a repo checkout |
+//!
+//! ## Index schema (`hub_index/v0`)
+//!
+//! ```json
+//! {
+//!   "schema_version": "hub_index/v0",
+//!   "updated_at": "2026-04-12T10:00:00Z",
+//!   "packages": [{
+//!     "name": "cot",
+//!     "version": "0.1.0",
+//!     "description": "Chain-of-Thought prompting",
+//!     "category": "reasoning",
+//!     "source": "https://github.com/...",
+//!     "card_count": 3,
+//!     "best_card": { "card_id": "...", "model": "...", "pass_rate": 0.82, "scenario": "..." }
+//!   }]
+//! }
+//! ```
+//!
+//! Index generation uses `init.lua` M.meta parsing only — no Lua VM
+//! required.  This keeps the index buildable in CI environments.
+//!
+//! ## Index URL discovery (4-tier)
+//!
+//! Sources are checked in priority order; URLs are deduplicated:
+//!
+//!   0. **Collection URL** — `[hub].collection_url` in `~/.algocline/config.toml`.
+//!      Aggregated index containing all known packages (Stage 3).
+//!   1. **Hub registries** — `~/.algocline/hub_registries.json`, auto-populated
+//!      by `pkg_install` and `card_install`.
+//!   2. **Installed manifest** — `~/.algocline/installed.json`, fallback for
+//!      sources registered before registries existed.
+//!   3. **Compiled-in seeds** — `AUTO_INSTALL_SOURCES` for first-run bootstrap.
+//!
+//! GitHub repo URLs are transformed to raw index URLs:
+//!
+//! ```text
+//! https://github.com/{owner}/{repo}
+//!   → https://raw.githubusercontent.com/{owner}/{repo}/main/hub_index.json
+//! ```
+//!
+//! ## Caching
 //!
 //! Remote indices are cached per-source at
-//! `~/.algocline/hub_cache/{hash}.json` with a TTL of 1 hour.
+//! `~/.algocline/hub_cache/{hash}.json` where hash is FNV-1a of the
+//! URL.  TTL is 1 hour.
+//!
+//! ## Registry persistence
+//!
+//! `~/.algocline/hub_registries.json` records source URLs from
+//! `pkg_install` and `card_install`.  Written atomically (tempfile +
+//! rename) to avoid corruption on interruption.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

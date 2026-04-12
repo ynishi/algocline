@@ -1,5 +1,24 @@
 //! Card storage — immutable run-result snapshots.
 //!
+//! A Card is a frozen record of a strategy run: identity, parameters,
+//! model, scenario, aggregate stats, and (optionally) per-case detail.
+//! Cards are **immutable** — once written they are never modified, only
+//! annotated via additive `append`.  Mutable **aliases** point to a
+//! Card and can be rebound freely.
+//!
+//! ## Design principles
+//!
+//! 1. **Minimal REQUIRED, maximal OPTIONAL** — v0 needs only 4 fields;
+//!    lightweight "ran this pkg" records and heavy optimize snapshots
+//!    share the same schema.
+//! 2. **Immutable append-only** — no overwrite, no delete.  New data is
+//!    added via `append` (new top-level keys only) or by creating a new
+//!    Card with a fresh `card_id`.
+//! 3. **Two-tier storage** — TOML for human-readable aggregate, JSONL
+//!    sidecar for machine-parseable per-case detail.
+//! 4. **File-primary** — files are the source of truth; in-memory state
+//!    is cache.  Cards can be copied, diffed, and version-controlled.
+//!
 //! ## Storage layout (two-tier)
 //!
 //! | Tier | File | Content |
@@ -8,13 +27,44 @@
 //! | **Tier 2** | `~/.algocline/cards/{pkg}/{card_id}.samples.jsonl` | Per-case raw data (JSONL, write-once) |
 //!
 //! Tier 1 holds a shareable summary (a few KB). Tier 2 holds per-case
-//! detail — the engine does not interpret its columns; packages define
+//! detail ��� the engine does not interpret its columns; packages define
 //! their own schema.
+//!
+//! Alias table: `~/.algocline/cards/_aliases.toml` (global).
+//!
+//! ## card_id naming
+//!
+//! `{pkg}_{model_short}_{compact_ts}_{hash6}`
+//!
+//! - `compact_ts`: `YYYYMMDDTHHMMSS` in UTC
+//! - `hash6`: first 6 hex chars of DJB2 param fingerprint
+//! - Example: `cot_opus46_20260412T061500_a3f9c1`
 //!
 //! ## v0 schema (frozen)
 //!
-//! REQUIRED fields: `schema_version`, `card_id`, `created_at`, `[pkg].name`.
-//! Everything else is OPTIONAL and auto-injected where possible.
+//! ### REQUIRED (minimum valid Card)
+//!
+//! | Field | Type | Example |
+//! |-------|------|---------|
+//! | `schema_version` | string | `"card/v0"` |
+//! | `card_id` | string | `"cot_opus46_20260412T061500_a3f9c1"` |
+//! | `created_at` | string (RFC 3339) | `"2026-04-12T06:15:00Z"` |
+//! | `[pkg].name` | string | `"cot"` |
+//!
+//! ### OPTIONAL (auto-injected where possible)
+//!
+//! | Section | Fields |
+//! |---------|--------|
+//! | `[pkg]` | `version`, `category`, `source`, `source_ref`, `source_sha` |
+//! | `[runtime]` | `alc_version`, `lua_version`, `host_os`, `git_sha` |
+//! | `[model]` | `provider`, `id`, `id_short`, `cutoff` |
+//! | `[params]` | Free-form ctx snapshot; `param_fingerprint` for DJB2 hash |
+//! | `[scenario]` | `name`, `source`, `case_count`, `grader` |
+//! | `[stats]` | `pass_rate`, `mean_score`, `std`, `median`, `min`, `max`, `n` |
+//! | `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |
+//! | `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |
+//! | `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |
+//! | `[metadata]` | Free-form escape hatch for unstandardized fields |
 //!
 //! ## Lua API (`alc.card.*`)
 //!

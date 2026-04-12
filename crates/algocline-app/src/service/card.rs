@@ -3,6 +3,9 @@
 //! Thin adapter between MCP tool handlers and [`algocline_engine::card`].
 //! All data flows through the engine; this layer handles JSON
 //! serialization for the MCP transport.
+//!
+//! For Card schema, storage layout, and design principles, see
+//! [`algocline_engine::card`] module documentation.
 
 use std::path::Path;
 

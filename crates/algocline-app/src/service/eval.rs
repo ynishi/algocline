@@ -1,27 +1,53 @@
 use super::eval_store::{
-    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, maybe_save_card,
+    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history,
     save_compare_result, save_eval_result,
 };
 use super::path::ContainedPath;
 use super::resolve::{is_package_installed, resolve_scenario_code};
-use super::{AppService, EvalSessionInfo};
+use super::AppService;
+
+/// Lua shim that bridges algocline's `alc.*` primitives to the `std` global
+/// expected by evalframe.std. Injected once before any evalframe code runs.
+const STD_SHIM: &str = r#"
+std = {
+  json = {
+    decode = alc.json_decode,
+    encode = alc.json_encode,
+  },
+  fs = {
+    read = function(path)
+      local f, err = io.open(path, "r")
+      if not f then error("std.fs.read: " .. (err or path), 2) end
+      local content = f:read("*a")
+      f:close()
+      return content
+    end,
+    is_file = function(path)
+      local f = io.open(path, "r")
+      if f then f:close(); return true end
+      return false
+    end,
+  },
+  time = {
+    now = alc.time,
+  },
+}
+"#;
 
 impl AppService {
-    /// Run an evalframe evaluation suite.
+    /// Run an evalframe evaluation suite via `alc.eval()`.
     ///
-    /// Accepts a scenario (bindings + cases) and a strategy name.
-    /// Automatically wires the strategy as the provider and executes
-    /// the evalframe suite, returning the report (summary, scores, failures).
-    ///
-    /// Injects a `std` global (mlua-batteries compatible shim) so evalframe's
-    /// `std.lua` can resolve json/fs/time from algocline's built-in primitives.
+    /// Resolves the scenario from one of three input modes (inline/file/name),
+    /// injects the `std` global shim, and delegates to `alc.eval()` in prelude
+    /// which handles evalframe loading, provider wiring, and optional Card
+    /// emission.
     ///
     /// # Security: `strategy` is not sanitized
     ///
     /// `strategy` is interpolated into a Lua string literal without escaping.
-    /// This is intentional — same rationale as [`make_require_code`]:
-    /// algocline runs Lua in the caller's own process with full ambient
-    /// authority, so Lua injection does not cross a trust boundary.
+    /// This is intentional — algocline runs Lua in the caller's own process
+    /// with full ambient authority, so Lua injection does not cross a trust
+    /// boundary.
     pub async fn eval(
         &self,
         scenario: Option<String>,
@@ -49,61 +75,27 @@ impl AppService {
         // Build strategy opts Lua table literal
         let opts_lua = match &strategy_opts {
             Some(v) if !v.is_null() => format!("alc.json_decode('{}')", v),
-            _ => "{}".to_string(),
+            _ => "nil".to_string(),
         };
 
-        // Inject `std` global as a mlua-batteries compatible shim.
-        //
-        // evalframe.std expects the host to provide a `std` global with:
-        //   std.json.decode/encode  — JSON serialization
-        //   std.fs.read/is_file     — filesystem access
-        //   std.time.now            — wall-clock time (epoch seconds, f64)
-        //
-        // We bridge these from algocline's alc.* primitives and Lua's io stdlib.
+        let auto_card_lua = if auto_card { "true" } else { "false" };
+
+        // Delegate to alc.eval() in prelude.
+        // The shim injects `std` for evalframe, then the scenario code is
+        // evaluated into a table and passed to alc.eval() along with opts.
         let wrapped = format!(
-            r#"
-std = {{
-  json = {{
-    decode = alc.json_decode,
-    encode = alc.json_encode,
-  }},
-  fs = {{
-    read = function(path)
-      local f, err = io.open(path, "r")
-      if not f then error("std.fs.read: " .. (err or path), 2) end
-      local content = f:read("*a")
-      f:close()
-      return content
-    end,
-    is_file = function(path)
-      local f = io.open(path, "r")
-      if f then f:close(); return true end
-      return false
-    end,
-  }},
-  time = {{
-    now = alc.time,
-  }},
-}}
+            r#"{std_shim}
 
-local ef = require("evalframe")
-
--- Load scenario (bindings + cases, no provider)
-local spec = (function()
+local scenario = (function()
 {scenario_code}
 end)()
 
--- Inject strategy as provider
-spec.provider = ef.providers.algocline {{
-  strategy = "{strategy}",
-  opts = {opts_lua},
-}}
-
--- Build and run suite
-local s = ef.suite "eval" (spec)
-local report = s:run()
-return report:to_table()
-"#
+return alc.eval(scenario, "{strategy}", {{
+  strategy_opts = {opts_lua},
+  auto_card = {auto_card_lua},
+}})
+"#,
+            std_shim = STD_SHIM,
         );
 
         let ctx = serde_json::Value::Null;
@@ -111,26 +103,17 @@ return report:to_table()
             .start_and_tick(wrapped, ctx, Some(strategy), vec![])
             .await?;
 
-        // Register this session for eval result saving on completion.
-        // start_and_tick returns the first pause (needs_response) or completed.
-        // If completed immediately, save now. Otherwise, save when continue_* finishes.
+        // Persist eval result for history/comparison.
+        // Card emission is handled by alc.eval() Lua-side when auto_card=true.
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
             match parsed.get("status").and_then(|s| s.as_str()) {
                 Some("completed") => {
                     save_eval_result(strategy, &result);
-                    maybe_save_card(strategy, scenario_name.as_deref(), &result, auto_card);
                 }
                 Some("needs_response") => {
                     if let Some(sid) = parsed.get("session_id").and_then(|s| s.as_str()) {
                         if let Ok(mut map) = self.eval_sessions.lock() {
-                            map.insert(
-                                sid.to_string(),
-                                EvalSessionInfo {
-                                    strategy: strategy.to_string(),
-                                    auto_card,
-                                    scenario_name: scenario_name.clone(),
-                                },
-                            );
+                            map.insert(sid.to_string(), strategy.to_string());
                         }
                     }
                 }

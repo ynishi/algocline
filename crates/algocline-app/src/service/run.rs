@@ -144,14 +144,8 @@ impl AppService {
             };
             map.remove(session_id)
         };
-        if let Some(info) = info {
-            super::eval_store::save_eval_result(&info.strategy, result_json);
-            super::eval_store::maybe_save_card(
-                &info.strategy,
-                info.scenario_name.as_deref(),
-                result_json,
-                info.auto_card,
-            );
+        if let Some(strategy) = info {
+            super::eval_store::save_eval_result(&strategy, result_json);
         }
     }
 

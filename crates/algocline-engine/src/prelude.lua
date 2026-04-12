@@ -670,7 +670,7 @@ do
             end
             return grader_fn
         end
-        if type(g) == "table" and g._is_binding then
+        if type(g) == "table" and ef.bind.is_binding(g) then
             return g -- already a binding, pass through
         end
         error("alc.eval: grader must be string name or function, got " .. type(g))
@@ -680,7 +680,7 @@ do
     local function resolve_cases(ef, raw_cases)
         local cases = {}
         for i, c in ipairs(raw_cases) do
-            if type(c) == "table" and c._is_case then
+            if type(c) == "table" and ef.case.is_case(c) then
                 cases[i] = c
             elseif type(c) == "table" and c.input then
                 cases[i] = ef.case(c)
@@ -696,7 +696,7 @@ do
         -- Full form: spec already contains ef.bind entries as indexed elements
         local has_bindings = false
         for i = 1, #spec do
-            if type(spec[i]) == "table" and spec[i]._is_binding then
+            if type(spec[i]) == "table" and ef.bind.is_binding(spec[i]) then
                 has_bindings = true
                 break
             end
@@ -788,7 +788,7 @@ do
             scenario_name = scenario.name
             spec = scenario
         else
-            error("alc.eval: scenario must be string or table")
+            error("alc.eval: scenario must be a string or table")
         end
 
         -- 3. Build provider
@@ -799,7 +799,8 @@ do
 
         -- 4. Build and run suite
         local suite_spec = build_suite_spec(ef, spec, provider)
-        local suite = ef.suite("eval")(suite_spec)
+        local suite_name = strategy .. ":" .. (scenario_name or "inline")
+        local suite = ef.suite(suite_name)(suite_spec)
         local report = suite:run():to_table()
 
         -- 5. Auto-card

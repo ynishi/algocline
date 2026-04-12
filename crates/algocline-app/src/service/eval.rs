@@ -1,6 +1,6 @@
 use super::eval_store::{
-    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history,
-    save_compare_result, save_eval_result,
+    escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, save_compare_result,
+    save_eval_result,
 };
 use super::path::ContainedPath;
 use super::resolve::{is_package_installed, resolve_scenario_code};
@@ -69,8 +69,7 @@ impl AppService {
             }
         }
 
-        let scenario_code =
-            resolve_scenario_code(scenario, scenario_file, scenario_name.clone())?;
+        let scenario_code = resolve_scenario_code(scenario, scenario_file, scenario_name.clone())?;
 
         // Build strategy opts Lua table literal
         let opts_lua = match &strategy_opts {

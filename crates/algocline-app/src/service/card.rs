@@ -80,11 +80,7 @@ impl AppService {
     }
 
     /// Additive-only annotation — new top-level keys only.
-    pub fn card_append(
-        &self,
-        card_id: &str,
-        fields: serde_json::Value,
-    ) -> Result<String, String> {
+    pub fn card_append(&self, card_id: &str, fields: serde_json::Value) -> Result<String, String> {
         let merged = card::append(card_id, fields)?;
         Ok(merged.to_string())
     }
@@ -113,8 +109,7 @@ impl AppService {
         };
 
         // Clone to temp directory
-        let staging =
-            tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
+        let staging = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
         let output = tokio::process::Command::new("git")
             .args([
@@ -141,11 +136,9 @@ impl AppService {
         // Verify this is a Card Collection (alc_cards.toml present)
         let manifest_path = root.join("alc_cards.toml");
         if !manifest_path.exists() {
-            return Err(
-                "Not a Card Collection: alc_cards.toml not found at root. \
+            return Err("Not a Card Collection: alc_cards.toml not found at root. \
                  Card Collections must have an alc_cards.toml manifest."
-                    .into(),
-            );
+                .into());
         }
 
         let mut all_imported: Vec<String> = Vec::new();
@@ -204,10 +197,7 @@ impl AppService {
     ///
     /// Called by `pkg_install` when a package contains a `cards/` dir.
     /// Returns imported card_ids (may be empty if all were skipped).
-    pub(crate) fn import_pkg_bundled_cards(
-        pkg_name: &str,
-        cards_dir: &Path,
-    ) -> Vec<String> {
+    pub(crate) fn import_pkg_bundled_cards(pkg_name: &str, cards_dir: &Path) -> Vec<String> {
         match card::import_from_dir(cards_dir, pkg_name) {
             Ok((imported, _)) => imported,
             Err(e) => {

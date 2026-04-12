@@ -801,7 +801,11 @@ impl AlcService {
     /// though Cards are not.
     #[tool(
         name = "alc_card_alias_set",
-        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn card_alias_set(
         &self,
@@ -822,9 +826,7 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<CardAppendParams>,
     ) -> Result<String, String> {
-        self.app
-            .card_append(&params.card_id, params.fields)
-            .await
+        self.app.card_append(&params.card_id, params.fields).await
     }
 
     /// Read per-case samples from a Card's sidecar JSONL file.

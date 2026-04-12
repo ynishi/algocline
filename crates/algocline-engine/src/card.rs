@@ -341,8 +341,7 @@ pub fn create(mut input: Json) -> Result<(String, PathBuf), String> {
 fn find_card_path(card_id: &str) -> Result<Option<PathBuf>, String> {
     validate_name(card_id, "card_id")?;
     let root = cards_dir()?;
-    let entries = fs::read_dir(&root)
-        .map_err(|e| format!("Failed to read cards dir: {e}"))?;
+    let entries = fs::read_dir(&root).map_err(|e| format!("Failed to read cards dir: {e}"))?;
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
@@ -361,10 +360,10 @@ pub fn get(card_id: &str) -> Result<Option<Json>, String> {
         Some(p) => p,
         None => return Ok(None),
     };
-    let text = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
-    let val: toml::Value = toml::from_str(&text)
-        .map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
+    let val: toml::Value =
+        toml::from_str(&text).map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
     Ok(Some(toml_to_json(val)))
 }
 
@@ -514,10 +513,10 @@ pub fn append(card_id: &str, fields: Json) -> Result<Json, String> {
         _ => return Err("alc.card.append: fields must be a table".into()),
     };
 
-    let text = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
-    let existing: toml::Value = toml::from_str(&text)
-        .map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
+    let existing: toml::Value =
+        toml::from_str(&text).map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
     let mut existing_json = toml_to_json(existing);
     let existing_obj = existing_json
         .as_object_mut()
@@ -579,10 +578,10 @@ fn read_aliases() -> Result<Vec<Alias>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let text = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read aliases file: {e}"))?;
-    let val: toml::Value = toml::from_str(&text)
-        .map_err(|e| format!("Failed to parse aliases file: {e}"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read aliases file: {e}"))?;
+    let val: toml::Value =
+        toml::from_str(&text).map_err(|e| format!("Failed to parse aliases file: {e}"))?;
     let arr = val
         .get("alias")
         .and_then(|v| v.as_array())
@@ -785,8 +784,8 @@ pub fn import_from_dir(
     let mut imported = Vec::new();
     let mut skipped = Vec::new();
 
-    let entries = fs::read_dir(source_dir)
-        .map_err(|e| format!("Failed to read card source dir: {e}"))?;
+    let entries =
+        fs::read_dir(source_dir).map_err(|e| format!("Failed to read card source dir: {e}"))?;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -813,17 +812,12 @@ pub fn import_from_dir(
             .map_err(|e| format!("Failed to read card file '{fname}': {e}"))?;
         let val: toml::Value = toml::from_str(&text)
             .map_err(|e| format!("Failed to parse card file '{fname}': {e}"))?;
-        if val
-            .get("schema_version")
-            .and_then(|v| v.as_str())
-            != Some(SCHEMA_VERSION)
-        {
+        if val.get("schema_version").and_then(|v| v.as_str()) != Some(SCHEMA_VERSION) {
             continue; // skip non-card TOML files (e.g. index.toml, _aliases.toml)
         }
 
         // Copy .toml
-        fs::copy(&path, &dest_toml)
-            .map_err(|e| format!("Failed to copy card '{fname}': {e}"))?;
+        fs::copy(&path, &dest_toml).map_err(|e| format!("Failed to copy card '{fname}': {e}"))?;
 
         // Copy matching .samples.jsonl if present
         let samples_name = format!("{card_id}.samples.jsonl");
@@ -847,8 +841,8 @@ pub fn import_from_dir(
 /// Returns an error if the Card does not exist — samples without a
 /// parent Card are meaningless and we refuse to create orphans.
 fn samples_path(card_id: &str) -> Result<PathBuf, String> {
-    let card_path = find_card_path(card_id)?
-        .ok_or_else(|| format!("card '{card_id}' not found"))?;
+    let card_path =
+        find_card_path(card_id)?.ok_or_else(|| format!("card '{card_id}' not found"))?;
     let dir = card_path
         .parent()
         .ok_or_else(|| format!("card '{card_id}' has no parent directory"))?;
@@ -876,10 +870,8 @@ pub fn write_samples(card_id: &str, samples: Vec<Json>) -> Result<PathBuf, Strin
         buf.push('\n');
     }
     let tmp = path.with_extension("jsonl.tmp");
-    fs::write(&tmp, &buf)
-        .map_err(|e| format!("Failed to write samples tmp: {e}"))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| format!("Failed to rename samples file: {e}"))?;
+    fs::write(&tmp, &buf).map_err(|e| format!("Failed to write samples tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename samples file: {e}"))?;
     Ok(path)
 }
 
@@ -896,8 +888,8 @@ pub fn read_samples(
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let text = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read samples file: {e}"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read samples file: {e}"))?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -1385,7 +1377,11 @@ mod tests {
         let card_content = format!(
             "schema_version = \"{SCHEMA_VERSION}\"\ncard_id = \"{existing_id}\"\npkg = \"{pkg}\"\n"
         );
-        fs::write(tmp.path().join(format!("{existing_id}.toml")), &card_content).unwrap();
+        fs::write(
+            tmp.path().join(format!("{existing_id}.toml")),
+            &card_content,
+        )
+        .unwrap();
 
         let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
         assert!(imported.is_empty());
@@ -1404,11 +1400,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // A TOML file without schema_version = "card/v0" should be skipped
-        fs::write(
-            tmp.path().join("not_a_card.toml"),
-            "title = \"hello\"\n",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("not_a_card.toml"), "title = \"hello\"\n").unwrap();
 
         let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
         assert!(imported.is_empty());

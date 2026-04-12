@@ -1,13 +1,17 @@
 //! Hub — Remote Index search with local merge.
 //!
-//! Discovers index URLs from the installed-packages manifest
-//! (`~/.algocline/installed.json`), fetches each remote index,
-//! merges with locally installed packages and cards, and returns
-//! search results with `installed: true/false` for each entry.
+//! Discovers index URLs from three sources (in priority order):
+//!   1. Hub registries (`~/.algocline/hub_registries.json`) — auto-populated
+//!      by `pkg_install` and `card_install`
+//!   2. Installed-packages manifest (`~/.algocline/installed.json`) — fallback
+//!      for sources registered before registries existed
+//!   3. `AUTO_INSTALL_SOURCES` — compiled-in seeds for first-run
+//!
+//! Fetches each remote index, merges with locally installed packages
+//! and cards, and returns search results with `installed: true/false`.
 //!
 //! Remote indices are cached per-source at
-//! `~/.algocline/hub_cache/{hash}.json` with a configurable TTL
-//! (default 1 hour).
+//! `~/.algocline/hub_cache/{hash}.json` with a TTL of 1 hour.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -126,6 +130,11 @@ fn load_registries() -> HubRegistries {
 }
 
 /// Register a source URL.  Deduplicates by normalized URL.
+///
+/// Uses atomic write (tempfile + rename) to avoid partial writes if
+/// the process is interrupted.  Read-modify-write is not locked across
+/// processes, but MCP servers are single-process so this is safe in
+/// practice.
 pub(crate) fn register_source(source: &str, origin: &str) {
     let normalized = source.trim_end_matches('/').to_string();
     if normalized.is_empty() {
@@ -136,6 +145,15 @@ pub(crate) fn register_source(source: &str, origin: &str) {
         return;
     }
 
+    let path = match registries_path() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Re-read from disk right before write to minimize TOCTOU window
     let mut reg = load_registries();
 
     // Already registered?
@@ -153,18 +171,21 @@ pub(crate) fn register_source(source: &str, origin: &str) {
         added_at: manifest::now_iso8601(),
     });
 
-    if let Ok(path) = registries_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match serde_json::to_string_pretty(&reg) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("failed to write hub registries: {e}");
-                }
+    // Atomic write: write to temp file, then rename
+    match serde_json::to_string_pretty(&reg) {
+        Ok(json) => {
+            let tmp_path = path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp_path, &json) {
+                tracing::warn!("failed to write hub registries tmp: {e}");
+                return;
             }
-            Err(e) => tracing::warn!("failed to serialize hub registries: {e}"),
+            if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                tracing::warn!("failed to rename hub registries: {e}");
+                // Clean up tmp on failure
+                let _ = std::fs::remove_file(&tmp_path);
+            }
         }
+        Err(e) => tracing::warn!("failed to serialize hub registries: {e}"),
     }
 }
 
@@ -720,7 +741,7 @@ impl AppService {
 
     /// Search packages across remote indices + local state.
     ///
-    /// Index URLs are discovered from the manifest's `source` fields
+    /// Index URLs are discovered from hub registries, manifest sources,
     /// and `AUTO_INSTALL_SOURCES`. Each source is cached independently.
     pub fn hub_search(
         &self,

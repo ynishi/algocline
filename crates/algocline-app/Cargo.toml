@@ -25,6 +25,7 @@ dirs = "6"
 tempfile = "3"
 toml = { workspace = true }
 toml_edit = "0.22"
+ureq = "3"
 
 [dev-dependencies]
 proptest = "1"

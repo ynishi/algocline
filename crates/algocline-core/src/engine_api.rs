@@ -232,6 +232,20 @@ pub trait EngineApi: Send + Sync {
         limit: Option<usize>,
     ) -> Result<String, String>;
 
+    // ─── Hub ─────────────────────────────────────────────────
+
+    /// Rebuild hub index from locally installed packages.
+    async fn hub_reindex(&self, output_path: Option<String>) -> Result<String, String>;
+
+    /// Search packages across remote index + local install state.
+    async fn hub_search(
+        &self,
+        query: Option<String>,
+        category: Option<String>,
+        installed_only: Option<bool>,
+        limit: Option<usize>,
+    ) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

@@ -18,6 +18,8 @@ expression: names
   "alc_eval_compare",
   "alc_eval_detail",
   "alc_eval_history",
+  "alc_hub_reindex",
+  "alc_hub_search",
   "alc_info",
   "alc_init",
   "alc_log_view",

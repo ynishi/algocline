@@ -241,6 +241,38 @@ impl EngineApi for AppService {
         AppService::card_samples(self, card_id, offset.unwrap_or(0), limit)
     }
 
+    // ─── Hub ─────────────────────────────────────────────────
+
+    async fn hub_reindex(&self, output_path: Option<String>) -> Result<String, String> {
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || {
+            AppService::hub_reindex(&svc, output_path.as_deref())
+        })
+        .await
+        .map_err(|e| format!("hub_reindex task panicked: {e}"))?
+    }
+
+    async fn hub_search(
+        &self,
+        query: Option<String>,
+        category: Option<String>,
+        installed_only: Option<bool>,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || {
+            AppService::hub_search(
+                &svc,
+                query.as_deref(),
+                category.as_deref(),
+                installed_only,
+                limit,
+            )
+        })
+        .await
+        .map_err(|e| format!("hub_search task panicked: {e}"))?
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

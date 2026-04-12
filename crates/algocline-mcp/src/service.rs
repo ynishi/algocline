@@ -338,6 +338,25 @@ pub struct CardInstallParams {
     pub url: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HubReindexParams {
+    /// File path to write the generated index JSON to (e.g. for CI publishing).
+    pub output_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HubSearchParams {
+    /// Search query (matched against package name, description, category).
+    /// Omit to list all available packages.
+    pub query: Option<String>,
+    /// Filter by category (e.g. "reasoning", "aggregation", "synthesis").
+    pub category: Option<String>,
+    /// When true, only show locally installed packages.
+    pub installed_only: Option<bool>,
+    /// Maximum number of results (default: 50).
+    pub limit: Option<usize>,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -862,6 +881,45 @@ impl AlcService {
         self.app.card_install(params.url).await
     }
 
+    // ─── Hub ────────────────────────────────────────────────────
+
+    /// Generate a Hub index from locally installed packages.
+    ///
+    /// Scans `~/.algocline/packages/` and extracts metadata from each
+    /// package's `init.lua` (M.meta) without Lua VM. Writes the index
+    /// to a file path for CI publishing. Does NOT touch the remote
+    /// search cache used by `alc_hub_search`.
+    #[tool(
+        name = "alc_hub_reindex",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn hub_reindex(
+        &self,
+        Parameters(params): Parameters<HubReindexParams>,
+    ) -> Result<String, String> {
+        self.app.hub_reindex(params.output_path).await
+    }
+
+    /// Search packages across the remote Hub index and local install state.
+    ///
+    /// Fetches the remote package index (cached for 1 hour), merges with
+    /// locally installed packages/cards, and returns results with
+    /// `installed: true/false` for each entry. Use this to discover
+    /// available strategies — uninstalled packages can be installed via
+    /// `alc_pkg_install` using the `source` URL from the result.
+    #[tool(
+        name = "alc_hub_search",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn hub_search(
+        &self,
+        Parameters(params): Parameters<HubSearchParams>,
+    ) -> Result<String, String> {
+        self.app
+            .hub_search(params.query, params.category, params.installed_only, params.limit)
+            .await
+    }
+
     // ─── Diagnostics ────────────────────────────────────────────
 
     /// Show algocline server configuration and diagnostic info.
@@ -924,6 +982,9 @@ impl ServerHandler for AlcService {
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
+                 Hub:\n\
+                 - alc_hub_search: Search packages across the remote Hub index + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
+                 - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Updates cache and optionally writes to a file for CI publishing.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

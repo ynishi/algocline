@@ -4,6 +4,7 @@ mod config;
 mod engine_api_impl;
 mod eval;
 mod eval_store;
+mod hub;
 mod init;
 pub(crate) mod lockfile;
 mod logging;

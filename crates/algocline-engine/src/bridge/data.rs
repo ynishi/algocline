@@ -198,29 +198,27 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     })?;
 
     // alc.card.write_samples(card_id, samples) -> { path, count }
-    let write_samples = lua.create_function(
-        |lua, (card_id, samples): (String, LuaValue)| {
-            let json: serde_json::Value = lua.from_value(samples)?;
-            let arr = match json {
-                serde_json::Value::Array(a) => a,
-                _ => {
-                    return Err(LuaError::external(
-                        "alc.card.write_samples: samples must be an array",
-                    ))
-                }
-            };
-            let count = arr.len();
-            let path = card::write_samples(&card_id, arr).map_err(LuaError::external)?;
-            let ret = lua.create_table()?;
-            ret.set("path", path.to_string_lossy().to_string())?;
-            ret.set("count", count)?;
-            Ok(ret)
-        },
-    )?;
+    let write_samples = lua.create_function(|lua, (card_id, samples): (String, LuaValue)| {
+        let json: serde_json::Value = lua.from_value(samples)?;
+        let arr = match json {
+            serde_json::Value::Array(a) => a,
+            _ => {
+                return Err(LuaError::external(
+                    "alc.card.write_samples: samples must be an array",
+                ))
+            }
+        };
+        let count = arr.len();
+        let path = card::write_samples(&card_id, arr).map_err(LuaError::external)?;
+        let ret = lua.create_table()?;
+        ret.set("path", path.to_string_lossy().to_string())?;
+        ret.set("count", count)?;
+        Ok(ret)
+    })?;
 
     // alc.card.read_samples(card_id, opts?) -> [sample]
-    let read_samples = lua.create_function(
-        |lua, (card_id, opts): (String, Option<LuaTable>)| {
+    let read_samples =
+        lua.create_function(|lua, (card_id, opts): (String, Option<LuaTable>)| {
             let (offset, limit) = match opts {
                 Some(t) => (
                     t.get::<Option<usize>>("offset")?.unwrap_or(0),
@@ -230,8 +228,7 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
             };
             let rows = card::read_samples(&card_id, offset, limit).map_err(LuaError::external)?;
             lua.to_value(&serde_json::Value::Array(rows))
-        },
-    )?;
+        })?;
 
     card_table.set("create", create)?;
     card_table.set("get", get)?;

@@ -228,6 +228,10 @@ impl EngineApi for AppService {
         AppService::card_append(self, card_id, fields)
     }
 
+    async fn card_install(&self, url: String) -> Result<String, String> {
+        AppService::card_install(self, url).await
+    }
+
     async fn card_samples(
         &self,
         card_id: &str,

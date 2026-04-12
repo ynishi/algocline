@@ -329,6 +329,15 @@ pub struct CardAppendParams {
     pub fields: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardInstallParams {
+    /// Git URL or local absolute path to a Card Collection.
+    /// A Card Collection is a repo with `alc_cards.toml` at root and
+    /// subdirectories named after packages, each containing Card TOML files.
+    /// Example: `github.com/user/my-alcards` or `/path/to/local/cards`.
+    pub url: String,
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -792,7 +801,11 @@ impl AlcService {
     /// though Cards are not.
     #[tool(
         name = "alc_card_alias_set",
-        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn card_alias_set(
         &self,
@@ -813,9 +826,7 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<CardAppendParams>,
     ) -> Result<String, String> {
-        self.app
-            .card_append(&params.card_id, params.fields)
-            .await
+        self.app.card_append(&params.card_id, params.fields).await
     }
 
     /// Read per-case samples from a Card's sidecar JSONL file.
@@ -832,6 +843,23 @@ impl AlcService {
         self.app
             .card_samples(&params.card_id, params.offset, params.limit)
             .await
+    }
+
+    /// Install Cards from a Card Collection (Git repo or local directory).
+    ///
+    /// A Card Collection has `alc_cards.toml` at root and subdirectories
+    /// named after packages, each containing `*.toml` Card files and optional
+    /// `*.samples.jsonl` sidecars. Cards are imported into `~/.algocline/cards/{pkg}/`.
+    /// Existing Cards with the same id are skipped (immutable, first-writer wins).
+    #[tool(
+        name = "alc_card_install",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn card_install(
+        &self,
+        Parameters(params): Parameters<CardInstallParams>,
+    ) -> Result<String, String> {
+        self.app.card_install(params.url).await
     }
 
     // ─── Diagnostics ────────────────────────────────────────────
@@ -894,7 +922,8 @@ impl ServerHandler for AlcService {
                  - alc_card_get_by_alias: Resolve an alias name to the full Card JSON (shortcut for alias_list → filter → get).\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
-                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\n\
+                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
+                 - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

@@ -138,6 +138,17 @@ impl AppService {
                 installed.push(pkg_name);
             }
 
+            // Import bundled cards from each package's cards/ subdirectory.
+            let mut cards_installed: Vec<String> = Vec::new();
+            for pkg_name in installed.iter().chain(skipped.iter()) {
+                let cards_subdir = staging.path().join(pkg_name).join("cards");
+                if cards_subdir.is_dir() {
+                    let imported =
+                        crate::AppService::import_pkg_bundled_cards(pkg_name, &cards_subdir);
+                    cards_installed.extend(imported);
+                }
+            }
+
             // Install bundled scenarios only when an explicit `scenarios/` subdir exists.
             let scenarios_subdir = staging.path().join("scenarios");
             let mut scenarios_installed: Vec<String> = Vec::new();
@@ -181,6 +192,7 @@ impl AppService {
             let mut response = serde_json::json!({
                 "installed": installed,
                 "skipped": skipped,
+                "cards_installed": cards_installed,
                 "scenarios_installed": scenarios_installed,
                 "scenarios_failures": scenarios_failures,
                 "mode": "collection",
@@ -277,6 +289,17 @@ impl AppService {
                 );
             }
 
+            // Import bundled cards from each package's cards/ subdirectory.
+            let mut cards_installed: Vec<String> = Vec::new();
+            for pkg_name in installed.iter().chain(updated.iter()) {
+                let cards_subdir = source.join(pkg_name).join("cards");
+                if cards_subdir.is_dir() {
+                    let imported =
+                        crate::AppService::import_pkg_bundled_cards(pkg_name, &cards_subdir);
+                    cards_installed.extend(imported);
+                }
+            }
+
             // Record in manifest (best-effort)
             let source_str = source.display().to_string();
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
@@ -288,6 +311,7 @@ impl AppService {
             let mut response = serde_json::json!({
                 "installed": installed,
                 "updated": updated,
+                "cards_installed": cards_installed,
                 "mode": "local_collection",
             });
             if let Some(tp) = super::super::resolve::types_stub_path() {

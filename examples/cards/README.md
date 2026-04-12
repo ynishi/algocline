@@ -43,6 +43,29 @@ ls ~/.algocline/cards/prompt_ab_demo/
 cat ~/.algocline/cards/_aliases.toml
 ```
 
+## sweep_replay_demo.lua
+
+Replay sweep pattern: load existing Cards (seed data), derive new
+Cards with varying EMA alpha parameters, and chain them via
+`metadata.prior_card_id`. Demonstrates the two-tier content policy:
+
+- **Tier 1** (Card body): `stats.ev`, `stats.ev_raw`, `params.alpha`
+- **Tier 2** (samples.jsonl): per-case `{ case, passed, score }` rows
+
+Creates 3 seed Cards with per-case samples, then derives 12 Cards
+(3 seeds × 4 alpha values). Pins the best-scoring Card with an alias.
+
+```sh
+alc_run code_file=examples/cards/sweep_replay_demo.lua
+```
+
+Inspect:
+
+```sh
+ls ~/.algocline/cards/sweep_replay_demo/
+cat ~/.algocline/cards/_aliases.toml
+```
+
 ### Adapting to real workloads
 
 Replace `synthetic_score(...)` with a real grader — either call

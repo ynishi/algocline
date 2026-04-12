@@ -1,13 +1,21 @@
+//! Card service layer — MCP-facing read/write operations.
+//!
+//! Thin adapter between MCP tool handlers and [`algocline_engine::card`].
+//! All data flows through the engine; this layer handles JSON
+//! serialization for the MCP transport.
+
 use algocline_engine::card;
 
 use super::AppService;
 
 impl AppService {
+    /// List Cards as JSON summaries, optionally filtered by package.
     pub fn card_list(&self, pkg: Option<&str>) -> Result<String, String> {
         let rows = card::list(pkg)?;
         Ok(card::summaries_to_json(&rows).to_string())
     }
 
+    /// Fetch full Card body (Tier 1) by id.
     pub fn card_get(&self, card_id: &str) -> Result<String, String> {
         match card::get(card_id)? {
             Some(v) => Ok(v.to_string()),
@@ -15,6 +23,7 @@ impl AppService {
         }
     }
 
+    /// Query Cards with sort, filter, and limit.
     #[allow(clippy::too_many_arguments)]
     pub fn card_find(
         &self,
@@ -37,6 +46,7 @@ impl AppService {
         Ok(card::summaries_to_json(&rows).to_string())
     }
 
+    /// Resolve alias then fetch the full Card.
     pub fn card_get_by_alias(&self, name: &str) -> Result<String, String> {
         match card::get_by_alias(name)? {
             Some(v) => Ok(v.to_string()),
@@ -44,11 +54,13 @@ impl AppService {
         }
     }
 
+    /// List aliases, optionally filtered by package.
     pub fn card_alias_list(&self, pkg: Option<&str>) -> Result<String, String> {
         let rows = card::alias_list(pkg)?;
         Ok(card::aliases_to_json(&rows).to_string())
     }
 
+    /// Pin or rebind a mutable alias to a Card.
     pub fn card_alias_set(
         &self,
         name: &str,
@@ -65,6 +77,7 @@ impl AppService {
         Ok(single.to_string())
     }
 
+    /// Additive-only annotation — new top-level keys only.
     pub fn card_append(
         &self,
         card_id: &str,
@@ -74,6 +87,7 @@ impl AppService {
         Ok(merged.to_string())
     }
 
+    /// Read per-case sidecar rows (Tier 2) with offset/limit paging.
     pub fn card_samples(
         &self,
         card_id: &str,

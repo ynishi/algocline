@@ -628,6 +628,147 @@ end
 
 ---
 
+## alc.card — Immutable Run-Result Snapshots
+
+Persistent storage for evaluation / experiment results. Each Card is a
+write-once TOML file under `~/.algocline/cards/{pkg}/{card_id}.toml`.
+
+### Two-Tier Content Policy
+
+Card storage follows a two-tier architecture aligned with industry
+practice (MLflow, W&B, OpenAI Evals, LangSmith, etc.):
+
+| Tier | Storage | Content | Size guidance |
+|------|---------|---------|---------------|
+| **Tier 1** — Card body (TOML) | `{card_id}.toml` | Aggregate scalars, decision values, identity/lineage, params fingerprint, single summary text | A few KB |
+| **Tier 2** — Samples sidecar (JSONL) | `{card_id}.samples.jsonl` | Per-case raw data, per-sample I/O, per-persona scores, large transcripts | Unbounded |
+
+Rule of thumb: if a value is **per-case** or **large**, it belongs in
+Tier 2. Everything else goes in Tier 1.
+
+### Write API
+
+#### `alc.card.create(table) -> { card_id, path }`
+
+Write a new Card. Immutable — calling `create` with the same `card_id`
+errors.
+
+**Required fields:** `pkg.name`
+
+Auto-injected: `schema_version`, `card_id`, `created_at`, `created_by`,
+`param_fingerprint` (when `params` is present).
+
+```lua
+local result = alc.card.create({
+    pkg = { name = "my_eval" },
+    scenario = { name = "gsm8k_100" },
+    model = { id = "claude-opus-4-6" },
+    params = { temperature = 0.0, depth = 3 },
+    stats = { pass_rate = 0.82, ev = 4.2 },
+})
+-- result.card_id, result.path
+```
+
+#### `alc.card.append(card_id, fields)`
+
+Additive-only annotation. New top-level keys only — overwriting existing
+keys is rejected.
+
+```lua
+alc.card.append(card_id, {
+    caveats = { notes = "rescored after grader fix" },
+    metadata = { reviewer = "yn" },
+})
+```
+
+#### `alc.card.write_samples(card_id, samples)`
+
+Write per-case data to the JSONL sidecar (Tier 2). Write-once per Card.
+Column schema is package-defined — the engine does not interpret content.
+
+```lua
+alc.card.write_samples(card_id, {
+    { case = "c0", passed = true, score = 1.0, response = "..." },
+    { case = "c1", passed = false, score = 0.0, response = "..." },
+})
+```
+
+#### `alc.card.alias_set(name, card_id, opts?)`
+
+Pin a mutable alias to a Card. Aliases are global
+(`~/.algocline/cards/_aliases.toml`). Re-binding overwrites the previous
+target.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | yes | Alias name |
+| `card_id` | string | yes | Target Card |
+| `opts.pkg` | string | no | Package hint (metadata only) |
+| `opts.note` | string | no | Free-text annotation |
+
+```lua
+alc.card.alias_set("best_gsm8k", card_id, { pkg = "my_eval" })
+```
+
+### Read API
+
+#### `alc.card.get(card_id) -> table | nil`
+
+Fetch full Card body by id.
+
+#### `alc.card.get_by_alias(name) -> table | nil`
+
+Resolve alias then fetch the Card.
+
+#### `alc.card.list(filter?) -> summary[]`
+
+List Cards as summaries (newest first).
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `filter.pkg` | string | no | Filter by package |
+
+#### `alc.card.find(query?) -> summary[]`
+
+Query Cards with sort and filter.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query.pkg` | string | no | Filter by package |
+| `query.scenario` | string | no | Filter by scenario name |
+| `query.model` | string | no | Filter by model id |
+| `query.sort` | string | no | Sort field (e.g. `"pass_rate"`) |
+| `query.limit` | integer | no | Max results |
+| `query.min_pass_rate` | number | no | Minimum pass_rate threshold |
+
+```lua
+local best = alc.card.find({
+    pkg = "my_eval",
+    scenario = "gsm8k_100",
+    sort = "pass_rate",
+    limit = 1,
+})
+```
+
+#### `alc.card.alias_list(filter?) -> alias[]`
+
+List aliases, optionally filtered by `filter.pkg`.
+
+#### `alc.card.read_samples(card_id, opts?) -> table[]`
+
+Read per-case sidecar rows with paging.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `opts.offset` | integer | no | Skip first N rows (default: 0) |
+| `opts.limit` | integer | no | Max rows to return |
+
+```lua
+local rows = alc.card.read_samples(card_id, { offset = 0, limit = 50 })
+```
+
+---
+
 ## alc.math — Numeric Computing
 
 Re-exported from [mlua-mathlib](https://crates.io/crates/mlua-mathlib) v0.3. Provides RNG, distribution sampling, descriptive statistics, CDF/PPF, special functions, hypothesis testing, ranking/IR metrics, information theory, and time series analysis backed by Rust (`rand`, `statrs`, `nalgebra`). Available as `alc.math.*` without `require()`.

@@ -1,15 +1,35 @@
 //! Card storage — immutable run-result snapshots.
 //!
-//! Storage: ~/.algocline/cards/{pkg}/{card_id}.toml
+//! ## Storage layout (two-tier)
 //!
-//! v0 schema (card_schema_v0_draft.md):
-//!   REQUIRED fields: schema_version, card_id, created_at, [pkg].name
-//!   Everything else is OPTIONAL and auto-injected where possible.
+//! | Tier | File | Content |
+//! |------|------|---------|
+//! | **Tier 1** | `~/.algocline/cards/{pkg}/{card_id}.toml` | Aggregate scalars, decisions, identity, params |
+//! | **Tier 2** | `~/.algocline/cards/{pkg}/{card_id}.samples.jsonl` | Per-case raw data (JSONL, write-once) |
 //!
-//! v0 P0 API (exposed to Lua as alc.card.*):
-//!   create(table) -> { card_id, path }   — write new Card
-//!   get(card_id)  -> table | nil          — read Card by id
-//!   list(filter?) -> [summary]            — list Cards, optionally filtered by pkg
+//! Tier 1 holds a shareable summary (a few KB). Tier 2 holds per-case
+//! detail — the engine does not interpret its columns; packages define
+//! their own schema.
+//!
+//! ## v0 schema (frozen)
+//!
+//! REQUIRED fields: `schema_version`, `card_id`, `created_at`, `[pkg].name`.
+//! Everything else is OPTIONAL and auto-injected where possible.
+//!
+//! ## Lua API (`alc.card.*`)
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | `create(table)` | Write new Card (Tier 1). Returns `{ card_id, path }` |
+//! | `get(card_id)` | Read Card by id. Returns table or nil |
+//! | `list(filter?)` | List Cards as summaries (newest first) |
+//! | `find(query?)` | Query with sort / filter / limit |
+//! | `append(card_id, fields)` | Additive-only annotation (new keys only) |
+//! | `alias_set(name, card_id, opts?)` | Pin mutable alias |
+//! | `alias_list(filter?)` | List aliases |
+//! | `get_by_alias(name)` | Resolve alias → full Card |
+//! | `write_samples(card_id, samples)` | Write Tier 2 sidecar (write-once) |
+//! | `read_samples(card_id, opts?)` | Read Tier 2 with offset/limit paging |
 
 use std::fs;
 use std::path::PathBuf;

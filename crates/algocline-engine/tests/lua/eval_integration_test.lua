@@ -345,6 +345,63 @@ describe("alc.eval integration", function()
         end)
     end)
 
+    -- ── Named scenario resolution ─────────────────────────────
+    describe("named scenario resolution", function()
+        it("resolves from require (package.loaded)", function()
+            -- Register a scenario module
+            package.loaded["test_inline_scenario"] = {
+                cases = {
+                    { input = "2+2?", expected = "4" },
+                },
+                graders = { "exact_match" },
+            }
+
+            local report = alc.eval("test_inline_scenario", "mock_strategy")
+
+            expect(report.aggregated.total).to.equal(1)
+            expect(report.aggregated.passed).to.equal(1)
+            expect(report.name).to.equal("mock_strategy:test_inline_scenario")
+
+            package.loaded["test_inline_scenario"] = nil
+        end)
+
+        it("resolves from ~/.algocline/scenarios/{name}.lua", function()
+            -- math_basic.lua should exist in ~/.algocline/scenarios/
+            -- It uses full evalframe form (ef.bind with weighted graders)
+            local report = alc.eval("math_basic", "mock_strategy")
+
+            expect(report.aggregated).to.exist()
+            expect(report.aggregated.total > 0).to.equal(true)
+            expect(report.name).to.equal("mock_strategy:math_basic")
+        end)
+
+        it("resolves from direct file path", function()
+            local scenario_path = home .. "/.algocline/scenarios/math_basic.lua"
+            local report = alc.eval(scenario_path, "mock_strategy")
+
+            expect(report.aggregated).to.exist()
+            expect(report.aggregated.total > 0).to.equal(true)
+        end)
+
+        it("errors on nonexistent scenario string", function()
+            local ok, err = pcall(alc.eval, "nonexistent_scenario_xyz", "mock_strategy")
+            expect(ok).to.equal(false)
+            local msg = tostring(err)
+            expect(msg:find("could not resolve scenario") ~= nil).to.equal(true)
+        end)
+
+        it("errors when named scenario resolves to non-table", function()
+            package.loaded["returns_number"] = 42
+
+            local ok, err = pcall(alc.eval, "returns_number", "mock_strategy")
+            expect(ok).to.equal(false)
+            local msg = tostring(err)
+            expect(msg:find("resolved to number") ~= nil).to.equal(true)
+
+            package.loaded["returns_number"] = nil
+        end)
+    end)
+
     -- ── Error cases ──────────────────────────────────────────
     describe("error handling", function()
         it("errors on unknown grader name", function()

@@ -764,22 +764,44 @@ do
         local spec
         local scenario_name
         if type(scenario) == "string" then
-            -- Load named scenario from ~/.algocline/scenarios/
             scenario_name = scenario
-            local scenario_path = scenario
-            local load_ok, loaded = pcall(require, scenario_path)
+            local load_ok, loaded
+
+            -- 2a. Try require (packages on package.path)
+            load_ok, loaded = pcall(require, scenario)
+
+            -- 2b. Try ~/.algocline/scenarios/{name}.lua
             if not load_ok then
-                -- Try as a file path
+                local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+                local path = home .. "/.algocline/scenarios/" .. scenario .. ".lua"
+                local f = io.open(path, "r")
+                if f then
+                    local code = f:read("*a")
+                    f:close()
+                    local chunk, err = load(code, "@" .. path)
+                    if not chunk then
+                        error("alc.eval: failed to load scenario '" .. scenario .. "': " .. err)
+                    end
+                    loaded = chunk()
+                    load_ok = true
+                end
+            end
+
+            -- 2c. Try as a direct file path (absolute or relative)
+            if not load_ok then
                 local f = io.open(scenario, "r")
                 if f then
                     local code = f:read("*a")
                     f:close()
                     local chunk, err = load(code, "@" .. scenario)
-                    if not chunk then error("alc.eval: failed to load scenario: " .. err) end
+                    if not chunk then
+                        error("alc.eval: failed to load scenario: " .. err)
+                    end
                     loaded = chunk()
                     load_ok = true
                 end
             end
+
             if not load_ok then
                 error("alc.eval: could not resolve scenario '" .. scenario .. "'")
             end

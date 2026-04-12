@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-04-13
+
+### Added
+
+- **`alc_hub_info`**: Show detailed information for a single package — metadata, all Cards, aliases, and aggregated stats (card count, eval count, best pass rate). Looks up remote indices first, falls back to local `init.lua` parse.
+- **`collection_url` support**: New `[hub].collection_url` in `~/.algocline/config.toml` adds a Tier 0 aggregated index URL, fetched before per-source registries.
+
+### Fixed
+
+- **Path traversal guard** in `hub_info`: reject package names containing `..`, `/`, or `\`.
+- **Duplicate `card::list` call** in `hub_info`: reuse a single call for both JSON output and stats.
+- **`count_evals_for_pkg` ordering**: two-pass collection eliminates `read_dir` iteration-order dependency.
+
+### Changed
+
+- Enriched module-level RustDoc for `card.rs` (Card schema, design principles, storage layout) and `hub.rs` (staged design, index schema, 4-tier discovery, caching).
+
 ## [0.18.0] - 2026-04-12
 
 ### Added — Hub: Package Discovery & Search

@@ -223,6 +223,9 @@ alc_continue({ session_id, response })
 | `alc_stats` | Aggregate usage stats across sessions (per-strategy) |
 | `alc_status` | Query active session status, progress, and metrics |
 | `alc_info` | Show server configuration and diagnostics |
+| `alc_hub_search` | Search packages across remote Hub indices + local state |
+| `alc_hub_info` | Show detailed info for a single package (metadata, Cards, aliases, stats) |
+| `alc_hub_reindex` | Rebuild Hub index from locally installed packages |
 | `alc_scenario_list` | List installed eval scenarios |
 | `alc_scenario_show` | Show an installed scenario's content |
 | `alc_scenario_install` | Install scenarios from Git URL or local path |

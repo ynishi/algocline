@@ -642,3 +642,173 @@ function alc.pipe(strategies, ctx, opts)
 
     return pipe_ctx
 end
+
+--- alc.eval(scenario, strategy, opts?) -> report
+--- Evaluate a strategy against a scenario. Thin facade over evalframe
+--- that handles scenario resolution, provider wiring, and Card emission.
+---
+--- scenario: string (name in ~/.algocline/scenarios/) or table:
+---   Simple form:  { cases = { {input=..., expected=...}, ... }, graders = {"exact_match"} }
+---   Full form:    evalframe-compatible spec with ef.bind / ef.case
+---
+--- strategy: string (package name, e.g. "cot", "reflect")
+---
+--- opts:
+---   strategy_opts  table   Extra opts passed to strategy.run()
+---   auto_card      bool    Emit Card on completion (default: false)
+---   card_pkg       string  Card pkg.name override
+---
+--- Returns: evalframe report table (aggregated, failures, results, summary)
+do
+    -- Resolve grader shorthand ("exact_match") to evalframe grader function.
+    local function resolve_grader(ef, g)
+        if type(g) == "function" then return g end
+        if type(g) == "string" then
+            local grader_fn = ef.graders[g]
+            if not grader_fn then
+                error("alc.eval: unknown grader '" .. g .. "'")
+            end
+            return grader_fn
+        end
+        if type(g) == "table" and g._is_binding then
+            return g -- already a binding, pass through
+        end
+        error("alc.eval: grader must be string name or function, got " .. type(g))
+    end
+
+    -- Wrap simple {input, expected} tables as ef.case if needed.
+    local function resolve_cases(ef, raw_cases)
+        local cases = {}
+        for i, c in ipairs(raw_cases) do
+            if type(c) == "table" and c._is_case then
+                cases[i] = c
+            elseif type(c) == "table" and c.input then
+                cases[i] = ef.case(c)
+            else
+                error("alc.eval: case #" .. i .. " must have an 'input' field")
+            end
+        end
+        return cases
+    end
+
+    -- Build evalframe suite spec from scenario table.
+    local function build_suite_spec(ef, spec, provider)
+        -- Full form: spec already contains ef.bind entries as indexed elements
+        local has_bindings = false
+        for i = 1, #spec do
+            if type(spec[i]) == "table" and spec[i]._is_binding then
+                has_bindings = true
+                break
+            end
+        end
+
+        if has_bindings then
+            -- Full evalframe-compatible spec: copy indexed bindings + cases
+            local suite_spec = { provider = provider }
+            for i = 1, #spec do
+                suite_spec[i] = spec[i]
+            end
+            suite_spec.cases = spec.cases
+            return suite_spec
+        end
+
+        -- Simple form: resolve graders → bindings, cases → ef.case
+        local grader_names = spec.graders or { "exact_match" }
+        local suite_spec = { provider = provider }
+        for i, g in ipairs(grader_names) do
+            suite_spec[i] = ef.bind({ resolve_grader(ef, g) })
+        end
+        suite_spec.cases = resolve_cases(ef, spec.cases or {})
+        return suite_spec
+    end
+
+    -- Emit Card from eval report (Two-Tier Content Policy).
+    local function emit_eval_card(strategy, scenario_name, report, opts)
+        local pkg_name = opts.card_pkg or strategy
+        local agg = report.aggregated or {}
+        local scores = agg.scores or {}
+
+        local card = alc.card.create({
+            pkg = { name = pkg_name },
+            scenario = { name = scenario_name or "inline" },
+            stats = {
+                pass_rate = agg.pass_rate,
+                mean_score = scores.mean,
+                n = agg.total,
+                passed = agg.passed,
+            },
+        })
+
+        -- Tier 2: per-case results as samples sidecar
+        if report.results and #report.results > 0 then
+            alc.card.write_samples(card.card_id, report.results)
+        end
+
+        return card.card_id
+    end
+
+    function alc.eval(scenario, strategy, opts)
+        if not scenario then error("alc.eval: scenario is required") end
+        if not strategy or type(strategy) ~= "string" then
+            error("alc.eval: strategy must be a string package name")
+        end
+        opts = opts or {}
+
+        -- 1. Load evalframe
+        local ok, ef = pcall(require, "evalframe")
+        if not ok then
+            error("alc.eval: evalframe not installed. Run alc_pkg_install to add it.")
+        end
+
+        -- 2. Resolve scenario
+        local spec
+        local scenario_name
+        if type(scenario) == "string" then
+            -- Load named scenario from ~/.algocline/scenarios/
+            scenario_name = scenario
+            local scenario_path = scenario
+            local load_ok, loaded = pcall(require, scenario_path)
+            if not load_ok then
+                -- Try as a file path
+                local f = io.open(scenario, "r")
+                if f then
+                    local code = f:read("*a")
+                    f:close()
+                    local chunk, err = load(code, "@" .. scenario)
+                    if not chunk then error("alc.eval: failed to load scenario: " .. err) end
+                    loaded = chunk()
+                    load_ok = true
+                end
+            end
+            if not load_ok then
+                error("alc.eval: could not resolve scenario '" .. scenario .. "'")
+            end
+            spec = loaded
+        elseif type(scenario) == "table" then
+            scenario_name = scenario.name
+            spec = scenario
+        else
+            error("alc.eval: scenario must be string or table")
+        end
+
+        -- 3. Build provider
+        local provider = ef.providers.algocline({
+            strategy = strategy,
+            opts = opts.strategy_opts,
+        })
+
+        -- 4. Build and run suite
+        local suite_spec = build_suite_spec(ef, spec, provider)
+        local suite = ef.suite("eval")(suite_spec)
+        local report = suite:run():to_table()
+
+        -- 5. Auto-card
+        if opts.auto_card then
+            local card_id = emit_eval_card(strategy, scenario_name, report, opts)
+            report.card_id = card_id
+            alc.log("info", "alc.eval: card emitted — " .. card_id)
+        end
+
+        return report
+    end
+end

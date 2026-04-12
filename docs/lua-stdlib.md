@@ -626,6 +626,93 @@ if alc.budget_check() then
 end
 ```
 
+### Evaluation
+
+#### `alc.eval(scenario, strategy, opts?) -> report`
+
+Evaluate a strategy against a scenario. Thin facade over
+[evalframe](https://github.com/yutakanishimura/evalframe) that handles
+scenario resolution, provider wiring, and optional Card emission.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `scenario` | string or table | yes | Named scenario or inline spec |
+| `strategy` | string | yes | Package name (e.g. `"cot"`, `"reflect"`) |
+| `opts.strategy_opts` | table | no | Extra opts passed to strategy `run()` |
+| `opts.auto_card` | boolean | no | Emit Card on completion (default: false) |
+| `opts.card_pkg` | string | no | Card `pkg.name` override |
+
+**Scenario formats:**
+
+```lua
+-- Simple form: cases + grader names
+{
+    cases = {
+        { input = "2+2?", expected = "4" },
+        { input = "sqrt(16)?", expected = "4" },
+    },
+    graders = { "exact_match" },
+}
+
+-- Full evalframe-compatible form
+local ef = require("evalframe")
+{
+    ef.bind { ef.graders.exact_match },
+    ef.bind { ef.graders.contains, weight = 0.5 },
+    cases = {
+        ef.case { input = "2+2?", expected = "4", tags = { "math" } },
+    },
+}
+
+-- Named scenario (loads from ~/.algocline/scenarios/)
+"gsm8k_100"
+```
+
+**Returns:** report table
+
+```lua
+report.aggregated.pass_rate    -- 0.8
+report.aggregated.passed       -- 8
+report.aggregated.total        -- 10
+report.aggregated.scores.mean  -- 0.75
+report.aggregated.scores.std_dev
+report.aggregated.ci_95        -- { lower = 0.62, upper = 0.88 }
+report.aggregated.by_tag       -- per-tag breakdown
+report.failures                -- failed case details
+report.results                 -- all case results
+report.summary                 -- human-readable text
+report.card_id                 -- set when auto_card = true
+```
+
+**Available graders** (string shorthand):
+
+| Name | Returns | Behavior |
+|------|---------|----------|
+| `"exact_match"` | bool | Exact string match against expected |
+| `"contains"` | bool | Expected substring found in response |
+| `"starts_with"` | bool | Response starts with expected |
+| `"json_valid"` | bool | Response is valid JSON |
+| `"not_empty"` | bool | Non-empty response |
+
+```lua
+-- Basic eval
+local report = alc.eval({
+    cases = {
+        { input = "2+2?", expected = "4" },
+        { input = "Capital of France?", expected = "Paris" },
+    },
+    graders = { "contains" },
+}, "cot")
+
+-- With Card emission
+local report = alc.eval("gsm8k_100", "reflect", {
+    auto_card = true,
+})
+alc.log("info", "pass_rate: " .. report.aggregated.pass_rate)
+```
+
 ---
 
 ## alc.card — Immutable Run-Result Snapshots

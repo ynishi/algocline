@@ -318,6 +318,50 @@ function alc.state.update(key, fn, default) end
 ---@return table ctx Context with .result and .pipe_history
 function alc.pipe(strategies, ctx, opts) end
 
+-- Evaluation ---
+
+---@class AlcEvalOpts
+---@field strategy_opts? table Extra opts passed to strategy run()
+---@field auto_card? boolean Emit Card on completion (default: false)
+---@field card_pkg? string Card pkg.name override
+
+---@class AlcEvalScores
+---@field n integer Number of cases
+---@field mean number Mean score
+---@field std_dev number Standard deviation
+---@field min number Minimum score
+---@field max number Maximum score
+---@field median number Median score
+
+---@class AlcEvalCi95
+---@field lower number Lower bound
+---@field upper number Upper bound
+
+---@class AlcEvalAggregated
+---@field total integer Total cases
+---@field passed integer Passed cases
+---@field pass_rate number Pass rate [0, 1]
+---@field pass_at_1? number Pass@1
+---@field pass_at_5? number Pass@5 (if total ≥ 5)
+---@field pass_at_10? number Pass@10 (if total ≥ 10)
+---@field scores AlcEvalScores Score statistics
+---@field ci_95 AlcEvalCi95 95% confidence interval
+---@field by_tag? table<string, table> Per-tag breakdown
+
+---@class AlcEvalReport
+---@field aggregated AlcEvalAggregated Aggregated statistics
+---@field failures table[] Failed case details
+---@field results table[] All case results
+---@field summary string Human-readable summary
+---@field card_id? string Card id (when auto_card = true)
+
+--- Evaluate a strategy against a scenario. Facade over evalframe.
+---@param scenario string|table Named scenario or inline spec
+---@param strategy string Package name (e.g. "cot", "reflect")
+---@param opts? AlcEvalOpts Options
+---@return AlcEvalReport report
+function alc.eval(scenario, strategy, opts) end
+
 -- Tuning ---
 
 ---@class AlcTuningOpts

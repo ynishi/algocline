@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `alc.eval()` Lua function
+
+Evalframe facade exposed as a first-class Lua function in prelude.
+Accepts string scenario names or inline tables, wires the algocline
+provider automatically, and optionally emits a Card on completion.
+
 ### Added — Card schema v0 (frozen)
 
 Immutable run-result snapshots stored as TOML under

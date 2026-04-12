@@ -152,6 +152,7 @@ Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.tuning(defaults, ctx)     — config merge with deep merge
 │  alc.budget_check()            — boolean budget guard
 │  alc.pipe(strategies, ctx)     — sequential strategy pipeline
+│  alc.eval(scenario, strategy)  — evalframe facade (eval + Card)
 │
 Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
    cot        — chain-of-thought                    [reasoning]

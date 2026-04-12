@@ -179,15 +179,7 @@ return alc.eval(scenario, "{strategy}", {{
         // Build Lua snippet that uses evalframe's stats module
         // to compute welch_t from the persisted aggregated scores.
         let lua_code = format!(
-            r#"
-std = {{
-  json = {{
-    decode = alc.json_decode,
-    encode = alc.json_encode,
-  }},
-  fs = {{ read = function() end, is_file = function() return false end }},
-  time = {{ now = alc.time }},
-}}
+            r#"{std_shim}
 
 local stats = require("evalframe.eval.stats")
 
@@ -274,6 +266,7 @@ return {{
             result_b_escaped = escape_for_lua_sq(&result_b),
             eval_id_a = eval_id_a,
             eval_id_b = eval_id_b,
+            std_shim = STD_SHIM,
             strategy_a_fallback = extract_strategy_from_id(eval_id_a).unwrap_or("A"),
             strategy_b_fallback = extract_strategy_from_id(eval_id_b).unwrap_or("B"),
         );

@@ -764,6 +764,84 @@ pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
 // rewritten — mismatched per-case data would break auditability.
 // ───────────────────────────────────────────────────────────────
 
+// ───────────────────────────────────────────────────────────────
+// Card import: copy Card files from an external directory into the
+// local cards store. Used by `alc_card_install` (Card Collections)
+// and by `alc_pkg_install` (Pkg-bundled cards/).
+// ───────────────────────────────────────────────────────────────
+
+/// Import Card files from `source_dir` into `~/.algocline/cards/{pkg}/`.
+///
+/// Copies `*.toml` and `*.samples.jsonl` files. Existing cards with the
+/// same id are skipped (first-writer wins — Card immutability).
+///
+/// Returns `(imported, skipped)` card_id lists.
+pub fn import_from_dir(
+    source_dir: &std::path::Path,
+    pkg: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    validate_name(pkg, "pkg")?;
+    let dest = pkg_dir(pkg)?;
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+
+    let entries = fs::read_dir(source_dir)
+        .map_err(|e| format!("Failed to read card source dir: {e}"))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Only process .toml card files (not .samples.jsonl — those are handled below)
+        if !fname.ends_with(".toml") {
+            continue;
+        }
+
+        let card_id = fname.trim_end_matches(".toml");
+        let dest_toml = dest.join(&fname);
+
+        if dest_toml.exists() {
+            skipped.push(card_id.to_string());
+            continue;
+        }
+
+        // Validate: must contain schema_version = "card/v0"
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read card file '{fname}': {e}"))?;
+        let val: toml::Value = toml::from_str(&text)
+            .map_err(|e| format!("Failed to parse card file '{fname}': {e}"))?;
+        if val
+            .get("schema_version")
+            .and_then(|v| v.as_str())
+            != Some(SCHEMA_VERSION)
+        {
+            continue; // skip non-card TOML files (e.g. index.toml, _aliases.toml)
+        }
+
+        // Copy .toml
+        fs::copy(&path, &dest_toml)
+            .map_err(|e| format!("Failed to copy card '{fname}': {e}"))?;
+
+        // Copy matching .samples.jsonl if present
+        let samples_name = format!("{card_id}.samples.jsonl");
+        let samples_src = source_dir.join(&samples_name);
+        if samples_src.exists() {
+            let samples_dest = dest.join(&samples_name);
+            if !samples_dest.exists() {
+                fs::copy(&samples_src, &samples_dest)
+                    .map_err(|e| format!("Failed to copy samples '{samples_name}': {e}"))?;
+            }
+        }
+
+        imported.push(card_id.to_string());
+    }
+
+    Ok((imported, skipped))
+}
+
 /// Resolve the samples sidecar path for a Card.
 ///
 /// Returns an error if the Card does not exist — samples without a
@@ -1254,5 +1332,88 @@ mod tests {
     fn samples_errors_on_missing_card() {
         let err = write_samples("does_not_exist_xyz_samples", vec![json!({})]).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    // ─── import_from_dir ───────────────────────────────────────
+
+    #[test]
+    fn import_from_dir_copies_cards() {
+        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a source card file
+        let card_id = format!("{pkg}_imported");
+        let card_content = format!(
+            "schema_version = \"{SCHEMA_VERSION}\"\ncard_id = \"{card_id}\"\npkg = \"{pkg}\"\n"
+        );
+        fs::write(tmp.path().join(format!("{card_id}.toml")), &card_content).unwrap();
+
+        // Create a matching samples file
+        fs::write(
+            tmp.path().join(format!("{card_id}.samples.jsonl")),
+            "{\"case\":\"c0\"}\n",
+        )
+        .unwrap();
+
+        let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
+        assert_eq!(imported, vec![card_id.clone()]);
+        assert!(skipped.is_empty());
+
+        // Verify card was imported
+        let got = get(&card_id).unwrap().unwrap();
+        assert_eq!(got["card_id"], json!(card_id));
+
+        // Verify samples were copied
+        let samples = read_samples(&card_id, 0, None).unwrap();
+        assert_eq!(samples.len(), 1);
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn import_from_dir_skips_existing() {
+        let pkg = unique_pkg();
+        // Create a card in the store first
+        let (existing_id, _) = create(json!({
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.5 }
+        }))
+        .unwrap();
+
+        // Try to import a card with the same id
+        let tmp = tempfile::tempdir().unwrap();
+        let card_content = format!(
+            "schema_version = \"{SCHEMA_VERSION}\"\ncard_id = \"{existing_id}\"\npkg = \"{pkg}\"\n"
+        );
+        fs::write(tmp.path().join(format!("{existing_id}.toml")), &card_content).unwrap();
+
+        let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
+        assert!(imported.is_empty());
+        assert_eq!(skipped, vec![existing_id.clone()]);
+
+        // Original card untouched
+        let got = get(&existing_id).unwrap().unwrap();
+        assert_eq!(got["stats"]["pass_rate"], json!(0.5));
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn import_from_dir_skips_non_card_toml() {
+        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A TOML file without schema_version = "card/v0" should be skipped
+        fs::write(
+            tmp.path().join("not_a_card.toml"),
+            "title = \"hello\"\n",
+        )
+        .unwrap();
+
+        let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
+        assert!(imported.is_empty());
+        assert!(skipped.is_empty());
+
+        cleanup(&pkg);
     }
 }

@@ -10,6 +10,7 @@ expression: names
   "alc_card_find",
   "alc_card_get",
   "alc_card_get_by_alias",
+  "alc_card_install",
   "alc_card_list",
   "alc_card_samples",
   "alc_continue",

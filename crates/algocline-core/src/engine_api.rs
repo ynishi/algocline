@@ -224,6 +224,9 @@ pub trait EngineApi: Send + Sync {
         fields: serde_json::Value,
     ) -> Result<String, String>;
 
+    /// Install Cards from a Card Collection repo (Git URL or local path).
+    async fn card_install(&self, url: String) -> Result<String, String>;
+
     /// Read per-case samples from a Card's sidecar JSONL file.
     async fn card_samples(
         &self,

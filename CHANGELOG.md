@@ -13,6 +13,13 @@ Evalframe facade exposed as a first-class Lua function in prelude.
 Accepts string scenario names or inline tables, wires the algocline
 provider automatically, and optionally emits a Card on completion.
 
+### Changed — `alc_eval` MCP tool delegates to `alc.eval()`
+
+The MCP `alc_eval` tool now delegates to the prelude `alc.eval()`
+function instead of hand-building evalframe Lua code. Card emission
+is handled Lua-side, removing Rust-side `maybe_save_card`.
+`eval_compare` shares the `STD_SHIM` constant with `eval`.
+
 ### Added — Card schema v0 (frozen)
 
 Immutable run-result snapshots stored as TOML under

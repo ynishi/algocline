@@ -571,7 +571,12 @@ fn count_evals_for_pkg(pkg: &str) -> usize {
         Err(_) => return 0,
     };
 
-    let mut count = 0;
+    // Collect all filenames first so ordering doesn't matter.
+    // We track stems that have a .meta.json to avoid reading the full eval JSON.
+    let mut meta_stems: HashSet<String> = HashSet::new();
+    let mut meta_matches: usize = 0;
+    let mut non_meta_paths: Vec<(PathBuf, String)> = Vec::new(); // (path, stem)
+
     for entry in entries.flatten() {
         let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
@@ -579,12 +584,13 @@ fn count_evals_for_pkg(pkg: &str) -> usize {
             None => continue,
         };
 
-        // Prefer .meta.json files (lightweight)
         if name.ends_with(".meta.json") {
+            let stem = name.trim_end_matches(".meta.json").to_string();
+            meta_stems.insert(stem);
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     if val.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
-                        count += 1;
+                        meta_matches += 1;
                     }
                 }
             }
@@ -592,27 +598,32 @@ fn count_evals_for_pkg(pkg: &str) -> usize {
         }
 
         // Skip non-json or comparison files
-        if !name.ends_with(".json") || name.starts_with("compare_") || name.contains(".meta.") {
+        if !name.ends_with(".json") || name.starts_with("compare_") {
             continue;
         }
 
-        // Check if a meta file exists (already counted above)
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let meta_path = evals_dir.join(format!("{stem}.meta.json"));
-        if meta_path.exists() {
-            continue; // Already handled by meta path
-        }
-
-        // Fall back to reading the full eval to check strategy
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if val.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
-                    count += 1;
-                }
-            }
-        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        non_meta_paths.push((path, stem));
     }
-    count
+
+    // Only read full eval JSON for entries without a .meta.json
+    let fallback_matches = non_meta_paths
+        .iter()
+        .filter(|(_, stem)| !meta_stems.contains(stem))
+        .filter(|(path, _)| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .and_then(|v| v.get("strategy")?.as_str().map(|s| s == pkg))
+                .unwrap_or(false)
+        })
+        .count();
+
+    meta_matches + fallback_matches
 }
 
 // ─── Merge ─────────────────────────────────────────────────────
@@ -906,6 +917,11 @@ impl AppService {
     pub fn hub_info(&self, pkg: &str) -> Result<String, String> {
         use algocline_engine::card;
 
+        // Guard against path traversal
+        if pkg.contains("..") || pkg.contains('/') || pkg.contains('\\') {
+            return Err(format!("Invalid package name: '{pkg}'"));
+        }
+
         // Package metadata: try remote index first, fall back to local
         let installed = installed_packages();
         let is_installed = installed.contains_key(pkg);
@@ -949,11 +965,9 @@ impl AppService {
             }
         };
 
-        // Cards for this package
-        let cards_json = match card::list(Some(pkg)) {
-            Ok(rows) => card::summaries_to_json(&rows),
-            Err(_) => serde_json::json!([]),
-        };
+        // Cards for this package (single call, reused for stats)
+        let card_rows = card::list(Some(pkg)).unwrap_or_default();
+        let cards_json = card::summaries_to_json(&card_rows);
 
         // Aliases for this package
         let aliases_json = match card::alias_list(Some(pkg)) {
@@ -962,7 +976,6 @@ impl AppService {
         };
 
         // Stats: card count, best pass_rate, eval count
-        let card_rows = card::list(Some(pkg)).unwrap_or_default();
         let card_count = card_rows.len();
         let best_pass_rate = card_rows
             .iter()

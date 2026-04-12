@@ -256,6 +256,13 @@ impl EngineApi for AppService {
         .map_err(|e| format!("hub_reindex task panicked: {e}"))?
     }
 
+    async fn hub_info(&self, pkg: String) -> Result<String, String> {
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || AppService::hub_info(&svc, &pkg))
+            .await
+            .map_err(|e| format!("hub_info task panicked: {e}"))?
+    }
+
     async fn hub_search(
         &self,
         query: Option<String>,

@@ -1,6 +1,8 @@
 //! Hub — Remote Index search with local merge.
 //!
-//! Discovers index URLs from three sources (in priority order):
+//! Discovers index URLs from four sources (in priority order):
+//!   0. Hub Collection URL (`~/.algocline/config.toml` `[hub]` section) —
+//!      aggregated index containing all known packages (Stage 3)
 //!   1. Hub registries (`~/.algocline/hub_registries.json`) — auto-populated
 //!      by `pkg_install` and `card_install`
 //!   2. Installed-packages manifest (`~/.algocline/installed.json`) — fallback
@@ -189,9 +191,39 @@ pub(crate) fn register_source(source: &str, origin: &str) {
     }
 }
 
+// ─── Hub config ──────────────────────────────────────────────
+//
+// Optional `[hub]` section in `~/.algocline/config.toml`:
+//
+//   [hub]
+//   collection_url = "https://raw.githubusercontent.com/.../hub_index.json"
+//
+// When set, this is fetched as Tier 0 (the aggregated collection
+// index containing all known packages, including uninstalled ones).
+
+/// Read the `[hub].collection_url` from `~/.algocline/config.toml`.
+fn collection_url_from_config() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".algocline").join("config.toml");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let doc: toml_edit::DocumentMut = content.parse().ok()?;
+    let url = doc
+        .get("hub")?
+        .get("collection_url")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
 // ─── Index URL discovery ──────────────────────────────────────
 //
 // Derives remote index URLs from:
+//   0. Hub Collection URL (from config.toml) — aggregated index
 //   1. Hub registries (`hub_registries.json`) — primary source
 //   2. Unique `source` fields in the installed-packages manifest
 //   3. `AUTO_INSTALL_SOURCES` as fallback seeds (for first run)
@@ -222,8 +254,15 @@ fn repo_to_index_url(repo_url: &str) -> Option<String> {
     }
 }
 
-/// Collect unique index URLs from registries + manifest + bundled seeds.
+/// Collect unique index URLs from config + registries + manifest + bundled seeds.
 fn discover_index_urls() -> Vec<String> {
+    let mut index_urls: Vec<String> = Vec::new();
+
+    // 0. From config.toml [hub].collection_url (Tier 0 — aggregated collection)
+    if let Some(url) = collection_url_from_config() {
+        index_urls.push(url);
+    }
+
     let mut repo_urls: HashSet<String> = HashSet::new();
 
     // 1. From hub registries (primary)
@@ -250,13 +289,17 @@ fn discover_index_urls() -> Vec<String> {
         repo_urls.insert(url.to_string());
     }
 
-    // 4. Transform repo URLs → index URLs
-    let mut index_urls: Vec<String> = repo_urls
+    // 4. Transform repo URLs → index URLs, dedup against Tier 0
+    let existing: HashSet<String> = index_urls.iter().cloned().collect();
+    let mut derived: Vec<String> = repo_urls
         .iter()
         .filter_map(|url| repo_to_index_url(url))
+        .filter(|url| !existing.contains(url))
         .collect();
-    index_urls.sort();
-    index_urls.dedup();
+    derived.sort();
+    derived.dedup();
+    index_urls.extend(derived);
+
     index_urls
 }
 
@@ -453,6 +496,65 @@ fn local_card_counts() -> HashMap<String, usize> {
         }
     }
     map
+}
+
+/// Count eval results for a specific package by scanning `~/.algocline/evals/`.
+///
+/// Reads only `.meta.json` files (lightweight) to check the strategy field.
+/// Falls back to reading full eval JSON if meta is missing.
+fn count_evals_for_pkg(pkg: &str) -> usize {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return 0,
+    };
+    let evals_dir = home.join(".algocline").join("evals");
+    let entries = match std::fs::read_dir(&evals_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Prefer .meta.json files (lightweight)
+        if name.ends_with(".meta.json") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if val.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
+                        count += 1;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Skip non-json or comparison files
+        if !name.ends_with(".json") || name.starts_with("compare_") || name.contains(".meta.") {
+            continue;
+        }
+
+        // Check if a meta file exists (already counted above)
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let meta_path = evals_dir.join(format!("{stem}.meta.json"));
+        if meta_path.exists() {
+            continue; // Already handled by meta path
+        }
+
+        // Fall back to reading the full eval to check strategy
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if val.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
 }
 
 // ─── Merge ─────────────────────────────────────────────────────
@@ -735,6 +837,104 @@ impl AppService {
             "updated_at": index.updated_at,
             "output_path": written_path,
             "source_dir": source_dir,
+        });
+        Ok(response.to_string())
+    }
+
+    /// Show detailed information for a single package.
+    ///
+    /// Aggregates package metadata (from index or local `init.lua`),
+    /// all Cards, aliases, and eval stats into one response.
+    pub fn hub_info(&self, pkg: &str) -> Result<String, String> {
+        use algocline_engine::card;
+
+        // Package metadata: try remote index first, fall back to local
+        let installed = installed_packages();
+        let is_installed = installed.contains_key(pkg);
+
+        let (version, description, category, source) = {
+            // Try to get from remote index
+            let (remote, _) = fetch_remote_indices();
+            if let Some(entry) = remote.packages.iter().find(|e| e.name == pkg) {
+                (
+                    entry.version.clone(),
+                    entry.description.clone(),
+                    entry.category.clone(),
+                    entry.source.clone(),
+                )
+            } else if is_installed {
+                // Fall back to local init.lua parse
+                let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+                let init_lua = home
+                    .join(".algocline")
+                    .join("packages")
+                    .join(pkg)
+                    .join("init.lua");
+                let meta = parse_meta_from_init_lua(&init_lua);
+                let manifest_source = manifest::load_manifest()
+                    .ok()
+                    .and_then(|m| m.packages.get(pkg).map(|e| e.source.clone()))
+                    .unwrap_or_default();
+                match meta {
+                    Some((_, v, d, c)) => (v, d, c, manifest_source),
+                    None => (
+                        installed.get(pkg).cloned().flatten().unwrap_or_default(),
+                        String::new(),
+                        String::new(),
+                        manifest_source,
+                    ),
+                }
+            } else {
+                return Err(format!(
+                    "Package '{pkg}' not found in remote indices or locally installed packages"
+                ));
+            }
+        };
+
+        // Cards for this package
+        let cards_json = match card::list(Some(pkg)) {
+            Ok(rows) => card::summaries_to_json(&rows),
+            Err(_) => serde_json::json!([]),
+        };
+
+        // Aliases for this package
+        let aliases_json = match card::alias_list(Some(pkg)) {
+            Ok(rows) => card::aliases_to_json(&rows),
+            Err(_) => serde_json::json!([]),
+        };
+
+        // Stats: card count, best pass_rate, eval count
+        let card_rows = card::list(Some(pkg)).unwrap_or_default();
+        let card_count = card_rows.len();
+        let best_pass_rate = card_rows
+            .iter()
+            .filter_map(|c| c.pass_rate)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let best_pass_rate = if best_pass_rate.is_finite() {
+            Some(best_pass_rate)
+        } else {
+            None
+        };
+
+        // Eval count from evals directory
+        let eval_count = count_evals_for_pkg(pkg);
+
+        let response = serde_json::json!({
+            "pkg": {
+                "name": pkg,
+                "version": version,
+                "description": description,
+                "category": category,
+                "source": source,
+                "installed": is_installed,
+            },
+            "cards": cards_json,
+            "aliases": aliases_json,
+            "stats": {
+                "card_count": card_count,
+                "eval_count": eval_count,
+                "best_pass_rate": best_pass_rate,
+            },
         });
         Ok(response.to_string())
     }

@@ -244,6 +244,9 @@ pub trait EngineApi: Send + Sync {
         source_dir: Option<String>,
     ) -> Result<String, String>;
 
+    /// Show detailed information for a single package.
+    async fn hub_info(&self, pkg: String) -> Result<String, String>;
+
     /// Search packages across remote index + local install state.
     async fn hub_search(
         &self,

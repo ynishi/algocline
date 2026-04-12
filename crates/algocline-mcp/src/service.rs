@@ -339,6 +339,12 @@ pub struct CardInstallParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HubInfoParams {
+    /// Package name to get detailed information for.
+    pub pkg: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HubReindexParams {
     /// File path to write the generated index JSON to (e.g. for CI publishing).
     pub output_path: Option<String>,
@@ -888,6 +894,22 @@ impl AlcService {
 
     // ─── Hub ────────────────────────────────────────────────────
 
+    /// Show detailed information for a single package.
+    ///
+    /// Returns package metadata, all Cards (newest first), aliases,
+    /// and aggregated stats (card count, eval count, best pass rate).
+    /// Looks up the package in remote indices and local install state.
+    #[tool(
+        name = "alc_hub_info",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn hub_info(
+        &self,
+        Parameters(params): Parameters<HubInfoParams>,
+    ) -> Result<String, String> {
+        self.app.hub_info(params.pkg).await
+    }
+
     /// Generate a Hub index from a packages directory.
     ///
     /// When `source_dir` is provided, scans that directory directly
@@ -997,7 +1019,8 @@ impl ServerHandler for AlcService {
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
                  Hub:\n\
-                 - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
+                 - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
+                 - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\
                  - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Writes to a file for CI publishing.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."

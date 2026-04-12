@@ -693,6 +693,7 @@ report.card_id                 -- set when auto_card = true
 | `"exact_match"` | bool | Exact string match against expected |
 | `"contains"` | bool | Expected substring found in response |
 | `"starts_with"` | bool | Response starts with expected |
+| `"regex"` | bool | Lua pattern match (via `context.pattern` or `expected[1]`) |
 | `"json_valid"` | bool | Response is valid JSON |
 | `"not_empty"` | bool | Non-empty response |
 

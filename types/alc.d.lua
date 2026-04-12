@@ -349,6 +349,7 @@ function alc.pipe(strategies, ctx, opts) end
 ---@field by_tag? table<string, table> Per-tag breakdown
 
 ---@class AlcEvalReport
+---@field name string Suite name (strategy:scenario)
 ---@field aggregated AlcEvalAggregated Aggregated statistics
 ---@field failures table[] Failed case details
 ---@field results table[] All case results

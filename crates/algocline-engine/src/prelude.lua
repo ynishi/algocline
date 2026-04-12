@@ -670,10 +670,7 @@ do
             end
             return grader_fn
         end
-        if type(g) == "table" and ef.bind.is_binding(g) then
-            return g -- already a binding, pass through
-        end
-        error("alc.eval: grader must be string name or function, got " .. type(g))
+        error("alc.eval: grader must be a string name or function, got " .. type(g))
     end
 
     -- Wrap simple {input, expected} tables as ef.case if needed.
@@ -789,6 +786,11 @@ do
             spec = scenario
         else
             error("alc.eval: scenario must be a string or table")
+        end
+
+        -- Validate resolved spec
+        if type(spec) ~= "table" then
+            error("alc.eval: scenario resolved to " .. type(spec) .. ", expected table")
         end
 
         -- 3. Build provider

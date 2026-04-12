@@ -746,6 +746,9 @@ do
 
     function alc.eval(scenario, strategy, opts)
         if not scenario then error("alc.eval: scenario is required") end
+        if type(scenario) ~= "string" and type(scenario) ~= "table" then
+            error("alc.eval: scenario must be a string or table")
+        end
         if not strategy or type(strategy) ~= "string" then
             error("alc.eval: strategy must be a string package name")
         end
@@ -781,11 +784,9 @@ do
                 error("alc.eval: could not resolve scenario '" .. scenario .. "'")
             end
             spec = loaded
-        elseif type(scenario) == "table" then
+        else -- type(scenario) == "table" (guaranteed by early validation)
             scenario_name = scenario.name
             spec = scenario
-        else
-            error("alc.eval: scenario must be a string or table")
         end
 
         -- Validate resolved spec

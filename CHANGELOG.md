@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-04-12
+
+### Added — Hub: Package Discovery & Search
+
+Registry-based remote index discovery with per-source caching.
+
+- **`alc_hub_search`**: Search packages across remote Hub indices + local install state. Index URLs are auto-discovered from hub registries (populated by `pkg_install` / `card_install`), the installed-packages manifest, and bundled seeds. Results include `installed: true/false`, descriptions, categories, and source URLs.
+- **`alc_hub_reindex`**: Generate a hub index from a packages directory. New `source_dir` parameter enables pure metadata extraction from a repo checkout (no manifest or card data mixed in) for CI publishing.
+- **Hub registries** (`~/.algocline/hub_registries.json`): Persistent registry of source URLs, auto-populated on `pkg_install` and `card_install`. Atomic writes via tempfile + rename.
+- **Per-source cache** (`~/.algocline/hub_cache/{hash}.json`): Each remote index cached independently with 1-hour TTL using FNV-1a URL hashing.
+
+### Changed
+
+- Bump `algocline-bundled-packages` to v0.11.2 (adds `hub_index.json`)
+
 ## [0.17.1] - 2026-04-12
 
 ### Changed

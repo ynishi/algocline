@@ -234,8 +234,15 @@ pub trait EngineApi: Send + Sync {
 
     // ─── Hub ─────────────────────────────────────────────────
 
-    /// Rebuild hub index from locally installed packages.
-    async fn hub_reindex(&self, output_path: Option<String>) -> Result<String, String>;
+    /// Rebuild hub index from a packages directory.
+    ///
+    /// When `source_dir` is provided, scans that directory directly
+    /// (pure metadata, no manifest).  When omitted, scans `~/.algocline/packages/`.
+    async fn hub_reindex(
+        &self,
+        output_path: Option<String>,
+        source_dir: Option<String>,
+    ) -> Result<String, String>;
 
     /// Search packages across remote index + local install state.
     async fn hub_search(

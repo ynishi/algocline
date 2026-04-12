@@ -342,6 +342,11 @@ pub struct CardInstallParams {
 pub struct HubReindexParams {
     /// File path to write the generated index JSON to (e.g. for CI publishing).
     pub output_path: Option<String>,
+    /// Directory to scan for packages (e.g. a repo checkout).
+    /// When omitted, scans `~/.algocline/packages/` (local install state).
+    /// When provided, generates a pure index from that directory only
+    /// — no manifest sources or card counts are mixed in.
+    pub source_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -883,12 +888,13 @@ impl AlcService {
 
     // ─── Hub ────────────────────────────────────────────────────
 
-    /// Generate a Hub index from locally installed packages.
+    /// Generate a Hub index from a packages directory.
     ///
-    /// Scans `~/.algocline/packages/` and extracts metadata from each
-    /// package's `init.lua` (M.meta) without Lua VM. Writes the index
-    /// to a file path for CI publishing. Does NOT touch the remote
-    /// search cache used by `alc_hub_search`.
+    /// When `source_dir` is provided, scans that directory directly
+    /// (e.g. a repo checkout) for pure metadata extraction — no manifest
+    /// or card data mixed in.  When omitted, scans `~/.algocline/packages/`.
+    /// Writes the index to `output_path` for CI publishing. Does NOT
+    /// touch the remote search cache used by `alc_hub_search`.
     #[tool(
         name = "alc_hub_reindex",
         annotations(destructive_hint = false, open_world_hint = false)
@@ -897,12 +903,15 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<HubReindexParams>,
     ) -> Result<String, String> {
-        self.app.hub_reindex(params.output_path).await
+        self.app
+            .hub_reindex(params.output_path, params.source_dir)
+            .await
     }
 
-    /// Search packages across the remote Hub index and local install state.
+    /// Search packages across remote Hub indices and local install state.
     ///
-    /// Fetches the remote package index (cached for 1 hour), merges with
+    /// Discovers index URLs from installed package sources and bundled
+    /// seeds, fetches each (cached per-source for 1 hour), merges with
     /// locally installed packages/cards, and returns results with
     /// `installed: true/false` for each entry. Use this to discover
     /// available strategies — uninstalled packages can be installed via
@@ -916,7 +925,12 @@ impl AlcService {
         Parameters(params): Parameters<HubSearchParams>,
     ) -> Result<String, String> {
         self.app
-            .hub_search(params.query, params.category, params.installed_only, params.limit)
+            .hub_search(
+                params.query,
+                params.category,
+                params.installed_only,
+                params.limit,
+            )
             .await
     }
 
@@ -983,8 +997,8 @@ impl ServerHandler for AlcService {
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
                  Hub:\n\
-                 - alc_hub_search: Search packages across the remote Hub index + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
-                 - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Updates cache and optionally writes to a file for CI publishing.\n\n\
+                 - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
+                 - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Writes to a file for CI publishing.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

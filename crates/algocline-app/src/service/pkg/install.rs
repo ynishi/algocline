@@ -5,6 +5,7 @@ use std::path::Path;
 use super::super::alc_toml::{
     add_package_entry, load_alc_toml_document, save_alc_toml, PackageDep,
 };
+use super::super::hub;
 use super::super::lockfile::{load_lockfile, save_lockfile, LockFile, LockPackage};
 use super::super::manifest;
 use super::super::path::{copy_dir, ContainedPath};
@@ -88,6 +89,7 @@ impl AppService {
 
             // Record in manifest (best-effort; install itself already succeeded)
             let _ = manifest::record_install(&name, None, &url);
+            hub::register_source(&url, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(std::slice::from_ref(&name))
@@ -185,6 +187,7 @@ impl AppService {
 
             // Record in manifest (best-effort)
             let _ = manifest::record_install_batch(&installed, &url);
+            hub::register_source(&url, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(&installed).await;
@@ -231,7 +234,9 @@ impl AppService {
             let _ = std::fs::remove_dir_all(dest.as_ref().join(".git"));
 
             // Record in manifest (best-effort)
-            let _ = manifest::record_install(&name, None, &source.display().to_string());
+            let source_str_local = source.display().to_string();
+            let _ = manifest::record_install(&name, None, &source_str_local);
+            hub::register_source(&source_str_local, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(std::slice::from_ref(&name))
@@ -304,6 +309,7 @@ impl AppService {
             let source_str = source.display().to_string();
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
             let _ = manifest::record_install_batch(&all_names, &source_str);
+            hub::register_source(&source_str, "pkg_install");
 
             // Update alc.toml + alc.lock for newly installed packages
             self.update_project_files_for_install(&installed).await;

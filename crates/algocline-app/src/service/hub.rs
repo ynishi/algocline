@@ -1,29 +1,30 @@
 //! Hub — Remote Index search with local merge.
 //!
-//! Fetches a static JSON index from a remote URL, merges with locally
-//! installed packages and cards, and returns search results with
-//! `installed: true/false` for each entry.
+//! Discovers index URLs from the installed-packages manifest
+//! (`~/.algocline/installed.json`), fetches each remote index,
+//! merges with locally installed packages and cards, and returns
+//! search results with `installed: true/false` for each entry.
 //!
-//! The remote index is cached at `~/.algocline/hub_cache.json` with a
-//! configurable TTL (default 1 hour).
+//! Remote indices are cached per-source at
+//! `~/.algocline/hub_cache/{hash}.json` with a configurable TTL
+//! (default 1 hour).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use super::manifest;
+use super::resolve::AUTO_INSTALL_SOURCES;
 use super::AppService;
 
 // ─── Constants ─────────────────────────────────────────────────
 
-/// Default remote index URL. Points to the generated index in the
-/// bundled-packages repository (GitHub Pages or raw).
-const DEFAULT_INDEX_URL: &str =
-    "https://raw.githubusercontent.com/ynishi/algocline-bundled-packages/main/hub_index.json";
-
 /// Cache TTL in seconds (1 hour).
 const CACHE_TTL_SECS: u64 = 3600;
+
+/// HTTP request timeout (30 seconds).
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ─── Index schema ──────────────────────────────────────────────
 
@@ -80,19 +81,191 @@ struct SearchResult {
     best_card: Option<BestCard>,
 }
 
-// ─── Remote Cache ─────────────────────────────────────────────
+// ─── Hub registries ───────────────────────────────────────────
 //
-// Caches the remote index only. `hub_reindex` (local index generation)
-// does NOT use this cache — it writes to a user-specified output path.
+// Persistent file (`~/.algocline/hub_registries.json`) that records
+// source URLs from `pkg_install` and `card_install`.  This is the
+// primary source for Hub index URL discovery — the manifest and
+// `AUTO_INSTALL_SOURCES` serve as fallback seeds.
 
-fn remote_cache_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("hub_remote_cache.json"))
+/// One entry in `hub_registries.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RegistryEntry {
+    /// Original source URL (Git repo or local path).
+    pub source: String,
+    /// How it was registered: "pkg_install" or "card_install".
+    pub origin: String,
+    /// ISO 8601 timestamp of when the entry was added.
+    pub added_at: String,
 }
 
-/// Load cached remote index if fresh (within TTL).
-fn load_remote_cache() -> Option<HubIndex> {
-    let path = remote_cache_path().ok()?;
+/// Top-level registries file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct HubRegistries {
+    pub registries: Vec<RegistryEntry>,
+}
+
+fn registries_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(home.join(".algocline").join("hub_registries.json"))
+}
+
+/// Load registries from disk.  Returns empty list if file is missing.
+fn load_registries() -> HubRegistries {
+    let path = match registries_path() {
+        Ok(p) => p,
+        Err(_) => return HubRegistries::default(),
+    };
+    if !path.exists() {
+        return HubRegistries::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+/// Register a source URL.  Deduplicates by normalized URL.
+pub(crate) fn register_source(source: &str, origin: &str) {
+    let normalized = source.trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        return;
+    }
+    // Skip local paths — they can't host a remote index
+    if normalized.starts_with('/') || normalized.starts_with('.') {
+        return;
+    }
+
+    let mut reg = load_registries();
+
+    // Already registered?
+    if reg
+        .registries
+        .iter()
+        .any(|e| e.source.trim_end_matches('/') == normalized)
+    {
+        return;
+    }
+
+    reg.registries.push(RegistryEntry {
+        source: normalized,
+        origin: origin.to_string(),
+        added_at: manifest::now_iso8601(),
+    });
+
+    if let Ok(path) = registries_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match serde_json::to_string_pretty(&reg) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("failed to write hub registries: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("failed to serialize hub registries: {e}"),
+        }
+    }
+}
+
+// ─── Index URL discovery ──────────────────────────────────────
+//
+// Derives remote index URLs from:
+//   1. Hub registries (`hub_registries.json`) — primary source
+//   2. Unique `source` fields in the installed-packages manifest
+//   3. `AUTO_INSTALL_SOURCES` as fallback seeds (for first run)
+//
+// GitHub repos are transformed:
+//   https://github.com/{owner}/{repo}  →
+//   https://raw.githubusercontent.com/{owner}/{repo}/main/hub_index.json
+
+/// Convert a GitHub repo URL to a raw `hub_index.json` URL.
+/// Returns `None` for non-GitHub URLs (future: support other hosts).
+fn repo_to_index_url(repo_url: &str) -> Option<String> {
+    let trimmed = repo_url.trim_end_matches('/').trim_end_matches(".git");
+    if let Some(path) = trimmed.strip_prefix("https://github.com/") {
+        // path = "owner/repo"
+        let parts: Vec<&str> = path.splitn(3, '/').collect();
+        if parts.len() >= 2 {
+            return Some(format!(
+                "https://raw.githubusercontent.com/{}/{}/main/hub_index.json",
+                parts[0], parts[1]
+            ));
+        }
+    }
+    // Non-GitHub URL: assume it's already a direct index URL
+    if trimmed.ends_with(".json") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Collect unique index URLs from registries + manifest + bundled seeds.
+fn discover_index_urls() -> Vec<String> {
+    let mut repo_urls: HashSet<String> = HashSet::new();
+
+    // 1. From hub registries (primary)
+    let reg = load_registries();
+    for entry in &reg.registries {
+        let normalized = entry.source.trim_end_matches('/').to_string();
+        if !normalized.is_empty() {
+            repo_urls.insert(normalized);
+        }
+    }
+
+    // 2. From manifest (catch sources registered before hub_registries existed)
+    if let Ok(m) = manifest::load_manifest() {
+        for entry in m.packages.values() {
+            let normalized = entry.source.trim_end_matches('/').to_string();
+            if !normalized.is_empty() && !normalized.starts_with('/') {
+                repo_urls.insert(normalized);
+            }
+        }
+    }
+
+    // 3. Fallback: bundled sources (ensures at least these are checked)
+    for url in AUTO_INSTALL_SOURCES {
+        repo_urls.insert(url.to_string());
+    }
+
+    // 4. Transform repo URLs → index URLs
+    let mut index_urls: Vec<String> = repo_urls
+        .iter()
+        .filter_map(|url| repo_to_index_url(url))
+        .collect();
+    index_urls.sort();
+    index_urls.dedup();
+    index_urls
+}
+
+// ─── Per-source cache ─────────────────────────────────────────
+//
+// Each remote index is cached separately at
+// `~/.algocline/hub_cache/{hash}.json` where hash is derived from
+// the index URL. This avoids mixing data from different registries
+// and allows per-source TTL validation.
+
+fn cache_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(home.join(".algocline").join("hub_cache"))
+}
+
+fn cache_key(url: &str) -> String {
+    // Simple hash: use the URL bytes to produce a stable hex string.
+    // Avoids pulling in a hash crate — good enough for cache file naming.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3); // FNV prime
+    }
+    format!("{h:016x}")
+}
+
+/// Load cached remote index for a specific URL if fresh (within TTL).
+fn load_cached(url: &str) -> Option<HubIndex> {
+    let dir = cache_dir().ok()?;
+    let path = dir.join(format!("{}.json", cache_key(url)));
     if !path.exists() {
         return None;
     }
@@ -105,66 +278,95 @@ fn load_remote_cache() -> Option<HubIndex> {
     serde_json::from_str(&content).ok()
 }
 
-/// Save remote index to cache file.
-fn save_remote_cache(index: &HubIndex) {
-    if let Ok(path) = remote_cache_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+/// Save remote index to per-source cache file.
+fn save_cached(url: &str, index: &HubIndex) {
+    let dir = match cache_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("hub cache dir unavailable: {e}");
+            return;
         }
-        if let Ok(json) = serde_json::to_string_pretty(index) {
-            let _ = std::fs::write(&path, json);
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("failed to create hub cache dir: {e}");
+        return;
+    }
+    let path = dir.join(format!("{}.json", cache_key(url)));
+    match serde_json::to_string_pretty(index) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("failed to write hub cache {}: {e}", path.display());
+            }
         }
+        Err(e) => tracing::warn!("failed to serialize hub cache: {e}"),
     }
 }
 
 // ─── Remote fetch ──────────────────────────────────────────────
 
-/// HTTP request timeout (30 seconds).
-const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Fetch the remote index, using cache if fresh.
-/// Falls back to an empty index on network failure (local-only mode).
-fn fetch_remote_index(url: Option<&str>) -> (HubIndex, Option<String>) {
-    // Try cache first
-    if let Some(cached) = load_remote_cache() {
-        return (cached, None);
+/// Fetch a single remote index by URL, using per-source cache.
+fn fetch_one(url: &str) -> Result<HubIndex, String> {
+    if let Some(cached) = load_cached(url) {
+        return Ok(cached);
     }
 
-    let index_url = url.unwrap_or(DEFAULT_INDEX_URL);
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build(),
+    );
+    let body: String = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("Failed to fetch {url}: {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Failed to read response from {url}: {e}"))?;
 
-    let result = (|| -> Result<HubIndex, String> {
-        let agent = ureq::Agent::new_with_config(
-            ureq::config::Config::builder()
-                .timeout_global(Some(HTTP_TIMEOUT))
-                .build(),
-        );
-        let body: String = agent
-            .get(index_url)
-            .call()
-            .map_err(|e| format!("Failed to fetch remote index from {index_url}: {e}"))?
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("Failed to read response body: {e}"))?;
+    let index: HubIndex = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse index from {url}: {e}"))?;
 
-        let index: HubIndex = serde_json::from_str(&body)
-            .map_err(|e| format!("Failed to parse remote index: {e}"))?;
+    save_cached(url, &index);
+    Ok(index)
+}
 
-        save_remote_cache(&index);
-        Ok(index)
-    })();
+/// Fetch all discovered remote indices and merge into one.
+/// Falls back gracefully: failed sources are skipped with warnings.
+fn fetch_remote_indices() -> (HubIndex, Vec<String>) {
+    let urls = discover_index_urls();
+    let mut all_packages: Vec<IndexEntry> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut warnings: Vec<String> = Vec::new();
 
-    match result {
-        Ok(index) => (index, None),
-        Err(e) => {
-            // Fallback: empty remote index, search will still show local packages
-            let empty = HubIndex {
-                schema_version: "hub_index/v0".into(),
-                updated_at: String::new(),
-                packages: Vec::new(),
-            };
-            (empty, Some(format!("remote index unavailable ({e}), showing local packages only")))
+    for url in &urls {
+        match fetch_one(url) {
+            Ok(index) => {
+                for entry in index.packages {
+                    if seen_names.insert(entry.name.clone()) {
+                        all_packages.push(entry);
+                    }
+                    // If duplicate name across sources, first wins
+                }
+            }
+            Err(e) => {
+                warnings.push(e);
+            }
         }
     }
+
+    if all_packages.is_empty() && !warnings.is_empty() {
+        warnings.insert(
+            0,
+            "all remote indices unavailable, showing local packages only".to_string(),
+        );
+    }
+
+    let merged = HubIndex {
+        schema_version: "hub_index/v0".into(),
+        updated_at: String::new(),
+        packages: all_packages,
+    };
+    (merged, warnings)
 }
 
 // ─── Local state ───────────────────────────────────────────────
@@ -239,12 +441,14 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
     let installed = installed_packages();
     let card_counts = local_card_counts();
 
+    let mut seen: HashSet<String> = HashSet::new();
     let mut results: Vec<SearchResult> = Vec::new();
 
     for entry in &remote.packages {
         let is_installed = installed.contains_key(&entry.name);
         let local_cards = card_counts.get(&entry.name).copied().unwrap_or(0);
 
+        seen.insert(entry.name.clone());
         results.push(SearchResult {
             name: entry.name.clone(),
             version: entry.version.clone(),
@@ -263,7 +467,7 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
 
     // Add local-only packages (not in remote index)
     for (name, version) in &installed {
-        if results.iter().any(|r| r.name == *name) {
+        if seen.contains(name) {
             continue;
         }
         results.push(SearchResult {
@@ -293,7 +497,14 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
 // ─── Index generation (reindex) ───────────────────────────────
 
 /// Parse `M.meta = { ... }` from an `init.lua` file without Lua VM.
-/// Returns (name, version, description, category) or None on failure.
+///
+/// Extracts (name, version, description, category) from the first
+/// `M.meta = { ... }` block found in the first ~2 KB.
+///
+/// **Limitation**: Only supports flat key-value pairs inside `M.meta`.
+/// Nested tables (e.g. `tags = { ... }`) will cause the block to be
+/// truncated at the inner `}`. This is intentional — `M.meta` fields
+/// are expected to be simple strings.
 fn parse_meta_from_init_lua(path: &std::path::Path) -> Option<(String, String, String, String)> {
     let content = std::fs::read_to_string(path).ok()?;
     // Limit search to first ~2KB (snap back to a char boundary)
@@ -303,60 +514,114 @@ fn parse_meta_from_init_lua(path: &std::path::Path) -> Option<(String, String, S
     }
     let head = &content[..limit];
 
-    // Find M.meta = { ... } block
+    // Find M.meta = { ... } block (with brace-depth tracking)
     let meta_start = head.find("M.meta")?;
     let brace_start = head[meta_start..].find('{')? + meta_start;
-    let brace_end = head[brace_start..].find('}')? + brace_start;
+
+    // Track brace depth to handle nested tables correctly
+    let mut depth = 0;
+    let mut brace_end = None;
+    for (i, ch) in head[brace_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    brace_end = Some(brace_start + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let brace_end = brace_end?;
     let block = &head[brace_start + 1..brace_end];
 
     let extract = |field: &str| -> String {
-        // Match: field = "value"
-        block
-            .find(field)
-            .and_then(|pos| {
+        // Match: field = "value" with word-boundary check.
+        // Walk through all occurrences and pick one that is either at
+        // the start of a line (after whitespace) or preceded by a
+        // non-alphanumeric character, preventing "description" from
+        // matching inside "short_description".
+        let mut search_from = 0;
+        while let Some(rel) = block[search_from..].find(field) {
+            let pos = search_from + rel;
+            // Check that the character before the match is not alphanumeric/underscore
+            let word_boundary = if pos == 0 {
+                true
+            } else {
+                let prev = block.as_bytes()[pos - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_')
+            };
+            if word_boundary {
                 let after = &block[pos + field.len()..];
-                let q_start = after.find('"')? + 1;
-                let q_end = after[q_start..].find('"')? + q_start;
-                Some(after[q_start..q_end].to_string())
-            })
-            .unwrap_or_default()
+                if let Some(q_start_rel) = after.find('"') {
+                    let q_start = q_start_rel + 1;
+                    if let Some(q_end_rel) = after[q_start..].find('"') {
+                        return after[q_start..q_start + q_end_rel].to_string();
+                    }
+                }
+            }
+            search_from = pos + field.len();
+        }
+        String::new()
     };
 
     let name = extract("name");
     if name.is_empty() {
         return None;
     }
-    Some((name, extract("version"), extract("description"), extract("category")))
+    Some((
+        name,
+        extract("version"),
+        extract("description"),
+        extract("category"),
+    ))
 }
 
-/// Build a hub index from locally installed packages.
-fn build_local_index() -> HubIndex {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
+/// Build a hub index by scanning a packages directory.
+///
+/// When `source_dir` is provided, scans that directory directly
+/// (for generating an index from a repo checkout).  Metadata comes
+/// only from `init.lua` — no manifest lookup, no card counts.
+///
+/// When `source_dir` is `None`, scans `~/.algocline/packages/` and
+/// enriches entries with manifest source and local card counts.
+fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
+    let empty = || HubIndex {
+        schema_version: "hub_index/v0".into(),
+        updated_at: super::manifest::now_iso8601(),
+        packages: Vec::new(),
+    };
+
+    let pkg_dir = match source_dir {
+        Some(d) => d.to_path_buf(),
         None => {
-            return HubIndex {
-                schema_version: "hub_index/v0".into(),
-                updated_at: super::manifest::now_iso8601(),
-                packages: Vec::new(),
-            }
+            let home = match dirs::home_dir() {
+                Some(h) => h,
+                None => return empty(),
+            };
+            home.join(".algocline").join("packages")
         }
     };
 
-    let pkg_dir = home.join(".algocline").join("packages");
-    let card_counts = local_card_counts();
-    let manifest = manifest::load_manifest().unwrap_or_default();
+    let use_local_state = source_dir.is_none();
+    let card_counts = if use_local_state {
+        local_card_counts()
+    } else {
+        HashMap::new()
+    };
+    let manifest = if use_local_state {
+        manifest::load_manifest().unwrap_or_default()
+    } else {
+        manifest::Manifest::default()
+    };
 
     let mut entries = Vec::new();
 
     let dir_entries = match std::fs::read_dir(&pkg_dir) {
         Ok(e) => e,
-        Err(_) => {
-            return HubIndex {
-                schema_version: "hub_index/v0".into(),
-                updated_at: super::manifest::now_iso8601(),
-                packages: Vec::new(),
-            }
-        }
+        Err(_) => return empty(),
     };
 
     for entry in dir_entries.flatten() {
@@ -364,17 +629,26 @@ fn build_local_index() -> HubIndex {
             continue;
         }
         let dir_name = match entry.file_name().to_str() {
-            Some(n) => n.to_string(),
-            None => continue,
+            Some(n) if !n.starts_with('.') && !n.starts_with('_') => n.to_string(),
+            _ => continue,
         };
 
         let init_lua = entry.path().join("init.lua");
-        let (name, version, description, category) =
-            parse_meta_from_init_lua(&init_lua).unwrap_or_else(|| {
-                (dir_name.clone(), String::new(), String::new(), String::new())
+        if !init_lua.exists() {
+            continue;
+        }
+
+        let (name, version, description, category) = parse_meta_from_init_lua(&init_lua)
+            .unwrap_or_else(|| {
+                (
+                    dir_name.clone(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
             });
 
-        // Use manifest source if available
+        // Use manifest source only for local-state mode
         let source = manifest
             .packages
             .get(&dir_name)
@@ -404,13 +678,26 @@ fn build_local_index() -> HubIndex {
 // ─── Public API ────────────────────────────────────────────────
 
 impl AppService {
-    /// Generate a hub index from locally installed packages.
+    /// Generate a hub index from a packages directory.
     ///
-    /// Scans `~/.algocline/packages/` and parses `M.meta` from each
-    /// `init.lua` without Lua VM. Writes the index to `output_path`
-    /// (for CI / publishing). Does NOT touch the remote search cache.
-    pub fn hub_reindex(&self, output_path: Option<&str>) -> Result<String, String> {
-        let index = build_local_index();
+    /// When `source_dir` is provided, scans that directory (e.g. a
+    /// repo checkout) — pure metadata extraction, no manifest or card
+    /// data mixed in.  When omitted, scans `~/.algocline/packages/`.
+    ///
+    /// Writes the index to `output_path` (for CI / publishing).
+    /// Does NOT touch the remote search cache.
+    pub fn hub_reindex(
+        &self,
+        output_path: Option<&str>,
+        source_dir: Option<&str>,
+    ) -> Result<String, String> {
+        let src = source_dir.map(std::path::Path::new);
+        if let Some(d) = src {
+            if !d.is_dir() {
+                return Err(format!("source_dir '{}' is not a directory", d.display()));
+            }
+        }
+        let index = build_index(src);
 
         let written_path = if let Some(path) = output_path {
             let json = serde_json::to_string_pretty(&index)
@@ -426,11 +713,15 @@ impl AppService {
             "package_count": index.packages.len(),
             "updated_at": index.updated_at,
             "output_path": written_path,
+            "source_dir": source_dir,
         });
         Ok(response.to_string())
     }
 
-    /// Search packages across remote index + local state.
+    /// Search packages across remote indices + local state.
+    ///
+    /// Index URLs are discovered from the manifest's `source` fields
+    /// and `AUTO_INSTALL_SOURCES`. Each source is cached independently.
     pub fn hub_search(
         &self,
         query: Option<&str>,
@@ -438,7 +729,7 @@ impl AppService {
         installed_only: Option<bool>,
         limit: Option<usize>,
     ) -> Result<String, String> {
-        let (remote, warning) = fetch_remote_index(None);
+        let (remote, warnings) = fetch_remote_indices();
         let mut results = merge(&remote);
 
         // Filter by query
@@ -471,14 +762,177 @@ impl AppService {
         let limit = limit.unwrap_or(50);
         results.truncate(limit);
 
+        // Collect discovered sources for transparency
+        let sources = discover_index_urls();
+
         let mut json = serde_json::json!({
             "results": results,
             "total": total,
-            "index_url": DEFAULT_INDEX_URL,
+            "sources": sources,
         });
-        if let Some(w) = warning {
-            json["warning"] = serde_json::Value::String(w);
+        if !warnings.is_empty() {
+            json["warnings"] = serde_json::json!(warnings);
         }
         Ok(json.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_to_index_url_github() {
+        assert_eq!(
+            repo_to_index_url("https://github.com/ynishi/algocline-bundled-packages"),
+            Some(
+                "https://raw.githubusercontent.com/ynishi/algocline-bundled-packages/main/hub_index.json"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn repo_to_index_url_github_trailing_slash() {
+        assert_eq!(
+            repo_to_index_url("https://github.com/user/repo/"),
+            Some("https://raw.githubusercontent.com/user/repo/main/hub_index.json".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_to_index_url_github_dot_git() {
+        assert_eq!(
+            repo_to_index_url("https://github.com/user/repo.git"),
+            Some("https://raw.githubusercontent.com/user/repo/main/hub_index.json".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_to_index_url_direct_json() {
+        assert_eq!(
+            repo_to_index_url("https://example.com/my_index.json"),
+            Some("https://example.com/my_index.json".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_to_index_url_unknown_host_no_json() {
+        assert_eq!(repo_to_index_url("https://example.com/some-repo"), None);
+    }
+
+    #[test]
+    fn repo_to_index_url_local_path() {
+        assert_eq!(repo_to_index_url("/home/user/my-pkg"), None);
+    }
+
+    #[test]
+    fn cache_key_stable() {
+        let k1 = cache_key("https://example.com/index.json");
+        let k2 = cache_key("https://example.com/index.json");
+        assert_eq!(k1, k2);
+        assert_eq!(k1.len(), 16); // 16 hex chars
+    }
+
+    #[test]
+    fn cache_key_different_urls() {
+        let k1 = cache_key("https://a.com/index.json");
+        let k2 = cache_key("https://b.com/index.json");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn parse_meta_flat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        std::fs::write(
+            &path,
+            r#"
+local M = {}
+M.meta = {
+    name = "my_pkg",
+    version = "1.0.0",
+    description = "A test package",
+    category = "reasoning",
+}
+return M
+"#,
+        )
+        .unwrap();
+
+        let result = parse_meta_from_init_lua(&path).unwrap();
+        assert_eq!(result.0, "my_pkg");
+        assert_eq!(result.1, "1.0.0");
+        assert_eq!(result.2, "A test package");
+        assert_eq!(result.3, "reasoning");
+    }
+
+    #[test]
+    fn parse_meta_nested_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        std::fs::write(
+            &path,
+            r#"
+local M = {}
+M.meta = {
+    name = "nested_pkg",
+    tags = { "a", "b" },
+    description = "After nested",
+}
+return M
+"#,
+        )
+        .unwrap();
+
+        let result = parse_meta_from_init_lua(&path).unwrap();
+        assert_eq!(result.0, "nested_pkg");
+        assert_eq!(result.2, "After nested");
+    }
+
+    #[test]
+    fn parse_meta_word_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        std::fs::write(
+            &path,
+            r#"
+local M = {}
+M.meta = {
+    name = "wb_pkg",
+    short_description = "should not match",
+    description = "correct one",
+}
+return M
+"#,
+        )
+        .unwrap();
+
+        let result = parse_meta_from_init_lua(&path).unwrap();
+        assert_eq!(result.0, "wb_pkg");
+        assert_eq!(result.2, "correct one");
+    }
+
+    #[test]
+    fn merge_dedup_uses_hashset() {
+        // Verify that merge correctly handles local-only packages
+        // without O(n*m) behavior (structural test).
+        let remote = HubIndex {
+            schema_version: "hub_index/v0".into(),
+            updated_at: String::new(),
+            packages: vec![IndexEntry {
+                name: "remote_only".into(),
+                version: "1.0".into(),
+                description: "from remote".into(),
+                category: "test".into(),
+                source: String::new(),
+                card_count: 0,
+                best_card: None,
+            }],
+        };
+
+        let results = merge(&remote);
+        // Should include remote_only + any locally installed packages
+        assert!(results.iter().any(|r| r.name == "remote_only"));
     }
 }

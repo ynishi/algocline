@@ -243,10 +243,14 @@ impl EngineApi for AppService {
 
     // ─── Hub ─────────────────────────────────────────────────
 
-    async fn hub_reindex(&self, output_path: Option<String>) -> Result<String, String> {
+    async fn hub_reindex(
+        &self,
+        output_path: Option<String>,
+        source_dir: Option<String>,
+    ) -> Result<String, String> {
         let svc = self.clone();
         tokio::task::spawn_blocking(move || {
-            AppService::hub_reindex(&svc, output_path.as_deref())
+            AppService::hub_reindex(&svc, output_path.as_deref(), source_dir.as_deref())
         })
         .await
         .map_err(|e| format!("hub_reindex task panicked: {e}"))?

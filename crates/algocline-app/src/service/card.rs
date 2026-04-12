@@ -8,6 +8,7 @@ use std::path::Path;
 
 use algocline_engine::card;
 
+use super::hub;
 use super::AppService;
 
 impl AppService {
@@ -182,6 +183,9 @@ impl AppService {
         if all_imported.is_empty() && all_skipped.is_empty() {
             return Err("No Card files found in any subdirectory.".into());
         }
+
+        // Register source for Hub index discovery
+        hub::register_source(source, "card_install");
 
         let response = serde_json::json!({
             "installed_cards": all_imported,

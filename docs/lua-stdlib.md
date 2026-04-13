@@ -734,6 +734,39 @@ practice (MLflow, W&B, OpenAI Evals, LangSmith, etc.):
 Rule of thumb: if a value is **per-case** or **large**, it belongs in
 Tier 2. Everything else goes in Tier 1.
 
+### Schema Conventions
+
+Cards are schemaless TOML: any section / field you write is preserved
+and queryable via `where`. The following conventions are **recognized**
+— not enforced, but tools and docs assume this layout when it exists.
+
+**`[strategy_params]`** — parameters the strategy treats as tunable
+(sweep knobs, optimizer targets). Kept as a first-class section so
+sweep / optimize tooling can pick them up without pattern-matching
+`[params]`. Example: `strategy_params = { alpha = 0.7, depth = 3 }`.
+
+**`[metadata]` lineage fields:**
+
+| Field | Meaning |
+|-------|---------|
+| `prior_card_id` | The parent Card's `card_id`, for derived runs (sweeps, reflections, re-scorings). |
+| `prior_relation` | Short tag describing the relation type. Suggested values: `"sweep_variant"`, `"reflection_of"`, `"derived_from"`, `"rescored_from"`. |
+
+Writing these lets future lineage tooling (`alc.card.lineage`, Step 4)
+traverse Card ancestries without guessing field names.
+
+```lua
+alc.card.create({
+    pkg = { name = "my_sweep" },
+    strategy_params = { alpha = 0.7 },
+    stats = { ev = 0.62 },
+    metadata = {
+        prior_card_id = seed_card_id,
+        prior_relation = "sweep_variant",
+    },
+})
+```
+
 ### Write API
 
 #### `alc.card.create(table) -> { card_id, path }`

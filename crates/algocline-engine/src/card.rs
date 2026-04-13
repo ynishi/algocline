@@ -59,12 +59,13 @@
 //! | `[runtime]` | `alc_version`, `lua_version`, `host_os`, `git_sha` |
 //! | `[model]` | `provider`, `id`, `id_short`, `cutoff` |
 //! | `[params]` | Free-form ctx snapshot; `param_fingerprint` for DJB2 hash |
+//! | `[strategy_params]` | Strategy-tunable parameters surfaced for sweeps / optimizers (e.g. `alpha`, `temperature`, `depth`). Free-form, but `where`-queryable as a first-class section |
 //! | `[scenario]` | `name`, `source`, `case_count`, `grader` |
 //! | `[stats]` | `pass_rate`, `mean_score`, `std`, `median`, `min`, `max`, `n` |
 //! | `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |
 //! | `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |
 //! | `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |
-//! | `[metadata]` | Free-form escape hatch for unstandardized fields |
+//! | `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`) |
 //!
 //! ## Lua API (`alc.card.*`)
 //!

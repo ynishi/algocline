@@ -118,6 +118,9 @@ pub(crate) struct IndexEntry {
     pub card_count: usize,
     #[serde(default)]
     pub best_card: Option<BestCard>,
+    /// Leading `---` docstring lines from init.lua (for full-text search).
+    #[serde(default)]
+    pub docstring: String,
 }
 
 /// Best card summary within a package.
@@ -143,6 +146,8 @@ struct SearchResult {
     installed: bool,
     card_count: usize,
     best_card: Option<BestCard>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    docstring: String,
 }
 
 // ─── Hub registries ───────────────────────────────────────────
@@ -629,9 +634,14 @@ fn count_evals_for_pkg(pkg: &str) -> usize {
 // ─── Merge ─────────────────────────────────────────────────────
 
 /// Merge remote index with local install state.
+///
+/// When a package is installed locally and the remote index lacks a
+/// docstring (pre-v0.21 indices), the docstring is extracted from the
+/// local `init.lua` so that full-text search works immediately.
 fn merge(remote: &HubIndex) -> Vec<SearchResult> {
     let installed = installed_packages();
     let card_counts = local_card_counts();
+    let pkg_dir = dirs::home_dir().map(|h| h.join(".algocline").join("packages"));
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut results: Vec<SearchResult> = Vec::new();
@@ -639,6 +649,16 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
     for entry in &remote.packages {
         let is_installed = installed.contains_key(&entry.name);
         let local_cards = card_counts.get(&entry.name).copied().unwrap_or(0);
+
+        // Supplement empty docstring from local init.lua when installed
+        let docstring = if entry.docstring.is_empty() && is_installed {
+            pkg_dir
+                .as_ref()
+                .map(|d| extract_docstring(&d.join(&entry.name).join("init.lua")))
+                .unwrap_or_default()
+        } else {
+            entry.docstring.clone()
+        };
 
         seen.insert(entry.name.clone());
         results.push(SearchResult {
@@ -654,14 +674,19 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
                 entry.card_count
             },
             best_card: entry.best_card.clone(),
+            docstring,
         });
     }
 
-    // Add local-only packages (not in remote index)
+    // Add local-only packages (not in remote index).
     for (name, version) in &installed {
         if seen.contains(name) {
             continue;
         }
+        let docstring = pkg_dir
+            .as_ref()
+            .map(|d| extract_docstring(&d.join(name).join("init.lua")))
+            .unwrap_or_default();
         results.push(SearchResult {
             name: name.clone(),
             version: version.clone().unwrap_or_default(),
@@ -671,6 +696,7 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
             installed: true,
             card_count: card_counts.get(name).copied().unwrap_or(0),
             best_card: None,
+            docstring,
         });
     }
 
@@ -684,9 +710,36 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
     result.name.to_lowercase().contains(&q)
         || result.description.to_lowercase().contains(&q)
         || result.category.to_lowercase().contains(&q)
+        || result.docstring.to_lowercase().contains(&q)
 }
 
 // ─── Index generation (reindex) ───────────────────────────────
+
+/// Extract leading `---` docstring lines from an `init.lua` file.
+///
+/// Collects consecutive lines starting with `---` (Lua doc-comment)
+/// from the beginning of the file.  Stops at the first non-doc line.
+/// Returns a single string with lines joined by newline, stripped of
+/// the `---` prefix.  Used for full-text search in hub_search.
+fn extract_docstring(path: &std::path::Path) -> String {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("---") {
+            lines.push(rest.trim().to_string());
+        } else if trimmed.is_empty() {
+            // Allow blank lines within the docstring block
+            continue;
+        } else {
+            break;
+        }
+    }
+    lines.join("\n")
+}
 
 /// Parse `M.meta = { ... }` from an `init.lua` file without Lua VM.
 ///
@@ -840,6 +893,8 @@ fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
                 )
             });
 
+        let docstring = extract_docstring(&init_lua);
+
         // Use manifest source only for local-state mode
         let source = manifest
             .packages
@@ -855,6 +910,7 @@ fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
             source,
             card_count: card_counts.get(&dir_name).copied().unwrap_or(0),
             best_card: None,
+            docstring,
         });
     }
 
@@ -1220,11 +1276,65 @@ return M
                 source: String::new(),
                 card_count: 0,
                 best_card: None,
+                docstring: String::new(),
             }],
         };
 
         let results = merge(&remote);
         // Should include remote_only + any locally installed packages
         assert!(results.iter().any(|r| r.name == "remote_only"));
+    }
+
+    #[test]
+    fn extract_docstring_collects_leading_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        std::fs::write(
+            &path,
+            r#"--- cascade — Multi-level difficulty routing with confidence gating
+--- Based on: "FrugalGPT" (Chen et al., 2023)
+--- Uses Thompson Sampling for budget allocation.
+
+local M = {}
+M.meta = { name = "cascade" }
+return M
+"#,
+        )
+        .unwrap();
+
+        let doc = extract_docstring(&path);
+        assert!(doc.contains("FrugalGPT"), "should contain paper ref");
+        assert!(doc.contains("Thompson Sampling"), "should contain technique");
+        assert!(!doc.contains("local M"), "should not contain code");
+    }
+
+    #[test]
+    fn extract_docstring_empty_when_no_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        std::fs::write(&path, "local M = {}\nreturn M\n").unwrap();
+
+        let doc = extract_docstring(&path);
+        assert!(doc.is_empty());
+    }
+
+    #[test]
+    fn matches_query_searches_docstring() {
+        let result = SearchResult {
+            name: "cascade".into(),
+            version: "0.1.0".into(),
+            description: "Multi-level routing".into(),
+            category: "meta".into(),
+            source: String::new(),
+            installed: true,
+            card_count: 0,
+            best_card: None,
+            docstring: "Based on FrugalGPT. Uses Thompson Sampling.".into(),
+        };
+
+        assert!(matches_query(&result, "thompson"), "docstring match");
+        assert!(matches_query(&result, "FrugalGPT"), "docstring match case");
+        assert!(matches_query(&result, "routing"), "description match");
+        assert!(!matches_query(&result, "bayesian"), "no match");
     }
 }

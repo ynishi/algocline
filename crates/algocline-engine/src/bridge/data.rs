@@ -248,16 +248,32 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     })?;
 
     // alc.card.read_samples(card_id, opts?) -> [sample]
+    //
+    // opts.where applies the Prisma-style DSL to each row; offset/limit
+    // page the post-filter stream. See `card::parse_where`.
     let read_samples =
         lua.create_function(|lua, (card_id, opts): (String, Option<LuaTable>)| {
-            let (offset, limit) = match opts {
-                Some(t) => (
-                    t.get::<Option<usize>>("offset")?.unwrap_or(0),
-                    t.get::<Option<usize>>("limit")?,
-                ),
-                None => (0, None),
+            let (offset, limit, where_parsed) = match opts {
+                Some(t) => {
+                    let offset = t.get::<Option<usize>>("offset")?.unwrap_or(0);
+                    let limit = t.get::<Option<usize>>("limit")?;
+                    let where_parsed = match t.get::<LuaValue>("where")? {
+                        LuaValue::Nil => None,
+                        v => {
+                            let json: serde_json::Value = lua.from_value(v)?;
+                            Some(card::parse_where(&json).map_err(LuaError::external)?)
+                        }
+                    };
+                    (offset, limit, where_parsed)
+                }
+                None => (0, None, None),
             };
-            let rows = card::read_samples(&card_id, offset, limit).map_err(LuaError::external)?;
+            let q = card::SamplesQuery {
+                offset,
+                limit,
+                where_: where_parsed,
+            };
+            let rows = card::read_samples(&card_id, q).map_err(LuaError::external)?;
             lua.to_value(&serde_json::Value::Array(rows))
         })?;
 

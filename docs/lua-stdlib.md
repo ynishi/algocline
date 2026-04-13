@@ -907,15 +907,26 @@ List aliases, optionally filtered by `filter.pkg`.
 
 #### `alc.card.read_samples(card_id, opts?) -> table[]`
 
-Read per-case sidecar rows with paging.
+Read per-case sidecar rows with optional filtering and paging.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `opts.offset` | integer | no | Skip first N rows (default: 0) |
+| `opts.offset` | integer | no | Skip first N matched rows (default: 0) |
 | `opts.limit` | integer | no | Max rows to return |
+| `opts.where` | table | no | Prisma-style predicate applied to each row |
+
+`opts.where` uses the same nested-object DSL as
+[`alc.card.find`](#alccardfindquery---summary), evaluated against each
+sample row directly — samples are flat per-case objects, so no section
+prefix is used. `offset` is applied **after** filtering (Prisma / SQL
+convention).
 
 ```lua
-local rows = alc.card.read_samples(card_id, { offset = 0, limit = 50 })
+local rows = alc.card.read_samples(card_id, {
+  where  = { passed = true, score = { gte = 0.5 } },
+  offset = 0,
+  limit  = 50,
+})
 ```
 
 #### `alc.card.lineage(query) -> { root, nodes, edges, truncated } | nil`

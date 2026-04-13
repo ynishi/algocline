@@ -219,14 +219,24 @@ impl AppService {
         }
     }
 
-    /// Read per-case sidecar rows (Tier 2) with offset/limit paging.
+    /// Read per-case sidecar rows (Tier 2) with `where` filtering and paging.
     pub fn card_samples(
         &self,
         card_id: &str,
         offset: usize,
         limit: Option<usize>,
+        where_: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        let rows = card::read_samples(card_id, offset, limit)?;
+        let where_parsed = match where_ {
+            Some(v) => Some(card::parse_where(&v)?),
+            None => None,
+        };
+        let q = card::SamplesQuery {
+            offset,
+            limit,
+            where_: where_parsed,
+        };
+        let rows = card::read_samples(card_id, q)?;
         Ok(serde_json::Value::Array(rows).to_string())
     }
 

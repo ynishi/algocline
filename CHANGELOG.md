@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `alc_card_samples` / `alc.card.read_samples` gains `where`
+
+The per-case sidecar reader now accepts the same nested-object `where`
+DSL as `alc_card_find`, evaluated against each JSONL row. `offset` is
+applied after filtering (Prisma/SQL convention), so paging the matched
+subset is predictable.
+
+```lua
+local failures = alc.card.read_samples(card_id, {
+  where  = { passed = false, score = { lt = 0.5 } },
+  offset = 0,
+  limit  = 20,
+})
+```
+
+Pure addition — calls without `where` keep previous semantics.
+
 ### Added — `alc_card_lineage` / `alc.card.lineage`
 
 New lineage walker that traverses Card ancestry/descendants via the

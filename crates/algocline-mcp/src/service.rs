@@ -320,10 +320,16 @@ pub struct CardAliasSetParams {
 pub struct CardSamplesParams {
     /// Card ID whose sidecar samples to read.
     pub card_id: String,
-    /// Skip this many rows from the start of the JSONL file. Default 0.
+    /// Skip this many **matched** rows. Default 0.
+    /// When `where` is set, offset applies to the post-filter stream.
     pub offset: Option<usize>,
     /// Max rows returned. Omit to return everything from `offset`.
     pub limit: Option<usize>,
+    /// Prisma-style `where` predicate applied to each sample row.
+    /// Same DSL as `alc_card_find.where`, but the row object is the
+    /// top-level scope (samples have no section wrapping).
+    /// Example: `{ "score": { "lt": 0.5 } }`.
+    pub r#where: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -886,7 +892,9 @@ impl AlcService {
 
     /// Read per-case samples from a Card's sidecar JSONL file.
     /// Returns `[]` when the Card has no samples sidecar.
-    /// Use `offset` + `limit` to page through large suites.
+    /// Accepts a Prisma-style `where` predicate (same nested-object DSL
+    /// as `alc_card_find`, evaluated against each row); `offset` + `limit`
+    /// page through the post-filter stream.
     #[tool(
         name = "alc_card_samples",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -896,7 +904,12 @@ impl AlcService {
         Parameters(params): Parameters<CardSamplesParams>,
     ) -> Result<String, String> {
         self.app
-            .card_samples(&params.card_id, params.offset, params.limit)
+            .card_samples(
+                &params.card_id,
+                params.offset,
+                params.limit,
+                params.r#where,
+            )
             .await
     }
 
@@ -1066,7 +1079,7 @@ impl ServerHandler for AlcService {
                  - alc_card_get_by_alias: Resolve an alias name to the full Card JSON (shortcut for alias_list → filter → get).\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
-                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
+                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true). Supports the same `where` DSL as alc_card_find.\n\
                  - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
                  Hub:\n\

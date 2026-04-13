@@ -229,11 +229,15 @@ pub trait EngineApi: Send + Sync {
     async fn card_install(&self, url: String) -> Result<String, String>;
 
     /// Read per-case samples from a Card's sidecar JSONL file.
+    ///
+    /// `where_` applies the same Prisma-style DSL used by `card_find`
+    /// to each sample row; offset/limit page the post-filter stream.
     async fn card_samples(
         &self,
         card_id: &str,
         offset: Option<usize>,
         limit: Option<usize>,
+        where_: Option<serde_json::Value>,
     ) -> Result<String, String>;
 
     /// Walk a Card's lineage tree via `metadata.prior_card_id`.

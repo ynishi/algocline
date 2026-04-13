@@ -236,8 +236,9 @@ impl EngineApi for AppService {
         card_id: &str,
         offset: Option<usize>,
         limit: Option<usize>,
+        where_: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        AppService::card_samples(self, card_id, offset.unwrap_or(0), limit)
+        AppService::card_samples(self, card_id, offset.unwrap_or(0), limit, where_)
     }
 
     async fn card_lineage(

@@ -1725,36 +1725,57 @@ pub fn write_samples(card_id: &str, samples: Vec<Json>) -> Result<PathBuf, Strin
     Ok(path)
 }
 
+/// Query parameters for `read_samples`.
+#[derive(Debug, Default, Clone)]
+pub struct SamplesQuery {
+    /// Skip this many matched rows (after `where` filtering).
+    pub offset: usize,
+    /// Max matched rows to return.
+    pub limit: Option<usize>,
+    /// Optional `where` predicate applied to each sample row.
+    /// The row JSON is the full line object (no section wrapping).
+    pub where_: Option<Predicate>,
+}
+
 /// Read per-case samples from `{card_id}.samples.jsonl`.
+///
+/// Streams the JSONL file line by line; rows are parsed, optionally
+/// filtered by `q.where_`, then paged by `offset` + `limit`.  Offset
+/// applies to the **post-filter** stream, matching Prisma/SQL
+/// semantics.
 ///
 /// Returns an empty Vec if no samples file exists (Cards without
 /// per-case details are the common case, not an error).
-pub fn read_samples(
-    card_id: &str,
-    offset: usize,
-    limit: Option<usize>,
-) -> Result<Vec<Json>, String> {
+pub fn read_samples(card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String> {
     let path = samples_path(card_id)?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let text =
         fs::read_to_string(&path).map_err(|e| format!("Failed to read samples file: {e}"))?;
+    let mut matched: usize = 0;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        if i < offset {
+        let val: Json = serde_json::from_str(line)
+            .map_err(|e| format!("Failed to parse sample line {i}: {e}"))?;
+        if let Some(pred) = &q.where_ {
+            if !eval_predicate(pred, &val) {
+                continue;
+            }
+        }
+        if matched < q.offset {
+            matched += 1;
             continue;
         }
-        if let Some(lim) = limit {
+        matched += 1;
+        if let Some(lim) = q.limit {
             if out.len() >= lim {
                 break;
             }
         }
-        let val: Json = serde_json::from_str(line)
-            .map_err(|e| format!("Failed to parse sample line {i}: {e}"))?;
         out.push(val);
     }
     Ok(out)
@@ -2551,13 +2572,21 @@ mod tests {
         assert!(path.exists());
         assert!(path.to_string_lossy().ends_with(".samples.jsonl"));
 
-        let got = read_samples(&id, 0, None).unwrap();
+        let got = read_samples(&id, SamplesQuery::default()).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0]["case"], json!("c0"));
         assert_eq!(got[2]["score"], json!(0.75));
 
         // offset + limit
-        let slice = read_samples(&id, 1, Some(1)).unwrap();
+        let slice = read_samples(
+            &id,
+            SamplesQuery {
+                offset: 1,
+                limit: Some(1),
+                where_: None,
+            },
+        )
+        .unwrap();
         assert_eq!(slice.len(), 1);
         assert_eq!(slice[0]["case"], json!("c1"));
 
@@ -2578,8 +2607,73 @@ mod tests {
     fn read_samples_empty_when_absent() {
         let pkg = unique_pkg();
         let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
-        let got = read_samples(&id, 0, None).unwrap();
+        let got = read_samples(&id, SamplesQuery::default()).unwrap();
         assert!(got.is_empty());
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn read_samples_where_filters_rows() {
+        let pkg = unique_pkg();
+        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+        write_samples(
+            &id,
+            vec![
+                json!({ "case": "c0", "passed": true,  "score": 1.0 }),
+                json!({ "case": "c1", "passed": false, "score": 0.0 }),
+                json!({ "case": "c2", "passed": true,  "score": 0.25 }),
+                json!({ "case": "c3", "passed": true,  "score": 0.75 }),
+                json!({ "case": "c4", "passed": false, "score": 0.5 }),
+            ],
+        )
+        .unwrap();
+
+        // Equality predicate: passed == true keeps 3 rows.
+        let pred = parse_where(&json!({ "passed": true })).unwrap();
+        let got = read_samples(
+            &id,
+            SamplesQuery {
+                offset: 0,
+                limit: None,
+                where_: Some(pred),
+            },
+        )
+        .unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0]["case"], json!("c0"));
+        assert_eq!(got[1]["case"], json!("c2"));
+        assert_eq!(got[2]["case"], json!("c3"));
+
+        // Nested comparator: score gte 0.5 keeps c0/c3/c4.
+        let pred = parse_where(&json!({ "score": { "gte": 0.5 } })).unwrap();
+        let got = read_samples(
+            &id,
+            SamplesQuery {
+                offset: 0,
+                limit: None,
+                where_: Some(pred),
+            },
+        )
+        .unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0]["case"], json!("c0"));
+        assert_eq!(got[1]["case"], json!("c3"));
+        assert_eq!(got[2]["case"], json!("c4"));
+
+        // Offset applies AFTER filter: passed=true then skip 1 + limit 1 → c2.
+        let pred = parse_where(&json!({ "passed": true })).unwrap();
+        let slice = read_samples(
+            &id,
+            SamplesQuery {
+                offset: 1,
+                limit: Some(1),
+                where_: Some(pred),
+            },
+        )
+        .unwrap();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0]["case"], json!("c2"));
+
         cleanup(&pkg);
     }
 
@@ -2640,7 +2734,7 @@ mod tests {
         assert_eq!(got["card_id"], json!(card_id));
 
         // Verify samples were copied
-        let samples = read_samples(&card_id, 0, None).unwrap();
+        let samples = read_samples(&card_id, SamplesQuery::default()).unwrap();
         assert_eq!(samples.len(), 1);
 
         cleanup(&pkg);

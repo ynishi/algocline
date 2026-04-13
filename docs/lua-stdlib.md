@@ -232,6 +232,36 @@ Remove a key from the store.
 alc.state.delete("score")
 ```
 
+#### `alc.state.has(key) -> boolean`
+
+Check whether a key exists without reading the value.
+
+```lua
+if alc.state.has("score") then
+  -- key exists
+end
+```
+
+#### `alc.state.set_nx(key, value) -> boolean`
+
+Set a value only if the key does **not** already exist. Returns `true` if the value was written, `false` if the key was already present.
+
+```lua
+local ok = alc.state.set_nx("lock", true)   -- true (first call)
+local ok = alc.state.set_nx("lock", true)   -- false (already set)
+```
+
+#### `alc.state.incr(key, delta?, default?) -> number`
+
+Atomic counter increment. Adds `delta` (default 1) to the current numeric value. If the key is missing, initialises from `default` (default 0) before adding. Returns the new value. Errors if the existing value is not a number.
+
+```lua
+alc.state.incr("counter")           -- 1   (0 + 1)
+alc.state.incr("counter", 5)        -- 6   (1 + 5)
+alc.state.incr("counter", -2)       -- 4   (6 - 2)
+alc.state.incr("score", 10, 100)    -- 110 (init 100, + 10)
+```
+
 ### Text
 
 #### `alc.chunk(text, opts?) -> string[]`

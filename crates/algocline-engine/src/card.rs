@@ -1933,6 +1933,79 @@ mod tests {
     }
 
     #[test]
+    fn find_where_string_ops_contains_and_starts_with() {
+        let pkg = unique_pkg();
+        create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-opus-4-6" },
+            "metadata": { "tag": "experiment_alpha" },
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_b"),
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-haiku-4-5-20251001" },
+            "metadata": { "tag": "experiment_beta" },
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_c"),
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-sonnet-4-5" },
+            "metadata": { "tag": "baseline" },
+        }))
+        .unwrap();
+
+        // contains: matches substring anywhere
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "metadata": { "tag": { "contains": "experiment" } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // starts_with: matches only the prefix
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "model": { "id": { "starts_with": "claude-opus" } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].card_id.ends_with("_a"));
+
+        // string ops on missing field → false
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "metadata": { "missing_field": { "contains": "x" } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        // string ops on non-string field → false
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "metadata": { "tag": { "starts_with": 42 } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        cleanup(&pkg);
+    }
+
+    #[test]
     fn where_missing_field_ne_is_true() {
         let pkg = unique_pkg();
         create(json!({

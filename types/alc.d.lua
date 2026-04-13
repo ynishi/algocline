@@ -120,6 +120,27 @@ function alc.state.keys() end
 ---@param key string Key to delete
 function alc.state.delete(key) end
 
+--- Check whether a key exists (cost is backend-dependent).
+---@param key string Key to check
+---@return boolean exists true if key exists
+function alc.state.has(key) end
+
+--- Set a value only if the key does not already exist.
+---@param key string Key to set
+---@param value any JSON-serializable value
+---@return boolean written true if written, false if key was already present
+function alc.state.set_nx(key, value) end
+
+--- Counter increment (single-process atomic).
+--- Adds delta (default 1) to the current numeric value.
+--- If key is missing, initialises from default (default 0) before adding.
+--- Integer-valued deltas are exact; fractional deltas may accumulate rounding.
+---@param key string Key to increment
+---@param delta? number Amount to add (default 1)
+---@param default? number Initial value if key is missing (default 0)
+---@return number new_value The value after increment
+function alc.state.incr(key, delta, default) end
+
 -- Text ---
 
 ---@class AlcChunkOpts

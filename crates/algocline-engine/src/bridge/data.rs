@@ -37,7 +37,7 @@ pub(super) fn register_log(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     Ok(())
 }
 
-/// Register `alc.state` table with get/set/keys/delete.
+/// Register `alc.state` table with get/set/keys/delete/has/set_nx/incr.
 ///
 /// Lua usage:
 ///   alc.state.set("score", 42)
@@ -45,6 +45,11 @@ pub(super) fn register_log(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
 ///   local v = alc.state.get("missing", 0)  -- 0 (default)
 ///   local k = alc.state.keys()             -- {"score"}
 ///   alc.state.delete("score")
+///   alc.state.has("score")                 -- false
+///   alc.state.set_nx("score", 100)         -- true (set because absent)
+///   alc.state.incr("counter")              -- 1 (init 0 + delta 1)
+///   alc.state.incr("counter", 5)           -- 6
+///   alc.state.incr("counter", 10, 100)     -- 16 (default ignored)
 pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> LuaResult<()> {
     let state_table = lua.create_table()?;
 
@@ -79,10 +84,35 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
         state::delete(&ns_del, &key).map_err(LuaError::external)
     })?;
 
+    // alc.state.has(key) -> bool
+    let ns_has = ns.clone();
+    let has = lua.create_function(move |_, key: String| {
+        state::has(&ns_has, &key).map_err(LuaError::external)
+    })?;
+
+    // alc.state.set_nx(key, value) -> bool
+    let ns_snx = ns.clone();
+    let set_nx = lua.create_function(move |lua, (key, value): (String, LuaValue)| {
+        let json: serde_json::Value = lua.from_value(value)?;
+        state::set_nx(&ns_snx, &key, json).map_err(LuaError::external)
+    })?;
+
+    // alc.state.incr(key, delta?, default?) -> number
+    let ns_incr = ns;
+    let incr = lua.create_function(
+        move |_, (key, delta, default): (String, Option<f64>, Option<f64>)| {
+            state::incr(&ns_incr, &key, delta.unwrap_or(1.0), default.unwrap_or(0.0))
+                .map_err(LuaError::external)
+        },
+    )?;
+
     state_table.set("get", get)?;
     state_table.set("set", set)?;
     state_table.set("keys", keys)?;
     state_table.set("delete", delete)?;
+    state_table.set("has", has)?;
+    state_table.set("set_nx", set_nx)?;
+    state_table.set("incr", incr)?;
 
     alc_table.set("state", state_table)?;
     Ok(())
@@ -458,6 +488,65 @@ mod tests {
 
         // Clean up
         let _ = crate::state::delete(ns, "x");
+    }
+
+    #[test]
+    fn state_has_set_nx_incr() {
+        let ns = "_test_bridge_state_t1";
+        let _ = crate::state::delete(ns, "k");
+        let _ = crate::state::delete(ns, "counter");
+
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        crate::bridge::register(&lua, &t, test_config_with_ns(ns)).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // has: false for missing key
+        let h: bool = lua.load(r#"return alc.state.has("k")"#).eval().unwrap();
+        assert!(!h);
+
+        // set_nx: true when absent
+        let ok: bool = lua
+            .load(r#"return alc.state.set_nx("k", "first")"#)
+            .eval()
+            .unwrap();
+        assert!(ok);
+
+        // has: true after set
+        let h: bool = lua.load(r#"return alc.state.has("k")"#).eval().unwrap();
+        assert!(h);
+
+        // set_nx: false when present
+        let ok: bool = lua
+            .load(r#"return alc.state.set_nx("k", "second")"#)
+            .eval()
+            .unwrap();
+        assert!(!ok);
+
+        // incr: init + delta
+        let v: f64 = lua
+            .load(r#"return alc.state.incr("counter")"#)
+            .eval()
+            .unwrap();
+        assert!((v - 1.0).abs() < f64::EPSILON);
+
+        // incr: with explicit delta
+        let v: f64 = lua
+            .load(r#"return alc.state.incr("counter", 5)"#)
+            .eval()
+            .unwrap();
+        assert!((v - 6.0).abs() < f64::EPSILON);
+
+        // incr: with custom default (ignored since key exists)
+        let v: f64 = lua
+            .load(r#"return alc.state.incr("counter", 10, 100)"#)
+            .eval()
+            .unwrap();
+        assert!((v - 16.0).abs() < f64::EPSILON);
+
+        // Clean up
+        let _ = crate::state::delete(ns, "k");
+        let _ = crate::state::delete(ns, "counter");
     }
 
     #[test]

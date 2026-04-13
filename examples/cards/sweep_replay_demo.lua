@@ -71,13 +71,14 @@ for _, alpha in ipairs(alphas) do
             pkg = { name = PKG },
             scenario = { name = SCENARIO },
             model = { id = "claude-opus-4-6" },
-            params = { alpha = alpha },
+            strategy_params = { alpha = alpha },
             stats = {
                 ev = new_ev,
                 ev_raw = raw_ev,
             },
             metadata = {
                 prior_card_id = seed_id,
+                prior_relation = "sweep_variant",
                 derived_from = "replay_sweep",
             },
         })
@@ -94,7 +95,7 @@ end
 
 local all = alc.card.find({
     pkg = PKG,
-    scenario = SCENARIO,
+    where = { scenario = { name = SCENARIO } },
     limit = 100,
 })
 

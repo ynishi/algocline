@@ -191,15 +191,19 @@ pub trait EngineApi: Send + Sync {
     /// Fetch a full Card by id.
     async fn card_get(&self, card_id: &str) -> Result<String, String>;
 
-    /// Filter/sort Cards with optional pkg / scenario / model / sort / limit / min_pass_rate.
+    /// Filter/sort Cards using the Prisma-style `where` DSL.
+    ///
+    /// - `pkg`: restricts filesystem scan to a single pkg subdir (I/O hint).
+    /// - `where_`: nested-object predicate (see `card::parse_where`).
+    /// - `order_by`: array of dotted-path sort keys; `-` prefix = desc.
+    /// - `limit` / `offset`: pagination.
     async fn card_find(
         &self,
         pkg: Option<String>,
-        scenario: Option<String>,
-        model: Option<String>,
-        sort: Option<String>,
+        where_: Option<serde_json::Value>,
+        order_by: Option<serde_json::Value>,
         limit: Option<usize>,
-        min_pass_rate: Option<f64>,
+        offset: Option<usize>,
     ) -> Result<String, String>;
 
     /// List aliases, optionally filtered by pkg.
@@ -225,11 +229,30 @@ pub trait EngineApi: Send + Sync {
     async fn card_install(&self, url: String) -> Result<String, String>;
 
     /// Read per-case samples from a Card's sidecar JSONL file.
+    ///
+    /// `where_` applies the same Prisma-style DSL used by `card_find`
+    /// to each sample row; offset/limit page the post-filter stream.
     async fn card_samples(
         &self,
         card_id: &str,
         offset: Option<usize>,
         limit: Option<usize>,
+        where_: Option<serde_json::Value>,
+    ) -> Result<String, String>;
+
+    /// Walk a Card's lineage tree via `metadata.prior_card_id`.
+    ///
+    /// - `direction`: `"up"` | `"down"` | `"both"` (default `"up"`).
+    /// - `depth`: max traversal depth (default 10).
+    /// - `include_stats`: include each node's `[stats]` section.
+    /// - `relation_filter`: optional list of accepted `prior_relation` values.
+    async fn card_lineage(
+        &self,
+        card_id: &str,
+        direction: Option<String>,
+        depth: Option<usize>,
+        include_stats: Option<bool>,
+        relation_filter: Option<Vec<String>>,
     ) -> Result<String, String>;
 
     // ─── Hub ─────────────────────────────────────────────────

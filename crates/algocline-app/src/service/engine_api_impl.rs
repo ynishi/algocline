@@ -193,13 +193,12 @@ impl EngineApi for AppService {
     async fn card_find(
         &self,
         pkg: Option<String>,
-        scenario: Option<String>,
-        model: Option<String>,
-        sort: Option<String>,
+        where_: Option<serde_json::Value>,
+        order_by: Option<serde_json::Value>,
         limit: Option<usize>,
-        min_pass_rate: Option<f64>,
+        offset: Option<usize>,
     ) -> Result<String, String> {
-        AppService::card_find(self, pkg, scenario, model, sort, limit, min_pass_rate)
+        AppService::card_find(self, pkg, where_, order_by, limit, offset)
     }
 
     async fn card_alias_list(&self, pkg: Option<String>) -> Result<String, String> {
@@ -237,8 +236,27 @@ impl EngineApi for AppService {
         card_id: &str,
         offset: Option<usize>,
         limit: Option<usize>,
+        where_: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        AppService::card_samples(self, card_id, offset.unwrap_or(0), limit)
+        AppService::card_samples(self, card_id, offset.unwrap_or(0), limit, where_)
+    }
+
+    async fn card_lineage(
+        &self,
+        card_id: &str,
+        direction: Option<String>,
+        depth: Option<usize>,
+        include_stats: Option<bool>,
+        relation_filter: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        AppService::card_lineage(
+            self,
+            card_id,
+            direction.as_deref(),
+            depth,
+            include_stats,
+            relation_filter,
+        )
     }
 
     // ─── Hub ─────────────────────────────────────────────────

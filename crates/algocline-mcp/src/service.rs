@@ -272,18 +272,24 @@ pub struct CardGetParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardFindParams {
-    /// Optional pkg filter.
+    /// Optional pkg filter.  Restricts the filesystem scan to a single
+    /// pkg subdir — use it when you know the target package for speed.
     pub pkg: Option<String>,
-    /// Optional scenario.name filter.
-    pub scenario: Option<String>,
-    /// Optional model.id filter.
-    pub model: Option<String>,
-    /// Sort mode: "pass_rate" (desc), "pass_rate_asc", or "created_at" (desc, default).
-    pub sort: Option<String>,
+    /// Prisma-style `where` predicate.  Nested objects are interpreted
+    /// as section paths; keys whose value is an object whose every key
+    /// is a reserved operator name (`eq ne lt lte gt gte in nin exists
+    /// contains starts_with`) become leaf comparisons.  Logical ops:
+    /// `_and` / `_or` / `_not`.  Example:
+    /// `{ "stats": { "pass_rate": { "gte": 0.8 } }, "model": { "id": "claude-opus-4-6" } }`
+    pub r#where: Option<serde_json::Value>,
+    /// Sort keys.  Accepts a single dotted-path string (`"stats.pass_rate"`,
+    /// `"-stats.pass_rate"` for desc) or an array of such strings.
+    /// Defaults to `created_at` descending.
+    pub order_by: Option<serde_json::Value>,
     /// Max rows returned.
     pub limit: Option<usize>,
-    /// Drop rows with stats.pass_rate below this threshold.
-    pub min_pass_rate: Option<f64>,
+    /// Skip this many rows before `limit` applies.
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -314,10 +320,32 @@ pub struct CardAliasSetParams {
 pub struct CardSamplesParams {
     /// Card ID whose sidecar samples to read.
     pub card_id: String,
-    /// Skip this many rows from the start of the JSONL file. Default 0.
+    /// Skip this many **matched** rows. Default 0.
+    /// When `where` is set, offset applies to the post-filter stream.
     pub offset: Option<usize>,
     /// Max rows returned. Omit to return everything from `offset`.
     pub limit: Option<usize>,
+    /// Prisma-style `where` predicate applied to each sample row.
+    /// Same DSL as `alc_card_find.where`, but the row object is the
+    /// top-level scope (samples have no section wrapping).
+    /// Example: `{ "score": { "lt": 0.5 } }`.
+    pub r#where: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardLineageParams {
+    /// Card ID to start the walk from.
+    pub card_id: String,
+    /// Walk direction: `"up"` (ancestors, default), `"down"` (descendants),
+    /// or `"both"`.
+    pub direction: Option<String>,
+    /// Max traversal depth. Default 10.
+    pub depth: Option<usize>,
+    /// Include each node's `[stats]` section.  Default true.
+    pub include_stats: Option<bool>,
+    /// Optional list of accepted `metadata.prior_relation` values.
+    /// When set, edges whose relation is not in the list are not followed.
+    pub relation_filter: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -780,8 +808,12 @@ impl AlcService {
         self.app.card_get(&params.card_id).await
     }
 
-    /// Filter/sort Cards. Thin layer over `alc_card_list` with
-    /// pkg/scenario/model/min_pass_rate filters and pass_rate/created_at sort.
+    /// Filter/sort Cards using the Prisma-style `where` DSL.
+    ///
+    /// Supports nested-object predicates, reserved operator objects,
+    /// `_and`/`_or`/`_not` logical ops, and `order_by` with dotted
+    /// paths + optional `-` prefix for descending.  See
+    /// `CardFindParams` for the exact shape.
     #[tool(
         name = "alc_card_find",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -793,11 +825,10 @@ impl AlcService {
         self.app
             .card_find(
                 params.pkg,
-                params.scenario,
-                params.model,
-                params.sort,
+                params.r#where,
+                params.order_by,
                 params.limit,
-                params.min_pass_rate,
+                params.offset,
             )
             .await
     }
@@ -861,7 +892,9 @@ impl AlcService {
 
     /// Read per-case samples from a Card's sidecar JSONL file.
     /// Returns `[]` when the Card has no samples sidecar.
-    /// Use `offset` + `limit` to page through large suites.
+    /// Accepts a Prisma-style `where` predicate (same nested-object DSL
+    /// as `alc_card_find`, evaluated against each row); `offset` + `limit`
+    /// page through the post-filter stream.
     #[tool(
         name = "alc_card_samples",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -871,7 +904,32 @@ impl AlcService {
         Parameters(params): Parameters<CardSamplesParams>,
     ) -> Result<String, String> {
         self.app
-            .card_samples(&params.card_id, params.offset, params.limit)
+            .card_samples(&params.card_id, params.offset, params.limit, params.r#where)
+            .await
+    }
+
+    /// Walk a Card's lineage tree via `metadata.prior_card_id`.
+    ///
+    /// Follows the `prior_card_id` parent pointer (`direction="up"`, default),
+    /// collects descendants (`direction="down"`), or both. Returns nodes,
+    /// edges, and a `truncated` flag indicating whether the walk hit the
+    /// depth limit.
+    #[tool(
+        name = "alc_card_lineage",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_lineage(
+        &self,
+        Parameters(params): Parameters<CardLineageParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_lineage(
+                &params.card_id,
+                params.direction,
+                params.depth,
+                params.include_stats,
+                params.relation_filter,
+            )
             .await
     }
 
@@ -1011,12 +1069,13 @@ impl ServerHandler for AlcService {
                  Cards (immutable run snapshots in ~/.algocline/cards/):\n\
                  - alc_card_list: List Card summaries (newest-first). Filter by pkg.\n\
                  - alc_card_get: Fetch a full Card by card_id.\n\
-                 - alc_card_find: Filter/sort Cards by pkg/scenario/model/min_pass_rate with pass_rate or created_at sort.\n\
+                 - alc_card_find: Filter/sort Cards with a Prisma-style `where` DSL (nested eq/lt/gte/in/_and/_or/_not) and dotted-path `order_by`.\n\
                  - alc_card_alias_list: List aliases from _aliases.toml.\n\
                  - alc_card_get_by_alias: Resolve an alias name to the full Card JSON (shortcut for alias_list → filter → get).\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
-                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
+                 - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true). Supports the same `where` DSL as alc_card_find.\n\
+                 - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
                  Hub:\n\
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\

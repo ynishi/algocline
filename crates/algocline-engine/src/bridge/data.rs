@@ -100,7 +100,15 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
 ///   alc.card.append("cot_...", { caveats = { notes = "rescored" } })
 ///   alc.card.alias_set("best_on_gsm8k", "cot_...", { pkg = "cot", note = "..." })
 ///   alc.card.alias_list({ pkg = "cot" })
-///   alc.card.find({ pkg = "cot", scenario = "gsm8k", sort = "pass_rate", limit = 5 })
+///   alc.card.find({
+///       pkg = "cot",
+///       where = {
+///           scenario = { name = "gsm8k" },
+///           stats = { pass_rate = { gte = 0.8 } },
+///       },
+///       order_by = "-stats.pass_rate",
+///       limit = 5,
+///   })
 ///   alc.card.get_by_alias("best_on_gsm8k")  -- resolve alias → full Card
 ///   alc.card.write_samples("cot_...", { {case="c0", passed=true}, ... })  -- write-once
 ///   alc.card.read_samples("cot_...", { offset = 0, limit = 100 })
@@ -181,16 +189,39 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     })?;
 
     // alc.card.find(query?) -> [summary]
+    //
+    // Accepts a Prisma-style `where` DSL + dotted-path `order_by`.
+    // See `card::parse_where` / `card::parse_order_by` for semantics.
     let find = lua.create_function(|lua, query: Option<LuaTable>| {
         let q = match query {
-            Some(t) => card::FindQuery {
-                pkg: t.get::<Option<String>>("pkg")?,
-                scenario: t.get::<Option<String>>("scenario")?,
-                model: t.get::<Option<String>>("model")?,
-                sort: t.get::<Option<String>>("sort")?,
-                limit: t.get::<Option<usize>>("limit")?,
-                min_pass_rate: t.get::<Option<f64>>("min_pass_rate")?,
-            },
+            Some(t) => {
+                let pkg = t.get::<Option<String>>("pkg")?;
+                let limit = t.get::<Option<usize>>("limit")?;
+                let offset = t.get::<Option<usize>>("offset")?;
+
+                let where_parsed = match t.get::<LuaValue>("where")? {
+                    LuaValue::Nil => None,
+                    v => {
+                        let json: serde_json::Value = lua.from_value(v)?;
+                        Some(card::parse_where(&json).map_err(LuaError::external)?)
+                    }
+                };
+                let order_parsed = match t.get::<LuaValue>("order_by")? {
+                    LuaValue::Nil => Vec::new(),
+                    v => {
+                        let json: serde_json::Value = lua.from_value(v)?;
+                        card::parse_order_by(&json).map_err(LuaError::external)?
+                    }
+                };
+
+                card::FindQuery {
+                    pkg,
+                    where_: where_parsed,
+                    order_by: order_parsed,
+                    limit,
+                    offset,
+                }
+            }
             None => card::FindQuery::default(),
         };
         let rows = card::find(q).map_err(LuaError::external)?;
@@ -217,18 +248,65 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     })?;
 
     // alc.card.read_samples(card_id, opts?) -> [sample]
+    //
+    // opts.where applies the Prisma-style DSL to each row; offset/limit
+    // page the post-filter stream. See `card::parse_where`.
     let read_samples =
         lua.create_function(|lua, (card_id, opts): (String, Option<LuaTable>)| {
-            let (offset, limit) = match opts {
-                Some(t) => (
-                    t.get::<Option<usize>>("offset")?.unwrap_or(0),
-                    t.get::<Option<usize>>("limit")?,
-                ),
-                None => (0, None),
+            let (offset, limit, where_parsed) = match opts {
+                Some(t) => {
+                    let offset = t.get::<Option<usize>>("offset")?.unwrap_or(0);
+                    let limit = t.get::<Option<usize>>("limit")?;
+                    let where_parsed = match t.get::<LuaValue>("where")? {
+                        LuaValue::Nil => None,
+                        v => {
+                            let json: serde_json::Value = lua.from_value(v)?;
+                            Some(card::parse_where(&json).map_err(LuaError::external)?)
+                        }
+                    };
+                    (offset, limit, where_parsed)
+                }
+                None => (0, None, None),
             };
-            let rows = card::read_samples(&card_id, offset, limit).map_err(LuaError::external)?;
+            let q = card::SamplesQuery {
+                offset,
+                limit,
+                where_: where_parsed,
+            };
+            let rows = card::read_samples(&card_id, q).map_err(LuaError::external)?;
             lua.to_value(&serde_json::Value::Array(rows))
         })?;
+
+    // alc.card.lineage(query) -> { root, nodes, edges, truncated }
+    //
+    // Walks `metadata.prior_card_id` ancestors (default), descendants, or
+    // both. Relation filter and depth cap are both optional.
+    let lineage = lua.create_function(|lua, query: LuaTable| {
+        let card_id: String = query.get("card_id")?;
+        let direction_str: Option<String> = query.get("direction")?;
+        let direction = match direction_str.as_deref() {
+            Some(s) => card::LineageDirection::parse(s).map_err(LuaError::external)?,
+            None => card::LineageDirection::Up,
+        };
+        let depth: Option<usize> = query.get("depth")?;
+        let include_stats: Option<bool> = query.get("include_stats")?;
+        let relation_filter: Option<Vec<String>> = match query.get::<LuaValue>("relation_filter")? {
+            LuaValue::Nil => None,
+            v => Some(lua.from_value(v)?),
+        };
+
+        let q = card::LineageQuery {
+            card_id,
+            direction,
+            depth,
+            include_stats: include_stats.unwrap_or(true),
+            relation_filter,
+        };
+        match card::lineage(q).map_err(LuaError::external)? {
+            Some(res) => lua.to_value(&card::lineage_to_json(&res)),
+            None => Ok(LuaValue::Nil),
+        }
+    })?;
 
     card_table.set("create", create)?;
     card_table.set("get", get)?;
@@ -240,6 +318,7 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     card_table.set("find", find)?;
     card_table.set("write_samples", write_samples)?;
     card_table.set("read_samples", read_samples)?;
+    card_table.set("lineage", lineage)?;
 
     alc_table.set("card", card_table)?;
     Ok(())

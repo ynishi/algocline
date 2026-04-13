@@ -734,6 +734,39 @@ practice (MLflow, W&B, OpenAI Evals, LangSmith, etc.):
 Rule of thumb: if a value is **per-case** or **large**, it belongs in
 Tier 2. Everything else goes in Tier 1.
 
+### Schema Conventions
+
+Cards are schemaless TOML: any section / field you write is preserved
+and queryable via `where`. The following conventions are **recognized**
+— not enforced, but tools and docs assume this layout when it exists.
+
+**`[strategy_params]`** — parameters the strategy treats as tunable
+(sweep knobs, optimizer targets). Kept as a first-class section so
+sweep / optimize tooling can pick them up without pattern-matching
+`[params]`. Example: `strategy_params = { alpha = 0.7, depth = 3 }`.
+
+**`[metadata]` lineage fields:**
+
+| Field | Meaning |
+|-------|---------|
+| `prior_card_id` | The parent Card's `card_id`, for derived runs (sweeps, reflections, re-scorings). |
+| `prior_relation` | Short tag describing the relation type. Suggested values: `"sweep_variant"`, `"reflection_of"`, `"derived_from"`, `"rescored_from"`. |
+
+Writing these lets future lineage tooling (`alc.card.lineage`, Step 4)
+traverse Card ancestries without guessing field names.
+
+```lua
+alc.card.create({
+    pkg = { name = "my_sweep" },
+    strategy_params = { alpha = 0.7 },
+    stats = { ev = 0.62 },
+    metadata = {
+        prior_card_id = seed_card_id,
+        prior_relation = "sweep_variant",
+    },
+})
+```
+
 ### Write API
 
 #### `alc.card.create(table) -> { card_id, path }`
@@ -818,23 +851,53 @@ List Cards as summaries (newest first).
 
 #### `alc.card.find(query?) -> summary[]`
 
-Query Cards with sort and filter.
+Query Cards with a Prisma-style `where` DSL plus dotted-path `order_by`.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `query.pkg` | string | no | Filter by package |
-| `query.scenario` | string | no | Filter by scenario name |
-| `query.model` | string | no | Filter by model id |
-| `query.sort` | string | no | Sort field (e.g. `"pass_rate"`) |
+| `query.pkg` | string | no | Restrict scan to a single pkg subdir (I/O hint) |
+| `query.where` | table | no | Nested-object predicate (see below) |
+| `query.order_by` | string \| string[] | no | Sort keys; `-` prefix = desc |
 | `query.limit` | integer | no | Max results |
-| `query.min_pass_rate` | number | no | Minimum pass_rate threshold |
+| `query.offset` | integer | no | Skip first N rows before `limit` |
+
+**`where` DSL**
+
+- Nested objects are interpreted as path extensions: `where.stats.pass_rate` targets Card root `[stats] pass_rate`.
+- A value whose every key is a reserved operator name becomes a leaf comparison.
+- Scalar values become implicit `eq`.
+- Multiple keys in the same object combine with AND. Use `_and` / `_or` / `_not` for explicit logical ops.
+
+**Reserved operators**: `eq ne lt lte gt gte in nin exists contains starts_with`. Card schemas must not use these names as field names anywhere.
+
+**Missing-field semantics**: `eq/lt/lte/gt/gte/in/contains/starts_with` return false on missing fields; `ne/nin` return true; `exists` is explicit.
 
 ```lua
+-- Best-scoring cot Card on gsm8k
 local best = alc.card.find({
-    pkg = "my_eval",
-    scenario = "gsm8k_100",
-    sort = "pass_rate",
+    pkg = "cot",
+    where = {
+        scenario = { name = "gsm8k_100" },
+        stats = { pass_rate = { gte = 0.7 }, n = { gte = 30 } },
+    },
+    order_by = "-stats.pass_rate",
     limit = 1,
+})
+
+-- Cards where strategy temperature is >= 0.7 OR equilibrium is "dead"
+local mixed = alc.card.find({
+    where = {
+        _or = {
+            { strategy_params = { temperature = { gte = 0.7 } } },
+            { stats = { equilibrium_position = "dead" } },
+        },
+    },
+    order_by = { "-stats.pass_rate", "created_at" },
+})
+
+-- Cards that have no prior_card_id (roots)
+local roots = alc.card.find({
+    where = { prior_card_id = { exists = false } },
 })
 ```
 
@@ -844,16 +907,66 @@ List aliases, optionally filtered by `filter.pkg`.
 
 #### `alc.card.read_samples(card_id, opts?) -> table[]`
 
-Read per-case sidecar rows with paging.
+Read per-case sidecar rows with optional filtering and paging.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `opts.offset` | integer | no | Skip first N rows (default: 0) |
+| `opts.offset` | integer | no | Skip first N matched rows (default: 0) |
 | `opts.limit` | integer | no | Max rows to return |
+| `opts.where` | table | no | Prisma-style predicate applied to each row |
+
+`opts.where` uses the same nested-object DSL as
+[`alc.card.find`](#alccardfindquery---summary), evaluated against each
+sample row directly — samples are flat per-case objects, so no section
+prefix is used. `offset` is applied **after** filtering (Prisma / SQL
+convention).
 
 ```lua
-local rows = alc.card.read_samples(card_id, { offset = 0, limit = 50 })
+local rows = alc.card.read_samples(card_id, {
+  where  = { passed = true, score = { gte = 0.5 } },
+  offset = 0,
+  limit  = 50,
+})
 ```
+
+#### `alc.card.lineage(query) -> { root, nodes, edges, truncated } | nil`
+
+Walk a Card's lineage tree via the `metadata.prior_card_id` convention.
+Follows the parent pointer (`direction = "up"`, default), collects
+descendants (`direction = "down"`), or both. Returns `nil` when the
+starting Card does not exist.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query.card_id` | string | yes | Starting Card id. |
+| `query.direction` | string | no | `"up"` (default), `"down"`, or `"both"`. |
+| `query.depth` | integer | no | Max traversal depth (default 10). |
+| `query.include_stats` | boolean | no | Include each node's `[stats]` section (default `true`). |
+| `query.relation_filter` | string[] | no | If set, only edges whose `prior_relation` is in this list are followed. |
+
+Return shape:
+
+- `root` — the starting `card_id`.
+- `nodes` — list of `{ card_id, pkg, depth, prior_card_id?, prior_relation?, stats? }`. `depth` is signed: `0` for the root, negative for ancestors, positive for descendants.
+- `edges` — list of `{ from, to, relation? }` (child → parent).
+- `truncated` — `true` when the walk hit the depth cap while more unwalked edges existed.
+
+```lua
+local tree = alc.card.lineage({
+    card_id = current_id,
+    direction = "up",
+    depth = 5,
+    relation_filter = { "sweep_variant", "rerun_of" },
+})
+if tree then
+    for _, node in ipairs(tree.nodes) do
+        alc.log("info", string.format("%+d  %s", node.depth, node.card_id))
+    end
+end
+```
+
+Cycle detection uses `card_id` visited-set; `card_id` embeds a UTC
+timestamp so cycles cannot form naturally, but the guard is present.
 
 ---
 

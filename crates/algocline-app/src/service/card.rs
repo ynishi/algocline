@@ -29,24 +29,29 @@ impl AppService {
         }
     }
 
-    /// Query Cards with sort, filter, and limit.
-    #[allow(clippy::too_many_arguments)]
+    /// Query Cards using the `where` DSL + `order_by` / limit / offset.
     pub fn card_find(
         &self,
         pkg: Option<String>,
-        scenario: Option<String>,
-        model: Option<String>,
-        sort: Option<String>,
+        where_: Option<serde_json::Value>,
+        order_by: Option<serde_json::Value>,
         limit: Option<usize>,
-        min_pass_rate: Option<f64>,
+        offset: Option<usize>,
     ) -> Result<String, String> {
+        let where_parsed = match where_ {
+            Some(v) => Some(card::parse_where(&v)?),
+            None => None,
+        };
+        let order_parsed = match order_by {
+            Some(v) => card::parse_order_by(&v)?,
+            None => Vec::new(),
+        };
         let q = card::FindQuery {
             pkg,
-            scenario,
-            model,
-            sort,
+            where_: where_parsed,
+            order_by: order_parsed,
             limit,
-            min_pass_rate,
+            offset,
         };
         let rows = card::find(q)?;
         Ok(card::summaries_to_json(&rows).to_string())
@@ -214,14 +219,50 @@ impl AppService {
         }
     }
 
-    /// Read per-case sidecar rows (Tier 2) with offset/limit paging.
+    /// Read per-case sidecar rows (Tier 2) with `where` filtering and paging.
     pub fn card_samples(
         &self,
         card_id: &str,
         offset: usize,
         limit: Option<usize>,
+        where_: Option<serde_json::Value>,
     ) -> Result<String, String> {
-        let rows = card::read_samples(card_id, offset, limit)?;
+        let where_parsed = match where_ {
+            Some(v) => Some(card::parse_where(&v)?),
+            None => None,
+        };
+        let q = card::SamplesQuery {
+            offset,
+            limit,
+            where_: where_parsed,
+        };
+        let rows = card::read_samples(card_id, q)?;
         Ok(serde_json::Value::Array(rows).to_string())
+    }
+
+    /// Walk a Card's lineage tree via `metadata.prior_card_id`.
+    pub fn card_lineage(
+        &self,
+        card_id: &str,
+        direction: Option<&str>,
+        depth: Option<usize>,
+        include_stats: Option<bool>,
+        relation_filter: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        let dir = match direction {
+            Some(s) => card::LineageDirection::parse(s)?,
+            None => card::LineageDirection::Up,
+        };
+        let q = card::LineageQuery {
+            card_id: card_id.to_string(),
+            direction: dir,
+            depth,
+            include_stats: include_stats.unwrap_or(true),
+            relation_filter,
+        };
+        match card::lineage(q)? {
+            Some(res) => Ok(card::lineage_to_json(&res).to_string()),
+            None => Err(format!("card '{card_id}' not found")),
+        }
     }
 }

@@ -5,6 +5,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — `alc_card_samples` / `alc.card.read_samples` gains `where`
+
+The per-case sidecar reader now accepts the same nested-object `where`
+DSL as `alc_card_find`, evaluated against each JSONL row. `offset` is
+applied after filtering (Prisma/SQL convention), so paging the matched
+subset is predictable.
+
+```lua
+local failures = alc.card.read_samples(card_id, {
+  where  = { passed = false, score = { lt = 0.5 } },
+  offset = 0,
+  limit  = 20,
+})
+```
+
+Pure addition — calls without `where` keep previous semantics.
+
+### Added — `alc_card_lineage` / `alc.card.lineage`
+
+New lineage walker that traverses Card ancestry/descendants via the
+`metadata.prior_card_id` convention. Directions: `"up"` (ancestors,
+default), `"down"` (descendants), `"both"`. Optional `depth` cap,
+`include_stats`, and `relation_filter` for following only edges with
+specific `prior_relation` values. Returns `{ root, nodes, edges,
+truncated }` where `nodes[*].depth` is signed (0 root, negative
+ancestor, positive descendant).
+
+Also documents `[strategy_params]` and `metadata.prior_card_id` /
+`metadata.prior_relation` as recognized Card schema conventions.
+
+### Changed — **BREAKING**: `alc_card_find` / `alc.card.find` DSL
+
+Two breaking changes, plus one additive field. 0.x allows breaks —
+migrate callers before upgrading.
+
+**1. Filter fields → `where` object (Prisma-style)**
+
+All ad-hoc filter fields (`scenario`, `model`, `min_pass_rate`) are
+removed. Use a nested `where` object that walks Card sections, with
+implicit equality on scalars and reserved operators on leaf objects.
+
+```lua
+-- Before
+alc.card.find({ pkg = "foo", scenario = "bar", min_pass_rate = 0.5 })
+
+-- After
+alc.card.find({
+    pkg = "foo",
+    where = {
+        scenario = { name = "bar" },
+        stats = { pass_rate = { gte = 0.5 } },
+    },
+})
+```
+
+Operators: `eq ne lt lte gt gte in nin exists contains starts_with`,
+plus logical `_and` / `_or` / `_not` at any level.
+
+**2. `sort` → `order_by` (dotted path, descending prefix, multi-key)**
+
+`sort = "pass_rate"` is replaced with `order_by` — a dotted-path string
+(`"stats.pass_rate"`), a `-` prefix for descending, or an array for
+multi-key sort with tiebreakers.
+
+```lua
+-- Before
+sort = "pass_rate"
+
+-- After
+order_by = "-stats.pass_rate"
+-- or
+order_by = { "-stats.pass_rate", "created_at" }
+```
+
+**Added**: `offset` for pagination (pure addition, non-breaking).
+
+Missing-field semantics: `eq`/`lt`/etc. evaluate false on missing
+fields; `ne`/`nin` evaluate true; `exists: false` matches only when
+the field is absent.
+
+See `docs/lua-stdlib.md#alccardfind` for the full reference.
+
 ## [0.19.0] - 2026-04-13
 
 ### Added

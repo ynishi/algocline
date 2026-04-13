@@ -74,13 +74,14 @@
 //! | `create(table)` | Write new Card (Tier 1). Returns `{ card_id, path }` |
 //! | `get(card_id)` | Read Card by id. Returns table or nil |
 //! | `list(filter?)` | List Cards as summaries (newest first) |
-//! | `find(query?)` | Query with sort / filter / limit |
+//! | `find(query?)` | Prisma-style `where` DSL + dotted-path `order_by` + `offset`/`limit` |
 //! | `append(card_id, fields)` | Additive-only annotation (new keys only) |
 //! | `alias_set(name, card_id, opts?)` | Pin mutable alias |
 //! | `alias_list(filter?)` | List aliases |
 //! | `get_by_alias(name)` | Resolve alias → full Card |
 //! | `write_samples(card_id, samples)` | Write Tier 2 sidecar (write-once) |
-//! | `read_samples(card_id, opts?)` | Read Tier 2 with offset/limit paging |
+//! | `read_samples(card_id, opts?)` | Read Tier 2 with `where` filtering + offset/limit paging |
+//! | `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |
 
 use std::fs;
 use std::path::PathBuf;

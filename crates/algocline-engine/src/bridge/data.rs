@@ -261,6 +261,37 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
             lua.to_value(&serde_json::Value::Array(rows))
         })?;
 
+    // alc.card.lineage(query) -> { root, nodes, edges, truncated }
+    //
+    // Walks `metadata.prior_card_id` ancestors (default), descendants, or
+    // both. Relation filter and depth cap are both optional.
+    let lineage = lua.create_function(|lua, query: LuaTable| {
+        let card_id: String = query.get("card_id")?;
+        let direction_str: Option<String> = query.get("direction")?;
+        let direction = match direction_str.as_deref() {
+            Some(s) => card::LineageDirection::parse(s).map_err(LuaError::external)?,
+            None => card::LineageDirection::Up,
+        };
+        let depth: Option<usize> = query.get("depth")?;
+        let include_stats: Option<bool> = query.get("include_stats")?;
+        let relation_filter: Option<Vec<String>> = match query.get::<LuaValue>("relation_filter")? {
+            LuaValue::Nil => None,
+            v => Some(lua.from_value(v)?),
+        };
+
+        let q = card::LineageQuery {
+            card_id,
+            direction,
+            depth,
+            include_stats: include_stats.unwrap_or(true),
+            relation_filter,
+        };
+        match card::lineage(q).map_err(LuaError::external)? {
+            Some(res) => lua.to_value(&card::lineage_to_json(&res)),
+            None => Ok(LuaValue::Nil),
+        }
+    })?;
+
     card_table.set("create", create)?;
     card_table.set("get", get)?;
     card_table.set("list", list)?;
@@ -271,6 +302,7 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     card_table.set("find", find)?;
     card_table.set("write_samples", write_samples)?;
     card_table.set("read_samples", read_samples)?;
+    card_table.set("lineage", lineage)?;
 
     alc_table.set("card", card_table)?;
     Ok(())

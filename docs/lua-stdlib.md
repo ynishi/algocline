@@ -918,6 +918,45 @@ Read per-case sidecar rows with paging.
 local rows = alc.card.read_samples(card_id, { offset = 0, limit = 50 })
 ```
 
+#### `alc.card.lineage(query) -> { root, nodes, edges, truncated } | nil`
+
+Walk a Card's lineage tree via the `metadata.prior_card_id` convention.
+Follows the parent pointer (`direction = "up"`, default), collects
+descendants (`direction = "down"`), or both. Returns `nil` when the
+starting Card does not exist.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query.card_id` | string | yes | Starting Card id. |
+| `query.direction` | string | no | `"up"` (default), `"down"`, or `"both"`. |
+| `query.depth` | integer | no | Max traversal depth (default 10). |
+| `query.include_stats` | boolean | no | Include each node's `[stats]` section (default `true`). |
+| `query.relation_filter` | string[] | no | If set, only edges whose `prior_relation` is in this list are followed. |
+
+Return shape:
+
+- `root` — the starting `card_id`.
+- `nodes` — list of `{ card_id, pkg, depth, prior_card_id?, prior_relation?, stats? }`. `depth` is signed: `0` for the root, negative for ancestors, positive for descendants.
+- `edges` — list of `{ from, to, relation? }` (child → parent).
+- `truncated` — `true` when the walk hit the depth cap while more unwalked edges existed.
+
+```lua
+local tree = alc.card.lineage({
+    card_id = current_id,
+    direction = "up",
+    depth = 5,
+    relation_filter = { "sweep_variant", "rerun_of" },
+})
+if tree then
+    for _, node in ipairs(tree.nodes) do
+        alc.log("info", string.format("%+d  %s", node.depth, node.card_id))
+    end
+end
+```
+
+Cycle detection uses `card_id` visited-set; `card_id` embeds a UTC
+timestamp so cycles cannot form naturally, but the guard is present.
+
 ---
 
 ## alc.math — Numeric Computing

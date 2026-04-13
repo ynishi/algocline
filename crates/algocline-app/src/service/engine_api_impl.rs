@@ -240,6 +240,24 @@ impl EngineApi for AppService {
         AppService::card_samples(self, card_id, offset.unwrap_or(0), limit)
     }
 
+    async fn card_lineage(
+        &self,
+        card_id: &str,
+        direction: Option<String>,
+        depth: Option<usize>,
+        include_stats: Option<bool>,
+        relation_filter: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        AppService::card_lineage(
+            self,
+            card_id,
+            direction.as_deref(),
+            depth,
+            include_stats,
+            relation_filter,
+        )
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     async fn hub_reindex(

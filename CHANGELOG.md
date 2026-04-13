@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `alc_card_lineage` / `alc.card.lineage`
+
+New lineage walker that traverses Card ancestry/descendants via the
+`metadata.prior_card_id` convention. Directions: `"up"` (ancestors,
+default), `"down"` (descendants), `"both"`. Optional `depth` cap,
+`include_stats`, and `relation_filter` for following only edges with
+specific `prior_relation` values. Returns `{ root, nodes, edges,
+truncated }` where `nodes[*].depth` is signed (0 root, negative
+ancestor, positive descendant).
+
+Also documents `[strategy_params]` and `metadata.prior_card_id` /
+`metadata.prior_relation` as recognized Card schema conventions.
+
 ### Changed — **BREAKING**: `alc_card_find` / `alc.card.find` DSL
 
 Two breaking changes, plus one additive field. 0.x allows breaks —

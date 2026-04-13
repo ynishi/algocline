@@ -236,6 +236,21 @@ pub trait EngineApi: Send + Sync {
         limit: Option<usize>,
     ) -> Result<String, String>;
 
+    /// Walk a Card's lineage tree via `metadata.prior_card_id`.
+    ///
+    /// - `direction`: `"up"` | `"down"` | `"both"` (default `"up"`).
+    /// - `depth`: max traversal depth (default 10).
+    /// - `include_stats`: include each node's `[stats]` section.
+    /// - `relation_filter`: optional list of accepted `prior_relation` values.
+    async fn card_lineage(
+        &self,
+        card_id: &str,
+        direction: Option<String>,
+        depth: Option<usize>,
+        include_stats: Option<bool>,
+        relation_filter: Option<Vec<String>>,
+    ) -> Result<String, String>;
+
     // ─── Hub ─────────────────────────────────────────────────
 
     /// Rebuild hub index from a packages directory.

@@ -229,4 +229,30 @@ impl AppService {
         let rows = card::read_samples(card_id, offset, limit)?;
         Ok(serde_json::Value::Array(rows).to_string())
     }
+
+    /// Walk a Card's lineage tree via `metadata.prior_card_id`.
+    pub fn card_lineage(
+        &self,
+        card_id: &str,
+        direction: Option<&str>,
+        depth: Option<usize>,
+        include_stats: Option<bool>,
+        relation_filter: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        let dir = match direction {
+            Some(s) => card::LineageDirection::parse(s)?,
+            None => card::LineageDirection::Up,
+        };
+        let q = card::LineageQuery {
+            card_id: card_id.to_string(),
+            direction: dir,
+            depth,
+            include_stats: include_stats.unwrap_or(true),
+            relation_filter,
+        };
+        match card::lineage(q)? {
+            Some(res) => Ok(card::lineage_to_json(&res).to_string()),
+            None => Err(format!("card '{card_id}' not found")),
+        }
+    }
 }

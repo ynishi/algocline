@@ -1,5 +1,6 @@
 ---
 source: tests/e2e.rs
+assertion_line: 108
 expression: names
 ---
 [
@@ -11,6 +12,7 @@ expression: names
   "alc_card_get",
   "alc_card_get_by_alias",
   "alc_card_install",
+  "alc_card_lineage",
   "alc_card_list",
   "alc_card_samples",
   "alc_continue",

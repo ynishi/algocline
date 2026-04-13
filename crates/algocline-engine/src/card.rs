@@ -1253,6 +1253,360 @@ pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
 }
 
 // ───────────────────────────────────────────────────────────────
+// Lineage walker
+// ───────────────────────────────────────────────────────────────
+//
+// Cards form a tree (typically, not strictly a DAG) via the
+// `metadata.prior_card_id` convention. `lineage()` walks that tree
+// either up (toward ancestors) or down (toward descendants) or both,
+// up to a configurable depth, optionally filtered by `prior_relation`.
+//
+// Up-walk is O(depth) — each step reads one parent Card.
+// Down-walk is O(N_cards × depth) — we scan the whole store at each
+// level. For the current scale (hundreds to low thousands of cards)
+// this is fine; if the store grows we can build a prior_card_id index.
+
+/// Walk direction for `lineage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageDirection {
+    Up,
+    Down,
+    Both,
+}
+
+impl LineageDirection {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "up" => Ok(Self::Up),
+            "down" => Ok(Self::Down),
+            "both" => Ok(Self::Both),
+            other => Err(format!(
+                "direction must be 'up', 'down', or 'both' (got '{other}')"
+            )),
+        }
+    }
+}
+
+/// Query parameters for `lineage`.
+#[derive(Debug, Clone)]
+pub struct LineageQuery {
+    pub card_id: String,
+    pub direction: LineageDirection,
+    /// Max traversal depth. Default 10.
+    pub depth: Option<usize>,
+    /// Include a per-node `stats` field (full [stats] section).
+    pub include_stats: bool,
+    /// If set, only edges whose `prior_relation` is in this list are
+    /// followed.  The root is always included regardless.
+    pub relation_filter: Option<Vec<String>>,
+}
+
+/// One node in the lineage result.
+///
+/// `depth` is the signed distance from the root: negative for
+/// ancestors (up-walk), 0 for the root, positive for descendants.
+#[derive(Debug, Clone)]
+pub struct LineageNode {
+    pub card_id: String,
+    pub pkg: String,
+    pub prior_card_id: Option<String>,
+    pub prior_relation: Option<String>,
+    pub depth: i32,
+    pub stats: Option<Json>,
+}
+
+/// One edge in the lineage result (child → parent, always).
+#[derive(Debug, Clone)]
+pub struct LineageEdge {
+    pub from: String,
+    pub to: String,
+    pub relation: Option<String>,
+}
+
+/// Full lineage walk result.
+#[derive(Debug, Clone)]
+pub struct LineageResult {
+    pub root: String,
+    pub nodes: Vec<LineageNode>,
+    pub edges: Vec<LineageEdge>,
+    pub truncated: bool,
+}
+
+const DEFAULT_LINEAGE_DEPTH: usize = 10;
+
+/// Extract the lineage fields from a Card JSON.
+/// Returns (prior_card_id, prior_relation).
+fn lineage_fields(card: &Json) -> (Option<String>, Option<String>) {
+    let meta = card.get("metadata");
+    let prior_card_id = meta
+        .and_then(|m| m.get("prior_card_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let prior_relation = meta
+        .and_then(|m| m.get("prior_relation"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    (prior_card_id, prior_relation)
+}
+
+/// Build a LineageNode from a loaded CardRow at a given depth.
+fn make_node(row: &CardRow, depth: i32, include_stats: bool) -> LineageNode {
+    let (prior_card_id, prior_relation) = lineage_fields(&row.full);
+    let stats = if include_stats {
+        row.full.get("stats").cloned()
+    } else {
+        None
+    };
+    LineageNode {
+        card_id: row.summary.card_id.clone(),
+        pkg: row.summary.pkg.clone(),
+        prior_card_id,
+        prior_relation,
+        depth,
+        stats,
+    }
+}
+
+/// Check whether `relation` passes the relation_filter (None means no
+/// filter, which always passes).
+fn relation_passes(filter: &Option<Vec<String>>, relation: &Option<String>) -> bool {
+    match filter {
+        None => true,
+        Some(allowed) => match relation {
+            Some(r) => allowed.iter().any(|a| a == r),
+            None => false,
+        },
+    }
+}
+
+/// Load all Cards in the store once, keyed by card_id.
+/// Used by both up and down walks so we only touch disk once.
+fn load_card_index() -> Result<std::collections::HashMap<String, CardRow>, String> {
+    let root = cards_dir()?;
+    let mut index = std::collections::HashMap::new();
+
+    let pkg_dirs = fs::read_dir(&root)
+        .map_err(|e| format!("Failed to read cards dir: {e}"))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir());
+
+    for pdir in pkg_dirs {
+        let pkg = pdir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let entries = match fs::read_dir(&pdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            if let Some(row) = load_full(&p, &pkg) {
+                index.insert(row.summary.card_id.clone(), row);
+            }
+        }
+    }
+    Ok(index)
+}
+
+/// Invariant context passed through the lineage walkers.
+struct LineageCtx<'a> {
+    index: &'a std::collections::HashMap<String, CardRow>,
+    relation_filter: &'a Option<Vec<String>>,
+    include_stats: bool,
+    max_depth: usize,
+}
+
+/// Mutable accumulator for one lineage walk.
+struct LineageAccum {
+    nodes: Vec<LineageNode>,
+    edges: Vec<LineageEdge>,
+    visited: std::collections::HashSet<String>,
+    truncated: bool,
+}
+
+/// Walk ancestors via `metadata.prior_card_id`.
+fn walk_up(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
+    let mut cur = start_id.to_string();
+    for step in 1..=ctx.max_depth {
+        let Some(row) = ctx.index.get(&cur) else {
+            return;
+        };
+        let (prior_id, prior_rel) = lineage_fields(&row.full);
+        let Some(prior_id) = prior_id else {
+            return;
+        };
+        if !relation_passes(ctx.relation_filter, &prior_rel) {
+            return;
+        }
+        if acc.visited.contains(&prior_id) {
+            return;
+        }
+        let Some(parent) = ctx.index.get(&prior_id) else {
+            return;
+        };
+        acc.nodes
+            .push(make_node(parent, -(step as i32), ctx.include_stats));
+        acc.edges.push(LineageEdge {
+            from: row.summary.card_id.clone(),
+            to: parent.summary.card_id.clone(),
+            relation: prior_rel,
+        });
+        acc.visited.insert(prior_id.clone());
+        cur = prior_id;
+    }
+    // Depth exhausted but another unwalked parent exists → truncated.
+    if let Some(row) = ctx.index.get(&cur) {
+        let (prior_id, _) = lineage_fields(&row.full);
+        if prior_id
+            .as_ref()
+            .is_some_and(|p| ctx.index.contains_key(p) && !acc.visited.contains(p))
+        {
+            acc.truncated = true;
+        }
+    }
+}
+
+/// Walk descendants (Cards whose `metadata.prior_card_id` points at
+/// anyone in the current frontier), breadth-first.
+fn walk_down(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
+    let mut frontier: Vec<String> = vec![start_id.to_string()];
+
+    for depth in 1..=ctx.max_depth {
+        let mut next_frontier: Vec<String> = Vec::new();
+        for parent_id in &frontier {
+            for (child_id, child) in ctx.index {
+                if acc.visited.contains(child_id) {
+                    continue;
+                }
+                let (prior_id, prior_rel) = lineage_fields(&child.full);
+                if prior_id.as_deref() != Some(parent_id.as_str()) {
+                    continue;
+                }
+                if !relation_passes(ctx.relation_filter, &prior_rel) {
+                    continue;
+                }
+                acc.nodes
+                    .push(make_node(child, depth as i32, ctx.include_stats));
+                acc.edges.push(LineageEdge {
+                    from: child.summary.card_id.clone(),
+                    to: parent_id.clone(),
+                    relation: prior_rel,
+                });
+                acc.visited.insert(child_id.clone());
+                next_frontier.push(child_id.clone());
+            }
+        }
+        if next_frontier.is_empty() {
+            return;
+        }
+        frontier = next_frontier;
+    }
+    // Frontier still has nodes but depth is exhausted: check for
+    // unwalked children at the next level.
+    for parent_id in &frontier {
+        for (child_id, child) in ctx.index {
+            if acc.visited.contains(child_id) {
+                continue;
+            }
+            let (prior_id, prior_rel) = lineage_fields(&child.full);
+            if prior_id.as_deref() == Some(parent_id.as_str())
+                && relation_passes(ctx.relation_filter, &prior_rel)
+            {
+                acc.truncated = true;
+                return;
+            }
+        }
+    }
+}
+
+/// Walk the lineage tree from `q.card_id`.
+pub fn lineage(q: LineageQuery) -> Result<Option<LineageResult>, String> {
+    let index = load_card_index()?;
+    let Some(root_row) = index.get(&q.card_id) else {
+        return Ok(None);
+    };
+
+    let ctx = LineageCtx {
+        index: &index,
+        relation_filter: &q.relation_filter,
+        include_stats: q.include_stats,
+        max_depth: q.depth.unwrap_or(DEFAULT_LINEAGE_DEPTH),
+    };
+    let mut acc = LineageAccum {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        visited: std::collections::HashSet::new(),
+        truncated: false,
+    };
+
+    acc.nodes.push(make_node(root_row, 0, q.include_stats));
+    acc.visited.insert(q.card_id.clone());
+
+    if matches!(q.direction, LineageDirection::Up | LineageDirection::Both) {
+        walk_up(&q.card_id, &ctx, &mut acc);
+    }
+    if matches!(q.direction, LineageDirection::Down | LineageDirection::Both) {
+        walk_down(&q.card_id, &ctx, &mut acc);
+    }
+
+    Ok(Some(LineageResult {
+        root: q.card_id,
+        nodes: acc.nodes,
+        edges: acc.edges,
+        truncated: acc.truncated,
+    }))
+}
+
+/// Render a LineageResult as JSON for the service layer.
+pub fn lineage_to_json(r: &LineageResult) -> Json {
+    let nodes: Vec<Json> = r
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut m = serde_json::Map::new();
+            m.insert("card_id".into(), json!(n.card_id));
+            m.insert("pkg".into(), json!(n.pkg));
+            m.insert("depth".into(), json!(n.depth));
+            if let Some(p) = &n.prior_card_id {
+                m.insert("prior_card_id".into(), json!(p));
+            }
+            if let Some(rel) = &n.prior_relation {
+                m.insert("prior_relation".into(), json!(rel));
+            }
+            if let Some(s) = &n.stats {
+                m.insert("stats".into(), s.clone());
+            }
+            Json::Object(m)
+        })
+        .collect();
+    let edges: Vec<Json> = r
+        .edges
+        .iter()
+        .map(|e| {
+            let mut m = serde_json::Map::new();
+            m.insert("from".into(), json!(e.from));
+            m.insert("to".into(), json!(e.to));
+            if let Some(rel) = &e.relation {
+                m.insert("relation".into(), json!(rel));
+            }
+            Json::Object(m)
+        })
+        .collect();
+    json!({
+        "root": r.root,
+        "nodes": nodes,
+        "edges": edges,
+        "truncated": r.truncated,
+    })
+}
+
+// ───────────────────────────────────────────────────────────────
 // Samples sidecar: per-case detail written alongside a Card as
 // `{pkg}/{card_id}.samples.jsonl`. Write-once to preserve Card
 // immutability: once a Card has a samples file, it cannot be
@@ -2026,6 +2380,155 @@ mod tests {
         assert_eq!(rows.len(), 1, "missing field is ne to anything");
 
         cleanup(&pkg);
+    }
+
+    // ─── lineage ───────────────────────────────────────────────
+
+    /// Helper: create a child Card pointing at a parent with a relation.
+    fn create_child(pkg: &str, suffix: &str, parent_id: &str, relation: &str) -> String {
+        let (id, _) = create(json!({
+            "card_id": format!("{pkg}_{suffix}"),
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.5 },
+            "metadata": {
+                "prior_card_id": parent_id,
+                "prior_relation": relation,
+            },
+        }))
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn lineage_up_walks_prior_card_id_chain() {
+        let pkg = unique_pkg();
+        // a → b → c (c is newest; b points at a; c points at b)
+        let (a, _) = create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+        }))
+        .unwrap();
+        let b = create_child(&pkg, "b", &a, "rerun_of");
+        let c = create_child(&pkg, "c", &b, "rerun_of");
+
+        let res = lineage(LineageQuery {
+            card_id: c.clone(),
+            direction: LineageDirection::Up,
+            depth: None,
+            include_stats: false,
+            relation_filter: None,
+        })
+        .unwrap()
+        .expect("lineage result");
+
+        assert_eq!(res.root, c);
+        assert_eq!(res.nodes.len(), 3, "root + 2 ancestors");
+        assert_eq!(res.nodes[0].card_id, c);
+        assert_eq!(res.nodes[0].depth, 0);
+        assert_eq!(res.nodes[1].card_id, b);
+        assert_eq!(res.nodes[1].depth, -1);
+        assert_eq!(res.nodes[2].card_id, a);
+        assert_eq!(res.nodes[2].depth, -2);
+        assert_eq!(res.edges.len(), 2);
+        assert!(!res.truncated);
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn lineage_down_walks_descendants_breadth_first() {
+        let pkg = unique_pkg();
+        // a has two children b, c; c has one child d.
+        let (a, _) = create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+        }))
+        .unwrap();
+        let _b = create_child(&pkg, "b", &a, "sweep_variant");
+        let c = create_child(&pkg, "c", &a, "sweep_variant");
+        let _d = create_child(&pkg, "d", &c, "rerun_of");
+
+        let res = lineage(LineageQuery {
+            card_id: a.clone(),
+            direction: LineageDirection::Down,
+            depth: None,
+            include_stats: false,
+            relation_filter: None,
+        })
+        .unwrap()
+        .expect("lineage result");
+
+        // root + b + c + d = 4 nodes
+        assert_eq!(res.nodes.len(), 4);
+        assert_eq!(res.edges.len(), 3);
+        assert!(!res.truncated);
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn lineage_depth_truncation_sets_flag() {
+        let pkg = unique_pkg();
+        let (a, _) = create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+        }))
+        .unwrap();
+        let b = create_child(&pkg, "b", &a, "rerun_of");
+        let _c = create_child(&pkg, "c", &b, "rerun_of");
+
+        let res = lineage(LineageQuery {
+            card_id: a,
+            direction: LineageDirection::Down,
+            depth: Some(1),
+            include_stats: false,
+            relation_filter: None,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(res.nodes.len(), 2, "root + 1 level");
+        assert!(res.truncated, "should be truncated at depth=1");
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn lineage_relation_filter_skips_unlisted() {
+        let pkg = unique_pkg();
+        let (a, _) = create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+        }))
+        .unwrap();
+        let _b = create_child(&pkg, "b", &a, "sweep_variant");
+        let _c = create_child(&pkg, "c", &a, "rerun_of");
+
+        let res = lineage(LineageQuery {
+            card_id: a,
+            direction: LineageDirection::Down,
+            depth: None,
+            include_stats: false,
+            relation_filter: Some(vec!["sweep_variant".to_string()]),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(res.nodes.len(), 2, "root + only sweep_variant child");
+        assert_eq!(res.edges[0].relation.as_deref(), Some("sweep_variant"));
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn lineage_missing_card_returns_none() {
+        let res = lineage(LineageQuery {
+            card_id: "nonexistent_card_id_xyz".into(),
+            direction: LineageDirection::Up,
+            depth: None,
+            include_stats: false,
+            relation_filter: None,
+        })
+        .unwrap();
+        assert!(res.is_none());
     }
 
     // ─── samples sidecar ───────────────────────────────────────

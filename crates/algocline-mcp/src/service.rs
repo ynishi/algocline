@@ -327,6 +327,22 @@ pub struct CardSamplesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardLineageParams {
+    /// Card ID to start the walk from.
+    pub card_id: String,
+    /// Walk direction: `"up"` (ancestors, default), `"down"` (descendants),
+    /// or `"both"`.
+    pub direction: Option<String>,
+    /// Max traversal depth. Default 10.
+    pub depth: Option<usize>,
+    /// Include each node's `[stats]` section.  Default true.
+    pub include_stats: Option<bool>,
+    /// Optional list of accepted `metadata.prior_relation` values.
+    /// When set, edges whose relation is not in the list are not followed.
+    pub relation_filter: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardAppendParams {
     /// Card ID to append fields to.
     pub card_id: String,
@@ -884,6 +900,31 @@ impl AlcService {
             .await
     }
 
+    /// Walk a Card's lineage tree via `metadata.prior_card_id`.
+    ///
+    /// Follows the `prior_card_id` parent pointer (`direction="up"`, default),
+    /// collects descendants (`direction="down"`), or both. Returns nodes,
+    /// edges, and a `truncated` flag indicating whether the walk hit the
+    /// depth limit.
+    #[tool(
+        name = "alc_card_lineage",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn card_lineage(
+        &self,
+        Parameters(params): Parameters<CardLineageParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_lineage(
+                &params.card_id,
+                params.direction,
+                params.depth,
+                params.include_stats,
+                params.relation_filter,
+            )
+            .await
+    }
+
     /// Install Cards from a Card Collection (Git repo or local directory).
     ///
     /// A Card Collection has `alc_cards.toml` at root and subdirectories
@@ -1026,6 +1067,7 @@ impl ServerHandler for AlcService {
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true).\n\
+                 - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
                  Hub:\n\
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\

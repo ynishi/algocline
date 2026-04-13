@@ -16,14 +16,15 @@
 //! | `set` | Write a value (upsert) |
 //! | `delete` | Remove a key (returns whether it existed) |
 //! | `keys` | List all keys in a namespace |
-//! | `has` | Check existence without deserializing the value |
+//! | `has` | Check existence (cost is backend-dependent) |
 //! | `set_nx` | Set-if-not-exists (returns `false` if key already present) |
-//! | `incr` | Atomic counter increment (read-modify-write in one call) |
+//! | `incr` | Counter increment — single-process atomic (read-modify-write) |
 //!
-//! ## Tier 2 — Future Extensions
+//! ## Tier 2 — Future Extensions (design notes, not yet implemented)
 //!
-//! The following operations are **not yet implemented** but the trait
-//! is designed to accommodate them without breaking changes:
+//! The following operations are planned but **not yet implemented**.
+//! The trait is designed to accommodate them without breaking changes.
+//! Review this list when adding a new backend.
 //!
 //! - **TTL**: `set(key, value, opts)` with `opts.ttl_secs`, plus
 //!   `ttl(key) -> Option<Duration>` to query remaining time.  Useful
@@ -72,18 +73,36 @@ pub trait StateStore: Send + Sync {
     /// List all keys in a namespace.
     fn keys(&self, ns: &str) -> Result<Vec<String>, String>;
 
-    /// Check whether a key exists (cheaper than `get` + nil check
-    /// when the value is large and deserialization is expensive).
+    /// Check whether a key exists.
+    ///
+    /// Whether this is cheaper than `get` + nil check depends on the
+    /// backend.  `JsonFileStore` still loads the whole namespace; backends
+    /// like Redis or SQLite can answer with an `EXISTS` command.
     fn has(&self, ns: &str, key: &str) -> Result<bool, String>;
 
     /// Set a value only if the key does **not** already exist.
     /// Returns `true` if the value was written, `false` if the key
     /// was already present.
+    ///
+    /// **Note:** `JsonFileStore` performs a non-locking load-check-save
+    /// cycle.  This is safe within a single process but **not** across
+    /// concurrent processes.  Backends with native CAS (Redis `SETNX`,
+    /// SQLite transactions) will provide true atomicity.
     fn set_nx(&self, ns: &str, key: &str, value: Value) -> Result<bool, String>;
 
-    /// Atomic counter increment.  Adds `delta` to the current numeric
-    /// value at `key`.  If the key is missing, initialises it to
-    /// `default` before adding.  Returns the new value.
+    /// Counter increment (single-process atomic).
+    ///
+    /// Adds `delta` to the current numeric value at `key`.  If the key
+    /// is missing, initialises it to `default` before adding.  Returns
+    /// the new value.
+    ///
+    /// **Note:** `JsonFileStore` performs a non-locking
+    /// read-modify-write.  Safe within one process; use a backend with
+    /// native `INCR` (Redis) or transactions (SQLite) for multi-process
+    /// safety.
+    ///
+    /// Uses `f64` internally.  Integer-valued deltas are exact; fractional
+    /// deltas may accumulate floating-point rounding errors over many calls.
     ///
     /// Errors if the existing value is not a JSON number.
     fn incr(&self, ns: &str, key: &str, delta: f64, default: f64) -> Result<f64, String>;
@@ -244,10 +263,20 @@ mod tests {
         let _ = std::fs::remove_file(JsonFileStore::state_path(ns).unwrap());
     }
 
+    /// RAII guard that removes the namespace file on drop, so cleanup
+    /// runs even if the test panics mid-way.
+    struct CleanupGuard(&'static str);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(JsonFileStore::state_path(self.0).unwrap());
+        }
+    }
+
     #[test]
     fn roundtrip() {
         let ns = "_test_roundtrip";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         set(ns, "count", serde_json::json!(42)).unwrap();
         set(ns, "name", serde_json::json!("algocline")).unwrap();
@@ -266,8 +295,6 @@ mod tests {
         assert!(delete(ns, "count").unwrap());
         assert!(!delete(ns, "count").unwrap());
         assert_eq!(get(ns, "count").unwrap(), None);
-
-        cleanup(ns);
     }
 
     #[test]
@@ -302,12 +329,11 @@ mod tests {
     fn set_overwrites_existing_value() {
         let ns = "_test_overwrite";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         set(ns, "k", serde_json::json!(1)).unwrap();
         set(ns, "k", serde_json::json!(2)).unwrap();
         assert_eq!(get(ns, "k").unwrap(), Some(serde_json::json!(2)));
-
-        cleanup(ns);
     }
 
     #[test]
@@ -323,18 +349,18 @@ mod tests {
     fn has_returns_existence() {
         let ns = "_test_has";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         assert!(!has(ns, "x").unwrap());
         set(ns, "x", serde_json::json!(1)).unwrap();
         assert!(has(ns, "x").unwrap());
-
-        cleanup(ns);
     }
 
     #[test]
     fn set_nx_only_sets_if_absent() {
         let ns = "_test_set_nx";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         assert!(set_nx(ns, "k", serde_json::json!("first")).unwrap());
         assert!(!set_nx(ns, "k", serde_json::json!("second")).unwrap());
@@ -343,14 +369,13 @@ mod tests {
             Some(serde_json::json!("first")),
             "set_nx should not overwrite"
         );
-
-        cleanup(ns);
     }
 
     #[test]
     fn incr_initialises_and_increments() {
         let ns = "_test_incr";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         // Missing key: initialise from default (0) + delta (1) = 1
         let v = incr(ns, "counter", 1.0, 0.0).unwrap();
@@ -363,31 +388,27 @@ mod tests {
         // Negative delta
         let v = incr(ns, "counter", -2.0, 0.0).unwrap();
         assert!((v - 4.0).abs() < f64::EPSILON);
-
-        cleanup(ns);
     }
 
     #[test]
     fn incr_rejects_non_numeric() {
         let ns = "_test_incr_err";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         set(ns, "s", serde_json::json!("hello")).unwrap();
         let err = incr(ns, "s", 1.0, 0.0).unwrap_err();
         assert!(err.contains("not a number"), "got: {err}");
-
-        cleanup(ns);
     }
 
     #[test]
     fn incr_custom_default() {
         let ns = "_test_incr_default";
         cleanup(ns);
+        let _g = CleanupGuard(ns);
 
         let v = incr(ns, "score", 10.0, 100.0).unwrap();
         assert!((v - 110.0).abs() < f64::EPSILON, "100 + 10 = 110");
-
-        cleanup(ns);
     }
 }
 

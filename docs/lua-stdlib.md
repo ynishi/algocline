@@ -253,7 +253,7 @@ local ok = alc.state.set_nx("lock", true)   -- false (already set)
 
 #### `alc.state.incr(key, delta?, default?) -> number`
 
-Atomic counter increment. Adds `delta` (default 1) to the current numeric value. If the key is missing, initialises from `default` (default 0) before adding. Returns the new value. Errors if the existing value is not a number.
+Counter increment (single-process atomic). Adds `delta` (default 1) to the current numeric value. If the key is missing, initialises from `default` (default 0) before adding. Returns the new value. Errors if the existing value is not a number. Integer-valued deltas are exact; fractional deltas may accumulate floating-point rounding over many calls.
 
 ```lua
 alc.state.incr("counter")           -- 1   (0 + 1)

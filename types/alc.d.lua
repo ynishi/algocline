@@ -120,7 +120,7 @@ function alc.state.keys() end
 ---@param key string Key to delete
 function alc.state.delete(key) end
 
---- Check whether a key exists without reading the value.
+--- Check whether a key exists (cost is backend-dependent).
 ---@param key string Key to check
 ---@return boolean exists true if key exists
 function alc.state.has(key) end
@@ -131,9 +131,10 @@ function alc.state.has(key) end
 ---@return boolean written true if written, false if key was already present
 function alc.state.set_nx(key, value) end
 
---- Atomic counter increment.
+--- Counter increment (single-process atomic).
 --- Adds delta (default 1) to the current numeric value.
 --- If key is missing, initialises from default (default 0) before adding.
+--- Integer-valued deltas are exact; fractional deltas may accumulate rounding.
 ---@param key string Key to increment
 ---@param delta? number Amount to add (default 1)
 ---@param default? number Initial value if key is missing (default 0)

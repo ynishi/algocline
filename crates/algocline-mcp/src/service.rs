@@ -272,18 +272,24 @@ pub struct CardGetParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardFindParams {
-    /// Optional pkg filter.
+    /// Optional pkg filter.  Restricts the filesystem scan to a single
+    /// pkg subdir — use it when you know the target package for speed.
     pub pkg: Option<String>,
-    /// Optional scenario.name filter.
-    pub scenario: Option<String>,
-    /// Optional model.id filter.
-    pub model: Option<String>,
-    /// Sort mode: "pass_rate" (desc), "pass_rate_asc", or "created_at" (desc, default).
-    pub sort: Option<String>,
+    /// Prisma-style `where` predicate.  Nested objects are interpreted
+    /// as section paths; keys whose value is an object whose every key
+    /// is a reserved operator name (`eq ne lt lte gt gte in nin exists
+    /// contains starts_with`) become leaf comparisons.  Logical ops:
+    /// `_and` / `_or` / `_not`.  Example:
+    /// `{ "stats": { "pass_rate": { "gte": 0.8 } }, "model": { "id": "claude-opus-4-6" } }`
+    pub r#where: Option<serde_json::Value>,
+    /// Sort keys.  Accepts a single dotted-path string (`"stats.pass_rate"`,
+    /// `"-stats.pass_rate"` for desc) or an array of such strings.
+    /// Defaults to `created_at` descending.
+    pub order_by: Option<serde_json::Value>,
     /// Max rows returned.
     pub limit: Option<usize>,
-    /// Drop rows with stats.pass_rate below this threshold.
-    pub min_pass_rate: Option<f64>,
+    /// Skip this many rows before `limit` applies.
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -780,8 +786,12 @@ impl AlcService {
         self.app.card_get(&params.card_id).await
     }
 
-    /// Filter/sort Cards. Thin layer over `alc_card_list` with
-    /// pkg/scenario/model/min_pass_rate filters and pass_rate/created_at sort.
+    /// Filter/sort Cards using the Prisma-style `where` DSL.
+    ///
+    /// Supports nested-object predicates, reserved operator objects,
+    /// `_and`/`_or`/`_not` logical ops, and `order_by` with dotted
+    /// paths + optional `-` prefix for descending.  See
+    /// `CardFindParams` for the exact shape.
     #[tool(
         name = "alc_card_find",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -793,11 +803,10 @@ impl AlcService {
         self.app
             .card_find(
                 params.pkg,
-                params.scenario,
-                params.model,
-                params.sort,
+                params.r#where,
+                params.order_by,
                 params.limit,
-                params.min_pass_rate,
+                params.offset,
             )
             .await
     }
@@ -1011,7 +1020,7 @@ impl ServerHandler for AlcService {
                  Cards (immutable run snapshots in ~/.algocline/cards/):\n\
                  - alc_card_list: List Card summaries (newest-first). Filter by pkg.\n\
                  - alc_card_get: Fetch a full Card by card_id.\n\
-                 - alc_card_find: Filter/sort Cards by pkg/scenario/model/min_pass_rate with pass_rate or created_at sort.\n\
+                 - alc_card_find: Filter/sort Cards with a Prisma-style `where` DSL (nested eq/lt/gte/in/_and/_or/_not) and dotted-path `order_by`.\n\
                  - alc_card_alias_list: List aliases from _aliases.toml.\n\
                  - alc_card_get_by_alias: Resolve an alias name to the full Card JSON (shortcut for alias_list → filter → get).\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\

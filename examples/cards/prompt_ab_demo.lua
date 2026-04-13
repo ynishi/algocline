@@ -68,10 +68,10 @@ for _, p in ipairs(prompts) do
 end
 
 -- ─── Query for the winner ───────────────────────────────────────
--- find() sorts by pass_rate desc and limits to the top row.
+-- find() uses a Prisma-style `where` DSL and dotted-path order_by.
 local best = alc.card.find({
     pkg = PKG,
-    sort = "pass_rate",
+    order_by = "-stats.pass_rate",
     limit = 1,
 })[1]
 

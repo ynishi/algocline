@@ -29,24 +29,29 @@ impl AppService {
         }
     }
 
-    /// Query Cards with sort, filter, and limit.
-    #[allow(clippy::too_many_arguments)]
+    /// Query Cards using the `where` DSL + `order_by` / limit / offset.
     pub fn card_find(
         &self,
         pkg: Option<String>,
-        scenario: Option<String>,
-        model: Option<String>,
-        sort: Option<String>,
+        where_: Option<serde_json::Value>,
+        order_by: Option<serde_json::Value>,
         limit: Option<usize>,
-        min_pass_rate: Option<f64>,
+        offset: Option<usize>,
     ) -> Result<String, String> {
+        let where_parsed = match where_ {
+            Some(v) => Some(card::parse_where(&v)?),
+            None => None,
+        };
+        let order_parsed = match order_by {
+            Some(v) => card::parse_order_by(&v)?,
+            None => Vec::new(),
+        };
         let q = card::FindQuery {
             pkg,
-            scenario,
-            model,
-            sort,
+            where_: where_parsed,
+            order_by: order_parsed,
             limit,
-            min_pass_rate,
+            offset,
         };
         let rows = card::find(q)?;
         Ok(card::summaries_to_json(&rows).to_string())

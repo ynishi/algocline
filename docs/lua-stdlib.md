@@ -818,23 +818,53 @@ List Cards as summaries (newest first).
 
 #### `alc.card.find(query?) -> summary[]`
 
-Query Cards with sort and filter.
+Query Cards with a Prisma-style `where` DSL plus dotted-path `order_by`.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `query.pkg` | string | no | Filter by package |
-| `query.scenario` | string | no | Filter by scenario name |
-| `query.model` | string | no | Filter by model id |
-| `query.sort` | string | no | Sort field (e.g. `"pass_rate"`) |
+| `query.pkg` | string | no | Restrict scan to a single pkg subdir (I/O hint) |
+| `query.where` | table | no | Nested-object predicate (see below) |
+| `query.order_by` | string \| string[] | no | Sort keys; `-` prefix = desc |
 | `query.limit` | integer | no | Max results |
-| `query.min_pass_rate` | number | no | Minimum pass_rate threshold |
+| `query.offset` | integer | no | Skip first N rows before `limit` |
+
+**`where` DSL**
+
+- Nested objects are interpreted as path extensions: `where.stats.pass_rate` targets Card root `[stats] pass_rate`.
+- A value whose every key is a reserved operator name becomes a leaf comparison.
+- Scalar values become implicit `eq`.
+- Multiple keys in the same object combine with AND. Use `_and` / `_or` / `_not` for explicit logical ops.
+
+**Reserved operators**: `eq ne lt lte gt gte in nin exists contains starts_with`. Card schemas must not use these names as field names anywhere.
+
+**Missing-field semantics**: `eq/lt/lte/gt/gte/in/contains/starts_with` return false on missing fields; `ne/nin` return true; `exists` is explicit.
 
 ```lua
+-- Best-scoring cot Card on gsm8k
 local best = alc.card.find({
-    pkg = "my_eval",
-    scenario = "gsm8k_100",
-    sort = "pass_rate",
+    pkg = "cot",
+    where = {
+        scenario = { name = "gsm8k_100" },
+        stats = { pass_rate = { gte = 0.7 }, n = { gte = 30 } },
+    },
+    order_by = "-stats.pass_rate",
     limit = 1,
+})
+
+-- Cards where strategy temperature is >= 0.7 OR equilibrium is "dead"
+local mixed = alc.card.find({
+    where = {
+        _or = {
+            { strategy_params = { temperature = { gte = 0.7 } } },
+            { stats = { equilibrium_position = "dead" } },
+        },
+    },
+    order_by = { "-stats.pass_rate", "created_at" },
+})
+
+-- Cards that have no prior_card_id (roots)
+local roots = alc.card.find({
+    where = { prior_card_id = { exists = false } },
 })
 ```
 

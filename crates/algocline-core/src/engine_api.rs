@@ -191,15 +191,19 @@ pub trait EngineApi: Send + Sync {
     /// Fetch a full Card by id.
     async fn card_get(&self, card_id: &str) -> Result<String, String>;
 
-    /// Filter/sort Cards with optional pkg / scenario / model / sort / limit / min_pass_rate.
+    /// Filter/sort Cards using the Prisma-style `where` DSL.
+    ///
+    /// - `pkg`: restricts filesystem scan to a single pkg subdir (I/O hint).
+    /// - `where_`: nested-object predicate (see `card::parse_where`).
+    /// - `order_by`: array of dotted-path sort keys; `-` prefix = desc.
+    /// - `limit` / `offset`: pagination.
     async fn card_find(
         &self,
         pkg: Option<String>,
-        scenario: Option<String>,
-        model: Option<String>,
-        sort: Option<String>,
+        where_: Option<serde_json::Value>,
+        order_by: Option<serde_json::Value>,
         limit: Option<usize>,
-        min_pass_rate: Option<f64>,
+        offset: Option<usize>,
     ) -> Result<String, String>;
 
     /// List aliases, optionally filtered by pkg.

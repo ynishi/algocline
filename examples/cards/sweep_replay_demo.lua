@@ -94,7 +94,7 @@ end
 
 local all = alc.card.find({
     pkg = PKG,
-    scenario = SCENARIO,
+    where = { scenario = { name = SCENARIO } },
     limit = 100,
 })
 

@@ -754,56 +754,501 @@ pub fn aliases_to_json(rows: &[Alias]) -> Json {
     Json::Array(rows.iter().map(|a| a.to_json()).collect())
 }
 
-/// Query parameters for `find`. All filters are optional.
-#[derive(Debug, Default, Clone)]
-pub struct FindQuery {
-    pub pkg: Option<String>,
-    pub scenario: Option<String>,
-    pub model: Option<String>,
-    /// One of: `"pass_rate"` (desc), `"pass_rate_asc"`, `"created_at"` (desc, default).
-    pub sort: Option<String>,
-    pub limit: Option<usize>,
-    pub min_pass_rate: Option<f64>,
+// ═══════════════════════════════════════════════════════════════
+// Where DSL — Prisma/Mongo-style nested predicates
+// ═══════════════════════════════════════════════════════════════
+//
+// See `workspace/tasks/card-dsl/design.md` for the full spec.
+//
+// Syntax (JSON form, as received from Lua / MCP):
+//
+//   where = {
+//     pkg: "cot",                                      // implicit eq
+//     stats: { pass_rate: { gte: 0.8 }, n: { gte: 30 } },
+//     strategy_params: { temperature: { gte: 0.7 } },
+//     prior_card_id: { exists: true },
+//     _or: [ {...}, {...} ],                           // logical ops
+//     _not: { model: { id: "claude-haiku-4-5-20251001" } },
+//   }
+//
+// Semantics:
+//   * Multiple keys in the same object → implicit AND.
+//   * Nested object value → section (path extension).
+//   * Object whose every key is a reserved operator name → leaf operator
+//     object; applies the operators to the value at the current path.
+//   * Scalar/array value → implicit eq.
+//   * Reserved logical keys: `_and` / `_or` / `_not`.
+//   * Reserved operator keys: `eq ne lt lte gt gte in nin exists
+//     contains starts_with`.  Card schemas must not use these names as
+//     field names under any section.
+//
+// Missing-field comparison:
+//   * `eq/lt/lte/gt/gte/in/contains/starts_with` → false on missing
+//   * `ne/nin`                                   → true  on missing
+//   * `exists`                                   → explicit
+//
+
+/// Single comparison operator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    In,
+    Nin,
+    Exists,
+    Contains,
+    StartsWith,
 }
 
-/// Filter/sort Cards across the store.
+impl CmpOp {
+    fn from_key(k: &str) -> Option<Self> {
+        Some(match k {
+            "eq" => Self::Eq,
+            "ne" => Self::Ne,
+            "lt" => Self::Lt,
+            "lte" => Self::Lte,
+            "gt" => Self::Gt,
+            "gte" => Self::Gte,
+            "in" => Self::In,
+            "nin" => Self::Nin,
+            "exists" => Self::Exists,
+            "contains" => Self::Contains,
+            "starts_with" => Self::StartsWith,
+            _ => return None,
+        })
+    }
+}
+
+/// One parsed comparison: `path` points at a nested field,
+/// `op` + `value` describe how to compare it.
+#[derive(Debug, Clone)]
+pub struct Comparison {
+    pub path: Vec<String>,
+    pub op: CmpOp,
+    pub value: Json,
+}
+
+/// Parsed predicate tree.
+#[derive(Debug, Clone)]
+pub enum Predicate {
+    And(Vec<Predicate>),
+    Or(Vec<Predicate>),
+    Not(Box<Predicate>),
+    Cmp(Comparison),
+}
+
+/// Is `obj` entirely composed of reserved operator keys?
+/// Empty objects return false (meaningless as an operator object).
+fn is_operator_object(obj: &serde_json::Map<String, Json>) -> bool {
+    if obj.is_empty() {
+        return false;
+    }
+    obj.keys().all(|k| CmpOp::from_key(k).is_some())
+}
+
+/// Parse a `where` JSON value into a `Predicate`.
 ///
-/// Thin layer over `list`: loads all summaries (optionally restricted to
-/// a pkg subdir), applies field filters, sorts, and truncates.
-pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
-    let mut rows = list(q.pkg.as_deref())?;
-    if let Some(s) = &q.scenario {
-        rows.retain(|r| r.scenario.as_deref() == Some(s.as_str()));
-    }
-    if let Some(m) = &q.model {
-        rows.retain(|r| r.model.as_deref() == Some(m.as_str()));
-    }
-    if let Some(min) = q.min_pass_rate {
-        rows.retain(|r| r.pass_rate.is_some_and(|v| v >= min));
-    }
-    match q.sort.as_deref() {
-        Some("pass_rate") => rows.sort_by(|a, b| {
-            b.pass_rate
-                .partial_cmp(&a.pass_rate)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        Some("pass_rate_asc") => rows.sort_by(|a, b| {
-            a.pass_rate
-                .partial_cmp(&b.pass_rate)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        _ => {
-            rows.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then_with(|| b.card_id.cmp(&a.card_id))
-            });
+/// `prefix` is the current nested-key path as we descend through
+/// section objects.
+pub fn parse_where(value: &Json) -> Result<Predicate, String> {
+    parse_predicate(value, &[])
+}
+
+fn parse_predicate(value: &Json, prefix: &[String]) -> Result<Predicate, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "where clause must be a table".to_string())?;
+
+    let mut clauses: Vec<Predicate> = Vec::new();
+
+    for (key, val) in obj {
+        match key.as_str() {
+            "_and" => {
+                let arr = val.as_array().ok_or_else(|| {
+                    "_and must be an array of sub-predicates".to_string()
+                })?;
+                let mut subs = Vec::with_capacity(arr.len());
+                for sub in arr {
+                    subs.push(parse_predicate(sub, prefix)?);
+                }
+                clauses.push(Predicate::And(subs));
+            }
+            "_or" => {
+                let arr = val
+                    .as_array()
+                    .ok_or_else(|| "_or must be an array of sub-predicates".to_string())?;
+                let mut subs = Vec::with_capacity(arr.len());
+                for sub in arr {
+                    subs.push(parse_predicate(sub, prefix)?);
+                }
+                clauses.push(Predicate::Or(subs));
+            }
+            "_not" => {
+                clauses.push(Predicate::Not(Box::new(parse_predicate(val, prefix)?)));
+            }
+            _ => {
+                // Field key — extend the current path.
+                let mut new_path = prefix.to_vec();
+                new_path.push(key.clone());
+
+                match val {
+                    Json::Object(m) if is_operator_object(m) => {
+                        // Leaf: operator object at this path.
+                        for (op_key, op_val) in m {
+                            let op = CmpOp::from_key(op_key).expect("validated above");
+                            clauses.push(Predicate::Cmp(Comparison {
+                                path: new_path.clone(),
+                                op,
+                                value: op_val.clone(),
+                            }));
+                        }
+                    }
+                    Json::Object(_) => {
+                        // Nested section: recurse with extended path.
+                        clauses.push(parse_predicate(val, &new_path)?);
+                    }
+                    _ => {
+                        // Scalar/array: implicit eq.
+                        clauses.push(Predicate::Cmp(Comparison {
+                            path: new_path,
+                            op: CmpOp::Eq,
+                            value: val.clone(),
+                        }));
+                    }
+                }
+            }
         }
     }
-    if let Some(lim) = q.limit {
-        rows.truncate(lim);
+
+    if clauses.len() == 1 {
+        Ok(clauses.remove(0))
+    } else {
+        Ok(Predicate::And(clauses))
     }
-    Ok(rows)
+}
+
+/// Fetch a nested value from a Card JSON by dotted path.
+fn fetch_path<'a>(card: &'a Json, path: &[String]) -> Option<&'a Json> {
+    let mut node = card;
+    for key in path {
+        let obj = node.as_object()?;
+        node = obj.get(key)?;
+    }
+    Some(node)
+}
+
+/// Compare two JSON scalars with a numeric/string/bool comparator.
+/// Returns None when the types aren't comparable.
+fn json_cmp(a: &Json, b: &Json) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Json::Number(x), Json::Number(y)) => {
+            let xf = x.as_f64()?;
+            let yf = y.as_f64()?;
+            xf.partial_cmp(&yf)
+        }
+        (Json::String(x), Json::String(y)) => Some(x.cmp(y)),
+        (Json::Bool(x), Json::Bool(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+fn json_eq(a: &Json, b: &Json) -> bool {
+    match (a, b) {
+        (Json::Number(x), Json::Number(y)) => {
+            match (x.as_f64(), y.as_f64()) {
+                (Some(xf), Some(yf)) => xf == yf,
+                _ => a == b,
+            }
+        }
+        _ => a == b,
+    }
+}
+
+fn eval_cmp(cmp: &Comparison, card: &Json) -> bool {
+    let actual = fetch_path(card, &cmp.path);
+    let exists = actual.is_some();
+
+    match cmp.op {
+        CmpOp::Exists => {
+            let want = cmp.value.as_bool().unwrap_or(true);
+            exists == want
+        }
+        CmpOp::Ne => match actual {
+            None => true,
+            Some(v) => !json_eq(v, &cmp.value),
+        },
+        CmpOp::Nin => match actual {
+            None => true,
+            Some(v) => match cmp.value.as_array() {
+                Some(arr) => !arr.iter().any(|e| json_eq(e, v)),
+                None => false,
+            },
+        },
+        CmpOp::Eq => actual.is_some_and(|v| json_eq(v, &cmp.value)),
+        CmpOp::In => actual.is_some_and(|v| match cmp.value.as_array() {
+            Some(arr) => arr.iter().any(|e| json_eq(e, v)),
+            None => false,
+        }),
+        CmpOp::Lt | CmpOp::Lte | CmpOp::Gt | CmpOp::Gte => {
+            let Some(v) = actual else { return false };
+            let Some(ord) = json_cmp(v, &cmp.value) else {
+                return false;
+            };
+            use std::cmp::Ordering::{Equal, Greater, Less};
+            matches!(
+                (&cmp.op, ord),
+                (CmpOp::Lt, Less)
+                    | (CmpOp::Lte, Less | Equal)
+                    | (CmpOp::Gt, Greater)
+                    | (CmpOp::Gte, Greater | Equal)
+            )
+        }
+        CmpOp::Contains => {
+            let Some(Json::String(haystack)) = actual else {
+                return false;
+            };
+            let Some(needle) = cmp.value.as_str() else {
+                return false;
+            };
+            haystack.contains(needle)
+        }
+        CmpOp::StartsWith => {
+            let Some(Json::String(haystack)) = actual else {
+                return false;
+            };
+            let Some(needle) = cmp.value.as_str() else {
+                return false;
+            };
+            haystack.starts_with(needle)
+        }
+    }
+}
+
+/// Evaluate a predicate tree against a full Card JSON.
+pub fn eval_predicate(pred: &Predicate, card: &Json) -> bool {
+    match pred {
+        Predicate::And(subs) => subs.iter().all(|p| eval_predicate(p, card)),
+        Predicate::Or(subs) => subs.iter().any(|p| eval_predicate(p, card)),
+        Predicate::Not(sub) => !eval_predicate(sub, card),
+        Predicate::Cmp(c) => eval_cmp(c, card),
+    }
+}
+
+// ───────────────────────────────────────────────────────────────
+// Order-by
+// ───────────────────────────────────────────────────────────────
+
+/// Parsed sort key: path with optional descending flag.
+#[derive(Debug, Clone)]
+pub struct OrderKey {
+    pub path: Vec<String>,
+    pub desc: bool,
+}
+
+impl OrderKey {
+    fn parse(raw: &str) -> Result<Self, String> {
+        if raw.is_empty() {
+            return Err("order_by key must not be empty".into());
+        }
+        let (desc, rest) = if let Some(r) = raw.strip_prefix('-') {
+            (true, r)
+        } else {
+            (false, raw)
+        };
+        let path: Vec<String> = rest.split('.').map(|s| s.to_string()).collect();
+        if path.iter().any(|p| p.is_empty()) {
+            return Err(format!("invalid order_by key: '{raw}'"));
+        }
+        Ok(Self { path, desc })
+    }
+}
+
+/// Parse an order_by JSON value.  Accepts:
+///   - a string: `"stats.pass_rate"` or `"-stats.pass_rate"`
+///   - an array of strings: `["-stats.pass_rate", "created_at"]`
+pub fn parse_order_by(value: &Json) -> Result<Vec<OrderKey>, String> {
+    match value {
+        Json::String(s) => Ok(vec![OrderKey::parse(s)?]),
+        Json::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| "order_by array must contain strings".to_string())?;
+                out.push(OrderKey::parse(s)?);
+            }
+            Ok(out)
+        }
+        _ => Err("order_by must be a string or array of strings".into()),
+    }
+}
+
+/// Query parameters for `find`.
+#[derive(Debug, Default, Clone)]
+pub struct FindQuery {
+    /// Restrict scan to a single pkg subdir (I/O optimization).
+    pub pkg: Option<String>,
+    /// Prisma-style predicate tree.
+    pub where_: Option<Predicate>,
+    /// Sort keys (dotted paths, optional `-` prefix for desc).
+    pub order_by: Vec<OrderKey>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// A loaded Card row flowing through the find() pipeline.
+///
+/// `full` is the whole Card JSON (used by `where` evaluation and
+/// `order_by` dotted-path lookup); `summary` is the projection
+/// returned to callers.
+#[derive(Debug, Clone)]
+struct CardRow {
+    full: Json,
+    summary: Summary,
+}
+
+/// Load a single Card file into a `CardRow`.
+fn load_full(path: &std::path::Path, pkg: &str) -> Option<CardRow> {
+    let text = fs::read_to_string(path).ok()?;
+    let val: toml::Value = toml::from_str(&text).ok()?;
+    let json = toml_to_json(val);
+
+    let card_id = json
+        .get("card_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()))?
+        .to_string();
+    let created_at = json
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let model = json
+        .get("model")
+        .and_then(|m| m.get("id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let scenario = json
+        .get("scenario")
+        .and_then(|s| s.get("name"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let pass_rate = json
+        .get("stats")
+        .and_then(|s| s.get("pass_rate"))
+        .and_then(|v| v.as_f64());
+
+    Some(CardRow {
+        full: json,
+        summary: Summary {
+            card_id,
+            pkg: pkg.to_string(),
+            created_at,
+            model,
+            scenario,
+            pass_rate,
+        },
+    })
+}
+
+/// Compare two Card rows according to an ordered list of sort keys.
+fn order_cards(a: &CardRow, b: &CardRow, keys: &[OrderKey]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for k in keys {
+        let va = fetch_path(&a.full, &k.path);
+        let vb = fetch_path(&b.full, &k.path);
+        let ord = match (va, vb) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater, // missing sorts last
+            (Some(_), None) => Ordering::Less,
+            (Some(x), Some(y)) => json_cmp(x, y).unwrap_or(Ordering::Equal),
+        };
+        let ord = if k.desc { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Filter/sort Cards across the store using the `where` DSL.
+///
+/// Loads the full TOML for each Card (not just the Summary) so that
+/// arbitrary sparse fields can be evaluated.  With no `where` clause,
+/// behaves like `list` + `order_by` + `limit`/`offset`.
+pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
+    let root = cards_dir()?;
+
+    let pkg_dirs: Vec<PathBuf> = if let Some(p) = q.pkg.as_deref() {
+        validate_name(p, "pkg")?;
+        let d = root.join(p);
+        if d.is_dir() {
+            vec![d]
+        } else {
+            return Ok(Vec::new());
+        }
+    } else {
+        fs::read_dir(&root)
+            .map_err(|e| format!("Failed to read cards dir: {e}"))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    };
+
+    // Load full rows, filtering by where.
+    let mut rows: Vec<CardRow> = Vec::new();
+    for pdir in pkg_dirs {
+        let pkg = pdir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let entries = match fs::read_dir(&pdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(row) = load_full(&p, &pkg) else {
+                continue;
+            };
+            if let Some(pred) = &q.where_ {
+                if !eval_predicate(pred, &row.full) {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+    }
+
+    // Sort.
+    if q.order_by.is_empty() {
+        rows.sort_by(|a, b| {
+            b.summary
+                .created_at
+                .cmp(&a.summary.created_at)
+                .then_with(|| b.summary.card_id.cmp(&a.summary.card_id))
+        });
+    } else {
+        rows.sort_by(|a, b| order_cards(a, b, &q.order_by));
+    }
+
+    // Offset + limit.
+    let out: Vec<Summary> = rows
+        .into_iter()
+        .skip(q.offset.unwrap_or(0))
+        .take(q.limit.unwrap_or(usize::MAX))
+        .map(|r| r.summary)
+        .collect();
+
+    Ok(out)
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -1234,10 +1679,18 @@ mod tests {
         assert!(err.contains("not found"));
     }
 
-    // ─── P1: find ──────────────────────────────────────────────
+    // ─── find + where DSL ───────────────────────────────────────
+
+    fn where_from(v: Json) -> Predicate {
+        parse_where(&v).expect("parse where")
+    }
+
+    fn order_from(v: Json) -> Vec<OrderKey> {
+        parse_order_by(&v).expect("parse order_by")
+    }
 
     #[test]
-    fn find_filters_and_sorts_by_pass_rate() {
+    fn find_where_nested_eq_and_gte() {
         let pkg = unique_pkg();
         create(json!({
             "card_id": format!("{pkg}_low"),
@@ -1261,10 +1714,13 @@ mod tests {
         }))
         .unwrap();
 
+        // scenario eq via nested object
         let rows = find(FindQuery {
             pkg: Some(pkg.clone()),
-            scenario: Some("gsm8k".into()),
-            sort: Some("pass_rate".into()),
+            where_: Some(where_from(json!({
+                "scenario": { "name": "gsm8k" },
+            }))),
+            order_by: order_from(json!("-stats.pass_rate")),
             ..Default::default()
         })
         .unwrap();
@@ -1272,11 +1728,13 @@ mod tests {
         assert_eq!(rows[0].pass_rate, Some(0.9));
         assert_eq!(rows[1].pass_rate, Some(0.4));
 
-        // min_pass_rate filter
+        // gte operator
         let rows = find(FindQuery {
             pkg: Some(pkg.clone()),
-            min_pass_rate: Some(0.8),
-            sort: Some("pass_rate".into()),
+            where_: Some(where_from(json!({
+                "stats": { "pass_rate": { "gte": 0.8 } },
+            }))),
+            order_by: order_from(json!("-stats.pass_rate")),
             ..Default::default()
         })
         .unwrap();
@@ -1286,13 +1744,212 @@ mod tests {
         // limit
         let rows = find(FindQuery {
             pkg: Some(pkg.clone()),
-            sort: Some("pass_rate".into()),
+            order_by: order_from(json!("-stats.pass_rate")),
             limit: Some(1),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pass_rate, Some(1.0));
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn find_where_implicit_eq_and_logical() {
+        let pkg = unique_pkg();
+        create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-opus-4-6" },
+            "stats": { "equilibrium_position": "dead", "survival_rate": 0.0 }
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_b"),
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-opus-4-6" },
+            "stats": { "equilibrium_position": "niche_leader", "survival_rate": 1.0 }
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_c"),
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-haiku-4-5-20251001" },
+            "stats": { "equilibrium_position": "fragile", "survival_rate": 0.2 }
+        }))
+        .unwrap();
+
+        // implicit eq on sparse stats field
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "stats": { "equilibrium_position": "dead" },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].card_id.ends_with("_a"));
+
+        // _or
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "_or": [
+                    { "stats": { "equilibrium_position": "dead" } },
+                    { "stats": { "survival_rate": { "gte": 0.9 } } },
+                ],
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // _not
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "_not": { "model": { "id": "claude-haiku-4-5-20251001" } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // in operator
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "stats": {
+                    "equilibrium_position": { "in": ["dead", "fragile"] },
+                },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // exists false (sparse field missing on haiku card? all have it, so test on
+        // a field that only some have)
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "strategy_params": { "temperature": { "exists": false } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 3, "none of the cards have strategy_params");
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn find_order_by_multi_key() {
+        let pkg = unique_pkg();
+        create(json!({
+            "card_id": format!("{pkg}_a"),
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.5 }
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_b"),
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.9 }
+        }))
+        .unwrap();
+        create(json!({
+            "card_id": format!("{pkg}_c"),
+            "pkg": { "name": pkg },
+            "stats": { "pass_rate": 0.9 }
+        }))
+        .unwrap();
+
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            order_by: order_from(json!(["-stats.pass_rate", "card_id"])),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].pass_rate, Some(0.9));
+        assert_eq!(rows[1].pass_rate, Some(0.9));
+        assert_eq!(rows[2].pass_rate, Some(0.5));
+        // Tiebreak by card_id ascending
+        assert!(rows[0].card_id < rows[1].card_id);
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn find_offset_and_limit() {
+        let pkg = unique_pkg();
+        for i in 0..5 {
+            create(json!({
+                "card_id": format!("{pkg}_{i}"),
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.1 * (i + 1) as f64 }
+            }))
+            .unwrap();
+        }
+
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            order_by: order_from(json!("-stats.pass_rate")),
+            offset: Some(1),
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Best is 0.5, after offset=1 we start at 0.4 then 0.3.
+        let pr0 = rows[0].pass_rate.unwrap();
+        let pr1 = rows[1].pass_rate.unwrap();
+        assert!((pr0 - 0.4).abs() < 1e-9, "got {pr0}");
+        assert!((pr1 - 0.3).abs() < 1e-9, "got {pr1}");
+
+        cleanup(&pkg);
+    }
+
+    #[test]
+    fn parse_where_rejects_non_object() {
+        assert!(parse_where(&json!("not an object")).is_err());
+        assert!(parse_where(&json!(42)).is_err());
+    }
+
+    #[test]
+    fn parse_order_by_accepts_string_and_array() {
+        let k = parse_order_by(&json!("-stats.pass_rate")).unwrap();
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].path, vec!["stats", "pass_rate"]);
+        assert!(k[0].desc);
+
+        let k = parse_order_by(&json!(["created_at", "-stats.n"])).unwrap();
+        assert_eq!(k.len(), 2);
+        assert!(!k[0].desc);
+        assert!(k[1].desc);
+    }
+
+    #[test]
+    fn where_missing_field_ne_is_true() {
+        let pkg = unique_pkg();
+        create(json!({
+            "card_id": format!("{pkg}_x"),
+            "pkg": { "name": pkg },
+        }))
+        .unwrap();
+
+        let rows = find(FindQuery {
+            pkg: Some(pkg.clone()),
+            where_: Some(where_from(json!({
+                "strategy_params": { "temperature": { "ne": 0.5 } },
+            }))),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 1, "missing field is ne to anything");
 
         cleanup(&pkg);
     }

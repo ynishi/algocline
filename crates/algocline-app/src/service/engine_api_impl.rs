@@ -193,13 +193,12 @@ impl EngineApi for AppService {
     async fn card_find(
         &self,
         pkg: Option<String>,
-        scenario: Option<String>,
-        model: Option<String>,
-        sort: Option<String>,
+        where_: Option<serde_json::Value>,
+        order_by: Option<serde_json::Value>,
         limit: Option<usize>,
-        min_pass_rate: Option<f64>,
+        offset: Option<usize>,
     ) -> Result<String, String> {
-        AppService::card_find(self, pkg, scenario, model, sort, limit, min_pass_rate)
+        AppService::card_find(self, pkg, where_, order_by, limit, offset)
     }
 
     async fn card_alias_list(&self, pkg: Option<String>) -> Result<String, String> {

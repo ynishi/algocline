@@ -869,9 +869,9 @@ fn parse_predicate(value: &Json, prefix: &[String]) -> Result<Predicate, String>
     for (key, val) in obj {
         match key.as_str() {
             "_and" => {
-                let arr = val.as_array().ok_or_else(|| {
-                    "_and must be an array of sub-predicates".to_string()
-                })?;
+                let arr = val
+                    .as_array()
+                    .ok_or_else(|| "_and must be an array of sub-predicates".to_string())?;
                 let mut subs = Vec::with_capacity(arr.len());
                 for sub in arr {
                     subs.push(parse_predicate(sub, prefix)?);
@@ -959,12 +959,10 @@ fn json_cmp(a: &Json, b: &Json) -> Option<std::cmp::Ordering> {
 
 fn json_eq(a: &Json, b: &Json) -> bool {
     match (a, b) {
-        (Json::Number(x), Json::Number(y)) => {
-            match (x.as_f64(), y.as_f64()) {
-                (Some(xf), Some(yf)) => xf == yf,
-                _ => a == b,
-            }
-        }
+        (Json::Number(x), Json::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(xf), Some(yf)) => xf == yf,
+            _ => a == b,
+        },
         _ => a == b,
     }
 }
@@ -1175,14 +1173,78 @@ fn order_cards(a: &CardRow, b: &CardRow, keys: &[OrderKey]) -> std::cmp::Orderin
     Ordering::Equal
 }
 
+/// Summary-only fields that can be sorted without loading full TOML.
+const SUMMARY_SORT_FIELDS: &[&str] = &[
+    "card_id",
+    "created_at",
+    "stats.pass_rate",
+    "scenario.name",
+    "model.id",
+];
+
+/// Return true when the query can be answered with lightweight Summary
+/// rows (no full-TOML load needed).
+fn is_lightweight_query(q: &FindQuery) -> bool {
+    q.where_.is_none()
+        && q.order_by
+            .iter()
+            .all(|k| SUMMARY_SORT_FIELDS.contains(&k.path.join(".").as_str()))
+}
+
+/// Sort Summary rows using order_by keys that map to Summary fields.
+fn order_summaries(a: &Summary, b: &Summary, keys: &[OrderKey]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for k in keys {
+        let key_str = k.path.join(".");
+        let ord = match key_str.as_str() {
+            "card_id" => a.card_id.cmp(&b.card_id),
+            "created_at" => a.created_at.cmp(&b.created_at),
+            "stats.pass_rate" => match (a.pass_rate, b.pass_rate) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            },
+            "scenario.name" => a.scenario.cmp(&b.scenario),
+            "model.id" => a.model.cmp(&b.model),
+            _ => Ordering::Equal,
+        };
+        let ord = if k.desc { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// Filter/sort Cards across the store using the `where` DSL.
 ///
-/// Loads the full TOML for each Card (not just the Summary) so that
-/// arbitrary sparse fields can be evaluated.  With no `where` clause,
-/// behaves like `list` + `order_by` + `limit`/`offset`.
+/// When no `where` clause is specified and `order_by` only references
+/// summary-level fields, uses the lightweight `list()` path to avoid
+/// loading full TOML.  Otherwise loads full TOML per Card.
 pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
-    let root = cards_dir()?;
+    // Fast path: lightweight query, no full-TOML load needed.
+    if is_lightweight_query(&q) {
+        let mut rows = list(q.pkg.as_deref())?;
+        if q.order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.card_id.cmp(&a.card_id))
+            });
+        } else {
+            rows.sort_by(|a, b| order_summaries(a, b, &q.order_by));
+        }
+        let out: Vec<Summary> = rows
+            .into_iter()
+            .skip(q.offset.unwrap_or(0))
+            .take(q.limit.unwrap_or(usize::MAX))
+            .collect();
+        return Ok(out);
+    }
 
+    // Full path: load entire TOML for where evaluation / arbitrary order_by.
+    let root = cards_dir()?;
     let pkg_dirs: Vec<PathBuf> = if let Some(p) = q.pkg.as_deref() {
         validate_name(p, "pkg")?;
         let d = root.join(p);
@@ -1200,34 +1262,17 @@ pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
             .collect()
     };
 
-    // Load full rows, filtering by where.
-    let mut rows: Vec<CardRow> = Vec::new();
-    for pdir in pkg_dirs {
-        let pkg = pdir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let entries = match fs::read_dir(&pdir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("toml") {
-                continue;
-            }
-            let Some(row) = load_full(&p, &pkg) else {
-                continue;
-            };
-            if let Some(pred) = &q.where_ {
-                if !eval_predicate(pred, &row.full) {
-                    continue;
-                }
-            }
-            rows.push(row);
-        }
-    }
+    let all_rows = scan_pkg_dirs(&pkg_dirs)?;
+
+    // Filter by where.
+    let mut rows: Vec<CardRow> = if let Some(pred) = &q.where_ {
+        all_rows
+            .into_iter()
+            .filter(|row| eval_predicate(pred, &row.full))
+            .collect()
+    } else {
+        all_rows
+    };
 
     // Sort.
     if q.order_by.is_empty() {
@@ -1267,8 +1312,9 @@ pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
 // this is fine; if the store grows we can build a prior_card_id index.
 
 /// Walk direction for `lineage`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LineageDirection {
+    #[default]
     Up,
     Down,
     Both,
@@ -1288,7 +1334,7 @@ impl LineageDirection {
 }
 
 /// Query parameters for `lineage`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LineageQuery {
     pub card_id: String,
     pub direction: LineageDirection,
@@ -1379,25 +1425,58 @@ fn relation_passes(filter: &Option<Vec<String>>, relation: &Option<String>) -> b
     }
 }
 
-/// Load all Cards in the store once, keyed by card_id.
-/// Used by both up and down walks so we only touch disk once.
-fn load_card_index() -> Result<std::collections::HashMap<String, CardRow>, String> {
-    let root = cards_dir()?;
-    let mut index = std::collections::HashMap::new();
+/// Full in-memory card index with forward and reverse lineage maps.
+struct CardIndex {
+    /// card_id → CardRow
+    cards: std::collections::HashMap<String, CardRow>,
+    /// parent card_id → Vec<child card_id> (reverse lineage index)
+    children: std::collections::HashMap<String, Vec<String>>,
+}
 
-    let pkg_dirs = fs::read_dir(&root)
+/// Load all Cards in the store once, keyed by card_id.
+/// Also builds a reverse index (parent → children) so that
+/// `walk_down` is O(result_size) instead of O(N_cards × depth).
+fn load_card_index() -> Result<CardIndex, String> {
+    let root = cards_dir()?;
+    let rows = scan_all_cards(&root)?;
+
+    let mut cards = std::collections::HashMap::with_capacity(rows.len());
+    let mut children: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for row in rows {
+        let id = row.summary.card_id.clone();
+        let (prior_id, _) = lineage_fields(&row.full);
+        if let Some(parent) = prior_id {
+            children.entry(parent).or_default().push(id.clone());
+        }
+        cards.insert(id, row);
+    }
+    Ok(CardIndex { cards, children })
+}
+
+/// Scan all Card TOML files from `root`, returning loaded CardRows.
+/// Shared between `find` and `load_card_index`.
+fn scan_all_cards(root: &std::path::Path) -> Result<Vec<CardRow>, String> {
+    let pkg_dirs: Vec<PathBuf> = fs::read_dir(root)
         .map_err(|e| format!("Failed to read cards dir: {e}"))?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_dir());
+        .filter(|p| p.is_dir())
+        .collect();
+    scan_pkg_dirs(&pkg_dirs)
+}
 
+/// Scan a list of pkg directories, loading every Card in them.
+fn scan_pkg_dirs(pkg_dirs: &[PathBuf]) -> Result<Vec<CardRow>, String> {
+    let mut rows = Vec::new();
     for pdir in pkg_dirs {
         let pkg = pdir
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let entries = match fs::read_dir(&pdir) {
+        let entries = match fs::read_dir(pdir) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -1407,16 +1486,16 @@ fn load_card_index() -> Result<std::collections::HashMap<String, CardRow>, Strin
                 continue;
             }
             if let Some(row) = load_full(&p, &pkg) {
-                index.insert(row.summary.card_id.clone(), row);
+                rows.push(row);
             }
         }
     }
-    Ok(index)
+    Ok(rows)
 }
 
 /// Invariant context passed through the lineage walkers.
 struct LineageCtx<'a> {
-    index: &'a std::collections::HashMap<String, CardRow>,
+    index: &'a CardIndex,
     relation_filter: &'a Option<Vec<String>>,
     include_stats: bool,
     max_depth: usize,
@@ -1434,7 +1513,7 @@ struct LineageAccum {
 fn walk_up(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
     let mut cur = start_id.to_string();
     for step in 1..=ctx.max_depth {
-        let Some(row) = ctx.index.get(&cur) else {
+        let Some(row) = ctx.index.cards.get(&cur) else {
             return;
         };
         let (prior_id, prior_rel) = lineage_fields(&row.full);
@@ -1447,7 +1526,7 @@ fn walk_up(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
         if acc.visited.contains(&prior_id) {
             return;
         }
-        let Some(parent) = ctx.index.get(&prior_id) else {
+        let Some(parent) = ctx.index.cards.get(&prior_id) else {
             return;
         };
         acc.nodes
@@ -1461,33 +1540,37 @@ fn walk_up(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
         cur = prior_id;
     }
     // Depth exhausted but another unwalked parent exists → truncated.
-    if let Some(row) = ctx.index.get(&cur) {
+    if let Some(row) = ctx.index.cards.get(&cur) {
         let (prior_id, _) = lineage_fields(&row.full);
         if prior_id
             .as_ref()
-            .is_some_and(|p| ctx.index.contains_key(p) && !acc.visited.contains(p))
+            .is_some_and(|p| ctx.index.cards.contains_key(p) && !acc.visited.contains(p))
         {
             acc.truncated = true;
         }
     }
 }
 
-/// Walk descendants (Cards whose `metadata.prior_card_id` points at
-/// anyone in the current frontier), breadth-first.
+/// Walk descendants using the reverse index (parent → children),
+/// breadth-first.  O(result_size) instead of O(N_cards × depth).
 fn walk_down(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
     let mut frontier: Vec<String> = vec![start_id.to_string()];
 
     for depth in 1..=ctx.max_depth {
         let mut next_frontier: Vec<String> = Vec::new();
         for parent_id in &frontier {
-            for (child_id, child) in ctx.index {
+            let children = match ctx.index.children.get(parent_id) {
+                Some(c) => c,
+                None => continue,
+            };
+            for child_id in children {
                 if acc.visited.contains(child_id) {
                     continue;
                 }
-                let (prior_id, prior_rel) = lineage_fields(&child.full);
-                if prior_id.as_deref() != Some(parent_id.as_str()) {
+                let Some(child) = ctx.index.cards.get(child_id) else {
                     continue;
-                }
+                };
+                let (_, prior_rel) = lineage_fields(&child.full);
                 if !relation_passes(ctx.relation_filter, &prior_rel) {
                     continue;
                 }
@@ -1510,14 +1593,19 @@ fn walk_down(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
     // Frontier still has nodes but depth is exhausted: check for
     // unwalked children at the next level.
     for parent_id in &frontier {
-        for (child_id, child) in ctx.index {
+        let children = match ctx.index.children.get(parent_id) {
+            Some(c) => c,
+            None => continue,
+        };
+        for child_id in children {
             if acc.visited.contains(child_id) {
                 continue;
             }
-            let (prior_id, prior_rel) = lineage_fields(&child.full);
-            if prior_id.as_deref() == Some(parent_id.as_str())
-                && relation_passes(ctx.relation_filter, &prior_rel)
-            {
+            let Some(child) = ctx.index.cards.get(child_id) else {
+                continue;
+            };
+            let (_, prior_rel) = lineage_fields(&child.full);
+            if relation_passes(ctx.relation_filter, &prior_rel) {
                 acc.truncated = true;
                 return;
             }
@@ -1528,7 +1616,7 @@ fn walk_down(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
 /// Walk the lineage tree from `q.card_id`.
 pub fn lineage(q: LineageQuery) -> Result<Option<LineageResult>, String> {
     let index = load_card_index()?;
-    let Some(root_row) = index.get(&q.card_id) else {
+    let Some(root_row) = index.cards.get(&q.card_id) else {
         return Ok(None);
     };
 
@@ -1770,12 +1858,12 @@ pub fn read_samples(card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String>
             matched += 1;
             continue;
         }
-        matched += 1;
         if let Some(lim) = q.limit {
             if out.len() >= lim {
                 break;
             }
         }
+        matched += 1;
         out.push(val);
     }
     Ok(out)

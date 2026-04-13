@@ -904,12 +904,7 @@ impl AlcService {
         Parameters(params): Parameters<CardSamplesParams>,
     ) -> Result<String, String> {
         self.app
-            .card_samples(
-                &params.card_id,
-                params.offset,
-                params.limit,
-                params.r#where,
-            )
+            .card_samples(&params.card_id, params.offset, params.limit, params.r#where)
             .await
     }
 

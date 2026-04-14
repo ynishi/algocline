@@ -744,23 +744,32 @@ fn extract_docstring(path: &std::path::Path) -> String {
 /// Parse `M.meta = { ... }` from an `init.lua` file without Lua VM.
 ///
 /// Extracts (name, version, description, category) from the first
-/// `M.meta = { ... }` block found in the first ~2 KB.
+/// `M.meta = { ... }` block found anywhere in the file.
+///
+/// Supports string concatenation: `description = "foo " .. "bar"` is
+/// collected as `"foo bar"`.
 ///
 /// **Limitation**: Only supports flat key-value pairs inside `M.meta`.
-/// Nested tables (e.g. `tags = { ... }`) will cause the block to be
-/// truncated at the inner `}`. This is intentional — `M.meta` fields
-/// are expected to be simple strings.
+/// Nested tables (e.g. `tags = { ... }`) are skipped via brace-depth
+/// tracking. `M.meta` fields are expected to be simple (possibly
+/// concatenated) string literals.
 fn parse_meta_from_init_lua(path: &std::path::Path) -> Option<(String, String, String, String)> {
     let content = std::fs::read_to_string(path).ok()?;
-    // Limit search to first ~2KB (snap back to a char boundary)
-    let mut limit = 2048.min(content.len());
-    while limit > 0 && !content.is_char_boundary(limit) {
-        limit -= 1;
-    }
-    let head = &content[..limit];
+    let head = content.as_str();
 
-    // Find M.meta = { ... } block (with brace-depth tracking)
-    let meta_start = head.find("M.meta")?;
+    // Find M.meta = { ... } block (with brace-depth tracking).
+    // Skip occurrences inside Lua line comments (`-- ...`) so that
+    // docstrings mentioning "M.meta" do not hijack the search.
+    let mut search_from = 0;
+    let meta_start = loop {
+        let rel = head[search_from..].find("M.meta")?;
+        let pos = search_from + rel;
+        let line_start = head[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if !head[line_start..pos].contains("--") {
+            break pos;
+        }
+        search_from = pos + "M.meta".len();
+    };
     let brace_start = head[meta_start..].find('{')? + meta_start;
 
     // Track brace depth to handle nested tables correctly
@@ -783,28 +792,48 @@ fn parse_meta_from_init_lua(path: &std::path::Path) -> Option<(String, String, S
     let block = &head[brace_start + 1..brace_end];
 
     let extract = |field: &str| -> String {
-        // Match: field = "value" with word-boundary check.
-        // Walk through all occurrences and pick one that is either at
-        // the start of a line (after whitespace) or preceded by a
-        // non-alphanumeric character, preventing "description" from
-        // matching inside "short_description".
+        // Match: field = "value" [.. "value" ...] with word-boundary check.
+        // Walk through all occurrences of `field`, skipping matches inside
+        // longer identifiers (e.g. "short_description"). On the first valid
+        // occurrence, collect one or more `"..."` string literals joined by
+        // `..` concatenation operators.
         let mut search_from = 0;
         while let Some(rel) = block[search_from..].find(field) {
             let pos = search_from + rel;
-            // Check that the character before the match is not alphanumeric/underscore
-            let word_boundary = if pos == 0 {
-                true
-            } else {
+            let word_boundary = pos == 0 || {
                 let prev = block.as_bytes()[pos - 1];
                 !(prev.is_ascii_alphanumeric() || prev == b'_')
             };
             if word_boundary {
                 let after = &block[pos + field.len()..];
-                if let Some(q_start_rel) = after.find('"') {
-                    let q_start = q_start_rel + 1;
-                    if let Some(q_end_rel) = after[q_start..].find('"') {
-                        return after[q_start..q_start + q_end_rel].to_string();
+                let mut collected = String::new();
+                let mut cursor = 0usize;
+                let mut found_any = false;
+                loop {
+                    let rest = &after[cursor..];
+                    let Some(q_start_rel) = rest.find('"') else {
+                        break;
+                    };
+                    if found_any {
+                        // Between the prior closing quote and this opening
+                        // quote, only whitespace and a single `..` operator
+                        // are allowed. Anything else (comma, another field,
+                        // etc.) ends the value.
+                        let between = &rest[..q_start_rel];
+                        if between.trim() != ".." {
+                            break;
+                        }
                     }
+                    let lit_start = cursor + q_start_rel + 1;
+                    let Some(q_end_rel) = after[lit_start..].find('"') else {
+                        break;
+                    };
+                    collected.push_str(&after[lit_start..lit_start + q_end_rel]);
+                    cursor = lit_start + q_end_rel + 1;
+                    found_any = true;
+                }
+                if found_any {
+                    return collected;
                 }
             }
             search_from = pos + field.len();
@@ -1238,6 +1267,124 @@ return M
         assert_eq!(result.2, "After nested");
     }
 
+    /// End-to-end sanity check against a real bundled-packages checkout.
+    /// Set `BUNDLED_PACKAGES_DIR` to the repo root and run with
+    /// `cargo test -- --ignored parse_meta_real_bundled`.
+    #[test]
+    #[ignore]
+    fn parse_meta_real_bundled_packages() {
+        let Ok(root) = std::env::var("BUNDLED_PACKAGES_DIR") else {
+            panic!("set BUNDLED_PACKAGES_DIR=/path/to/algocline-bundled-packages");
+        };
+        let root = std::path::Path::new(&root);
+        let mut total = 0usize;
+        let mut failed_parse: Vec<String> = Vec::new();
+        let mut empty_desc: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap().flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name.starts_with('_') {
+                continue;
+            }
+            let init_lua = entry.path().join("init.lua");
+            if !init_lua.exists() {
+                continue;
+            }
+            total += 1;
+            match parse_meta_from_init_lua(&init_lua) {
+                Some((_n, _v, desc, _c)) => {
+                    if desc.is_empty() {
+                        empty_desc.push(name);
+                    }
+                }
+                None => failed_parse.push(name),
+            }
+        }
+        assert!(total >= 100, "expected ≥100 pkgs, got {total}");
+        assert!(
+            failed_parse.is_empty(),
+            "parse_meta returned None for {} pkgs: {:?}",
+            failed_parse.len(),
+            failed_parse
+        );
+        assert!(
+            empty_desc.is_empty(),
+            "empty description for {} pkgs: {:?}",
+            empty_desc.len(),
+            empty_desc
+        );
+    }
+
+    #[test]
+    fn parse_meta_concat_string_literals() {
+        // description = "foo " .. "bar " .. "baz" should produce "foo bar baz"
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        std::fs::write(
+            &path,
+            r#"
+local M = {}
+M.meta = {
+    name = "concat_pkg",
+    version = "0.1.0",
+    description = "Adaptive Branching MCTS — Thompson Sampling with dynamic "
+        .. "wider/deeper decisions. GEN node mechanism for principled branching. "
+        .. "Consistently outperforms standard MCTS and repeated sampling.",
+    category = "reasoning",
+}
+return M
+"#,
+        )
+        .unwrap();
+
+        let result = parse_meta_from_init_lua(&path).unwrap();
+        assert_eq!(result.0, "concat_pkg");
+        assert_eq!(result.1, "0.1.0");
+        assert_eq!(
+            result.2,
+            "Adaptive Branching MCTS — Thompson Sampling with dynamic \
+             wider/deeper decisions. GEN node mechanism for principled branching. \
+             Consistently outperforms standard MCTS and repeated sampling."
+        );
+        assert_eq!(result.3, "reasoning");
+    }
+
+    #[test]
+    fn parse_meta_large_leading_docstring() {
+        // M.meta located beyond 2KB (long leading --- docstring) must still parse.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("init.lua");
+        let mut content = String::new();
+        // Generate ~4KB of leading comments
+        for i in 0..120 {
+            content.push_str(&format!(
+                "--- line {i}: this is a long documentation comment to push M.meta beyond the old 2KB scan window\n"
+            ));
+        }
+        content.push_str(
+            r#"
+local M = {}
+M.meta = {
+    name = "late_meta_pkg",
+    version = "0.2.0",
+    description = "Located past 2KB",
+    category = "test",
+}
+return M
+"#,
+        );
+        std::fs::write(&path, &content).unwrap();
+        assert!(content.len() > 2048, "fixture should exceed 2KB");
+
+        let result = parse_meta_from_init_lua(&path).unwrap();
+        assert_eq!(result.0, "late_meta_pkg");
+        assert_eq!(result.1, "0.2.0");
+        assert_eq!(result.2, "Located past 2KB");
+        assert_eq!(result.3, "test");
+    }
+
     #[test]
     fn parse_meta_word_boundary() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1304,7 +1451,10 @@ return M
 
         let doc = extract_docstring(&path);
         assert!(doc.contains("FrugalGPT"), "should contain paper ref");
-        assert!(doc.contains("Thompson Sampling"), "should contain technique");
+        assert!(
+            doc.contains("Thompson Sampling"),
+            "should contain technique"
+        );
         assert!(!doc.contains("local M"), "should not contain code");
     }
 

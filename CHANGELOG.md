@@ -7,9 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-04-16
+
 ### Added
 
 - `alc_pkg_list`: entries now include `resolved_source_path` (canonical absolute dir), `resolved_source_kind` (installed/linked/local_path/bundled), and `override_paths` (shadowed same-name pkg paths) for LLM agent source access.
+
+### Fixed
+
+- `alc_pkg_list`: project `installed` / `git` / `bundled` entries no longer list their own backing directory (`packages_dir()/{name}`) as a `override_paths` self-shadow. Only genuinely distinct same-name packages (e.g. a project `path` vendor dir overriding a global install) now appear in `override_paths`.
+
+### Changed
+
+- `alc_pkg_list` (internal): meta merge ordering tightened so every host-authoritative field (`error`, `linked`, `link_target`, `broken`, …) is uniformly protected from Lua `meta.*` clobbering. Output JSON shape is unchanged for conforming packages; packages whose `meta` illicitly shadowed these names now correctly return the host value.
+- `alc_pkg_list` (internal): `resolved_source_kind` is now a typed enum internally (`Installed`/`Linked`/`LocalPath`/`Bundled`); wire format is identical (snake_case strings).
 
 ## [0.20.0] - 2026-04-13
 

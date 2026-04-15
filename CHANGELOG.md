@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `alc_pkg_list`: entries now include `resolved_source_path` (canonical absolute dir), `resolved_source_kind` (installed/linked/local_path/bundled), and `override_paths` (shadowed same-name pkg paths) for LLM agent source access.
+
 ## [0.20.0] - 2026-04-13
 
 ### Added — `alc_card_samples` / `alc.card.read_samples` gains `where`

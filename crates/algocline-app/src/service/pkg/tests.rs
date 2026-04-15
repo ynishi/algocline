@@ -169,6 +169,529 @@ async fn pkg_remove_project_scope_not_found_returns_error() {
     assert!(result.unwrap_err().contains("not found in alc.lock"));
 }
 
+// ── resolved_source_path / resolved_source_kind / override_paths tests ────
+
+/// Case 1: project `path` entry — `resolved_source_path` is the canonicalized
+/// absolute path of the package directory; `resolved_source_kind = "local_path"`.
+#[tokio::test]
+async fn pkg_list_project_path_entry_has_resolved_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    // Create a vendor package directory inside the project.
+    let pkg_dir = project_root.join("my_vendor_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    // alc.toml with path dependency.
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nmy_vendor_pkg = { path = \"my_vendor_pkg\" }\n",
+    )
+    .unwrap();
+
+    // alc.lock with Path source.
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "my_vendor_pkg".to_string(),
+            version: None,
+            source: PackageSource::Path {
+                path: "my_vendor_pkg".to_string(),
+            },
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "my_vendor_pkg")
+        .expect("my_vendor_pkg not found");
+
+    let expected_canonical = std::fs::canonicalize(&pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should be canonicalized path"
+    );
+    assert_eq!(pkg["resolved_source_kind"], "local_path");
+}
+
+/// Case 2: project `path` entry where the vendor directory is itself a symlink —
+/// `resolved_source_path` follows the symlink to the real target.
+#[tokio::test]
+async fn pkg_list_project_path_with_symlink_vendor_follows_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    // Create a real package directory somewhere else.
+    let real_pkg = tmp.path().join("real_pkg_dir");
+    std::fs::create_dir_all(&real_pkg).unwrap();
+    std::fs::write(real_pkg.join("init.lua"), "return {}").unwrap();
+
+    // Create a symlink inside the project pointing to the real dir.
+    let symlink_in_project = project_root.join("sym_vendor_pkg");
+    std::os::unix::fs::symlink(&real_pkg, &symlink_in_project).unwrap();
+
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nsym_vendor_pkg = { path = \"sym_vendor_pkg\" }\n",
+    )
+    .unwrap();
+
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "sym_vendor_pkg".to_string(),
+            version: None,
+            source: PackageSource::Path {
+                path: "sym_vendor_pkg".to_string(),
+            },
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "sym_vendor_pkg")
+        .expect("sym_vendor_pkg not found");
+
+    // canonicalize follows the symlink to real_pkg.
+    let expected_canonical = std::fs::canonicalize(&real_pkg)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should resolve through symlink to real target"
+    );
+    assert_eq!(pkg["resolved_source_kind"], "local_path");
+}
+
+/// Case 3: project `installed` entry — `resolved_source_path` is
+/// `{packages_dir()}/{name}` canonicalized; `resolved_source_kind = "installed"`.
+#[tokio::test]
+async fn pkg_list_project_installed_entry_has_resolved_source() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+    let packages_dir = fake_home.home.join(".algocline").join("packages");
+    let pkg_dir = packages_dir.join("installed_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\ninstalled_pkg = \"*\"\n",
+    )
+    .unwrap();
+
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "installed_pkg".to_string(),
+            version: None,
+            source: PackageSource::Installed,
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    drop(fake_home);
+
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "installed_pkg")
+        .expect("installed_pkg not found");
+
+    let expected_canonical = std::fs::canonicalize(&pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should be packages_dir/{name} canonicalized"
+    );
+    assert_eq!(pkg["resolved_source_kind"], "installed");
+}
+
+/// Case 4 (light): project `installed` entry where `packages_dir/{name}` is itself
+/// a symlink (linked package). The resolved path follows through to the real target.
+#[tokio::test]
+async fn pkg_list_project_installed_resolves_through_linked_pkg() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+    let packages_dir = fake_home.home.join(".algocline").join("packages");
+    std::fs::create_dir_all(&packages_dir).unwrap();
+
+    // The "real" development directory (what the symlink points to).
+    let real_dev_dir = fake_home.home.join("dev").join("linked_pkg_real");
+    std::fs::create_dir_all(&real_dev_dir).unwrap();
+    std::fs::write(real_dev_dir.join("init.lua"), "return {}").unwrap();
+
+    // Symlink in packages_dir pointing to the dev dir.
+    let symlink_path = packages_dir.join("linked_pkg");
+    std::os::unix::fs::symlink(&real_dev_dir, &symlink_path).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nlinked_pkg = \"*\"\n",
+    )
+    .unwrap();
+
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "linked_pkg".to_string(),
+            version: None,
+            source: PackageSource::Installed,
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    drop(fake_home);
+
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "linked_pkg")
+        .expect("linked_pkg not found");
+
+    // canonicalize follows the symlink to the real dev dir.
+    let expected_canonical = std::fs::canonicalize(&real_dev_dir)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should follow symlink in packages_dir to real target"
+    );
+    assert_eq!(pkg["resolved_source_kind"], "installed");
+}
+
+/// Case 5: global regular (non-symlink) package —
+/// `resolved_source_path = canonicalize({search_path}/{name})`,
+/// `resolved_source_kind = "installed"` (no manifest entry → "installed").
+#[tokio::test]
+async fn pkg_list_global_regular_pkg_has_resolved_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("pkgs");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    let pkg_dir = search_dir.join("regular_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    let search_path = crate::service::resolve::SearchPath {
+        path: search_dir.clone(),
+        source: crate::service::resolve::SearchPathSource::Env,
+    };
+    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+    let result = svc.pkg_list(None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "regular_pkg")
+        .expect("regular_pkg not found");
+
+    let expected_canonical = std::fs::canonicalize(&pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical
+    );
+    assert_eq!(pkg["resolved_source_kind"], "installed");
+}
+
+/// Case 6: global linked (symlink) package —
+/// `resolved_source_path` is the canonicalized symlink target;
+/// `resolved_source_kind = "linked"`.
+#[tokio::test]
+async fn pkg_list_global_linked_pkg_resolves_to_link_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("pkgs");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    // Real package directory (dev workspace).
+    let real_dir = tmp.path().join("my_dev_pkg");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::write(real_dir.join("init.lua"), "return {}").unwrap();
+
+    // Symlink in the search_dir pointing to real_dir.
+    let link_path = search_dir.join("linked_global_pkg");
+    std::os::unix::fs::symlink(&real_dir, &link_path).unwrap();
+
+    let search_path = crate::service::resolve::SearchPath {
+        path: search_dir,
+        source: crate::service::resolve::SearchPathSource::Env,
+    };
+    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+    let result = svc.pkg_list(None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "linked_global_pkg")
+        .expect("linked_global_pkg not found");
+
+    let expected_canonical = std::fs::canonicalize(&real_dir)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should point to real target"
+    );
+    assert_eq!(pkg["resolved_source_kind"], "linked");
+    assert_eq!(pkg["linked"], true);
+}
+
+/// Case 7: global linked package with a dangling (broken) symlink —
+/// `resolved_source_path` must be absent; `resolved_source_kind = "linked"`;
+/// `broken = true`.
+#[tokio::test]
+async fn pkg_list_global_linked_broken_omits_resolved_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("pkgs");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    // Create a symlink pointing to a nonexistent path.
+    let nonexistent_target = tmp.path().join("this_does_not_exist");
+    let link_path = search_dir.join("broken_pkg");
+    std::os::unix::fs::symlink(&nonexistent_target, &link_path).unwrap();
+
+    let search_path = crate::service::resolve::SearchPath {
+        path: search_dir,
+        source: crate::service::resolve::SearchPathSource::Env,
+    };
+    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+    let result = svc.pkg_list(None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let pkg = packages
+        .iter()
+        .find(|p| p["name"] == "broken_pkg")
+        .expect("broken_pkg not found");
+
+    assert!(
+        pkg.get("resolved_source_path").is_none() || pkg["resolved_source_path"].is_null(),
+        "resolved_source_path must be absent for broken symlink"
+    );
+    assert_eq!(pkg["resolved_source_kind"], "linked");
+    assert_eq!(pkg["broken"], true);
+}
+
+/// Case 8: two global search paths contain a package with the same name —
+/// `override_paths` on the active entry lists the shadowed path(s) in
+/// search-path order.
+#[tokio::test]
+async fn pkg_list_override_paths_global_shadow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir1 = tmp.path().join("pkgs1");
+    let search_dir2 = tmp.path().join("pkgs2");
+    std::fs::create_dir_all(&search_dir1).unwrap();
+    std::fs::create_dir_all(&search_dir2).unwrap();
+
+    // Same package name in both search paths.
+    for dir in [&search_dir1, &search_dir2] {
+        let pkg_dir = dir.join("dup_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+    }
+
+    let svc = make_app_service_with_search_paths(vec![
+        crate::service::resolve::SearchPath {
+            path: search_dir1.clone(),
+            source: crate::service::resolve::SearchPathSource::Env,
+        },
+        crate::service::resolve::SearchPath {
+            path: search_dir2.clone(),
+            source: crate::service::resolve::SearchPathSource::Env,
+        },
+    ])
+    .await;
+
+    let result = svc.pkg_list(None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    // Active entry is the one from search_dir1 (first wins).
+    let active_pkg = packages
+        .iter()
+        .find(|p| p["name"] == "dup_pkg" && p["active"] == true)
+        .expect("active dup_pkg not found");
+
+    let override_paths = active_pkg["override_paths"]
+        .as_array()
+        .expect("override_paths should be an array on active entry");
+
+    assert_eq!(
+        override_paths.len(),
+        1,
+        "should have exactly one shadowed entry"
+    );
+
+    let expected_shadow = std::fs::canonicalize(search_dir2.join("dup_pkg"))
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert_eq!(
+        override_paths[0].as_str().unwrap(),
+        expected_shadow,
+        "override_paths[0] should be the canonicalized path in search_dir2"
+    );
+}
+
+/// Case 9: project entry shadows a global entry —
+/// the project entry's `override_paths` contains the global package path;
+/// the inactive global entry has no `override_paths`.
+#[tokio::test]
+async fn pkg_list_override_paths_project_shadows_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+    let search_dir = tmp.path().join("global_pkgs");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    // Global package directory.
+    let global_pkg_dir = search_dir.join("shared_pkg");
+    std::fs::create_dir_all(&global_pkg_dir).unwrap();
+    std::fs::write(global_pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    // Project vendor package directory.
+    let local_pkg_dir = project_root.join("shared_pkg");
+    std::fs::create_dir_all(&local_pkg_dir).unwrap();
+    std::fs::write(local_pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nshared_pkg = { path = \"shared_pkg\" }\n",
+    )
+    .unwrap();
+
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "shared_pkg".to_string(),
+            version: None,
+            source: PackageSource::Path {
+                path: "shared_pkg".to_string(),
+            },
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    let svc = make_app_service_with_search_paths(vec![crate::service::resolve::SearchPath {
+        path: search_dir.clone(),
+        source: crate::service::resolve::SearchPathSource::Env,
+    }])
+    .await;
+
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    // Project entry (active, scope = "project") must have override_paths with the global path.
+    let project_entry = packages
+        .iter()
+        .find(|p| p["name"] == "shared_pkg" && p["scope"] == "project")
+        .expect("project shared_pkg not found");
+
+    let override_paths = project_entry["override_paths"]
+        .as_array()
+        .expect("project entry should have override_paths listing shadowed global");
+
+    let expected_global_canonical = std::fs::canonicalize(&global_pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
+
+    assert!(
+        override_paths
+            .iter()
+            .any(|p| p.as_str().unwrap() == expected_global_canonical),
+        "project override_paths should include the global pkg canonical path"
+    );
+
+    // Inactive global entry must NOT have override_paths.
+    let global_entry = packages
+        .iter()
+        .find(|p| p["name"] == "shared_pkg" && p["scope"] == "global")
+        .expect("global shared_pkg not found");
+
+    assert_eq!(
+        global_entry["active"], false,
+        "global entry should be inactive"
+    );
+    let global_map = global_entry
+        .as_object()
+        .expect("global entry must be object");
+    assert!(
+        !global_map.contains_key("override_paths"),
+        "inactive global entry must not have override_paths, got: {:?}",
+        global_map.get("override_paths")
+    );
+}
+
 /// A global package that exists on disk but is NOT registered in
 /// `installed.json` must NOT emit a `source_type` field.
 ///

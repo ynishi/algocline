@@ -621,6 +621,9 @@ impl AlcService {
     /// When `project_root` is provided, project-local packages from `alc.lock`
     /// are included alongside global packages. Each package entry includes
     /// `scope` ("project" or "global") and `active` (effective vs shadowed).
+    /// Each entry also includes `resolved_source_path` (canonical absolute directory),
+    /// `resolved_source_kind` (installed / linked / local_path / bundled; future values may appear),
+    /// and `override_paths` (shadowed same-name packages).
     #[tool(
         name = "alc_pkg_list",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -1061,6 +1064,10 @@ impl ServerHandler for AlcService {
                  - alc_init: Initialize alc.toml in the project root.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\
                  - alc_migrate: Migrate legacy alc.lock to alc.toml + new alc.lock format.\n\n\
+                 Accessing a pkg's Lua source:\n\
+                 1. If `resolved_source_path` is set AND your client can access the local filesystem, read files under that absolute directory path directly (e.g., via the Read tool or a filesystem MCP server).\n\
+                 2. If `resolved_source_path` is absent OR your client cannot reach the local filesystem, and `remote_download_url` is set (future extension), fetch via that URL.\n\
+                 3. `resolved_source_kind` indicates the origin of the path (installed / linked / local_path / bundled; future values may appear — treat unknown kinds as \"unknown, attempt filesystem access\").\n\n\
                  Logging:\n\
                  - alc_note: Add a note to a completed session's log (feedback, observations).\n\
                  - alc_log_view: View session logs. Omit session_id for summary list, provide it for full detail.\n\n\

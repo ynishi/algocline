@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `alc init`: bundled `algocline-bundled-packages` tag bumped `v0.11.2` → `v0.12.0` (adds 12 Swarm foundation packages: `shapley`, `mwu`, `kemeny`, `scoring_rule`, F1-F5, N1-N5; plus recategorisation of 10 existing packages). `evalframe` stays at `v0.3.0`. Runtime behaviour unchanged — only the default set fetched by `alc init`.
+
 ## [0.20.1] - 2026-04-16
 
 ### Added

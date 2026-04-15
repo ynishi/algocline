@@ -19,6 +19,34 @@ enum Scope {
     Global,
 }
 
+/// Origin of a package's `resolved_source_path`.
+///
+/// Stringified form is part of the MCP wire contract (`resolved_source_kind`
+/// field of `alc_pkg_list` entries). Adding a new variant is a backward-
+/// compatible extension; renaming an existing one is a breaking change.
+#[derive(Debug, Clone, Copy)]
+enum ResolvedSourceKind {
+    /// Package materialised under `packages_dir()` via git clone / copy.
+    Installed,
+    /// Symlink under `packages_dir()` or a search path (dev workflow).
+    Linked,
+    /// Project vendor directory referenced by `path = "..."` in alc.toml.
+    LocalPath,
+    /// Package shipped with algocline via `BUNDLED_SOURCES`.
+    Bundled,
+}
+
+impl ResolvedSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResolvedSourceKind::Installed => "installed",
+            ResolvedSourceKind::Linked => "linked",
+            ResolvedSourceKind::LocalPath => "local_path",
+            ResolvedSourceKind::Bundled => "bundled",
+        }
+    }
+}
+
 /// Typed intermediate representation of a single package list entry.
 /// Converted to `serde_json::Value` only at the final serialisation step.
 /// Fields that are `None` are omitted from the output JSON.
@@ -51,9 +79,9 @@ struct PackageListEntry {
     /// Canonical absolute path of the Lua source directory for this package.
     /// Absent for broken entries or when canonicalization fails.
     resolved_source_path: Option<String>,
-    /// Origin of `resolved_source_path`: one of `"installed"`, `"linked"`,
-    /// `"local_path"`, or `"bundled"`. Future values may appear.
-    resolved_source_kind: Option<String>,
+    /// Origin of `resolved_source_path`. Serialised as the variant string
+    /// (`"installed"` / `"linked"` / `"local_path"` / `"bundled"`).
+    resolved_source_kind: Option<ResolvedSourceKind>,
     /// Canonical absolute paths of same-name packages that are shadowed by
     /// this (active) entry. Only present when overrides exist.
     override_paths: Option<Vec<String>>,
@@ -111,25 +139,20 @@ impl PackageListEntry {
         if let Some(rsk) = self.resolved_source_kind {
             map.insert(
                 "resolved_source_kind".to_string(),
-                serde_json::Value::String(rsk),
+                serde_json::Value::String(rsk.as_str().to_string()),
             );
         }
         if let Some(op) = self.override_paths {
             map.insert("override_paths".to_string(), serde_json::json!(op));
         }
 
-        // Merge meta fields (Lua pkg.meta) into the top-level object.
-        if let serde_json::Value::Object(meta_map) = self.meta {
-            for (k, v) in meta_map {
-                // Never let meta overwrite the fields we have already set.
-                map.entry(k).or_insert(v);
-            }
-        }
-
+        // All host-authoritative fields must be inserted BEFORE the meta
+        // merge so `map.entry().or_insert` skips them — otherwise Lua meta
+        // can masquerade as host-authoritative state (e.g. meta.linked
+        // silently overriding the real symlink status).
         if let Some(err) = self.error {
             map.insert("error".to_string(), serde_json::Value::String(err));
         }
-
         if let Some(linked) = self.linked {
             map.insert("linked".to_string(), serde_json::Value::Bool(linked));
         }
@@ -138,6 +161,14 @@ impl PackageListEntry {
         }
         if let Some(broken) = self.broken {
             map.insert("broken".to_string(), serde_json::Value::Bool(broken));
+        }
+
+        // Merge meta fields (Lua pkg.meta) into the top-level object.
+        if let serde_json::Value::Object(meta_map) = self.meta {
+            for (k, v) in meta_map {
+                // Never let meta overwrite the fields we have already set.
+                map.entry(k).or_insert(v);
+            }
         }
 
         serde_json::Value::Object(map)
@@ -192,32 +223,36 @@ impl AppService {
                         project_names.insert(name.clone());
 
                         // Resolve canonical source path depending on source_type.
-                        let (rsp, rsk, resolve_err) = match source_type.as_deref() {
+                        // `path` → vendor dir from alc.toml; everything else
+                        // (`installed` / `git` / `bundled`) resolves under
+                        // `packages_dir()/{name}` and differs only in `kind`.
+                        let (rsp, rsk, resolve_err): (
+                            Option<String>,
+                            Option<ResolvedSourceKind>,
+                            Option<String>,
+                        ) = match source_type.as_deref() {
                             Some("path") => {
-                                // abs_path is already absolutized; canonicalize it.
                                 let rsp = abs_path
                                     .as_ref()
                                     .and_then(|p| resolve_source_path(std::path::Path::new(p)));
-                                (rsp, Some("local_path".to_string()), None)
+                                (rsp, Some(ResolvedSourceKind::LocalPath), None)
                             }
-                            Some("bundled") => {
-                                let (rsp, err) = match packages_dir() {
-                                    Ok(dir) => (resolve_source_path(&dir.join(name)), None),
-                                    Err(e) => {
-                                        (None, Some(format!("cannot resolve packages_dir: {e}")))
-                                    }
+                            Some(st) => {
+                                let kind = if st == "bundled" {
+                                    ResolvedSourceKind::Bundled
+                                } else {
+                                    ResolvedSourceKind::Installed
                                 };
-                                (rsp, Some("bundled".to_string()), err)
-                            }
-                            Some(_) => {
-                                // "installed" or "git" → packages_dir/{name}
-                                let (rsp, err) = match packages_dir() {
-                                    Ok(dir) => (resolve_source_path(&dir.join(name)), None),
-                                    Err(e) => {
-                                        (None, Some(format!("cannot resolve packages_dir: {e}")))
+                                match packages_dir() {
+                                    Ok(dir) => {
+                                        (resolve_source_path(&dir.join(name)), Some(kind), None)
                                     }
-                                };
-                                (rsp, Some("installed".to_string()), err)
+                                    Err(e) => (
+                                        None,
+                                        Some(kind),
+                                        Some(format!("cannot resolve packages_dir: {e}")),
+                                    ),
+                                }
                             }
                             None => (None, None, None),
                         };
@@ -280,8 +315,15 @@ impl AppService {
                 };
 
                 // broken = symlink exists but target does not.
+                //
+                // `try_exists()` distinguishes Err (IO / permission failure)
+                // from Ok(false) (confirmed non-existent). On Err we cannot
+                // prove the target is intact, so we conservatively report
+                // `broken: true` — the user cannot use the target either
+                // way, so the signal is more useful than silently hiding
+                // the symlink. `path.exists()` collapsed these cases.
                 let broken = if is_symlink {
-                    Some(!path.exists())
+                    Some(!path.try_exists().unwrap_or(false))
                 } else {
                     None
                 };
@@ -358,9 +400,11 @@ return pkg.meta or {{ name = "{name}" }}"#
                     };
 
                 // Resolve canonical source path for this global entry.
-                let (resolved_source_path, resolved_source_kind) = if is_symlink {
-                    // linked package
-                    let kind = Some("linked".to_string());
+                let (resolved_source_path, resolved_source_kind): (
+                    Option<String>,
+                    Option<ResolvedSourceKind>,
+                ) = if is_symlink {
+                    let kind = Some(ResolvedSourceKind::Linked);
                     if broken == Some(true) {
                         // dangling symlink — omit path, keep kind
                         (None, kind)
@@ -381,10 +425,10 @@ return pkg.meta or {{ name = "{name}" }}"#
                     let candidate = sp.path.join(&name);
                     let rsp = resolve_source_path(&candidate);
                     let kind = match source_type.as_deref() {
-                        Some(st) if st.starts_with("bundled") => Some("bundled".to_string()),
-                        _ => Some("installed".to_string()),
+                        Some("bundled") => ResolvedSourceKind::Bundled,
+                        _ => ResolvedSourceKind::Installed,
                     };
-                    (rsp, kind)
+                    (rsp, Some(kind))
                 };
 
                 entries.push(PackageListEntry {
@@ -544,7 +588,7 @@ fn make_project_entry(
     source_type: Option<String>,
     abs_path: Option<String>,
     resolved_source_path: Option<String>,
-    resolved_source_kind: Option<String>,
+    resolved_source_kind: Option<ResolvedSourceKind>,
     error: Option<String>,
 ) -> PackageListEntry {
     PackageListEntry {
@@ -593,7 +637,7 @@ fn collect_path_entries_from_lock(
                 Some("path".to_string()),
                 Some(abs.display().to_string()),
                 rsp,
-                Some("local_path".to_string()),
+                Some(ResolvedSourceKind::LocalPath),
                 None,
             ));
         }

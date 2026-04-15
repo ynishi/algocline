@@ -804,4 +804,21 @@ async fn pkg_list_global_unregistered_has_no_source_type() {
     );
     assert_eq!(pkg["scope"], "global");
     assert_eq!(pkg["active"], true);
+
+    // resolved_source_path must still be populated even without manifest
+    // registration — filesystem access is independent of installed.json.
+    let expected_canonical = std::fs::canonicalize(&pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
+    assert_eq!(
+        pkg["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should be populated regardless of manifest state"
+    );
+    // Unregistered packages default to "installed" kind (not "bundled").
+    assert_eq!(
+        pkg["resolved_source_kind"], "installed",
+        "unregistered global package should default to installed kind"
+    );
 }

@@ -7,7 +7,7 @@ use super::super::alc_toml::{self, load_alc_toml};
 use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
 use super::super::project::resolve_project_root;
-use super::super::resolve::is_system_package;
+use super::super::resolve::{is_system_package, packages_dir};
 use super::super::source::{infer_from_legacy_source_string, PackageSource};
 use super::super::AppService;
 
@@ -48,6 +48,15 @@ struct PackageListEntry {
     link_target: Option<String>,
     /// `Some(true)` when the symlink target does not exist (dangling symlink).
     broken: Option<bool>,
+    /// Canonical absolute path of the Lua source directory for this package.
+    /// Absent for broken entries or when canonicalization fails.
+    resolved_source_path: Option<String>,
+    /// Origin of `resolved_source_path`: one of `"installed"`, `"linked"`,
+    /// `"local_path"`, or `"bundled"`. Future values may appear.
+    resolved_source_kind: Option<String>,
+    /// Canonical absolute paths of same-name packages that are shadowed by
+    /// this (active) entry. Only present when overrides exist.
+    override_paths: Option<Vec<String>>,
 }
 
 impl PackageListEntry {
@@ -92,6 +101,21 @@ impl PackageListEntry {
         }
         if let Some(ov) = self.overrides {
             map.insert("overrides".to_string(), serde_json::json!(ov));
+        }
+        if let Some(rsp) = self.resolved_source_path {
+            map.insert(
+                "resolved_source_path".to_string(),
+                serde_json::Value::String(rsp),
+            );
+        }
+        if let Some(rsk) = self.resolved_source_kind {
+            map.insert(
+                "resolved_source_kind".to_string(),
+                serde_json::Value::String(rsk),
+            );
+        }
+        if let Some(op) = self.override_paths {
+            map.insert("override_paths".to_string(), serde_json::json!(op));
         }
 
         // Merge meta fields (Lua pkg.meta) into the top-level object.
@@ -166,11 +190,47 @@ impl AppService {
                         let (version, source_type, abs_path) =
                             resolve_project_pkg_info(name, dep, &lock_map, root);
                         project_names.insert(name.clone());
+
+                        // Resolve canonical source path depending on source_type.
+                        let (rsp, rsk) = match source_type.as_deref() {
+                            Some("path") => {
+                                // abs_path is already absolutized; canonicalize it.
+                                let rsp = abs_path
+                                    .as_ref()
+                                    .and_then(|p| resolve_source_path(std::path::Path::new(p)));
+                                (rsp, Some("local_path".to_string()))
+                            }
+                            Some("bundled") => {
+                                let rsp = match packages_dir() {
+                                    Ok(dir) => resolve_source_path(&dir.join(name)),
+                                    Err(e) => {
+                                        tracing::warn!(package = %name, error = %e, "cannot resolve packages_dir for bundled entry");
+                                        None
+                                    }
+                                };
+                                (rsp, Some("bundled".to_string()))
+                            }
+                            Some(_) => {
+                                // "installed" or "git" → packages_dir/{name}
+                                let rsp = match packages_dir() {
+                                    Ok(dir) => resolve_source_path(&dir.join(name)),
+                                    Err(e) => {
+                                        tracing::warn!(package = %name, error = %e, "cannot resolve packages_dir for installed entry");
+                                        None
+                                    }
+                                };
+                                (rsp, Some("installed".to_string()))
+                            }
+                            None => (None, None),
+                        };
+
                         entries.push(make_project_entry(
                             name.clone(),
                             version,
                             source_type,
                             abs_path,
+                            rsp,
+                            rsk,
                         ));
                     }
                 }
@@ -298,6 +358,36 @@ return pkg.meta or {{ name = "{name}" }}"#
                         (None, None, None, None)
                     };
 
+                // Resolve canonical source path for this global entry.
+                let (resolved_source_path, resolved_source_kind) = if is_symlink {
+                    // linked package
+                    let kind = Some("linked".to_string());
+                    if broken == Some(true) {
+                        // dangling symlink — omit path, keep kind
+                        (None, kind)
+                    } else {
+                        // resolve symlink target; make absolute if relative
+                        let candidate = path.read_link().ok().map(|target| {
+                            if target.is_absolute() {
+                                target
+                            } else {
+                                sp.path.join(target)
+                            }
+                        });
+                        let rsp = candidate.as_deref().and_then(resolve_source_path);
+                        (rsp, kind)
+                    }
+                } else {
+                    // normal (non-symlink) entry
+                    let candidate = sp.path.join(&name);
+                    let rsp = resolve_source_path(&candidate);
+                    let kind = match source_type.as_deref() {
+                        Some(st) if st.starts_with("bundled") => Some("bundled".to_string()),
+                        _ => Some("installed".to_string()),
+                    };
+                    (rsp, kind)
+                };
+
                 entries.push(PackageListEntry {
                     name,
                     scope: Scope::Global,
@@ -315,13 +405,18 @@ return pkg.meta or {{ name = "{name}" }}"#
                     linked: if is_symlink { Some(true) } else { None },
                     link_target,
                     broken,
+                    resolved_source_path,
+                    resolved_source_kind,
+                    override_paths: None,
                 });
             }
         }
 
         // ── Overrides pass (global packages only) ─────────────────────────
         // For each active global whose name appears in more than one search path,
-        // record the lower-priority search-path paths as `overrides`.
+        // record the lower-priority search-path paths as `overrides` (existing
+        // behaviour) and the canonicalized pkg directories as `override_paths`
+        // (new, §3.2-a).
         for entry in entries[global_start_idx..].iter_mut() {
             if !entry.active {
                 continue;
@@ -330,6 +425,37 @@ return pkg.meta or {{ name = "{name}" }}"#
                 if occurrences.len() > 1 {
                     entry.overrides =
                         Some(occurrences.iter().skip(1).map(|(_, s)| s.clone()).collect());
+
+                    // §3.2-a: canonicalized pkg directories for shadowed global entries.
+                    let override_ps: Vec<String> = occurrences
+                        .iter()
+                        .skip(1)
+                        .filter_map(|(idx, _)| {
+                            let candidate = self.search_paths[*idx].path.join(&entry.name);
+                            resolve_source_path(&candidate)
+                        })
+                        .collect();
+                    if !override_ps.is_empty() {
+                        entry.override_paths = Some(override_ps);
+                    }
+                }
+            }
+        }
+
+        // ── Project-shadows-global pass (§3.2-b) ──────────────────────────
+        // For each active project entry whose name also appears in global seen map,
+        // expose all global occurrences as override_paths on the project entry.
+        for entry in entries[..global_start_idx].iter_mut() {
+            if let Some(occurrences) = seen.get(&entry.name) {
+                let ps: Vec<String> = occurrences
+                    .iter()
+                    .filter_map(|(idx, _)| {
+                        let candidate = self.search_paths[*idx].path.join(&entry.name);
+                        resolve_source_path(&candidate)
+                    })
+                    .collect();
+                if !ps.is_empty() {
+                    entry.override_paths = Some(ps);
                 }
             }
         }
@@ -410,6 +536,8 @@ fn make_project_entry(
     version: Option<String>,
     source_type: Option<String>,
     abs_path: Option<String>,
+    resolved_source_path: Option<String>,
+    resolved_source_kind: Option<String>,
 ) -> PackageListEntry {
     PackageListEntry {
         name,
@@ -428,6 +556,9 @@ fn make_project_entry(
         linked: None,
         link_target: None,
         broken: None,
+        resolved_source_path,
+        resolved_source_kind,
+        override_paths: None,
     }
 }
 
@@ -447,14 +578,29 @@ fn collect_path_entries_from_lock(
                 root.join(p)
             };
             project_names.insert(name.clone());
+            let rsp = resolve_source_path(&abs);
             entries.push(make_project_entry(
                 name.clone(),
                 version.clone(),
                 Some("path".to_string()),
                 Some(abs.display().to_string()),
+                rsp,
+                Some("local_path".to_string()),
             ));
         }
     }
+}
+
+// ─── Path resolution ─────────────────────────────────────────────
+
+/// Canonicalize `candidate` and return the canonical absolute path string,
+/// or `None` on failure (broken symlink, race condition, missing dir, etc.).
+/// The `kind` decision is left to the caller; this helper focuses solely on
+/// the canonicalize step.
+fn resolve_source_path(candidate: &std::path::Path) -> Option<String> {
+    std::fs::canonicalize(candidate)
+        .ok()
+        .map(|p| p.display().to_string())
 }
 
 // ─── Name validation ─────────────────────────────────────────────

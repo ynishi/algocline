@@ -192,36 +192,34 @@ impl AppService {
                         project_names.insert(name.clone());
 
                         // Resolve canonical source path depending on source_type.
-                        let (rsp, rsk) = match source_type.as_deref() {
+                        let (rsp, rsk, resolve_err) = match source_type.as_deref() {
                             Some("path") => {
                                 // abs_path is already absolutized; canonicalize it.
                                 let rsp = abs_path
                                     .as_ref()
                                     .and_then(|p| resolve_source_path(std::path::Path::new(p)));
-                                (rsp, Some("local_path".to_string()))
+                                (rsp, Some("local_path".to_string()), None)
                             }
                             Some("bundled") => {
-                                let rsp = match packages_dir() {
-                                    Ok(dir) => resolve_source_path(&dir.join(name)),
+                                let (rsp, err) = match packages_dir() {
+                                    Ok(dir) => (resolve_source_path(&dir.join(name)), None),
                                     Err(e) => {
-                                        tracing::warn!(package = %name, error = %e, "cannot resolve packages_dir for bundled entry");
-                                        None
+                                        (None, Some(format!("cannot resolve packages_dir: {e}")))
                                     }
                                 };
-                                (rsp, Some("bundled".to_string()))
+                                (rsp, Some("bundled".to_string()), err)
                             }
                             Some(_) => {
                                 // "installed" or "git" → packages_dir/{name}
-                                let rsp = match packages_dir() {
-                                    Ok(dir) => resolve_source_path(&dir.join(name)),
+                                let (rsp, err) = match packages_dir() {
+                                    Ok(dir) => (resolve_source_path(&dir.join(name)), None),
                                     Err(e) => {
-                                        tracing::warn!(package = %name, error = %e, "cannot resolve packages_dir for installed entry");
-                                        None
+                                        (None, Some(format!("cannot resolve packages_dir: {e}")))
                                     }
                                 };
-                                (rsp, Some("installed".to_string()))
+                                (rsp, Some("installed".to_string()), err)
                             }
-                            None => (None, None),
+                            None => (None, None, None),
                         };
 
                         entries.push(make_project_entry(
@@ -231,6 +229,7 @@ impl AppService {
                             abs_path,
                             rsp,
                             rsk,
+                            resolve_err,
                         ));
                     }
                 }
@@ -538,6 +537,7 @@ fn make_project_entry(
     abs_path: Option<String>,
     resolved_source_path: Option<String>,
     resolved_source_kind: Option<String>,
+    error: Option<String>,
 ) -> PackageListEntry {
     PackageListEntry {
         name,
@@ -552,7 +552,7 @@ fn make_project_entry(
         install_source: None,
         overrides: None,
         meta: serde_json::Value::Object(serde_json::Map::new()),
-        error: None,
+        error,
         linked: None,
         link_target: None,
         broken: None,
@@ -586,6 +586,7 @@ fn collect_path_entries_from_lock(
                 Some(abs.display().to_string()),
                 rsp,
                 Some("local_path".to_string()),
+                None,
             ));
         }
     }

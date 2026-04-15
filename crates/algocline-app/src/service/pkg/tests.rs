@@ -326,6 +326,10 @@ async fn pkg_list_project_installed_entry_has_resolved_source() {
         .pkg_list(Some(project_root.to_string_lossy().to_string()))
         .await
         .unwrap();
+    let expected_canonical = std::fs::canonicalize(&pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
     drop(fake_home);
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -336,15 +340,10 @@ async fn pkg_list_project_installed_entry_has_resolved_source() {
         .find(|p| p["name"] == "installed_pkg")
         .expect("installed_pkg not found");
 
-    let expected_canonical = std::fs::canonicalize(&pkg_dir)
-        .unwrap()
-        .display()
-        .to_string();
-
     assert_eq!(
         pkg["resolved_source_path"].as_str().unwrap(),
         expected_canonical,
-        "resolved_source_path should be packages_dir/{name} canonicalized"
+        "resolved_source_path should be packages_dir/<name> canonicalized"
     );
     assert_eq!(pkg["resolved_source_kind"], "installed");
 }
@@ -392,6 +391,11 @@ async fn pkg_list_project_installed_resolves_through_linked_pkg() {
         .pkg_list(Some(project_root.to_string_lossy().to_string()))
         .await
         .unwrap();
+    // canonicalize follows the symlink to the real dev dir.
+    let expected_canonical = std::fs::canonicalize(&real_dev_dir)
+        .unwrap()
+        .display()
+        .to_string();
     drop(fake_home);
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -401,12 +405,6 @@ async fn pkg_list_project_installed_resolves_through_linked_pkg() {
         .iter()
         .find(|p| p["name"] == "linked_pkg")
         .expect("linked_pkg not found");
-
-    // canonicalize follows the symlink to the real dev dir.
-    let expected_canonical = std::fs::canonicalize(&real_dev_dir)
-        .unwrap()
-        .display()
-        .to_string();
 
     assert_eq!(
         pkg["resolved_source_path"].as_str().unwrap(),

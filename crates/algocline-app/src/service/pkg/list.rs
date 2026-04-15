@@ -444,7 +444,14 @@ return pkg.meta or {{ name = "{name}" }}"#
         // ── Project-shadows-global pass (§3.2-b) ──────────────────────────
         // For each active project entry whose name also appears in global seen map,
         // expose all global occurrences as override_paths on the project entry.
+        //
+        // A project `installed` / `git` / `bundled` entry's own `resolved_source_path`
+        // typically resolves to `packages_dir()/{name}`, which is itself one of the
+        // search paths. Filter those occurrences out so an entry never lists itself
+        // as a shadow target — `override_paths` should only contain genuinely distinct
+        // same-name packages.
         for entry in entries[..global_start_idx].iter_mut() {
+            let self_path = entry.resolved_source_path.as_deref();
             if let Some(occurrences) = seen.get(&entry.name) {
                 let ps: Vec<String> = occurrences
                     .iter()
@@ -452,6 +459,7 @@ return pkg.meta or {{ name = "{name}" }}"#
                         let candidate = self.search_paths[*idx].path.join(&entry.name);
                         resolve_source_path(&candidate)
                     })
+                    .filter(|p| Some(p.as_str()) != self_path)
                     .collect();
                 if !ps.is_empty() {
                     entry.override_paths = Some(ps);

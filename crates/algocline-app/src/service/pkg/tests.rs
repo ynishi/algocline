@@ -690,6 +690,73 @@ async fn pkg_list_override_paths_project_shadows_global() {
     );
 }
 
+/// Regression: a project `installed` entry must not list its own backing
+/// directory (`packages_dir/{name}`) in `override_paths` just because the
+/// global search paths include `packages_dir`. The entry's own
+/// `resolved_source_path` canonicalizes to the same location, so that
+/// occurrence is not a genuine shadow and must be filtered out.
+#[tokio::test]
+async fn pkg_list_project_installed_does_not_self_shadow() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+    let packages_dir = fake_home.home.join(".algocline").join("packages");
+    let pkg_dir = packages_dir.join("self_shadow_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nself_shadow_pkg = \"*\"\n",
+    )
+    .unwrap();
+
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "self_shadow_pkg".to_string(),
+            version: None,
+            source: PackageSource::Installed,
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    // Include packages_dir as a search path — this is the real production
+    // topology (see `resolve_lib_paths` in src/main.rs).
+    let svc = make_app_service_with_search_paths(vec![crate::service::resolve::SearchPath {
+        path: packages_dir.clone(),
+        source: crate::service::resolve::SearchPathSource::Default,
+    }])
+    .await;
+
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    drop(fake_home);
+
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let project_entry = packages
+        .iter()
+        .find(|p| p["name"] == "self_shadow_pkg" && p["scope"] == "project")
+        .expect("project self_shadow_pkg not found");
+
+    let entry_map = project_entry
+        .as_object()
+        .expect("project entry must be object");
+
+    assert!(
+        !entry_map.contains_key("override_paths"),
+        "project `installed` entry must not list its own backing dir as override_paths, got: {:?}",
+        entry_map.get("override_paths")
+    );
+}
+
 /// A global package that exists on disk but is NOT registered in
 /// `installed.json` must NOT emit a `source_type` field.
 ///

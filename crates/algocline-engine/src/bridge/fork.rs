@@ -120,8 +120,8 @@ pub(crate) fn register_fork(
                             if let Some(resolver) = make_resolver(path) {
                                 reg.add(resolver);
                             } else {
-                                eprintln!(
-                                    "alc.fork: warn: resolver init failed for {}",
+                                tracing::warn!(
+                                    "alc.fork: resolver init failed for {}",
                                     path.display()
                                 );
                             }

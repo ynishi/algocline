@@ -148,8 +148,17 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 
 /// Record a successful install/update in the manifest.
 ///
-/// - If the package already exists, updates `version`, `source`, and `updated_at`.
-/// - If new, sets both `installed_at` and `updated_at` to now.
+/// - If the package already exists:
+///   - `version` is overwritten **only when the caller provides `Some(_)`**;
+///     `None` preserves whatever version was stored previously. Rationale:
+///     the git-clone single-pkg path in `pkg_install` always passes `None`
+///     here (it fetches the version later via `update_project_files_for_install`
+///     for `alc.lock`, and does not write it back into this manifest).
+///     Blindly clobbering with `None` would erase the version displayed by
+///     `pkg_list` on every re-install.
+///   - `source` and `updated_at` are always refreshed.
+/// - If new, sets both `installed_at` and `updated_at` to now, and records
+///   `version` verbatim (may be `None`).
 ///
 /// `version` is extracted from the package's `M.meta.version` field if provided.
 pub(crate) fn record_install(
@@ -165,7 +174,9 @@ pub(crate) fn record_install(
             .packages
             .entry(name.to_string())
             .and_modify(|e| {
-                e.version = version.map(String::from);
+                if let Some(v) = version {
+                    e.version = Some(v.to_string());
+                }
                 e.source = source.to_string();
                 e.updated_at = now.clone();
             })
@@ -274,5 +285,55 @@ mod tests {
         let path = tmp.path().join("nonexistent.json");
         let loaded = load_manifest_from(&path).unwrap();
         assert!(loaded.packages.is_empty());
+    }
+
+    #[test]
+    fn record_install_none_preserves_existing_version() {
+        // Regression: prior to `and_modify { e.version = version.map(..) }` →
+        // conditional assignment, re-installing a git-cloned single pkg
+        // (which passes `version = None`) silently erased the stored version
+        // displayed by `pkg_list`. Guarantee: `None` preserves; `Some` overwrites.
+        let _fake_home = super::super::test_support::FakeHome::new();
+
+        // Seed: insert an entry with a known version.
+        record_install(
+            "cot",
+            Some("0.1.0"),
+            "https://github.com/ynishi/algocline-bundled-packages",
+        )
+        .unwrap();
+        let before = load_manifest().unwrap();
+        assert_eq!(
+            before.packages.get("cot").unwrap().version.as_deref(),
+            Some("0.1.0")
+        );
+
+        // Re-install with `None` — should keep "0.1.0", not clobber.
+        record_install(
+            "cot",
+            None,
+            "https://github.com/ynishi/algocline-bundled-packages",
+        )
+        .unwrap();
+        let after_none = load_manifest().unwrap();
+        assert_eq!(
+            after_none.packages.get("cot").unwrap().version.as_deref(),
+            Some("0.1.0"),
+            "version=None must preserve existing version"
+        );
+
+        // Re-install with `Some("0.2.0")` — should overwrite.
+        record_install(
+            "cot",
+            Some("0.2.0"),
+            "https://github.com/ynishi/algocline-bundled-packages",
+        )
+        .unwrap();
+        let after_some = load_manifest().unwrap();
+        assert_eq!(
+            after_some.packages.get("cot").unwrap().version.as_deref(),
+            Some("0.2.0"),
+            "version=Some(_) must overwrite"
+        );
     }
 }

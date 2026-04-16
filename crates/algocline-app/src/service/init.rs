@@ -6,13 +6,18 @@ use super::alc_toml::{alc_toml_path, save_alc_toml};
 use super::project::resolve_project_root;
 use super::AppService;
 
-/// Entry to ensure is present in `.gitignore` after `alc_init`.
+/// Entries to ensure are present in `.gitignore` after `alc_init`.
 ///
-/// Matches the physical filename chosen in `decisions.md` Q1. The logical
-/// scope name (`variant`) and the physical filename (`alc.local.toml`) are
-/// intentionally asymmetric — the filename follows the dotenv `.env.local`
-/// convention so "gitignored" is read at a glance.
-const GITIGNORE_ENTRY: &str = "alc.local.toml";
+/// - `alc.local.toml` — variant-scoped package overrides (decisions.md Q1).
+///   The filename follows the dotenv `.env.local` convention so "gitignored"
+///   reads at a glance; the logical scope name (`variant`) and the physical
+///   filename are intentionally asymmetric.
+/// - `.alc-install.lock` — advisory flock companion created by
+///   `pkg_install::project_files_lock_path` in the project root when
+///   `alc_pkg_install` serializes concurrent writes to `alc.toml` / `alc.lock`.
+///   Adding it up-front avoids surprising a user who runs `pkg_install` inside
+///   a checkout and then sees the lock file in `git status`.
+const GITIGNORE_ENTRIES: &[&str] = &["alc.local.toml", ".alc-install.lock"];
 
 impl AppService {
     pub async fn init(&self, project_root: Option<String>) -> Result<String, String> {
@@ -35,9 +40,18 @@ impl AppService {
         // Best-effort .gitignore append. Failures are surfaced to the caller
         // rather than swallowed — the whole point of `alc_init` is to set up
         // a reproducible project shape, and a silent gitignore failure
-        // would leak `alc.local.toml` into VCS later.
+        // would leak algocline-internal files into VCS later.
+        //
+        // `gitignore_updated` is the OR across all managed entries: `true` when
+        // any entry was newly written, `false` only when every entry was
+        // already present.
         let gitignore_path = root.join(".gitignore");
-        let gitignore_updated = update_gitignore(&root, GITIGNORE_ENTRY)?;
+        let mut gitignore_updated = false;
+        for entry in GITIGNORE_ENTRIES {
+            if update_gitignore(&root, entry)? {
+                gitignore_updated = true;
+            }
+        }
 
         let result = serde_json::json!({
             "created": path.display().to_string(),
@@ -139,7 +153,7 @@ mod tests {
         let gi = tmp.path().join(".gitignore");
         assert!(gi.exists());
         let content = std::fs::read_to_string(&gi).unwrap();
-        assert_eq!(content, "alc.local.toml\n");
+        assert_eq!(content, "alc.local.toml\n.alc-install.lock\n");
     }
 
     #[tokio::test]
@@ -157,14 +171,21 @@ mod tests {
         assert_eq!(json["gitignore_updated"], true);
 
         let content = std::fs::read_to_string(&gi).unwrap();
-        assert_eq!(content, "target\nworkspace\nalc.local.toml\n");
+        assert_eq!(
+            content,
+            "target\nworkspace\nalc.local.toml\n.alc-install.lock\n"
+        );
     }
 
     #[tokio::test]
-    async fn init_is_idempotent_on_gitignore_entry() {
+    async fn init_is_idempotent_on_gitignore_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let gi = tmp.path().join(".gitignore");
-        std::fs::write(&gi, "target\nalc.local.toml\nworkspace\n").unwrap();
+        std::fs::write(
+            &gi,
+            "target\nalc.local.toml\n.alc-install.lock\nworkspace\n",
+        )
+        .unwrap();
 
         let svc = make_service().await;
         let raw = svc
@@ -176,7 +197,30 @@ mod tests {
 
         // File unchanged.
         let content = std::fs::read_to_string(&gi).unwrap();
-        assert_eq!(content, "target\nalc.local.toml\nworkspace\n");
+        assert_eq!(
+            content,
+            "target\nalc.local.toml\n.alc-install.lock\nworkspace\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_partial_existing_gitignore_updates_missing_entry_only() {
+        // One of the two managed entries already exists; `gitignore_updated`
+        // must still be `true` because the second is appended.
+        let tmp = tempfile::tempdir().unwrap();
+        let gi = tmp.path().join(".gitignore");
+        std::fs::write(&gi, "target\nalc.local.toml\n").unwrap();
+
+        let svc = make_service().await;
+        let raw = svc
+            .init(Some(tmp.path().to_str().unwrap().to_string()))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["gitignore_updated"], true);
+
+        let content = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(content, "target\nalc.local.toml\n.alc-install.lock\n");
     }
 
     #[tokio::test]

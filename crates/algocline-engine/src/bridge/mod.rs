@@ -20,6 +20,7 @@ mod llm;
 mod text;
 
 use crate::llm_bridge::LlmRequest;
+use crate::variant_pkg::VariantPkg;
 
 /// Layer 1 prelude (also used by fork to setup child VMs).
 pub(crate) const PRELUDE: &str = include_str!("../prelude.lua");
@@ -41,6 +42,8 @@ pub struct BridgeConfig {
     pub progress: ProgressHandle,
     /// Package search paths (needed by alc.fork to setup child VMs).
     pub lib_paths: Vec<PathBuf>,
+    /// Variant pkg overrides (`alc.local.toml`) — propagated to fork children.
+    pub variant_pkgs: Vec<VariantPkg>,
 }
 
 /// Register all Layer 0 runtime primitives onto the given table.
@@ -59,7 +62,14 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     if let Some(tx) = config.llm_tx {
         llm::register_llm(lua, alc_table, tx.clone(), config.budget.clone())?;
         llm::register_llm_batch(lua, alc_table, tx.clone(), config.budget.clone())?;
-        fork::register_fork(lua, alc_table, tx, config.budget, config.lib_paths)?;
+        fork::register_fork(
+            lua,
+            alc_table,
+            tx,
+            config.budget,
+            config.lib_paths,
+            config.variant_pkgs,
+        )?;
     }
     Ok(())
 }
@@ -105,6 +115,7 @@ mod tests {
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: vec![],
+            variant_pkgs: vec![],
         }
     }
 

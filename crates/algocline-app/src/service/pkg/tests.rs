@@ -822,3 +822,184 @@ async fn pkg_list_global_unregistered_has_no_source_type() {
         "unregistered global package should default to installed kind"
     );
 }
+
+// ── variant scope (alc.local.toml) ───────────────────────────
+
+/// `alc.local.toml` declares a variant pkg → it appears in `pkg_list` with
+/// `scope: "variant"`, `resolved_source_kind: "variant"`, `active: true`,
+/// and `path` set to the absolute pkg dir.
+#[tokio::test]
+async fn pkg_list_variant_pkg_appears_with_variant_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    // Variant pkg lives outside the project root (typical worktree workflow).
+    let pkg_dir = tmp.path().join("variant_src").join("my_variant_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    std::fs::write(
+        project_root.join("alc.local.toml"),
+        format!(
+            "[packages]\nmy_variant_pkg = {{ path = \"{}\" }}\n",
+            pkg_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let entry = packages
+        .iter()
+        .find(|p| p["name"] == "my_variant_pkg")
+        .expect("my_variant_pkg not found in pkg_list output");
+
+    assert_eq!(entry["scope"], "variant");
+    assert_eq!(entry["active"], true);
+    assert_eq!(entry["source_type"], "path");
+    assert_eq!(entry["resolved_source_kind"], "variant");
+
+    let expected_canonical = std::fs::canonicalize(&pkg_dir)
+        .unwrap()
+        .display()
+        .to_string();
+    assert_eq!(
+        entry["resolved_source_path"].as_str().unwrap(),
+        expected_canonical,
+        "resolved_source_path should canonicalize to the variant pkg dir"
+    );
+    assert_eq!(
+        entry["path"].as_str().unwrap(),
+        pkg_dir.display().to_string(),
+        "path should be the absolute pkg_dir as declared in alc.local.toml"
+    );
+}
+
+/// A variant pkg shadowing a same-name global package: the variant entry
+/// is `active: true`, the global one is demoted to `active: false`.
+#[tokio::test]
+async fn pkg_list_variant_shadows_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+    let global_dir = tmp.path().join("global_pkgs");
+    std::fs::create_dir_all(&global_dir).unwrap();
+
+    // Global pkg of the same name.
+    let global_pkg = global_dir.join("shared");
+    std::fs::create_dir_all(&global_pkg).unwrap();
+    std::fs::write(global_pkg.join("init.lua"), "return {}").unwrap();
+
+    // Variant pkg.
+    let variant_pkg = tmp.path().join("variant_src").join("shared");
+    std::fs::create_dir_all(&variant_pkg).unwrap();
+    std::fs::write(variant_pkg.join("init.lua"), "return {}").unwrap();
+
+    std::fs::write(
+        project_root.join("alc.local.toml"),
+        format!(
+            "[packages]\nshared = {{ path = \"{}\" }}\n",
+            variant_pkg.display()
+        ),
+    )
+    .unwrap();
+
+    let svc = make_app_service_with_search_paths(vec![crate::service::resolve::SearchPath {
+        path: global_dir.clone(),
+        source: crate::service::resolve::SearchPathSource::Env,
+    }])
+    .await;
+
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let variant_entry = packages
+        .iter()
+        .find(|p| p["name"] == "shared" && p["scope"] == "variant")
+        .expect("variant 'shared' entry not found");
+    assert_eq!(variant_entry["active"], true);
+
+    let global_entry = packages
+        .iter()
+        .find(|p| p["name"] == "shared" && p["scope"] == "global")
+        .expect("global 'shared' entry not found");
+    assert_eq!(
+        global_entry["active"], false,
+        "global entry must be demoted when shadowed by variant"
+    );
+}
+
+/// A variant pkg with the same name as an `alc.toml`-declared project pkg:
+/// the variant entry wins (`active: true`), the project entry is demoted.
+#[tokio::test]
+async fn pkg_list_variant_shadows_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    // Project pkg via alc.toml + alc.lock (path entry).
+    let project_pkg = project_root.join("shared");
+    std::fs::create_dir_all(&project_pkg).unwrap();
+    std::fs::write(project_pkg.join("init.lua"), "return {}").unwrap();
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nshared = { path = \"shared\" }\n",
+    )
+    .unwrap();
+    let lock = LockFile {
+        version: 1,
+        packages: vec![LockPackage {
+            name: "shared".to_string(),
+            version: None,
+            source: PackageSource::Path {
+                path: "shared".to_string(),
+            },
+        }],
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+
+    // Variant override.
+    let variant_pkg = tmp.path().join("variant_src").join("shared");
+    std::fs::create_dir_all(&variant_pkg).unwrap();
+    std::fs::write(variant_pkg.join("init.lua"), "return {}").unwrap();
+    std::fs::write(
+        project_root.join("alc.local.toml"),
+        format!(
+            "[packages]\nshared = {{ path = \"{}\" }}\n",
+            variant_pkg.display()
+        ),
+    )
+    .unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    let variant_entry = packages
+        .iter()
+        .find(|p| p["name"] == "shared" && p["scope"] == "variant")
+        .expect("variant 'shared' entry not found");
+    assert_eq!(variant_entry["active"], true);
+
+    let project_entry = packages
+        .iter()
+        .find(|p| p["name"] == "shared" && p["scope"] == "project")
+        .expect("project 'shared' entry not found");
+    assert_eq!(
+        project_entry["active"], false,
+        "project entry must be demoted when shadowed by variant"
+    );
+}

@@ -201,7 +201,25 @@ pub(crate) fn resolve_local_path_entries(
     project_root: &Path,
     local: &AlcToml,
 ) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    resolve_local_variant_pkgs(project_root, local)
+        .into_iter()
+        .map(|vp| vp.pkg_dir)
+        .collect()
+}
+
+/// Resolve `[packages.*] path = "..."` entries from `alc.local.toml` to
+/// `(name, pkg_dir)` pairs (the shape `algocline-engine` consumes).
+///
+/// Same skip / warn / ordering rules as [`resolve_local_path_entries`]; the
+/// difference is that the require name is preserved alongside the resolved
+/// path so that variant resolvers can map `require("{name}")` directly to
+/// `{pkg_dir}/init.lua` regardless of whether the on-disk directory name
+/// matches.
+pub(crate) fn resolve_local_variant_pkgs(
+    project_root: &Path,
+    local: &AlcToml,
+) -> Vec<algocline_engine::VariantPkg> {
+    let mut out = Vec::new();
 
     for (name, dep) in &local.packages {
         let raw = match dep {
@@ -227,10 +245,10 @@ pub(crate) fn resolve_local_path_entries(
             continue;
         }
 
-        paths.push(resolved);
+        out.push(algocline_engine::VariantPkg::new(name, resolved));
     }
 
-    paths
+    out
 }
 
 // ─── Entry manipulation ──────────────────────────────────────────────────────

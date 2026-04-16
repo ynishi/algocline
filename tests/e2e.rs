@@ -562,3 +562,88 @@ return M"#,
     }
     client.cancel().await.expect("cancel failed");
 }
+
+/// Variant scope link → require: `alc_pkg_link --scope=variant` writes
+/// `alc.local.toml` and the next `alc_run` (with the same `project_root`)
+/// must be able to `require()` the variant pkg by its declared name.
+///
+/// Regression for the `VariantPkg` resolver: see
+/// `crates/algocline-engine/src/variant_pkg.rs`.
+#[tokio::test]
+async fn test_variant_scope_link_then_run_require() {
+    let client = connect().await;
+
+    // 1. Create a temp project root with empty alc.toml so resolve_project_root succeeds.
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let project_root = tmp.path();
+    std::fs::write(project_root.join("alc.toml"), "[packages]\n").expect("write alc.toml");
+
+    // 2. Create a temp pkg dir living OUTSIDE the project root (typical worktree workflow).
+    let pkg_dir = tmp.path().join("variant_src").join("e2e_variant_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"return { value = "from-variant" }"#,
+    )
+    .expect("write init.lua");
+
+    // 3. Link as variant scope → writes alc.local.toml.
+    let link_resp = call_json(
+        &client,
+        "alc_pkg_link",
+        json!({
+            "path": pkg_dir.to_string_lossy(),
+            "scope": "variant",
+            "project_root": project_root.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert!(
+        link_resp.get("error").is_none(),
+        "alc_pkg_link should succeed, got: {link_resp}"
+    );
+    assert!(
+        project_root.join("alc.local.toml").exists(),
+        "alc.local.toml should have been created"
+    );
+
+    // 4. Run `require("e2e_variant_pkg")` — must resolve through VariantPkg resolver.
+    let run_resp = call_json(
+        &client,
+        "alc_run",
+        json!({
+            "code": r#"return require("e2e_variant_pkg").value"#,
+            "project_root": project_root.to_string_lossy(),
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        run_resp["status"], "completed",
+        "alc_run should complete, got: {run_resp}"
+    );
+    assert_eq!(
+        run_resp["result"], "from-variant",
+        "variant pkg should be resolved and return its sentinel value"
+    );
+
+    // 5. alc_pkg_list should surface the variant entry.
+    let list_resp = call_json(
+        &client,
+        "alc_pkg_list",
+        json!({ "project_root": project_root.to_string_lossy() }),
+    )
+    .await;
+    let packages = list_resp["packages"]
+        .as_array()
+        .expect("packages array missing");
+    let entry = packages
+        .iter()
+        .find(|p| p["name"] == "e2e_variant_pkg")
+        .expect("e2e_variant_pkg not found in alc_pkg_list");
+    assert_eq!(entry["scope"], "variant");
+    assert_eq!(entry["active"], true);
+    assert_eq!(entry["resolved_source_kind"], "variant");
+
+    client.cancel().await.expect("cancel failed");
+}

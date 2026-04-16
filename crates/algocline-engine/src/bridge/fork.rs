@@ -14,6 +14,7 @@ use mlua_pkg::{resolvers::FsResolver, Registry};
 
 use super::{register, BridgeConfig, PRELUDE};
 use crate::llm_bridge::{LlmRequest, QueryRequest};
+use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
 
 /// Event from a child VM during fork execution.
 enum ForkEvent {
@@ -52,12 +53,14 @@ pub(crate) fn register_fork(
     llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
     budget: BudgetHandle,
     lib_paths: Vec<PathBuf>,
+    variant_pkgs: Vec<VariantPkg>,
 ) -> LuaResult<()> {
     let fork_fn = lua.create_async_function(
         move |lua, (strategies, ctx, opts): (LuaTable, LuaTable, Option<LuaTable>)| {
             let parent_tx = llm_tx.clone();
             let bh = budget.clone();
             let paths = lib_paths.clone();
+            let variants = variant_pkgs.clone();
             async move {
                 let n = strategies.len()? as usize;
                 if n == 0 {
@@ -102,8 +105,11 @@ pub(crate) fn register_fork(
 
                     // Spawn child VM
                     let child_paths = paths.clone();
+                    let child_variants = variants.clone();
                     let (child_isle, child_driver) = AsyncIsle::spawn(move |child_lua| {
                         let mut reg = Registry::new();
+                        // Variant pkgs first (highest priority — alc.local.toml wins).
+                        register_variant_pkgs(&mut reg, &child_variants);
                         for path in &child_paths {
                             match FsResolver::new(path) {
                                 Ok(resolver) => {
@@ -136,7 +142,8 @@ pub(crate) fn register_fork(
                         custom_metrics: child_metrics.custom_metrics_handle(),
                         budget: bh.clone(),
                         progress: child_metrics.progress_handle(),
-                        lib_paths: vec![], // Children don't need to fork further
+                        lib_paths: vec![],    // Children don't need to fork further
+                        variant_pkgs: vec![], // Children don't need to fork further
                     };
 
                     child_isle

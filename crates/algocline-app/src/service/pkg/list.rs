@@ -15,6 +15,9 @@ use super::super::AppService;
 
 #[derive(Debug)]
 enum Scope {
+    /// Worktree-scoped override from `alc.local.toml` (gitignored).
+    /// Highest priority — shadows same-name Project and Global entries.
+    Variant,
     Project,
     Global,
 }
@@ -34,6 +37,8 @@ enum ResolvedSourceKind {
     LocalPath,
     /// Package shipped with algocline via `BUNDLED_SOURCES`.
     Bundled,
+    /// Worktree-scoped override declared in `alc.local.toml`.
+    Variant,
 }
 
 impl ResolvedSourceKind {
@@ -43,6 +48,7 @@ impl ResolvedSourceKind {
             ResolvedSourceKind::Linked => "linked",
             ResolvedSourceKind::LocalPath => "local_path",
             ResolvedSourceKind::Bundled => "bundled",
+            ResolvedSourceKind::Variant => "variant",
         }
     }
 }
@@ -90,6 +96,7 @@ struct PackageListEntry {
 impl PackageListEntry {
     fn into_json(self) -> serde_json::Value {
         let scope_str = match self.scope {
+            Scope::Variant => "variant",
             Scope::Project => "project",
             Scope::Global => "global",
         };
@@ -191,6 +198,7 @@ impl AppService {
         let resolved_root = resolve_project_root(project_root.as_deref());
 
         let mut project_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut variant_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut entries: Vec<PackageListEntry> = Vec::new();
         let mut project_root_str: Option<String> = None;
         let mut lockfile_path_str: Option<String> = None;
@@ -198,6 +206,11 @@ impl AppService {
         if let Some(ref root) = resolved_root {
             project_root_str = Some(root.display().to_string());
             lockfile_path_str = Some(lockfile_path(root).display().to_string());
+
+            // Variant pkgs from alc.local.toml (worktree-scoped, gitignored).
+            // Highest priority — recorded first so they shadow same-name
+            // project / global entries via `variant_names` set.
+            collect_variant_entries(root, &mut variant_names, &mut entries);
 
             // Load alc.lock for version/source lookup (may not exist yet).
             let lock_map: HashMap<String, (Option<String>, PackageSource)> =
@@ -257,7 +270,7 @@ impl AppService {
                             None => (None, None, None),
                         };
 
-                        entries.push(make_project_entry(
+                        let mut entry = make_project_entry(
                             name.clone(),
                             version,
                             source_type,
@@ -265,7 +278,11 @@ impl AppService {
                             rsp,
                             rsk,
                             resolve_err,
-                        ));
+                        );
+                        if variant_names.contains(name) {
+                            entry.active = false;
+                        }
+                        entries.push(entry);
                     }
                 }
                 Ok(None) => {
@@ -273,6 +290,7 @@ impl AppService {
                     collect_path_entries_from_lock(
                         &lock_map,
                         root,
+                        &variant_names,
                         &mut project_names,
                         &mut entries,
                     );
@@ -351,8 +369,10 @@ impl AppService {
                     .push((idx, source_display.clone()));
 
                 // active among globals: first occurrence wins; also shadowed
-                // by project-local if same name
-                let global_active = seen[&name].len() == 1 && !project_names.contains(&name);
+                // by project-local or variant if same name
+                let global_active = seen[&name].len() == 1
+                    && !project_names.contains(&name)
+                    && !variant_names.contains(&name);
 
                 // Evaluate Lua meta (best-effort; error captured in entry).
                 let (meta, eval_error) = if is_safe_pkg_name(&name) {
@@ -581,6 +601,57 @@ fn resolve_project_pkg_info(
     }
 }
 
+/// Enumerate variant pkgs from `alc.local.toml` and push them as
+/// `Scope::Variant` entries.
+///
+/// Variant pkgs are worktree-scoped (gitignored) overrides resolved by
+/// `algocline_engine::VariantPkg`. They have the highest priority — same-name
+/// project / global entries are demoted to `active: false`.
+///
+/// Failures (missing / malformed `alc.local.toml`) are logged at `warn` and
+/// degrade to no variant entries (consistent with `resolve_extra_lib_paths`).
+fn collect_variant_entries(
+    root: &Path,
+    variant_names: &mut std::collections::HashSet<String>,
+    entries: &mut Vec<PackageListEntry>,
+) {
+    let local = match alc_toml::load_alc_local_toml(root) {
+        Ok(Some(l)) => l,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("failed to load alc.local.toml at {}: {e}", root.display());
+            return;
+        }
+    };
+
+    for vp in alc_toml::resolve_local_variant_pkgs(root, &local) {
+        variant_names.insert(vp.name.clone());
+        let abs_path = vp.pkg_dir.display().to_string();
+        let rsp = resolve_source_path(&vp.pkg_dir);
+        entries.push(PackageListEntry {
+            name: vp.name,
+            scope: Scope::Variant,
+            source_type: Some("path".to_string()),
+            path: Some(abs_path),
+            source: None,
+            active: true,
+            version: None,
+            installed_at: None,
+            updated_at: None,
+            install_source: None,
+            overrides: None,
+            meta: serde_json::Value::Object(serde_json::Map::new()),
+            error: None,
+            linked: None,
+            link_target: None,
+            broken: None,
+            resolved_source_path: rsp,
+            resolved_source_kind: Some(ResolvedSourceKind::Variant),
+            override_paths: None,
+        });
+    }
+}
+
 /// Create a `PackageListEntry` for a project-scoped package.
 fn make_project_entry(
     name: String,
@@ -618,6 +689,7 @@ fn make_project_entry(
 fn collect_path_entries_from_lock(
     lock_map: &HashMap<String, (Option<String>, PackageSource)>,
     root: &Path,
+    variant_names: &std::collections::HashSet<String>,
     project_names: &mut std::collections::HashSet<String>,
     entries: &mut Vec<PackageListEntry>,
 ) {
@@ -631,7 +703,7 @@ fn collect_path_entries_from_lock(
             };
             project_names.insert(name.clone());
             let rsp = resolve_source_path(&abs);
-            entries.push(make_project_entry(
+            let mut entry = make_project_entry(
                 name.clone(),
                 version.clone(),
                 Some("path".to_string()),
@@ -639,7 +711,11 @@ fn collect_path_entries_from_lock(
                 rsp,
                 Some(ResolvedSourceKind::LocalPath),
                 None,
-            ));
+            );
+            if variant_names.contains(name) {
+                entry.active = false;
+            }
+            entries.push(entry);
         }
     }
 }

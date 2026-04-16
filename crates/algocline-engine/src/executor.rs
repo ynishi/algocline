@@ -27,6 +27,7 @@ use mlua_pkg::{resolvers::FsResolver, sandbox::SymlinkAwareSandbox, Registry};
 use crate::bridge;
 use crate::llm_bridge::LlmRequest;
 use crate::session::Session;
+use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
 
 /// Build an `FsResolver` for the given path.
 ///
@@ -95,21 +96,23 @@ impl Executor {
     /// Uses the shared VM. `extra_lib_paths` must be empty — use
     /// [`eval_simple_with_paths`] when project-local paths are needed.
     pub async fn eval_simple(&self, code: String) -> Result<serde_json::Value, String> {
-        self.eval_simple_with_paths(code, vec![]).await
+        self.eval_simple_with_paths(code, vec![], vec![]).await
     }
 
-    /// Evaluate Lua code without LLM bridge, with optional extra package paths.
+    /// Evaluate Lua code without LLM bridge, with optional extra package paths
+    /// and variant pkgs.
     ///
-    /// When `extra_lib_paths` is empty, reuses the shared VM (cheap).
-    /// When non-empty, spawns a dedicated VM so the extra resolvers are active
-    /// (slightly more expensive, but `pkg_list` is the only caller and it is
-    /// low-frequency).
+    /// When both `extra_lib_paths` and `variant_pkgs` are empty, reuses the
+    /// shared VM (cheap). When either is non-empty, spawns a dedicated VM so
+    /// the extra resolvers are active (slightly more expensive, but `pkg_list`
+    /// is the only caller and it is low-frequency).
     pub async fn eval_simple_with_paths(
         &self,
         code: String,
         extra_lib_paths: Vec<PathBuf>,
+        variant_pkgs: Vec<VariantPkg>,
     ) -> Result<serde_json::Value, String> {
-        if extra_lib_paths.is_empty() {
+        if extra_lib_paths.is_empty() && variant_pkgs.is_empty() {
             // Fast path: reuse the long-lived shared VM.
             let task = self.isle.spawn_exec(move |lua| {
                 let result: mlua::Value = lua
@@ -132,6 +135,8 @@ impl Executor {
 
         let (tmp_isle, _tmp_driver) = AsyncIsle::spawn(move |lua| {
             let mut reg = Registry::new();
+            // Variant pkgs first so alc.local.toml overrides win over global.
+            register_variant_pkgs(&mut reg, &variant_pkgs);
             for path in &effective {
                 if let Some(resolver) = make_resolver(path) {
                     reg.add(resolver);
@@ -167,11 +172,14 @@ impl Executor {
     ///
     /// `extra_lib_paths` are prepended to `self.lib_paths` so project-local
     /// packages take precedence over the global package directory.
+    /// `variant_pkgs` come from `alc.local.toml` and override both layers
+    /// (registered at the highest priority).
     pub async fn start_session(
         &self,
         code: String,
         ctx: serde_json::Value,
         extra_lib_paths: Vec<PathBuf>,
+        variant_pkgs: Vec<VariantPkg>,
     ) -> Result<Session, String> {
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
@@ -184,7 +192,8 @@ impl Executor {
         let (llm_tx, llm_rx) = tokio::sync::mpsc::channel::<LlmRequest>(16);
 
         // Build effective lib_paths: extra (project-local) first, then defaults.
-        // Priority: extra_lib_paths > self.lib_paths (ALC_PACKAGES_PATH + global default).
+        // Priority: variant_pkgs > extra_lib_paths > self.lib_paths
+        // (ALC_PACKAGES_PATH + global default).
         let mut effective = extra_lib_paths;
         effective.extend(self.lib_paths.iter().cloned());
 
@@ -195,6 +204,7 @@ impl Executor {
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: effective.clone(), // fork child VMs inherit project paths
+            variant_pkgs: variant_pkgs.clone(), // fork child VMs inherit variant overrides
         };
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();
@@ -202,6 +212,8 @@ impl Executor {
         // 1. Spawn a dedicated VM for this session.
         let (session_isle, session_driver) = AsyncIsle::spawn(move |lua| {
             let mut reg = Registry::new();
+            // Variant pkgs first so alc.local.toml overrides win over global.
+            register_variant_pkgs(&mut reg, &variant_pkgs);
             for path in &effective {
                 if let Some(resolver) = make_resolver(path) {
                     reg.add(resolver);
@@ -285,11 +297,82 @@ mod tests {
         .to_string();
 
         let result = executor
-            .eval_simple_with_paths(code, vec![pkg_root])
+            .eval_simple_with_paths(code, vec![pkg_root], vec![])
             .await
             .unwrap();
 
         assert_eq!(result, serde_json::json!(99));
+    }
+
+    /// Variant pkg with a non-matching directory name resolves via
+    /// `VariantRootResolver` + `PrefixResolver`.
+    #[tokio::test]
+    async fn variant_pkg_resolves_root_and_submodule() {
+        let tmp = tempfile::tempdir().unwrap();
+        // pkg dir name (`physical-dir`) intentionally differs from the
+        // require name (`logical_name`) — variant scope must support this.
+        let pkg_dir = tmp.path().join("physical-dir");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("init.lua"),
+            "return { greet = function(n) return 'hi-' .. n end, sub = require('logical_name.sub') }",
+        )
+        .unwrap();
+        fs::write(pkg_dir.join("sub.lua"), "return { value = 7 }").unwrap();
+
+        let executor = Executor::new(vec![]).await.unwrap();
+        let code = r#"
+            local pkg = require("logical_name")
+            return { msg = pkg.greet("there"), sub_value = pkg.sub.value }
+        "#
+        .to_string();
+
+        let result = executor
+            .eval_simple_with_paths(
+                code,
+                vec![],
+                vec![VariantPkg::new("logical_name", pkg_dir)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["msg"], serde_json::json!("hi-there"));
+        assert_eq!(result["sub_value"], serde_json::json!(7));
+    }
+
+    /// Variant pkg overrides a same-name global pkg (priority: variant > global).
+    #[tokio::test]
+    async fn variant_pkg_overrides_global_same_name() {
+        let global_tmp = tempfile::tempdir().unwrap();
+        let variant_tmp = tempfile::tempdir().unwrap();
+
+        // Global: my_pkg returns 1
+        make_pkg_dir(global_tmp.path(), "my_pkg", "return { value = 1 }");
+        // Variant: my_pkg returns 2 — must win
+        let variant_dir = variant_tmp.path().join("my_pkg");
+        fs::create_dir_all(&variant_dir).unwrap();
+        fs::write(variant_dir.join("init.lua"), "return { value = 2 }").unwrap();
+
+        let executor = Executor::new(vec![global_tmp.path().to_path_buf()])
+            .await
+            .unwrap();
+
+        let code = r#"
+            local pkg = require("my_pkg")
+            return pkg.value
+        "#
+        .to_string();
+
+        let result = executor
+            .eval_simple_with_paths(
+                code,
+                vec![],
+                vec![VariantPkg::new("my_pkg", variant_dir)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, serde_json::json!(2));
     }
 
     /// When `extra_lib_paths` has a pkg with the same name as one in global paths,
@@ -316,7 +399,7 @@ mod tests {
         .to_string();
 
         let result = executor
-            .eval_simple_with_paths(code, vec![extra_root])
+            .eval_simple_with_paths(code, vec![extra_root], vec![])
             .await
             .unwrap();
 

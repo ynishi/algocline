@@ -1,5 +1,5 @@
 use algocline_core::QueryId;
-use algocline_engine::FeedResult;
+use algocline_engine::{FeedResult, VariantPkg};
 
 use super::resolve::{is_package_installed, make_require_code, resolve_code, QueryResponse};
 use super::transcript::write_transcript_log;
@@ -20,7 +20,8 @@ impl AppService {
         let code = resolve_code(code, code_file)?;
         let ctx = ctx.unwrap_or(serde_json::Value::Null);
         let extra = self.resolve_extra_lib_paths(project_root.as_deref());
-        self.start_and_tick(code, ctx, None, extra).await
+        let variants = self.resolve_variant_pkgs(project_root.as_deref());
+        self.start_and_tick(code, ctx, None, extra, variants).await
     }
 
     /// Apply a built-in strategy to a task.
@@ -60,7 +61,9 @@ impl AppService {
         let ctx = serde_json::Value::Object(ctx_map);
 
         let extra = self.resolve_extra_lib_paths(project_root.as_deref());
-        self.start_and_tick(code, ctx, Some(strategy), extra).await
+        let variants = self.resolve_variant_pkgs(project_root.as_deref());
+        self.start_and_tick(code, ctx, Some(strategy), extra, variants)
+            .await
     }
 
     /// Continue a paused execution — batch feed.
@@ -155,10 +158,11 @@ impl AppService {
         ctx: serde_json::Value,
         strategy: Option<&str>,
         extra_lib_paths: Vec<std::path::PathBuf>,
+        variant_pkgs: Vec<VariantPkg>,
     ) -> Result<String, String> {
         let session = self
             .executor
-            .start_session(code, ctx, extra_lib_paths)
+            .start_session(code, ctx, extra_lib_paths, variant_pkgs)
             .await?;
         let (session_id, result) = self
             .registry

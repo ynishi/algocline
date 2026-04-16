@@ -31,7 +31,7 @@ mod tests;
 use std::path::Path;
 use std::sync::Arc;
 
-use algocline_engine::{Executor, SessionRegistry};
+use algocline_engine::{Executor, SessionRegistry, VariantPkg};
 
 pub use algocline_core::{EngineApi, TokenUsage};
 pub use config::{AppConfig, LogDirSource};
@@ -146,6 +146,28 @@ impl AppService {
         let mut merged = local_paths;
         merged.extend(lock_paths);
         merged
+    }
+
+    /// Resolve variant pkg overrides for a request.
+    ///
+    /// Reads `alc.local.toml` (worktree-scoped, gitignored) and emits one
+    /// [`VariantPkg`] per `[packages.{name}] path = "..."` entry, preserving
+    /// the explicit `(name, pkg_dir)` mapping. Returns an empty `Vec` if no
+    /// project root is found or `alc.local.toml` is missing/malformed
+    /// (failures are logged at `warn`).
+    pub(crate) fn resolve_variant_pkgs(&self, project_root: Option<&str>) -> Vec<VariantPkg> {
+        let Some(root) = project::resolve_project_root(project_root) else {
+            return vec![];
+        };
+
+        match alc_toml::load_alc_local_toml(&root) {
+            Ok(Some(local)) => alc_toml::resolve_local_variant_pkgs(&root, &local),
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::warn!("failed to load alc.local.toml at {}: {e}", root.display());
+                Vec::new()
+            }
+        }
     }
 
     fn warn_toml_lock_mismatch(&self, root: &Path, lock: &lockfile::LockFile) {

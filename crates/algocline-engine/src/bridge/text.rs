@@ -88,6 +88,7 @@ mod tests {
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: vec![],
+            variant_pkgs: vec![],
         }
     }
 

@@ -99,7 +99,7 @@ return alc.eval(scenario, "{strategy}", {{
 
         let ctx = serde_json::Value::Null;
         let result = self
-            .start_and_tick(wrapped, ctx, Some(strategy), vec![])
+            .start_and_tick(wrapped, ctx, Some(strategy), vec![], vec![])
             .await?;
 
         // Persist eval result for history/comparison.
@@ -271,7 +271,9 @@ return {{
         );
 
         let ctx = serde_json::Value::Null;
-        let raw_result = self.start_and_tick(lua_code, ctx, None, vec![]).await?;
+        let raw_result = self
+            .start_and_tick(lua_code, ctx, None, vec![], vec![])
+            .await?;
 
         // Persist comparison result
         save_compare_result(eval_id_a, eval_id_b, &raw_result);

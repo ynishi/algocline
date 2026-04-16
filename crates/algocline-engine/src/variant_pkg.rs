@@ -34,11 +34,13 @@ impl VariantPkg {
 
 /// Resolver for `require("{name}")` — the package root of a variant pkg.
 ///
-/// Reads `{init_path}` lazily on each resolve so that an in-place edit of
-/// the variant pkg's `init.lua` is visible on the next `alc_run` (each
-/// `alc_run` builds a fresh session VM, but `package.loaded` cache only
-/// applies within a single session). Submodule lookups (`{name}.{sub}`)
-/// are delegated to a separate `PrefixResolver(name, FsResolver(pkg_dir))`.
+/// `resolve()` reads `{init_path}` from disk each time it fires. Within a
+/// single Lua session, `package.loaded` caches the first result, so this
+/// resolver runs at most once per name per session. Freshness across edits
+/// comes from the fact that each `alc_run` builds a fresh session VM: the
+/// disk read at resolve time guarantees the new session sees the current
+/// `init.lua` content. Submodule lookups (`{name}.{sub}`) are delegated to
+/// a separate `PrefixResolver(name, FsResolver(pkg_dir))`.
 struct VariantRootResolver {
     name: String,
     init_path: PathBuf,

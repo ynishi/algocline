@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-04-17
+
 ### Changed
 
-- `alc init`: bundled `algocline-bundled-packages` tag bumped `v0.11.2` → `v0.12.0` (adds 12 Swarm foundation packages: `shapley`, `mwu`, `kemeny`, `scoring_rule`, F1-F5, N1-N5; plus recategorisation of 10 existing packages). `evalframe` stays at `v0.3.0`. Runtime behaviour unchanged — only the default set fetched by `alc init`.
+- `alc_pkg_repair`: LocalPath sources whose source directory is missing, or exists but has no `init.lua` at root, are now classified as `unrepairable` (`kind: "installed_missing"`) with an actionable `reason` / `suggestion`, instead of landing in `failed` with the misleading "'name' parameter is only supported for single-package dirs" message. Matches the policy already used for Bundled / Path sources: states detectable before attempting install belong in `unrepairable`; `failed` is reserved for runtime errors during an actual install attempt.
+- `alc_pkg_install` (local path): now rejects a missing source directory up front with a clear `"Source directory does not exist: {path}"` error instead of falling through to the collection-mode branch and producing the misleading `'name' parameter` error.
+- `alc init`: bundled `algocline-bundled-packages` tag bumped `v0.12.0` → `v0.14.0`. `evalframe` stays at `v0.3.0`.
 
 ## [0.20.1] - 2026-04-16
 

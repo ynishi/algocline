@@ -22,16 +22,91 @@ use super::super::resolve::packages_dir;
 use super::super::source::PackageSource;
 use super::super::AppService;
 
-/// Outcome of repairing a single package.
+/// Outcome of repairing a single manifest-tracked package.
 enum RepairOutcome {
     /// Successfully reinstalled from `source`.
     Repaired { source: String },
     /// Package is healthy — nothing to do.
     Skipped,
-    /// Cannot repair automatically — user must intervene.
-    Unrepairable { reason: String, suggestion: String },
+    /// Cannot repair automatically — user must intervene. `kind` is emitted
+    /// verbatim into the JSON bucket entry, letting a single variant carry
+    /// both the `installed_missing` sub-kinds (bundled / path) and the
+    /// `symlink_dangling` case (dangling symlink at a manifest-tracked name).
+    Unrepairable {
+        kind: &'static str,
+        reason: String,
+        suggestion: String,
+    },
     /// Repair was attempted but failed.
     Failed { reason: String },
+}
+
+/// Accumulator for the four JSON output buckets.
+#[derive(Default)]
+struct Buckets {
+    repaired: Vec<serde_json::Value>,
+    skipped: Vec<serde_json::Value>,
+    unrepairable: Vec<serde_json::Value>,
+    failed: Vec<serde_json::Value>,
+}
+
+impl Buckets {
+    fn any_matched(&self) -> bool {
+        !self.repaired.is_empty()
+            || !self.skipped.is_empty()
+            || !self.unrepairable.is_empty()
+            || !self.failed.is_empty()
+    }
+
+    fn into_json(self) -> String {
+        serde_json::json!({
+            "repaired": self.repaired,
+            "skipped": self.skipped,
+            "unrepairable": self.unrepairable,
+            "failed": self.failed,
+        })
+        .to_string()
+    }
+}
+
+/// Suggestion string shared by the manifest-pass dangling-symlink case and
+/// the (A) unattached-symlink pass.
+fn symlink_dangling_suggestion(name: &str) -> String {
+    format!("alc_pkg_unlink({name:?}) then alc_pkg_link with the new path")
+}
+
+/// Push a manifest-pass outcome into the appropriate bucket. Non-Unrepairable
+/// outcomes use `kind = "installed_missing"`; Unrepairable carries its own
+/// kind so both `installed_missing` (bundled/path) and `symlink_dangling`
+/// can flow through the same helper.
+fn push_installed_outcome(name: &str, outcome: RepairOutcome, buckets: &mut Buckets) {
+    match outcome {
+        RepairOutcome::Repaired { source } => buckets.repaired.push(serde_json::json!({
+            "name": name,
+            "kind": "installed_missing",
+            "action": "reinstall",
+            "source": source,
+        })),
+        RepairOutcome::Skipped => buckets.skipped.push(serde_json::json!({
+            "name": name,
+            "reason": "healthy",
+        })),
+        RepairOutcome::Unrepairable {
+            kind,
+            reason,
+            suggestion,
+        } => buckets.unrepairable.push(serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "reason": reason,
+            "suggestion": suggestion,
+        })),
+        RepairOutcome::Failed { reason } => buckets.failed.push(serde_json::json!({
+            "name": name,
+            "kind": "installed_missing",
+            "reason": reason,
+        })),
+    }
 }
 
 impl AppService {
@@ -53,11 +128,7 @@ impl AppService {
         let pkg_dir = packages_dir()?;
         let resolved_root = resolve_project_root(project_root.as_deref());
 
-        let mut repaired: Vec<serde_json::Value> = Vec::new();
-        let mut skipped: Vec<serde_json::Value> = Vec::new();
-        let mut unrepairable: Vec<serde_json::Value> = Vec::new();
-        let mut failed: Vec<serde_json::Value> = Vec::new();
-
+        let mut buckets = Buckets::default();
         let target_filter = name.as_deref();
 
         // ── (B) installed pkgs from manifest ──────────────────────
@@ -67,77 +138,17 @@ impl AppService {
                     continue;
                 }
             }
-
-            match self.repair_installed(pkg_name, entry, &pkg_dir).await {
-                RepairOutcome::Repaired { source } => repaired.push(serde_json::json!({
-                    "name": pkg_name,
-                    "kind": "installed_missing",
-                    "action": "reinstall",
-                    "source": source,
-                })),
-                RepairOutcome::Skipped => skipped.push(serde_json::json!({
-                    "name": pkg_name,
-                    "reason": "healthy",
-                })),
-                RepairOutcome::Unrepairable { reason, suggestion } => {
-                    unrepairable.push(serde_json::json!({
-                        "name": pkg_name,
-                        "kind": "installed_missing",
-                        "reason": reason,
-                        "suggestion": suggestion,
-                    }));
-                }
-                RepairOutcome::Failed { reason } => failed.push(serde_json::json!({
-                    "name": pkg_name,
-                    "kind": "installed_missing",
-                    "reason": reason,
-                })),
-            }
+            let outcome = self.repair_installed(pkg_name, entry, &pkg_dir).await;
+            push_installed_outcome(pkg_name, outcome, &mut buckets);
         }
 
-        // ── (A) global symlinks dangling — surface as unrepairable ──
-        if let Ok(read) = std::fs::read_dir(&pkg_dir) {
-            for dir_entry in read.flatten() {
-                let path = dir_entry.path();
-                let pkg_name = dir_entry.file_name().to_string_lossy().to_string();
-
-                if let Some(target) = target_filter {
-                    if target != pkg_name.as_str() {
-                        continue;
-                    }
-                }
-                // Already covered by manifest pass.
-                if manifest.packages.contains_key(&pkg_name) {
-                    continue;
-                }
-
-                let is_symlink = path
-                    .symlink_metadata()
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false);
-                if !is_symlink {
-                    continue;
-                }
-                let target_exists = path.try_exists().unwrap_or(false);
-                if target_exists {
-                    continue;
-                }
-
-                let link_target = path
-                    .read_link()
-                    .map(|t| t.display().to_string())
-                    .unwrap_or_else(|_| "<unknown>".to_string());
-
-                unrepairable.push(serde_json::json!({
-                    "name": pkg_name,
-                    "kind": "symlink_dangling",
-                    "reason": format!("symlink target missing: {link_target}"),
-                    "suggestion": format!(
-                        "alc_pkg_unlink({pkg_name:?}) then alc_pkg_link with the new path"
-                    ),
-                }));
-            }
-        }
+        // ── (A) unattached dangling symlinks (no manifest entry) ──
+        collect_unattached_dangling_symlinks(
+            &pkg_dir,
+            target_filter,
+            &manifest.packages,
+            &mut buckets.unrepairable,
+        );
 
         // ── (C) project `path = ...` missing ──────────────────────
         // ── (D) variant `path = ...` missing ──────────────────────
@@ -146,43 +157,34 @@ impl AppService {
                 root,
                 target_filter,
                 "project",
-                &mut unrepairable,
+                &mut buckets.unrepairable,
                 ProjectPathSource::Toml,
             );
             collect_path_missing(
                 root,
                 target_filter,
                 "variant",
-                &mut unrepairable,
+                &mut buckets.unrepairable,
                 ProjectPathSource::Local,
             );
         }
 
-        // ── target_filter sanity: nothing matched at all ─────────
         if let Some(target) = target_filter {
-            let any_matched = !repaired.is_empty()
-                || !skipped.is_empty()
-                || !unrepairable.is_empty()
-                || !failed.is_empty();
-            if !any_matched {
+            if !buckets.any_matched() {
                 return Err(format!(
                     "Package '{target}' not found in installed.json, ~/.algocline/packages/, alc.toml, or alc.local.toml"
                 ));
             }
         }
 
-        Ok(serde_json::json!({
-            "repaired": repaired,
-            "skipped": skipped,
-            "unrepairable": unrepairable,
-            "failed": failed,
-        })
-        .to_string())
+        Ok(buckets.into_json())
     }
 
     /// Attempt to repair a single manifest-tracked package by re-running
     /// `pkg_install` with the recorded `source`. Returns `Skipped` when the
-    /// package directory already exists (healthy).
+    /// package directory already exists (healthy), or Unrepairable with
+    /// `kind = "symlink_dangling"` when dest is a dangling symlink — the
+    /// (A) pass's "skip if in manifest" rule would otherwise drop this case.
     async fn repair_installed(
         &self,
         name: &str,
@@ -191,14 +193,25 @@ impl AppService {
     ) -> RepairOutcome {
         let dest = pkg_dir.join(name);
 
-        // If dest is a symlink (live or dangling), it's a pkg_link case and
-        // we don't touch it here — it will be handled by the (A) pass.
         let is_symlink = dest
             .symlink_metadata()
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
         if is_symlink {
-            return RepairOutcome::Skipped;
+            // `try_exists` follows the symlink — true iff target is alive.
+            let target_alive = dest.try_exists().unwrap_or(false);
+            if target_alive {
+                return RepairOutcome::Skipped;
+            }
+            let link_target = dest
+                .read_link()
+                .map(|t| t.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            return RepairOutcome::Unrepairable {
+                kind: "symlink_dangling",
+                reason: format!("symlink target missing: {link_target}"),
+                suggestion: symlink_dangling_suggestion(name),
+            };
         }
 
         if dest.exists() {
@@ -206,31 +219,91 @@ impl AppService {
         }
 
         // Source classification: only `Installed` (local copy) and `Git` can be
-        // re-fetched. Bundled is conceptually re-installable via `init` but
-        // out of scope for `pkg_repair`. Path is not tracked in manifest.
+        // re-fetched. Bundled is conceptually re-installable via `alc_init`;
+        // Path sources are not tracked in the manifest for repair.
         let inferred = super::super::source::infer_from_legacy_source_string(&entry.source);
         match inferred {
-            PackageSource::Installed | PackageSource::Git { .. } => {
-                match self
-                    .pkg_install(entry.source.clone(), Some(name.to_string()))
-                    .await
-                {
-                    Ok(_) => RepairOutcome::Repaired {
-                        source: entry.source.clone(),
-                    },
-                    Err(e) => RepairOutcome::Failed { reason: e },
-                }
-            }
+            PackageSource::Installed | PackageSource::Git { .. } => match self
+                .pkg_install(entry.source.clone(), Some(name.to_string()))
+                .await
+            {
+                Ok(_) => RepairOutcome::Repaired {
+                    source: entry.source.clone(),
+                },
+                Err(e) => RepairOutcome::Failed { reason: e },
+            },
             PackageSource::Bundled { .. } => RepairOutcome::Unrepairable {
+                kind: "installed_missing",
                 reason: "bundled package — restore via `alc_init` or reinstall algocline"
                     .to_string(),
-                suggestion: format!("alc_pkg_install({:?})", entry.source),
+                suggestion: "alc_init (reinstalls bundled packages from the algocline binary)"
+                    .to_string(),
             },
             PackageSource::Path { path } => RepairOutcome::Unrepairable {
+                kind: "installed_missing",
                 reason: format!("path source ({path}) — not tracked in manifest for repair"),
                 suggestion: "edit alc.toml or alc.local.toml directly".to_string(),
             },
         }
+    }
+}
+
+/// Scan `pkg_dir` for dangling symlinks whose name is *not* present in the
+/// manifest. Manifest-tracked names are handled by `repair_installed` so
+/// they're skipped here to avoid double-counting.
+fn collect_unattached_dangling_symlinks(
+    pkg_dir: &Path,
+    target_filter: Option<&str>,
+    manifest_names: &std::collections::BTreeMap<String, ManifestEntry>,
+    unrepairable: &mut Vec<serde_json::Value>,
+) {
+    let read = match std::fs::read_dir(pkg_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "pkg_repair: failed to read packages_dir at {}: {e}",
+                pkg_dir.display()
+            );
+            return;
+        }
+    };
+
+    for dir_entry in read.flatten() {
+        let path = dir_entry.path();
+        let pkg_name = dir_entry.file_name().to_string_lossy().to_string();
+
+        if let Some(target) = target_filter {
+            if target != pkg_name.as_str() {
+                continue;
+            }
+        }
+        if manifest_names.contains_key(&pkg_name) {
+            continue;
+        }
+
+        let is_symlink = path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_symlink {
+            continue;
+        }
+        let target_exists = path.try_exists().unwrap_or(false);
+        if target_exists {
+            continue;
+        }
+
+        let link_target = path
+            .read_link()
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+
+        unrepairable.push(serde_json::json!({
+            "name": pkg_name,
+            "kind": "symlink_dangling",
+            "reason": format!("symlink target missing: {link_target}"),
+            "suggestion": symlink_dangling_suggestion(&pkg_name),
+        }));
     }
 }
 
@@ -264,6 +337,12 @@ fn collect_path_missing(
     // For project scope, the lockfile is the more accurate source for the
     // resolved path (it absorbs canonicalization done at install time). Fall
     // back to the alc.toml declaration when no lockfile exists.
+    //
+    // TODO(variant-canonicalization): variant scope reads the raw
+    // alc.local.toml path verbatim. If `pkg_link --scope=variant` ever starts
+    // writing relative paths (today it writes absolute), this block will
+    // diverge from what `pkg_list` / `pkg_run` resolve — mirror the project
+    // lockfile lookup for variants at that point.
     let lock_lookup = if matches!(src, ProjectPathSource::Toml) {
         load_lockfile(root).ok().flatten().map(|l| {
             l.packages
@@ -310,9 +389,9 @@ fn collect_path_missing(
             ProjectPathSource::Toml => {
                 format!("update or remove [packages.{name}] in alc.toml")
             }
-            ProjectPathSource::Local => format!(
-                "alc_pkg_unlink({name:?}) or update [packages.{name}] in alc.local.toml"
-            ),
+            ProjectPathSource::Local => {
+                format!("alc_pkg_unlink({name:?}) or update [packages.{name}] in alc.local.toml")
+            }
         };
 
         unrepairable.push(serde_json::json!({
@@ -324,4 +403,3 @@ fn collect_path_missing(
         }));
     }
 }
-

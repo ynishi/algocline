@@ -1017,7 +1017,11 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
     // Build a source pkg dir outside of HOME.
     let source = fake_home.home.join("src_repo").join("repair_pkg");
     std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("init.lua"), "return { meta = { version = '0.1.0' } }").unwrap();
+    std::fs::write(
+        source.join("init.lua"),
+        "return { meta = { version = '0.1.0' } }",
+    )
+    .unwrap();
 
     let svc = make_app_service().await;
 
@@ -1117,9 +1121,14 @@ async fn pkg_repair_reports_dangling_symlink_as_unrepairable() {
 /// exist on disk — surfaced as unrepairable with `scope: "project"`.
 #[tokio::test]
 async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
-    let _home_lock = crate::service::test_support::lock_home();
-    let tmp = tempfile::tempdir().unwrap();
-    let project_root = tmp.path();
+    use crate::service::test_support::FakeHome;
+
+    // FakeHome acquires HOME_MUTEX at struct-field level — matches the
+    // other pkg_repair tests and avoids `await_holding_lock` on a local
+    // `MutexGuard` binding.
+    let fake_home = FakeHome::new();
+    let project_root = fake_home.home.join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
 
     std::fs::write(
         project_root.join("alc.toml"),
@@ -1138,21 +1147,20 @@ async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
     let entry = unrepairable
         .iter()
         .find(|e| e["name"] == "ghost" && e["scope"] == "project")
-        .expect("ghost must surface as project path_missing, got: {json}");
+        .unwrap_or_else(|| panic!("ghost must surface as project path_missing, got: {json}"));
     assert_eq!(entry["kind"], "path_missing");
-    assert!(entry["suggestion"]
-        .as_str()
-        .unwrap()
-        .contains("alc.toml"));
+    assert!(entry["suggestion"].as_str().unwrap().contains("alc.toml"));
 }
 
 /// (D) variant-scope `path = ...` declared in alc.local.toml but the path
 /// doesn't exist on disk — surfaced as unrepairable with `scope: "variant"`.
 #[tokio::test]
 async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
-    let _home_lock = crate::service::test_support::lock_home();
-    let tmp = tempfile::tempdir().unwrap();
-    let project_root = tmp.path();
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+    let project_root = fake_home.home.join("proj");
+    std::fs::create_dir_all(&project_root).unwrap();
 
     let absent = project_root.join("nope_pkg");
     std::fs::write(
@@ -1186,7 +1194,12 @@ async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
 /// `name` filter that matches nothing → Err with informative message.
 #[tokio::test]
 async fn pkg_repair_unknown_name_returns_error() {
-    let _home_lock = crate::service::test_support::lock_home();
+    use crate::service::test_support::FakeHome;
+
+    // FakeHome isolates HOME so this test doesn't depend on whether the
+    // developer happens to have a package with the probe name installed.
+    let _fake_home = FakeHome::new();
+
     let svc = make_app_service().await;
     let err = svc
         .pkg_repair(Some("nonexistent_pkg".to_string()), None)
@@ -1197,4 +1210,3 @@ async fn pkg_repair_unknown_name_returns_error() {
         "error should mention the missing name, got: {err}"
     );
 }
-

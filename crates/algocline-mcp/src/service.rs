@@ -1263,6 +1263,9 @@ mod tests {
         assert!(s.contains("\"global\""), "schema missing global: {s}");
         assert!(s.contains("\"variant\""), "schema missing variant: {s}");
         // The pre-decision value must not leak into the schema.
-        assert!(!s.contains("\"local\""), "schema unexpectedly contains legacy 'local': {s}");
+        assert!(
+            !s.contains("\"local\""),
+            "schema unexpectedly contains legacy 'local': {s}"
+        );
     }
 }

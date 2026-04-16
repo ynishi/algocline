@@ -328,11 +328,7 @@ mod tests {
         .to_string();
 
         let result = executor
-            .eval_simple_with_paths(
-                code,
-                vec![],
-                vec![VariantPkg::new("logical_name", pkg_dir)],
-            )
+            .eval_simple_with_paths(code, vec![], vec![VariantPkg::new("logical_name", pkg_dir)])
             .await
             .unwrap();
 
@@ -364,11 +360,7 @@ mod tests {
         .to_string();
 
         let result = executor
-            .eval_simple_with_paths(
-                code,
-                vec![],
-                vec![VariantPkg::new("my_pkg", variant_dir)],
-            )
+            .eval_simple_with_paths(code, vec![], vec![VariantPkg::new("my_pkg", variant_dir)])
             .await
             .unwrap();
 

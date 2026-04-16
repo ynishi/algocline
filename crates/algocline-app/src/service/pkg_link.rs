@@ -12,9 +12,7 @@ use std::os::unix::fs::symlink;
 
 use std::path::{Path, PathBuf};
 
-use super::alc_toml::{
-    self, add_package_entry, validate_package_name, PackageDep,
-};
+use super::alc_toml::{self, add_package_entry, validate_package_name, PackageDep};
 use super::project::resolve_project_root;
 #[cfg(unix)]
 use super::resolve::packages_dir;
@@ -107,10 +105,7 @@ impl AppService {
                         source
                             .file_name()
                             .ok_or_else(|| {
-                                format!(
-                                    "Cannot determine package name from: {}",
-                                    source.display()
-                                )
+                                format!("Cannot determine package name from: {}", source.display())
                             })?
                             .to_string_lossy()
                             .to_string()
@@ -133,8 +128,8 @@ impl AppService {
                     })?;
 
                     for entry in entries {
-                        let entry = entry
-                            .map_err(|e| format!("Failed to read directory entry: {e}"))?;
+                        let entry =
+                            entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
                         let pkg_path = entry.path();
                         // Skip non-dirs and dirs without init.lua.
                         if !pkg_path.is_dir() || !pkg_path.join("init.lua").exists() {
@@ -617,11 +612,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cache_link = env
-            .home
-            .join(".algocline")
-            .join("packages")
-            .join("my_pkg");
+        let cache_link = env.home.join(".algocline").join("packages").join("my_pkg");
         assert!(
             cache_link.symlink_metadata().is_err(),
             "variant scope must not create a symlink in ~/.algocline/packages/"

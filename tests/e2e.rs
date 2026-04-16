@@ -693,9 +693,7 @@ return M"#,
     )
     .await;
 
-    let repaired = resp["repaired"]
-        .as_array()
-        .expect("repaired array missing");
+    let repaired = resp["repaired"].as_array().expect("repaired array missing");
     assert_eq!(repaired.len(), 1, "one repair expected, got: {resp}");
     assert_eq!(repaired[0]["name"], "e2e_repair_pkg");
     assert_eq!(repaired[0]["kind"], "installed_missing");

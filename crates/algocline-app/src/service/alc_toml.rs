@@ -154,12 +154,9 @@ pub(crate) fn load_alc_local_toml_document(
 ///
 /// Shared by `save_alc_toml` and `save_alc_local_toml`.
 fn save_alc_toml_at(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "Cannot determine parent directory for {}",
-            path.display()
-        )
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Cannot determine parent directory for {}", path.display()))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("Failed to create directory for {}: {e}", path.display()))?;
 
@@ -197,10 +194,7 @@ pub(crate) fn save_alc_local_toml(
 /// - Entries whose resolved path does not exist are skipped with a
 ///   `tracing::warn!`.
 /// - Iteration order follows `BTreeMap` (= package-name ascending).
-pub(crate) fn resolve_local_path_entries(
-    project_root: &Path,
-    local: &AlcToml,
-) -> Vec<PathBuf> {
+pub(crate) fn resolve_local_path_entries(project_root: &Path, local: &AlcToml) -> Vec<PathBuf> {
     resolve_local_variant_pkgs(project_root, local)
         .into_iter()
         .map(|vp| vp.pkg_dir)
@@ -572,10 +566,7 @@ invalid_key = 42
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("target-dir");
         std::fs::create_dir_all(&target).unwrap();
-        let content = format!(
-            "[packages.cot]\npath = \"{}\"\n",
-            target.display()
-        );
+        let content = format!("[packages.cot]\npath = \"{}\"\n", target.display());
         std::fs::write(tmp.path().join("alc.local.toml"), &content).unwrap();
 
         let parsed = load_alc_local_toml(tmp.path()).unwrap().unwrap();

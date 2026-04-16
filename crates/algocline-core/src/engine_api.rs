@@ -106,12 +106,24 @@ pub trait EngineApi: Send + Sync {
 
     /// Link a local directory as a project-local package (symlink to cache).
     ///
-    /// Phase 2 (subtask 5) will implement the full symlink logic.
+    /// Scope selection:
+    /// - `scope = None` or `Some("global")` — symlink into `~/.algocline/packages/`
+    ///   (visible to all projects).
+    /// - `scope = Some("variant")` — record the path in `alc.local.toml`
+    ///   at the project root (worktree-scoped override, git-ignored). No
+    ///   symlink is created.
+    /// - Any other value → `Err("invalid scope: ...")`.
+    ///
+    /// `project_root` is only consulted when `scope = Some("variant")`.
+    /// If `None`, falls back to `ALC_PROJECT_ROOT` env or ancestor walk
+    /// from cwd.
     async fn pkg_link(
         &self,
         path: String,
         name: Option<String>,
         force: Option<bool>,
+        scope: Option<String>,
+        project_root: Option<String>,
     ) -> Result<String, String>;
 
     /// List installed packages with metadata.

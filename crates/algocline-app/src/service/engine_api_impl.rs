@@ -113,8 +113,10 @@ impl EngineApi for AppService {
         path: String,
         name: Option<String>,
         force: Option<bool>,
+        scope: Option<String>,
+        project_root: Option<String>,
     ) -> Result<String, String> {
-        AppService::pkg_link(self, path, name, force).await
+        AppService::pkg_link(self, path, name, force, scope, project_root).await
     }
 
     async fn pkg_unlink(&self, name: String) -> Result<String, String> {

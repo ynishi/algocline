@@ -1210,3 +1210,135 @@ async fn pkg_repair_unknown_name_returns_error() {
         "error should mention the missing name, got: {err}"
     );
 }
+
+/// LocalPath source dir vanished after manifest was written: classify as
+/// Unrepairable (structural impossibility — no bytes to copy from), not
+/// Failed (runtime error). Also verifies the `reason` names the missing path
+/// so the operator can act on it without reading installed.json by hand.
+#[tokio::test]
+async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    let source = fake_home.home.join("gone").join("ghost_pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("init.lua"), "return {}").unwrap();
+
+    let svc = make_app_service().await;
+    svc.pkg_install(source.display().to_string(), None)
+        .await
+        .expect("initial install");
+
+    // Break both the installed dest AND the source so repair can't auto-heal.
+    let dest = fake_home
+        .home
+        .join(".algocline")
+        .join("packages")
+        .join("ghost_pkg");
+    std::fs::remove_dir_all(&dest).unwrap();
+    std::fs::remove_dir_all(&source).unwrap();
+
+    let result = svc.pkg_repair(None, None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert!(
+        json["failed"].as_array().unwrap().is_empty(),
+        "missing-source must not leak into `failed`; got: {json}"
+    );
+    let unrepairable = json["unrepairable"].as_array().expect("unrepairable");
+    let entry = unrepairable
+        .iter()
+        .find(|e| e["name"] == "ghost_pkg")
+        .unwrap_or_else(|| panic!("ghost_pkg must appear in unrepairable, got: {json}"));
+    assert_eq!(entry["kind"], "installed_missing");
+    let reason = entry["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("source directory missing"),
+        "reason should mention missing source, got: {reason}"
+    );
+    assert!(
+        reason.contains("ghost_pkg"),
+        "reason should name the path, got: {reason}"
+    );
+}
+
+/// LocalPath source exists but has no `init.lua` at root: current install
+/// layer routes this into collection mode which rejects `name`, so repair
+/// can't produce bytes for the named pkg. Classify Unrepairable (structural
+/// impossibility) rather than Failed.
+#[tokio::test]
+async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    // Build a valid source first so pkg_install succeeds and writes manifest.
+    let source = fake_home.home.join("shell").join("shell_pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("init.lua"), "return {}").unwrap();
+
+    let svc = make_app_service().await;
+    svc.pkg_install(source.display().to_string(), None)
+        .await
+        .expect("initial install");
+
+    // Break the installed dest, then mutate the source into an empty-dir
+    // shape (remove init.lua) so repair's pre-check lands on the
+    // "no init.lua at root" branch rather than the source-missing one.
+    let dest = fake_home
+        .home
+        .join(".algocline")
+        .join("packages")
+        .join("shell_pkg");
+    std::fs::remove_dir_all(&dest).unwrap();
+    std::fs::remove_file(source.join("init.lua")).unwrap();
+
+    let result = svc.pkg_repair(None, None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert!(
+        json["failed"].as_array().unwrap().is_empty(),
+        "init.lua-missing must not leak into `failed`; got: {json}"
+    );
+    let entry = json["unrepairable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "shell_pkg")
+        .unwrap_or_else(|| panic!("shell_pkg must appear in unrepairable, got: {json}"))
+        .clone();
+    assert_eq!(entry["kind"], "installed_missing");
+    let reason = entry["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no init.lua at root"),
+        "reason should cite missing init.lua, got: {reason}"
+    );
+}
+
+/// Direct `pkg_install` against a non-existent path must surface a clear
+/// "Source directory does not exist" error rather than the misleading
+/// collection-mode "'name' parameter is only supported..." error (which
+/// previously fired because a missing source has no `init.lua` at root and
+/// fell through to the collection branch).
+#[tokio::test]
+async fn pkg_install_rejects_missing_local_source_with_clear_error() {
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+
+    let svc = make_app_service().await;
+    let missing = "/tmp/alc-nonexistent-source-for-test-2e8f3a";
+    let err = svc
+        .pkg_install(missing.to_string(), Some("anything".to_string()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("Source directory does not exist"),
+        "expected explicit source-missing error, got: {err}"
+    );
+    assert!(
+        !err.contains("'name' parameter"),
+        "must not regress to collection-mode misleading error, got: {err}"
+    );
+}

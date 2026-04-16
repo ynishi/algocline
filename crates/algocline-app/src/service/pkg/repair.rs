@@ -225,13 +225,12 @@ impl AppService {
         //
         // `infer_from_legacy_source_string` classifies **syntactically** (shape,
         // not filesystem existence), so a manifest entry whose local source
-        // directory has since been deleted still maps to `Installed` — and we
-        // route it through `install_from_local_path`, whose error
-        // ("Failed to read source dir: ... No such file or directory") is
-        // diagnostic. Prior to that fix this branch fell through to the Git
-        // arm and produced `git clone https:///abs/path` → "unable to find
-        // remote helper for 'https'", the exact symptom the `pkg_install`
-        // typed-dispatch refactor (H1) set out to eliminate.
+        // directory has since been deleted still maps to `Installed`. That case
+        // is a structural dead-end (nothing to copy from), so we route it to
+        // `Unrepairable` in the pre-check below — matching the policy used for
+        // Bundled / Path sources: states detectable before attempting install
+        // belong in `unrepairable`, not `failed`. `failed` is reserved for
+        // runtime errors during an actual install attempt.
         let inferred = super::super::source::infer_from_legacy_source_string(&entry.source);
         let install_source = match inferred {
             PackageSource::Installed => InstallSource::LocalPath(PathBuf::from(&entry.source)),
@@ -260,6 +259,43 @@ impl AppService {
                 };
             }
         };
+
+        // Pre-check: a LocalPath is structurally unrepairable when
+        // (a) the source directory no longer exists, or
+        // (b) the source exists but has no `init.lua` at its root.
+        // (b) matters because `install_from_local_path` routes a no-root-init
+        // source into collection mode, which rejects the `name` argument that
+        // repair must pass — the combination is unreachable with the current
+        // install layer, so there are no bytes to copy for *this* named pkg.
+        // Classify both up front rather than letting the install layer fail
+        // at runtime; that would land in `failed`, mixing structural
+        // impossibility with transient runtime failures.
+        //
+        // Git sources are deliberately not pre-checked here: network/remote
+        // availability is a runtime concern that belongs in the attempt path.
+        if let InstallSource::LocalPath(ref p) = install_source {
+            if !p.exists() {
+                return RepairOutcome::Unrepairable {
+                    kind: "installed_missing",
+                    reason: format!("source directory missing: {}", p.display()),
+                    suggestion: format!(
+                        "alc_pkg_install from a valid source, or remove the '{name}' entry from ~/.algocline/installed.json"
+                    ),
+                };
+            }
+            if !p.join("init.lua").exists() {
+                return RepairOutcome::Unrepairable {
+                    kind: "installed_missing",
+                    reason: format!(
+                        "source directory has no init.lua at root: {}",
+                        p.display()
+                    ),
+                    suggestion: format!(
+                        "alc_pkg_install from a valid source, or remove the '{name}' entry from ~/.algocline/installed.json"
+                    ),
+                };
+            }
+        }
 
         match self
             .pkg_install_typed(install_source, Some(name.to_string()))

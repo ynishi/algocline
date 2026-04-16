@@ -280,6 +280,17 @@ impl AppService {
         pkg_dir: &Path,
         name: Option<String>,
     ) -> Result<String, String> {
+        // Reject a missing source dir up front. Without this check, a missing
+        // path falls through to the Collection branch (since `init.lua` isn't
+        // present) and surfaces as the misleading "'name' parameter is only
+        // supported for single-package dirs" error when `name` is provided —
+        // which hides the real failure mode (source gone) from the caller.
+        if !source.exists() {
+            return Err(format!(
+                "Source directory does not exist: {}",
+                source.display()
+            ));
+        }
         if source.join("init.lua").exists() {
             // Single package
             let name = name.unwrap_or_else(|| {

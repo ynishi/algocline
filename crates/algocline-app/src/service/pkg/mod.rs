@@ -58,6 +58,7 @@
 mod install;
 mod list;
 mod remove;
+mod repair;
 
 #[cfg(test)]
 mod tests;

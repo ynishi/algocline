@@ -647,3 +647,61 @@ async fn test_variant_scope_link_then_run_require() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// Install → remove dest dir → repair: full round-trip through MCP.
+/// Covers the (B) installed-dir-missing class of `alc_pkg_repair`.
+#[tokio::test]
+async fn test_pkg_repair_reinstalls_deleted_dir() {
+    let client = connect().await;
+
+    // Source pkg dir outside HOME.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("e2e_repair_pkg");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::write(
+        source.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_repair_pkg", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    // Install.
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": source.to_string_lossy() }),
+    )
+    .await;
+
+    // Simulate breakage: remove the installed dest.
+    let dest = dirs::home_dir()
+        .expect("home")
+        .join(".algocline")
+        .join("packages")
+        .join("e2e_repair_pkg");
+    assert!(dest.exists(), "dest should exist after install");
+    std::fs::remove_dir_all(&dest).expect("rm dest");
+    assert!(!dest.exists());
+
+    // Repair.
+    let resp = call_json(
+        &client,
+        "alc_pkg_repair",
+        json!({ "name": "e2e_repair_pkg" }),
+    )
+    .await;
+
+    let repaired = resp["repaired"]
+        .as_array()
+        .expect("repaired array missing");
+    assert_eq!(repaired.len(), 1, "one repair expected, got: {resp}");
+    assert_eq!(repaired[0]["name"], "e2e_repair_pkg");
+    assert_eq!(repaired[0]["kind"], "installed_missing");
+    assert!(dest.exists(), "dest should be restored after repair");
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&dest);
+    client.cancel().await.expect("cancel failed");
+}

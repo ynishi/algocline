@@ -1003,3 +1003,198 @@ async fn pkg_list_variant_shadows_project() {
         "project entry must be demoted when shadowed by variant"
     );
 }
+
+// ── pkg_repair tests ────────────────────────────────────────
+
+/// (B) installed dir missing: pkg_install populates manifest, then we delete
+/// the dest dir, then pkg_repair must restore it via reinstall.
+#[tokio::test]
+async fn pkg_repair_reinstalls_missing_installed_dir() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    // Build a source pkg dir outside of HOME.
+    let source = fake_home.home.join("src_repo").join("repair_pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("init.lua"), "return { meta = { version = '0.1.0' } }").unwrap();
+
+    let svc = make_app_service().await;
+
+    // Initial install — populates installed.json and creates dest dir.
+    svc.pkg_install(source.display().to_string(), None)
+        .await
+        .expect("initial install");
+
+    let dest = fake_home
+        .home
+        .join(".algocline")
+        .join("packages")
+        .join("repair_pkg");
+    assert!(dest.exists(), "dest must exist after install");
+
+    // Simulate breakage: remove the dest dir.
+    std::fs::remove_dir_all(&dest).unwrap();
+    assert!(!dest.exists());
+
+    // Repair — should re-run install from manifest source.
+    let result = svc.pkg_repair(None, None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    let repaired = json["repaired"].as_array().expect("repaired array");
+    assert_eq!(repaired.len(), 1, "exactly one repair, got: {json}");
+    assert_eq!(repaired[0]["name"], "repair_pkg");
+    assert_eq!(repaired[0]["kind"], "installed_missing");
+    assert_eq!(repaired[0]["action"], "reinstall");
+    assert!(dest.exists(), "dest must be restored after repair");
+}
+
+/// Healthy package — manifest entry + dest exist → Skipped.
+#[tokio::test]
+async fn pkg_repair_skips_healthy_pkg() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    let source = fake_home.home.join("src_repo").join("healthy_pkg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("init.lua"), "return {}").unwrap();
+
+    let svc = make_app_service().await;
+    svc.pkg_install(source.display().to_string(), None)
+        .await
+        .unwrap();
+
+    let result = svc.pkg_repair(None, None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert!(
+        json["repaired"].as_array().unwrap().is_empty(),
+        "no repair expected"
+    );
+    let skipped = json["skipped"].as_array().unwrap();
+    assert!(
+        skipped.iter().any(|e| e["name"] == "healthy_pkg"),
+        "healthy_pkg must be in skipped, got: {json}"
+    );
+}
+
+/// (A) global symlink dangling — surfaced as unrepairable.
+#[tokio::test]
+async fn pkg_repair_reports_dangling_symlink_as_unrepairable() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    // Create the packages dir and a dangling symlink in it.
+    let pkg_dir = fake_home.home.join(".algocline").join("packages");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+
+    let target = fake_home.home.join("does_not_exist");
+    let link = pkg_dir.join("dangling_pkg");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc.pkg_repair(None, None).await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    let unrepairable = json["unrepairable"].as_array().expect("unrepairable array");
+    let entry = unrepairable
+        .iter()
+        .find(|e| e["name"] == "dangling_pkg")
+        .expect("dangling_pkg must surface as unrepairable");
+    assert_eq!(entry["kind"], "symlink_dangling");
+    assert!(
+        entry["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("alc_pkg_unlink"),
+        "suggestion should mention alc_pkg_unlink"
+    );
+}
+
+/// (C) project-scope `path = ...` declared in alc.toml but the path doesn't
+/// exist on disk — surfaced as unrepairable with `scope: "project"`.
+#[tokio::test]
+async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
+    let _home_lock = crate::service::test_support::lock_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    std::fs::write(
+        project_root.join("alc.toml"),
+        "[packages]\nghost = { path = \"missing_dir\" }\n",
+    )
+    .unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_repair(None, Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    let unrepairable = json["unrepairable"].as_array().unwrap();
+    let entry = unrepairable
+        .iter()
+        .find(|e| e["name"] == "ghost" && e["scope"] == "project")
+        .expect("ghost must surface as project path_missing, got: {json}");
+    assert_eq!(entry["kind"], "path_missing");
+    assert!(entry["suggestion"]
+        .as_str()
+        .unwrap()
+        .contains("alc.toml"));
+}
+
+/// (D) variant-scope `path = ...` declared in alc.local.toml but the path
+/// doesn't exist on disk — surfaced as unrepairable with `scope: "variant"`.
+#[tokio::test]
+async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
+    let _home_lock = crate::service::test_support::lock_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    let absent = project_root.join("nope_pkg");
+    std::fs::write(
+        project_root.join("alc.local.toml"),
+        format!(
+            "[packages]\nnope_pkg = {{ path = \"{}\" }}\n",
+            absent.display()
+        ),
+    )
+    .unwrap();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_repair(None, Some(project_root.to_string_lossy().to_string()))
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    let unrepairable = json["unrepairable"].as_array().unwrap();
+    let entry = unrepairable
+        .iter()
+        .find(|e| e["name"] == "nope_pkg" && e["scope"] == "variant")
+        .expect("nope_pkg must surface as variant path_missing");
+    assert_eq!(entry["kind"], "path_missing");
+    assert!(entry["suggestion"]
+        .as_str()
+        .unwrap()
+        .contains("alc_pkg_unlink"));
+}
+
+/// `name` filter that matches nothing → Err with informative message.
+#[tokio::test]
+async fn pkg_repair_unknown_name_returns_error() {
+    let _home_lock = crate::service::test_support::lock_home();
+    let svc = make_app_service().await;
+    let err = svc
+        .pkg_repair(Some("nonexistent_pkg".to_string()), None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("nonexistent_pkg"),
+        "error should mention the missing name, got: {err}"
+    );
+}
+

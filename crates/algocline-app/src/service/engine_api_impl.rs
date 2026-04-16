@@ -140,6 +140,14 @@ impl EngineApi for AppService {
         AppService::pkg_remove(self, name, project_root, version).await
     }
 
+    async fn pkg_repair(
+        &self,
+        name: Option<String>,
+        project_root: Option<String>,
+    ) -> Result<String, String> {
+        AppService::pkg_repair(self, name, project_root).await
+    }
+
     // ─── Logging ─────────────────────────────────────────────
 
     async fn add_note(

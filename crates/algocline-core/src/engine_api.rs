@@ -151,6 +151,16 @@ pub trait EngineApi: Send + Sync {
         version: Option<String>,
     ) -> Result<String, String>;
 
+    /// Heal broken package state by reinstalling entries whose installed
+    /// directory is missing. Other broken kinds (dangling symlink,
+    /// declared-path missing) are surfaced as `unrepairable` with a
+    /// suggested remediation.
+    async fn pkg_repair(
+        &self,
+        name: Option<String>,
+        project_root: Option<String>,
+    ) -> Result<String, String>;
+
     // ─── Logging ─────────────────────────────────────────────
 
     /// Append a note to a session's log file.

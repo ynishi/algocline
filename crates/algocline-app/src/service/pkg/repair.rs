@@ -12,7 +12,7 @@
 //! `alc_pkg_repair` is an actuator (side-effecting). The sensor side
 //! (`alc_pkg_list`) is intentionally read-only — see decisions.md Q3.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::super::alc_toml::{self, PackageDep};
 use super::super::lockfile::load_lockfile;
@@ -21,6 +21,7 @@ use super::super::project::resolve_project_root;
 use super::super::resolve::packages_dir;
 use super::super::source::PackageSource;
 use super::super::AppService;
+use super::install::InstallSource;
 
 /// Outcome of repairing a single manifest-tracked package.
 enum RepairOutcome {
@@ -221,30 +222,61 @@ impl AppService {
         // Source classification: only `Installed` (local copy) and `Git` can be
         // re-fetched. Bundled is conceptually re-installable via `alc_init`;
         // Path sources are not tracked in the manifest for repair.
+        //
+        // We classify once here and hand the typed `InstallSource` to
+        // `pkg_install_typed` so the installer does not re-check
+        // `is_absolute() && is_dir()` on a string that may refer to a
+        // directory which no longer exists — that TOCTOU path is what
+        // produces the "git clone failed: ...'https:///var/folders/...'"
+        // symptom observed in pkg_repair's earlier implementation.
         let inferred = super::super::source::infer_from_legacy_source_string(&entry.source);
-        match inferred {
-            PackageSource::Installed | PackageSource::Git { .. } => match self
-                .pkg_install(entry.source.clone(), Some(name.to_string()))
-                .await
-            {
-                Ok(_) => RepairOutcome::Repaired {
-                    source: entry.source.clone(),
-                },
-                Err(e) => RepairOutcome::Failed { reason: e },
+        let install_source = match inferred {
+            PackageSource::Installed => InstallSource::LocalPath(PathBuf::from(&entry.source)),
+            PackageSource::Git { url, .. } => InstallSource::GitUrl(normalize_git_url(&url)),
+            PackageSource::Bundled { .. } => {
+                return RepairOutcome::Unrepairable {
+                    kind: "installed_missing",
+                    reason: "bundled package — restore via `alc_init` or reinstall algocline"
+                        .to_string(),
+                    suggestion: "alc_init (reinstalls bundled packages from the algocline binary)"
+                        .to_string(),
+                };
+            }
+            PackageSource::Path { path } => {
+                return RepairOutcome::Unrepairable {
+                    kind: "installed_missing",
+                    reason: format!("path source ({path}) — not tracked in manifest for repair"),
+                    suggestion: "edit alc.toml or alc.local.toml directly".to_string(),
+                };
+            }
+        };
+
+        match self
+            .pkg_install_typed(install_source, Some(name.to_string()))
+            .await
+        {
+            Ok(_) => RepairOutcome::Repaired {
+                source: entry.source.clone(),
             },
-            PackageSource::Bundled { .. } => RepairOutcome::Unrepairable {
-                kind: "installed_missing",
-                reason: "bundled package — restore via `alc_init` or reinstall algocline"
-                    .to_string(),
-                suggestion: "alc_init (reinstalls bundled packages from the algocline binary)"
-                    .to_string(),
-            },
-            PackageSource::Path { path } => RepairOutcome::Unrepairable {
-                kind: "installed_missing",
-                reason: format!("path source ({path}) — not tracked in manifest for repair"),
-                suggestion: "edit alc.toml or alc.local.toml directly".to_string(),
-            },
+            Err(e) => RepairOutcome::Failed { reason: e },
         }
+    }
+}
+
+/// Apply the same URL normalization `classify_install_url` uses (prefix
+/// `https://` to bare domain-style URLs) without re-checking whether the
+/// string refers to a local directory. Repair has already established the
+/// source is Git; re-classifying via the directory heuristic would be both
+/// redundant and racy.
+fn normalize_git_url(url: &str) -> String {
+    if url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("file://")
+        || url.starts_with("git@")
+    {
+        url.to_string()
+    } else {
+        format!("https://{url}")
     }
 }
 
@@ -268,7 +300,22 @@ fn collect_unattached_dangling_symlinks(
         }
     };
 
-    for dir_entry in read.flatten() {
+    for dir_entry_result in read {
+        let dir_entry = match dir_entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                // Previously this scan used `read.flatten()` which dropped
+                // per-entry I/O errors silently. Some names (permission
+                // denials, transient FS errors) therefore slipped through
+                // the dangling-symlink check without diagnosis. Log here
+                // so at least the repair attempt leaves a trail.
+                tracing::warn!(
+                    "pkg_repair: skipping unreadable entry in {}: {e}",
+                    pkg_dir.display()
+                );
+                continue;
+            }
+        };
         let path = dir_entry.path();
         let pkg_name = dir_entry.file_name().to_string_lossy().to_string();
 

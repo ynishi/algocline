@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 
 use mlua_pkg::{
     resolvers::{FsResolver, PrefixResolver},
-    sandbox::SymlinkAwareSandbox,
     Registry, Resolver,
 };
+
+use crate::resolver_factory::make_resolver;
 
 /// A variant-scoped package pinned to an explicit `(name, pkg_dir)` mapping.
 ///
@@ -71,22 +72,11 @@ impl Resolver for VariantRootResolver {
 
 /// Build a sandboxed `FsResolver` for a variant pkg's submodule lookups.
 ///
-/// Mirrors the behaviour of `Executor`'s global path resolver factory:
-/// `SymlinkAwareSandbox` by default so `alc_pkg_link` symlinks inside the
-/// variant pkg are followed; `ALC_PKG_STRICT=1` falls back to plain
-/// `FsResolver::new` (rejects all symlinks pointing outside the root).
+/// Delegates to the crate-level [`make_resolver`] factory so the sandbox
+/// policy (default `SymlinkAwareSandbox`, strict under `ALC_PKG_STRICT=1`)
+/// stays identical to the resolvers `Executor` and `alc.fork` construct.
 fn make_submodule_resolver(pkg_dir: &Path) -> Option<FsResolver> {
-    let strict = std::env::var("ALC_PKG_STRICT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if strict {
-        FsResolver::new(pkg_dir).ok()
-    } else {
-        SymlinkAwareSandbox::new(pkg_dir)
-            .ok()
-            .map(FsResolver::with_sandbox)
-    }
+    make_resolver(pkg_dir)
 }
 
 /// Register both the root resolver and the submodule prefix resolver for

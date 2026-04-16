@@ -10,10 +10,11 @@ use algocline_core::{BudgetHandle, ExecutionMetrics, QueryId};
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 use mlua_isle::{AsyncIsle, AsyncIsleDriver};
-use mlua_pkg::{resolvers::FsResolver, Registry};
+use mlua_pkg::Registry;
 
 use super::{register, BridgeConfig, PRELUDE};
 use crate::llm_bridge::{LlmRequest, QueryRequest};
+use crate::resolver_factory::make_resolver;
 use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
 
 /// Event from a child VM during fork execution.
@@ -111,16 +112,18 @@ pub(crate) fn register_fork(
                         // Variant pkgs first (highest priority — alc.local.toml wins).
                         register_variant_pkgs(&mut reg, &child_variants);
                         for path in &child_paths {
-                            match FsResolver::new(path) {
-                                Ok(resolver) => {
-                                    reg.add(resolver);
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "alc.fork: warn: FsResolver failed for {}: {e}",
-                                        path.display()
-                                    );
-                                }
+                            // Use the shared resolver factory so fork children honour
+                            // the same ALC_PKG_STRICT / SymlinkAwareSandbox policy as
+                            // the parent session's Executor-built VM. Prior to this,
+                            // fork always took the strict `FsResolver::new` path,
+                            // silently diverging when the parent was sandboxed.
+                            if let Some(resolver) = make_resolver(path) {
+                                reg.add(resolver);
+                            } else {
+                                eprintln!(
+                                    "alc.fork: warn: resolver init failed for {}",
+                                    path.display()
+                                );
                             }
                         }
                         reg.install(child_lua)?;

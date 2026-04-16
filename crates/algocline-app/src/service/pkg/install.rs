@@ -1,6 +1,6 @@
 //! `pkg_install` — install a package from a Git URL or local path.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::super::alc_toml::{
     add_package_entry, load_alc_toml_document, save_alc_toml, PackageDep,
@@ -16,30 +16,73 @@ use super::super::resolve::{
 use super::super::source::PackageSource;
 use super::super::AppService;
 
+/// Explicit install dispatch. Carries exactly the information `pkg_install`
+/// needs after classification so that downstream code does not re-classify
+/// a string (which is racy: the local directory may disappear between the
+/// caller's check and the installer's check).
+#[derive(Debug, Clone)]
+pub(crate) enum InstallSource {
+    /// Copy from a local directory (absolute path).
+    LocalPath(PathBuf),
+    /// Clone from a Git URL (already normalized with scheme or `git@`).
+    GitUrl(String),
+}
+
+/// Classify a caller-provided `url` string into an [`InstallSource`].
+///
+/// Must stay consistent with [`super::super::source::infer_from_legacy_source_string`]:
+/// an absolute-existing-dir string maps to [`InstallSource::LocalPath`] (matching
+/// `PackageSource::Installed`), everything else maps to a normalized Git URL.
+fn classify_install_url(url: &str) -> InstallSource {
+    let local_path = Path::new(url);
+    if local_path.is_absolute() && local_path.is_dir() {
+        return InstallSource::LocalPath(local_path.to_path_buf());
+    }
+
+    let git_url = if url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("file://")
+        || url.starts_with("git@")
+    {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    };
+    InstallSource::GitUrl(git_url)
+}
+
 impl AppService {
-    /// Install a package from a Git URL or local path.
+    /// Install a package from a Git URL or local path (string-typed, public MCP API).
+    ///
+    /// Classifies `url` via [`classify_install_url`] then delegates to
+    /// [`AppService::pkg_install_typed`]. Callers that already hold a
+    /// classified [`InstallSource`] (e.g. `pkg_repair`) should call the
+    /// typed API directly to avoid re-classifying a stale string.
     pub async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {
+        let source = classify_install_url(&url);
+        self.pkg_install_typed(source, name).await
+    }
+
+    /// Typed install dispatch. Does no string re-classification; branches
+    /// explicitly on the already-classified [`InstallSource`].
+    pub(crate) async fn pkg_install_typed(
+        &self,
+        source: InstallSource,
+        name: Option<String>,
+    ) -> Result<String, String> {
         let pkg_dir = packages_dir()?;
         let _ = std::fs::create_dir_all(&pkg_dir);
 
-        // Local path: copy directly (supports uncommitted/dirty working trees)
-        let local_path = Path::new(&url);
-        if local_path.is_absolute() && local_path.is_dir() {
-            return self
-                .install_from_local_path(local_path, &pkg_dir, name)
-                .await;
-        }
-
-        // Normalize URL: add https:// only for bare domain-style URLs
-        let git_url = if url.starts_with("http://")
-            || url.starts_with("https://")
-            || url.starts_with("file://")
-            || url.starts_with("git@")
-        {
-            url.clone()
-        } else {
-            format!("https://{url}")
+        let git_url = match source {
+            InstallSource::LocalPath(path) => {
+                return self.install_from_local_path(&path, &pkg_dir, name).await;
+            }
+            InstallSource::GitUrl(u) => u,
         };
+        // `url` is the recorded form used for manifest/hub. Normalization
+        // happens in `classify_install_url`, so this is already the
+        // scheme-prefixed form (e.g. `https://github.com/x`).
+        let url = git_url.clone();
 
         // Clone to temp directory first to detect single vs collection
         let staging = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;

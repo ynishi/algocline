@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Per-package record in the manifest.
@@ -33,6 +34,51 @@ pub(crate) struct Manifest {
 fn manifest_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     Ok(home.join(".algocline").join("installed.json"))
+}
+
+/// Path to the advisory lock companion file for the manifest.
+fn manifest_lock_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(home.join(".algocline").join("installed.json.lock"))
+}
+
+/// Execute `f` while holding an exclusive `flock` on the manifest's
+/// companion lock file.
+///
+/// `record_install`, `record_install_batch`, and `record_remove` all
+/// perform an unguarded read-modify-write sequence on `installed.json`.
+/// When two `pkg_install` calls overlap (e.g. the e2e suite running
+/// multiple `test_*` in-process tests against the same `$HOME`), one
+/// writer can load the manifest, the other completes its own
+/// load-modify-write, and the first writer then overwrites with its
+/// now-stale copy — losing entries.
+///
+/// The lock is released when `file` is dropped (on both the success and
+/// the error path), so the guard survives early returns inside `f`.
+fn with_manifest_lock<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> Result<R, String>,
+{
+    let lock_path = manifest_lock_path()?;
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create manifest lock dir: {e}"))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open manifest lock: {e}"))?;
+    FileExt::lock_exclusive(&file).map_err(|e| format!("Failed to acquire manifest lock: {e}"))?;
+
+    let result = f();
+    // Drop `file` — the OS releases the lock even if `f` panicked,
+    // so a poisoned result never leaves the lock held. Explicit
+    // unlock is skipped since `File::drop` calls it for us.
+    drop(file);
+    result
 }
 
 // ─── Read / Write ──────────────────────────────────────────────
@@ -108,26 +154,27 @@ pub(crate) fn record_install(
     version: Option<&str>,
     source: &str,
 ) -> Result<(), String> {
-    let mut manifest = load_manifest()?;
-    let now = now_iso8601();
+    with_manifest_lock(|| {
+        let mut manifest = load_manifest()?;
+        let now = now_iso8601();
 
-    let entry = manifest
-        .packages
-        .entry(name.to_string())
-        .and_modify(|e| {
-            e.version = version.map(String::from);
-            e.source = source.to_string();
-            e.updated_at = now.clone();
-        })
-        .or_insert_with(|| ManifestEntry {
-            version: version.map(String::from),
-            source: source.to_string(),
-            installed_at: now.clone(),
-            updated_at: now,
-        });
-    let _ = entry; // silence unused binding
+        manifest
+            .packages
+            .entry(name.to_string())
+            .and_modify(|e| {
+                e.version = version.map(String::from);
+                e.source = source.to_string();
+                e.updated_at = now.clone();
+            })
+            .or_insert_with(|| ManifestEntry {
+                version: version.map(String::from),
+                source: source.to_string(),
+                installed_at: now.clone(),
+                updated_at: now,
+            });
 
-    save_manifest(&manifest)
+        save_manifest(&manifest)
+    })
 }
 
 /// Record a batch of installs (e.g. collection mode).
@@ -135,34 +182,38 @@ pub(crate) fn record_install_batch(names: &[String], source: &str) -> Result<(),
     if names.is_empty() {
         return Ok(());
     }
-    let mut manifest = load_manifest()?;
-    let now = now_iso8601();
+    with_manifest_lock(|| {
+        let mut manifest = load_manifest()?;
+        let now = now_iso8601();
 
-    for name in names {
-        manifest
-            .packages
-            .entry(name.clone())
-            .and_modify(|e| {
-                e.source = source.to_string();
-                e.updated_at = now.clone();
-            })
-            .or_insert_with(|| ManifestEntry {
-                version: None, // batch installs don't have per-package version info readily
-                source: source.to_string(),
-                installed_at: now.clone(),
-                updated_at: now.clone(),
-            });
-    }
+        for name in names {
+            manifest
+                .packages
+                .entry(name.clone())
+                .and_modify(|e| {
+                    e.source = source.to_string();
+                    e.updated_at = now.clone();
+                })
+                .or_insert_with(|| ManifestEntry {
+                    version: None, // batch installs don't have per-package version info readily
+                    source: source.to_string(),
+                    installed_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+        }
 
-    save_manifest(&manifest)
+        save_manifest(&manifest)
+    })
 }
 
 /// Remove a package from the manifest.
 #[allow(dead_code)]
 pub(crate) fn record_remove(name: &str) -> Result<(), String> {
-    let mut manifest = load_manifest()?;
-    manifest.packages.remove(name);
-    save_manifest(&manifest)
+    with_manifest_lock(|| {
+        let mut manifest = load_manifest()?;
+        manifest.packages.remove(name);
+        save_manifest(&manifest)
+    })
 }
 
 /// Load manifest for test with custom path.

@@ -22,31 +22,13 @@ use std::path::PathBuf;
 use algocline_core::{Budget, ExecutionMetrics, ExecutionSpec};
 use mlua::LuaSerdeExt;
 use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
-use mlua_pkg::{resolvers::FsResolver, sandbox::SymlinkAwareSandbox, Registry};
+use mlua_pkg::Registry;
 
 use crate::bridge;
 use crate::llm_bridge::LlmRequest;
+use crate::resolver_factory::make_resolver;
 use crate::session::Session;
 use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
-
-/// Build an `FsResolver` for the given path.
-///
-/// By default uses `SymlinkAwareSandbox` so that `alc_pkg_link` symlinks
-/// are followed. Set `ALC_PKG_STRICT=1` to use the strict `FsSandbox`
-/// (rejects all symlinks pointing outside the root).
-fn make_resolver(path: &std::path::Path) -> Option<FsResolver> {
-    let strict = std::env::var("ALC_PKG_STRICT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if strict {
-        FsResolver::new(path).ok()
-    } else {
-        SymlinkAwareSandbox::new(path)
-            .ok()
-            .map(FsResolver::with_sandbox)
-    }
-}
 
 /// Layer 1: Prelude combinators (map, reduce, vote, filter).
 /// Embedded at compile time and loaded into every session.

@@ -81,6 +81,42 @@ pub struct PkgInstallParams {
     pub name: Option<String>,
 }
 
+/// Scope selector for `alc_pkg_link`.
+///
+/// - `global` (default): creates a symlink in `~/.algocline/packages/{name}`.
+///   Visible to all projects that share the host's `~/.algocline/` cache.
+///   Unix-only (requires `symlink(2)`).
+/// - `variant`: records the path in `alc.local.toml` at the project root
+///   instead of creating a symlink. Worktree-scoped override (git-ignored,
+///   loaded every `alc_run`). Works on all platforms.
+///
+/// The logical scope name (`variant`) is intentionally decoupled from the
+/// physical filename (`alc.local.toml`). Rationale: the filename follows
+/// the dotenv `.env.local` convention (machine-specific, gitignored),
+/// while the scope name describes its semantic layer (Sub-unit of Repo).
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PkgLinkScope {
+    /// Symlink into `~/.algocline/packages/` (all projects).
+    Global,
+    /// Append to `alc.local.toml` (worktree-scoped, gitignored).
+    Variant,
+}
+
+impl PkgLinkScope {
+    /// String form passed to the App-layer `EngineApi::pkg_link(scope: Option<String>)`.
+    ///
+    /// The EngineApi boundary takes `String` rather than this enum so that
+    /// `algocline-core` does not depend on `schemars`. This keeps the
+    /// schemars-dependent types pinned to the MCP crate.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Variant => "variant",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgLinkParams {
     /// Absolute or relative path to the directory to link as a package.
@@ -91,7 +127,17 @@ pub struct PkgLinkParams {
     /// Defaults to the directory name.
     pub name: Option<String>,
     /// Force overwrite of existing symlinks. Default: false.
+    /// Only meaningful when `scope = "global"` — ignored in `"variant"` scope.
     pub force: Option<bool>,
+    /// Scope of the link. Default: `"global"`.
+    ///
+    /// - `"global"`: symlink into `~/.algocline/packages/{name}` (existing behavior).
+    /// - `"variant"`: append to `{project_root}/alc.local.toml`
+    ///   (worktree-scoped override, gitignored).
+    pub scope: Option<PkgLinkScope>,
+    /// Optional absolute path to the project root. Used only in `scope = "variant"`.
+    /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -592,10 +638,17 @@ impl AlcService {
 
     // ─── Package Management ─────────────────────────────────────
 
-    /// Link a local directory as a package (symlink to cache).
+    /// Link a local directory as a package.
     ///
-    /// Creates a symlink from `~/.algocline/packages/{name}` to the given path.
-    /// Changes to files in the source directory are reflected immediately on the next `alc_run`.
+    /// Two scopes:
+    /// - `scope = "global"` (default): creates a symlink from
+    ///   `~/.algocline/packages/{name}` to the given path. Changes to files
+    ///   in the source directory are reflected immediately on the next `alc_run`.
+    ///   Visible to all projects (all worktrees share the same cache).
+    /// - `scope = "variant"`: appends a `[packages.{name}]` entry to
+    ///   `{project_root}/alc.local.toml`. Worktree-scoped override
+    ///   (git-ignored, loaded every `alc_run`). No symlink is created, so
+    ///   sibling worktrees are unaffected.
     ///
     /// Single mode: directory has `init.lua` at root → one package (name = dirname or `name` param).
     /// Collection mode: subdirectories have `init.lua` → each subdir is a package.
@@ -611,8 +664,15 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<PkgLinkParams>,
     ) -> Result<String, String> {
+        let scope = params.scope.map(|s| s.as_str().to_string());
         self.app
-            .pkg_link(params.path, params.name, params.force)
+            .pkg_link(
+                params.path,
+                params.name,
+                params.force,
+                scope,
+                params.project_root,
+            )
             .await
     }
 
@@ -751,11 +811,20 @@ impl AlcService {
 
     /// Initialize `alc.toml` in the project root.
     ///
-    /// Creates a minimal `alc.toml` with an empty `[packages]` section.
-    /// Fails if `alc.toml` already exists (no overwrite).
+    /// Creates a minimal `alc.toml` with an empty `[packages]` section and
+    /// ensures `alc.local.toml` is listed in `.gitignore` (creating the
+    /// file if absent, appending the entry otherwise). Fails if `alc.toml`
+    /// already exists (no overwrite).
+    ///
+    /// Returns `{ "created", "gitignore_path", "gitignore_updated" }`.
+    /// `gitignore_updated=false` means the entry was already present.
     #[tool(
         name = "alc_init",
-        annotations(destructive_hint = false, open_world_hint = false)
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn init(&self, Parameters(params): Parameters<InitParams>) -> Result<String, String> {
         self.app.init(params.project_root).await
@@ -1056,12 +1125,12 @@ impl ServerHandler for AlcService {
                  - alc_scenario_show: Show the content of an installed scenario by name.\n\
                  - alc_scenario_install: Install scenarios from a Git URL or local path.\n\n\
                  Package Management:\n\
-                 - alc_pkg_link: Link a local directory as a package (symlink to cache). Changes reflect immediately on next alc_run.\n\
+                 - alc_pkg_link: Link a local directory as a package. scope=\"global\" (default) symlinks into ~/.algocline/packages/ (all worktrees); scope=\"variant\" appends to {project_root}/alc.local.toml (worktree-scoped, gitignored).\n\
                  - alc_pkg_list: List installed packages with metadata. Pass project_root to include project-local packages.\n\
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
                  - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
-                 - alc_init: Initialize alc.toml in the project root.\n\
+                 - alc_init: Initialize alc.toml in the project root and ensure alc.local.toml is listed in .gitignore.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\
                  - alc_migrate: Migrate legacy alc.lock to alc.toml + new alc.lock format.\n\n\
                  Accessing a pkg's Lua source:\n\
@@ -1095,5 +1164,72 @@ impl ServerHandler for AlcService {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkg_link_scope_deserializes_snake_case_global() {
+        let params: PkgLinkParams = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/x",
+            "scope": "global",
+        }))
+        .unwrap();
+        assert_eq!(params.scope, Some(PkgLinkScope::Global));
+    }
+
+    #[test]
+    fn pkg_link_scope_deserializes_snake_case_variant() {
+        let params: PkgLinkParams = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/x",
+            "scope": "variant",
+        }))
+        .unwrap();
+        assert_eq!(params.scope, Some(PkgLinkScope::Variant));
+    }
+
+    #[test]
+    fn pkg_link_scope_unknown_value_is_rejected_by_schema() {
+        // `local` used to be the candidate before scope-matrix.md → variant
+        // rename. It must now be a schema error rather than silently accepted.
+        let err: Result<PkgLinkParams, _> = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/x",
+            "scope": "local",
+        }));
+        assert!(err.is_err(), "expected schema error for unknown scope");
+    }
+
+    #[test]
+    fn pkg_link_scope_as_str_round_trip() {
+        assert_eq!(PkgLinkScope::Global.as_str(), "global");
+        assert_eq!(PkgLinkScope::Variant.as_str(), "variant");
+    }
+
+    #[test]
+    fn pkg_link_params_accepts_project_root_and_optional_scope() {
+        // scope omitted → None (App layer will treat as default "global").
+        let params: PkgLinkParams = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/x",
+            "project_root": "/tmp/proj",
+        }))
+        .unwrap();
+        assert!(params.scope.is_none());
+        assert_eq!(params.project_root.as_deref(), Some("/tmp/proj"));
+    }
+
+    #[test]
+    fn pkg_link_scope_enum_exposes_both_variants_in_json_schema() {
+        use schemars::schema_for;
+        let schema = schema_for!(PkgLinkScope);
+        let json = serde_json::to_value(&schema).unwrap();
+        let s = json.to_string();
+        // snake_case serialization — both variants must appear.
+        assert!(s.contains("\"global\""), "schema missing global: {s}");
+        assert!(s.contains("\"variant\""), "schema missing variant: {s}");
+        // The pre-decision value must not leak into the schema.
+        assert!(!s.contains("\"local\""), "schema unexpectedly contains legacy 'local': {s}");
     }
 }

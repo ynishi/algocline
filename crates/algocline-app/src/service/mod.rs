@@ -101,13 +101,16 @@ impl AppService {
 
     /// Resolve extra lib paths for a request.
     ///
-    /// 1. Determines the project root from `project_root` (explicit) or
-    ///    `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
-    /// 2. Reads `alc.lock` from that root.
-    /// 3. Returns the resolved absolute paths of all `local_dir` entries.
+    /// Merges two layers in priority order (first = highest = prepended
+    /// by the Executor to `package.path`):
     ///
-    /// Returns an empty `Vec` if no project root is found, if `alc.lock`
-    /// does not exist, or if no `local_dir` entries are present.
+    /// 1. `alc.local.toml` path entries — worktree-scoped override
+    ///    (git-ignored, not persisted to alc.lock, loaded every call).
+    /// 2. `alc.lock` path entries — alc.toml-derived, git-managed.
+    ///
+    /// Returns an empty `Vec` if no project root is found. Partial
+    /// failures (e.g. malformed `alc.local.toml`) are logged at `warn`
+    /// and degraded to the empty layer without failing the whole call.
     pub(crate) fn resolve_extra_lib_paths(
         &self,
         project_root: Option<&str>,
@@ -116,17 +119,33 @@ impl AppService {
             return vec![];
         };
 
-        match lockfile::load_lockfile(&root) {
+        // Local override layer (highest priority) — merged every call,
+        // never persisted to alc.lock (decisions.md FsResolver priority).
+        let local_paths: Vec<std::path::PathBuf> = match alc_toml::load_alc_local_toml(&root) {
+            Ok(Some(local)) => alc_toml::resolve_local_path_entries(&root, &local),
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::warn!("failed to load alc.local.toml at {}: {e}", root.display());
+                Vec::new()
+            }
+        };
+
+        // Existing alc.lock layer.
+        let lock_paths: Vec<std::path::PathBuf> = match lockfile::load_lockfile(&root) {
             Ok(Some(lock)) => {
                 self.warn_toml_lock_mismatch(&root, &lock);
                 lockfile::resolve_path_entries(&root, &lock)
             }
-            Ok(None) => vec![],
+            Ok(None) => Vec::new(),
             Err(e) => {
                 tracing::warn!("failed to load alc.lock at {}: {e}", root.display());
-                vec![]
+                Vec::new()
             }
-        }
+        };
+
+        let mut merged = local_paths;
+        merged.extend(lock_paths);
+        merged
     }
 
     fn warn_toml_lock_mismatch(&self, root: &Path, lock: &lockfile::LockFile) {

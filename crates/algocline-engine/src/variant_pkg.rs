@@ -55,10 +55,12 @@ impl Resolver for VariantRootResolver {
         let content = match std::fs::read_to_string(&self.init_path) {
             Ok(c) => c,
             Err(e) => {
+                // `{:?}` preserves non-UTF-8 bytes in the path for debugging;
+                // `display()` would replace them with U+FFFD and obscure the
+                // actual offending filename when the OS locale is misaligned.
                 return Some(Err(mlua::Error::external(format!(
-                    "variant pkg '{}': failed to read {}: {e}",
-                    self.name,
-                    self.init_path.display()
+                    "variant pkg '{}': failed to read {:?}: {e}",
+                    self.name, self.init_path
                 ))));
             }
         };

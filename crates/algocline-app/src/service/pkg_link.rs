@@ -41,7 +41,18 @@ impl AppService {
         match scope_str {
             "global" => self.pkg_link_global(path, name, force).await,
             "variant" => {
-                let _ = force;
+                // `force` has no meaning under variant scope — the op is a
+                // `[packages.{name}]` upsert into `alc.local.toml`, not a
+                // filesystem overwrite. Silently ignoring a caller-supplied
+                // `force=true` masks intent (user expected overwrite but got
+                // a no-op on an existing entry), so reject it explicitly.
+                if force == Some(true) {
+                    return Err(
+                        "force is not supported with scope='variant' (variant scope writes \
+                         alc.local.toml; there is no filesystem destination to overwrite)"
+                            .to_string(),
+                    );
+                }
                 self.pkg_link_variant(path, name, project_root).await
             }
             other => Err(format!(
@@ -783,5 +794,67 @@ mod tests {
         let content = std::fs::read_to_string(&local).unwrap();
         assert!(content.contains("pkg_a"));
         assert!(content.contains("pkg_b"));
+    }
+
+    /// `scope = variant` with `force = Some(true)` must be rejected — there is
+    /// no filesystem destination to overwrite, so silently ignoring `force`
+    /// would mask caller intent.
+    #[tokio::test]
+    async fn pkg_link_scope_variant_rejects_force() {
+        let env = FakeHome::new();
+        let root = env.home.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = env.home.join("my_pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+
+        let svc = make_app_service().await;
+        let err = svc
+            .pkg_link(
+                src.to_string_lossy().to_string(),
+                None,
+                Some(true),
+                Some("variant".to_string()),
+                Some(root.to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("force is not supported with scope='variant'"),
+            "got: {err}"
+        );
+
+        // alc.local.toml must not have been written.
+        assert!(
+            !root.join("alc.local.toml").exists(),
+            "alc.local.toml must not be written when the call is rejected"
+        );
+    }
+
+    /// `scope = variant` with `force = Some(false)` is allowed (same as None).
+    #[tokio::test]
+    async fn pkg_link_scope_variant_accepts_force_false() {
+        let env = FakeHome::new();
+        let root = env.home.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = env.home.join("my_pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+
+        let svc = make_app_service().await;
+        let result = svc
+            .pkg_link(
+                src.to_string_lossy().to_string(),
+                None,
+                Some(false),
+                Some("variant".to_string()),
+                Some(root.to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["scope"], "variant");
+        assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
     }
 }

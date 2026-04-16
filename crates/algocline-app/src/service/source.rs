@@ -28,17 +28,29 @@ pub(crate) enum PackageSource {
 
 /// Infer a `PackageSource` from a legacy `ManifestEntry.source` string.
 ///
-/// Heuristics (evaluated in order):
+/// Heuristics (evaluated in order, **syntactic only**):
 /// 1. `"bundled"` → `Bundled { collection: None }`
-/// 2. Absolute path that exists as a directory → `Installed`
+/// 2. Absolute path (by shape, not existence) → `Installed`
 /// 3. Anything else → `Git { url, rev: None }`
+///
+/// The classification deliberately does **not** touch the filesystem. A prior
+/// version used `p.is_dir()`, which produced a symptom identical to the one
+/// `pkg_install` → `classify_install_url` previously had: if the original
+/// local source directory was deleted after install (e.g. a `tempfile::tempdir`
+/// source that e2e tests drop at end-of-scope), the string fell through to
+/// the `Git` arm and `normalize_git_url("/abs/path")` produced
+/// `"https:///abs/path"`, which git rejects as
+/// `unable to find remote helper for 'https'`. Classifying by absolute-path
+/// shape alone lets `pkg_repair` route the entry to the `LocalPath` installer,
+/// whose error message ("Failed to read source dir: ... No such file or directory")
+/// is at least diagnostic.
 pub(crate) fn infer_from_legacy_source_string(s: &str) -> PackageSource {
     if s == "bundled" {
         return PackageSource::Bundled { collection: None };
     }
 
     let p = Path::new(s);
-    if p.is_absolute() && p.is_dir() {
+    if p.is_absolute() {
         return PackageSource::Installed;
     }
 
@@ -82,10 +94,22 @@ mod tests {
     }
 
     #[test]
-    fn infer_non_existent_absolute_path_is_git() {
-        // An absolute path that does NOT exist → falls through to Git.
+    fn infer_non_existent_absolute_path_is_installed() {
+        // An absolute path that does NOT exist still classifies as Installed —
+        // classification is now syntactic (shape, not existence). The caller
+        // (pkg_repair) then routes to the LocalPath installer, whose copy-dir
+        // error is more diagnostic than `git clone https:///abs/...`.
         let result =
             infer_from_legacy_source_string("/nonexistent/path/that/should/never/exist_xyz");
+        assert_eq!(result, PackageSource::Installed);
+    }
+
+    #[test]
+    fn infer_relative_path_is_git() {
+        // Relative paths are NOT Installed — they fall through to the Git arm.
+        // (Callers never record relative paths as `ManifestEntry.source`, but
+        // keep this branch for backward compatibility with older manifests.)
+        let result = infer_from_legacy_source_string("relative/path/pkg");
         assert!(matches!(result, PackageSource::Git { .. }));
     }
 }

@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Per-package record in the manifest.
@@ -53,32 +52,17 @@ fn manifest_lock_path() -> Result<PathBuf, String> {
 /// load-modify-write, and the first writer then overwrites with its
 /// now-stale copy — losing entries.
 ///
-/// The lock is released when `file` is dropped (on both the success and
-/// the error path), so the guard survives early returns inside `f`.
+/// The lock is released when the `File` is dropped. Dropping happens on
+/// every exit from this function, including a panic in `f`: stack
+/// unwinding runs `File`'s destructor, which calls `close(2)` and thus
+/// releases the advisory `flock`. The explicit `drop(file)` after `f`
+/// is just ordering insurance for the success path.
 fn with_manifest_lock<F, R>(f: F) -> Result<R, String>
 where
     F: FnOnce() -> Result<R, String>,
 {
     let lock_path = manifest_lock_path()?;
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create manifest lock dir: {e}"))?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("Failed to open manifest lock: {e}"))?;
-    FileExt::lock_exclusive(&file).map_err(|e| format!("Failed to acquire manifest lock: {e}"))?;
-
-    let result = f();
-    // Drop `file` — the OS releases the lock even if `f` panicked,
-    // so a poisoned result never leaves the lock held. Explicit
-    // unlock is skipped since `File::drop` calls it for us.
-    drop(file);
-    result
+    crate::service::lock::with_exclusive_lock(&lock_path, f)
 }
 
 // ─── Read / Write ──────────────────────────────────────────────
@@ -95,6 +79,14 @@ pub(crate) fn load_manifest() -> Result<Manifest, String> {
 }
 
 /// Save the manifest to disk (pretty-printed for human readability).
+///
+/// Writes atomically: serialize into `installed.json.tmp`, then `rename` onto
+/// `installed.json`. POSIX `rename(2)` is atomic within the same filesystem,
+/// so an unguarded reader — e.g. `load_manifest` in `pkg_list` or `pkg_repair`,
+/// which does not take `with_manifest_lock` — never observes a partially
+/// written JSON document. Without the temp-and-rename dance, a concurrent
+/// reader could see a truncated file between `open(TRUNC)` and the final
+/// `write`, producing a spurious "Failed to parse manifest" error.
 fn save_manifest(manifest: &Manifest) -> Result<(), String> {
     let path = manifest_path()?;
     if let Some(parent) = path.parent() {
@@ -103,7 +95,18 @@ fn save_manifest(manifest: &Manifest) -> Result<(), String> {
     }
     let content = serde_json::to_string_pretty(manifest)
         .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("Failed to write manifest: {e}"))
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &content)
+        .map_err(|e| format!("Failed to write manifest temp file {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        // Best-effort cleanup of the stale temp file on rename failure.
+        let _ = std::fs::remove_file(&tmp);
+        format!(
+            "Failed to atomically rename manifest temp onto {}: {e}",
+            path.display()
+        )
+    })
 }
 
 // ─── Operations ────────────────────────────────────────────────

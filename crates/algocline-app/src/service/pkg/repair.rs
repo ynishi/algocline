@@ -223,12 +223,15 @@ impl AppService {
         // re-fetched. Bundled is conceptually re-installable via `alc_init`;
         // Path sources are not tracked in the manifest for repair.
         //
-        // We classify once here and hand the typed `InstallSource` to
-        // `pkg_install_typed` so the installer does not re-check
-        // `is_absolute() && is_dir()` on a string that may refer to a
-        // directory which no longer exists — that TOCTOU path is what
-        // produces the "git clone failed: ...'https:///var/folders/...'"
-        // symptom observed in pkg_repair's earlier implementation.
+        // `infer_from_legacy_source_string` classifies **syntactically** (shape,
+        // not filesystem existence), so a manifest entry whose local source
+        // directory has since been deleted still maps to `Installed` — and we
+        // route it through `install_from_local_path`, whose error
+        // ("Failed to read source dir: ... No such file or directory") is
+        // diagnostic. Prior to that fix this branch fell through to the Git
+        // arm and produced `git clone https:///abs/path` → "unable to find
+        // remote helper for 'https'", the exact symptom the `pkg_install`
+        // typed-dispatch refactor (H1) set out to eliminate.
         let inferred = super::super::source::infer_from_legacy_source_string(&entry.source);
         let install_source = match inferred {
             PackageSource::Installed => InstallSource::LocalPath(PathBuf::from(&entry.source)),
@@ -242,6 +245,13 @@ impl AppService {
                         .to_string(),
                 };
             }
+            // Defensive: `infer_from_legacy_source_string` never constructs
+            // `PackageSource::Path` today (it only emits Bundled / Installed /
+            // Git). We keep this arm as an exhaustive-match guard so future
+            // additions to the inference function don't silently break the
+            // repair path — the explicit Unrepairable is a safer default than
+            // `_ => unreachable!()`, which would panic if the guarantee ever
+            // erodes.
             PackageSource::Path { path } => {
                 return RepairOutcome::Unrepairable {
                     kind: "installed_missing",

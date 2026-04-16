@@ -31,11 +31,17 @@ pub(crate) enum InstallSource {
 /// Classify a caller-provided `url` string into an [`InstallSource`].
 ///
 /// Must stay consistent with [`super::super::source::infer_from_legacy_source_string`]:
-/// an absolute-existing-dir string maps to [`InstallSource::LocalPath`] (matching
-/// `PackageSource::Installed`), everything else maps to a normalized Git URL.
+/// an absolute-path-*shaped* string maps to [`InstallSource::LocalPath`]
+/// (matching `PackageSource::Installed`), everything else maps to a normalized
+/// Git URL. Classification is deliberately syntactic — no filesystem probes.
+/// Rationale: a dir that is_absolute but currently missing used to fall through
+/// to the Git arm and produce `https:///abs/path`, which git rejects with
+/// `unable to find remote helper for 'https'`. Keeping the classification
+/// syntactic gives `install_from_local_path` a chance to surface a diagnostic
+/// "Failed to read source dir" error instead.
 fn classify_install_url(url: &str) -> InstallSource {
     let local_path = Path::new(url);
-    if local_path.is_absolute() && local_path.is_dir() {
+    if local_path.is_absolute() {
         return InstallSource::LocalPath(local_path.to_path_buf());
     }
 
@@ -87,7 +93,11 @@ impl AppService {
         // Clone to temp directory first to detect single vs collection
         let staging = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
-        let output = tokio::process::Command::new("git")
+        // Bound `git clone` wall time. Without this a misconfigured remote
+        // (auth prompt, unreachable host, slow network) can block the MCP
+        // tool call indefinitely. 60s covers normal shallow clones of our
+        // bundled-packages-sized repos with margin.
+        let clone_future = tokio::process::Command::new("git")
             .args([
                 "clone",
                 "--depth",
@@ -95,8 +105,10 @@ impl AppService {
                 &git_url,
                 &staging.path().to_string_lossy(),
             ])
-            .output()
+            .output();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), clone_future)
             .await
+            .map_err(|_| format!("git clone timed out after 60s: {git_url}"))?
             .map_err(|e| format!("Failed to run git: {e}"))?;
 
         if !output.status.success() {
@@ -104,8 +116,16 @@ impl AppService {
             return Err(format!("git clone failed: {stderr}"));
         }
 
-        // Remove .git dir from staging
-        let _ = std::fs::remove_dir_all(staging.path().join(".git"));
+        // Remove .git dir from staging (best-effort; absent .git would be
+        // surprising but not fatal).
+        if let Err(e) = std::fs::remove_dir_all(staging.path().join(".git")) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "pkg_install: failed to strip .git from staging {}: {e}",
+                    staging.path().display()
+                );
+            }
+        }
 
         // Detect: single package (init.lua at root) vs collection (subdirs with init.lua)
         if staging.path().join("init.lua").exists() {
@@ -173,12 +193,15 @@ impl AppService {
                     continue;
                 }
                 let pkg_name = entry.file_name().to_string_lossy().to_string();
-                let dest = pkg_dir.join(&pkg_name);
-                if dest.exists() {
+                // Go through ContainedPath::child to block path traversal from
+                // a malicious subdir name (`..`, `foo/../bar`) — the staging
+                // dir is untrusted input in the general case.
+                let dest = ContainedPath::child(&pkg_dir, &pkg_name)?;
+                if dest.as_ref().exists() {
                     skipped.push(pkg_name);
                     continue;
                 }
-                copy_dir(&path, &dest)
+                copy_dir(&path, dest.as_ref())
                     .map_err(|e| format!("Failed to copy package '{pkg_name}': {e}"))?;
                 installed.push(pkg_name);
             }
@@ -268,13 +291,28 @@ impl AppService {
 
             let dest = ContainedPath::child(pkg_dir, &name)?;
             if dest.as_ref().exists() {
-                // Overwrite for local installs (dev workflow)
-                let _ = std::fs::remove_dir_all(&dest);
+                // Overwrite for local installs (dev workflow). Log failures —
+                // silent `let _ =` used to hide Permission Denied / Busy
+                // errors and surfaced later as a confusing "File exists" from
+                // copy_dir.
+                if let Err(e) = std::fs::remove_dir_all(&dest) {
+                    tracing::warn!(
+                        "pkg_install: failed to remove existing dest {} before overwrite: {e}",
+                        dest.as_ref().display()
+                    );
+                }
             }
 
             copy_dir(source, dest.as_ref()).map_err(|e| format!("Failed to copy package: {e}"))?;
-            // Remove .git if copied
-            let _ = std::fs::remove_dir_all(dest.as_ref().join(".git"));
+            // Remove .git if copied (best-effort; absent .git is the common case).
+            if let Err(e) = std::fs::remove_dir_all(dest.as_ref().join(".git")) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "pkg_install: failed to strip .git from {}: {e}",
+                        dest.as_ref().display()
+                    );
+                }
+            }
 
             // Record in manifest (best-effort)
             let source_str_local = source.display().to_string();
@@ -315,14 +353,28 @@ impl AppService {
                     continue;
                 }
                 let pkg_name = entry.file_name().to_string_lossy().to_string();
-                let dest = pkg_dir.join(&pkg_name);
-                let existed = dest.exists();
+                // Guard against traversal-shaped subdir names from an
+                // untrusted source tree, matching the git-clone branch.
+                let dest = ContainedPath::child(pkg_dir, &pkg_name)?;
+                let existed = dest.as_ref().exists();
                 if existed {
-                    let _ = std::fs::remove_dir_all(&dest);
+                    if let Err(e) = std::fs::remove_dir_all(dest.as_ref()) {
+                        tracing::warn!(
+                            "pkg_install: failed to remove existing dest {} before overwrite: {e}",
+                            dest.as_ref().display()
+                        );
+                    }
                 }
-                copy_dir(&path, &dest)
+                copy_dir(&path, dest.as_ref())
                     .map_err(|e| format!("Failed to copy package '{pkg_name}': {e}"))?;
-                let _ = std::fs::remove_dir_all(dest.join(".git"));
+                if let Err(e) = std::fs::remove_dir_all(dest.as_ref().join(".git")) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            "pkg_install: failed to strip .git from {}: {e}",
+                            dest.as_ref().display()
+                        );
+                    }
+                }
                 if existed {
                     updated.push(pkg_name);
                 } else {
@@ -379,45 +431,69 @@ impl AppService {
             None => return, // No project root → skip (current-compat)
         };
 
-        // Load alc.toml document (preserving comments/formatting).
-        let mut doc = match load_alc_toml_document(&root) {
-            Ok(Some(d)) => d,
-            Ok(None) => return, // alc.toml not found → skip
-            Err(e) => {
-                tracing::warn!("pkg_install: failed to load alc.toml: {e}");
-                return;
-            }
-        };
-
-        // Load or create alc.lock.
-        let mut lock = match load_lockfile(&root) {
-            Ok(Some(l)) => l,
-            Ok(None) => LockFile {
-                version: 1,
-                packages: Vec::new(),
-            },
-            Err(e) => {
-                tracing::warn!("pkg_install: failed to load alc.lock: {e}");
-                return;
-            }
-        };
-
+        // Resolve per-package versions *before* taking the lock, so the
+        // lock-held critical section contains only synchronous I/O
+        // (load → mutate → save). `fetch_pkg_version` dispatches into the
+        // shared Lua executor and may await arbitrarily long.
+        let mut resolved: Vec<(String, Option<String>)> = Vec::with_capacity(names.len());
         for name in names {
-            // Add to alc.toml (no-op if already present).
-            add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
-
-            // Resolve version via eval_simple (best-effort).
             let version = self.fetch_pkg_version(name).await;
-
-            // Upsert into alc.lock.
-            upsert_lock_entry(&mut lock, name.clone(), version, PackageSource::Installed);
+            resolved.push((name.clone(), version));
         }
 
-        if let Err(e) = save_alc_toml(&root, &doc) {
-            tracing::warn!("pkg_install: failed to save alc.toml: {e}");
-        }
-        if let Err(e) = save_lockfile(&root, &lock) {
-            tracing::warn!("pkg_install: failed to save alc.lock: {e}");
+        // Guard the alc.toml / alc.lock load→modify→save against overlapping
+        // `pkg_install` calls that target the same project root. Without this
+        // advisory lock two concurrent installs can each load the old state,
+        // apply their own mutation, and race to save — the later writer
+        // silently overwrites the earlier's entry.
+        let lock_path = project_files_lock_path(&root);
+        let lock_result = super::super::lock::with_exclusive_lock(&lock_path, move || {
+            // Load alc.toml document (preserving comments/formatting).
+            let mut doc = match load_alc_toml_document(&root) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Ok(()), // alc.toml not found → skip
+                Err(e) => {
+                    tracing::warn!("pkg_install: failed to load alc.toml: {e}");
+                    return Ok(());
+                }
+            };
+
+            // Load or create alc.lock.
+            let mut lock = match load_lockfile(&root) {
+                Ok(Some(l)) => l,
+                Ok(None) => LockFile {
+                    version: 1,
+                    packages: Vec::new(),
+                },
+                Err(e) => {
+                    tracing::warn!("pkg_install: failed to load alc.lock: {e}");
+                    return Ok(());
+                }
+            };
+
+            for (name, version) in &resolved {
+                // Add to alc.toml (no-op if already present).
+                add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
+                // Upsert into alc.lock with the pre-resolved version.
+                upsert_lock_entry(
+                    &mut lock,
+                    name.clone(),
+                    version.clone(),
+                    PackageSource::Installed,
+                );
+            }
+
+            if let Err(e) = save_alc_toml(&root, &doc) {
+                tracing::warn!("pkg_install: failed to save alc.toml: {e}");
+            }
+            if let Err(e) = save_lockfile(&root, &lock) {
+                tracing::warn!("pkg_install: failed to save alc.lock: {e}");
+            }
+            Ok(())
+        });
+
+        if let Err(e) = lock_result {
+            tracing::warn!("pkg_install: project files lock failed: {e}");
         }
     }
 
@@ -459,6 +535,19 @@ return (pkg.meta or {{}}).version"#
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Path to the advisory lock file guarding `alc.toml` + `alc.lock` updates
+/// within a project root. The lock file sits alongside the project files so
+/// two processes working in the same checkout serialize on the same path.
+///
+/// The filename is deliberately distinct from `alc.lock` itself — the latter
+/// is the dependency lockfile users read, while `.alc-install.lock` is an
+/// internal flock companion. Consumers who share a project tree via `.gitignore`
+/// should ignore it alongside other temp files; algocline does not add it
+/// automatically today.
+fn project_files_lock_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(".alc-install.lock")
+}
 
 /// Returns `true` iff `name` is safe to interpolate into a Lua source string.
 fn is_safe_pkg_name(name: &str) -> bool {

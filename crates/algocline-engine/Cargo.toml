@@ -33,3 +33,6 @@ dirs = "6"
 [dev-dependencies]
 proptest = "1"
 tempfile = { workspace = true }
+
+[features]
+test-support = []

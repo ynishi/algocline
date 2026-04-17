@@ -90,6 +90,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value as Json};
 
 pub const SCHEMA_VERSION: &str = "card/v0";
@@ -2272,7 +2273,7 @@ pub enum CardEventKind {
 }
 
 impl CardEventKind {
-    /// Stable string tag used in `tracing` log fields and JSON output.
+    /// Stable string tag used in `tracing` log fields.
     pub fn as_str(self) -> &'static str {
         match self {
             CardEventKind::Created => "created",
@@ -2280,6 +2281,36 @@ impl CardEventKind {
             CardEventKind::SamplesWritten => "samples_written",
             CardEventKind::AliasesWritten => "aliases_written",
         }
+    }
+
+    /// Short JSON key for the public `alc_stats` snapshot.
+    /// Distinct from `as_str()` so that tracing logs keep their
+    /// verbose form while the JSON surface stays compact.
+    pub fn json_key(self) -> &'static str {
+        match self {
+            CardEventKind::Created => "created",
+            CardEventKind::Appended => "appended",
+            CardEventKind::SamplesWritten => "samples",
+            CardEventKind::AliasesWritten => "aliases",
+        }
+    }
+
+    /// All kinds in stable display order. Used by `SubscriberHealthRow`
+    /// to emit all four counter keys even when a counter is zero, so
+    /// that downstream consumers can rely on field presence.
+    pub fn all() -> [CardEventKind; 4] {
+        [
+            CardEventKind::Created,
+            CardEventKind::Appended,
+            CardEventKind::SamplesWritten,
+            CardEventKind::AliasesWritten,
+        ]
+    }
+}
+
+impl Serialize for CardEventKind {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.json_key())
     }
 }
 
@@ -2314,19 +2345,29 @@ pub trait CardSubscriber: Send + Sync {
     fn describe(&self) -> String;
 }
 
-// ─── SubscriberStats (skeleton — full impl in Subtask 2) ───────
+// ─── SubscriberStats ───────────────────────────────────────────
 
-/// Per-subscriber counter shell. Subtask 1 only tracks enough state to
-/// satisfy the fan-out invariants and concurrency tests; the JSON
-/// snapshot shape is finalized in Subtask 2.
+/// Most recent delivery failure for a single subscriber. Exposed via
+/// `SubscriberHealthRow.last_error` in the `alc_stats` JSON snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct LastError {
+    pub kind: CardEventKind,
+    pub msg: String,
+    pub ts_ms: u64,
+}
+
+/// Per-subscriber counter state. Held inside `SubscriberStats` under a
+/// `Mutex`; `snapshot` clones the fields into an owned `SubscriberHealthRow`
+/// while the lock is held, so the lock window stays short.
 #[derive(Default, Debug)]
 pub struct PerSubscriber {
     pub ok: HashMap<CardEventKind, u64>,
     pub err: HashMap<CardEventKind, u64>,
-    pub last_error: Option<String>,
+    pub last_error: Option<LastError>,
 }
 
-/// Process-wide per-subscriber statistics, keyed by subscriber URI.
+/// Process-wide per-subscriber statistics, keyed by subscriber URI
+/// (the value returned by `CardSubscriber::describe`).
 #[derive(Default, Debug)]
 pub struct SubscriberStats {
     inner: Mutex<HashMap<String, PerSubscriber>>,
@@ -2342,40 +2383,78 @@ impl SubscriberStats {
     }
 
     /// Record a delivery failure together with the error message.
+    /// The failure kind, message, and timestamp overwrite `last_error`
+    /// — there is no ring buffer; only the most recent failure is kept.
     pub fn record_err(&self, key: &str, kind: CardEventKind, err: &str) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = g.entry(key.to_string()).or_default();
         let c = entry.err.entry(kind).or_insert(0);
         *c = c.saturating_add(1);
-        entry.last_error = Some(err.to_string());
+        entry.last_error = Some(LastError {
+            kind,
+            msg: err.to_string(),
+            ts_ms: now_ms(),
+        });
     }
 
-    /// Snapshot shell. Subtask 2 fills in the real shape; Subtask 1
-    /// only needs the method to exist so downstream code compiles.
+    /// Take a point-in-time snapshot of all subscribers. The returned
+    /// `Vec` is owned — the internal lock is released before this
+    /// function returns, so callers can hold it freely.
+    ///
+    /// All four `CardEventKind` keys (`created / appended / samples /
+    /// aliases`) are always present in both `ok` and `err`, defaulting
+    /// to 0 if no event of that kind has been recorded. This lets
+    /// downstream consumers rely on field presence.
     pub fn snapshot(&self) -> Vec<SubscriberHealthRow> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows = Vec::with_capacity(g.len());
-        for (uri, ps) in g.iter() {
-            let ok_total: u64 = ps.ok.values().copied().sum();
-            let err_total: u64 = ps.err.values().copied().sum();
+        for (sink, ps) in g.iter() {
+            let mut ok: HashMap<String, u64> = HashMap::with_capacity(4);
+            let mut err: HashMap<String, u64> = HashMap::with_capacity(4);
+            for k in CardEventKind::all() {
+                ok.insert(k.json_key().to_string(), ps.ok.get(&k).copied().unwrap_or(0));
+                err.insert(k.json_key().to_string(), ps.err.get(&k).copied().unwrap_or(0));
+            }
             rows.push(SubscriberHealthRow {
-                uri: uri.clone(),
-                ok_total,
-                err_total,
+                sink: sink.clone(),
+                ok,
+                err,
                 last_error: ps.last_error.clone(),
             });
         }
+        // Stable output ordering (by sink URI) so that the JSON dump is
+        // deterministic across runs — useful for snapshot tests.
+        rows.sort_by(|a, b| a.sink.cmp(&b.sink));
         rows
     }
 }
 
-/// Flat snapshot row for a single subscriber. Subtask 2 extends this.
-#[derive(Debug, Clone)]
+/// Unix-epoch milliseconds used by `LastError.ts_ms`. Uses
+/// `unwrap_or_default` so no panic can escape even if the system
+/// clock is misconfigured.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Snapshot row for a single subscriber, serialized directly into the
+/// `alc_stats` JSON output as one element of the `card_sinks` array.
+#[derive(Debug, Clone, Serialize)]
 pub struct SubscriberHealthRow {
-    pub uri: String,
-    pub ok_total: u64,
-    pub err_total: u64,
-    pub last_error: Option<String>,
+    pub sink: String,
+    pub ok: HashMap<String, u64>,
+    pub err: HashMap<String, u64>,
+    pub last_error: Option<LastError>,
+}
+
+/// Public entry point: snapshot of all process-wide subscriber stats.
+/// Wrapper around `event_bus().stats().snapshot()` so that downstream
+/// crates (notably `algocline-app`) do not need a handle to the
+/// `CardEventBus` singleton.
+pub fn subscriber_stats_snapshot() -> Vec<SubscriberHealthRow> {
+    event_bus().stats().snapshot()
 }
 
 // ─── FileCardSubscriber — file-URI backend ─────────────────────
@@ -4240,9 +4319,10 @@ mod tests {
             let snap = bus.stats().snapshot();
             let row = snap
                 .iter()
-                .find(|r| r.uri == fs_sub.describe())
+                .find(|r| r.sink == fs_sub.describe())
                 .expect("subscriber row exists");
-            assert!(row.err_total >= 1, "subscriber append err must be recorded");
+            let err_total: u64 = row.err.values().sum();
+            assert!(err_total >= 1, "subscriber append err must be recorded");
             assert!(row.last_error.is_some());
         });
     }
@@ -4273,11 +4353,186 @@ mod tests {
                 let snap = bus.stats().snapshot();
                 let row = snap
                     .iter()
-                    .find(|r| r.uri == "mock://failing")
+                    .find(|r| r.sink == "mock://failing")
                     .expect("row exists");
-                assert!(row.err_total >= 1);
+                let err_total: u64 = row.err.values().sum();
+                assert!(err_total >= 1);
             },
         );
+    }
+
+    // ─── SubscriberStats JSON shape tests (Subtask 2) ──────────
+
+    #[test]
+    fn stats_counts_ok() {
+        let primary = tempfile::tempdir().unwrap();
+        let mock = MockSubscriber::new("mock://stats-ok");
+        with_bus_subscribers(vec![mock.clone() as Arc<dyn CardSubscriber>], |bus| {
+            let store = FileCardStore::new(primary.path().to_path_buf());
+            for i in 0..3 {
+                create_with_store(
+                    &store,
+                    json!({
+                        "card_id": format!("stats_ok_{i}"),
+                        "pkg": { "name": "stats_ok_pkg" },
+                    }),
+                )
+                .unwrap();
+            }
+            let snap = bus.stats().snapshot();
+            let row = snap
+                .iter()
+                .find(|r| r.sink == "mock://stats-ok")
+                .expect("row");
+            assert_eq!(row.ok.get("created").copied().unwrap_or(0), 3);
+            assert_eq!(row.err.get("created").copied().unwrap_or(0), 0);
+            // All four keys must be present (may be 0).
+            for k in ["created", "appended", "samples", "aliases"] {
+                assert!(row.ok.contains_key(k), "ok.{k} must be present");
+                assert!(row.err.contains_key(k), "err.{k} must be present");
+            }
+            assert!(row.last_error.is_none());
+        });
+    }
+
+    #[test]
+    fn stats_counts_err_with_last_error() {
+        struct FailingSubscriber;
+        impl CardSubscriber for FailingSubscriber {
+            fn on_event(&self, _ev: &CardEvent) -> Result<(), String> {
+                Err("synthetic create failure".into())
+            }
+            fn describe(&self) -> String {
+                "mock://stats-err".into()
+            }
+        }
+        let primary = tempfile::tempdir().unwrap();
+        with_bus_subscribers(
+            vec![Arc::new(FailingSubscriber) as Arc<dyn CardSubscriber>],
+            |bus| {
+                let store = FileCardStore::new(primary.path().to_path_buf());
+                create_with_store(
+                    &store,
+                    json!({ "pkg": { "name": "stats_err_pkg" } }),
+                )
+                .unwrap();
+                let snap = bus.stats().snapshot();
+                let row = snap
+                    .iter()
+                    .find(|r| r.sink == "mock://stats-err")
+                    .expect("row");
+                assert_eq!(row.err.get("created").copied().unwrap_or(0), 1);
+                let le = row.last_error.as_ref().expect("last_error set");
+                assert!(!le.msg.is_empty(), "last_error.msg must be non-empty");
+                assert_eq!(le.kind, CardEventKind::Created);
+                assert!(le.ts_ms > 0, "last_error.ts_ms must be populated");
+            },
+        );
+    }
+
+    #[test]
+    fn stats_per_subscriber_isolated() {
+        struct FailingSubscriber;
+        impl CardSubscriber for FailingSubscriber {
+            fn on_event(&self, _ev: &CardEvent) -> Result<(), String> {
+                Err("sub1 fails".into())
+            }
+            fn describe(&self) -> String {
+                "mock://sub1-fail".into()
+            }
+        }
+        let primary = tempfile::tempdir().unwrap();
+        let mock_ok = MockSubscriber::new("mock://sub2-ok");
+        let subs: Vec<Arc<dyn CardSubscriber>> = vec![
+            Arc::new(FailingSubscriber) as Arc<dyn CardSubscriber>,
+            mock_ok.clone() as Arc<dyn CardSubscriber>,
+        ];
+        with_bus_subscribers(subs, |bus| {
+            let store = FileCardStore::new(primary.path().to_path_buf());
+            create_with_store(
+                &store,
+                json!({ "pkg": { "name": "isolated_pkg" } }),
+            )
+            .unwrap();
+            let snap = bus.stats().snapshot();
+            let r1 = snap
+                .iter()
+                .find(|r| r.sink == "mock://sub1-fail")
+                .expect("sub1 row");
+            let r2 = snap
+                .iter()
+                .find(|r| r.sink == "mock://sub2-ok")
+                .expect("sub2 row");
+            assert_eq!(r1.err.get("created").copied().unwrap_or(0), 1);
+            assert_eq!(r1.ok.get("created").copied().unwrap_or(0), 0);
+            assert_eq!(r2.ok.get("created").copied().unwrap_or(0), 1);
+            assert_eq!(r2.err.get("created").copied().unwrap_or(0), 0);
+            assert!(r1.last_error.is_some());
+            assert!(r2.last_error.is_none());
+        });
+    }
+
+    #[test]
+    fn subscriber_stats_survive_multiple_calls() {
+        // Regression guard: per-call SubscriberStats creation would
+        // have reset the counter between create_with_store invocations.
+        // Verify that counters accumulate across 3 independent calls
+        // against the global bus's stats handle.
+        let primary = tempfile::tempdir().unwrap();
+        let mock = MockSubscriber::new("mock://stats-survive");
+        with_bus_subscribers(vec![mock.clone() as Arc<dyn CardSubscriber>], |_bus| {
+            let store = FileCardStore::new(primary.path().to_path_buf());
+            for i in 0..3 {
+                create_with_store(
+                    &store,
+                    json!({
+                        "card_id": format!("survive_{i}"),
+                        "pkg": { "name": "survive_pkg" },
+                    }),
+                )
+                .unwrap();
+            }
+            // Use the public snapshot entry point to exercise the
+            // same path that AppService::stats uses.
+            let snap = subscriber_stats_snapshot();
+            let row = snap
+                .iter()
+                .find(|r| r.sink == "mock://stats-survive")
+                .expect("row");
+            assert_eq!(
+                row.ok.get("created").copied().unwrap_or(0),
+                3,
+                "counters must accumulate across calls"
+            );
+        });
+    }
+
+    #[test]
+    fn stats_snapshot_serializes_with_all_kind_keys() {
+        // Serialize a minimal row and verify JSON field shape.
+        let primary = tempfile::tempdir().unwrap();
+        let mock = MockSubscriber::new("mock://json-shape");
+        with_bus_subscribers(vec![mock.clone() as Arc<dyn CardSubscriber>], |_bus| {
+            let store = FileCardStore::new(primary.path().to_path_buf());
+            create_with_store(
+                &store,
+                json!({ "pkg": { "name": "json_shape_pkg" } }),
+            )
+            .unwrap();
+            let snap = subscriber_stats_snapshot();
+            let json = serde_json::to_value(&snap).expect("serializable");
+            let arr = json.as_array().expect("array");
+            let row = arr
+                .iter()
+                .find(|r| r.get("sink").and_then(|s| s.as_str()) == Some("mock://json-shape"))
+                .expect("row present in JSON");
+            assert_eq!(row.get("sink").unwrap(), "mock://json-shape");
+            for k in ["created", "appended", "samples", "aliases"] {
+                assert!(row.pointer(&format!("/ok/{k}")).is_some(), "ok.{k} missing");
+                assert!(row.pointer(&format!("/err/{k}")).is_some(), "err.{k} missing");
+            }
+            assert!(row.get("last_error").is_some());
+        });
     }
 
     #[test]
@@ -4510,10 +4765,11 @@ mod tests {
         let snap = stats.snapshot();
         let row = snap
             .iter()
-            .find(|r| r.uri == "mock://same-subscriber")
+            .find(|r| r.sink == "mock://same-subscriber")
             .expect("row");
         let expected = (n_threads * per_thread) as u64;
-        assert_eq!(row.ok_total, expected, "all increments must be counted");
+        let ok_total: u64 = row.ok.values().sum();
+        assert_eq!(ok_total, expected, "all increments must be counted");
     }
 
     #[test]
@@ -4533,12 +4789,14 @@ mod tests {
         // Follow-up accessors must not hang and must return the prior value.
         let snap = stats.snapshot();
         assert!(!snap.is_empty(), "snapshot after poison must still work");
-        assert_eq!(snap[0].ok_total, 1);
+        let ok1: u64 = snap[0].ok.values().sum();
+        assert_eq!(ok1, 1);
 
         // Further writes must also succeed (via unwrap_or_else).
         stats.record_ok("mock://poison", CardEventKind::Created);
         let snap2 = stats.snapshot();
-        assert_eq!(snap2[0].ok_total, 2);
+        let ok2: u64 = snap2[0].ok.values().sum();
+        assert_eq!(ok2, 2);
     }
 
     #[test]
@@ -4660,10 +4918,11 @@ mod tests {
             let snap = bus.stats().snapshot();
             let row = snap
                 .iter()
-                .find(|r| r.uri == fs_sub.describe())
+                .find(|r| r.sink == fs_sub.describe())
                 .expect("row");
+            let ok_total: u64 = row.ok.values().sum();
             assert_eq!(
-                row.ok_total, 4,
+                ok_total, 4,
                 "subscriber must have recorded 4 successful deliveries"
             );
         });

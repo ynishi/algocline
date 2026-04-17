@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-04-18
+
+### Added — Card sink fan-out (`ALC_CARD_SINKS`) + backfill
+
+Card mutations (`create` / `append` / `write_samples` / alias writes /
+`import_from_dir`) now fan out to every subscriber URI listed in the
+`ALC_CARD_SINKS` env var (pipe-separated). The primary store remains
+authoritative; subscriber failures are isolated — primary writes always
+succeed, and per-subscriber health is exposed via `alc_stats` under the
+new `card_sinks` field (`ok` / `err` counters keyed by event kind +
+`last_error`).
+
+Registered sinks can be backfilled with the new tool:
+
+```lua
+local r = alc.card.sink_backfill({
+  sink    = "file:///tmp/mirror",
+  dry_run = false,
+})
+-- r = { sink, pushed = {...}, skipped = {...}, failed = {...}, pushed_samples = {...} }
+```
+
+`alc_card_sink_backfill` pushes every Card from the primary store to one
+registered subscriber URI. Drift-safe: cards already present on the sink
+are skipped (never overwritten). Bypasses bus fan-out so in-sync peers
+see no duplicate Created events. Supports `dry_run` for preview.
+
+Tool annotations: `destructive_hint = false`, `idempotent_hint = true`,
+`open_world_hint = false`.
+
+### Added — `SubscriberStats` exposed via `alc_stats`
+
+`alc_stats` now includes a `card_sinks` array with one row per
+registered subscriber:
+
+```json
+"card_sinks": [
+  {
+    "sink": "file:///tmp/mirror",
+    "ok":  { "created": 12, "appended": 3, "samples": 5, "aliases": 1 },
+    "err": { "created": 0,  "appended": 0, "samples": 0, "aliases": 0 },
+    "last_error": null
+  }
+]
+```
+
+All four event-kind keys are always present (may be 0). `last_error`
+populates the latest failing publish with `{ kind, msg, ts_ms }`.
+
 ## [0.21.0] - 2026-04-17
 
 ### Changed

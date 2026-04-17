@@ -10,9 +10,19 @@
 use std::path::Path;
 
 use algocline_engine::card;
+use serde::Deserialize;
 
 use super::hub;
 use super::AppService;
+
+/// Input shape for [`AppService::card_sink_backfill`]. Deserialized from
+/// the Lua/MCP table argument `{ sink, dry_run }`.
+#[derive(Debug, Deserialize)]
+pub struct SinkBackfillParams {
+    pub sink: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
 
 impl AppService {
     /// List Cards as JSON summaries, optionally filtered by package.
@@ -264,5 +274,16 @@ impl AppService {
             Some(res) => Ok(card::lineage_to_json(&res).to_string()),
             None => Err(format!("card '{card_id}' not found")),
         }
+    }
+
+    /// Backfill one subscriber (`sink` URI) with all cards from the
+    /// primary store. Drift-safe: existing cards on the subscriber
+    /// are skipped, never overwritten. Returns the
+    /// [`card::SinkBackfillReport`] serialized as JSON for MCP
+    /// transport.
+    pub fn card_sink_backfill(&self, params: SinkBackfillParams) -> Result<String, String> {
+        let report = card::card_sink_backfill(&params.sink, params.dry_run)?;
+        serde_json::to_string(&report)
+            .map_err(|e| format!("failed to serialize SinkBackfillReport: {e}"))
     }
 }

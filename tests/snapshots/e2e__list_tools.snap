@@ -15,6 +15,7 @@ expression: names
   "alc_card_lineage",
   "alc_card_list",
   "alc_card_samples",
+  "alc_card_sink_backfill",
   "alc_continue",
   "alc_eval",
   "alc_eval_compare",

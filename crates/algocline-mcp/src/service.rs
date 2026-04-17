@@ -413,6 +413,16 @@ pub struct CardAppendParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardSinkBackfillParams {
+    /// Subscriber URI (e.g. `file:///path/to/mirror`). Must be registered
+    /// via `ALC_CARD_SINKS` at startup.
+    pub sink: String,
+    /// When true, report what would be pushed without writing to the sink.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardInstallParams {
     /// Git URL or local absolute path to a Card Collection.
     /// A Card Collection is a repo with `alc_cards.toml` at root and
@@ -1037,6 +1047,30 @@ impl AlcService {
             .await
     }
 
+    /// Backfill one subscriber (`sink` URI) with all cards from the
+    /// primary store.
+    ///
+    /// Drift-safe: cards already present on the subscriber are skipped
+    /// (never overwritten). The primary store is not touched — only the
+    /// subscriber receives writes. Returns a `SinkBackfillReport` JSON
+    /// with `pushed`, `skipped`, `failed`, and `pushed_samples` lists.
+    #[tool(
+        name = "alc_card_sink_backfill",
+        annotations(
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false,
+        )
+    )]
+    async fn card_sink_backfill(
+        &self,
+        Parameters(params): Parameters<CardSinkBackfillParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_sink_backfill(params.sink, params.dry_run)
+            .await
+    }
+
     /// Install Cards from a Card Collection (Git repo or local directory).
     ///
     /// A Card Collection has `alc_cards.toml` at root and subdirectories
@@ -1185,7 +1219,8 @@ impl ServerHandler for AlcService {
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true). Supports the same `where` DSL as alc_card_find.\n\
                  - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
-                 - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\n\
+                 - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\
+                 - alc_card_sink_backfill: Backfill one subscriber (ALC_CARD_SINKS URI) with every Card already in the primary store. Drift-safe: existing Cards on the sink are skipped, never overwritten. Supports dry_run.\n\n\
                  Hub:\n\
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
                  - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\

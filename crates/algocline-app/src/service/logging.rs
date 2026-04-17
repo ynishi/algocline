@@ -232,9 +232,11 @@ impl AppService {
         let dir = match self.log_config.log_dir.as_deref() {
             Some(d) if d.is_dir() => d,
             _ => {
+                let card_sinks = algocline_engine::card::subscriber_stats_snapshot();
                 return Ok(serde_json::json!({
                     "total_sessions": 0,
                     "strategies": {},
+                    "card_sinks": card_sinks,
                 })
                 .to_string());
             }
@@ -396,9 +398,11 @@ impl AppService {
             );
         }
 
+        let card_sinks = algocline_engine::card::subscriber_stats_snapshot();
         Ok(serde_json::json!({
             "total_sessions": total,
             "strategies": strategies,
+            "card_sinks": card_sinks,
         })
         .to_string())
     }

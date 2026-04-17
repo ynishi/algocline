@@ -122,6 +122,12 @@ async fn main() -> anyhow::Result<()> {
     let config = AppConfig::from_env();
     setup_tracing(config.log_dir.as_deref())?;
 
+    // Eager init of the card event bus so that ALC_CARD_SINKS
+    // registration logs surface at startup rather than on the first
+    // card write. Placed after setup_tracing so that tracing::info!
+    // calls inside init_event_bus() reach the configured subscriber.
+    algocline_engine::card::init_event_bus();
+
     // Distribute type stubs (non-fatal: log warning on failure)
     match init::distribute_types() {
         Ok(path) => tracing::debug!("types installed: {}", path.display()),

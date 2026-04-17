@@ -307,6 +307,18 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
             lua.to_value(&serde_json::Value::Array(rows))
         })?;
 
+    // alc.card.sink_backfill({ sink, dry_run }) -> report
+    //
+    // Backfill one subscriber with all cards from the primary store.
+    // Drift-safe: existing cards on the subscriber are skipped.
+    let sink_backfill = lua.create_function(|lua, params: LuaTable| {
+        let sink: String = params.get("sink")?;
+        let dry_run: Option<bool> = params.get("dry_run")?;
+        let report = card::card_sink_backfill(&sink, dry_run.unwrap_or(false))
+            .map_err(LuaError::external)?;
+        lua.to_value(&report)
+    })?;
+
     // alc.card.lineage(query) -> { root, nodes, edges, truncated }
     //
     // Walks `metadata.prior_card_id` ancestors (default), descendants, or
@@ -349,6 +361,7 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     card_table.set("write_samples", write_samples)?;
     card_table.set("read_samples", read_samples)?;
     card_table.set("lineage", lineage)?;
+    card_table.set("sink_backfill", sink_backfill)?;
 
     alc_table.set("card", card_table)?;
     Ok(())

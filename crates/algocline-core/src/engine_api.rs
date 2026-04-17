@@ -277,6 +277,18 @@ pub trait EngineApi: Send + Sync {
         relation_filter: Option<Vec<String>>,
     ) -> Result<String, String>;
 
+    /// Backfill one subscriber (`sink` URI) with all cards from the
+    /// primary store. Drift-safe: cards already present on the sink are
+    /// skipped (never overwritten). Returns a `SinkBackfillReport`
+    /// serialized as a JSON string.
+    async fn card_sink_backfill(
+        &self,
+        _sink: String,
+        _dry_run: bool,
+    ) -> Result<String, String> {
+        Err("card_sink_backfill: not implemented by this EngineApi impl".into())
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     /// Rebuild hub index from a packages directory.

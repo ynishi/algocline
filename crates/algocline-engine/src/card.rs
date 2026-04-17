@@ -2343,6 +2343,17 @@ pub trait CardSubscriber: Send + Sync {
     /// `SubscriberStats` and as the match target for
     /// `CardEventBus::publish_to`.
     fn describe(&self) -> String;
+
+    /// Best-effort check for whether `card_id` already exists in this
+    /// subscriber. Used by `alc_card_sink_backfill` to skip cards that
+    /// are already mirrored (drift-safe: we never overwrite).
+    ///
+    /// Default implementation returns `Ok(false)` so subscribers that
+    /// cannot cheaply answer (e.g. future network-backed sinks) always
+    /// get the push. Override when a cheap local check is possible.
+    fn has_card(&self, _card_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 // ─── SubscriberStats ───────────────────────────────────────────
@@ -2521,7 +2532,7 @@ impl FileCardSubscriber {
     /// Scan the subscriber root for a Card with `card_id` under any
     /// `{pkg}` subdirectory. Returns `Ok(None)` when the root itself
     /// does not exist yet (subscribers are write-once lazy).
-    pub(crate) fn locate_card(&self, card_id: &str) -> Result<Option<PathBuf>, String> {
+    pub fn locate_card(&self, card_id: &str) -> Result<Option<PathBuf>, String> {
         validate_name(card_id, "card_id")?;
         if !self.root.exists() {
             return Ok(None);
@@ -2612,6 +2623,13 @@ impl CardSubscriber for FileCardSubscriber {
     fn describe(&self) -> String {
         self.uri.clone()
     }
+
+    /// Delegates to [`FileCardSubscriber::locate_card`]. A non-existent
+    /// root (subscriber has never been written to) returns `Ok(false)`,
+    /// which is the correct "backfill needed" answer.
+    fn has_card(&self, card_id: &str) -> Result<bool, String> {
+        Ok(self.locate_card(card_id)?.is_some())
+    }
 }
 
 // ─── CardEventBus + OnceLock singleton ─────────────────────────
@@ -2701,6 +2719,15 @@ impl CardEventBus {
         guard.iter().map(|s| s.describe()).collect()
     }
 
+    /// Look up a subscriber by URI (as returned by `describe`). Returns
+    /// `None` when no subscriber matches. Used by
+    /// `alc_card_sink_backfill` to dispatch has_card checks against a
+    /// specific sink.
+    pub fn find_subscriber(&self, uri: &str) -> Option<Arc<dyn CardSubscriber>> {
+        let guard = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
+        guard.iter().find(|s| s.describe() == uri).cloned()
+    }
+
     /// Replace the subscriber list in place while preserving singleton
     /// identity and shared `SubscriberStats`. Test-only.
     #[cfg(any(test, feature = "test-support"))]
@@ -2787,6 +2814,140 @@ fn bus_test_gate() -> &'static Mutex<()> {
 #[cfg(test)]
 thread_local! {
     static INSIDE_BUS_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// ─── alc_card_sink_backfill ────────────────────────────────────
+
+/// Result of a [`card_sink_backfill`] run. One row per card the tool
+/// touched (classified as pushed / skipped / failed / pushed_samples).
+/// The `failed` entries carry the error message so an operator can
+/// triage read-only mounts etc.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SinkBackfillReport {
+    pub sink: String,
+    pub pushed: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub pushed_samples: Vec<String>,
+}
+
+/// Backfill one subscriber (`sink` URI) from the primary store.
+///
+/// Steps:
+/// 1. Look up the target subscriber on the event bus; fail fast if
+///    the URI is not registered so the caller gets an immediate
+///    error rather than a silent no-op.
+/// 2. Enumerate every `(pkg, card_id)` pair from the default
+///    [`CardStore`].
+/// 3. For each pair, ask the subscriber whether it already has that
+///    card (`CardSubscriber::has_card`). If yes → skipped (drift-safe,
+///    no overwrite). If no → read the primary TOML and `publish_to`
+///    the one target sink. Samples are mirrored the same way.
+/// 4. `dry_run = true` short-circuits step 3: the report lists
+///    what would have been pushed but no `publish_to` is issued,
+///    so `SubscriberStats` does not increment.
+pub fn card_sink_backfill(sink: &str, dry_run: bool) -> Result<SinkBackfillReport, String> {
+    let store = default_store()?;
+    card_sink_backfill_with_store(&store, sink, dry_run)
+}
+
+/// `card_sink_backfill` with an injectable [`CardStore`]. Tests drive
+/// this directly against a tempdir-backed [`FileCardStore`] to avoid
+/// touching the user's real `~/.algocline/cards/`.
+pub fn card_sink_backfill_with_store(
+    store: &dyn CardStore,
+    sink: &str,
+    dry_run: bool,
+) -> Result<SinkBackfillReport, String> {
+    let bus = event_bus();
+    let sub = bus
+        .find_subscriber(sink)
+        .ok_or_else(|| format!("unknown sink: {sink}"))?;
+
+    let locators = store.list_card_locators(None)?;
+
+    let mut report = SinkBackfillReport {
+        sink: sink.to_string(),
+        ..Default::default()
+    };
+
+    for (pkg, locator) in locators {
+        let card_id = match locator.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+
+        match sub.has_card(&card_id) {
+            Ok(true) => {
+                report.skipped.push(card_id);
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    card_id = %card_id,
+                    error = %e,
+                    "backfill: has_card failed; treating as skipped"
+                );
+                report.skipped.push(card_id);
+                continue;
+            }
+        }
+
+        let toml_text = match store.read_locator_text(&locator) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                // Unreadable / corrupt on primary. Do not panic; skip.
+                report.skipped.push(card_id);
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    card_id = %card_id,
+                    error = %e,
+                    "backfill: read_locator_text failed; treating as skipped"
+                );
+                report.skipped.push(card_id);
+                continue;
+            }
+        };
+
+        if dry_run {
+            report.pushed.push(card_id.clone());
+            if matches!(store.read_samples_text(&card_id), Ok(Some(_))) {
+                report.pushed_samples.push(card_id);
+            }
+            continue;
+        }
+
+        let ev = CardEvent::Created {
+            pkg: pkg.clone(),
+            card_id: card_id.clone(),
+            toml_text,
+        };
+        match bus.publish_to(sink, &ev) {
+            Ok(()) => report.pushed.push(card_id.clone()),
+            Err(e) => {
+                report.failed.push((card_id, e));
+                continue;
+            }
+        }
+
+        if let Ok(Some(jsonl_text)) = store.read_samples_text(&card_id) {
+            let ev = CardEvent::SamplesWritten {
+                card_id: card_id.clone(),
+                jsonl_text,
+            };
+            match bus.publish_to(sink, &ev) {
+                Ok(()) => report.pushed_samples.push(card_id),
+                Err(e) => {
+                    report.failed.push((card_id, format!("samples: {e}")));
+                }
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 // ─── ALC_CARD_SINKS env parser ─────────────────────────────────
@@ -4925,6 +5086,271 @@ mod tests {
                 ok_total, 4,
                 "subscriber must have recorded 4 successful deliveries"
             );
+        });
+    }
+
+    // ─── card_sink_backfill (Subtask 3) ────────────────────────
+
+    /// Primary-side fixture with N cards already written via the
+    /// subscriber-free path so backfill has something to push.
+    /// Returns (primary_dir_guard, store, card_ids).
+    fn backfill_primary_with_cards(
+        pkg: &str,
+        count: usize,
+    ) -> (tempfile::TempDir, FileCardStore, Vec<String>) {
+        let primary = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(primary.path().to_path_buf());
+        let mut ids = Vec::new();
+        for i in 0..count {
+            let (id, _) = create_with_store(
+                &store,
+                json!({
+                    "card_id": format!("{pkg}_{i}"),
+                    "pkg": { "name": pkg },
+                }),
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        (primary, store, ids)
+    }
+
+    #[test]
+    fn backfill_pushes_missing_cards() {
+        let sub_dir = tempfile::tempdir().unwrap();
+        let fs_sub = Arc::new(FileCardSubscriber::new(sub_dir.path().to_path_buf()));
+        let uri = fs_sub.describe();
+        with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
+            // Populate primary before the subscriber is live (temporarily drop it).
+            let bus = event_bus();
+            bus.replace_subscribers_for_test(Vec::new());
+            let (_primary, store, ids) = backfill_primary_with_cards("backfill_push_pkg", 2);
+            bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
+
+            let report = card_sink_backfill_with_store(&store, &uri, false).unwrap();
+            assert_eq!(report.pushed.len(), 2);
+            assert_eq!(report.skipped.len(), 0);
+            assert!(report.failed.is_empty());
+            for id in &ids {
+                let p = sub_dir
+                    .path()
+                    .join("backfill_push_pkg")
+                    .join(format!("{id}.toml"));
+                assert!(p.exists(), "card {id} must exist on subscriber");
+            }
+        });
+    }
+
+    #[test]
+    fn backfill_skips_existing_on_subscriber() {
+        let sub_dir = tempfile::tempdir().unwrap();
+        let fs_sub = Arc::new(FileCardSubscriber::new(sub_dir.path().to_path_buf()));
+        let uri = fs_sub.describe();
+        with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
+            // Subscriber is live during create, so it already has the card.
+            let (_primary, store, _ids) = backfill_primary_with_cards("backfill_skip_pkg", 3);
+            let report = card_sink_backfill_with_store(&store, &uri, false).unwrap();
+            assert_eq!(report.pushed.len(), 0);
+            assert_eq!(report.skipped.len(), 3);
+            assert!(report.failed.is_empty());
+        });
+    }
+
+    #[test]
+    fn backfill_dry_run_no_writes() {
+        let sub_dir = tempfile::tempdir().unwrap();
+        let fs_sub = Arc::new(FileCardSubscriber::new(sub_dir.path().to_path_buf()));
+        let uri = fs_sub.describe();
+        with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
+            let bus = event_bus();
+            bus.replace_subscribers_for_test(Vec::new());
+            let (_primary, store, ids) = backfill_primary_with_cards("backfill_dry_pkg", 2);
+            bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
+
+            let report = card_sink_backfill_with_store(&store, &uri, true).unwrap();
+            assert_eq!(report.pushed.len(), 2, "pushed must list ids even in dry run");
+            for id in &ids {
+                let p = sub_dir
+                    .path()
+                    .join("backfill_dry_pkg")
+                    .join(format!("{id}.toml"));
+                assert!(!p.exists(), "dry run must NOT write card {id}");
+            }
+            // Stats must remain zero — dry run publishes nothing.
+            let snap = bus.stats().snapshot();
+            if let Some(row) = snap.iter().find(|r| r.sink == uri) {
+                let total: u64 = row.ok.values().sum::<u64>() + row.err.values().sum::<u64>();
+                assert_eq!(total, 0, "dry run must not touch stats");
+            }
+        });
+    }
+
+    #[test]
+    fn backfill_drifted_card_skipped_not_overwritten() {
+        let sub_dir = tempfile::tempdir().unwrap();
+        let fs_sub = Arc::new(FileCardSubscriber::new(sub_dir.path().to_path_buf()));
+        let uri = fs_sub.describe();
+        with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
+            let bus = event_bus();
+            bus.replace_subscribers_for_test(Vec::new());
+            let (_primary, store, ids) = backfill_primary_with_cards("backfill_drift_pkg", 1);
+            let id = &ids[0];
+
+            // Manually place a drifted copy on the subscriber with sentinel text.
+            let sub_card_dir = sub_dir.path().join("backfill_drift_pkg");
+            fs::create_dir_all(&sub_card_dir).unwrap();
+            let sub_card = sub_card_dir.join(format!("{id}.toml"));
+            fs::write(&sub_card, "drifted=true\n").unwrap();
+
+            bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
+            let report = card_sink_backfill_with_store(&store, &uri, false).unwrap();
+            assert_eq!(report.skipped, vec![id.clone()]);
+            assert!(report.pushed.is_empty());
+            let after = fs::read_to_string(&sub_card).unwrap();
+            assert_eq!(after, "drifted=true\n", "drifted copy must be preserved");
+        });
+    }
+
+    #[test]
+    fn backfill_includes_samples() {
+        let sub_dir = tempfile::tempdir().unwrap();
+        let fs_sub = Arc::new(FileCardSubscriber::new(sub_dir.path().to_path_buf()));
+        let uri = fs_sub.describe();
+        with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
+            let bus = event_bus();
+            bus.replace_subscribers_for_test(Vec::new());
+            let (_primary, store, ids) = backfill_primary_with_cards("backfill_samples_pkg", 1);
+            let id = &ids[0];
+            write_samples_with_store(&store, id, vec![json!({ "case": "c0" })]).unwrap();
+            bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
+
+            let report = card_sink_backfill_with_store(&store, &uri, false).unwrap();
+            assert_eq!(report.pushed, vec![id.clone()]);
+            assert_eq!(report.pushed_samples, vec![id.clone()]);
+            let sub_samples = sub_dir
+                .path()
+                .join("backfill_samples_pkg")
+                .join(format!("{id}.samples.jsonl"));
+            assert!(sub_samples.exists());
+            assert!(fs::read_to_string(&sub_samples).unwrap().contains("c0"));
+        });
+    }
+
+    #[test]
+    fn backfill_unknown_sink_err() {
+        with_bus_subscribers(Vec::new(), |_bus| {
+            let (_primary, store, _ids) = backfill_primary_with_cards("backfill_unknown_pkg", 1);
+            let err =
+                card_sink_backfill_with_store(&store, "file:///nonexistent/sink", false)
+                    .unwrap_err();
+            assert!(
+                err.starts_with("unknown sink"),
+                "must reject unregistered sink; got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn backfill_bypasses_bus_fanout() {
+        // Subscriber A is already in-sync; Subscriber B is the backfill target.
+        // Backfilling B must NOT re-deliver Created events to A.
+        let sub_a_dir = tempfile::tempdir().unwrap();
+        let sub_b_dir = tempfile::tempdir().unwrap();
+        let fa = Arc::new(FileCardSubscriber::new(sub_a_dir.path().to_path_buf()));
+        let fb = Arc::new(FileCardSubscriber::new(sub_b_dir.path().to_path_buf()));
+        let uri_b = fb.describe();
+        with_bus_subscribers(
+            vec![
+                fa.clone() as Arc<dyn CardSubscriber>,
+                fb.clone() as Arc<dyn CardSubscriber>,
+            ],
+            |bus| {
+                // Populate primary with subscriber A live (B temporarily absent).
+                bus.replace_subscribers_for_test(vec![fa.clone()]);
+                let (_primary, store, _ids) = backfill_primary_with_cards("backfill_bypass_pkg", 2);
+                // Capture A's ok[created] count before backfill.
+                let before = bus
+                    .stats()
+                    .snapshot()
+                    .into_iter()
+                    .find(|r| r.sink == fa.describe())
+                    .map(|r| r.ok.get("created").copied().unwrap_or(0))
+                    .unwrap_or(0);
+                // Now reinstall both subscribers and backfill only B.
+                bus.replace_subscribers_for_test(vec![fa.clone(), fb.clone()]);
+                card_sink_backfill_with_store(&store, &uri_b, false).unwrap();
+                let after = bus
+                    .stats()
+                    .snapshot()
+                    .into_iter()
+                    .find(|r| r.sink == fa.describe())
+                    .map(|r| r.ok.get("created").copied().unwrap_or(0))
+                    .unwrap_or(0);
+                assert_eq!(
+                    before, after,
+                    "backfill target B must not cause fan-out to subscriber A"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn backfill_updates_subscriber_stats() {
+        let sub_dir = tempfile::tempdir().unwrap();
+        let fs_sub = Arc::new(FileCardSubscriber::new(sub_dir.path().to_path_buf()));
+        let uri = fs_sub.describe();
+        with_bus_subscribers(vec![fs_sub.clone()], |bus| {
+            bus.replace_subscribers_for_test(Vec::new());
+            let (_primary, store, _ids) = backfill_primary_with_cards("backfill_stats_pkg", 2);
+            bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
+
+            card_sink_backfill_with_store(&store, &uri, false).unwrap();
+            let snap = bus.stats().snapshot();
+            let row = snap.iter().find(|r| r.sink == uri).expect("row");
+            assert_eq!(
+                row.ok.get("created").copied().unwrap_or(0),
+                2,
+                "backfill must increment ok[created] on the target sink"
+            );
+        });
+    }
+
+    #[test]
+    fn backfill_failure_records_err_stat() {
+        // Subscriber whose on_event always fails (no filesystem needed).
+        struct FailingSub {
+            uri: String,
+        }
+        impl CardSubscriber for FailingSub {
+            fn on_event(&self, _ev: &CardEvent) -> Result<(), String> {
+                Err("synthetic backfill failure".into())
+            }
+            fn has_card(&self, _card_id: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn describe(&self) -> String {
+                self.uri.clone()
+            }
+        }
+        let uri = "mock://backfill-fail".to_string();
+        let failing: Arc<dyn CardSubscriber> = Arc::new(FailingSub { uri: uri.clone() });
+        with_bus_subscribers(vec![failing], |bus| {
+            bus.replace_subscribers_for_test(Vec::new());
+            let (_primary, store, _ids) = backfill_primary_with_cards("backfill_fail_pkg", 1);
+            // Reinstall the failing subscriber for the backfill phase.
+            let reinstall: Arc<dyn CardSubscriber> = Arc::new(FailingSub { uri: uri.clone() });
+            bus.replace_subscribers_for_test(vec![reinstall]);
+
+            let report = card_sink_backfill_with_store(&store, &uri, false).unwrap();
+            assert_eq!(report.failed.len(), 1, "failed must record the synthetic err");
+            assert!(report.pushed.is_empty());
+            let snap = bus.stats().snapshot();
+            let row = snap.iter().find(|r| r.sink == uri).expect("row");
+            assert!(
+                row.err.get("created").copied().unwrap_or(0) >= 1,
+                "failing publish must increment err[created]"
+            );
+            assert!(row.last_error.is_some());
         });
     }
 

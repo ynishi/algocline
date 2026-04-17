@@ -269,6 +269,17 @@ impl EngineApi for AppService {
         )
     }
 
+    async fn card_sink_backfill(
+        &self,
+        sink: String,
+        dry_run: bool,
+    ) -> Result<String, String> {
+        AppService::card_sink_backfill(
+            self,
+            super::card::SinkBackfillParams { sink, dry_run },
+        )
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     async fn hub_reindex(

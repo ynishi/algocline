@@ -1,5 +1,6 @@
 ---
 source: tests/e2e.rs
+assertion_line: 124
 expression: redacted
 ---
 {
@@ -16,5 +17,5 @@ expression: redacted
     }
   ],
   "tracing": "file + stderr",
-  "version": "0.21.0"
+  "version": "0.22.0"
 }

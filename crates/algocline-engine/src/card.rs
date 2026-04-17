@@ -84,11 +84,114 @@
 //! | `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value as Json};
 
 pub const SCHEMA_VERSION: &str = "card/v0";
+
+// ═══════════════════════════════════════════════════════════════
+// CardStore trait — physical I/O abstraction.
+// ═══════════════════════════════════════════════════════════════
+//
+// Card domain logic (schema / Query DSL / Lineage) is backend-
+// neutral. Only the physical read/write layer is swappable.
+//
+// The default backend is `FileCardStore`, which preserves the
+// legacy `~/.algocline/cards/{pkg}/{card_id}.toml` layout
+// byte-for-byte. Alternative backends (PathCardStore, SqliteCardStore,
+// MemoryCardStore) can be added by implementing this trait.
+//
+// Locators are `PathBuf` values. For FileCardStore they are real
+// filesystem paths; for non-file backends they are synthetic paths
+// (e.g. `sqlite:///db.sqlite#card/{id}`) — the value is opaque to
+// the domain layer and only exposed via the Lua `alc.card.create`
+// / `alc.card.write_samples` return values.
+
+/// Storage backend for Cards.
+///
+/// Implementations must be `Send + Sync` so that they can be shared
+/// across Lua host threads safely. All methods may fail with an
+/// error `String` describing the backend-specific failure.
+pub trait CardStore: Send + Sync {
+    // ─── Card CRUD ─────────────────────────────────────────────
+
+    /// Write a new Card (Tier 1 TOML).
+    ///
+    /// The caller has already:
+    ///   - validated `pkg` and `card_id` via [`validate_name`]
+    ///   - serialized `toml_text` with `toml::to_string_pretty`
+    ///
+    /// Fails if a Card with the same id already exists
+    /// (immutability).  Returns the locator of the written Card.
+    fn write_new_card(&self, pkg: &str, card_id: &str, toml_text: &str) -> Result<PathBuf, String>;
+
+    /// Overwrite an existing Card (append flow).
+    ///
+    /// Append is additive-only w.r.t. keys, but the underlying
+    /// TOML file is rewritten in place; callers must have validated
+    /// the additive-only constraint before calling this.
+    fn overwrite_card(&self, card_id: &str, toml_text: &str) -> Result<PathBuf, String>;
+
+    /// Locate a Card file by id. Returns `None` if not found.
+    fn find_card_locator(&self, card_id: &str) -> Result<Option<PathBuf>, String>;
+
+    /// Read a Card's raw TOML text by id. Returns `None` if missing.
+    fn read_card_text(&self, card_id: &str) -> Result<Option<String>, String>;
+
+    /// List `(pkg, locator)` pairs for every Card file in the store.
+    ///
+    /// When `pkg_filter` is `Some(name)`, restrict to that pkg
+    /// subdir. Non-existent pkg subdir yields an empty Vec.
+    ///
+    /// Order is implementation-defined — callers sort explicitly.
+    fn list_card_locators(
+        &self,
+        pkg_filter: Option<&str>,
+    ) -> Result<Vec<(String, PathBuf)>, String>;
+
+    /// Read raw TOML text from a locator returned by
+    /// [`Self::list_card_locators`]. `Ok(None)` on read failure so
+    /// scans can skip corrupt files without aborting.
+    fn read_locator_text(&self, locator: &Path) -> Result<Option<String>, String>;
+
+    // ─── Alias table ───────────────────────────────────────────
+
+    fn read_aliases(&self) -> Result<Vec<Alias>, String>;
+    fn write_aliases(&self, aliases: &[Alias]) -> Result<(), String>;
+
+    // ─── Samples sidecar ───────────────────────────────────────
+
+    /// Check whether a samples sidecar exists for `card_id`.
+    fn samples_exists(&self, card_id: &str) -> Result<bool, String>;
+
+    /// Write a samples sidecar (write-once).
+    ///
+    /// `jsonl_text` is the complete JSONL payload (one JSON line
+    /// per sample, `\n`-terminated). Fails if a sidecar already
+    /// exists. Returns the locator.
+    fn write_samples_text(&self, card_id: &str, jsonl_text: &str) -> Result<PathBuf, String>;
+
+    /// Read a samples sidecar as raw JSONL text. Returns `None`
+    /// when no sidecar exists (samples are optional).
+    fn read_samples_text(&self, card_id: &str) -> Result<Option<String>, String>;
+
+    // ─── Import ────────────────────────────────────────────────
+
+    /// Import Card files from `source_dir` into the store under
+    /// `pkg`. First-writer wins (existing Cards are skipped).
+    /// Returns `(imported, skipped)` card_id lists.
+    fn import_from_dir(
+        &self,
+        source_dir: &Path,
+        pkg: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String>;
+}
+
+/// Return the default backend (File-backed, `~/.algocline/cards/`).
+fn default_store() -> Result<FileCardStore, String> {
+    FileCardStore::from_home()
+}
 
 /// Resolve the cards root directory, creating it if needed.
 fn cards_dir() -> Result<PathBuf, String> {
@@ -96,16 +199,6 @@ fn cards_dir() -> Result<PathBuf, String> {
     let dir = home.join(".algocline").join("cards");
     if !dir.exists() {
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create cards dir: {e}"))?;
-    }
-    Ok(dir)
-}
-
-/// Per-pkg subdirectory. Validates pkg name to prevent path traversal.
-fn pkg_dir(pkg: &str) -> Result<PathBuf, String> {
-    validate_name(pkg, "pkg")?;
-    let dir = cards_dir()?.join(pkg);
-    if !dir.exists() {
-        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create pkg dir: {e}"))?;
     }
     Ok(dir)
 }
@@ -329,7 +422,15 @@ fn require_pkg_name(input: &Json) -> Result<String, String> {
 }
 
 /// Main create entry. Returns (card_id, absolute_path).
-pub fn create(mut input: Json) -> Result<(String, PathBuf), String> {
+pub fn create(input: Json) -> Result<(String, PathBuf), String> {
+    create_with_store(&default_store()?, input)
+}
+
+/// Create a new Card backed by `store`. See [`create`] for the default-store variant.
+pub fn create_with_store(
+    store: &dyn CardStore,
+    mut input: Json,
+) -> Result<(String, PathBuf), String> {
     if !input.is_object() {
         return Err("alc.card.create: input must be a table".into());
     }
@@ -371,49 +472,25 @@ pub fn create(mut input: Json) -> Result<(String, PathBuf), String> {
     validate_name(&card_id, "card_id")?;
     obj.insert("card_id".to_string(), json!(card_id.clone()));
 
-    // ─── Write TOML atomically ────────────────────────────────
-    let dir = pkg_dir(&pkg_name)?;
-    let path = dir.join(format!("{card_id}.toml"));
-    if path.exists() {
-        return Err(format!(
-            "alc.card.create: card '{card_id}' already exists (immutable)"
-        ));
-    }
     let toml_val = json_to_toml(input)?;
     let text = toml::to_string_pretty(&toml_val)
         .map_err(|e| format!("Failed to serialize card TOML: {e}"))?;
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, &text).map_err(|e| format!("Failed to write card tmp: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename card file: {e}"))?;
+    let path = store.write_new_card(&pkg_name, &card_id, &text)?;
 
     Ok((card_id, path))
 }
 
-/// Search cards dir for `{card_id}.toml`.
-fn find_card_path(card_id: &str) -> Result<Option<PathBuf>, String> {
-    validate_name(card_id, "card_id")?;
-    let root = cards_dir()?;
-    let entries = fs::read_dir(&root).map_err(|e| format!("Failed to read cards dir: {e}"))?;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            let candidate = p.join(format!("{card_id}.toml"));
-            if candidate.exists() {
-                return Ok(Some(candidate));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Read a Card by id. Returns None if not found.
 pub fn get(card_id: &str) -> Result<Option<Json>, String> {
-    let path = match find_card_path(card_id)? {
-        Some(p) => p,
+    get_with_store(&default_store()?, card_id)
+}
+
+/// Read a Card from `store`. See [`get`] for the default-store variant.
+pub fn get_with_store(store: &dyn CardStore, card_id: &str) -> Result<Option<Json>, String> {
+    let text = match store.read_card_text(card_id)? {
+        Some(t) => t,
         None => return Ok(None),
     };
-    let text =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
     let val: toml::Value =
         toml::from_str(&text).map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
     Ok(Some(toml_to_json(val)))
@@ -451,13 +528,13 @@ impl Summary {
     }
 }
 
-fn summarize(path: &std::path::Path, pkg: &str) -> Option<Summary> {
-    let text = fs::read_to_string(path).ok()?;
+fn summarize(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Option<Summary> {
+    let text = store.read_locator_text(locator).ok().flatten()?;
     let val: toml::Value = toml::from_str(&text).ok()?;
     let card_id = val
         .get("card_id")
         .and_then(|v| v.as_str())
-        .or_else(|| path.file_stem().and_then(|s| s.to_str()))?
+        .or_else(|| locator.file_stem().and_then(|s| s.to_str()))?
         .to_string();
     let created_at = val
         .get("created_at")
@@ -489,44 +566,19 @@ fn summarize(path: &std::path::Path, pkg: &str) -> Option<Summary> {
 
 /// List cards. `pkg_filter = Some("name")` restricts to that pkg subdir.
 pub fn list(pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
-    let root = cards_dir()?;
-    let mut out = Vec::new();
+    list_with_store(&default_store()?, pkg_filter)
+}
 
-    let pkg_dirs: Vec<PathBuf> = if let Some(p) = pkg_filter {
-        validate_name(p, "pkg")?;
-        let d = root.join(p);
-        if d.is_dir() {
-            vec![d]
-        } else {
-            vec![]
-        }
-    } else {
-        fs::read_dir(&root)
-            .map_err(|e| format!("Failed to read cards dir: {e}"))?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect()
-    };
-
-    for pdir in pkg_dirs {
-        let pkg = pdir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let entries = match fs::read_dir(&pdir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("toml") {
-                continue;
-            }
-            if let Some(s) = summarize(&p, &pkg) {
-                out.push(s);
-            }
+/// List cards from `store`. See [`list`] for the default-store variant.
+pub fn list_with_store(
+    store: &dyn CardStore,
+    pkg_filter: Option<&str>,
+) -> Result<Vec<Summary>, String> {
+    let locators = store.list_card_locators(pkg_filter)?;
+    let mut out = Vec::with_capacity(locators.len());
+    for (pkg, loc) in &locators {
+        if let Some(s) = summarize(store, loc, pkg) {
+            out.push(s);
         }
     }
 
@@ -558,15 +610,23 @@ pub fn summaries_to_json(rows: &[Summary]) -> Json {
 ///
 /// Returns the merged Card JSON.
 pub fn append(card_id: &str, fields: Json) -> Result<Json, String> {
-    let path = find_card_path(card_id)?
+    append_with_store(&default_store()?, card_id, fields)
+}
+
+/// Append to a Card in `store`. See [`append`] for the default-store variant.
+pub fn append_with_store(
+    store: &dyn CardStore,
+    card_id: &str,
+    fields: Json,
+) -> Result<Json, String> {
+    let text = store
+        .read_card_text(card_id)?
         .ok_or_else(|| format!("alc.card.append: card '{card_id}' not found"))?;
     let fields_obj = match fields {
         Json::Object(m) => m,
         _ => return Err("alc.card.append: fields must be a table".into()),
     };
 
-    let text =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
     let existing: toml::Value =
         toml::from_str(&text).map_err(|e| format!("Failed to parse card '{card_id}': {e}"))?;
     let mut existing_json = toml_to_json(existing);
@@ -588,16 +648,9 @@ pub fn append(card_id: &str, fields: Json) -> Result<Json, String> {
     let toml_val = json_to_toml(existing_json.clone())?;
     let text = toml::to_string_pretty(&toml_val)
         .map_err(|e| format!("Failed to serialize card TOML: {e}"))?;
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, &text).map_err(|e| format!("Failed to write card tmp: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename card file: {e}"))?;
+    store.overwrite_card(card_id, &text)?;
 
     Ok(existing_json)
-}
-
-/// Path of the global alias table: `~/.algocline/cards/_aliases.toml`.
-fn aliases_path() -> Result<PathBuf, String> {
-    Ok(cards_dir()?.join("_aliases.toml"))
 }
 
 #[derive(Debug, Clone)]
@@ -625,75 +678,6 @@ impl Alias {
     }
 }
 
-fn read_aliases() -> Result<Vec<Alias>, String> {
-    let path = aliases_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read aliases file: {e}"))?;
-    let val: toml::Value =
-        toml::from_str(&text).map_err(|e| format!("Failed to parse aliases file: {e}"))?;
-    let arr = val
-        .get("alias")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut out = Vec::with_capacity(arr.len());
-    for entry in arr {
-        let t = match entry {
-            toml::Value::Table(t) => t,
-            _ => continue,
-        };
-        let name = match t.get("name").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let card_id = match t.get("card_id").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        out.push(Alias {
-            name,
-            card_id,
-            pkg: t.get("pkg").and_then(|v| v.as_str()).map(String::from),
-            set_at: t
-                .get("set_at")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default(),
-            note: t.get("note").and_then(|v| v.as_str()).map(String::from),
-        });
-    }
-    Ok(out)
-}
-
-fn write_aliases(aliases: &[Alias]) -> Result<(), String> {
-    let path = aliases_path()?;
-    let mut arr = Vec::with_capacity(aliases.len());
-    for a in aliases {
-        let mut t = toml::map::Map::new();
-        t.insert("name".into(), toml::Value::String(a.name.clone()));
-        t.insert("card_id".into(), toml::Value::String(a.card_id.clone()));
-        if let Some(p) = &a.pkg {
-            t.insert("pkg".into(), toml::Value::String(p.clone()));
-        }
-        t.insert("set_at".into(), toml::Value::String(a.set_at.clone()));
-        if let Some(n) = &a.note {
-            t.insert("note".into(), toml::Value::String(n.clone()));
-        }
-        arr.push(toml::Value::Table(t));
-    }
-    let mut root = toml::map::Map::new();
-    root.insert("alias".into(), toml::Value::Array(arr));
-    let text = toml::to_string_pretty(&toml::Value::Table(root))
-        .map_err(|e| format!("Failed to serialize aliases: {e}"))?;
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, &text).map_err(|e| format!("Failed to write aliases tmp: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename aliases file: {e}"))?;
-    Ok(())
-}
-
 /// Bind (or rebind) an alias to a Card.
 ///
 /// Validates that `card_id` exists. If an alias with the same `name` already
@@ -705,11 +689,22 @@ pub fn alias_set(
     pkg: Option<&str>,
     note: Option<&str>,
 ) -> Result<Alias, String> {
+    alias_set_with_store(&default_store()?, name, card_id, pkg, note)
+}
+
+/// Bind an alias in `store`. See [`alias_set`] for the default-store variant.
+pub fn alias_set_with_store(
+    store: &dyn CardStore,
+    name: &str,
+    card_id: &str,
+    pkg: Option<&str>,
+    note: Option<&str>,
+) -> Result<Alias, String> {
     validate_name(name, "alias")?;
-    if find_card_path(card_id)?.is_none() {
+    if store.find_card_locator(card_id)?.is_none() {
         return Err(format!("alc.card.alias_set: card '{card_id}' not found"));
     }
-    let mut aliases = read_aliases()?;
+    let mut aliases = store.read_aliases()?;
     aliases.retain(|a| a.name != name);
     let entry = Alias {
         name: name.to_string(),
@@ -719,7 +714,7 @@ pub fn alias_set(
         note: note.map(String::from),
     };
     aliases.push(entry.clone());
-    write_aliases(&aliases)?;
+    store.write_aliases(&aliases)?;
     Ok(entry)
 }
 
@@ -729,12 +724,20 @@ pub fn alias_set(
 /// does not exist. Errors when the alias points at a missing Card — that
 /// would indicate a corrupt alias table (the target was deleted out of band).
 pub fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
+    get_by_alias_with_store(&default_store()?, name)
+}
+
+/// Resolve an alias in `store`. See [`get_by_alias`] for the default-store variant.
+pub fn get_by_alias_with_store(
+    store: &dyn CardStore,
+    name: &str,
+) -> Result<Option<Json>, String> {
     validate_name(name, "alias")?;
-    let aliases = read_aliases()?;
+    let aliases = store.read_aliases()?;
     let Some(alias) = aliases.into_iter().find(|a| a.name == name) else {
         return Ok(None);
     };
-    match get(&alias.card_id)? {
+    match get_with_store(store, &alias.card_id)? {
         Some(card) => Ok(Some(card)),
         None => Err(format!(
             "alc.card.get_by_alias: alias '{name}' points at missing card '{}'",
@@ -745,7 +748,15 @@ pub fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
 
 /// List aliases, optionally filtered by pkg.
 pub fn alias_list(pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
-    let mut aliases = read_aliases()?;
+    alias_list_with_store(&default_store()?, pkg_filter)
+}
+
+/// List aliases from `store`. See [`alias_list`] for the default-store variant.
+pub fn alias_list_with_store(
+    store: &dyn CardStore,
+    pkg_filter: Option<&str>,
+) -> Result<Vec<Alias>, String> {
+    let mut aliases = store.read_aliases()?;
     if let Some(p) = pkg_filter {
         aliases.retain(|a| a.pkg.as_deref() == Some(p));
     }
@@ -1112,15 +1123,15 @@ struct CardRow {
 }
 
 /// Load a single Card file into a `CardRow`.
-fn load_full(path: &std::path::Path, pkg: &str) -> Option<CardRow> {
-    let text = fs::read_to_string(path).ok()?;
+fn load_full(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Option<CardRow> {
+    let text = store.read_locator_text(locator).ok().flatten()?;
     let val: toml::Value = toml::from_str(&text).ok()?;
     let json = toml_to_json(val);
 
     let card_id = json
         .get("card_id")
         .and_then(|v| v.as_str())
-        .or_else(|| path.file_stem().and_then(|s| s.to_str()))?
+        .or_else(|| locator.file_stem().and_then(|s| s.to_str()))?
         .to_string();
     let created_at = json
         .get("created_at")
@@ -1224,9 +1235,14 @@ fn order_summaries(a: &Summary, b: &Summary, keys: &[OrderKey]) -> std::cmp::Ord
 /// summary-level fields, uses the lightweight `list()` path to avoid
 /// loading full TOML.  Otherwise loads full TOML per Card.
 pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
+    find_with_store(&default_store()?, q)
+}
+
+/// Filter/sort Cards from `store`. See [`find`] for the default-store variant.
+pub fn find_with_store(store: &dyn CardStore, q: FindQuery) -> Result<Vec<Summary>, String> {
     // Fast path: lightweight query, no full-TOML load needed.
     if is_lightweight_query(&q) {
-        let mut rows = list(q.pkg.as_deref())?;
+        let mut rows = list_with_store(store, q.pkg.as_deref())?;
         if q.order_by.is_empty() {
             rows.sort_by(|a, b| {
                 b.created_at
@@ -1245,25 +1261,7 @@ pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
     }
 
     // Full path: load entire TOML for where evaluation / arbitrary order_by.
-    let root = cards_dir()?;
-    let pkg_dirs: Vec<PathBuf> = if let Some(p) = q.pkg.as_deref() {
-        validate_name(p, "pkg")?;
-        let d = root.join(p);
-        if d.is_dir() {
-            vec![d]
-        } else {
-            return Ok(Vec::new());
-        }
-    } else {
-        fs::read_dir(&root)
-            .map_err(|e| format!("Failed to read cards dir: {e}"))?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect()
-    };
-
-    let all_rows = scan_pkg_dirs(&pkg_dirs)?;
+    let all_rows = scan_cards(store, q.pkg.as_deref())?;
 
     // Filter by where.
     let mut rows: Vec<CardRow> = if let Some(pred) = &q.where_ {
@@ -1437,9 +1435,8 @@ struct CardIndex {
 /// Load all Cards in the store once, keyed by card_id.
 /// Also builds a reverse index (parent → children) so that
 /// `walk_down` is O(result_size) instead of O(N_cards × depth).
-fn load_card_index() -> Result<CardIndex, String> {
-    let root = cards_dir()?;
-    let rows = scan_all_cards(&root)?;
+fn load_card_index(store: &dyn CardStore) -> Result<CardIndex, String> {
+    let rows = scan_cards(store, None)?;
 
     let mut cards = std::collections::HashMap::with_capacity(rows.len());
     let mut children: std::collections::HashMap<String, Vec<String>> =
@@ -1456,39 +1453,15 @@ fn load_card_index() -> Result<CardIndex, String> {
     Ok(CardIndex { cards, children })
 }
 
-/// Scan all Card TOML files from `root`, returning loaded CardRows.
-/// Shared between `find` and `load_card_index`.
-fn scan_all_cards(root: &std::path::Path) -> Result<Vec<CardRow>, String> {
-    let pkg_dirs: Vec<PathBuf> = fs::read_dir(root)
-        .map_err(|e| format!("Failed to read cards dir: {e}"))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    scan_pkg_dirs(&pkg_dirs)
-}
-
-/// Scan a list of pkg directories, loading every Card in them.
-fn scan_pkg_dirs(pkg_dirs: &[PathBuf]) -> Result<Vec<CardRow>, String> {
-    let mut rows = Vec::new();
-    for pdir in pkg_dirs {
-        let pkg = pdir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let entries = match fs::read_dir(pdir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("toml") {
-                continue;
-            }
-            if let Some(row) = load_full(&p, &pkg) {
-                rows.push(row);
-            }
+/// Scan all Cards in the store, loading full TOML for each. When
+/// `pkg_filter` is provided, only that pkg subdir is scanned. Shared
+/// between `find` and `load_card_index`.
+fn scan_cards(store: &dyn CardStore, pkg_filter: Option<&str>) -> Result<Vec<CardRow>, String> {
+    let locators = store.list_card_locators(pkg_filter)?;
+    let mut rows = Vec::with_capacity(locators.len());
+    for (pkg, loc) in &locators {
+        if let Some(row) = load_full(store, loc, pkg) {
+            rows.push(row);
         }
     }
     Ok(rows)
@@ -1616,7 +1589,15 @@ fn walk_down(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
 
 /// Walk the lineage tree from `q.card_id`.
 pub fn lineage(q: LineageQuery) -> Result<Option<LineageResult>, String> {
-    let index = load_card_index()?;
+    lineage_with_store(&default_store()?, q)
+}
+
+/// Walk the lineage tree in `store`. See [`lineage`] for the default-store variant.
+pub fn lineage_with_store(
+    store: &dyn CardStore,
+    q: LineageQuery,
+) -> Result<Option<LineageResult>, String> {
+    let index = load_card_index(store)?;
     let Some(root_row) = index.cards.get(&q.card_id) else {
         return Ok(None);
     };
@@ -1718,74 +1699,16 @@ pub fn import_from_dir(
     source_dir: &std::path::Path,
     pkg: &str,
 ) -> Result<(Vec<String>, Vec<String>), String> {
-    validate_name(pkg, "pkg")?;
-    let dest = pkg_dir(pkg)?;
-    let mut imported = Vec::new();
-    let mut skipped = Vec::new();
-
-    let entries =
-        fs::read_dir(source_dir).map_err(|e| format!("Failed to read card source dir: {e}"))?;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let fname = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        // Only process .toml card files (not .samples.jsonl — those are handled below)
-        if !fname.ends_with(".toml") {
-            continue;
-        }
-
-        let card_id = fname.trim_end_matches(".toml");
-        let dest_toml = dest.join(&fname);
-
-        if dest_toml.exists() {
-            skipped.push(card_id.to_string());
-            continue;
-        }
-
-        // Validate: must contain schema_version = "card/v0"
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read card file '{fname}': {e}"))?;
-        let val: toml::Value = toml::from_str(&text)
-            .map_err(|e| format!("Failed to parse card file '{fname}': {e}"))?;
-        if val.get("schema_version").and_then(|v| v.as_str()) != Some(SCHEMA_VERSION) {
-            continue; // skip non-card TOML files (e.g. index.toml, _aliases.toml)
-        }
-
-        // Copy .toml
-        fs::copy(&path, &dest_toml).map_err(|e| format!("Failed to copy card '{fname}': {e}"))?;
-
-        // Copy matching .samples.jsonl if present
-        let samples_name = format!("{card_id}.samples.jsonl");
-        let samples_src = source_dir.join(&samples_name);
-        if samples_src.exists() {
-            let samples_dest = dest.join(&samples_name);
-            if !samples_dest.exists() {
-                fs::copy(&samples_src, &samples_dest)
-                    .map_err(|e| format!("Failed to copy samples '{samples_name}': {e}"))?;
-            }
-        }
-
-        imported.push(card_id.to_string());
-    }
-
-    Ok((imported, skipped))
+    import_from_dir_with_store(&default_store()?, source_dir, pkg)
 }
 
-/// Resolve the samples sidecar path for a Card.
-///
-/// Returns an error if the Card does not exist — samples without a
-/// parent Card are meaningless and we refuse to create orphans.
-fn samples_path(card_id: &str) -> Result<PathBuf, String> {
-    let card_path =
-        find_card_path(card_id)?.ok_or_else(|| format!("card '{card_id}' not found"))?;
-    let dir = card_path
-        .parent()
-        .ok_or_else(|| format!("card '{card_id}' has no parent directory"))?;
-    Ok(dir.join(format!("{card_id}.samples.jsonl")))
+/// Import Card files into `store`. See [`import_from_dir`] for the default-store variant.
+pub fn import_from_dir_with_store(
+    store: &dyn CardStore,
+    source_dir: &std::path::Path,
+    pkg: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    store.import_from_dir(source_dir, pkg)
 }
 
 /// Write per-case samples to `{card_id}.samples.jsonl` (write-once).
@@ -1794,8 +1717,16 @@ fn samples_path(card_id: &str) -> Result<PathBuf, String> {
 /// Fails if a samples file already exists for this card — mirrors
 /// the immutability guarantee of Cards themselves.
 pub fn write_samples(card_id: &str, samples: Vec<Json>) -> Result<PathBuf, String> {
-    let path = samples_path(card_id)?;
-    if path.exists() {
+    write_samples_with_store(&default_store()?, card_id, samples)
+}
+
+/// Write samples via `store`. See [`write_samples`] for the default-store variant.
+pub fn write_samples_with_store(
+    store: &dyn CardStore,
+    card_id: &str,
+    samples: Vec<Json>,
+) -> Result<PathBuf, String> {
+    if store.samples_exists(card_id)? {
         return Err(format!(
             "alc.card.write_samples: samples already exist for card '{card_id}' (write-once)"
         ));
@@ -1808,10 +1739,7 @@ pub fn write_samples(card_id: &str, samples: Vec<Json>) -> Result<PathBuf, Strin
         buf.push_str(&line);
         buf.push('\n');
     }
-    let tmp = path.with_extension("jsonl.tmp");
-    fs::write(&tmp, &buf).map_err(|e| format!("Failed to write samples tmp: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename samples file: {e}"))?;
-    Ok(path)
+    store.write_samples_text(card_id, &buf)
 }
 
 /// Query parameters for `read_samples`.
@@ -1836,12 +1764,19 @@ pub struct SamplesQuery {
 /// Returns an empty Vec if no samples file exists (Cards without
 /// per-case details are the common case, not an error).
 pub fn read_samples(card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String> {
-    let path = samples_path(card_id)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read samples file: {e}"))?;
+    read_samples_with_store(&default_store()?, card_id, q)
+}
+
+/// Read samples from `store`. See [`read_samples`] for the default-store variant.
+pub fn read_samples_with_store(
+    store: &dyn CardStore,
+    card_id: &str,
+    q: SamplesQuery,
+) -> Result<Vec<Json>, String> {
+    let text = match store.read_samples_text(card_id)? {
+        Some(t) => t,
+        None => return Ok(Vec::new()),
+    };
     let mut matched: usize = 0;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -1870,6 +1805,333 @@ pub fn read_samples(card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String>
     Ok(out)
 }
 
+// ═══════════════════════════════════════════════════════════════
+// FileCardStore — default backend.
+// ═══════════════════════════════════════════════════════════════
+//
+// Stores Cards as TOML files under `{root}/{pkg}/{card_id}.toml`,
+// samples as `{root}/{pkg}/{card_id}.samples.jsonl`, and the alias
+// table as `{root}/_aliases.toml`.
+//
+// `root` defaults to `~/.algocline/cards/` via `from_home()`. Tests
+// may use `new(tmpdir)` to redirect storage to a scratch directory.
+
+/// File-backed implementation of [`CardStore`].
+pub struct FileCardStore {
+    root: PathBuf,
+}
+
+impl FileCardStore {
+    /// Construct a store rooted at an explicit path.
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// Construct the default store rooted at `~/.algocline/cards/`.
+    pub fn from_home() -> Result<Self, String> {
+        Ok(Self { root: cards_dir()? })
+    }
+
+    /// Returns the absolute path to the per-pkg subdirectory,
+    /// creating it when missing. Validates `pkg` to prevent path
+    /// traversal.
+    fn pkg_dir(&self, pkg: &str) -> Result<PathBuf, String> {
+        validate_name(pkg, "pkg")?;
+        let dir = self.root.join(pkg);
+        if !dir.exists() {
+            fs::create_dir_all(&dir).map_err(|e| format!("Failed to create pkg dir: {e}"))?;
+        }
+        Ok(dir)
+    }
+
+    /// Path of the global alias table.
+    fn aliases_path(&self) -> PathBuf {
+        self.root.join("_aliases.toml")
+    }
+
+    /// Path of the samples sidecar for `card_id`. Errors if the
+    /// Card itself does not exist — samples without a parent Card
+    /// are meaningless and we refuse to create orphans.
+    fn samples_path(&self, card_id: &str) -> Result<PathBuf, String> {
+        let card_path = self
+            .find_card_locator(card_id)?
+            .ok_or_else(|| format!("card '{card_id}' not found"))?;
+        let dir = card_path
+            .parent()
+            .ok_or_else(|| format!("card '{card_id}' has no parent directory"))?;
+        Ok(dir.join(format!("{card_id}.samples.jsonl")))
+    }
+}
+
+impl CardStore for FileCardStore {
+    fn write_new_card(&self, pkg: &str, card_id: &str, toml_text: &str) -> Result<PathBuf, String> {
+        let dir = self.pkg_dir(pkg)?;
+        let path = dir.join(format!("{card_id}.toml"));
+        if path.exists() {
+            return Err(format!(
+                "alc.card.create: card '{card_id}' already exists (immutable)"
+            ));
+        }
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, toml_text).map_err(|e| format!("Failed to write card tmp: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename card file: {e}"))?;
+        Ok(path)
+    }
+
+    fn overwrite_card(&self, card_id: &str, toml_text: &str) -> Result<PathBuf, String> {
+        let path = self
+            .find_card_locator(card_id)?
+            .ok_or_else(|| format!("alc.card.overwrite: card '{card_id}' not found"))?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, toml_text).map_err(|e| format!("Failed to write card tmp: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename card file: {e}"))?;
+        Ok(path)
+    }
+
+    fn find_card_locator(&self, card_id: &str) -> Result<Option<PathBuf>, String> {
+        validate_name(card_id, "card_id")?;
+        if !self.root.exists() {
+            return Ok(None);
+        }
+        let entries =
+            fs::read_dir(&self.root).map_err(|e| format!("Failed to read cards dir: {e}"))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let candidate = p.join(format!("{card_id}.toml"));
+                if candidate.exists() {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_card_text(&self, card_id: &str) -> Result<Option<String>, String> {
+        let Some(path) = self.find_card_locator(card_id)? else {
+            return Ok(None);
+        };
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read card '{card_id}': {e}"))?;
+        Ok(Some(text))
+    }
+
+    fn list_card_locators(
+        &self,
+        pkg_filter: Option<&str>,
+    ) -> Result<Vec<(String, PathBuf)>, String> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let pkg_dirs: Vec<PathBuf> = if let Some(p) = pkg_filter {
+            validate_name(p, "pkg")?;
+            let d = self.root.join(p);
+            if d.is_dir() {
+                vec![d]
+            } else {
+                return Ok(Vec::new());
+            }
+        } else {
+            fs::read_dir(&self.root)
+                .map_err(|e| format!("Failed to read cards dir: {e}"))?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        };
+
+        let mut out = Vec::new();
+        for pdir in pkg_dirs {
+            let pkg = pdir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let entries = match fs::read_dir(&pdir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("toml") {
+                    continue;
+                }
+                out.push((pkg.clone(), p));
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_locator_text(&self, locator: &Path) -> Result<Option<String>, String> {
+        match fs::read_to_string(locator) {
+            Ok(text) => Ok(Some(text)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn read_aliases(&self) -> Result<Vec<Alias>, String> {
+        let path = self.aliases_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("Failed to read aliases file: {e}"))?;
+        let val: toml::Value =
+            toml::from_str(&text).map_err(|e| format!("Failed to parse aliases file: {e}"))?;
+        let arr = val
+            .get("alias")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for entry in arr {
+            let t = match entry {
+                toml::Value::Table(t) => t,
+                _ => continue,
+            };
+            let name = match t.get("name").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let card_id = match t.get("card_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            out.push(Alias {
+                name,
+                card_id,
+                pkg: t.get("pkg").and_then(|v| v.as_str()).map(String::from),
+                set_at: t
+                    .get("set_at")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_default(),
+                note: t.get("note").and_then(|v| v.as_str()).map(String::from),
+            });
+        }
+        Ok(out)
+    }
+
+    fn write_aliases(&self, aliases: &[Alias]) -> Result<(), String> {
+        // Ensure the cards root exists so aliases can be written to
+        // a brand-new store (mirrors the behaviour of `cards_dir()`).
+        if !self.root.exists() {
+            fs::create_dir_all(&self.root)
+                .map_err(|e| format!("Failed to create cards dir: {e}"))?;
+        }
+        let path = self.aliases_path();
+        let mut arr = Vec::with_capacity(aliases.len());
+        for a in aliases {
+            let mut t = toml::map::Map::new();
+            t.insert("name".into(), toml::Value::String(a.name.clone()));
+            t.insert("card_id".into(), toml::Value::String(a.card_id.clone()));
+            if let Some(p) = &a.pkg {
+                t.insert("pkg".into(), toml::Value::String(p.clone()));
+            }
+            t.insert("set_at".into(), toml::Value::String(a.set_at.clone()));
+            if let Some(n) = &a.note {
+                t.insert("note".into(), toml::Value::String(n.clone()));
+            }
+            arr.push(toml::Value::Table(t));
+        }
+        let mut root = toml::map::Map::new();
+        root.insert("alias".into(), toml::Value::Array(arr));
+        let text = toml::to_string_pretty(&toml::Value::Table(root))
+            .map_err(|e| format!("Failed to serialize aliases: {e}"))?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, &text).map_err(|e| format!("Failed to write aliases tmp: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename aliases file: {e}"))?;
+        Ok(())
+    }
+
+    fn samples_exists(&self, card_id: &str) -> Result<bool, String> {
+        let path = self.samples_path(card_id)?;
+        Ok(path.exists())
+    }
+
+    fn write_samples_text(&self, card_id: &str, jsonl_text: &str) -> Result<PathBuf, String> {
+        let path = self.samples_path(card_id)?;
+        if path.exists() {
+            return Err(format!(
+                "alc.card.write_samples: samples already exist for card '{card_id}' (write-once)"
+            ));
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        fs::write(&tmp, jsonl_text).map_err(|e| format!("Failed to write samples tmp: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename samples file: {e}"))?;
+        Ok(path)
+    }
+
+    fn read_samples_text(&self, card_id: &str) -> Result<Option<String>, String> {
+        let path = self.samples_path(card_id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("Failed to read samples file: {e}"))?;
+        Ok(Some(text))
+    }
+
+    fn import_from_dir(
+        &self,
+        source_dir: &Path,
+        pkg: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        validate_name(pkg, "pkg")?;
+        let dest = self.pkg_dir(pkg)?;
+        let mut imported = Vec::new();
+        let mut skipped = Vec::new();
+
+        let entries = fs::read_dir(source_dir)
+            .map_err(|e| format!("Failed to read card source dir: {e}"))?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            if !fname.ends_with(".toml") {
+                continue;
+            }
+
+            let card_id = fname.trim_end_matches(".toml");
+            let dest_toml = dest.join(&fname);
+
+            if dest_toml.exists() {
+                skipped.push(card_id.to_string());
+                continue;
+            }
+
+            let text = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read card file '{fname}': {e}"))?;
+            let val: toml::Value = toml::from_str(&text)
+                .map_err(|e| format!("Failed to parse card file '{fname}': {e}"))?;
+            if val.get("schema_version").and_then(|v| v.as_str()) != Some(SCHEMA_VERSION) {
+                continue;
+            }
+
+            fs::copy(&path, &dest_toml)
+                .map_err(|e| format!("Failed to copy card '{fname}': {e}"))?;
+
+            let samples_name = format!("{card_id}.samples.jsonl");
+            let samples_src = source_dir.join(&samples_name);
+            if samples_src.exists() {
+                let samples_dest = dest.join(&samples_name);
+                if !samples_dest.exists() {
+                    fs::copy(&samples_src, &samples_dest)
+                        .map_err(|e| format!("Failed to copy samples '{samples_name}': {e}"))?;
+                }
+            }
+
+            imported.push(card_id.to_string());
+        }
+
+        Ok((imported, skipped))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1883,8 +2145,10 @@ mod tests {
     }
 
     fn cleanup(pkg: &str) {
-        if let Ok(d) = pkg_dir(pkg) {
-            let _ = fs::remove_dir_all(&d);
+        if let Ok(store) = default_store() {
+            if let Ok(d) = store.pkg_dir(pkg) {
+                let _ = fs::remove_dir_all(&d);
+            }
         }
     }
 
@@ -2129,12 +2393,14 @@ mod tests {
         assert_eq!(matching[0].card_id, id2);
 
         // Cleanup: remove our alias from the file
-        let remaining: Vec<Alias> = read_aliases()
+        let store = default_store().unwrap();
+        let remaining: Vec<Alias> = store
+            .read_aliases()
             .unwrap()
             .into_iter()
             .filter(|a| a.name != alias_name)
             .collect();
-        write_aliases(&remaining).unwrap();
+        store.write_aliases(&remaining).unwrap();
         cleanup(&pkg);
     }
 
@@ -2874,5 +3140,62 @@ mod tests {
         assert!(skipped.is_empty());
 
         cleanup(&pkg);
+    }
+
+    // ─── PathCardStore (FileCardStore rooted at a custom path) ──────
+    //
+    // Smoke test proving the trait boundary lets callers swap the
+    // storage root without touching `~/.algocline/cards/`.
+
+    #[test]
+    fn custom_root_file_store_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "custom_root_pkg";
+
+        // create → get → list through the _with_store variants
+        let (id, path) = create_with_store(
+            &store,
+            json!({
+                "pkg":   { "name": pkg },
+                "model": { "id": "gpt-test" },
+            }),
+        )
+        .unwrap();
+        assert!(path.starts_with(tmp.path()));
+        assert!(path.ends_with(format!("{id}.toml")));
+
+        let card = get_with_store(&store, &id).unwrap().expect("card exists");
+        assert_eq!(card.get("card_id").and_then(|v| v.as_str()), Some(id.as_str()));
+
+        let rows = list_with_store(&store, Some(pkg)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].card_id, id);
+
+        // Ensure the default store is not polluted.
+        let default_rows = list(Some(pkg)).unwrap();
+        assert!(default_rows.iter().all(|r| r.card_id != id));
+
+        // alias + lookup scoped to the custom store
+        alias_set_with_store(&store, "alpha", &id, Some(pkg), None).unwrap();
+        let via_alias = get_by_alias_with_store(&store, "alpha")
+            .unwrap()
+            .expect("alias resolves");
+        assert_eq!(
+            via_alias.get("card_id").and_then(|v| v.as_str()),
+            Some(id.as_str())
+        );
+
+        // samples write/read roundtrip
+        let samples_path = write_samples_with_store(
+            &store,
+            &id,
+            vec![json!({ "case": "a", "pass": true })],
+        )
+        .unwrap();
+        assert!(samples_path.starts_with(tmp.path()));
+        let back = read_samples_with_store(&store, &id, SamplesQuery::default()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].get("case").and_then(|v| v.as_str()), Some("a"));
     }
 }

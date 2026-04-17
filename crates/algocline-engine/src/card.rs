@@ -779,10 +779,7 @@ pub fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
 }
 
 /// Resolve an alias in `store`. See [`get_by_alias`] for the default-store variant.
-pub fn get_by_alias_with_store(
-    store: &dyn CardStore,
-    name: &str,
-) -> Result<Option<Json>, String> {
+pub fn get_by_alias_with_store(store: &dyn CardStore, name: &str) -> Result<Option<Json>, String> {
     validate_name(name, "alias")?;
     let aliases = store.read_aliases()?;
     let Some(alias) = aliases.into_iter().find(|a| a.name == name) else {
@@ -2178,8 +2175,8 @@ impl CardStore for FileCardStore {
         let mut imported = Vec::new();
         let mut skipped = Vec::new();
 
-        let entries = fs::read_dir(source_dir)
-            .map_err(|e| format!("Failed to read card source dir: {e}"))?;
+        let entries =
+            fs::read_dir(source_dir).map_err(|e| format!("Failed to read card source dir: {e}"))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2423,8 +2420,14 @@ impl SubscriberStats {
             let mut ok: HashMap<String, u64> = HashMap::with_capacity(4);
             let mut err: HashMap<String, u64> = HashMap::with_capacity(4);
             for k in CardEventKind::all() {
-                ok.insert(k.json_key().to_string(), ps.ok.get(&k).copied().unwrap_or(0));
-                err.insert(k.json_key().to_string(), ps.err.get(&k).copied().unwrap_or(0));
+                ok.insert(
+                    k.json_key().to_string(),
+                    ps.ok.get(&k).copied().unwrap_or(0),
+                );
+                err.insert(
+                    k.json_key().to_string(),
+                    ps.err.get(&k).copied().unwrap_or(0),
+                );
             }
             rows.push(SubscriberHealthRow {
                 sink: sink.clone(),
@@ -2480,8 +2483,7 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     let pid = process::id();
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("subscriber mkdir: {e}"))?;
+            fs::create_dir_all(parent).map_err(|e| format!("subscriber mkdir: {e}"))?;
         }
     }
     let mut tmp = dest.as_os_str().to_owned();
@@ -2537,8 +2539,7 @@ impl FileCardSubscriber {
         if !self.root.exists() {
             return Ok(None);
         }
-        let entries = fs::read_dir(&self.root)
-            .map_err(|e| format!("subscriber read_dir: {e}"))?;
+        let entries = fs::read_dir(&self.root).map_err(|e| format!("subscriber read_dir: {e}"))?;
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
@@ -2593,8 +2594,7 @@ impl FileCardSubscriber {
 
     fn write_aliases(&self, toml_text: &str) -> Result<(), String> {
         if !self.root.exists() {
-            fs::create_dir_all(&self.root)
-                .map_err(|e| format!("subscriber mkdir: {e}"))?;
+            fs::create_dir_all(&self.root).map_err(|e| format!("subscriber mkdir: {e}"))?;
         }
         let dest = self.root.join("_aliases.toml");
         atomic_write(&dest, toml_text.as_bytes())
@@ -2609,9 +2609,7 @@ impl CardSubscriber for FileCardSubscriber {
                 card_id,
                 toml_text,
             } => self.write_created(pkg, card_id, toml_text),
-            CardEvent::Appended { card_id, toml_text } => {
-                self.write_appended(card_id, toml_text)
-            }
+            CardEvent::Appended { card_id, toml_text } => self.write_appended(card_id, toml_text),
             CardEvent::SamplesWritten {
                 card_id,
                 jsonl_text,
@@ -2791,9 +2789,7 @@ pub fn publish(ev: CardEvent) {
         let is_test_owner = INSIDE_BUS_TEST.with(|f| f.get());
         if !is_test_owner {
             // Block until any active subscriber test releases the lock.
-            let _gate = bus_test_gate()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _gate = bus_test_gate().lock().unwrap_or_else(|p| p.into_inner());
             event_bus().publish(&ev);
             return;
         }
@@ -3020,7 +3016,11 @@ fn parse_subscriber_spec(spec: &str) -> Option<Arc<dyn CardSubscriber>> {
     let authority = &after_slash[..path_start];
     let encoded_path = &after_slash[path_start..];
     if !authority.is_empty() {
-        tracing::error!(spec, authority, "file URI with non-empty authority is rejected");
+        tracing::error!(
+            spec,
+            authority,
+            "file URI with non-empty authority is rejected"
+        );
         return None;
     }
     let path = decode_file_uri_path(encoded_path)?;
@@ -4119,7 +4119,10 @@ mod tests {
         assert!(path.ends_with(format!("{id}.toml")));
 
         let card = get_with_store(&store, &id).unwrap().expect("card exists");
-        assert_eq!(card.get("card_id").and_then(|v| v.as_str()), Some(id.as_str()));
+        assert_eq!(
+            card.get("card_id").and_then(|v| v.as_str()),
+            Some(id.as_str())
+        );
 
         let rows = list_with_store(&store, Some(pkg)).unwrap();
         assert_eq!(rows.len(), 1);
@@ -4140,12 +4143,9 @@ mod tests {
         );
 
         // samples write/read roundtrip
-        let samples_path = write_samples_with_store(
-            &store,
-            &id,
-            vec![json!({ "case": "a", "pass": true })],
-        )
-        .unwrap();
+        let samples_path =
+            write_samples_with_store(&store, &id, vec![json!({ "case": "a", "pass": true })])
+                .unwrap();
         assert!(samples_path.starts_with(tmp.path()));
         let back = read_samples_with_store(&store, &id, SamplesQuery::default()).unwrap();
         assert_eq!(back.len(), 1);
@@ -4198,9 +4198,7 @@ mod tests {
     {
         // Acquire the gate FIRST. While we wait, no one else holds the owner
         // role, and our INSIDE_BUS_TEST is still false, so this lock is safe.
-        let _guard = bus_test_gate()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _guard = bus_test_gate().lock().unwrap_or_else(|p| p.into_inner());
         // Now mark this thread as the bus-test owner so that publish() from
         // within the closure does not try to re-acquire bus_test_gate().
         // The RAII guard clears the flag on both normal return and unwind.
@@ -4291,11 +4289,9 @@ mod tests {
         let fb = Arc::new(FileCardSubscriber::new(sub_b.path().to_path_buf()));
         with_bus_subscribers(vec![fa.clone(), fb.clone()], |_bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            let (id, path) = create_with_store(
-                &store,
-                json!({ "pkg": { "name": "fanout_create_pkg" } }),
-            )
-            .unwrap();
+            let (id, path) =
+                create_with_store(&store, json!({ "pkg": { "name": "fanout_create_pkg" } }))
+                    .unwrap();
             assert!(path.exists());
             let primary_text = fs::read_to_string(&path).unwrap();
             let a_path = sub_a
@@ -4320,11 +4316,9 @@ mod tests {
         let fs_sub = Arc::new(FileCardSubscriber::new(sub.path().to_path_buf()));
         with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            let (id, _) = create_with_store(
-                &store,
-                json!({ "pkg": { "name": "fanout_append_pkg" } }),
-            )
-            .unwrap();
+            let (id, _) =
+                create_with_store(&store, json!({ "pkg": { "name": "fanout_append_pkg" } }))
+                    .unwrap();
             // After create the subscriber must have the card so append can locate it.
             append_with_store(&store, &id, json!({ "extra_key": 42 })).unwrap();
             let sub_path = sub
@@ -4343,11 +4337,9 @@ mod tests {
         let fs_sub = Arc::new(FileCardSubscriber::new(sub.path().to_path_buf()));
         with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            let (id, _) = create_with_store(
-                &store,
-                json!({ "pkg": { "name": "fanout_samples_pkg" } }),
-            )
-            .unwrap();
+            let (id, _) =
+                create_with_store(&store, json!({ "pkg": { "name": "fanout_samples_pkg" } }))
+                    .unwrap();
             write_samples_with_store(&store, &id, vec![json!({ "case": "c0" })]).unwrap();
             let sub_path = sub
                 .path()
@@ -4365,11 +4357,9 @@ mod tests {
         let fs_sub = Arc::new(FileCardSubscriber::new(sub.path().to_path_buf()));
         with_bus_subscribers(vec![fs_sub.clone()], |_bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            let (id, _) = create_with_store(
-                &store,
-                json!({ "pkg": { "name": "fanout_alias_pkg" } }),
-            )
-            .unwrap();
+            let (id, _) =
+                create_with_store(&store, json!({ "pkg": { "name": "fanout_alias_pkg" } }))
+                    .unwrap();
             alias_set_with_store(&store, "myalias", &id, Some("fanout_alias_pkg"), None).unwrap();
             let sub_aliases = sub.path().join("_aliases.toml");
             assert!(sub_aliases.exists(), "subscriber must receive aliases file");
@@ -4398,10 +4388,7 @@ mod tests {
                 import_from_dir_with_store(&store, src.path(), "fanout_import_pkg").unwrap();
             assert_eq!(imported, vec!["card_x".to_string()]);
 
-            let sub_card = sub
-                .path()
-                .join("fanout_import_pkg")
-                .join("card_x.toml");
+            let sub_card = sub.path().join("fanout_import_pkg").join("card_x.toml");
             assert!(sub_card.exists(), "imported card must be mirrored");
         });
     }
@@ -4446,11 +4433,7 @@ mod tests {
         let mock = MockSubscriber::new("mock://direct");
         with_bus_subscribers(vec![mock.clone() as Arc<dyn CardSubscriber>], |_bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            create_with_store(
-                &store,
-                json!({ "pkg": { "name": "direct_call_pkg" } }),
-            )
-            .unwrap();
+            create_with_store(&store, json!({ "pkg": { "name": "direct_call_pkg" } })).unwrap();
             assert_eq!(mock.call_count(), 1, "direct _with_store call must publish");
         });
     }
@@ -4465,11 +4448,9 @@ mod tests {
             // Create the card BEFORE the subscriber knows about it. To do that,
             // swap the subscriber out so create does not mirror, then swap in.
             bus.replace_subscribers_for_test(Vec::new());
-            let (id, _) = create_with_store(
-                &store,
-                json!({ "pkg": { "name": "missing_append_pkg" } }),
-            )
-            .unwrap();
+            let (id, _) =
+                create_with_store(&store, json!({ "pkg": { "name": "missing_append_pkg" } }))
+                    .unwrap();
             // Re-install the subscriber; it has no mirror of the card.
             bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
 
@@ -4505,11 +4486,9 @@ mod tests {
             |bus| {
                 let store = FileCardStore::new(primary.path().to_path_buf());
                 // Primary call must still succeed despite subscriber failure.
-                let (_id, path) = create_with_store(
-                    &store,
-                    json!({ "pkg": { "name": "preserve_primary_pkg" } }),
-                )
-                .unwrap();
+                let (_id, path) =
+                    create_with_store(&store, json!({ "pkg": { "name": "preserve_primary_pkg" } }))
+                        .unwrap();
                 assert!(path.exists());
                 let snap = bus.stats().snapshot();
                 let row = snap
@@ -4572,11 +4551,7 @@ mod tests {
             vec![Arc::new(FailingSubscriber) as Arc<dyn CardSubscriber>],
             |bus| {
                 let store = FileCardStore::new(primary.path().to_path_buf());
-                create_with_store(
-                    &store,
-                    json!({ "pkg": { "name": "stats_err_pkg" } }),
-                )
-                .unwrap();
+                create_with_store(&store, json!({ "pkg": { "name": "stats_err_pkg" } })).unwrap();
                 let snap = bus.stats().snapshot();
                 let row = snap
                     .iter()
@@ -4610,11 +4585,7 @@ mod tests {
         ];
         with_bus_subscribers(subs, |bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            create_with_store(
-                &store,
-                json!({ "pkg": { "name": "isolated_pkg" } }),
-            )
-            .unwrap();
+            create_with_store(&store, json!({ "pkg": { "name": "isolated_pkg" } })).unwrap();
             let snap = bus.stats().snapshot();
             let r1 = snap
                 .iter()
@@ -4675,11 +4646,7 @@ mod tests {
         let mock = MockSubscriber::new("mock://json-shape");
         with_bus_subscribers(vec![mock.clone() as Arc<dyn CardSubscriber>], |_bus| {
             let store = FileCardStore::new(primary.path().to_path_buf());
-            create_with_store(
-                &store,
-                json!({ "pkg": { "name": "json_shape_pkg" } }),
-            )
-            .unwrap();
+            create_with_store(&store, json!({ "pkg": { "name": "json_shape_pkg" } })).unwrap();
             let snap = subscriber_stats_snapshot();
             let json = serde_json::to_value(&snap).expect("serializable");
             let arr = json.as_array().expect("array");
@@ -4690,7 +4657,10 @@ mod tests {
             assert_eq!(row.get("sink").unwrap(), "mock://json-shape");
             for k in ["created", "appended", "samples", "aliases"] {
                 assert!(row.pointer(&format!("/ok/{k}")).is_some(), "ok.{k} missing");
-                assert!(row.pointer(&format!("/err/{k}")).is_some(), "err.{k} missing");
+                assert!(
+                    row.pointer(&format!("/err/{k}")).is_some(),
+                    "err.{k} missing"
+                );
             }
             assert!(row.get("last_error").is_some());
         });
@@ -4740,7 +4710,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sub = FileCardSubscriber::new(dir.path().to_path_buf());
         let uri = sub.describe();
-        assert!(uri.starts_with("file:///"), "windows uri must be file:///...");
+        assert!(
+            uri.starts_with("file:///"),
+            "windows uri must be file:///..."
+        );
         let parsed = parse_subscriber_spec(&uri).expect("round-trip parse");
         assert_eq!(parsed.describe(), uri);
     }
@@ -4978,8 +4951,7 @@ mod tests {
                 dest.file_name().unwrap().to_string_lossy().to_string()
             }));
         }
-        let names: HashSet<String> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let names: HashSet<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         assert_eq!(names.len(), 8, "all dest names must be unique");
         // Additionally confirm suffix format by invoking atomic_write
         // again and parsing the tmp we leave on a forced failure.
@@ -5168,7 +5140,11 @@ mod tests {
             bus.replace_subscribers_for_test(vec![fs_sub.clone()]);
 
             let report = card_sink_backfill_with_store(&store, &uri, true).unwrap();
-            assert_eq!(report.pushed.len(), 2, "pushed must list ids even in dry run");
+            assert_eq!(
+                report.pushed.len(),
+                2,
+                "pushed must list ids even in dry run"
+            );
             for id in &ids {
                 let p = sub_dir
                     .path()
@@ -5240,9 +5216,8 @@ mod tests {
     fn backfill_unknown_sink_err() {
         with_bus_subscribers(Vec::new(), |_bus| {
             let (_primary, store, _ids) = backfill_primary_with_cards("backfill_unknown_pkg", 1);
-            let err =
-                card_sink_backfill_with_store(&store, "file:///nonexistent/sink", false)
-                    .unwrap_err();
+            let err = card_sink_backfill_with_store(&store, "file:///nonexistent/sink", false)
+                .unwrap_err();
             assert!(
                 err.starts_with("unknown sink"),
                 "must reject unregistered sink; got: {err}"
@@ -5342,7 +5317,11 @@ mod tests {
             bus.replace_subscribers_for_test(vec![reinstall]);
 
             let report = card_sink_backfill_with_store(&store, &uri, false).unwrap();
-            assert_eq!(report.failed.len(), 1, "failed must record the synthetic err");
+            assert_eq!(
+                report.failed.len(),
+                1,
+                "failed must record the synthetic err"
+            );
             assert!(report.pushed.is_empty());
             let snap = bus.stats().snapshot();
             let row = snap.iter().find(|r| r.sink == uri).expect("row");

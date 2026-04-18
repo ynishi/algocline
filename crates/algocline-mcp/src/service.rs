@@ -153,6 +153,63 @@ pub struct PkgListParams {
     /// alongside global packages. Each package carries a `scope` field
     /// ("project" or "global") and an `active` boolean.
     pub project_root: Option<String>,
+    /// Maximum number of `packages` entries to return (default: 50).
+    ///
+    /// - `null` (omit) → default cap 50
+    /// - `0`           → **no limit** (return all entries — empty-means-all idiom)
+    /// - negative      → clamped to 0, i.e. also "no limit"
+    ///
+    /// Truncation happens **after** filter/sort, so the highest-priority
+    /// entries survive.
+    pub limit: Option<i32>,
+    /// Sort order — MongoDB-style comma-separated keys with optional
+    /// `-` prefix for descending. Examples: `"name"`, `"-installed_at"`,
+    /// `"-active,-installed_at"` (the default). Unknown or empty keys
+    /// are rejected with an error. Default: `"-active,-installed_at"`
+    /// — active packages first (DESC on bool puts `true` before
+    /// `false`), then ties broken by newest install.
+    pub sort: Option<String>,
+    /// Key-value filter applied to each projected entry (after the
+    /// project/global merge). Exact equality on each key. Unknown keys
+    /// miss (i.e. no entry matches).
+    pub filter: Option<serde_json::Value>,
+    /// Sparse fieldsets — explicit list of per-entry keys to include
+    /// in the output. Unknown keys are silently skipped (JSON:API
+    /// convention). **`fields` wins over `verbose` when both are
+    /// supplied**, so `fields` is the way to get an exact projection.
+    pub fields: Option<Vec<String>>,
+    /// Output shape preset. Accepted values: `"summary"` (default) or
+    /// `"full"`. Any other value returns an error — there is no silent
+    /// fallback. When both `fields` and `verbose` are supplied,
+    /// **`fields` wins** and `verbose` is ignored.
+    ///
+    /// Preset field sets (verbatim — any change here is a semver event,
+    /// see "Preset drift policy" below):
+    ///
+    /// - `"summary"` = `["name", "scope", "version", "active",
+    ///   "resolved_source_path", "resolved_source_kind"]`
+    /// - `"full"` = summary plus `["install_source", "installed_at",
+    ///   "updated_at", "override_paths", "overrides", "linked",
+    ///   "link_target", "broken", "path", "source", "source_type",
+    ///   "meta", "error"]`
+    ///
+    /// ### Preset drift policy
+    ///
+    /// Changing these preset arrays is a semver-relevant action. Adding
+    /// a field is a **minor** version bump (existing callers can
+    /// safely ignore the new key). Removing a field is a **major**
+    /// version bump (output parsers can break). Every such change
+    /// MUST be recorded verbatim in `CHANGELOG.md` — listing both the
+    /// pre-change and post-change preset contents (see plan.md §3.3.2
+    /// and ST3 deliverable).
+    ///
+    /// ### Projection scope
+    ///
+    /// `verbose` / `fields` only affect the per-entry objects inside
+    /// the top-level `packages` array. Top-level keys (`search_paths`,
+    /// `project_root`, `lockfile_path`) are always returned regardless
+    /// of the chosen preset or field list.
+    pub verbose: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -450,15 +507,82 @@ pub struct HubReindexParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HubSearchParams {
-    /// Search query (matched against package name, description, category).
-    /// Omit to list all available packages.
+    /// Search query (matched against package name, description, category,
+    /// and docstring). Omit to list all available packages. When the
+    /// query matches **only** the docstring (i.e. not name/description/
+    /// category), the corresponding result carries `docstring_matched:
+    /// true` so the caller can tell that the hit came from the
+    /// full-text channel rather than the primary metadata.
     pub query: Option<String>,
     /// Filter by category (e.g. "reasoning", "aggregation", "synthesis").
+    /// Prefer the generic `filter` parameter for new callers; `category`
+    /// is kept for backward compatibility and is folded into `filter`
+    /// on the server side. If `filter` already contains a `"category"`
+    /// key, the explicit `filter` entry wins.
     pub category: Option<String>,
     /// When true, only show locally installed packages.
+    /// Prefer the generic `filter` parameter (`filter = {"installed":
+    /// true}`) for new callers; `installed_only` is kept for
+    /// backward compatibility. If `filter` already contains an
+    /// `"installed"` key, the explicit `filter` entry wins.
     pub installed_only: Option<bool>,
     /// Maximum number of results (default: 50).
-    pub limit: Option<usize>,
+    ///
+    /// - `null` (omit) → default cap 50
+    /// - `0`           → **no limit** (return all entries — empty-means-all idiom)
+    /// - negative      → clamped to 0, i.e. also "no limit"
+    pub limit: Option<i32>,
+    /// Sort order — MongoDB-style comma-separated keys with optional
+    /// `-` prefix for descending. Examples: `"name"`, `"-installed"`,
+    /// `"-installed,name"` (the default). Unknown or empty keys are
+    /// rejected with an error. Default: `"-installed,name"` — installed
+    /// packages first, then ascending by name.
+    pub sort: Option<String>,
+    /// Key-value filter applied to each projected result (after
+    /// query/category/installed_only). Exact equality on each key.
+    /// Unknown keys miss (i.e. no entry matches). When both `filter`
+    /// and legacy `category` / `installed_only` are supplied, the
+    /// explicit `filter` entry wins on key conflict.
+    pub filter: Option<serde_json::Value>,
+    /// Sparse fieldsets — explicit list of per-entry keys to include
+    /// in the output. Unknown keys are silently skipped (JSON:API
+    /// convention). **`fields` wins over `verbose` when both are
+    /// supplied**, so `fields` is the way to get an exact projection.
+    pub fields: Option<Vec<String>>,
+    /// Output shape preset. Accepted values: `"summary"` (default) or
+    /// `"full"`. Any other value returns an error — there is no silent
+    /// fallback. When both `fields` and `verbose` are supplied,
+    /// **`fields` wins** and `verbose` is ignored.
+    ///
+    /// Preset field sets (verbatim — any change here is a semver event,
+    /// see "Preset drift policy" below):
+    ///
+    /// - `"summary"` = `["name", "version", "description", "category",
+    ///   "installed", "docstring_matched"]`
+    /// - `"full"` = summary plus `["source", "card_count", "best_card",
+    ///   "docstring"]`
+    ///
+    /// `docstring_matched` is only present in individual result entries
+    /// when the query matched docstring and not the primary metadata;
+    /// otherwise the key is omitted from that entry.
+    ///
+    /// ### Preset drift policy
+    ///
+    /// Changing these preset arrays is a semver-relevant action. Adding
+    /// a field is a **minor** version bump (existing callers can
+    /// safely ignore the new key). Removing a field is a **major**
+    /// version bump (output parsers can break). Every such change
+    /// MUST be recorded verbatim in `CHANGELOG.md` — listing both the
+    /// pre-change and post-change preset contents (see plan.md §3.3.2
+    /// and ST3 deliverable).
+    ///
+    /// ### Projection scope
+    ///
+    /// `verbose` / `fields` only affect the per-entry objects inside
+    /// the top-level `results` array. Top-level keys (`total`,
+    /// `sources`, `warnings`) are always returned regardless of the
+    /// chosen preset or field list.
+    pub verbose: Option<String>,
 }
 
 // ─── MCP Handler ────────────────────────────────────────────────
@@ -703,6 +827,15 @@ impl AlcService {
     /// Each entry also includes `resolved_source_path` (canonical absolute directory),
     /// `resolved_source_kind` (installed / linked / local_path / bundled; future values may appear),
     /// and `override_paths` (shadowed same-name packages).
+    ///
+    /// ### List-tool params
+    /// - `verbose="summary"` (default) / `"full"` — preset field selector.
+    ///   - summary: `name, scope, version, active, resolved_source_path, resolved_source_kind`
+    ///   - full: summary + `install_source, installed_at, updated_at, override_paths, overrides, linked, link_target, broken, path, source, source_type, meta, error`
+    /// - `fields=["name","scope"]` — explicit field list (wins over `verbose` when both set).
+    /// - `sort="-active,-installed_at"` (default) — comma-separated keys, `-` prefix for descending.
+    /// - `filter={"scope":"global","active":true}` — key-value exact match.
+    /// - `limit=50` (default).
     #[tool(
         name = "alc_pkg_list",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -711,7 +844,16 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<PkgListParams>,
     ) -> Result<String, String> {
-        self.app.pkg_list(params.project_root).await
+        self.app
+            .pkg_list(
+                params.project_root,
+                params.limit,
+                params.sort,
+                params.filter,
+                params.fields,
+                params.verbose,
+            )
+            .await
     }
 
     /// Install a package from a Git URL or local path.
@@ -1134,6 +1276,21 @@ impl AlcService {
     /// `installed: true/false` for each entry. Use this to discover
     /// available strategies — uninstalled packages can be installed via
     /// `alc_pkg_install` using the `source` URL from the result.
+    ///
+    /// ### List-tool params
+    /// - `verbose="summary"` (default) / `"full"` — preset field selector.
+    ///   - summary: `name, version, description, category, installed, docstring_matched`
+    ///   - full: summary + `source, card_count, best_card, docstring`
+    /// - `fields=["name","version"]` — explicit field list (wins over `verbose` when both set).
+    /// - `sort="-installed,name"` (default) — comma-separated keys, `-` prefix for descending.
+    /// - `filter={"category":"reasoning","installed":true}` — key-value exact match.
+    ///   Legacy `category` / `installed_only` keep working; when both given, `filter` wins.
+    /// - `limit=50` (default).
+    ///
+    /// `docstring_matched=true` appears only when `query` hits the docstring
+    /// alone (missed `name` / `description` / `category`); otherwise the
+    /// field is omitted. The internal `docstring` is still searched — to
+    /// surface it in output use `verbose="full"` or `fields=["docstring"]`.
     #[tool(
         name = "alc_hub_search",
         annotations(read_only_hint = true, open_world_hint = true)
@@ -1148,6 +1305,10 @@ impl AlcService {
                 params.category,
                 params.installed_only,
                 params.limit,
+                params.sort,
+                params.filter,
+                params.fields,
+                params.verbose,
             )
             .await
     }

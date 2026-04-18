@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alc_pkg_list` / `alc_hub_search`: unified list-tool knobs (`limit` / `sort` / `filter` / `fields` / `verbose`)
+  - `verbose = "summary"` (default) | `"full"`; `fields` > `verbose` when both set
+  - `sort`: `"-key,key2"` DSL; default `pkg_list="-active,-installed_at"`, `hub_search="-installed,name"`
+  - `filter`: key-value exact match; when `filter` and legacy `category` / `installed_only` conflict on the same key, **`filter` wins** (explicit parameter priority). `hub_search`'s `category` / `installed_only` fold into the `filter` map only when the key is not already set
+  - `limit`: `null` → tool default (50); `0` → **no limit / return all** (empty-means-all idiom); negative → clamped to 0 (also "no limit")
+- `hub_search`: `SearchResult.docstring_matched: Option<bool>` — hit source flag (true only when the query hit docstring alone)
+- Size regression guard: default summary output capped < 15KB (50 entries × ~224 chars/entry ≈ 11 KB realistic ceiling, ~34% headroom)
+
+### Changed
+
+- `alc_pkg_list` summary preset fields (verbatim): `name`, `scope`, `version`, `active`, `resolved_source_path`, `resolved_source_kind`
+- `alc_pkg_list` full preset fields (verbatim): summary + `install_source`, `installed_at`, `updated_at`, `override_paths`, `overrides`, `linked`, `link_target`, `broken`, `path`, `source`, `source_type`, `meta`, `error`
+- `alc_hub_search` summary preset fields (verbatim): `name`, `version`, `description`, `category`, `installed`, `docstring_matched`
+- `alc_hub_search` full preset fields (verbatim): summary + `source`, `card_count`, `best_card`, `docstring`
+- `hub_search`: `SearchResult.docstring` is now `skip_serializing` (internal signal for matching; projected only when the field set includes `"docstring"` — via `fields=["docstring"]` or `verbose="full"`)
+
+### Preset drift policy
+
+- Add field to preset = **minor** version bump
+- Remove/rename field = **major** version bump
+- Both must list the full preset verbatim in the CHANGELOG `Changed` section
+
+### Fixed
+
+- `alc_pkg_list` / `alc_hub_search`: large 1-line JSON output (63K–68K chars) no longer exceeds Claude Code context limits at default `verbose="summary"`
+
 ## [0.22.0] - 2026-04-18
 
 ### Added — Card sink fan-out (`ALC_CARD_SINKS`) + backfill

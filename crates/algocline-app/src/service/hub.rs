@@ -78,6 +78,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::list_opts::{
+    apply_sort_by_value, matches_filter, parse_sort, project_fields, resolve_fields, ListOpts,
+    HUB_SEARCH_FULL, HUB_SEARCH_SUMMARY,
+};
 use super::manifest;
 use super::resolve::AUTO_INSTALL_SOURCES;
 use super::AppService;
@@ -136,6 +140,17 @@ pub(crate) struct BestCard {
 }
 
 /// Search result — index entry enriched with local install state.
+///
+/// `docstring` is `skip_serializing` so the default serde output never
+/// exposes it (docstrings can be large and dominate payload size). The
+/// `hub_search` projection path puts it back into the JSON object when
+/// the resolved field set contains `"docstring"`, via
+/// [`SearchResult::to_value_with_optional_docstring`].
+///
+/// `docstring_matched` is a query-time signal: it is `Some(true)` only
+/// when the query hit docstring and none of {name, description, category}.
+/// Otherwise (no query, or query hit any of the other fields) it is
+/// `None` and omitted from the output.
 #[derive(Debug, Clone, Serialize)]
 struct SearchResult {
     name: String,
@@ -146,8 +161,37 @@ struct SearchResult {
     installed: bool,
     card_count: usize,
     best_card: Option<BestCard>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing)]
     docstring: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docstring_matched: Option<bool>,
+}
+
+impl SearchResult {
+    /// Serialize `self` to a JSON `Value`, optionally re-attaching
+    /// `docstring` to the resulting object.
+    ///
+    /// `skip_serializing` removes `docstring` from every serde output
+    /// path. When projection selects `docstring` as an output field, we
+    /// need to put it back — this helper bridges that gap by inserting
+    /// the field manually into the resulting `Value::Object`.
+    ///
+    /// Returns the original `Value` unchanged if serialization produced
+    /// a non-object (should not happen for `SearchResult`, but we stay
+    /// defensive because the downstream `project_fields` contract
+    /// tolerates non-objects).
+    fn to_value_with_optional_docstring(&self, include_docstring: bool) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        if include_docstring {
+            if let serde_json::Value::Object(ref mut map) = v {
+                map.insert(
+                    "docstring".to_string(),
+                    serde_json::Value::String(self.docstring.clone()),
+                );
+            }
+        }
+        v
+    }
 }
 
 // ─── Hub registries ───────────────────────────────────────────
@@ -675,6 +719,7 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
             },
             best_card: entry.best_card.clone(),
             docstring,
+            docstring_matched: None,
         });
     }
 
@@ -697,6 +742,7 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
             card_count: card_counts.get(name).copied().unwrap_or(0),
             best_card: None,
             docstring,
+            docstring_matched: None,
         });
     }
 
@@ -1099,51 +1145,140 @@ impl AppService {
     ///
     /// Index URLs are discovered from hub registries, manifest sources,
     /// and `AUTO_INSTALL_SOURCES`. Each source is cached independently.
-    pub fn hub_search(
+    ///
+    /// ## List-tool options (`opts`)
+    ///
+    /// The `opts` parameter carries the list-tool primitives
+    /// (`limit / sort / filter / fields / verbose`) shared with other
+    /// list-style MCP tools. Defaults:
+    ///
+    /// - `limit` — 50 when `None`. `Some(0)` means **no limit** (return
+    ///   all matching entries — empty-means-all idiom).
+    /// - `sort` — `"-installed,name"` when `None` (installed first, then
+    ///   ascending by name).
+    /// - `filter` — no additional filter. Legacy `category` /
+    ///   `installed_only` parameters are merged into the filter map when
+    ///   `filter` does not already contain those keys (explicit
+    ///   `filter` wins on conflict).
+    /// - `fields` / `verbose` — projection is applied to every entry in
+    ///   the `results` array (see
+    ///   [`super::list_opts::resolve_fields`]). Top-level keys
+    ///   (`total`, `sources`, `warnings`) are never projected away.
+    ///
+    /// ## docstring handling
+    ///
+    /// [`SearchResult::docstring`] is `skip_serializing`, so it is
+    /// absent from the default serialized view. When the resolved
+    /// projection contains `"docstring"`, it is re-injected into the
+    /// per-entry JSON via
+    /// [`SearchResult::to_value_with_optional_docstring`].
+    pub(crate) fn hub_search(
         &self,
         query: Option<&str>,
         category: Option<&str>,
         installed_only: Option<bool>,
-        limit: Option<usize>,
+        opts: ListOpts,
     ) -> Result<String, String> {
         let (remote, warnings) = fetch_remote_indices();
         let mut results = merge(&remote);
 
-        // Filter by query
-        if let Some(q) = query {
-            if !q.is_empty() {
-                results.retain(|r| matches_query(r, q));
+        // Filter by query (internal signal covers name/description/
+        // category/docstring — `matches_query` unchanged).
+        let query_lower = query.filter(|q| !q.is_empty()).map(|q| q.to_lowercase());
+        if let Some(ref ql) = query_lower {
+            results.retain(|r| matches_query(r, ql));
+        }
+
+        // Compute docstring_matched per remaining hit: Some(true) only
+        // when the query matched docstring and none of {name,
+        // description, category}; otherwise None.
+        if let Some(ref ql) = query_lower {
+            for r in &mut results {
+                let other_hit = r.name.to_lowercase().contains(ql)
+                    || r.description.to_lowercase().contains(ql)
+                    || r.category.to_lowercase().contains(ql);
+                let doc_hit = r.docstring.to_lowercase().contains(ql);
+                r.docstring_matched = if !other_hit && doc_hit {
+                    Some(true)
+                } else {
+                    None
+                };
             }
         }
 
-        // Filter by category
+        // Build the effective filter map: start from explicit `opts.filter`,
+        // then fold legacy `category` / `installed_only` in only if the
+        // corresponding key is not already set (explicit filter wins).
+        let mut filter_map: std::collections::HashMap<String, serde_json::Value> =
+            opts.filter.unwrap_or_default();
         if let Some(cat) = category {
-            let cat_lower = cat.to_lowercase();
-            results.retain(|r| r.category.to_lowercase() == cat_lower);
+            filter_map
+                .entry("category".to_string())
+                .or_insert_with(|| serde_json::Value::String(cat.to_string()));
+        }
+        if let Some(only) = installed_only {
+            // Preserve prior semantic: `installed_only=Some(false)` was a
+            // no-op (it did not force `installed=false`). Only fold when
+            // explicitly true.
+            if only {
+                filter_map
+                    .entry("installed".to_string())
+                    .or_insert(serde_json::Value::Bool(true));
+            }
         }
 
-        // Filter by installed state
-        if let Some(true) = installed_only {
-            results.retain(|r| r.installed);
+        // Resolve sort keys up-front so an invalid sort string errors out
+        // before we touch results.
+        let sort_str = opts.sort.as_deref().unwrap_or("-installed,name");
+        let sort_keys = parse_sort(sort_str)?;
+
+        // Resolve projection fields; this also rejects unknown `verbose`
+        // values before any heavy work.
+        let fields = resolve_fields(
+            opts.verbose.as_deref(),
+            opts.fields.as_deref(),
+            HUB_SEARCH_SUMMARY,
+            HUB_SEARCH_FULL,
+        )?;
+        let include_docstring = fields.iter().any(|f| f == "docstring");
+
+        // Serialize each result to a Value (docstring optionally attached)
+        // so filter/sort/projection work uniformly on JSON values.
+        let mut items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| r.to_value_with_optional_docstring(include_docstring))
+            .collect();
+
+        // Filter AFTER serialization so filter keys can reference
+        // projection-level shape (e.g. `category`, `installed`).
+        if !filter_map.is_empty() {
+            items.retain(|v| matches_filter(v, &filter_map));
         }
 
-        // Sort: installed first, then by name
-        results.sort_by(|a, b| {
-            b.installed
-                .cmp(&a.installed)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        // Sort.
+        apply_sort_by_value(&mut items, &sort_keys);
 
-        // Limit
-        let total = results.len();
-        let limit = limit.unwrap_or(50);
-        results.truncate(limit);
+        // Limit. `limit = Some(0)` means "no limit" (return all results)
+        // — mirrors the `empty=all & some=filter` idiom used across the
+        // list-tool contract. `None` falls back to the default cap (50).
+        let total = items.len();
+        let limit = opts.limit.unwrap_or(50);
+        if limit > 0 {
+            items.truncate(limit);
+        }
 
-        // Collect discovered sources for transparency
+        // Projection (after truncation — unselected fields are stripped
+        // from the kept entries only).
+        let projected: Vec<serde_json::Value> = items
+            .into_iter()
+            .map(|v| project_fields(v, &fields))
+            .collect();
+
+        // Collect discovered sources for transparency.
         let sources = discover_index_urls();
 
         let mut json = serde_json::json!({
-            "results": results,
+            "results": projected,
             "total": total,
             "sources": sources,
         });
@@ -1480,11 +1615,330 @@ return M
             card_count: 0,
             best_card: None,
             docstring: "Based on FrugalGPT. Uses Thompson Sampling.".into(),
+            docstring_matched: None,
         };
 
         assert!(matches_query(&result, "thompson"), "docstring match");
         assert!(matches_query(&result, "FrugalGPT"), "docstring match case");
         assert!(matches_query(&result, "routing"), "description match");
         assert!(!matches_query(&result, "bayesian"), "no match");
+    }
+
+    // ─── SearchResult::to_value_with_optional_docstring ────────────
+    //
+    // `docstring` is `skip_serializing` so the default JSON view must
+    // omit it, and it is re-attached only when the projection path says
+    // so. These tests pin the two branches of that helper — they are the
+    // hinge that `verbose="full"` / `fields=["docstring"]` rely on.
+
+    fn sample_search_result() -> SearchResult {
+        SearchResult {
+            name: "cascade".into(),
+            version: "0.1.0".into(),
+            description: "Multi-level routing".into(),
+            category: "reasoning".into(),
+            source: "https://example.com/cascade".into(),
+            installed: true,
+            card_count: 3,
+            best_card: None,
+            docstring: "Based on FrugalGPT. Uses Thompson Sampling.".into(),
+            docstring_matched: None,
+        }
+    }
+
+    #[test]
+    fn to_value_default_omits_docstring() {
+        let r = sample_search_result();
+        let v = r.to_value_with_optional_docstring(false);
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("docstring"),
+            "default summary must not leak docstring"
+        );
+        assert_eq!(obj.get("name").and_then(|x| x.as_str()), Some("cascade"));
+        // `docstring_matched` is Option<None> → `skip_serializing_if`
+        // must omit it when the query did not mark a docstring-only hit.
+        assert!(
+            !obj.contains_key("docstring_matched"),
+            "docstring_matched=None must be omitted"
+        );
+    }
+
+    #[test]
+    fn to_value_include_reattaches_docstring() {
+        let r = sample_search_result();
+        let v = r.to_value_with_optional_docstring(true);
+        let obj = v.as_object().expect("object");
+        assert_eq!(
+            obj.get("docstring").and_then(|x| x.as_str()),
+            Some("Based on FrugalGPT. Uses Thompson Sampling.")
+        );
+    }
+
+    #[test]
+    fn to_value_serializes_docstring_matched_when_set() {
+        let mut r = sample_search_result();
+        r.docstring_matched = Some(true);
+        let v = r.to_value_with_optional_docstring(false);
+        let obj = v.as_object().expect("object");
+        assert_eq!(
+            obj.get("docstring_matched").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+    }
+
+    // ─── projection glue ──────────────────────────────────────────
+    //
+    // These tests exercise the projection path that `hub_search` uses to
+    // shape output: `resolve_fields` + `project_fields` applied to a
+    // `to_value_with_optional_docstring`-serialized entry. They pin the
+    // wf-sim-verbose contract: `fields` wins over `verbose`, default
+    // summary preset excludes docstring, `full` preset includes
+    // docstring, unknown keys silently skipped.
+
+    #[test]
+    fn hub_search_default_summary_excludes_docstring() {
+        let r = sample_search_result();
+        let fields = resolve_fields(None, None, HUB_SEARCH_SUMMARY, HUB_SEARCH_FULL).unwrap();
+        let include_docstring = fields.iter().any(|f| f == "docstring");
+        let v = project_fields(
+            r.to_value_with_optional_docstring(include_docstring),
+            &fields,
+        );
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("docstring"),
+            "summary preset must omit docstring"
+        );
+        // summary preset fields that are present on the sample entry
+        for key in ["name", "version", "description", "category", "installed"] {
+            assert!(obj.contains_key(key), "summary preset key {key} missing");
+        }
+    }
+
+    #[test]
+    fn hub_search_verbose_full_includes_docstring() {
+        let r = sample_search_result();
+        let fields =
+            resolve_fields(Some("full"), None, HUB_SEARCH_SUMMARY, HUB_SEARCH_FULL).unwrap();
+        let include_docstring = fields.iter().any(|f| f == "docstring");
+        let v = project_fields(
+            r.to_value_with_optional_docstring(include_docstring),
+            &fields,
+        );
+        let obj = v.as_object().expect("object");
+        assert_eq!(
+            obj.get("docstring").and_then(|x| x.as_str()),
+            Some("Based on FrugalGPT. Uses Thompson Sampling.")
+        );
+        // full preset superset keys
+        for key in ["source", "card_count"] {
+            assert!(obj.contains_key(key), "full preset key {key} missing");
+        }
+    }
+
+    #[test]
+    fn hub_search_fields_beats_verbose() {
+        let r = sample_search_result();
+        let explicit = vec!["name".to_string(), "docstring".to_string()];
+        // verbose=summary normally excludes docstring, but explicit
+        // fields must win.
+        let fields = resolve_fields(
+            Some("summary"),
+            Some(&explicit),
+            HUB_SEARCH_SUMMARY,
+            HUB_SEARCH_FULL,
+        )
+        .unwrap();
+        let include_docstring = fields.iter().any(|f| f == "docstring");
+        let v = project_fields(
+            r.to_value_with_optional_docstring(include_docstring),
+            &fields,
+        );
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2, "only the two requested fields");
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("docstring"));
+    }
+
+    #[test]
+    fn hub_search_fields_unknown_key_silently_skipped() {
+        let r = sample_search_result();
+        let explicit = vec!["name".to_string(), "bogus".to_string()];
+        let fields =
+            resolve_fields(None, Some(&explicit), HUB_SEARCH_SUMMARY, HUB_SEARCH_FULL).unwrap();
+        let v = project_fields(r.to_value_with_optional_docstring(false), &fields);
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 1, "bogus must not appear");
+        assert!(obj.contains_key("name"));
+    }
+
+    #[test]
+    fn hub_search_invalid_verbose_errors() {
+        let err =
+            resolve_fields(Some("fat"), None, HUB_SEARCH_SUMMARY, HUB_SEARCH_FULL).unwrap_err();
+        assert!(
+            err.contains("fat"),
+            "error must mention the offending value"
+        );
+    }
+
+    // ─── docstring_matched classification ─────────────────────────
+    //
+    // The query-time classification rule: `docstring_matched = Some(true)`
+    // only when the query hit docstring AND missed name/description/
+    // category; otherwise `None` (and therefore omitted from output).
+    // The logic lives inline in `hub_search`; we re-create it here over a
+    // tiny local helper so the three cases stay pinned as a contract.
+
+    fn classify(r: &SearchResult, query: &str) -> Option<bool> {
+        let ql = query.to_lowercase();
+        if query.is_empty() {
+            return None;
+        }
+        let other_hit = r.name.to_lowercase().contains(&ql)
+            || r.description.to_lowercase().contains(&ql)
+            || r.category.to_lowercase().contains(&ql);
+        let doc_hit = r.docstring.to_lowercase().contains(&ql);
+        if !other_hit && doc_hit {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn docstring_matched_true_when_only_docstring_hits() {
+        let r = sample_search_result();
+        // "Thompson" appears only in docstring of the sample entry.
+        assert_eq!(classify(&r, "thompson"), Some(true));
+    }
+
+    #[test]
+    fn docstring_matched_none_when_name_also_hits() {
+        let r = sample_search_result();
+        // "cascade" hits the name; docstring match is irrelevant now.
+        assert_eq!(classify(&r, "cascade"), None);
+    }
+
+    #[test]
+    fn docstring_matched_none_when_description_hits() {
+        let r = sample_search_result();
+        // "routing" hits description; should be None.
+        assert_eq!(classify(&r, "routing"), None);
+    }
+
+    #[test]
+    fn docstring_matched_none_when_query_empty() {
+        let r = sample_search_result();
+        assert_eq!(classify(&r, ""), None);
+    }
+
+    // ─── filter fold (legacy params → filter map) ─────────────────
+    //
+    // Behavioural rule: legacy `category` / `installed_only=true` fold
+    // into the filter map only when the corresponding key is not
+    // already set (explicit `filter` wins). `installed_only=false` is a
+    // no-op (preserves prior semantics).
+
+    fn build_filter_map(
+        category: Option<&str>,
+        installed_only: Option<bool>,
+        explicit: Option<HashMap<String, serde_json::Value>>,
+    ) -> HashMap<String, serde_json::Value> {
+        let mut filter_map = explicit.unwrap_or_default();
+        if let Some(cat) = category {
+            filter_map
+                .entry("category".to_string())
+                .or_insert_with(|| serde_json::Value::String(cat.to_string()));
+        }
+        if let Some(only) = installed_only {
+            if only {
+                filter_map
+                    .entry("installed".to_string())
+                    .or_insert(serde_json::Value::Bool(true));
+            }
+        }
+        filter_map
+    }
+
+    #[test]
+    fn filter_by_category_via_legacy_param() {
+        let m = build_filter_map(Some("reasoning"), None, None);
+        assert_eq!(
+            m.get("category"),
+            Some(&serde_json::Value::String("reasoning".to_string()))
+        );
+    }
+
+    #[test]
+    fn filter_by_installed_only_via_legacy_param() {
+        let m = build_filter_map(None, Some(true), None);
+        assert_eq!(m.get("installed"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn filter_installed_only_false_is_noop() {
+        let m = build_filter_map(None, Some(false), None);
+        assert!(
+            !m.contains_key("installed"),
+            "installed_only=false should not fold in"
+        );
+    }
+
+    #[test]
+    fn filter_beats_legacy_param_on_conflict() {
+        // Explicit filter says category=meta; legacy says reasoning.
+        // Explicit must win.
+        let mut explicit = HashMap::new();
+        explicit.insert(
+            "category".to_string(),
+            serde_json::Value::String("meta".to_string()),
+        );
+        let m = build_filter_map(Some("reasoning"), None, Some(explicit));
+        assert_eq!(
+            m.get("category"),
+            Some(&serde_json::Value::String("meta".to_string()))
+        );
+    }
+
+    #[test]
+    fn filter_merges_legacy_when_no_conflict() {
+        // Explicit sets a different key; legacy category should still
+        // be folded in.
+        let mut explicit = HashMap::new();
+        explicit.insert("installed".to_string(), serde_json::Value::Bool(true));
+        let m = build_filter_map(Some("reasoning"), None, Some(explicit));
+        assert_eq!(
+            m.get("category"),
+            Some(&serde_json::Value::String("reasoning".to_string()))
+        );
+        assert_eq!(m.get("installed"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    // ─── default sort verification ────────────────────────────────
+
+    #[test]
+    fn default_sort_is_minus_installed_name() {
+        let keys = parse_sort("-installed,name").unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "installed");
+        assert!(keys[0].desc, "installed must sort desc (true first)");
+        assert_eq!(keys[1].key, "name");
+        assert!(!keys[1].desc);
+
+        // Apply it against a small vec and confirm the expected order.
+        let mut items = vec![
+            serde_json::json!({"installed": false, "name": "zeta"}),
+            serde_json::json!({"installed": true, "name": "mu"}),
+            serde_json::json!({"installed": false, "name": "alpha"}),
+            serde_json::json!({"installed": true, "name": "beta"}),
+        ];
+        apply_sort_by_value(&mut items, &keys);
+        let names: Vec<&str> = items
+            .iter()
+            .map(|v| v.get("name").and_then(|x| x.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["beta", "mu", "alpha", "zeta"]);
     }
 }

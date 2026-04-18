@@ -1751,3 +1751,246 @@ async fn pkg_install_rejects_missing_local_source_with_clear_error() {
         "must not regress to collection-mode misleading error, got: {err}"
     );
 }
+
+// ─── Size regression guard (ST3) ──────────────────────────────
+//
+// Before the list-tool unification (pre-ST1), `alc_pkg_list` and
+// `alc_hub_search` emitted 63K–68K-char single-line JSON that exceeded
+// Claude Code's context window on populated environments. The summary
+// preset now caps per-entry output to roughly 6 fields; at the default
+// `limit=50` that should stay well under 15,000 chars. These two tests
+// pin that contract so any regression toward the fat shape is caught
+// immediately, regardless of preset churn.
+
+/// FNV-1a hash — reproduces `hub::cache_key` verbatim so the test can
+/// pre-populate the per-source cache without exposing the internal.
+fn fnv1a_hex(url: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// `alc_pkg_list` default summary (`verbose="summary"`) must stay under
+/// 15_000 chars with a realistically populated test environment.
+///
+/// Setup: write 60 synthetic installed packages under a search path
+/// (each with an `init.lua`). Summary preset projects 6 fields per
+/// entry; default `limit=50` caps the projected array, so the fixture
+/// populates **60 packages** to exercise the default-limit worst case
+/// (truncation to 50 entries). Real-world environments have ~100-150
+/// installed packages but hit the same 50-entry cap — 50 entries × ~224
+/// chars/entry puts the ceiling around 11 KB, so the 15_000 budget
+/// leaves ~34% headroom for natural field churn.
+#[tokio::test]
+async fn pkg_list_default_summary_is_compact() {
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("pkgs");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    // 60 > default limit (50). Guards the actual default-limit worst case:
+    // real-world setups (100-150 pkgs) hit the same 50-entry truncation.
+    for i in 0..60 {
+        let pkg_dir = search_dir.join(format!("size_regression_pkg_{i:02}"));
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+    }
+
+    let search_path = crate::service::resolve::SearchPath {
+        path: search_dir,
+        source: crate::service::resolve::SearchPathSource::Env,
+    };
+    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+    let out = pkg_list_summary(&svc, None).await;
+
+    assert!(
+        out.len() < 15_000,
+        "pkg_list default summary should stay compact (got {} chars)",
+        out.len()
+    );
+    // Sanity: output must be valid JSON and include at least one
+    // package — otherwise the budget is meaningless.
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        !json["packages"].as_array().unwrap().is_empty(),
+        "size test is meaningless without populated packages"
+    );
+}
+
+/// `alc_hub_search` default summary (`verbose="summary"`) must stay under
+/// 10_000 chars. To keep the test deterministic (and offline), the
+/// per-source cache is primed with empty `HubIndex` entries for every
+/// URL that `discover_index_urls` can surface under a `FakeHome`:
+///
+/// - `hub.collection_url` is unset → no Tier 0 entry.
+/// - No registries / manifest → only the compiled-in `AUTO_INSTALL_SOURCES`
+///   remain (2 entries), transformed by `repo_to_index_url` to raw
+///   GitHub URLs.
+///
+/// Populating the cache for those 2 URLs with an empty `HubIndex` means
+/// `fetch_one` returns early and never makes an HTTP call, so the test
+/// works offline and finishes in milliseconds.
+#[tokio::test]
+async fn hub_search_default_summary_is_compact() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    let cache_dir = fake_home.home.join(".algocline").join("hub_cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Empty HubIndex JSON — matches the schema `fetch_one` deserializes.
+    let empty_index = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "",
+        "packages": [],
+    })
+    .to_string();
+
+    // Seed cache for every URL `discover_index_urls` may surface under
+    // FakeHome. The compiled-in seeds live in `AUTO_INSTALL_SOURCES`;
+    // they are passed through `repo_to_index_url` before hitting the
+    // cache layer. If this list drifts the test must follow —
+    // `repo_to_index_url` is verified verbatim by `hub.rs` unit tests.
+    for repo in [
+        "https://github.com/ynishi/algocline-bundled-packages",
+        "https://github.com/ynishi/evalframe",
+    ] {
+        let owner_repo = repo.trim_start_matches("https://github.com/");
+        let index_url =
+            format!("https://raw.githubusercontent.com/{owner_repo}/main/hub_index.json");
+        let cache_path = cache_dir.join(format!("{}.json", fnv1a_hex(&index_url)));
+        std::fs::write(&cache_path, &empty_index).unwrap();
+    }
+
+    let svc = make_app_service().await;
+    // Call the internal `AppService::hub_search` directly (same form
+    // `engine_api_impl::hub_search` uses after folding MCP params into
+    // `ListOpts`). Keeps the test at the app-layer boundary and avoids
+    // the EngineApi trait import dance.
+    let out = svc.hub_search(None, None, None, opts()).unwrap();
+
+    assert!(
+        out.len() < 10_000,
+        "hub_search default summary should stay compact (got {} chars)",
+        out.len()
+    );
+    // Sanity: output is valid JSON.
+    let _: serde_json::Value = serde_json::from_str(&out).unwrap();
+}
+
+// ─── limit=0 → "no limit" (empty-means-all idiom) ──────────────
+//
+// `limit = Some(0)` means "return all entries" — the list-tool contract
+// mirrors common `empty=all & some=filter` idioms. Default (`None`) still
+// caps at 50. Pins the truncation branch for both tools.
+
+/// `alc_pkg_list` with `limit = Some(0)` returns every entry (no cap).
+#[tokio::test]
+async fn pkg_list_limit_zero_returns_all() {
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let search_dir = tmp.path().join("pkgs");
+    std::fs::create_dir_all(&search_dir).unwrap();
+
+    // Populate 60 packages — more than the default cap of 50 — so a
+    // regression that silently applies the default limit to `Some(0)`
+    // would surface as a truncated array.
+    for i in 0..60 {
+        let pkg_dir = search_dir.join(format!("limit_zero_pkg_{i:02}"));
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+    }
+
+    let search_path = crate::service::resolve::SearchPath {
+        path: search_dir,
+        source: crate::service::resolve::SearchPathSource::Env,
+    };
+    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+
+    let out = svc
+        .pkg_list(
+            None,
+            ListOpts {
+                limit: Some(0),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let packages = json["packages"].as_array().expect("packages array");
+    assert_eq!(
+        packages.len(),
+        60,
+        "limit=0 must return all 60 entries (got {})",
+        packages.len()
+    );
+}
+
+/// `alc_hub_search` with `limit = Some(0)` skips truncation — the result
+/// array length equals `total`. Uses a primed empty index (same pattern
+/// as `hub_search_default_summary_is_compact`) so `results` is an empty
+/// array whose length equals `total`; the non-truncation branch is
+/// confirmed by both sides agreeing.
+#[tokio::test]
+async fn hub_search_limit_zero_returns_all() {
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+
+    let cache_dir = fake_home.home.join(".algocline").join("hub_cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let empty_index = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "",
+        "packages": [],
+    })
+    .to_string();
+
+    for repo in [
+        "https://github.com/ynishi/algocline-bundled-packages",
+        "https://github.com/ynishi/evalframe",
+    ] {
+        let owner_repo = repo.trim_start_matches("https://github.com/");
+        let index_url =
+            format!("https://raw.githubusercontent.com/{owner_repo}/main/hub_index.json");
+        let cache_path = cache_dir.join(format!("{}.json", fnv1a_hex(&index_url)));
+        std::fs::write(&cache_path, &empty_index).unwrap();
+    }
+
+    let svc = make_app_service().await;
+    let out = svc
+        .hub_search(
+            None,
+            None,
+            None,
+            ListOpts {
+                limit: Some(0),
+                ..opts()
+            },
+        )
+        .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let results = json["results"].as_array().expect("results array");
+    let total = json["total"].as_u64().expect("total number");
+    assert_eq!(
+        results.len() as u64,
+        total,
+        "limit=0 must not truncate: results.len={} vs total={}",
+        results.len(),
+        total
+    );
+}

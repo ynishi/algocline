@@ -139,6 +139,9 @@ pub trait EngineApi: Send + Sync {
     ///
     /// - `limit` is `Option<i32>` at this layer (MCP/JSON boundary).
     ///   The impl clamps negative values to 0 and casts to `usize`.
+    ///   `Some(0)` (and thus clamped negatives) means **no limit**
+    ///   (return all entries — empty-means-all idiom); `None` falls
+    ///   back to the tool's default cap.
     /// - `filter` is a free-form JSON object; it is `Deserialize`d into
     ///   a `HashMap<String, Value>` inside the app layer. Non-object
     ///   values are logged via `tracing::warn` and treated as no filter.

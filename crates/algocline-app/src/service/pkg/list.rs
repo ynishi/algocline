@@ -4,6 +4,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::super::alc_toml::{self, load_alc_toml};
+use super::super::list_opts::{
+    apply_sort_by_value, matches_filter, parse_sort, project_fields, resolve_fields, ListOpts,
+    PKG_LIST_FULL, PKG_LIST_SUMMARY,
+};
 use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
 use super::super::project::resolve_project_root;
@@ -190,7 +194,38 @@ impl AppService {
     /// version/source info from `alc.lock`. Global packages carry `scope: "global"`.
     /// If a project package and a global package share the same name, the project
     /// one is `active: true` and the global one `active: false`.
-    pub async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String> {
+    ///
+    /// `opts` carries the list-tool knob set (`limit / sort / filter /
+    /// fields / verbose`); see [`super::super::list_opts`] for the
+    /// projection / sort / filter primitives. Top-level keys
+    /// (`packages`, `search_paths`, `project_root`, `lockfile_path`)
+    /// are never projected away — only the per-entry objects inside
+    /// `packages` are subject to projection.
+    pub(crate) async fn pkg_list(
+        &self,
+        project_root: Option<String>,
+        opts: ListOpts,
+    ) -> Result<String, String> {
+        // ── Resolve list-tool knobs up-front ─────────────────────────────
+        // Validate sort / verbose strings before doing any filesystem IO
+        // so user-input errors short-circuit fast.
+        //
+        // Default sort is `"-active,-installed_at"` (both descending):
+        // - `-active` (desc) puts `active=true` first, `active=false` last
+        //   (bool DESC: true > false in apply_sort_by_value).
+        // - `-installed_at` (desc) breaks ties with newest install first.
+        // The plan.md §3.3 prose says "active=true 先頭"; using `-active`
+        // (DESC) is the only way to satisfy that with the bool ordering
+        // contract — see context-st2.md Pitfall #3.
+        let sort_str = opts.sort.as_deref().unwrap_or("-active,-installed_at");
+        let sort_keys = parse_sort(sort_str)?;
+        let fields = resolve_fields(
+            opts.verbose.as_deref(),
+            opts.fields.as_deref(),
+            PKG_LIST_SUMMARY,
+            PKG_LIST_FULL,
+        )?;
+
         // ── Load manifest once upfront ─────────────────────────────────────
         let manifest_data = manifest::load_manifest().unwrap_or_default();
 
@@ -532,8 +567,28 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
 
         // ── Serialise ─────────────────────────────────────────────────────
-        let all_packages: Vec<serde_json::Value> =
+        let mut all_packages: Vec<serde_json::Value> =
             entries.into_iter().map(|e| e.into_json()).collect();
+
+        // ── List-tool pipeline: filter → sort → truncate → project ──────
+        // Applied to the per-entry `packages` array only. Top-level
+        // shape (`search_paths`, `project_root`, `lockfile_path`) is
+        // never projected — see context-st2.md.
+        if let Some(ref filter_map) = opts.filter {
+            if !filter_map.is_empty() {
+                all_packages.retain(|v| matches_filter(v, filter_map));
+            }
+        }
+
+        apply_sort_by_value(&mut all_packages, &sort_keys);
+
+        let limit = opts.limit.unwrap_or(50);
+        all_packages.truncate(limit);
+
+        let projected: Vec<serde_json::Value> = all_packages
+            .into_iter()
+            .map(|v| project_fields(v, &fields))
+            .collect();
 
         let search_paths_json: Vec<serde_json::Value> = self
             .search_paths
@@ -547,7 +602,7 @@ return pkg.meta or {{ name = "{name}" }}"#
             .collect();
 
         let mut result = serde_json::json!({
-            "packages": all_packages,
+            "packages": projected,
             "search_paths": search_paths_json,
         });
 

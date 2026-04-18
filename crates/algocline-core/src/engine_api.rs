@@ -130,7 +130,32 @@ pub trait EngineApi: Send + Sync {
     ///
     /// When `project_root` is provided, project-local packages from `alc.toml`/`alc.lock`
     /// are included with `scope: "project"`. Global packages carry `scope: "global"`.
-    async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String>;
+    ///
+    /// Mirrors the list-tool knob contract used by [`Self::hub_search`]
+    /// (plan.md §4.1). Parameters are individual JSON-primitive
+    /// `Option<T>` values so the `algocline-core` crate stays free of
+    /// `algocline-app`-internal types; the impl folds them into its
+    /// `pub(crate) ListOpts` struct.
+    ///
+    /// - `limit` is `Option<i32>` at this layer (MCP/JSON boundary).
+    ///   The impl clamps negative values to 0 and casts to `usize`.
+    /// - `filter` is a free-form JSON object; it is `Deserialize`d into
+    ///   a `HashMap<String, Value>` inside the app layer. Non-object
+    ///   values are logged via `tracing::warn` and treated as no filter.
+    /// - `fields` / `verbose` drive projection on each entry of the
+    ///   `packages` array; `fields` wins when both are supplied.
+    /// - Top-level keys (`packages`, `search_paths`, `project_root`,
+    ///   `lockfile_path`) are never projected away.
+    #[allow(clippy::too_many_arguments)]
+    async fn pkg_list(
+        &self,
+        project_root: Option<String>,
+        limit: Option<i32>,
+        sort: Option<String>,
+        filter: Option<serde_json::Value>,
+        fields: Option<Vec<String>>,
+        verbose: Option<String>,
+    ) -> Result<String, String>;
 
     /// Install a package from a Git URL or local path.
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String>;

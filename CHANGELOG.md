@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-04-19
+
 ### Added
 
+- `alc_status`: new `pending_filter` parameter for field-level projection of paused `LlmQuery`
+  - String preset: `"meta"` (no prompt), `"preview"` (truncated prompt, default `ALC_PROMPT_PREVIEW_CHARS=200`), `"full"` (full prompt)
+  - Custom object: `{ include_prompt: bool, prompt_max_chars: usize, include_batch_items: bool, include_opts: bool, include_payload: bool }`
+  - UTF-8 safe truncation via `chars().take(N)` (never splits multi-byte sequences)
+  - Unknown preset → typed error (no silent fallback)
+  - Omit / `null` → legacy shape (full query fidelity)
+- `ALC_PROMPT_PREVIEW_CHARS` env var: configure the preview char cap (default 200). Setting `0` yields empty previews — for no prompt at all, use the `"meta"` preset instead
+- `algocline-engine`: public `PendingFilter`, `PromptProjection`, and `DEFAULT_PROMPT_PREVIEW_CHARS` for downstream host integration
+- E2E coverage (`tests/e2e.rs`): 6 new rmcp-based tests — preset meta / preview+full / unknown preset error / bad-shape error / custom object filter / paused session projection
 - `alc_pkg_list` / `alc_hub_search`: unified list-tool knobs (`limit` / `sort` / `filter` / `fields` / `verbose`)
   - `verbose = "summary"` (default) | `"full"`; `fields` > `verbose` when both set
   - `sort`: `"-key,key2"` DSL; default `pkg_list="-active,-installed_at"`, `hub_search="-installed,name"`
@@ -19,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `EngineApi::status` trait gains `pending_filter: Option<serde_json::Value>` (breaking for trait implementors only; MCP wire shape is additive)
+- `Session::snapshot` / `SessionRegistry::list_snapshots`: signatures gain `Option<&PendingFilter>` for server-side projection
 - `alc_pkg_list` summary preset fields (verbatim): `name`, `scope`, `version`, `active`, `resolved_source_path`, `resolved_source_kind`
 - `alc_pkg_list` full preset fields (verbatim): summary + `install_source`, `installed_at`, `updated_at`, `override_paths`, `overrides`, `linked`, `link_target`, `broken`, `path`, `source`, `source_type`, `meta`, `error`
 - `alc_hub_search` summary preset fields (verbatim): `name`, `version`, `description`, `category`, `installed`, `docstring_matched`

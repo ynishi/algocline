@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-04-19
+
+### Changed
+
+- `alc init` bundled-packages tag bumped `v0.14.0` → `v0.15.0`
+  - 106 packages available (adds SoT docs pipeline + `alc_shapes` DSL extensions on bundled side; algocline core is unchanged — `hub_index.json` wire format `hub_index/v0` and flat `M.meta` structure are compatible)
+
 ## [0.23.0] - 2026-04-19
 
 ### Added

@@ -141,6 +141,183 @@ async fn test_alc_status_empty() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── alc_status pending_filter E2E ────────────────────────────
+//
+// Covers the MCP surface of the pending_filter parameter introduced
+// in feat(status). Empty-registry paths exercise the resolve dispatch
+// (preset / object / bad shape) without needing a paused session; the
+// paused-session test hits the actual projection pipeline.
+
+#[tokio::test]
+async fn test_alc_status_preset_meta_empty_registry() {
+    let client = connect().await;
+
+    let resp = call_json(&client, "alc_status", json!({ "pending_filter": "meta" })).await;
+    assert_eq!(resp["active_sessions"], 0);
+    assert_eq!(resp["sessions"].as_array().unwrap().len(), 0);
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_status_preset_preview_and_full_empty_registry() {
+    let client = connect().await;
+
+    for preset in ["preview", "full"] {
+        let resp = call_json(&client, "alc_status", json!({ "pending_filter": preset })).await;
+        assert_eq!(
+            resp["active_sessions"], 0,
+            "preset '{preset}' should return empty-registry shape"
+        );
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_status_unknown_preset_errors() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_status",
+            json!({ "pending_filter": "bogus" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("unknown pending_filter preset"),
+        "expected typed error, got: {text}"
+    );
+    assert!(
+        text.contains("bogus"),
+        "error should echo the bad preset name, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_status_bad_shape_errors() {
+    let client = connect().await;
+
+    // bool is neither a preset string nor a filter object
+    let result = client
+        .call_tool(call_params("alc_status", json!({ "pending_filter": true })))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("pending_filter must be a preset name"),
+        "expected shape error, got: {text}"
+    );
+    assert!(
+        text.contains("bool"),
+        "error should name the bad type, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_status_custom_object_filter() {
+    let client = connect().await;
+
+    // Empty registry still exercises the object dispatch branch.
+    let resp = call_json(
+        &client,
+        "alc_status",
+        json!({
+            "pending_filter": {
+                "query_id": true,
+                "prompt": { "mode": "preview", "chars": 50 }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp["active_sessions"], 0);
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_status_paused_session_projection() {
+    let client = connect().await;
+
+    // 1. Start a session that will pause on alc.llm()
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": "return alc.llm('What is 2+2?')" }),
+    )
+    .await;
+    assert_eq!(resp["status"], "needs_response");
+    let session_id = resp["session_id"].as_str().expect("session_id").to_string();
+
+    // 2. Query status with preset=meta and a specific session_id
+    let resp = call_json(
+        &client,
+        "alc_status",
+        json!({
+            "session_id": session_id,
+            "pending_filter": "meta",
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["pending_queries"], 1, "should report 1 pending query");
+    let pending = resp["pending"]
+        .as_array()
+        .expect("pending array should be emitted when filter is set");
+    assert_eq!(pending.len(), 1);
+    // meta preset: query_id + max_tokens only
+    assert!(
+        pending[0]["query_id"].is_string(),
+        "query_id must be present"
+    );
+    assert!(
+        pending[0]["max_tokens"].is_number(),
+        "max_tokens must be present"
+    );
+    assert!(
+        pending[0].get("prompt").is_none(),
+        "meta preset must not project prompt"
+    );
+    assert!(
+        pending[0].get("prompt_preview").is_none(),
+        "meta preset must not project prompt_preview"
+    );
+
+    // 3. Preview preset should add prompt_preview field
+    let resp = call_json(
+        &client,
+        "alc_status",
+        json!({
+            "session_id": session_id,
+            "pending_filter": "preview",
+        }),
+    )
+    .await;
+    let pending = resp["pending"].as_array().expect("pending array");
+    assert!(
+        pending[0]["prompt_preview"].is_string(),
+        "preview preset must project prompt_preview"
+    );
+
+    // 4. Clean up — resume the session so the process does not hold it
+    let _ = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "4" }),
+    )
+    .await;
+
+    client.cancel().await.expect("cancel failed");
+}
+
 #[tokio::test]
 async fn test_alc_run_pure_lua() {
     let client = connect().await;

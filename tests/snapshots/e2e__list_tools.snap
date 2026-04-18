@@ -29,6 +29,7 @@ expression: names
   "alc_log_view",
   "alc_migrate",
   "alc_note",
+  "alc_pkg_doctor",
   "alc_pkg_install",
   "alc_pkg_link",
   "alc_pkg_list",

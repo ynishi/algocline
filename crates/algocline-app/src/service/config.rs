@@ -39,12 +39,19 @@ impl std::fmt::Display for LogDirSource {
 /// 5. `None` — stderr-only mode (no file logging)
 ///
 /// - `ALC_LOG_LEVEL`: `full` (default) or `off`.
+/// - `ALC_PROMPT_PREVIEW_CHARS`: char count for `alc_status(pending_filter="preview")`
+///   prompt truncation. Falls back to
+///   [`algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS`] when unset or
+///   unparseable. Setting `0` yields empty previews — if you want no
+///   prompt at all, use the `"meta"` preset instead.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     /// Resolved log directory, or `None` if no writable directory is available.
     pub log_dir: Option<PathBuf>,
     pub log_dir_source: LogDirSource,
     pub log_enabled: bool,
+    /// Char count for `alc_status` prompt_preview truncation.
+    pub prompt_preview_chars: usize,
 }
 
 impl AppConfig {
@@ -56,10 +63,16 @@ impl AppConfig {
             .map(|v| v.to_lowercase() != "off")
             .unwrap_or(true);
 
+        let prompt_preview_chars = std::env::var("ALC_PROMPT_PREVIEW_CHARS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS);
+
         Self {
             log_dir,
             log_dir_source,
             log_enabled,
+            prompt_preview_chars,
         }
     }
 

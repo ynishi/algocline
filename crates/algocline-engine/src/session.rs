@@ -120,6 +120,154 @@ impl FeedResult {
     }
 }
 
+// ─── PendingFilter (field-level filter for Session::snapshot) ────
+
+/// Default preview length (chars) used when `PendingFilter::preset_preview()`
+/// is constructed without an explicit length. Env var
+/// `ALC_PROMPT_PREVIEW_CHARS` (resolved in `AppConfig`) overrides this.
+pub const DEFAULT_PROMPT_PREVIEW_CHARS: usize = 200;
+
+/// Per-field filter controlling which `LlmQuery` attributes are projected
+/// into a Snapshot's `pending` array.
+///
+/// Adding a new field to `LlmQuery` only requires adding one matching
+/// `bool` here — the shape stays stable so API surface does not grow
+/// enum variants for every new attribute.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PendingFilter {
+    #[serde(default)]
+    pub query_id: bool,
+    #[serde(default)]
+    pub max_tokens: bool,
+    #[serde(default)]
+    pub system: bool,
+    #[serde(default)]
+    pub grounded: bool,
+    #[serde(default)]
+    pub underspecified: bool,
+    #[serde(default)]
+    pub prompt: PromptProjection,
+}
+
+/// Prompt projection mode — 3 states rather than a bool so that truncation
+/// length can travel inside the filter object.
+///
+/// JSON tag is `mode`: `{"mode":"off"}` / `{"mode":"preview","chars":200}` /
+/// `{"mode":"full"}`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PromptProjection {
+    #[default]
+    Off,
+    Preview {
+        chars: usize,
+    },
+    Full,
+}
+
+impl PendingFilter {
+    /// Preset: query identification only (`query_id` + `max_tokens`).
+    pub fn preset_meta() -> Self {
+        Self {
+            query_id: true,
+            max_tokens: true,
+            ..Self::default()
+        }
+    }
+
+    /// Preset: meta + first N chars of the prompt. Uses the hard default
+    /// for N (`DEFAULT_PROMPT_PREVIEW_CHARS`).
+    pub fn preset_preview() -> Self {
+        Self::preset_preview_with(DEFAULT_PROMPT_PREVIEW_CHARS)
+    }
+
+    /// Preset: meta + first `chars` chars of the prompt. Lets callers
+    /// flow a config-resolved length (e.g. env var) into the preset.
+    pub fn preset_preview_with(chars: usize) -> Self {
+        Self {
+            query_id: true,
+            max_tokens: true,
+            prompt: PromptProjection::Preview { chars },
+            ..Self::default()
+        }
+    }
+
+    /// Preset: every field including the full prompt (debug use).
+    pub fn preset_full() -> Self {
+        Self {
+            query_id: true,
+            max_tokens: true,
+            system: true,
+            grounded: true,
+            underspecified: true,
+            prompt: PromptProjection::Full,
+        }
+    }
+
+    /// Resolve a preset by name. Unknown names return `None` so that
+    /// callers can surface a typed error rather than silently falling
+    /// back to a default projection.
+    pub fn from_preset(name: &str) -> Option<Self> {
+        match name {
+            "meta" => Some(Self::preset_meta()),
+            "preview" => Some(Self::preset_preview()),
+            "full" => Some(Self::preset_full()),
+            _ => None,
+        }
+    }
+
+    /// Same as [`Self::from_preset`] but lets `"preview"` pick up a
+    /// caller-supplied char count (config / env override).
+    pub fn from_preset_with(name: &str, preview_chars: usize) -> Option<Self> {
+        match name {
+            "meta" => Some(Self::preset_meta()),
+            "preview" => Some(Self::preset_preview_with(preview_chars)),
+            "full" => Some(Self::preset_full()),
+            _ => None,
+        }
+    }
+}
+
+/// Project a single `LlmQuery` into the JSON object requested by `filter`.
+///
+/// UTF-8 safety: `PromptProjection::Preview { chars }` uses `chars().take(N)`
+/// so the cut never splits a multi-byte code point.
+fn project_query(q: &LlmQuery, f: &PendingFilter) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if f.query_id {
+        obj.insert("query_id".into(), q.id.as_str().into());
+    }
+    if f.max_tokens {
+        obj.insert("max_tokens".into(), q.max_tokens.into());
+    }
+    if f.system {
+        obj.insert(
+            "system".into(),
+            match &q.system {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if f.grounded {
+        obj.insert("grounded".into(), q.grounded.into());
+    }
+    if f.underspecified {
+        obj.insert("underspecified".into(), q.underspecified.into());
+    }
+    match &f.prompt {
+        PromptProjection::Off => {}
+        PromptProjection::Full => {
+            obj.insert("prompt".into(), q.prompt.clone().into());
+        }
+        PromptProjection::Preview { chars } => {
+            let preview: String = q.prompt.chars().take(*chars).collect();
+            obj.insert("prompt_preview".into(), preview.into());
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
 // ─── Session ─────────────────────────────────────────────────
 
 /// A Lua execution session with domain state tracking.
@@ -269,7 +417,17 @@ impl Session {
     ///
     /// Returns session state label and running metrics without consuming
     /// or modifying the session.
-    pub fn snapshot(&self) -> serde_json::Value {
+    ///
+    /// `pending_filter` is opt-in projection for the currently pending
+    /// LLM queries:
+    /// - `None` (default) → only `pending_queries: N` (integer count) is
+    ///   emitted, preserving the v0.x wire shape for light-weight polling.
+    /// - `Some(filter)` → adds a `pending: [...]` array whose entries are
+    ///   per-query objects projected through the filter's field flags.
+    ///
+    /// The integer `pending_queries` field is always retained when paused
+    /// so existing consumers do not break.
+    pub fn snapshot(&self, pending_filter: Option<&PendingFilter>) -> serde_json::Value {
         let state_label = match &self.state {
             ExecutionState::Running => "running",
             ExecutionState::Paused(_) => "paused",
@@ -285,9 +443,18 @@ impl Session {
             json["metrics"] = metrics;
         }
 
-        // Include pending query count when paused
-        if let ExecutionState::Paused(_) = &self.state {
-            json["pending_queries"] = self.state.remaining().into();
+        // Pending query projection (additive; count is always present)
+        if let ExecutionState::Paused(pending) = &self.state {
+            json["pending_queries"] = pending.remaining().into();
+
+            if let Some(filter) = pending_filter {
+                let items: Vec<serde_json::Value> = pending
+                    .pending_queries()
+                    .iter()
+                    .map(|q| project_query(q, filter))
+                    .collect();
+                json["pending"] = serde_json::Value::Array(items);
+            }
         }
 
         json
@@ -454,10 +621,16 @@ impl SessionRegistry {
     /// Returns a map of session_id → snapshot JSON. Only includes sessions
     /// currently held in the registry (i.e. paused, awaiting responses).
     /// Sessions that have completed are already removed from the registry.
-    pub async fn list_snapshots(&self) -> HashMap<String, serde_json::Value> {
+    ///
+    /// `pending_filter` is forwarded verbatim to each session's
+    /// [`Session::snapshot`]; see its docs for semantics.
+    pub async fn list_snapshots(
+        &self,
+        pending_filter: Option<&PendingFilter>,
+    ) -> HashMap<String, serde_json::Value> {
         let map = self.sessions.lock().await;
         map.iter()
-            .map(|(id, session)| (id.clone(), session.snapshot()))
+            .map(|(id, session)| (id.clone(), session.snapshot(pending_filter)))
             .collect()
     }
 
@@ -830,5 +1003,247 @@ mod tests {
         // TTL = 0: any instant is immediately expired (edge case)
         let now = std::time::Instant::now();
         assert!(is_expired_impl(now, Duration::ZERO));
+    }
+
+    // ─── PendingFilter preset tests ───
+
+    #[test]
+    fn pending_filter_default_is_all_off() {
+        let f = PendingFilter::default();
+        assert!(!f.query_id);
+        assert!(!f.max_tokens);
+        assert!(!f.system);
+        assert!(!f.grounded);
+        assert!(!f.underspecified);
+        assert!(matches!(f.prompt, PromptProjection::Off));
+    }
+
+    #[test]
+    fn pending_filter_preset_meta_flags() {
+        let f = PendingFilter::preset_meta();
+        assert!(f.query_id);
+        assert!(f.max_tokens);
+        assert!(!f.system);
+        assert!(!f.grounded);
+        assert!(!f.underspecified);
+        assert!(
+            matches!(f.prompt, PromptProjection::Off),
+            "meta preset must not project prompt content"
+        );
+    }
+
+    #[test]
+    fn pending_filter_preset_preview_uses_default_chars() {
+        let f = PendingFilter::preset_preview();
+        assert!(f.query_id);
+        assert!(f.max_tokens);
+        match f.prompt {
+            PromptProjection::Preview { chars } => {
+                assert_eq!(chars, DEFAULT_PROMPT_PREVIEW_CHARS);
+            }
+            other => panic!("expected Preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_filter_preset_preview_with_custom_chars() {
+        let f = PendingFilter::preset_preview_with(42);
+        match f.prompt {
+            PromptProjection::Preview { chars } => assert_eq!(chars, 42),
+            other => panic!("expected Preview {{chars: 42}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_filter_preset_full_flags_all_on() {
+        let f = PendingFilter::preset_full();
+        assert!(f.query_id);
+        assert!(f.max_tokens);
+        assert!(f.system);
+        assert!(f.grounded);
+        assert!(f.underspecified);
+        assert!(matches!(f.prompt, PromptProjection::Full));
+    }
+
+    #[test]
+    fn pending_filter_from_preset_known_names() {
+        assert!(PendingFilter::from_preset("meta").is_some());
+        assert!(PendingFilter::from_preset("preview").is_some());
+        assert!(PendingFilter::from_preset("full").is_some());
+    }
+
+    #[test]
+    fn pending_filter_from_preset_unknown_returns_none() {
+        // Typo-protection invariant: caller must surface an error, not
+        // silently fall back to a default projection.
+        assert!(PendingFilter::from_preset("").is_none());
+        assert!(PendingFilter::from_preset("META").is_none());
+        assert!(PendingFilter::from_preset("bogus").is_none());
+    }
+
+    #[test]
+    fn pending_filter_from_preset_with_overrides_preview_chars() {
+        // "preview" respects the per-call chars count (flowed in from env
+        // or config); other presets ignore it.
+        let f = PendingFilter::from_preset_with("preview", 73).unwrap();
+        match f.prompt {
+            PromptProjection::Preview { chars } => assert_eq!(chars, 73),
+            other => panic!("expected Preview {{chars: 73}}, got {other:?}"),
+        }
+
+        let f_meta = PendingFilter::from_preset_with("meta", 73).unwrap();
+        assert!(matches!(f_meta.prompt, PromptProjection::Off));
+
+        let f_full = PendingFilter::from_preset_with("full", 73).unwrap();
+        assert!(matches!(f_full.prompt, PromptProjection::Full));
+    }
+
+    // ─── project_query tests ───
+
+    #[test]
+    fn project_query_default_filter_produces_empty_object() {
+        let q = make_query(0);
+        let v = project_query(&q, &PendingFilter::default());
+        let obj = v.as_object().expect("object");
+        assert!(obj.is_empty(), "default filter should project nothing");
+    }
+
+    #[test]
+    fn project_query_meta_preset_has_id_and_max_tokens_only() {
+        let q = make_query(0);
+        let v = project_query(&q, &PendingFilter::preset_meta());
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2);
+        assert_eq!(v["query_id"], "q-0");
+        assert_eq!(v["max_tokens"], 100);
+        assert!(obj.get("prompt").is_none());
+        assert!(obj.get("prompt_preview").is_none());
+        assert!(obj.get("system").is_none());
+        assert!(obj.get("grounded").is_none());
+        assert!(obj.get("underspecified").is_none());
+    }
+
+    #[test]
+    fn project_query_full_preset_has_all_fields() {
+        let q = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "hi".into(),
+            system: Some("sys".into()),
+            max_tokens: 100,
+            grounded: true,
+            underspecified: true,
+        };
+        let v = project_query(&q, &PendingFilter::preset_full());
+        assert_eq!(v["query_id"], "q-0");
+        assert_eq!(v["max_tokens"], 100);
+        assert_eq!(v["system"], "sys");
+        assert_eq!(v["grounded"], true);
+        assert_eq!(v["underspecified"], true);
+        assert_eq!(v["prompt"], "hi");
+        assert!(v.get("prompt_preview").is_none());
+    }
+
+    #[test]
+    fn project_query_preview_truncates_at_char_count() {
+        let q = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "abcdefghij".into(),
+            system: None,
+            max_tokens: 10,
+            grounded: false,
+            underspecified: false,
+        };
+        let v = project_query(&q, &PendingFilter::preset_preview_with(5));
+        assert_eq!(v["prompt_preview"], "abcde");
+        assert!(v.get("prompt").is_none());
+    }
+
+    #[test]
+    fn project_query_preview_utf8_multibyte_safe() {
+        // Japanese characters are 3-byte UTF-8 each; chars().take(N) must
+        // never split a codepoint. Taking 3 chars from 5 must yield exactly
+        // 3 chars (not bytes), and the String must be valid UTF-8.
+        let prompt = "あいうえお";
+        let q = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: prompt.to_string(),
+            system: None,
+            max_tokens: 10,
+            grounded: false,
+            underspecified: false,
+        };
+        let v = project_query(&q, &PendingFilter::preset_preview_with(3));
+        let preview = v["prompt_preview"].as_str().expect("str");
+        assert_eq!(preview, "あいう");
+        assert_eq!(preview.chars().count(), 3);
+    }
+
+    #[test]
+    fn project_query_preview_chars_over_length_returns_whole_prompt() {
+        let q = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "abc".into(),
+            system: None,
+            max_tokens: 10,
+            grounded: false,
+            underspecified: false,
+        };
+        let v = project_query(&q, &PendingFilter::preset_preview_with(100));
+        assert_eq!(v["prompt_preview"], "abc");
+    }
+
+    #[test]
+    fn project_query_system_field_null_when_absent() {
+        let q = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "p".into(),
+            system: None,
+            max_tokens: 10,
+            grounded: false,
+            underspecified: false,
+        };
+        let filter = PendingFilter {
+            system: true,
+            ..Default::default()
+        };
+        let v = project_query(&q, &filter);
+        assert!(
+            v["system"].is_null(),
+            "absent system must serialize as null"
+        );
+    }
+
+    // ─── PendingFilter deserialization (MCP custom object path) ───
+
+    #[test]
+    fn pending_filter_deserialize_custom_object_preview() {
+        // MCP callers may pass a raw JSON filter rather than a preset name.
+        let raw = serde_json::json!({
+            "query_id": true,
+            "prompt": { "mode": "preview", "chars": 50 }
+        });
+        let f: PendingFilter = serde_json::from_value(raw).expect("deserialize");
+        assert!(f.query_id);
+        match f.prompt {
+            PromptProjection::Preview { chars } => assert_eq!(chars, 50),
+            other => panic!("expected Preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_filter_deserialize_partial_object_uses_field_defaults() {
+        // serde(default) on every field means a `{}` object is valid and
+        // equivalent to PendingFilter::default().
+        let raw = serde_json::json!({});
+        let f: PendingFilter = serde_json::from_value(raw).expect("deserialize");
+        assert!(!f.query_id);
+        assert!(matches!(f.prompt, PromptProjection::Off));
+    }
+
+    #[test]
+    fn pending_filter_deserialize_prompt_full_tag() {
+        let raw = serde_json::json!({ "prompt": { "mode": "full" } });
+        let f: PendingFilter = serde_json::from_value(raw).expect("deserialize");
+        assert!(matches!(f.prompt, PromptProjection::Full));
     }
 }

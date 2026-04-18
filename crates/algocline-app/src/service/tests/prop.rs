@@ -247,6 +247,7 @@ fn eval_auto_installs_evalframe_on_missing() {
         log_dir: Some(tmp.path().join("logs")),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: false,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     // AppService::new() calls spawn_gc_task() which requires a tokio runtime context.
     // Scope the enter guard so it is dropped before rt.block_on() below.

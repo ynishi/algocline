@@ -56,8 +56,12 @@ impl EngineApi for AppService {
 
     // ─── Session status ──────────────────────────────────────
 
-    async fn status(&self, session_id: Option<&str>) -> Result<String, String> {
-        AppService::status(self, session_id).await
+    async fn status(
+        &self,
+        session_id: Option<&str>,
+        pending_filter: Option<serde_json::Value>,
+    ) -> Result<String, String> {
+        AppService::status(self, session_id, pending_filter).await
     }
 
     // ─── Evaluation ──────────────────────────────────────────

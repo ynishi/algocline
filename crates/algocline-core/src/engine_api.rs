@@ -64,7 +64,16 @@ pub trait EngineApi: Send + Sync {
     // ─── Session status ──────────────────────────────────────
 
     /// Query active session status.
-    async fn status(&self, session_id: Option<&str>) -> Result<String, String>;
+    ///
+    /// `pending_filter` is a free-form JSON value forwarded from MCP
+    /// callers, decoded inside the app layer into either a preset name
+    /// (`"meta"` / `"preview"` / `"full"`) or a custom field-filter
+    /// object. `None` keeps the legacy count-only snapshot.
+    async fn status(
+        &self,
+        session_id: Option<&str>,
+        pending_filter: Option<serde_json::Value>,
+    ) -> Result<String, String>;
 
     // ─── Evaluation ──────────────────────────────────────────
 

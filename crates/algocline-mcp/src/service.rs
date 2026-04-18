@@ -350,6 +350,22 @@ pub struct EvalCompareParams {
 pub struct StatusParams {
     /// Session ID to inspect. Omit to list all active sessions.
     pub session_id: Option<String>,
+    /// Pending query projection. Accepts either a preset name (string)
+    /// or a custom field filter (object).
+    ///
+    /// Preset names:
+    /// - `"meta"`    — `query_id` + `max_tokens`
+    /// - `"preview"` — meta + first N chars of prompt (N from env
+    ///   `ALC_PROMPT_PREVIEW_CHARS`, default 200)
+    /// - `"full"`    — every field including the full prompt (debug)
+    ///
+    /// Custom object example:
+    /// `{ "query_id": true, "prompt": { "mode": "preview", "chars": 500 } }`
+    ///
+    /// Unknown preset names return an error (no silent fallback). Omit
+    /// this field to retain the legacy count-only snapshot.
+    #[serde(default)]
+    pub pending_filter: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -988,7 +1004,9 @@ impl AlcService {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self, Parameters(params): Parameters<StatusParams>) -> Result<String, String> {
-        self.app.status(params.session_id.as_deref()).await
+        self.app
+            .status(params.session_id.as_deref(), params.pending_filter)
+            .await
     }
 
     // ─── Project lifecycle ──────────────────────────────────────

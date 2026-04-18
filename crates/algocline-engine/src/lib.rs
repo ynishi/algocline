@@ -9,5 +9,8 @@ mod variant_pkg;
 
 pub use executor::Executor;
 pub use llm_bridge::{LlmRequest, QueryRequest};
-pub use session::{ExecutionResult, FeedResult, Session, SessionRegistry};
+pub use session::{
+    ExecutionResult, FeedResult, PendingFilter, PromptProjection, Session, SessionRegistry,
+    DEFAULT_PROMPT_PREVIEW_CHARS,
+};
 pub use variant_pkg::VariantPkg;

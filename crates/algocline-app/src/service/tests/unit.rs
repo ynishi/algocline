@@ -159,6 +159,7 @@ fn log_list_from_dir() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
 
     // Use log_list directly via the free function path
@@ -231,6 +232,7 @@ fn write_transcript_log_creates_meta_file() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
 
     let metrics = algocline_core::ExecutionMetrics::new();
@@ -282,6 +284,7 @@ fn write_transcript_log_strategy_none() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
 
     let metrics = algocline_core::ExecutionMetrics::new();
@@ -360,6 +363,7 @@ fn transcript_config_default_enabled() {
         log_dir: Some(PathBuf::from("/tmp/test")),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     assert!(config.log_enabled);
 }
@@ -371,6 +375,7 @@ fn write_transcript_log_disabled_is_noop() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: false,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let metrics = algocline_core::ExecutionMetrics::new();
     let observer = metrics.create_observer();
@@ -400,6 +405,7 @@ fn write_transcript_log_empty_transcript_is_noop() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     // Metrics with no observer events → empty transcript
     let metrics = algocline_core::ExecutionMetrics::new();
@@ -450,6 +456,7 @@ fn write_transcript_log_truncates_long_prompt() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let metrics = algocline_core::ExecutionMetrics::new();
     let observer = metrics.create_observer();
@@ -525,6 +532,7 @@ fn log_list_prefers_meta_file() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -564,6 +572,7 @@ fn stats_empty_dir() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -617,6 +626,7 @@ fn stats_aggregates_by_strategy() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -674,6 +684,7 @@ fn stats_legacy_logs_without_strategy() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -704,6 +715,7 @@ fn info_returns_valid_json_with_expected_keys() {
         log_dir: Some(dir.path().to_path_buf()),
         log_dir_source: LogDirSource::Home,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -738,6 +750,7 @@ fn info_stderr_only_when_no_log_dir() {
         log_dir: None,
         log_dir_source: LogDirSource::None,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -770,6 +783,7 @@ fn require_log_dir_returns_path_when_present() {
         log_dir: Some(PathBuf::from("/tmp/test-logs")),
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -794,6 +808,7 @@ fn require_log_dir_returns_err_when_none() {
         log_dir: None,
         log_dir_source: LogDirSource::None,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -819,6 +834,7 @@ fn write_transcript_log_noop_when_log_dir_none() {
         log_dir: None,
         log_dir_source: LogDirSource::None,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let metrics = algocline_core::ExecutionMetrics::new();
     let observer = metrics.create_observer();
@@ -855,6 +871,7 @@ fn log_list_returns_empty_when_no_log_dir() {
         log_dir: None,
         log_dir_source: LogDirSource::None,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -881,6 +898,7 @@ fn stats_returns_zero_when_no_log_dir() {
         log_dir: None,
         log_dir_source: LogDirSource::None,
         log_enabled: true,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
     };
     let app = AppService {
         executor: Arc::new(
@@ -899,4 +917,100 @@ fn stats_returns_zero_when_no_log_dir() {
     let result = app.stats(None, None).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["total_sessions"].as_u64().unwrap(), 0);
+}
+
+// ─── status(pending_filter) tests ───
+//
+// These cover the `resolve_pending_filter` dispatch branches at the app
+// layer. With an empty registry the status response is `{active_sessions:
+// 0, sessions: []}` regardless of filter shape, so a filter error surfaces
+// on the Err path even without any Paused session in place.
+
+async fn make_status_test_app() -> AppService {
+    AppService {
+        executor: Arc::new(algocline_engine::Executor::new(vec![]).await.unwrap()),
+        registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        log_config: AppConfig {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: false,
+            prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        },
+        eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        search_paths: vec![],
+    }
+}
+
+#[tokio::test]
+async fn status_without_filter_returns_empty_active_sessions() {
+    let app = make_status_test_app().await;
+    let out = app.status(None, None).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["active_sessions"], 0);
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn status_with_known_preset_string_ok() {
+    let app = make_status_test_app().await;
+    for preset in ["meta", "preview", "full"] {
+        let out = app
+            .status(None, Some(serde_json::json!(preset)))
+            .await
+            .unwrap_or_else(|e| panic!("preset '{preset}' should resolve, got err: {e}"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["active_sessions"], 0);
+    }
+}
+
+#[tokio::test]
+async fn status_with_unknown_preset_returns_error() {
+    let app = make_status_test_app().await;
+    let err = app
+        .status(None, Some(serde_json::json!("bogus")))
+        .await
+        .expect_err("unknown preset must error");
+    assert!(
+        err.contains("unknown pending_filter preset"),
+        "err should explain the preset, got: {err}"
+    );
+    assert!(
+        err.contains("bogus"),
+        "err should echo the bad name, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn status_with_custom_object_filter_ok() {
+    let app = make_status_test_app().await;
+    let filter = serde_json::json!({
+        "query_id": true,
+        "prompt": { "mode": "preview", "chars": 80 }
+    });
+    let out = app.status(None, Some(filter)).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["active_sessions"], 0);
+}
+
+#[tokio::test]
+async fn status_with_non_object_non_string_filter_errors() {
+    let app = make_status_test_app().await;
+    for (label, bad) in [
+        ("null", serde_json::json!(null)),
+        ("bool", serde_json::json!(true)),
+        ("number", serde_json::json!(42)),
+        ("array", serde_json::json!(["meta"])),
+    ] {
+        let result = app.status(None, Some(bad)).await;
+        let err = result.expect_err(&format!("{label} filter must error"));
+        assert!(
+            err.contains("pending_filter must be a preset name"),
+            "err for {label} should explain shape, got: {err}"
+        );
+        assert!(
+            err.contains(label),
+            "err for {label} should name the bad type, got: {err}"
+        );
+    }
 }

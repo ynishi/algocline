@@ -1,3 +1,5 @@
+use algocline_engine::PendingFilter;
+
 use super::AppService;
 
 impl AppService {
@@ -7,8 +9,26 @@ impl AppService {
     /// Only includes sessions currently held in the registry (paused, awaiting
     /// host LLM responses). Completed sessions are not listed here — use
     /// `alc_log_view` for historical data.
-    pub async fn status(&self, session_id: Option<&str>) -> Result<String, String> {
-        let snapshots = self.registry.list_snapshots().await;
+    ///
+    /// `pending_filter` resolution:
+    /// - `None`  → legacy snapshot (count-only `pending_queries: N`).
+    /// - `Some(String)` → preset name: `"meta"` / `"preview"` / `"full"`.
+    ///   Unknown names return `Err` (typo protection).
+    /// - `Some(Object)` → free-form `PendingFilter` custom filter.
+    /// - Any other JSON shape → `Err`.
+    ///
+    /// The `preview` preset reads the char limit from
+    /// [`AppConfig::prompt_preview_chars`] (env `ALC_PROMPT_PREVIEW_CHARS`).
+    /// A custom filter that specifies its own `prompt: { mode: "preview",
+    /// chars: N }` wins outright — the per-request value is not clamped
+    /// by the env setting.
+    pub async fn status(
+        &self,
+        session_id: Option<&str>,
+        pending_filter: Option<serde_json::Value>,
+    ) -> Result<String, String> {
+        let filter = self.resolve_pending_filter(pending_filter)?;
+        let snapshots = self.registry.list_snapshots(filter.as_ref()).await;
 
         // If a specific session requested, return just that one
         if let Some(sid) = session_id {
@@ -57,5 +77,43 @@ impl AppService {
         });
 
         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    }
+
+    /// Decode the incoming `pending_filter` JSON value into an optional
+    /// `PendingFilter`. Preset strings read the per-request char count
+    /// from this service's `AppConfig`; custom objects use the values
+    /// declared by the caller.
+    fn resolve_pending_filter(
+        &self,
+        raw: Option<serde_json::Value>,
+    ) -> Result<Option<PendingFilter>, String> {
+        let Some(value) = raw else {
+            return Ok(None);
+        };
+        match value {
+            serde_json::Value::String(name) => PendingFilter::from_preset_with(
+                &name,
+                self.log_config.prompt_preview_chars,
+            )
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "unknown pending_filter preset '{name}' (valid: \"meta\" | \"preview\" | \"full\")"
+                )
+            }),
+            serde_json::Value::Object(_) => serde_json::from_value::<PendingFilter>(value)
+                .map(Some)
+                .map_err(|e| format!("invalid pending_filter object: {e}")),
+            other => Err(format!(
+                "pending_filter must be a preset name (string) or filter object, got {}",
+                match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    _ => "unknown",
+                }
+            )),
+        }
     }
 }

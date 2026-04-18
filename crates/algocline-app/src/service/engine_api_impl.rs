@@ -192,6 +192,14 @@ impl EngineApi for AppService {
         AppService::pkg_repair(self, name, project_root).await
     }
 
+    async fn pkg_doctor(
+        &self,
+        name: Option<String>,
+        project_root: Option<String>,
+    ) -> Result<String, String> {
+        AppService::pkg_doctor(self, name, project_root).await
+    }
+
     // ─── Logging ─────────────────────────────────────────────
 
     async fn add_note(

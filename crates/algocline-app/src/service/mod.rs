@@ -6,6 +6,7 @@ mod eval;
 mod eval_store;
 mod hub;
 mod init;
+pub(crate) mod list_opts;
 pub(crate) mod lock;
 pub(crate) mod lockfile;
 mod logging;

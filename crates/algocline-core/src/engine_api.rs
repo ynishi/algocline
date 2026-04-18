@@ -301,12 +301,31 @@ pub trait EngineApi: Send + Sync {
     async fn hub_info(&self, pkg: String) -> Result<String, String>;
 
     /// Search packages across remote index + local install state.
+    ///
+    /// This trait method mirrors the MCP `alc_hub_search` tool. Parameters
+    /// are deliberately individual JSON-primitive `Option<T>` values
+    /// (rather than an aggregate struct) so that the `algocline-core` crate
+    /// stays free of `algocline-app`-internal types (see plan.md §4.1).
+    /// The `algocline-app` side of the impl folds these into its
+    /// `pub(crate) ListOpts` struct.
+    ///
+    /// - `limit` is `Option<i32>` at this layer (MCP/JSON boundary). The
+    ///   impl casts to `usize` internally.
+    /// - `filter` is a free-form JSON object; it is `Deserialize`d into
+    ///   a `HashMap<String, Value>` inside the app layer.
+    /// - `fields` / `verbose` drive projection; `fields` wins when both
+    ///   are supplied.
+    #[allow(clippy::too_many_arguments)]
     async fn hub_search(
         &self,
         query: Option<String>,
         category: Option<String>,
         installed_only: Option<bool>,
-        limit: Option<usize>,
+        limit: Option<i32>,
+        sort: Option<String>,
+        filter: Option<serde_json::Value>,
+        fields: Option<Vec<String>>,
+        verbose: Option<String>,
     ) -> Result<String, String>;
 
     // ─── Diagnostics ─────────────────────────────────────────

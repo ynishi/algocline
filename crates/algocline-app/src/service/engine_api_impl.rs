@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use algocline_core::{EngineApi, QueryResponse};
 use async_trait::async_trait;
 
+use super::list_opts::ListOpts;
 use super::AppService;
 
 /// Delegates each [`EngineApi`] method to the corresponding `AppService`
@@ -295,21 +298,55 @@ impl EngineApi for AppService {
             .map_err(|e| format!("hub_info task panicked: {e}"))?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn hub_search(
         &self,
         query: Option<String>,
         category: Option<String>,
         installed_only: Option<bool>,
-        limit: Option<usize>,
+        limit: Option<i32>,
+        sort: Option<String>,
+        filter: Option<serde_json::Value>,
+        fields: Option<Vec<String>>,
+        verbose: Option<String>,
     ) -> Result<String, String> {
         let svc = self.clone();
+
+        // `filter` is a free-form JSON Value at the MCP boundary (so the
+        // trait stays core-crate-pure). If the caller sends something
+        // that is not a JSON object we treat it as "no filter" — the
+        // explicit category/installed_only params still cover the common
+        // cases. The MCP `JsonSchema` layer will have already flagged
+        // hard type errors. We log the drop so operators can diagnose
+        // unexpected filter shapes in production.
+        let filter_map = match filter {
+            None => None,
+            Some(v) => match serde_json::from_value::<HashMap<String, serde_json::Value>>(v) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    tracing::warn!(error = %e, "hub_search: filter value is not a JSON object — treating as no filter");
+                    None
+                }
+            },
+        };
+
+        // Negative limit values from MCP callers are clamped to 0 rather
+        // than wrapping to a huge usize (unchecked-user-bound-input pattern).
+        let opts = ListOpts {
+            limit: limit.map(|n| n.max(0) as usize),
+            sort,
+            filter: filter_map,
+            fields,
+            verbose,
+        };
+
         tokio::task::spawn_blocking(move || {
             AppService::hub_search(
                 &svc,
                 query.as_deref(),
                 category.as_deref(),
                 installed_only,
-                limit,
+                opts,
             )
         })
         .await

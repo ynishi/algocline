@@ -126,8 +126,43 @@ impl EngineApi for AppService {
         AppService::pkg_unlink(self, name).await
     }
 
-    async fn pkg_list(&self, project_root: Option<String>) -> Result<String, String> {
-        AppService::pkg_list(self, project_root).await
+    #[allow(clippy::too_many_arguments)]
+    async fn pkg_list(
+        &self,
+        project_root: Option<String>,
+        limit: Option<i32>,
+        sort: Option<String>,
+        filter: Option<serde_json::Value>,
+        fields: Option<Vec<String>>,
+        verbose: Option<String>,
+    ) -> Result<String, String> {
+        // `filter` is a free-form JSON Value at the MCP boundary (so the
+        // trait stays core-crate-pure). If the caller sends something
+        // that is not a JSON object we treat it as "no filter" and log
+        // the drop so operators can diagnose unexpected filter shapes
+        // in production.
+        let filter_map = match filter {
+            None => None,
+            Some(v) => match serde_json::from_value::<HashMap<String, serde_json::Value>>(v) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    tracing::warn!(error = %e, "pkg_list: filter value is not a JSON object — treating as no filter");
+                    None
+                }
+            },
+        };
+
+        // Negative limit values from MCP callers are clamped to 0 rather
+        // than wrapping to a huge usize (unchecked-user-bound-input pattern).
+        let opts = ListOpts {
+            limit: limit.map(|n| n.max(0) as usize),
+            sort,
+            filter: filter_map,
+            fields,
+            verbose,
+        };
+
+        AppService::pkg_list(self, project_root, opts).await
     }
 
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {

@@ -153,6 +153,58 @@ pub struct PkgListParams {
     /// alongside global packages. Each package carries a `scope` field
     /// ("project" or "global") and an `active` boolean.
     pub project_root: Option<String>,
+    /// Maximum number of `packages` entries to return (default: 50).
+    /// Negative values are clamped to 0. Truncation happens **after**
+    /// filter/sort, so the highest-priority entries survive.
+    pub limit: Option<i32>,
+    /// Sort order — MongoDB-style comma-separated keys with optional
+    /// `-` prefix for descending. Examples: `"name"`, `"-installed_at"`,
+    /// `"-active,-installed_at"` (the default). Unknown or empty keys
+    /// are rejected with an error. Default: `"-active,-installed_at"`
+    /// — active packages first (DESC on bool puts `true` before
+    /// `false`), then ties broken by newest install.
+    pub sort: Option<String>,
+    /// Key-value filter applied to each projected entry (after the
+    /// project/global merge). Exact equality on each key. Unknown keys
+    /// miss (i.e. no entry matches).
+    pub filter: Option<serde_json::Value>,
+    /// Sparse fieldsets — explicit list of per-entry keys to include
+    /// in the output. Unknown keys are silently skipped (JSON:API
+    /// convention). **`fields` wins over `verbose` when both are
+    /// supplied**, so `fields` is the way to get an exact projection.
+    pub fields: Option<Vec<String>>,
+    /// Output shape preset. Accepted values: `"summary"` (default) or
+    /// `"full"`. Any other value returns an error — there is no silent
+    /// fallback. When both `fields` and `verbose` are supplied,
+    /// **`fields` wins** and `verbose` is ignored.
+    ///
+    /// Preset field sets (verbatim — any change here is a semver event,
+    /// see "Preset drift policy" below):
+    ///
+    /// - `"summary"` = `["name", "scope", "version", "active",
+    ///   "resolved_source_path", "resolved_source_kind"]`
+    /// - `"full"` = summary plus `["install_source", "installed_at",
+    ///   "updated_at", "override_paths", "overrides", "linked",
+    ///   "link_target", "broken", "path", "source", "source_type",
+    ///   "meta", "error"]`
+    ///
+    /// ### Preset drift policy
+    ///
+    /// Changing these preset arrays is a semver-relevant action. Adding
+    /// a field is a **minor** version bump (existing callers can
+    /// safely ignore the new key). Removing a field is a **major**
+    /// version bump (output parsers can break). Every such change
+    /// MUST be recorded verbatim in `CHANGELOG.md` — listing both the
+    /// pre-change and post-change preset contents (see plan.md §3.3.2
+    /// and ST3 deliverable).
+    ///
+    /// ### Projection scope
+    ///
+    /// `verbose` / `fields` only affect the per-entry objects inside
+    /// the top-level `packages` array. Top-level keys (`search_paths`,
+    /// `project_root`, `lockfile_path`) are always returned regardless
+    /// of the chosen preset or field list.
+    pub verbose: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -774,7 +826,16 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<PkgListParams>,
     ) -> Result<String, String> {
-        self.app.pkg_list(params.project_root).await
+        self.app
+            .pkg_list(
+                params.project_root,
+                params.limit,
+                params.sort,
+                params.filter,
+                params.fields,
+                params.verbose,
+            )
+            .await
     }
 
     /// Install a package from a Git URL or local path.

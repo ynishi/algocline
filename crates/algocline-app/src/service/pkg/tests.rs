@@ -1,8 +1,31 @@
 //! Integration-style tests for the `pkg_*` methods on `AppService`.
 
+use crate::service::list_opts::ListOpts;
 use crate::service::lockfile::{load_lockfile, LockFile, LockPackage};
 use crate::service::source::PackageSource;
 use crate::service::test_support::{make_app_service, make_app_service_with_search_paths};
+
+/// Build a `ListOpts` for tests. All fields default to `None`; override
+/// individual fields with struct-update syntax.
+fn opts() -> ListOpts {
+    ListOpts {
+        limit: None,
+        sort: None,
+        filter: None,
+        fields: None,
+        verbose: None,
+    }
+}
+
+/// Build a filter `HashMap` from a `serde_json::json!({...})` value.
+/// Panics if the value is not a JSON object.
+fn filter_map(v: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
+    v.as_object()
+        .expect("filter must be a JSON object")
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
 
 fn make_lock_with_pkg(name: &str) -> LockFile {
     LockFile {
@@ -13,6 +36,36 @@ fn make_lock_with_pkg(name: &str) -> LockFile {
             source: PackageSource::Installed,
         }],
     }
+}
+
+/// Test helper: invoke `pkg_list` with the default summary preset.
+///
+/// Use this when the test only asserts on summary-preset fields
+/// (`name`, `scope`, `version`, `active`, `resolved_source_path`,
+/// `resolved_source_kind`).
+async fn pkg_list_summary(
+    svc: &crate::service::AppService,
+    project_root: Option<String>,
+) -> String {
+    svc.pkg_list(project_root, opts()).await.unwrap()
+}
+
+/// Test helper: invoke `pkg_list` with `verbose="full"`.
+///
+/// Use this when the test asserts on full-preset-only fields
+/// (`source_type`, `installed_at`, `install_source`, `override_paths`,
+/// `overrides`, `linked`, `link_target`, `broken`, `path`, `source`,
+/// `meta`, `error`, `updated_at`).
+async fn pkg_list_full(svc: &crate::service::AppService, project_root: Option<String>) -> String {
+    svc.pkg_list(
+        project_root,
+        ListOpts {
+            verbose: Some("full".to_string()),
+            ..opts()
+        },
+    )
+    .await
+    .unwrap()
 }
 
 // ── pkg_list tests ───────────────────────────────────────────
@@ -49,7 +102,13 @@ async fn pkg_list_with_project() {
 
     let svc = make_app_service().await;
     let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
+        .pkg_list(
+            Some(project_root.to_string_lossy().to_string()),
+            ListOpts {
+                verbose: Some("full".to_string()),
+                ..opts()
+            },
+        )
         .await
         .unwrap();
 
@@ -76,9 +135,386 @@ async fn pkg_list_no_project_root() {
     let svc = make_app_service().await;
 
     // Should succeed even without project_root (no crash).
-    let result = svc.pkg_list(None).await.unwrap();
+    let result = pkg_list_summary(&svc, None).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert!(json["packages"].is_array());
+}
+
+// ── ST2: ListOpts wiring tests ───────────────────────────────
+//
+// These exercise the new list-tool pipeline (filter / sort / truncate /
+// project_fields) introduced in ST2. They rely on a small synthetic
+// fixture: a project root with N declared packages, each with its own
+// vendor directory, registered via `alc.toml` + `alc.lock` (path
+// entries). This keeps every entry deterministic and timezone-free.
+
+/// Build a project_root with the given (`name`, `installed_at`) pairs.
+///
+/// Each package is created as a `path` entry in alc.toml + alc.lock.
+/// `installed_at` is recorded into `alc.local.toml` under a stub
+/// `manifest`-like field — but the `pkg_list` codepath populates
+/// `installed_at` only from `installed.json` (manifest), which is
+/// unrelated to project-local entries. So in these synthetic tests
+/// `installed_at` is always `None` for project entries; we instead
+/// exercise sort / filter on `name`, `scope`, and `active`.
+async fn build_project_with_pkgs(
+    project_root: &std::path::Path,
+    names: &[&str],
+) -> crate::service::AppService {
+    let mut alc_toml = String::from("[packages]\n");
+    let mut lock_pkgs = Vec::new();
+    for name in names {
+        alc_toml.push_str(&format!("{name} = {{ path = \"{name}\" }}\n"));
+        let pkg_dir = project_root.join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+        lock_pkgs.push(LockPackage {
+            name: (*name).to_string(),
+            version: None,
+            source: PackageSource::Path {
+                path: (*name).to_string(),
+            },
+        });
+    }
+    std::fs::write(project_root.join("alc.toml"), alc_toml).unwrap();
+    let lock = LockFile {
+        version: 1,
+        packages: lock_pkgs,
+    };
+    crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
+    make_app_service().await
+}
+
+/// Default summary preset must NOT include `install_source`.
+#[tokio::test]
+async fn pkg_list_summary_excludes_install_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    let result = pkg_list_summary(&svc, Some(tmp.path().to_string_lossy().to_string())).await;
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    let pkg = packages.iter().find(|p| p["name"] == "alpha").unwrap();
+    let map = pkg.as_object().unwrap();
+    assert!(
+        !map.contains_key("install_source"),
+        "install_source must be absent from summary preset, got: {map:?}"
+    );
+}
+
+/// Summary preset includes `resolved_source_path` (the primary "where is
+/// this package on disk" signal).
+#[tokio::test]
+async fn pkg_list_summary_includes_resolved_source_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    let result = pkg_list_summary(&svc, Some(tmp.path().to_string_lossy().to_string())).await;
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    let pkg = packages.iter().find(|p| p["name"] == "alpha").unwrap();
+    assert!(
+        pkg["resolved_source_path"].is_string(),
+        "resolved_source_path must appear under summary preset"
+    );
+}
+
+/// `verbose=full` brings back the extended fields: `path` is in the full
+/// preset and is populated for project `path` entries.
+#[tokio::test]
+async fn pkg_list_verbose_full_includes_install_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    // For project-local `path` entries `install_source` is None — the
+    // field is only populated from installed.json (global packages).
+    // Use `path` as the proxy "full-only" field that *is* set for these
+    // synthetic entries.
+    let result = pkg_list_full(&svc, Some(tmp.path().to_string_lossy().to_string())).await;
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    let pkg = packages.iter().find(|p| p["name"] == "alpha").unwrap();
+    let map = pkg.as_object().unwrap();
+    assert!(
+        map.contains_key("path"),
+        "path must reappear under verbose=full, got: {map:?}"
+    );
+    assert!(
+        map.contains_key("source_type"),
+        "source_type must reappear under verbose=full, got: {map:?}"
+    );
+}
+
+/// When both `fields` and `verbose` are supplied, `fields` wins.
+#[tokio::test]
+async fn pkg_list_fields_beats_verbose() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                fields: Some(vec!["name".to_string()]),
+                verbose: Some("full".to_string()),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    let pkg = packages.iter().find(|p| p["name"] == "alpha").unwrap();
+    let map = pkg.as_object().unwrap();
+    assert_eq!(map.len(), 1, "exact projection: only 'name' should survive");
+    assert!(map.contains_key("name"));
+}
+
+/// Default sort `-active,-installed_at` puts `active=true` entries first.
+///
+/// Synthetic setup: declare two project packages and one variant pkg that
+/// shadows one of them. The shadowed project entry becomes
+/// `active=false`, the variant + the unshadowed project are
+/// `active=true`. With default sort (`-active`), all `active=true`
+/// entries must come before any `active=false` entry.
+#[tokio::test]
+async fn pkg_list_sort_active_desc_installed_at() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+
+    // Two project packages.
+    let svc = build_project_with_pkgs(project_root, &["alpha", "beta"]).await;
+
+    // Variant pkg shadowing `alpha` so the project alpha entry becomes
+    // active=false.
+    let variant_dir = tmp.path().join("variant_src").join("alpha");
+    std::fs::create_dir_all(&variant_dir).unwrap();
+    std::fs::write(variant_dir.join("init.lua"), "return {}").unwrap();
+    std::fs::write(
+        project_root.join("alc.local.toml"),
+        format!(
+            "[packages]\nalpha = {{ path = \"{}\" }}\n",
+            variant_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+
+    // Walk the array and check no active=false comes before any active=true.
+    let mut seen_inactive = false;
+    for pkg in packages {
+        let active = pkg["active"].as_bool().unwrap_or(false);
+        if !active {
+            seen_inactive = true;
+        } else if seen_inactive {
+            panic!(
+                "default sort should put active=true before active=false; \
+                 saw active=true after active=false in {packages:?}"
+            );
+        }
+    }
+}
+
+/// `filter={"scope":"global"}` excludes project entries.
+#[tokio::test]
+async fn pkg_list_filter_by_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha", "beta"]).await;
+    let filter = serde_json::json!({"scope": "global"});
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                filter: Some(filter_map(filter)),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    for pkg in packages {
+        assert_ne!(
+            pkg["scope"], "project",
+            "filter scope=global must exclude project entries, got: {pkg:?}"
+        );
+    }
+}
+
+/// `filter={"active":true}` excludes inactive entries.
+#[tokio::test]
+async fn pkg_list_filter_by_active_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_root = tmp.path();
+    let svc = build_project_with_pkgs(project_root, &["alpha"]).await;
+
+    // Variant shadowing alpha so the project alpha becomes inactive.
+    let variant_dir = tmp.path().join("variant_src").join("alpha");
+    std::fs::create_dir_all(&variant_dir).unwrap();
+    std::fs::write(variant_dir.join("init.lua"), "return {}").unwrap();
+    std::fs::write(
+        project_root.join("alc.local.toml"),
+        format!(
+            "[packages]\nalpha = {{ path = \"{}\" }}\n",
+            variant_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let filter = serde_json::json!({"active": true});
+    let result = svc
+        .pkg_list(
+            Some(project_root.to_string_lossy().to_string()),
+            ListOpts {
+                filter: Some(filter_map(filter)),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    for pkg in packages {
+        assert_eq!(
+            pkg["active"], true,
+            "filter active=true must exclude inactive entries, got: {pkg:?}"
+        );
+    }
+}
+
+/// `limit=5` truncates the `packages` array to at most 5 entries.
+#[tokio::test]
+async fn pkg_list_limit_truncates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(
+        tmp.path(),
+        &[
+            "pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e", "pkg_f", "pkg_g",
+        ],
+    )
+    .await;
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                limit: Some(5),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    assert!(
+        packages.len() <= 5,
+        "limit=5 must truncate the array, got {} entries",
+        packages.len()
+    );
+}
+
+/// `limit=N` truncates `packages` but `search_paths` / `project_root` /
+/// `lockfile_path` top-level keys remain present.
+#[tokio::test]
+async fn pkg_list_limit_preserves_top_level_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["pkg_a", "pkg_b", "pkg_c"]).await;
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                limit: Some(1),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert!(
+        json["search_paths"].is_array(),
+        "search_paths must remain after limit truncation"
+    );
+    assert!(
+        json["project_root"].is_string(),
+        "project_root must remain after limit truncation"
+    );
+    assert!(
+        json["lockfile_path"].is_string(),
+        "lockfile_path must remain after limit truncation"
+    );
+    let packages = json["packages"].as_array().unwrap();
+    assert!(packages.len() <= 1);
+}
+
+/// Unknown field names in `fields` are silently skipped (JSON:API
+/// sparse fieldsets convention).
+#[tokio::test]
+async fn pkg_list_unknown_field_silently_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                fields: Some(vec!["name".to_string(), "bogus_field".to_string()]),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    let pkg = packages.iter().find(|p| p["name"] == "alpha").unwrap();
+    let map = pkg.as_object().unwrap();
+    assert!(map.contains_key("name"));
+    assert!(
+        !map.contains_key("bogus_field"),
+        "unknown field must be silently skipped, got: {map:?}"
+    );
+    assert_eq!(
+        map.len(),
+        1,
+        "only known fields should appear, got: {map:?}"
+    );
+}
+
+/// Invalid sort string (empty / dash-only) must produce an error
+/// before any IO is done. Defends the `parse_sort` short-circuit.
+#[tokio::test]
+async fn pkg_list_invalid_sort_returns_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                sort: Some("-".to_string()),
+                ..opts()
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "bare '-' sort string must be rejected, got: {result:?}"
+    );
+}
+
+/// Invalid `verbose` value must produce an error before IO.
+#[tokio::test]
+async fn pkg_list_invalid_verbose_returns_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = build_project_with_pkgs(tmp.path(), &["alpha"]).await;
+    let result = svc
+        .pkg_list(
+            Some(tmp.path().to_string_lossy().to_string()),
+            ListOpts {
+                verbose: Some("fat".to_string()),
+                ..opts()
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "verbose='fat' must be rejected, got: {result:?}"
+    );
 }
 
 // ── pkg_remove tests ─────────────────────────────────────────
@@ -204,10 +640,7 @@ async fn pkg_list_project_path_entry_has_resolved_source() {
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
     let svc = make_app_service().await;
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -264,10 +697,7 @@ async fn pkg_list_project_path_with_symlink_vendor_follows_target() {
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
     let svc = make_app_service().await;
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -322,10 +752,7 @@ async fn pkg_list_project_installed_entry_has_resolved_source() {
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
     let svc = make_app_service().await;
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let expected_canonical = std::fs::canonicalize(&pkg_dir)
         .unwrap()
         .display()
@@ -387,10 +814,7 @@ async fn pkg_list_project_installed_resolves_through_linked_pkg() {
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
     let svc = make_app_service().await;
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     // canonicalize follows the symlink to the real dev dir.
     let expected_canonical = std::fs::canonicalize(&real_dev_dir)
         .unwrap()
@@ -432,7 +856,7 @@ async fn pkg_list_global_regular_pkg_has_resolved_source() {
         source: crate::service::resolve::SearchPathSource::Env,
     };
     let svc = make_app_service_with_search_paths(vec![search_path]).await;
-    let result = svc.pkg_list(None).await.unwrap();
+    let result = pkg_list_summary(&svc, None).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -476,7 +900,7 @@ async fn pkg_list_global_linked_pkg_resolves_to_link_target() {
         source: crate::service::resolve::SearchPathSource::Env,
     };
     let svc = make_app_service_with_search_paths(vec![search_path]).await;
-    let result = svc.pkg_list(None).await.unwrap();
+    let result = pkg_list_full(&svc, None).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -518,7 +942,7 @@ async fn pkg_list_global_linked_broken_omits_resolved_source() {
         source: crate::service::resolve::SearchPathSource::Env,
     };
     let svc = make_app_service_with_search_paths(vec![search_path]).await;
-    let result = svc.pkg_list(None).await.unwrap();
+    let result = pkg_list_full(&svc, None).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -565,7 +989,7 @@ async fn pkg_list_override_paths_global_shadow() {
     ])
     .await;
 
-    let result = svc.pkg_list(None).await.unwrap();
+    let result = pkg_list_full(&svc, None).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -641,10 +1065,7 @@ async fn pkg_list_override_paths_project_shadows_global() {
     }])
     .await;
 
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_full(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -732,10 +1153,7 @@ async fn pkg_list_project_installed_does_not_self_shadow() {
     }])
     .await;
 
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_full(&svc, Some(project_root.to_string_lossy().to_string())).await;
     drop(fake_home);
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -784,7 +1202,7 @@ async fn pkg_list_global_unregistered_has_no_source_type() {
         source: crate::service::resolve::SearchPathSource::Env,
     };
     let svc = make_app_service_with_search_paths(vec![search_path]).await;
-    let result = svc.pkg_list(None).await.unwrap();
+    let result = pkg_list_full(&svc, None).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -848,10 +1266,7 @@ async fn pkg_list_variant_pkg_appears_with_variant_scope() {
     .unwrap();
 
     let svc = make_app_service().await;
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_full(&svc, Some(project_root.to_string_lossy().to_string())).await;
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
@@ -916,10 +1331,7 @@ async fn pkg_list_variant_shadows_global() {
     }])
     .await;
 
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 
@@ -981,10 +1393,7 @@ async fn pkg_list_variant_shadows_project() {
     .unwrap();
 
     let svc = make_app_service().await;
-    let result = svc
-        .pkg_list(Some(project_root.to_string_lossy().to_string()))
-        .await
-        .unwrap();
+    let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
 

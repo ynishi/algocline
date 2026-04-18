@@ -1152,7 +1152,8 @@ impl AppService {
     /// (`limit / sort / filter / fields / verbose`) shared with other
     /// list-style MCP tools. Defaults:
     ///
-    /// - `limit` — 50 when `None`.
+    /// - `limit` — 50 when `None`. `Some(0)` means **no limit** (return
+    ///   all matching entries — empty-means-all idiom).
     /// - `sort` — `"-installed,name"` when `None` (installed first, then
     ///   ascending by name).
     /// - `filter` — no additional filter. Legacy `category` /
@@ -1257,10 +1258,14 @@ impl AppService {
         // Sort.
         apply_sort_by_value(&mut items, &sort_keys);
 
-        // Limit.
+        // Limit. `limit = Some(0)` means "no limit" (return all results)
+        // — mirrors the `empty=all & some=filter` idiom used across the
+        // list-tool contract. `None` falls back to the default cap (50).
         let total = items.len();
         let limit = opts.limit.unwrap_or(50);
-        items.truncate(limit);
+        if limit > 0 {
+            items.truncate(limit);
+        }
 
         // Projection (after truncation — unselected fields are stripped
         // from the kept entries only).

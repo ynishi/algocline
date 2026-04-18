@@ -582,8 +582,13 @@ return pkg.meta or {{ name = "{name}" }}"#
 
         apply_sort_by_value(&mut all_packages, &sort_keys);
 
+        // `limit = Some(0)` means "no limit" (return all). `None` falls
+        // back to the default cap of 50. Mirrors `hub_search` (see
+        // `super::super::hub`) and the list-tool `empty=all` idiom.
         let limit = opts.limit.unwrap_or(50);
-        all_packages.truncate(limit);
+        if limit > 0 {
+            all_packages.truncate(limit);
+        }
 
         let projected: Vec<serde_json::Value> = all_packages
             .into_iter()

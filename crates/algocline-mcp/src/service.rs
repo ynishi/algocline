@@ -154,8 +154,13 @@ pub struct PkgListParams {
     /// ("project" or "global") and an `active` boolean.
     pub project_root: Option<String>,
     /// Maximum number of `packages` entries to return (default: 50).
-    /// Negative values are clamped to 0. Truncation happens **after**
-    /// filter/sort, so the highest-priority entries survive.
+    ///
+    /// - `null` (omit) → default cap 50
+    /// - `0`           → **no limit** (return all entries — empty-means-all idiom)
+    /// - negative      → clamped to 0, i.e. also "no limit"
+    ///
+    /// Truncation happens **after** filter/sort, so the highest-priority
+    /// entries survive.
     pub limit: Option<i32>,
     /// Sort order — MongoDB-style comma-separated keys with optional
     /// `-` prefix for descending. Examples: `"name"`, `"-installed_at"`,
@@ -522,6 +527,10 @@ pub struct HubSearchParams {
     /// `"installed"` key, the explicit `filter` entry wins.
     pub installed_only: Option<bool>,
     /// Maximum number of results (default: 50).
+    ///
+    /// - `null` (omit) → default cap 50
+    /// - `0`           → **no limit** (return all entries — empty-means-all idiom)
+    /// - negative      → clamped to 0, i.e. also "no limit"
     pub limit: Option<i32>,
     /// Sort order — MongoDB-style comma-separated keys with optional
     /// `-` prefix for descending. Examples: `"name"`, `"-installed"`,
@@ -818,6 +827,15 @@ impl AlcService {
     /// Each entry also includes `resolved_source_path` (canonical absolute directory),
     /// `resolved_source_kind` (installed / linked / local_path / bundled; future values may appear),
     /// and `override_paths` (shadowed same-name packages).
+    ///
+    /// ### List-tool params
+    /// - `verbose="summary"` (default) / `"full"` — preset field selector.
+    ///   - summary: `name, scope, version, active, resolved_source_path, resolved_source_kind`
+    ///   - full: summary + `install_source, installed_at, updated_at, override_paths, overrides, linked, link_target, broken, path, source, source_type, meta, error`
+    /// - `fields=["name","scope"]` — explicit field list (wins over `verbose` when both set).
+    /// - `sort="-active,-installed_at"` (default) — comma-separated keys, `-` prefix for descending.
+    /// - `filter={"scope":"global","active":true}` — key-value exact match.
+    /// - `limit=50` (default).
     #[tool(
         name = "alc_pkg_list",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -1258,6 +1276,21 @@ impl AlcService {
     /// `installed: true/false` for each entry. Use this to discover
     /// available strategies — uninstalled packages can be installed via
     /// `alc_pkg_install` using the `source` URL from the result.
+    ///
+    /// ### List-tool params
+    /// - `verbose="summary"` (default) / `"full"` — preset field selector.
+    ///   - summary: `name, version, description, category, installed, docstring_matched`
+    ///   - full: summary + `source, card_count, best_card, docstring`
+    /// - `fields=["name","version"]` — explicit field list (wins over `verbose` when both set).
+    /// - `sort="-installed,name"` (default) — comma-separated keys, `-` prefix for descending.
+    /// - `filter={"category":"reasoning","installed":true}` — key-value exact match.
+    ///   Legacy `category` / `installed_only` keep working; when both given, `filter` wins.
+    /// - `limit=50` (default).
+    ///
+    /// `docstring_matched=true` appears only when `query` hits the docstring
+    /// alone (missed `name` / `description` / `category`); otherwise the
+    /// field is omitted. The internal `docstring` is still searched — to
+    /// surface it in output use `verbose="full"` or `fields=["docstring"]`.
     #[tool(
         name = "alc_hub_search",
         annotations(read_only_hint = true, open_world_hint = true)

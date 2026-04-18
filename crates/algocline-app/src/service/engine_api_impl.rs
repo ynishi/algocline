@@ -154,6 +154,8 @@ impl EngineApi for AppService {
 
         // Negative limit values from MCP callers are clamped to 0 rather
         // than wrapping to a huge usize (unchecked-user-bound-input pattern).
+        // Downstream semantics: `Some(0)` means "no limit" (return all) —
+        // the truncate path in `AppService::pkg_list` short-circuits on 0.
         let opts = ListOpts {
             limit: limit.map(|n| n.max(0) as usize),
             sort,
@@ -367,6 +369,8 @@ impl EngineApi for AppService {
 
         // Negative limit values from MCP callers are clamped to 0 rather
         // than wrapping to a huge usize (unchecked-user-bound-input pattern).
+        // Downstream semantics: `Some(0)` means "no limit" (return all) —
+        // the truncate path in `AppService::hub_search` short-circuits on 0.
         let opts = ListOpts {
             limit: limit.map(|n| n.max(0) as usize),
             sort,

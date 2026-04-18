@@ -450,15 +450,78 @@ pub struct HubReindexParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HubSearchParams {
-    /// Search query (matched against package name, description, category).
-    /// Omit to list all available packages.
+    /// Search query (matched against package name, description, category,
+    /// and docstring). Omit to list all available packages. When the
+    /// query matches **only** the docstring (i.e. not name/description/
+    /// category), the corresponding result carries `docstring_matched:
+    /// true` so the caller can tell that the hit came from the
+    /// full-text channel rather than the primary metadata.
     pub query: Option<String>,
     /// Filter by category (e.g. "reasoning", "aggregation", "synthesis").
+    /// Prefer the generic `filter` parameter for new callers; `category`
+    /// is kept for backward compatibility and is folded into `filter`
+    /// on the server side. If `filter` already contains a `"category"`
+    /// key, the explicit `filter` entry wins.
     pub category: Option<String>,
     /// When true, only show locally installed packages.
+    /// Prefer the generic `filter` parameter (`filter = {"installed":
+    /// true}`) for new callers; `installed_only` is kept for
+    /// backward compatibility. If `filter` already contains an
+    /// `"installed"` key, the explicit `filter` entry wins.
     pub installed_only: Option<bool>,
     /// Maximum number of results (default: 50).
-    pub limit: Option<usize>,
+    pub limit: Option<i32>,
+    /// Sort order — MongoDB-style comma-separated keys with optional
+    /// `-` prefix for descending. Examples: `"name"`, `"-installed"`,
+    /// `"-installed,name"` (the default). Unknown or empty keys are
+    /// rejected with an error. Default: `"-installed,name"` — installed
+    /// packages first, then ascending by name.
+    pub sort: Option<String>,
+    /// Key-value filter applied to each projected result (after
+    /// query/category/installed_only). Exact equality on each key.
+    /// Unknown keys miss (i.e. no entry matches). When both `filter`
+    /// and legacy `category` / `installed_only` are supplied, the
+    /// explicit `filter` entry wins on key conflict.
+    pub filter: Option<serde_json::Value>,
+    /// Sparse fieldsets — explicit list of per-entry keys to include
+    /// in the output. Unknown keys are silently skipped (JSON:API
+    /// convention). **`fields` wins over `verbose` when both are
+    /// supplied**, so `fields` is the way to get an exact projection.
+    pub fields: Option<Vec<String>>,
+    /// Output shape preset. Accepted values: `"summary"` (default) or
+    /// `"full"`. Any other value returns an error — there is no silent
+    /// fallback. When both `fields` and `verbose` are supplied,
+    /// **`fields` wins** and `verbose` is ignored.
+    ///
+    /// Preset field sets (verbatim — any change here is a semver event,
+    /// see "Preset drift policy" below):
+    ///
+    /// - `"summary"` = `["name", "version", "description", "category",
+    ///   "installed", "docstring_matched"]`
+    /// - `"full"` = summary plus `["source", "card_count", "best_card",
+    ///   "docstring"]`
+    ///
+    /// `docstring_matched` is only present in individual result entries
+    /// when the query matched docstring and not the primary metadata;
+    /// otherwise the key is omitted from that entry.
+    ///
+    /// ### Preset drift policy
+    ///
+    /// Changing these preset arrays is a semver-relevant action. Adding
+    /// a field is a **minor** version bump (existing callers can
+    /// safely ignore the new key). Removing a field is a **major**
+    /// version bump (output parsers can break). Every such change
+    /// MUST be recorded verbatim in `CHANGELOG.md` — listing both the
+    /// pre-change and post-change preset contents (see plan.md §3.3.2
+    /// and ST3 deliverable).
+    ///
+    /// ### Projection scope
+    ///
+    /// `verbose` / `fields` only affect the per-entry objects inside
+    /// the top-level `results` array. Top-level keys (`total`,
+    /// `sources`, `warnings`) are always returned regardless of the
+    /// chosen preset or field list.
+    pub verbose: Option<String>,
 }
 
 // ─── MCP Handler ────────────────────────────────────────────────
@@ -1148,6 +1211,10 @@ impl AlcService {
                 params.category,
                 params.installed_only,
                 params.limit,
+                params.sort,
+                params.filter,
+                params.fields,
+                params.verbose,
             )
             .await
     }

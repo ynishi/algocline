@@ -339,7 +339,7 @@ pub(super) fn collect_unattached_dangling_symlinks(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
-                "pkg_repair: failed to read packages_dir at {}: {e}",
+                "pkg: failed to read packages_dir at {}: {e}",
                 pkg_dir.display()
             );
             return;
@@ -356,7 +356,7 @@ pub(super) fn collect_unattached_dangling_symlinks(
                 // the dangling-symlink check without diagnosis. Log here
                 // so at least the repair attempt leaves a trail.
                 tracing::warn!(
-                    "pkg_repair: skipping unreadable entry in {}: {e}",
+                    "pkg: skipping unreadable entry in {}: {e}",
                     pkg_dir.display()
                 );
                 continue;

@@ -3,12 +3,12 @@
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
 //! classifies packages into four buckets without touching the filesystem:
 //!
-//! | Bucket              | Source-of-truth                                   | Condition                                          |
-//! |---------------------|---------------------------------------------------|----------------------------------------------------|
-//! | `healthy`           | `installed.json` + `~/.algocline/packages/{name}` | dest directory exists (resolved through symlinks)  |
-//! | `installed_missing` | `installed.json`                                  | dest missing (non-symlink), `pkg_install` can heal |
-//! | `symlink_dangling`  | filesystem scan                                   | dest is a symlink whose target is missing          |
-//! | `path_missing`      | `alc.toml` / `alc.local.toml`                     | declared `path = ...` does not exist               |
+//! | Bucket              | Source-of-truth                                         | Condition                                          |
+//! |---------------------|---------------------------------------------------------|----------------------------------------------------|
+//! | `healthy`           | `installed.json` + `~/.algocline/packages/{name}`       | dest directory exists (resolved through symlinks)  |
+//! | `installed_missing` | `installed.json`                                        | dest missing (non-symlink), `pkg_install` can heal |
+//! | `symlink_dangling`  | `installed.json` (manifest-pass) + filesystem scan      | dest is a symlink whose target is missing          |
+//! | `path_missing`      | `alc.toml` / `alc.local.toml`                           | declared `path = ...` does not exist               |
 //!
 //! Contract:
 //! - **No side effects.** No `fs::write`, `fs::remove_*`, `fs::create_*`,
@@ -30,6 +30,7 @@ use tracing::warn;
 use super::super::manifest::{load_manifest, Manifest, ManifestEntry};
 use super::super::project::resolve_project_root;
 use super::super::resolve::packages_dir;
+use super::super::source::{infer_from_legacy_source_string, PackageSource};
 use super::super::AppService;
 use super::repair::{
     collect_path_missing, collect_unattached_dangling_symlinks, symlink_dangling_suggestion,
@@ -77,12 +78,28 @@ impl DoctorBuckets {
     }
 }
 
-/// Suggestion string for `installed_missing` — routes the caller to
-/// `alc_pkg_install`. Kept local to the doctor module (doctor never calls
-/// `pkg_install` itself, so reusing the install helper in `repair.rs` would
-/// be misleading).
-fn installed_missing_suggestion(name: &str, source: &str) -> String {
-    format!("alc_pkg_install({name:?}) to reinstall from source ({source})")
+/// Suggestion string for `installed_missing`, branched by source kind to
+/// match `pkg_repair`'s 3-way routing (repair.rs:238-260):
+///
+/// - `Git` / `Installed` (local path) → `alc_pkg_install(...)`
+/// - `Bundled` → `alc_init` (bundled packages cannot be reinstalled via
+///   `alc_pkg_install`; they ship inside the algocline binary)
+/// - `Path` → edit `alc.toml` / `alc.local.toml` directly (path sources
+///   aren't tracked for reinstall; today `infer_from_legacy_source_string`
+///   never emits this, but the arm is kept as a defensive guard that
+///   mirrors `repair.rs`)
+fn installed_missing_suggestion(name: &str, entry_source: &str) -> String {
+    match infer_from_legacy_source_string(entry_source) {
+        PackageSource::Bundled { .. } => {
+            "alc_init (reinstalls bundled packages from the algocline binary)".to_string()
+        }
+        PackageSource::Path { path } => {
+            format!("edit [packages.{name}] in alc.toml or alc.local.toml (path source: {path})")
+        }
+        PackageSource::Installed | PackageSource::Git { .. } => {
+            format!("alc_pkg_install({name:?}) to reinstall from source ({entry_source})")
+        }
+    }
 }
 
 /// Push a manifest-pass outcome into the appropriate bucket.
@@ -155,19 +172,23 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
     }
 }
 
-/// Classify every manifest entry into the four buckets.
+/// Classify every manifest entry into the four buckets. When `target_filter`
+/// is `Some(name)`, look the entry up directly (O(log N) on BTreeMap) instead
+/// of scanning the full map.
 fn run_manifest_pass(
     manifest: &Manifest,
     target_filter: Option<&str>,
     pkg_dir: &Path,
     buckets: &mut DoctorBuckets,
 ) {
-    for (pkg_name, entry) in &manifest.packages {
-        if let Some(target) = target_filter {
-            if target != pkg_name.as_str() {
-                continue;
-            }
+    if let Some(target) = target_filter {
+        if let Some(entry) = manifest.packages.get(target) {
+            let outcome = classify_installed(target, entry, pkg_dir);
+            push_doctor_outcome(target, outcome, buckets);
         }
+        return;
+    }
+    for (pkg_name, entry) in &manifest.packages {
         let outcome = classify_installed(pkg_name, entry, pkg_dir);
         push_doctor_outcome(pkg_name, outcome, buckets);
     }
@@ -402,5 +423,29 @@ mod tests {
         assert!(s.contains("alc_pkg_install"), "{s}");
         assert!(s.contains("\"ucb\""), "{s}");
         assert!(s.contains("github.com/foo/bar"), "{s}");
+    }
+
+    /// A bundled-source entry must route the user to `alc_init`, NOT
+    /// `alc_pkg_install("bundled")` (which would fail — bundled packages
+    /// ship inside the algocline binary and are restored via `alc_init`).
+    /// Mirrors `repair.rs:238-260`.
+    #[test]
+    fn installed_missing_suggestion_routes_bundled_to_alc_init() {
+        let s = installed_missing_suggestion("ucb", "bundled");
+        assert!(s.contains("alc_init"), "bundled must suggest alc_init: {s}");
+        assert!(
+            !s.contains("alc_pkg_install"),
+            "bundled must NOT suggest alc_pkg_install: {s}"
+        );
+    }
+
+    /// A bare local absolute path classifies as `Installed` (syntactic), so
+    /// the suggestion falls through to `alc_pkg_install` with that path as
+    /// the source — matching repair's LocalPath installer route.
+    #[test]
+    fn installed_missing_suggestion_routes_absolute_path_to_pkg_install() {
+        let s = installed_missing_suggestion("local_pkg", "/abs/path/to/src");
+        assert!(s.contains("alc_pkg_install"), "{s}");
+        assert!(s.contains("/abs/path/to/src"), "{s}");
     }
 }

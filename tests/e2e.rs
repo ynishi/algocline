@@ -880,3 +880,136 @@ return M"#,
     let _ = std::fs::remove_dir_all(&dest);
     client.cancel().await.expect("cancel failed");
 }
+
+/// Install → remove dest dir → doctor: diagnose without side effects.
+/// Verifies the (B) installed_missing bucket is populated AND that the dest
+/// directory is NOT resurrected (this is the doctor-vs-repair distinction).
+#[tokio::test]
+async fn test_pkg_doctor_reports_installed_missing() {
+    let client = connect().await;
+
+    // Source pkg dir outside HOME.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("e2e_doctor_pkg");
+    std::fs::create_dir_all(&source).expect("mkdir");
+    std::fs::write(
+        source.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_doctor_pkg", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    // Install.
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": source.to_string_lossy() }),
+    )
+    .await;
+
+    // Simulate breakage: remove the installed dest.
+    let dest = dirs::home_dir()
+        .expect("home")
+        .join(".algocline")
+        .join("packages")
+        .join("e2e_doctor_pkg");
+    assert!(dest.exists(), "dest should exist after install");
+    std::fs::remove_dir_all(&dest).expect("rm dest");
+    assert!(!dest.exists());
+
+    // Doctor (read-only diagnose).
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_doctor_pkg" }),
+    )
+    .await;
+
+    let installed_missing = resp["installed_missing"]
+        .as_array()
+        .expect("installed_missing array missing");
+    let entry = installed_missing
+        .iter()
+        .find(|e| e["name"] == "e2e_doctor_pkg")
+        .unwrap_or_else(|| panic!("e2e_doctor_pkg not found in installed_missing, got: {resp}"));
+    assert_eq!(entry["kind"], "installed_missing");
+
+    // THE doctor-vs-repair distinction: dest must NOT be resurrected.
+    assert!(
+        !dest.exists(),
+        "dest must not be resurrected by doctor (read-only)"
+    );
+
+    // Cleanup: doctor didn't create anything; remove the manifest entry via repair
+    // to keep installed.json clean for subsequent runs.
+    let _ = call_json(
+        &client,
+        "alc_pkg_repair",
+        json!({ "name": "e2e_doctor_pkg" }),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&dest);
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Unknown pkg name → Err with a "not found in installed.json" message.
+#[tokio::test]
+async fn test_pkg_doctor_unknown_pkg_errors() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_pkg_doctor",
+            json!({ "name": "nonexistent_xyz_pkg" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("not found in installed.json"),
+        "expected unknown-pkg error message, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Shape violation: `name` must be a string (or omitted), not a number.
+///
+/// The param deserialization fails at the MCP protocol layer (before the
+/// handler runs), so we expect `call_tool` itself to return `Err` with an
+/// invalid-type message — distinct from handler-level typed errors which
+/// surface as `CallToolResult { is_error: true, ... }`.
+#[tokio::test]
+async fn test_pkg_doctor_shape_error() {
+    let client = connect().await;
+
+    let outcome = client
+        .call_tool(call_params("alc_pkg_doctor", json!({ "name": 123 })))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            let has_type_error = text.contains("invalid type")
+                || text.contains("expected a string")
+                || text.contains("expected string");
+            assert!(
+                is_error || has_type_error,
+                "expected shape error (is_error=true or type-mismatch text), got is_error={is_error:?}, text: {text}"
+            );
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("invalid type") && msg.contains("string"),
+                "expected invalid-type error from param deserialization, got: {msg}"
+            );
+        }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}

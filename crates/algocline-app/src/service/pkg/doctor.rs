@@ -27,7 +27,7 @@ use std::path::Path;
 
 use tracing::warn;
 
-use super::super::manifest::{load_manifest, ManifestEntry};
+use super::super::manifest::{load_manifest, Manifest, ManifestEntry};
 use super::super::project::resolve_project_root;
 use super::super::resolve::packages_dir;
 use super::super::AppService;
@@ -155,6 +155,67 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
     }
 }
 
+/// Classify every manifest entry into the four buckets.
+fn run_manifest_pass(
+    manifest: &Manifest,
+    target_filter: Option<&str>,
+    pkg_dir: &Path,
+    buckets: &mut DoctorBuckets,
+) {
+    for (pkg_name, entry) in &manifest.packages {
+        if let Some(target) = target_filter {
+            if target != pkg_name.as_str() {
+                continue;
+            }
+        }
+        let outcome = classify_installed(pkg_name, entry, pkg_dir);
+        push_doctor_outcome(pkg_name, outcome, buckets);
+    }
+}
+
+/// Drain the unattached-symlink scan results into the `symlink_dangling`
+/// bucket. The shared helper writes tagged entries into a scratch vec so
+/// its signature can stay aligned with `pkg_repair`'s unrepairable bucket.
+fn run_unattached_symlink_pass(
+    pkg_dir: &Path,
+    target_filter: Option<&str>,
+    manifest: &Manifest,
+    buckets: &mut DoctorBuckets,
+) {
+    let mut scratch: Vec<serde_json::Value> = Vec::new();
+    collect_unattached_dangling_symlinks(pkg_dir, target_filter, &manifest.packages, &mut scratch);
+    buckets.symlink_dangling.extend(scratch);
+}
+
+/// Scan `alc.toml` + `alc.local.toml` for declared paths that no longer
+/// resolve. `resolved_root = None` means no project context was located,
+/// which mirrors `pkg_repair`'s skip-on-missing behavior.
+fn run_path_missing_pass(
+    resolved_root: Option<&Path>,
+    target_filter: Option<&str>,
+    buckets: &mut DoctorBuckets,
+) {
+    let Some(root) = resolved_root else {
+        return;
+    };
+    let mut scratch: Vec<serde_json::Value> = Vec::new();
+    collect_path_missing(
+        root,
+        target_filter,
+        "project",
+        &mut scratch,
+        ProjectPathSource::Toml,
+    );
+    collect_path_missing(
+        root,
+        target_filter,
+        "variant",
+        &mut scratch,
+        ProjectPathSource::Local,
+    );
+    buckets.path_missing.extend(scratch);
+}
+
 impl AppService {
     /// Diagnose package state without any side effects. Returns a JSON string
     /// with four arrays (`healthy`, `installed_missing`, `symlink_dangling`,
@@ -179,64 +240,13 @@ impl AppService {
         let manifest = load_manifest()?;
         let pkg_dir = packages_dir()?;
         let resolved_root = resolve_project_root(project_root.as_deref());
-
-        let mut buckets = DoctorBuckets::default();
         let target_filter = name.as_deref();
 
-        // ── manifest pass: classify installed packages ───────────
-        for (pkg_name, entry) in &manifest.packages {
-            if let Some(target) = target_filter {
-                if target != pkg_name.as_str() {
-                    continue;
-                }
-            }
-            let outcome = classify_installed(pkg_name, entry, &pkg_dir);
-            push_doctor_outcome(pkg_name, outcome, &mut buckets);
-        }
+        let mut buckets = DoctorBuckets::default();
+        run_manifest_pass(&manifest, target_filter, &pkg_dir, &mut buckets);
+        run_unattached_symlink_pass(&pkg_dir, target_filter, &manifest, &mut buckets);
+        run_path_missing_pass(resolved_root.as_deref(), target_filter, &mut buckets);
 
-        // ── unattached dangling symlink pass ─────────────────────
-        // The helper emits entries tagged `kind: "symlink_dangling"` into the
-        // scratch vec; doctor routes them straight into the `symlink_dangling`
-        // bucket. Using the scratch vec keeps the helper's signature stable
-        // (it was shaped for repair's shared `unrepairable` bucket).
-        let mut scratch: Vec<serde_json::Value> = Vec::new();
-        collect_unattached_dangling_symlinks(
-            &pkg_dir,
-            target_filter,
-            &manifest.packages,
-            &mut scratch,
-        );
-        for entry in scratch {
-            buckets.symlink_dangling.push(entry);
-        }
-
-        // ── path_missing pass: alc.toml / alc.local.toml ─────────
-        // `resolved_root = None` means no project context was found — skip
-        // this pass (mirrors repair.rs:156-171).
-        if let Some(root) = resolved_root.as_ref() {
-            let mut path_scratch: Vec<serde_json::Value> = Vec::new();
-            collect_path_missing(
-                root,
-                target_filter,
-                "project",
-                &mut path_scratch,
-                ProjectPathSource::Toml,
-            );
-            collect_path_missing(
-                root,
-                target_filter,
-                "variant",
-                &mut path_scratch,
-                ProjectPathSource::Local,
-            );
-            for entry in path_scratch {
-                buckets.path_missing.push(entry);
-            }
-        }
-
-        // target_filter specified + all buckets empty → not-found error.
-        // Wording is identical to `pkg_repair` so callers can share error-
-        // message assertions.
         if let Some(target) = target_filter {
             if !buckets.any_matched() {
                 return Err(format!(

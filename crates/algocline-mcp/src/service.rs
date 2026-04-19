@@ -235,6 +235,15 @@ pub struct PkgRepairParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PkgDoctorParams {
+    /// Optional name. When omitted, every known package is inspected.
+    pub name: Option<String>,
+    /// Optional absolute path to project root for `alc.toml` /
+    /// `alc.local.toml` checks. Falls back to ancestor walk from cwd.
+    pub project_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NoteParams {
     /// Session ID of the execution to annotate.
     pub session_id: String,
@@ -944,6 +953,29 @@ impl AlcService {
         self.app.pkg_repair(params.name, params.project_root).await
     }
 
+    /// Diagnose package state without side effects (read-only counterpart
+    /// of `alc_pkg_repair`).
+    ///
+    /// Returns JSON with four arrays:
+    ///   - `healthy` — package directory exists and is reachable
+    ///   - `installed_missing` — manifest entry exists but install dir is gone;
+    ///     use `alc_pkg_install` to reinstall
+    ///   - `symlink_dangling` — symlink target missing; use `alc_pkg_unlink`
+    ///   - `path_missing` — `alc.toml` / `alc.local.toml` `path = ...` points
+    ///     to a non-existent directory
+    ///
+    /// No `pkg_install` calls, no filesystem writes. Safe to invoke freely.
+    #[tool(
+        name = "alc_pkg_doctor",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn pkg_doctor(
+        &self,
+        Parameters(params): Parameters<PkgDoctorParams>,
+    ) -> Result<String, String> {
+        self.app.pkg_doctor(params.name, params.project_root).await
+    }
+
     // ─── Logging ─────────────────────────────────────────────
 
     /// Add a note to a completed session's log.
@@ -1375,6 +1407,7 @@ impl ServerHandler for AlcService {
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
                  - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
+                 - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/installed_missing/symlink_dangling/path_missing buckets. Use pkg_unlink to remove dangling symlinks.\n\
                  - alc_pkg_repair: Heal broken packages — reinstalls entries whose installed dir is missing; surfaces dangling symlinks and missing path = ... declarations as unrepairable with suggestions.\n\
                  - alc_init: Initialize alc.toml in the project root and ensure alc.local.toml is listed in .gitignore.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\

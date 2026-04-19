@@ -198,6 +198,22 @@ pub trait EngineApi: Send + Sync {
         project_root: Option<String>,
     ) -> Result<String, String>;
 
+    /// Diagnose package state without side effects.
+    ///
+    /// Read-only counterpart of [`Self::pkg_repair`]. Classifies packages
+    /// into four buckets — `healthy`, `installed_missing`, `symlink_dangling`,
+    /// `path_missing` — and returns the result as a JSON string. No
+    /// filesystem writes, no `pkg_install` calls.
+    ///
+    /// `name` restricts the report to a single package; `None` inspects
+    /// every known package. `project_root` is used for the `alc.toml` /
+    /// `alc.local.toml` pass (falls back to ancestor walk from cwd).
+    async fn pkg_doctor(
+        &self,
+        name: Option<String>,
+        project_root: Option<String>,
+    ) -> Result<String, String>;
+
     // ─── Logging ─────────────────────────────────────────────
 
     /// Append a note to a session's log file.

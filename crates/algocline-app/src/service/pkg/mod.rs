@@ -55,6 +55,7 @@
 //! - [`install`] — `pkg_install`, local-path variant, and bundled auto-install.
 //! - [`remove`] — `pkg_remove` (alc.toml + alc.lock deletion).
 
+mod doctor;
 mod install;
 mod list;
 mod remove;

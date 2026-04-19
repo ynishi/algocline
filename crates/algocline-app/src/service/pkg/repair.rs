@@ -72,7 +72,7 @@ impl Buckets {
 
 /// Suggestion string shared by the manifest-pass dangling-symlink case and
 /// the (A) unattached-symlink pass.
-fn symlink_dangling_suggestion(name: &str) -> String {
+pub(super) fn symlink_dangling_suggestion(name: &str) -> String {
     format!("alc_pkg_unlink({name:?}) then alc_pkg_link with the new path")
 }
 
@@ -329,7 +329,7 @@ fn normalize_git_url(url: &str) -> String {
 /// Scan `pkg_dir` for dangling symlinks whose name is *not* present in the
 /// manifest. Manifest-tracked names are handled by `repair_installed` so
 /// they're skipped here to avoid double-counting.
-fn collect_unattached_dangling_symlinks(
+pub(super) fn collect_unattached_dangling_symlinks(
     pkg_dir: &Path,
     target_filter: Option<&str>,
     manifest_names: &std::collections::BTreeMap<String, ManifestEntry>,
@@ -402,7 +402,7 @@ fn collect_unattached_dangling_symlinks(
 
 /// Which TOML file is the source of truth for path entries.
 #[derive(Debug, Clone, Copy)]
-enum ProjectPathSource {
+pub(super) enum ProjectPathSource {
     /// `alc.toml` `[packages.x] path = ...` (project scope).
     Toml,
     /// `alc.local.toml` `[packages.x] path = ...` (variant scope).
@@ -412,7 +412,7 @@ enum ProjectPathSource {
 /// Append `path_missing` unrepairable entries for either alc.toml or
 /// alc.local.toml. Filtering by `target_filter` (Some(name)) restricts
 /// to a single package.
-fn collect_path_missing(
+pub(super) fn collect_path_missing(
     root: &Path,
     target_filter: Option<&str>,
     scope: &'static str,

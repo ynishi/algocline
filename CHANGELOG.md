@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc_pkg_remove` `scope` parameter**: reintroduced with manifest-only
+  semantics. Accepts `"project"` (default, existing behavior — removes
+  from `alc.toml` + `alc.lock`), `"global"` (removes the entry from
+  `~/.algocline/installed.json`), or `"all"` (both, lenient — succeeds
+  if either scope had the entry).
+  - Physical files in `~/.algocline/packages/{name}/` are **never**
+    deleted by any scope. This is different from the historical
+    0.14.0 `scope="global"` (removed in 0.15.0), which deleted the
+    cache directory and was retired for safety. The name is reused
+    because the new semantics are safe (manifest edit only) and
+    mirror `PkgLinkScope`'s existing `scope` pattern.
+  - Closes the "orphan `installed.json` entry has no tool cleanup
+    path" gap that forced manual JSON edits (e.g. after e2e test
+    source tempdirs vanish, leaving dead manifest entries).
+- **`PkgRemoveScope` enum** in `algocline-mcp`: snake_case-serialized
+  `project` / `global` / `all`. Unknown values are rejected by the
+  schema rather than silently defaulted.
+- **`EngineApi::pkg_remove`**: gains a `scope: Option<String>`
+  parameter (breaking for trait implementors; the in-tree `AppService`
+  impl is updated accordingly).
+
 ## [0.23.1] - 2026-04-19
 
 ### Changed

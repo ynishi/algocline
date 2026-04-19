@@ -180,8 +180,9 @@ impl EngineApi for AppService {
         name: &str,
         project_root: Option<String>,
         version: Option<String>,
+        scope: Option<String>,
     ) -> Result<String, String> {
-        AppService::pkg_remove(self, name, project_root, version).await
+        AppService::pkg_remove(self, name, project_root, version, scope).await
     }
 
     async fn pkg_repair(

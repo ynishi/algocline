@@ -31,8 +31,12 @@
 //! `alc.lock` is the resolved lockfile (tool-managed).
 //!
 //! - `pkg_install` updates both `alc.toml` (adds entry) and `alc.lock` (records version/source).
-//! - `pkg_remove` removes the entry from both `alc.toml` and `alc.lock`.
-//! - Physical files in `~/.algocline/packages/` are never deleted by `pkg_remove`.
+//! - `pkg_remove` removes entries scoped by `scope`:
+//!   - `"project"` (default): `alc.toml` + `alc.lock`.
+//!   - `"global"`: `~/.algocline/installed.json`.
+//!   - `"all"`: both.
+//! - Physical files in `~/.algocline/packages/` are never deleted by `pkg_remove`
+//!   under any scope.
 //!
 //! `alc.lock` is updated atomically via temp-file + rename.
 //! Read at session start to build extra `FsResolver` entries.
@@ -53,7 +57,7 @@
 //!
 //! - [`list`] — `pkg_list` and its intermediate DTOs.
 //! - [`install`] — `pkg_install`, local-path variant, and bundled auto-install.
-//! - [`remove`] — `pkg_remove` (alc.toml + alc.lock deletion).
+//! - [`remove`] — `pkg_remove` (project / global / all scope dispatch).
 
 mod doctor;
 mod install;

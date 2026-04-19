@@ -177,15 +177,22 @@ pub trait EngineApi: Send + Sync {
     /// Only removes symlinks; for installed (copied) packages, use `pkg_remove`.
     async fn pkg_unlink(&self, name: String) -> Result<String, String>;
 
-    /// Remove a package declaration from `alc.toml` and `alc.lock`.
+    /// Remove a package entry, scoped by `scope` (`"project"` /
+    /// `"global"` / `"all"`, default `"project"`).
     ///
-    /// Requires an `alc.toml` to be found (via `project_root` or ancestor walk).
-    /// Does NOT delete physical files from `~/.algocline/packages/`.
+    /// - `"project"`: remove from `alc.toml` + `alc.lock`. Requires an
+    ///   `alc.toml` via `project_root` or ancestor walk.
+    /// - `"global"`: remove from `~/.algocline/installed.json` only.
+    ///   `project_root` is ignored.
+    /// - `"all"`: remove from both; succeeds if either scope had the entry.
+    ///
+    /// Physical files in `~/.algocline/packages/{name}/` are never deleted.
     async fn pkg_remove(
         &self,
         name: &str,
         project_root: Option<String>,
         version: Option<String>,
+        scope: Option<String>,
     ) -> Result<String, String>;
 
     /// Heal broken package state by reinstalling entries whose installed

@@ -212,17 +212,74 @@ pub struct PkgListParams {
     pub verbose: Option<String>,
 }
 
+/// Scope selector for `alc_pkg_remove`.
+///
+/// Mirrors `PkgLinkScope`'s snake_case enum pattern so that `scope` in
+/// `pkg_*` tools stays consistent at the schema level.
+///
+/// - `project` (default): remove the package declaration from
+///   `{project_root}/alc.toml` + `alc.lock`. Global manifest and cached
+///   files are untouched.
+/// - `global`: remove the package's entry from the global manifest
+///   `~/.algocline/installed.json`. The cached directory under
+///   `~/.algocline/packages/{name}/` is **not** deleted (symmetric with
+///   the `project` scope's "physical files preserved" policy).
+/// - `all`: apply both. Lenient: succeeds if either scope had an entry
+///   to remove. Errors only when neither scope has the package.
+///
+/// History: a `scope` parameter existed in 0.14.0 with different
+/// semantics (it deleted the physical cache dir) and was removed in
+/// 0.15.0 for safety. The re-introduced parameter is manifest-only —
+/// no filesystem destruction — and so reuses the name without the
+/// earlier danger.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PkgRemoveScope {
+    /// Remove from `alc.toml` + `alc.lock` (existing behavior).
+    Project,
+    /// Remove from `~/.algocline/installed.json` only.
+    Global,
+    /// Remove from both project and global manifests.
+    All,
+}
+
+impl PkgRemoveScope {
+    /// String form passed to the App-layer `EngineApi::pkg_remove(scope: Option<String>)`.
+    ///
+    /// The EngineApi boundary takes `String` rather than this enum so that
+    /// `algocline-core` does not depend on `schemars`. Same split as
+    /// `PkgLinkScope`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgRemoveParams {
     /// Name of the package to remove.
     pub name: String,
     /// Optional absolute path to project root containing alc.toml.
     /// Falls back to ALC_PROJECT_ROOT env or ancestor walk from cwd.
-    /// An alc.toml must be found — if not, the operation fails.
+    /// Required when `scope = "project"` or `"all"`; ignored when
+    /// `scope = "global"`.
     pub project_root: Option<String>,
     /// Optional version constraint. When specified, only the alc.lock entry
     /// matching this version is removed. Omit to remove any version.
+    /// Has no effect on the global manifest entry (which is version-agnostic).
     pub version: Option<String>,
+    /// Scope of the removal. Default: `"project"` (backward-compatible).
+    ///
+    /// - `"project"`: remove from `alc.toml` + `alc.lock` (existing behavior).
+    /// - `"global"`: remove from `~/.algocline/installed.json` only.
+    /// - `"all"`: remove from both.
+    ///
+    /// Physical files in `~/.algocline/packages/{name}/` are never deleted
+    /// by any scope.
+    pub scope: Option<PkgRemoveScope>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -897,11 +954,18 @@ impl AlcService {
         self.app.pkg_install(params.url, params.name).await
     }
 
-    /// Remove a package declaration from `alc.toml` and `alc.lock`.
+    /// Remove a package entry, scoped by `scope`:
     ///
-    /// Physical files in `~/.algocline/packages/` are NOT deleted.
-    /// Requires an `alc.toml` to be found (via `project_root` or ancestor walk from cwd).
-    /// Pass `version` to remove only a specific version from `alc.lock`.
+    /// - `scope = "project"` (default): remove from `alc.toml` + `alc.lock`.
+    ///   Requires an `alc.toml` found via `project_root` or ancestor walk.
+    /// - `scope = "global"`: remove the entry from `~/.algocline/installed.json`.
+    ///   `project_root` is ignored in this scope.
+    /// - `scope = "all"`: remove from both. Succeeds if either scope had
+    ///   the entry; errors only when neither did.
+    ///
+    /// Physical files in `~/.algocline/packages/{name}/` are **never** deleted
+    /// by any scope. Pass `version` to remove only a specific version from
+    /// `alc.lock` (project scope only).
     #[tool(
         name = "alc_pkg_remove",
         annotations(destructive_hint = true, open_world_hint = false)
@@ -910,8 +974,9 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<PkgRemoveParams>,
     ) -> Result<String, String> {
+        let scope = params.scope.map(|s| s.as_str().to_string());
         self.app
-            .pkg_remove(&params.name, params.project_root, params.version)
+            .pkg_remove(&params.name, params.project_root, params.version, scope)
             .await
     }
 
@@ -1514,5 +1579,76 @@ mod tests {
             !s.contains("\"local\""),
             "schema unexpectedly contains legacy 'local': {s}"
         );
+    }
+
+    // ── PkgRemoveScope / PkgRemoveParams — mirror PkgLinkScope coverage ──
+
+    #[test]
+    fn pkg_remove_scope_deserializes_snake_case_project() {
+        let params: PkgRemoveParams = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "scope": "project",
+        }))
+        .unwrap();
+        assert_eq!(params.scope, Some(PkgRemoveScope::Project));
+    }
+
+    #[test]
+    fn pkg_remove_scope_deserializes_snake_case_global() {
+        let params: PkgRemoveParams = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "scope": "global",
+        }))
+        .unwrap();
+        assert_eq!(params.scope, Some(PkgRemoveScope::Global));
+    }
+
+    #[test]
+    fn pkg_remove_scope_deserializes_snake_case_all() {
+        let params: PkgRemoveParams = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "scope": "all",
+        }))
+        .unwrap();
+        assert_eq!(params.scope, Some(PkgRemoveScope::All));
+    }
+
+    #[test]
+    fn pkg_remove_scope_unknown_value_is_rejected_by_schema() {
+        let err: Result<PkgRemoveParams, _> = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "scope": "everywhere",
+        }));
+        assert!(err.is_err(), "expected schema error for unknown scope");
+    }
+
+    #[test]
+    fn pkg_remove_scope_as_str_round_trip() {
+        assert_eq!(PkgRemoveScope::Project.as_str(), "project");
+        assert_eq!(PkgRemoveScope::Global.as_str(), "global");
+        assert_eq!(PkgRemoveScope::All.as_str(), "all");
+    }
+
+    #[test]
+    fn pkg_remove_params_accepts_name_only_for_backcompat() {
+        // scope omitted → None (App layer treats as default "project").
+        // Back-compat guard: callers written against the pre-scope schema
+        // must keep deserializing unchanged.
+        let params: PkgRemoveParams =
+            serde_json::from_value(serde_json::json!({ "name": "x" })).unwrap();
+        assert!(params.scope.is_none());
+        assert!(params.project_root.is_none());
+        assert!(params.version.is_none());
+    }
+
+    #[test]
+    fn pkg_remove_scope_enum_exposes_all_variants_in_json_schema() {
+        use schemars::schema_for;
+        let schema = schema_for!(PkgRemoveScope);
+        let json = serde_json::to_value(&schema).unwrap();
+        let s = json.to_string();
+        assert!(s.contains("\"project\""), "schema missing project: {s}");
+        assert!(s.contains("\"global\""), "schema missing global: {s}");
+        assert!(s.contains("\"all\""), "schema missing all: {s}");
     }
 }

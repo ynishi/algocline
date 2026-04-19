@@ -555,6 +555,7 @@ async fn pkg_remove_project_scope() {
             "my_local_pkg",
             Some(project_root.to_string_lossy().to_string()),
             None, // version
+            None, // scope → default "project"
         )
         .await
         .unwrap();
@@ -598,11 +599,166 @@ async fn pkg_remove_project_scope_not_found_returns_error() {
             "nonexistent_pkg",
             Some(project_root.to_string_lossy().to_string()),
             None, // version
+            None, // scope → default "project"
         )
         .await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found in alc.lock"));
+}
+
+// ── pkg_remove scope=global / all tests ─────────────────────
+
+/// `scope = "global"` removes the entry from `~/.algocline/installed.json`
+/// but leaves `~/.algocline/packages/{name}/` untouched. No `project_root`
+/// needed.
+#[tokio::test]
+async fn pkg_remove_global_scope_removes_manifest_entry() {
+    use crate::service::manifest::{load_manifest, record_install};
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+
+    record_install("ghost_pkg", Some("0.1.0"), "/tmp/ghost_source").unwrap();
+    assert!(load_manifest().unwrap().packages.contains_key("ghost_pkg"));
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_remove(
+            "ghost_pkg",
+            None, // project_root — ignored for global scope
+            None, // version
+            Some("global".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(json["removed"], "ghost_pkg");
+    assert_eq!(json["scope"], "global");
+    assert!(json["installed_json"].is_string());
+
+    assert!(
+        !load_manifest().unwrap().packages.contains_key("ghost_pkg"),
+        "global manifest still contains the entry"
+    );
+}
+
+/// `scope = "global"` errors when the name is not in the manifest so callers
+/// cannot silently no-op on a typo. Mirrors the `alc.lock` authoritative
+/// check in `scope = "project"`.
+#[tokio::test]
+async fn pkg_remove_global_scope_not_found_returns_error() {
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+
+    let svc = make_app_service().await;
+    let result = svc
+        .pkg_remove("never_installed", None, None, Some("global".to_string()))
+        .await;
+
+    let err = result.expect_err("expected Err");
+    assert!(
+        err.contains("not found in global manifest"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `scope = "global"` must not `rm -rf ~/.algocline/packages/{name}/`.
+/// Symmetric with the project scope's "physical files preserved" policy.
+#[tokio::test]
+async fn pkg_remove_global_scope_preserves_physical_dir() {
+    use crate::service::manifest::record_install;
+    use crate::service::test_support::FakeHome;
+
+    let fake_home = FakeHome::new();
+    let pkg_dir = fake_home
+        .home
+        .join(".algocline")
+        .join("packages")
+        .join("kept");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+    record_install("kept", Some("0.1.0"), "/tmp/kept_source").unwrap();
+
+    let svc = make_app_service().await;
+    svc.pkg_remove("kept", None, None, Some("global".to_string()))
+        .await
+        .unwrap();
+
+    assert!(
+        pkg_dir.exists(),
+        "global scope must not delete ~/.algocline/packages/{{name}}/"
+    );
+    assert!(
+        pkg_dir.join("init.lua").exists(),
+        "init.lua should still be present"
+    );
+}
+
+/// `scope = "all"` is lenient: removes from whichever scope has the entry.
+/// When only the global manifest has it (project scope legitimately absent
+/// because the project never declared the package), the call still succeeds
+/// and reports `project_removed = false`.
+#[tokio::test]
+async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
+    use crate::service::manifest::{load_manifest, record_install};
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+    record_install("orphan", None, "/tmp/orphan_source").unwrap();
+
+    let svc = make_app_service().await;
+    // No project_root supplied — project scope will fail to resolve.
+    let result = svc
+        .pkg_remove("orphan", None, None, Some("all".to_string()))
+        .await
+        .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(json["removed"], "orphan");
+    assert_eq!(json["scope"], "all");
+    assert_eq!(json["global_removed"], true);
+    assert_eq!(json["project_removed"], false);
+    assert!(
+        !load_manifest().unwrap().packages.contains_key("orphan"),
+        "global manifest still contains the entry"
+    );
+}
+
+/// `scope = "all"` errors only when neither scope has the entry. Both
+/// scope-specific error strings are surfaced so the caller can diagnose.
+#[tokio::test]
+async fn pkg_remove_all_scope_errors_when_neither_scope_has_entry() {
+    use crate::service::test_support::FakeHome;
+
+    let _fake_home = FakeHome::new();
+
+    let svc = make_app_service().await;
+    let err = svc
+        .pkg_remove("never_anywhere", None, None, Some("all".to_string()))
+        .await
+        .expect_err("expected Err");
+
+    assert!(err.contains("not found in any scope"), "unexpected: {err}");
+    assert!(err.contains("project:"), "missing project context: {err}");
+    assert!(err.contains("global:"), "missing global context: {err}");
+}
+
+/// Unknown `scope` values are rejected rather than silently defaulting.
+#[tokio::test]
+async fn pkg_remove_invalid_scope_errors() {
+    let svc = make_app_service().await;
+    let err = svc
+        .pkg_remove("x", None, None, Some("packages".to_string()))
+        .await
+        .expect_err("expected Err");
+    assert!(
+        err.contains("invalid scope") && err.contains("packages"),
+        "unexpected: {err}"
+    );
 }
 
 // ── resolved_source_path / resolved_source_kind / override_paths tests ────

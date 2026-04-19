@@ -220,8 +220,8 @@ pub(crate) fn record_install_batch(names: &[String], source: &str) -> Result<(),
     })
 }
 
-/// Remove a package from the manifest.
-#[allow(dead_code)]
+/// Remove a package from the manifest (`installed.json`). Used by
+/// `pkg_remove` scope `"global"` / `"all"`.
 pub(crate) fn record_remove(name: &str) -> Result<(), String> {
     with_manifest_lock(|| {
         let mut manifest = load_manifest()?;

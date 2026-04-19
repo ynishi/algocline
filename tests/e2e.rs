@@ -740,6 +740,78 @@ return M"#,
     client.cancel().await.expect("cancel failed");
 }
 
+/// `alc_pkg_remove` with `scope = "global"` deletes the entry from the
+/// global manifest `~/.algocline/installed.json` while leaving the cached
+/// directory `~/.algocline/packages/{name}/` intact. Regression against
+/// the "no tool path to clean up orphan `installed.json` entries" gap
+/// that motivated the scope reintroduction (CHANGELOG).
+#[tokio::test]
+async fn test_pkg_remove_scope_global_cleans_manifest_not_files() {
+    let client = connect().await;
+
+    // Install a unique package so we don't collide with real user state.
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let pkg_name = "e2e_remove_global";
+    let pkg_dir = tmp_dir.path().join(pkg_name);
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_remove_global", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_dir.to_string_lossy() }),
+    )
+    .await;
+
+    let home = dirs::home_dir().expect("home");
+    let manifest_path = home.join(".algocline").join("installed.json");
+    let cache_dir = home.join(".algocline").join("packages").join(pkg_name);
+
+    // Precondition: manifest has the entry, cache dir exists.
+    let before: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest read"))
+            .expect("manifest JSON");
+    assert!(
+        before["packages"][pkg_name].is_object(),
+        "precondition: manifest must contain '{pkg_name}' before remove"
+    );
+    assert!(cache_dir.exists(), "precondition: cache dir must exist");
+
+    // scope=global removal.
+    let resp = call_json(
+        &client,
+        "alc_pkg_remove",
+        json!({ "name": pkg_name, "scope": "global" }),
+    )
+    .await;
+    assert_eq!(resp["removed"], pkg_name);
+    assert_eq!(resp["scope"], "global");
+
+    // Postcondition: manifest no longer has the entry, cache dir still exists.
+    let after: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("manifest read"))
+            .expect("manifest JSON");
+    assert!(
+        after["packages"][pkg_name].is_null(),
+        "manifest still contains '{pkg_name}' after scope=global remove"
+    );
+    assert!(
+        cache_dir.exists(),
+        "scope=global must not delete ~/.algocline/packages/{pkg_name}/"
+    );
+
+    // Cleanup the cache dir (scope=global deliberately leaves it).
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Variant scope link → require: `alc_pkg_link --scope=variant` writes
 /// `alc.local.toml` and the next `alc_run` (with the same `project_root`)
 /// must be able to `require()` the variant pkg by its declared name.

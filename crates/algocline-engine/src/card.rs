@@ -3862,13 +3862,20 @@ mod tests {
 
     // ─── samples sidecar ───────────────────────────────────────
 
+    // Isolated `FileCardStore::new(tempdir)` sidesteps the shared-root race
+    // in `find_card_locator`; see `read_samples_empty_when_absent` for the
+    // full root-cause write-up.
     #[test]
     fn write_and_read_samples_roundtrip() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.5 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let (id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": "roundtrip_pkg" },
+                "stats": { "pass_rate": 0.5 }
+            }),
+        )
         .unwrap();
 
         let samples = vec![
@@ -3876,17 +3883,18 @@ mod tests {
             json!({ "case": "c1", "passed": false, "score": 0.0 }),
             json!({ "case": "c2", "passed": true, "score": 0.75 }),
         ];
-        let path = write_samples(&id, samples.clone()).unwrap();
+        let path = write_samples_with_store(&store, &id, samples.clone()).unwrap();
         assert!(path.exists());
         assert!(path.to_string_lossy().ends_with(".samples.jsonl"));
 
-        let got = read_samples(&id, SamplesQuery::default()).unwrap();
+        let got = read_samples_with_store(&store, &id, SamplesQuery::default()).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0]["case"], json!("c0"));
         assert_eq!(got[2]["score"], json!(0.75));
 
         // offset + limit
-        let slice = read_samples(
+        let slice = read_samples_with_store(
+            &store,
             &id,
             SamplesQuery {
                 offset: 1,
@@ -3897,34 +3905,51 @@ mod tests {
         .unwrap();
         assert_eq!(slice.len(), 1);
         assert_eq!(slice[0]["case"], json!("c1"));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn write_samples_is_write_once() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
-        write_samples(&id, vec![json!({ "x": 1 })]).unwrap();
-        let err = write_samples(&id, vec![json!({ "x": 2 })]).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let (id, _) =
+            create_with_store(&store, json!({ "pkg": { "name": "write_once_pkg" } })).unwrap();
+        write_samples_with_store(&store, &id, vec![json!({ "x": 1 })]).unwrap();
+        let err = write_samples_with_store(&store, &id, vec![json!({ "x": 2 })]).unwrap_err();
         assert!(err.contains("already exist"), "got: {err}");
-        cleanup(&pkg);
     }
 
+    // Previously used `create` / `read_samples` (default `~/.algocline/cards/`
+    // store). Under `cargo test --workspace` parallel runs, `find_card_locator`
+    // scans the shared root with `fs::read_dir(...).flatten()` which silently
+    // drops transient I/O errors — on macOS APFS, a concurrent `remove_dir_all`
+    // from another test's `cleanup(pkg)` could trigger that transient error and
+    // cause this test's just-created pkg dir entry to be missed, propagating
+    // `card '...' not found` up through `samples_path` → `read_samples`.
+    //
+    // Isolating via `FileCardStore::new(tempdir)` + `_with_store` variants
+    // sidesteps the shared-root race entirely. Same pattern as
+    // `custom_root_file_store_roundtrip` / `test_fanout_concurrent_*`.
     #[test]
     fn read_samples_empty_when_absent() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
-        let got = read_samples(&id, SamplesQuery::default()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let (id, _) = create_with_store(
+            &store,
+            json!({ "pkg": { "name": "read_samples_empty_pkg" } }),
+        )
+        .unwrap();
+        let got = read_samples_with_store(&store, &id, SamplesQuery::default()).unwrap();
         assert!(got.is_empty());
-        cleanup(&pkg);
     }
 
     #[test]
     fn read_samples_where_filters_rows() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
-        write_samples(
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let (id, _) =
+            create_with_store(&store, json!({ "pkg": { "name": "where_filter_pkg" } })).unwrap();
+        write_samples_with_store(
+            &store,
             &id,
             vec![
                 json!({ "case": "c0", "passed": true,  "score": 1.0 }),
@@ -3938,7 +3963,8 @@ mod tests {
 
         // Equality predicate: passed == true keeps 3 rows.
         let pred = parse_where(&json!({ "passed": true })).unwrap();
-        let got = read_samples(
+        let got = read_samples_with_store(
+            &store,
             &id,
             SamplesQuery {
                 offset: 0,
@@ -3954,7 +3980,8 @@ mod tests {
 
         // Nested comparator: score gte 0.5 keeps c0/c3/c4.
         let pred = parse_where(&json!({ "score": { "gte": 0.5 } })).unwrap();
-        let got = read_samples(
+        let got = read_samples_with_store(
+            &store,
             &id,
             SamplesQuery {
                 offset: 0,
@@ -3970,7 +3997,8 @@ mod tests {
 
         // Offset applies AFTER filter: passed=true then skip 1 + limit 1 → c2.
         let pred = parse_where(&json!({ "passed": true })).unwrap();
-        let slice = read_samples(
+        let slice = read_samples_with_store(
+            &store,
             &id,
             SamplesQuery {
                 offset: 1,
@@ -3981,8 +4009,6 @@ mod tests {
         .unwrap();
         assert_eq!(slice.len(), 1);
         assert_eq!(slice[0]["case"], json!("c2"));
-
-        cleanup(&pkg);
     }
 
     #[test]
@@ -4008,7 +4034,10 @@ mod tests {
 
     #[test]
     fn samples_errors_on_missing_card() {
-        let err = write_samples("does_not_exist_xyz_samples", vec![json!({})]).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let err = write_samples_with_store(&store, "does_not_exist_xyz_samples", vec![json!({})])
+            .unwrap_err();
         assert!(err.contains("not found"));
     }
 
@@ -4016,36 +4045,40 @@ mod tests {
 
     #[test]
     fn import_from_dir_copies_cards() {
-        let pkg = unique_pkg();
-        let tmp = tempfile::tempdir().unwrap();
+        let pkg = "import_copies_pkg";
+        let src_tmp = tempfile::tempdir().unwrap();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(store_tmp.path().to_path_buf());
 
         // Create a source card file
         let card_id = format!("{pkg}_imported");
         let card_content = format!(
             "schema_version = \"{SCHEMA_VERSION}\"\ncard_id = \"{card_id}\"\npkg = \"{pkg}\"\n"
         );
-        fs::write(tmp.path().join(format!("{card_id}.toml")), &card_content).unwrap();
+        fs::write(
+            src_tmp.path().join(format!("{card_id}.toml")),
+            &card_content,
+        )
+        .unwrap();
 
         // Create a matching samples file
         fs::write(
-            tmp.path().join(format!("{card_id}.samples.jsonl")),
+            src_tmp.path().join(format!("{card_id}.samples.jsonl")),
             "{\"case\":\"c0\"}\n",
         )
         .unwrap();
 
-        let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
+        let (imported, skipped) = import_from_dir_with_store(&store, src_tmp.path(), pkg).unwrap();
         assert_eq!(imported, vec![card_id.clone()]);
         assert!(skipped.is_empty());
 
         // Verify card was imported
-        let got = get(&card_id).unwrap().unwrap();
+        let got = get_with_store(&store, &card_id).unwrap().unwrap();
         assert_eq!(got["card_id"], json!(card_id));
 
         // Verify samples were copied
-        let samples = read_samples(&card_id, SamplesQuery::default()).unwrap();
+        let samples = read_samples_with_store(&store, &card_id, SamplesQuery::default()).unwrap();
         assert_eq!(samples.len(), 1);
-
-        cleanup(&pkg);
     }
 
     #[test]

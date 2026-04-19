@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `alc init` bundled-packages tag bumped `v0.15.0` → `v0.16.0`
+  - `evalframe` stays at `v0.3.0`
+
 ### Added
 
 - **`alc_pkg_remove` `scope` parameter**: reintroduced with manifest-only

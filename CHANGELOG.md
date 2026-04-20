@@ -7,44 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Changed — `source` field wire format
 
-- **`PackageSource` is now typed at the domain boundary.**
-  `ManifestEntry.source`, `IndexEntry.source`, and friends moved from
-  free-form `String` to the `PackageSource` enum
-  (`Unknown | Installed | Path { path } | Git { url, rev } | Bundled { collection }`).
-  - Reads stay backward-compatible: a serde untagged shim accepts both the
-    new tagged form (`{"type":"git","url":"…"}`) and legacy strings
-    (`"bundled"`, absolute paths, `"github.com/owner/repo"`, `"installed"`)
-    produced by 0.24.x and earlier manifests.
-  - Writes are always typed. Callers no longer round-trip through
-    `infer_from_legacy_source_string` to classify entries.
-  - `pkg_repair` now has an explicit arm for `Unknown` that routes to
-    `Unrepairable { reason: "source unknown (legacy entry; run alc_hub_reindex)" }`
-    instead of silently falling through. `Installed` (legacy "installed"
-    marker with no source path) is also explicitly unrepairable with a
-    dedicated reason.
-  - `pkg_doctor` `installed_missing_suggestion` now matches the typed
-    source and emits richer next-step commands per variant, including a
-    distinct branch for `Unknown` that suggests `alc_hub_reindex` before
-    `alc_pkg_install`.
-- **`PkgEntity` is the canonical projection of a package's `M.meta` block.**
-  Added to `algocline-core`. `PkgEntity::parse_from_init_lua(&source)`
-  returns `Option<PkgEntity>` and is used by the hub index builder to
-  **silently exclude** directories whose `init.lua` has no `M.meta.name`,
-  replacing the previous bespoke regex parser in `service::hub`.
-- **`IndexEntry` / `SearchResult` flatten `PkgEntity`.** The hub index
-  on-wire shape is unchanged — `name`, `version`, `description`,
-  `category` remain top-level — but internally the fields share a single
-  struct. `SearchResult` uses a custom `serialize_with` to keep `docstring`
-  out of the default serialization (preserved from the previous behavior).
+The `source` field in `alc_hub_info` / `alc_hub_search` responses and in the
+on-disk `~/.algocline/hub_index.json` / `~/.algocline/installed.json` files
+changes from a plain string to a tagged object. `alc_info` / `alc_pkg_list`
+outputs follow suit.
 
-### Removed
+**Before (0.24.x)**
 
-- `service::hub::parse_meta_from_init_lua` and
-  `service::hub::extract_docstring` (superseded by
-  `PkgEntity::parse_from_init_lua` in `algocline-core`). Their previous
-  inline regex-based parsing has been consolidated into one path.
+```json
+"source": ""
+"source": "installed"
+"source": "bundled"
+"source": "/Users/me/pkgs/foo"
+"source": "https://github.com/owner/repo"
+```
+
+**After (0.25.0)**
+
+```json
+"source": {"type": "unknown"}
+"source": {"type": "installed"}
+"source": {"type": "bundled", "collection": null}
+"source": {"type": "path", "path": "/Users/me/pkgs/foo"}
+"source": {"type": "git",  "url":  "https://github.com/owner/repo", "rev": null}
+```
+
+Variants: `unknown` / `installed` / `bundled {collection}` / `path {path}` /
+`git {url, rev}`.
+
+### Migration
+
+**Existing users: mostly no-op.**
+`~/.algocline/installed.json` and `~/.algocline/hub_index.json` stored in the
+legacy string form still load in 0.25.0 (a read-compat shim absorbs them).
+Each entry is rewritten to the tagged form the next time `alc_pkg_install` /
+`alc_pkg_remove` / `alc_hub_reindex` touches it. Legacy `""` entries now
+surface in `alc_pkg_repair` as `unrepairable` with
+`reason: "source unknown (legacy entry; run alc_hub_reindex)"`; run
+`alc_hub_reindex` once to clear them.
+
+**MCP consumers that read `source` from `alc_hub_info` / `alc_hub_search`:
+update required.** Replace the string-typed branch with an object dispatch:
+
+```lua
+local src = response.pkg.source  -- table in 0.25.0+
+if     src.type == "git"      then return src.url
+elseif src.type == "path"     then return src.path
+elseif src.type == "bundled"  then return src.collection   -- nil or string
+else                                return nil             -- installed / unknown
+end
+```
+
+For dual-compat with 0.24.x, append `elseif type(src) == "string" then ...`.
+
+**Bundled packages repo:** `algocline-bundled-packages/hub_index.json` will
+ship already reindexed in v0.18.0. Running 0.25.0 against v0.17.0 still
+works through the read shim.
 
 ## [0.24.1] - 2026-04-19
 

@@ -78,12 +78,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use algocline_core::PkgEntity;
+
 use super::list_opts::{
     apply_sort_by_value, matches_filter, parse_sort, project_fields, resolve_fields, ListOpts,
     HUB_SEARCH_FULL, HUB_SEARCH_SUMMARY,
 };
 use super::manifest;
 use super::resolve::AUTO_INSTALL_SOURCES;
+use super::source::PackageSource;
 use super::AppService;
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -107,24 +110,25 @@ pub(crate) struct HubIndex {
 }
 
 /// One package in the index.
+///
+/// `entity` carries the canonical Lua `M.meta` projection (name, version,
+/// description, category, docstring) via `#[serde(flatten)]` so the wire
+/// shape is identical to the pre-refactor flat-object layout. `source`
+/// is the typed package source; `card_count` / `best_card` are hub-side
+/// enrichments computed at index-build time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IndexEntry {
-    pub name: String,
+    #[serde(flatten)]
+    pub entity: PkgEntity,
+    /// How this package was obtained. Typed on write; legacy bare strings
+    /// in pre-migration `hub_index.json` deserialize via the serde shim
+    /// on `PackageSource` (see `service::source`).
     #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub category: String,
-    #[serde(default)]
-    pub source: String,
+    pub source: PackageSource,
     #[serde(default)]
     pub card_count: usize,
     #[serde(default)]
     pub best_card: Option<BestCard>,
-    /// Leading `---` docstring lines from init.lua (for full-text search).
-    #[serde(default)]
-    pub docstring: String,
 }
 
 /// Best card summary within a package.
@@ -141,30 +145,52 @@ pub(crate) struct BestCard {
 
 /// Search result — index entry enriched with local install state.
 ///
-/// `docstring` is `skip_serializing` so the default serde output never
-/// exposes it (docstrings can be large and dominate payload size). The
-/// `hub_search` projection path puts it back into the JSON object when
-/// the resolved field set contains `"docstring"`, via
+/// `entity.docstring` is `skip_serializing` (via the `skip_docstring`
+/// custom serializer on the flattened struct) so the default serde output
+/// never exposes the docstring field — docstrings can be large and
+/// dominate payload size. The `hub_search` projection path re-attaches
+/// the docstring to the output object when the resolved field set
+/// contains `"docstring"`, via
 /// [`SearchResult::to_value_with_optional_docstring`].
 ///
 /// `docstring_matched` is a query-time signal: it is `Some(true)` only
 /// when the query hit docstring and none of {name, description, category}.
 /// Otherwise (no query, or query hit any of the other fields) it is
 /// `None` and omitted from the output.
+///
+/// Because `#[serde(flatten)]` composes poorly with field-level
+/// `skip_serializing`, we carry the non-docstring part of `PkgEntity`
+/// via a custom `serialize_entity_without_docstring` path rather than a
+/// bare `#[serde(flatten)]`. The struct still holds a full `PkgEntity`
+/// internally for consistency with `IndexEntry`.
 #[derive(Debug, Clone, Serialize)]
 struct SearchResult {
-    name: String,
-    version: String,
-    description: String,
-    category: String,
-    source: String,
+    #[serde(flatten, serialize_with = "serialize_entity_without_docstring")]
+    entity: PkgEntity,
+    /// Typed source (mirrors `IndexEntry.source`).
+    source: PackageSource,
     installed: bool,
     card_count: usize,
     best_card: Option<BestCard>,
-    #[serde(skip_serializing)]
-    docstring: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     docstring_matched: Option<bool>,
+}
+
+/// Serialize a `PkgEntity` as a flat JSON object, intentionally dropping
+/// the `docstring` field so large docstrings do not dominate `hub_search`
+/// payloads. The projection path re-attaches docstring via
+/// [`SearchResult::to_value_with_optional_docstring`].
+fn serialize_entity_without_docstring<S>(entity: &PkgEntity, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut map = ser.serialize_map(Some(4))?;
+    map.serialize_entry("name", &entity.name)?;
+    map.serialize_entry("version", &entity.version)?;
+    map.serialize_entry("description", &entity.description)?;
+    map.serialize_entry("category", &entity.category)?;
+    map.end()
 }
 
 impl SearchResult {
@@ -184,10 +210,8 @@ impl SearchResult {
         let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         if include_docstring {
             if let serde_json::Value::Object(ref mut map) = v {
-                map.insert(
-                    "docstring".to_string(),
-                    serde_json::Value::String(self.docstring.clone()),
-                );
+                let doc = self.entity.docstring.clone().unwrap_or_default();
+                map.insert("docstring".to_string(), serde_json::Value::String(doc));
             }
         }
         v
@@ -381,12 +405,16 @@ fn discover_index_urls() -> Vec<String> {
         }
     }
 
-    // 2. From manifest (catch sources registered before hub_registries existed)
+    // 2. From manifest (catch sources registered before hub_registries existed).
+    // Only Git-variant sources can host a remote hub_index.json; other variants
+    // (Path / Installed / Bundled / Unknown) are skipped by `git_url()` returning None.
     if let Ok(m) = manifest::load_manifest() {
         for entry in m.packages.values() {
-            let normalized = entry.source.trim_end_matches('/').to_string();
-            if !normalized.is_empty() && !normalized.starts_with('/') {
-                repo_urls.insert(normalized);
+            if let Some(url) = entry.source.git_url() {
+                let normalized = url.trim_end_matches('/').to_string();
+                if !normalized.is_empty() {
+                    repo_urls.insert(normalized);
+                }
             }
         }
     }
@@ -513,7 +541,7 @@ fn fetch_remote_indices() -> (HubIndex, Vec<String>) {
         match fetch_one(url) {
             Ok(index) => {
                 for entry in index.packages {
-                    if seen_names.insert(entry.name.clone()) {
+                    if seen_names.insert(entry.entity.name.clone()) {
                         all_packages.push(entry);
                     }
                     // If duplicate name across sources, first wins
@@ -691,25 +719,29 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
     let mut results: Vec<SearchResult> = Vec::new();
 
     for entry in &remote.packages {
-        let is_installed = installed.contains_key(&entry.name);
-        let local_cards = card_counts.get(&entry.name).copied().unwrap_or(0);
+        let pkg_name = &entry.entity.name;
+        let is_installed = installed.contains_key(pkg_name);
+        let local_cards = card_counts.get(pkg_name).copied().unwrap_or(0);
 
-        // Supplement empty docstring from local init.lua when installed
-        let docstring = if entry.docstring.is_empty() && is_installed {
+        // Supplement empty docstring from local init.lua when installed.
+        // Re-parse via `PkgEntity` so the supplementation path stays
+        // consistent with `build_index`.
+        let docstring = if entry.entity.docstring.as_deref().unwrap_or("").is_empty()
+            && is_installed
+        {
             pkg_dir
                 .as_ref()
-                .map(|d| extract_docstring(&d.join(&entry.name).join("init.lua")))
-                .unwrap_or_default()
+                .and_then(|d| PkgEntity::parse_from_init_lua(&d.join(pkg_name).join("init.lua")))
+                .and_then(|e| e.docstring)
         } else {
-            entry.docstring.clone()
+            entry.entity.docstring.clone()
         };
 
-        seen.insert(entry.name.clone());
+        seen.insert(pkg_name.clone());
+        let mut merged_entity = entry.entity.clone();
+        merged_entity.docstring = docstring;
         results.push(SearchResult {
-            name: entry.name.clone(),
-            version: entry.version.clone(),
-            description: entry.description.clone(),
-            category: entry.category.clone(),
+            entity: merged_entity,
             source: entry.source.clone(),
             installed: is_installed,
             card_count: if is_installed && local_cards > entry.card_count {
@@ -718,7 +750,6 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
                 entry.card_count
             },
             best_card: entry.best_card.clone(),
-            docstring,
             docstring_matched: None,
         });
     }
@@ -728,20 +759,28 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
         if seen.contains(name) {
             continue;
         }
-        let docstring = pkg_dir
+        // Pull full `PkgEntity` from local init.lua when available (keeps the
+        // wire shape consistent with remote entries). When the package does
+        // not parse as a `PkgEntity` (missing `M.meta.name`), fall back to
+        // a minimal entity with just the directory name and the manifest
+        // version — the entry still appears in local-only listings, but the
+        // richer projection fields are simply absent.
+        let parsed_entity = pkg_dir
             .as_ref()
-            .map(|d| extract_docstring(&d.join(name).join("init.lua")))
-            .unwrap_or_default();
-        results.push(SearchResult {
+            .and_then(|d| PkgEntity::parse_from_init_lua(&d.join(name).join("init.lua")));
+        let entity = parsed_entity.unwrap_or(PkgEntity {
             name: name.clone(),
-            version: version.clone().unwrap_or_default(),
-            description: String::new(),
-            category: String::new(),
-            source: String::new(),
+            version: version.clone(),
+            description: None,
+            category: None,
+            docstring: None,
+        });
+        results.push(SearchResult {
+            entity,
+            source: PackageSource::Unknown,
             installed: true,
             card_count: card_counts.get(name).copied().unwrap_or(0),
             best_card: None,
-            docstring,
             docstring_matched: None,
         });
     }
@@ -753,151 +792,36 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
 
 fn matches_query(result: &SearchResult, query: &str) -> bool {
     let q = query.to_lowercase();
-    result.name.to_lowercase().contains(&q)
-        || result.description.to_lowercase().contains(&q)
-        || result.category.to_lowercase().contains(&q)
-        || result.docstring.to_lowercase().contains(&q)
+    let pkg = &result.entity;
+    let empty = String::new();
+    pkg.name.to_lowercase().contains(&q)
+        || pkg
+            .description
+            .as_ref()
+            .unwrap_or(&empty)
+            .to_lowercase()
+            .contains(&q)
+        || pkg
+            .category
+            .as_ref()
+            .unwrap_or(&empty)
+            .to_lowercase()
+            .contains(&q)
+        || pkg
+            .docstring
+            .as_ref()
+            .unwrap_or(&empty)
+            .to_lowercase()
+            .contains(&q)
 }
 
 // ─── Index generation (reindex) ───────────────────────────────
-
-/// Extract leading `---` docstring lines from an `init.lua` file.
-///
-/// Collects consecutive lines starting with `---` (Lua doc-comment)
-/// from the beginning of the file.  Stops at the first non-doc line.
-/// Returns a single string with lines joined by newline, stripped of
-/// the `---` prefix.  Used for full-text search in hub_search.
-fn extract_docstring(path: &std::path::Path) -> String {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    let mut lines = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("---") {
-            lines.push(rest.trim().to_string());
-        } else if trimmed.is_empty() {
-            // Allow blank lines within the docstring block
-            continue;
-        } else {
-            break;
-        }
-    }
-    lines.join("\n")
-}
-
-/// Parse `M.meta = { ... }` from an `init.lua` file without Lua VM.
-///
-/// Extracts (name, version, description, category) from the first
-/// `M.meta = { ... }` block found anywhere in the file.
-///
-/// Supports string concatenation: `description = "foo " .. "bar"` is
-/// collected as `"foo bar"`.
-///
-/// **Limitation**: Only supports flat key-value pairs inside `M.meta`.
-/// Nested tables (e.g. `tags = { ... }`) are skipped via brace-depth
-/// tracking. `M.meta` fields are expected to be simple (possibly
-/// concatenated) string literals.
-fn parse_meta_from_init_lua(path: &std::path::Path) -> Option<(String, String, String, String)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let head = content.as_str();
-
-    // Find M.meta = { ... } block (with brace-depth tracking).
-    // Skip occurrences inside Lua line comments (`-- ...`) so that
-    // docstrings mentioning "M.meta" do not hijack the search.
-    let mut search_from = 0;
-    let meta_start = loop {
-        let rel = head[search_from..].find("M.meta")?;
-        let pos = search_from + rel;
-        let line_start = head[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        if !head[line_start..pos].contains("--") {
-            break pos;
-        }
-        search_from = pos + "M.meta".len();
-    };
-    let brace_start = head[meta_start..].find('{')? + meta_start;
-
-    // Track brace depth to handle nested tables correctly
-    let mut depth = 0;
-    let mut brace_end = None;
-    for (i, ch) in head[brace_start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    brace_end = Some(brace_start + i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let brace_end = brace_end?;
-    let block = &head[brace_start + 1..brace_end];
-
-    let extract = |field: &str| -> String {
-        // Match: field = "value" [.. "value" ...] with word-boundary check.
-        // Walk through all occurrences of `field`, skipping matches inside
-        // longer identifiers (e.g. "short_description"). On the first valid
-        // occurrence, collect one or more `"..."` string literals joined by
-        // `..` concatenation operators.
-        let mut search_from = 0;
-        while let Some(rel) = block[search_from..].find(field) {
-            let pos = search_from + rel;
-            let word_boundary = pos == 0 || {
-                let prev = block.as_bytes()[pos - 1];
-                !(prev.is_ascii_alphanumeric() || prev == b'_')
-            };
-            if word_boundary {
-                let after = &block[pos + field.len()..];
-                let mut collected = String::new();
-                let mut cursor = 0usize;
-                let mut found_any = false;
-                loop {
-                    let rest = &after[cursor..];
-                    let Some(q_start_rel) = rest.find('"') else {
-                        break;
-                    };
-                    if found_any {
-                        // Between the prior closing quote and this opening
-                        // quote, only whitespace and a single `..` operator
-                        // are allowed. Anything else (comma, another field,
-                        // etc.) ends the value.
-                        let between = &rest[..q_start_rel];
-                        if between.trim() != ".." {
-                            break;
-                        }
-                    }
-                    let lit_start = cursor + q_start_rel + 1;
-                    let Some(q_end_rel) = after[lit_start..].find('"') else {
-                        break;
-                    };
-                    collected.push_str(&after[lit_start..lit_start + q_end_rel]);
-                    cursor = lit_start + q_end_rel + 1;
-                    found_any = true;
-                }
-                if found_any {
-                    return collected;
-                }
-            }
-            search_from = pos + field.len();
-        }
-        String::new()
-    };
-
-    let name = extract("name");
-    if name.is_empty() {
-        return None;
-    }
-    Some((
-        name,
-        extract("version"),
-        extract("description"),
-        extract("category"),
-    ))
-}
+//
+// The non-Lua-VM parser that used to live here
+// (`parse_meta_from_init_lua` / `extract_docstring`) has moved into
+// `algocline_core::PkgEntity::parse_from_init_lua`, where it is shared
+// with the manifest / lockfile wire format. The parsing tests migrated
+// with it; `hub.rs` now just consumes the typed `PkgEntity` projection.
 
 /// Build a hub index by scanning a packages directory.
 ///
@@ -958,19 +882,19 @@ fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
             continue;
         }
 
-        let (name, version, description, category) = parse_meta_from_init_lua(&init_lua)
-            .unwrap_or_else(|| {
-                (
-                    dir_name.clone(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                )
-            });
+        // Silent-exclude gate: `PkgEntity::parse_from_init_lua` returns `None`
+        // when `M.meta` is absent or `M.meta.name` is empty. Directories that
+        // happen to contain an `init.lua` but aren't algocline packages
+        // (e.g. `alc_shapes/`, a type DSL library) are dropped from the index
+        // rather than falling through with a placeholder name — that would
+        // pollute hub_search.
+        let Some(entity) = PkgEntity::parse_from_init_lua(&init_lua) else {
+            continue;
+        };
 
-        let docstring = extract_docstring(&init_lua);
-
-        // Use manifest source only for local-state mode
+        // Use manifest source only for local-state mode. When the manifest
+        // has no record for this directory, default to `PackageSource::Unknown`
+        // (via `Default`) — hub consumers see it as "source not recorded".
         let source = manifest
             .packages
             .get(&dir_name)
@@ -978,18 +902,14 @@ fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
             .unwrap_or_default();
 
         entries.push(IndexEntry {
-            name,
-            version,
-            description,
-            category,
+            entity,
             source,
             card_count: card_counts.get(&dir_name).copied().unwrap_or(0),
             best_card: None,
-            docstring,
         });
     }
 
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.sort_by(|a, b| a.entity.name.cmp(&b.entity.name));
 
     HubIndex {
         schema_version: "hub_index/v0".into(),
@@ -1057,31 +977,44 @@ impl AppService {
         let installed = installed_packages();
         let is_installed = installed.contains_key(pkg);
 
+        // Resolve package metadata: try remote index first, fall back to
+        // local init.lua. `version` / `description` / `category` are modelled
+        // as `Option<String>` at the `PkgEntity` layer; at this API surface
+        // we flatten `None` to empty string so the wire shape (non-null
+        // JSON string fields) stays unchanged for existing consumers.
         let (version, description, category, source) = {
-            // Try to get from remote index
             let (remote, _) = fetch_remote_indices();
-            if let Some(entry) = remote.packages.iter().find(|e| e.name == pkg) {
+            if let Some(entry) = remote.packages.iter().find(|e| e.entity.name == pkg) {
                 (
-                    entry.version.clone(),
-                    entry.description.clone(),
-                    entry.category.clone(),
+                    entry.entity.version.clone().unwrap_or_default(),
+                    entry.entity.description.clone().unwrap_or_default(),
+                    entry.entity.category.clone().unwrap_or_default(),
                     entry.source.clone(),
                 )
             } else if is_installed {
-                // Fall back to local init.lua parse
+                // Fall back to local init.lua parse via `PkgEntity`. When
+                // the file is not a valid package (no `M.meta.name`), we
+                // degrade gracefully by returning the manifest-recorded
+                // version and empty string fields — mirroring the pre-typed
+                // behaviour.
                 let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
                 let init_lua = home
                     .join(".algocline")
                     .join("packages")
                     .join(pkg)
                     .join("init.lua");
-                let meta = parse_meta_from_init_lua(&init_lua);
+                let entity = PkgEntity::parse_from_init_lua(&init_lua);
                 let manifest_source = manifest::load_manifest()
                     .ok()
                     .and_then(|m| m.packages.get(pkg).map(|e| e.source.clone()))
                     .unwrap_or_default();
-                match meta {
-                    Some((_, v, d, c)) => (v, d, c, manifest_source),
+                match entity {
+                    Some(e) => (
+                        e.version.unwrap_or_default(),
+                        e.description.unwrap_or_default(),
+                        e.category.unwrap_or_default(),
+                        manifest_source,
+                    ),
                     None => (
                         installed.get(pkg).cloned().flatten().unwrap_or_default(),
                         String::new(),
@@ -1194,10 +1127,27 @@ impl AppService {
         // description, category}; otherwise None.
         if let Some(ref ql) = query_lower {
             for r in &mut results {
-                let other_hit = r.name.to_lowercase().contains(ql)
-                    || r.description.to_lowercase().contains(ql)
-                    || r.category.to_lowercase().contains(ql);
-                let doc_hit = r.docstring.to_lowercase().contains(ql);
+                let empty = String::new();
+                let pkg = &r.entity;
+                let other_hit = pkg.name.to_lowercase().contains(ql)
+                    || pkg
+                        .description
+                        .as_ref()
+                        .unwrap_or(&empty)
+                        .to_lowercase()
+                        .contains(ql)
+                    || pkg
+                        .category
+                        .as_ref()
+                        .unwrap_or(&empty)
+                        .to_lowercase()
+                        .contains(ql);
+                let doc_hit = pkg
+                    .docstring
+                    .as_ref()
+                    .unwrap_or(&empty)
+                    .to_lowercase()
+                    .contains(ql);
                 r.docstring_matched = if !other_hit && doc_hit {
                     Some(true)
                 } else {
@@ -1353,195 +1303,10 @@ mod tests {
         assert_ne!(k1, k2);
     }
 
-    #[test]
-    fn parse_meta_flat() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        std::fs::write(
-            &path,
-            r#"
-local M = {}
-M.meta = {
-    name = "my_pkg",
-    version = "1.0.0",
-    description = "A test package",
-    category = "reasoning",
-}
-return M
-"#,
-        )
-        .unwrap();
-
-        let result = parse_meta_from_init_lua(&path).unwrap();
-        assert_eq!(result.0, "my_pkg");
-        assert_eq!(result.1, "1.0.0");
-        assert_eq!(result.2, "A test package");
-        assert_eq!(result.3, "reasoning");
-    }
-
-    #[test]
-    fn parse_meta_nested_table() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        std::fs::write(
-            &path,
-            r#"
-local M = {}
-M.meta = {
-    name = "nested_pkg",
-    tags = { "a", "b" },
-    description = "After nested",
-}
-return M
-"#,
-        )
-        .unwrap();
-
-        let result = parse_meta_from_init_lua(&path).unwrap();
-        assert_eq!(result.0, "nested_pkg");
-        assert_eq!(result.2, "After nested");
-    }
-
-    /// End-to-end sanity check against a real bundled-packages checkout.
-    /// Set `BUNDLED_PACKAGES_DIR` to the repo root and run with
-    /// `cargo test -- --ignored parse_meta_real_bundled`.
-    #[test]
-    #[ignore]
-    fn parse_meta_real_bundled_packages() {
-        let Ok(root) = std::env::var("BUNDLED_PACKAGES_DIR") else {
-            panic!("set BUNDLED_PACKAGES_DIR=/path/to/algocline-bundled-packages");
-        };
-        let root = std::path::Path::new(&root);
-        let mut total = 0usize;
-        let mut failed_parse: Vec<String> = Vec::new();
-        let mut empty_desc: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(root).unwrap().flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.starts_with('_') {
-                continue;
-            }
-            let init_lua = entry.path().join("init.lua");
-            if !init_lua.exists() {
-                continue;
-            }
-            total += 1;
-            match parse_meta_from_init_lua(&init_lua) {
-                Some((_n, _v, desc, _c)) => {
-                    if desc.is_empty() {
-                        empty_desc.push(name);
-                    }
-                }
-                None => failed_parse.push(name),
-            }
-        }
-        assert!(total >= 100, "expected ≥100 pkgs, got {total}");
-        assert!(
-            failed_parse.is_empty(),
-            "parse_meta returned None for {} pkgs: {:?}",
-            failed_parse.len(),
-            failed_parse
-        );
-        assert!(
-            empty_desc.is_empty(),
-            "empty description for {} pkgs: {:?}",
-            empty_desc.len(),
-            empty_desc
-        );
-    }
-
-    #[test]
-    fn parse_meta_concat_string_literals() {
-        // description = "foo " .. "bar " .. "baz" should produce "foo bar baz"
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        std::fs::write(
-            &path,
-            r#"
-local M = {}
-M.meta = {
-    name = "concat_pkg",
-    version = "0.1.0",
-    description = "Adaptive Branching MCTS — Thompson Sampling with dynamic "
-        .. "wider/deeper decisions. GEN node mechanism for principled branching. "
-        .. "Consistently outperforms standard MCTS and repeated sampling.",
-    category = "reasoning",
-}
-return M
-"#,
-        )
-        .unwrap();
-
-        let result = parse_meta_from_init_lua(&path).unwrap();
-        assert_eq!(result.0, "concat_pkg");
-        assert_eq!(result.1, "0.1.0");
-        assert_eq!(
-            result.2,
-            "Adaptive Branching MCTS — Thompson Sampling with dynamic \
-             wider/deeper decisions. GEN node mechanism for principled branching. \
-             Consistently outperforms standard MCTS and repeated sampling."
-        );
-        assert_eq!(result.3, "reasoning");
-    }
-
-    #[test]
-    fn parse_meta_large_leading_docstring() {
-        // M.meta located beyond 2KB (long leading --- docstring) must still parse.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        let mut content = String::new();
-        // Generate ~4KB of leading comments
-        for i in 0..120 {
-            content.push_str(&format!(
-                "--- line {i}: this is a long documentation comment to push M.meta beyond the old 2KB scan window\n"
-            ));
-        }
-        content.push_str(
-            r#"
-local M = {}
-M.meta = {
-    name = "late_meta_pkg",
-    version = "0.2.0",
-    description = "Located past 2KB",
-    category = "test",
-}
-return M
-"#,
-        );
-        std::fs::write(&path, &content).unwrap();
-        assert!(content.len() > 2048, "fixture should exceed 2KB");
-
-        let result = parse_meta_from_init_lua(&path).unwrap();
-        assert_eq!(result.0, "late_meta_pkg");
-        assert_eq!(result.1, "0.2.0");
-        assert_eq!(result.2, "Located past 2KB");
-        assert_eq!(result.3, "test");
-    }
-
-    #[test]
-    fn parse_meta_word_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        std::fs::write(
-            &path,
-            r#"
-local M = {}
-M.meta = {
-    name = "wb_pkg",
-    short_description = "should not match",
-    description = "correct one",
-}
-return M
-"#,
-        )
-        .unwrap();
-
-        let result = parse_meta_from_init_lua(&path).unwrap();
-        assert_eq!(result.0, "wb_pkg");
-        assert_eq!(result.2, "correct one");
-    }
+    // NOTE: The init.lua meta / docstring parsing tests have moved to
+    // `algocline_core::pkg::tests` along with the parser itself. The
+    // `hub.rs` call-path tests now exercise the typed `PkgEntity` via
+    // `build_index` / `merge` only.
 
     #[test]
     fn merge_dedup_uses_hashset() {
@@ -1551,70 +1316,38 @@ return M
             schema_version: "hub_index/v0".into(),
             updated_at: String::new(),
             packages: vec![IndexEntry {
-                name: "remote_only".into(),
-                version: "1.0".into(),
-                description: "from remote".into(),
-                category: "test".into(),
-                source: String::new(),
+                entity: PkgEntity {
+                    name: "remote_only".into(),
+                    version: Some("1.0".into()),
+                    description: Some("from remote".into()),
+                    category: Some("test".into()),
+                    docstring: None,
+                },
+                source: PackageSource::Unknown,
                 card_count: 0,
                 best_card: None,
-                docstring: String::new(),
             }],
         };
 
         let results = merge(&remote);
         // Should include remote_only + any locally installed packages
-        assert!(results.iter().any(|r| r.name == "remote_only"));
-    }
-
-    #[test]
-    fn extract_docstring_collects_leading_comments() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        std::fs::write(
-            &path,
-            r#"--- cascade — Multi-level difficulty routing with confidence gating
---- Based on: "FrugalGPT" (Chen et al., 2023)
---- Uses Thompson Sampling for budget allocation.
-
-local M = {}
-M.meta = { name = "cascade" }
-return M
-"#,
-        )
-        .unwrap();
-
-        let doc = extract_docstring(&path);
-        assert!(doc.contains("FrugalGPT"), "should contain paper ref");
-        assert!(
-            doc.contains("Thompson Sampling"),
-            "should contain technique"
-        );
-        assert!(!doc.contains("local M"), "should not contain code");
-    }
-
-    #[test]
-    fn extract_docstring_empty_when_no_comments() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("init.lua");
-        std::fs::write(&path, "local M = {}\nreturn M\n").unwrap();
-
-        let doc = extract_docstring(&path);
-        assert!(doc.is_empty());
+        assert!(results.iter().any(|r| r.entity.name == "remote_only"));
     }
 
     #[test]
     fn matches_query_searches_docstring() {
         let result = SearchResult {
-            name: "cascade".into(),
-            version: "0.1.0".into(),
-            description: "Multi-level routing".into(),
-            category: "meta".into(),
-            source: String::new(),
+            entity: PkgEntity {
+                name: "cascade".into(),
+                version: Some("0.1.0".into()),
+                description: Some("Multi-level routing".into()),
+                category: Some("meta".into()),
+                docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
+            },
+            source: PackageSource::Unknown,
             installed: true,
             card_count: 0,
             best_card: None,
-            docstring: "Based on FrugalGPT. Uses Thompson Sampling.".into(),
             docstring_matched: None,
         };
 
@@ -1626,22 +1359,28 @@ return M
 
     // ─── SearchResult::to_value_with_optional_docstring ────────────
     //
-    // `docstring` is `skip_serializing` so the default JSON view must
-    // omit it, and it is re-attached only when the projection path says
-    // so. These tests pin the two branches of that helper — they are the
-    // hinge that `verbose="full"` / `fields=["docstring"]` rely on.
+    // `docstring` is not emitted by the default serde path (via the
+    // `serialize_entity_without_docstring` custom serializer) and is
+    // re-attached only when the projection path says so. These tests
+    // pin the two branches of that helper — they are the hinge that
+    // `verbose="full"` / `fields=["docstring"]` rely on.
 
     fn sample_search_result() -> SearchResult {
         SearchResult {
-            name: "cascade".into(),
-            version: "0.1.0".into(),
-            description: "Multi-level routing".into(),
-            category: "reasoning".into(),
-            source: "https://example.com/cascade".into(),
+            entity: PkgEntity {
+                name: "cascade".into(),
+                version: Some("0.1.0".into()),
+                description: Some("Multi-level routing".into()),
+                category: Some("reasoning".into()),
+                docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
+            },
+            source: PackageSource::Git {
+                url: "https://example.com/cascade".into(),
+                rev: None,
+            },
             installed: true,
             card_count: 3,
             best_card: None,
-            docstring: "Based on FrugalGPT. Uses Thompson Sampling.".into(),
             docstring_matched: None,
         }
     }
@@ -1796,10 +1535,27 @@ return M
         if query.is_empty() {
             return None;
         }
-        let other_hit = r.name.to_lowercase().contains(&ql)
-            || r.description.to_lowercase().contains(&ql)
-            || r.category.to_lowercase().contains(&ql);
-        let doc_hit = r.docstring.to_lowercase().contains(&ql);
+        let empty = String::new();
+        let pkg = &r.entity;
+        let other_hit = pkg.name.to_lowercase().contains(&ql)
+            || pkg
+                .description
+                .as_ref()
+                .unwrap_or(&empty)
+                .to_lowercase()
+                .contains(&ql)
+            || pkg
+                .category
+                .as_ref()
+                .unwrap_or(&empty)
+                .to_lowercase()
+                .contains(&ql);
+        let doc_hit = pkg
+            .docstring
+            .as_ref()
+            .unwrap_or(&empty)
+            .to_lowercase()
+            .contains(&ql);
         if !other_hit && doc_hit {
             Some(true)
         } else {

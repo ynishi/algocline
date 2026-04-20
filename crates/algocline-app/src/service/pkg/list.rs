@@ -12,7 +12,7 @@ use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
 use super::super::project::resolve_project_root;
 use super::super::resolve::{is_system_package, packages_dir};
-use super::super::source::{infer_from_legacy_source_string, PackageSource};
+use super::super::source::PackageSource;
 use super::super::AppService;
 
 // ─── Intermediate DTO for pkg_list ───────────────────────────────
@@ -433,21 +433,37 @@ return pkg.meta or {{ name = "{name}" }}"#
                 // Look up manifest to determine source_type at collection time.
                 let (source_type, installed_at, updated_at, install_source) =
                     if let Some(entry) = manifest_data.packages.get(&name) {
-                        let inferred = infer_from_legacy_source_string(&entry.source);
-                        let st = match &inferred {
+                        let st = match &entry.source {
                             PackageSource::Git { .. } => "git".to_string(),
                             PackageSource::Installed => {
-                                // I-6: supplement with original path/URL from installed.json
-                                format!("installed (from: {})", entry.source)
+                                // I-6: supplement with original path/URL from installed.json.
+                                // For typed entries, `Installed` no longer carries the path
+                                // (the new `Path` variant does), so emit just "installed".
+                                "installed".to_string()
                             }
-                            PackageSource::Path { .. } => "path".to_string(),
+                            PackageSource::Path { path } => {
+                                format!("path (from: {path})")
+                            }
                             PackageSource::Bundled { .. } => "bundled".to_string(),
+                            // Legacy pre-typed entry with no recorded source. Surface it
+                            // distinctly so operators know to run `alc_hub_reindex`.
+                            PackageSource::Unknown => "unknown".to_string(),
+                        };
+                        // `install_source` is a legacy-compat string field. Emit the
+                        // human-readable display string so clients that only parse the
+                        // old schema keep working; `Unknown` maps to `""` and is
+                        // suppressed below (we pass `None` to skip insertion).
+                        let display = entry.source.display_string();
+                        let install_source = if display.is_empty() {
+                            None
+                        } else {
+                            Some(display)
                         };
                         (
                             Some(st),
                             Some(entry.installed_at.clone()),
                             Some(entry.updated_at.clone()),
-                            Some(entry.source.clone()),
+                            install_source,
                         )
                     } else {
                         // Not registered in manifest → source_type absent
@@ -650,6 +666,9 @@ fn resolve_project_pkg_info(
             PackageSource::Installed => (ver.clone(), Some("installed".to_string()), None),
             PackageSource::Git { .. } => (ver.clone(), Some("git".to_string()), None),
             PackageSource::Bundled { .. } => (ver.clone(), Some("bundled".to_string()), None),
+            // Legacy lockfile entry with no recorded source. Emit distinctly
+            // so operators know to rerun `alc_hub_reindex` / `alc pkg repair`.
+            PackageSource::Unknown => (ver.clone(), Some("unknown".to_string()), None),
         }
     } else {
         let st = match dep {

@@ -619,7 +619,14 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
 
     let _fake_home = FakeHome::new();
 
-    record_install("ghost_pkg", Some("0.1.0"), "/tmp/ghost_source").unwrap();
+    record_install(
+        "ghost_pkg",
+        Some("0.1.0"),
+        crate::service::source::PackageSource::Path {
+            path: "/tmp/ghost_source".to_string(),
+        },
+    )
+    .unwrap();
     assert!(load_manifest().unwrap().packages.contains_key("ghost_pkg"));
 
     let svc = make_app_service().await;
@@ -681,7 +688,14 @@ async fn pkg_remove_global_scope_preserves_physical_dir() {
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
-    record_install("kept", Some("0.1.0"), "/tmp/kept_source").unwrap();
+    record_install(
+        "kept",
+        Some("0.1.0"),
+        crate::service::source::PackageSource::Path {
+            path: "/tmp/kept_source".to_string(),
+        },
+    )
+    .unwrap();
 
     let svc = make_app_service().await;
     svc.pkg_remove("kept", None, None, Some("global".to_string()))
@@ -708,7 +722,14 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     use crate::service::test_support::FakeHome;
 
     let _fake_home = FakeHome::new();
-    record_install("orphan", None, "/tmp/orphan_source").unwrap();
+    record_install(
+        "orphan",
+        None,
+        crate::service::source::PackageSource::Path {
+            path: "/tmp/orphan_source".to_string(),
+        },
+    )
+    .unwrap();
 
     let svc = make_app_service().await;
     // No project_root supplied — project scope will fail to resolve.

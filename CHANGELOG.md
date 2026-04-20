@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`PackageSource` is now typed at the domain boundary.**
+  `ManifestEntry.source`, `IndexEntry.source`, and friends moved from
+  free-form `String` to the `PackageSource` enum
+  (`Unknown | Installed | Path { path } | Git { url, rev } | Bundled { collection }`).
+  - Reads stay backward-compatible: a serde untagged shim accepts both the
+    new tagged form (`{"type":"git","url":"…"}`) and legacy strings
+    (`"bundled"`, absolute paths, `"github.com/owner/repo"`, `"installed"`)
+    produced by 0.24.x and earlier manifests.
+  - Writes are always typed. Callers no longer round-trip through
+    `infer_from_legacy_source_string` to classify entries.
+  - `pkg_repair` now has an explicit arm for `Unknown` that routes to
+    `Unrepairable { reason: "source unknown (legacy entry; run alc_hub_reindex)" }`
+    instead of silently falling through. `Installed` (legacy "installed"
+    marker with no source path) is also explicitly unrepairable with a
+    dedicated reason.
+  - `pkg_doctor` `installed_missing_suggestion` now matches the typed
+    source and emits richer next-step commands per variant, including a
+    distinct branch for `Unknown` that suggests `alc_hub_reindex` before
+    `alc_pkg_install`.
+- **`PkgEntity` is the canonical projection of a package's `M.meta` block.**
+  Added to `algocline-core`. `PkgEntity::parse_from_init_lua(&source)`
+  returns `Option<PkgEntity>` and is used by the hub index builder to
+  **silently exclude** directories whose `init.lua` has no `M.meta.name`,
+  replacing the previous bespoke regex parser in `service::hub`.
+- **`IndexEntry` / `SearchResult` flatten `PkgEntity`.** The hub index
+  on-wire shape is unchanged — `name`, `version`, `description`,
+  `category` remain top-level — but internally the fields share a single
+  struct. `SearchResult` uses a custom `serialize_with` to keep `docstring`
+  out of the default serialization (preserved from the previous behavior).
+
+### Removed
+
+- `service::hub::parse_meta_from_init_lua` and
+  `service::hub::extract_docstring` (superseded by
+  `PkgEntity::parse_from_init_lua` in `algocline-core`). Their previous
+  inline regex-based parsing has been consolidated into one path.
+
 ## [0.24.1] - 2026-04-19
 
 ### Changed

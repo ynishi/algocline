@@ -9,13 +9,24 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::source::PackageSource;
+
 /// Per-package record in the manifest.
+///
+/// The `source` field is typed ([`PackageSource`]). On-disk compatibility
+/// with pre-typed manifests (where `source` was a bare string such as
+/// `""`, `"bundled"`, a Git URL, or an absolute path) is handled by
+/// `PackageSource`'s serde shim — see
+/// [`super::source::infer_from_legacy_source_string`] for the exact
+/// mapping. Writes always emit the tagged form, so each install / update
+/// migrates the file forward one entry at a time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ManifestEntry {
     /// Package version from `M.meta.version` (if available).
     pub version: Option<String>,
-    /// How the package was installed (git URL, local path, or "bundled").
-    pub source: String,
+    /// How the package was installed (Git URL, local path, bundled, etc.).
+    #[serde(default)]
+    pub source: PackageSource,
     /// ISO 8601 timestamp of first install.
     pub installed_at: String,
     /// ISO 8601 timestamp of last update (same as installed_at if never updated).
@@ -164,7 +175,7 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 pub(crate) fn record_install(
     name: &str,
     version: Option<&str>,
-    source: &str,
+    source: PackageSource,
 ) -> Result<(), String> {
     with_manifest_lock(|| {
         let mut manifest = load_manifest()?;
@@ -177,12 +188,12 @@ pub(crate) fn record_install(
                 if let Some(v) = version {
                     e.version = Some(v.to_string());
                 }
-                e.source = source.to_string();
+                e.source = source.clone();
                 e.updated_at = now.clone();
             })
             .or_insert_with(|| ManifestEntry {
                 version: version.map(String::from),
-                source: source.to_string(),
+                source: source.clone(),
                 installed_at: now.clone(),
                 updated_at: now,
             });
@@ -192,7 +203,7 @@ pub(crate) fn record_install(
 }
 
 /// Record a batch of installs (e.g. collection mode).
-pub(crate) fn record_install_batch(names: &[String], source: &str) -> Result<(), String> {
+pub(crate) fn record_install_batch(names: &[String], source: PackageSource) -> Result<(), String> {
     if names.is_empty() {
         return Ok(());
     }
@@ -205,12 +216,12 @@ pub(crate) fn record_install_batch(names: &[String], source: &str) -> Result<(),
                 .packages
                 .entry(name.clone())
                 .and_modify(|e| {
-                    e.source = source.to_string();
+                    e.source = source.clone();
                     e.updated_at = now.clone();
                 })
                 .or_insert_with(|| ManifestEntry {
                     version: None, // batch installs don't have per-package version info readily
-                    source: source.to_string(),
+                    source: source.clone(),
                     installed_at: now.clone(),
                     updated_at: now.clone(),
                 });
@@ -266,7 +277,10 @@ mod tests {
             "cot".to_string(),
             ManifestEntry {
                 version: Some("0.1.0".to_string()),
-                source: "https://github.com/ynishi/algocline-bundled-packages".to_string(),
+                source: PackageSource::Git {
+                    url: "https://github.com/ynishi/algocline-bundled-packages".to_string(),
+                    rev: None,
+                },
                 installed_at: "2024-01-01T00:00:00Z".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
             },
@@ -277,6 +291,76 @@ mod tests {
 
         let loaded = load_manifest_from(&path).unwrap();
         assert_eq!(loaded, manifest);
+    }
+
+    /// Regression: legacy `installed.json` files written before the
+    /// typed-source migration carried `source` as a bare string (e.g.
+    /// `"https://..."`). The `PackageSource` serde shim must accept that
+    /// shape and coerce it through `infer_from_legacy_source_string` to
+    /// the appropriate tagged variant. If this test ever fails, existing
+    /// user manifests on disk become unparseable — a breaking change
+    /// masquerading as a schema update.
+    #[test]
+    fn manifest_backward_compat_legacy_string_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("installed.json");
+
+        // A hand-written legacy manifest. Four entries covering the
+        // distinct legacy shapes:
+        //   - git URL  → PackageSource::Git
+        //   - bundled  → PackageSource::Bundled
+        //   - abs path → PackageSource::Installed
+        //   - ""       → PackageSource::Unknown
+        let legacy_json = r#"{
+  "packages": {
+    "cot": {
+      "version": "0.1.0",
+      "source": "https://github.com/ynishi/algocline-bundled-packages",
+      "installed_at": "2024-01-01T00:00:00Z",
+      "updated_at": "2024-01-01T00:00:00Z"
+    },
+    "ucb": {
+      "version": null,
+      "source": "bundled",
+      "installed_at": "2024-01-01T00:00:00Z",
+      "updated_at": "2024-01-01T00:00:00Z"
+    },
+    "local_pkg": {
+      "version": null,
+      "source": "/abs/local/pkg",
+      "installed_at": "2024-01-01T00:00:00Z",
+      "updated_at": "2024-01-01T00:00:00Z"
+    },
+    "legacy_empty": {
+      "version": null,
+      "source": "",
+      "installed_at": "2024-01-01T00:00:00Z",
+      "updated_at": "2024-01-01T00:00:00Z"
+    }
+  }
+}"#;
+        std::fs::write(&path, legacy_json).unwrap();
+
+        let loaded = load_manifest_from(&path).expect("must parse legacy manifest");
+        assert_eq!(
+            loaded.packages.get("cot").unwrap().source,
+            PackageSource::Git {
+                url: "https://github.com/ynishi/algocline-bundled-packages".to_string(),
+                rev: None,
+            },
+        );
+        assert_eq!(
+            loaded.packages.get("ucb").unwrap().source,
+            PackageSource::Bundled { collection: None },
+        );
+        assert_eq!(
+            loaded.packages.get("local_pkg").unwrap().source,
+            PackageSource::Installed,
+        );
+        assert_eq!(
+            loaded.packages.get("legacy_empty").unwrap().source,
+            PackageSource::Unknown,
+        );
     }
 
     #[test]
@@ -295,13 +379,13 @@ mod tests {
         // displayed by `pkg_list`. Guarantee: `None` preserves; `Some` overwrites.
         let _fake_home = super::super::test_support::FakeHome::new();
 
+        let git_src = || PackageSource::Git {
+            url: "https://github.com/ynishi/algocline-bundled-packages".to_string(),
+            rev: None,
+        };
+
         // Seed: insert an entry with a known version.
-        record_install(
-            "cot",
-            Some("0.1.0"),
-            "https://github.com/ynishi/algocline-bundled-packages",
-        )
-        .unwrap();
+        record_install("cot", Some("0.1.0"), git_src()).unwrap();
         let before = load_manifest().unwrap();
         assert_eq!(
             before.packages.get("cot").unwrap().version.as_deref(),
@@ -309,12 +393,7 @@ mod tests {
         );
 
         // Re-install with `None` — should keep "0.1.0", not clobber.
-        record_install(
-            "cot",
-            None,
-            "https://github.com/ynishi/algocline-bundled-packages",
-        )
-        .unwrap();
+        record_install("cot", None, git_src()).unwrap();
         let after_none = load_manifest().unwrap();
         assert_eq!(
             after_none.packages.get("cot").unwrap().version.as_deref(),
@@ -323,12 +402,7 @@ mod tests {
         );
 
         // Re-install with `Some("0.2.0")` — should overwrite.
-        record_install(
-            "cot",
-            Some("0.2.0"),
-            "https://github.com/ynishi/algocline-bundled-packages",
-        )
-        .unwrap();
+        record_install("cot", Some("0.2.0"), git_src()).unwrap();
         let after_some = load_manifest().unwrap();
         assert_eq!(
             after_some.packages.get("cot").unwrap().version.as_deref(),

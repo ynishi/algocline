@@ -219,22 +219,18 @@ impl AppService {
             return RepairOutcome::Skipped;
         }
 
-        // Source classification: only `Installed` (local copy) and `Git` can be
+        // Source classification: only `Path` (local copy) and `Git` can be
         // re-fetched. Bundled is conceptually re-installable via `alc_init`;
-        // Path sources are not tracked in the manifest for repair.
+        // `Installed` is a legacy marker that carries no re-fetch info (the
+        // typed successor is `Path { path }`). `Unknown` is the pre-typed
+        // "source unrecorded" landing site and is structurally unrepairable.
         //
-        // `infer_from_legacy_source_string` classifies **syntactically** (shape,
-        // not filesystem existence), so a manifest entry whose local source
-        // directory has since been deleted still maps to `Installed`. That case
-        // is a structural dead-end (nothing to copy from), so we route it to
-        // `Unrepairable` in the pre-check below — matching the policy used for
-        // Bundled / Path sources: states detectable before attempting install
-        // belong in `unrepairable`, not `failed`. `failed` is reserved for
-        // runtime errors during an actual install attempt.
-        let inferred = super::super::source::infer_from_legacy_source_string(&entry.source);
-        let install_source = match inferred {
-            PackageSource::Installed => InstallSource::LocalPath(PathBuf::from(&entry.source)),
-            PackageSource::Git { url, .. } => InstallSource::GitUrl(normalize_git_url(&url)),
+        // States detectable before attempting install belong in `unrepairable`,
+        // not `failed`. `failed` is reserved for runtime errors during an
+        // actual install attempt.
+        let install_source = match &entry.source {
+            PackageSource::Path { path } => InstallSource::LocalPath(PathBuf::from(path)),
+            PackageSource::Git { url, .. } => InstallSource::GitUrl(normalize_git_url(url)),
             PackageSource::Bundled { .. } => {
                 return RepairOutcome::Unrepairable {
                     kind: "installed_missing",
@@ -244,18 +240,29 @@ impl AppService {
                         .to_string(),
                 };
             }
-            // Defensive: `infer_from_legacy_source_string` never constructs
-            // `PackageSource::Path` today (it only emits Bundled / Installed /
-            // Git). We keep this arm as an exhaustive-match guard so future
-            // additions to the inference function don't silently break the
-            // repair path — the explicit Unrepairable is a safer default than
-            // `_ => unreachable!()`, which would panic if the guarantee ever
-            // erodes.
-            PackageSource::Path { path } => {
+            PackageSource::Installed => {
+                // Legacy marker: pre-typed manifest that recorded a local install
+                // as `source: "installed"` / absolute path (see
+                // `infer_from_legacy_source_string`). The actual source path is
+                // lost, so we cannot re-fetch automatically.
                 return RepairOutcome::Unrepairable {
                     kind: "installed_missing",
-                    reason: format!("path source ({path}) — not tracked in manifest for repair"),
-                    suggestion: "edit alc.toml or alc.local.toml directly".to_string(),
+                    reason: "legacy 'installed' marker carries no source path".to_string(),
+                    suggestion: "alc_pkg_install <path-or-url> to re-record source, \
+                                 then alc_pkg_repair"
+                        .to_string(),
+                };
+            }
+            PackageSource::Unknown => {
+                // Pre-typed manifest entry with `source: ""` (never recorded).
+                // Routed here per the Phase 3 spec: `Unknown` must land in
+                // `Unrepairable`, not be silently coerced.
+                return RepairOutcome::Unrepairable {
+                    kind: "installed_missing",
+                    reason: "source unknown (legacy entry; run alc_hub_reindex)".to_string(),
+                    suggestion: "alc_hub_reindex to rebuild the index, or \
+                                 alc_pkg_install <path-or-url> to re-record source"
+                        .to_string(),
                 };
             }
         };
@@ -302,7 +309,10 @@ impl AppService {
             .await
         {
             Ok(_) => RepairOutcome::Repaired {
-                source: entry.source.clone(),
+                // Emit a human-readable source string (legacy schema). The
+                // typed source is already persisted back into the manifest
+                // by the install path — this field is just display.
+                source: entry.source.display_string(),
             },
             Err(e) => RepairOutcome::Failed { reason: e },
         }

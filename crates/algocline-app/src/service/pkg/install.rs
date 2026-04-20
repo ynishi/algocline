@@ -151,7 +151,14 @@ impl AppService {
                 .map_err(|e| format!("Failed to copy package: {e}"))?;
 
             // Record in manifest (best-effort; install itself already succeeded)
-            let _ = manifest::record_install(&name, None, &url);
+            let _ = manifest::record_install(
+                &name,
+                None,
+                super::super::source::PackageSource::Git {
+                    url: url.clone(),
+                    rev: None,
+                },
+            );
             hub::register_source(&url, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
@@ -252,7 +259,13 @@ impl AppService {
             }
 
             // Record in manifest (best-effort)
-            let _ = manifest::record_install_batch(&installed, &url);
+            let _ = manifest::record_install_batch(
+                &installed,
+                super::super::source::PackageSource::Git {
+                    url: url.clone(),
+                    rev: None,
+                },
+            );
             hub::register_source(&url, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
@@ -325,9 +338,22 @@ impl AppService {
                 }
             }
 
-            // Record in manifest (best-effort)
+            // Record in manifest (best-effort). Local-path installs are
+            // recorded as `Path { path }` so the original source location
+            // is preserved in the typed form — this keeps `pkg_repair` able
+            // to re-copy from the same source, and `pkg_list` can show
+            // where the bytes came from. (Pre-typed manifests stored the
+            // path as a bare string; `infer_from_legacy_source_string`
+            // coerced it to `Installed`, which lost the path — the typed
+            // form fixes that regression by carrying `path` explicitly.)
             let source_str_local = source.display().to_string();
-            let _ = manifest::record_install(&name, None, &source_str_local);
+            let _ = manifest::record_install(
+                &name,
+                None,
+                super::super::source::PackageSource::Path {
+                    path: source_str_local.clone(),
+                },
+            );
             hub::register_source(&source_str_local, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
@@ -411,10 +437,17 @@ impl AppService {
                 }
             }
 
-            // Record in manifest (best-effort)
+            // Record in manifest (best-effort). Batch local-path installs
+            // use `Path { path }` for the same reason as single-install
+            // (preserve the source path in the typed form).
             let source_str = source.display().to_string();
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
-            let _ = manifest::record_install_batch(&all_names, &source_str);
+            let _ = manifest::record_install_batch(
+                &all_names,
+                super::super::source::PackageSource::Path {
+                    path: source_str.clone(),
+                },
+            );
             hub::register_source(&source_str, "pkg_install");
 
             // Update alc.toml + alc.lock for newly installed packages

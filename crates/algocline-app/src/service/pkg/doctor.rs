@@ -30,7 +30,7 @@ use tracing::warn;
 use super::super::manifest::{load_manifest, Manifest, ManifestEntry};
 use super::super::project::resolve_project_root;
 use super::super::resolve::packages_dir;
-use super::super::source::{infer_from_legacy_source_string, PackageSource};
+use super::super::source::PackageSource;
 use super::super::AppService;
 use super::repair::{
     collect_path_missing, collect_unattached_dangling_symlinks, symlink_dangling_suggestion,
@@ -79,25 +79,37 @@ impl DoctorBuckets {
 }
 
 /// Suggestion string for `installed_missing`, branched by source kind to
-/// match `pkg_repair`'s 3-way routing (repair.rs:238-260):
+/// mirror `pkg_repair`'s routing:
 ///
-/// - `Git` / `Installed` (local path) → `alc_pkg_install(...)`
+/// - `Git` → `alc_pkg_install(<url>)`
+/// - `Path` → `alc_pkg_install(<path>)` (local re-copy)
 /// - `Bundled` → `alc_init` (bundled packages cannot be reinstalled via
 ///   `alc_pkg_install`; they ship inside the algocline binary)
-/// - `Path` → edit `alc.toml` / `alc.local.toml` directly (path sources
-///   aren't tracked for reinstall; today `infer_from_legacy_source_string`
-///   never emits this, but the arm is kept as a defensive guard that
-///   mirrors `repair.rs`)
-fn installed_missing_suggestion(name: &str, entry_source: &str) -> String {
-    match infer_from_legacy_source_string(entry_source) {
+/// - `Installed` → legacy marker with no re-fetch info (user must re-record
+///   source via `alc_pkg_install`)
+/// - `Unknown` → reindex + reinstall (pre-typed manifest with no source)
+fn installed_missing_suggestion(name: &str, entry_source: &PackageSource) -> String {
+    match entry_source {
         PackageSource::Bundled { .. } => {
             "alc_init (reinstalls bundled packages from the algocline binary)".to_string()
         }
         PackageSource::Path { path } => {
-            format!("edit [packages.{name}] in alc.toml or alc.local.toml (path source: {path})")
+            format!("alc_pkg_install({path:?}) to reinstall {name:?} from local path")
         }
-        PackageSource::Installed | PackageSource::Git { .. } => {
-            format!("alc_pkg_install({name:?}) to reinstall from source ({entry_source})")
+        PackageSource::Git { url, .. } => {
+            format!("alc_pkg_install({url:?}) to reinstall {name:?} from Git")
+        }
+        PackageSource::Installed => {
+            format!(
+                "alc_pkg_install <path-or-url> to re-record source for {name:?} \
+                 (legacy 'installed' marker carries no path)"
+            )
+        }
+        PackageSource::Unknown => {
+            format!(
+                "alc_hub_reindex then alc_pkg_install <path-or-url> for {name:?} \
+                 (source unknown — legacy entry)"
+            )
         }
     }
 }
@@ -285,10 +297,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Build a minimal `ManifestEntry` with a `PackageSource::Path`.
+    /// Takes a legacy path string so the existing tests keep reading
+    /// naturally; the arg is wrapped into the typed `Path` variant.
     fn mk_entry(source: &str) -> ManifestEntry {
         ManifestEntry {
             version: None,
-            source: source.to_string(),
+            source: PackageSource::Path {
+                path: source.to_string(),
+            },
             installed_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -419,7 +436,11 @@ mod tests {
 
     #[test]
     fn installed_missing_suggestion_shape() {
-        let s = installed_missing_suggestion("ucb", "github.com/foo/bar");
+        let git = PackageSource::Git {
+            url: "github.com/foo/bar".to_string(),
+            rev: None,
+        };
+        let s = installed_missing_suggestion("ucb", &git);
         assert!(s.contains("alc_pkg_install"), "{s}");
         assert!(s.contains("\"ucb\""), "{s}");
         assert!(s.contains("github.com/foo/bar"), "{s}");
@@ -428,10 +449,11 @@ mod tests {
     /// A bundled-source entry must route the user to `alc_init`, NOT
     /// `alc_pkg_install("bundled")` (which would fail — bundled packages
     /// ship inside the algocline binary and are restored via `alc_init`).
-    /// Mirrors `repair.rs:238-260`.
+    /// Mirrors `repair.rs` bundled arm.
     #[test]
     fn installed_missing_suggestion_routes_bundled_to_alc_init() {
-        let s = installed_missing_suggestion("ucb", "bundled");
+        let bundled = PackageSource::Bundled { collection: None };
+        let s = installed_missing_suggestion("ucb", &bundled);
         assert!(s.contains("alc_init"), "bundled must suggest alc_init: {s}");
         assert!(
             !s.contains("alc_pkg_install"),
@@ -439,13 +461,31 @@ mod tests {
         );
     }
 
-    /// A bare local absolute path classifies as `Installed` (syntactic), so
-    /// the suggestion falls through to `alc_pkg_install` with that path as
-    /// the source — matching repair's LocalPath installer route.
+    /// A `Path` source entry emits a suggestion pointing at
+    /// `alc_pkg_install(<path>)` — matching repair's LocalPath installer
+    /// route. (Under the typed migration, `alc_pkg_install` now records
+    /// local installs as `Path { path }` rather than the legacy
+    /// `Installed` coercion, so this is the canonical local-reinstall
+    /// suggestion.)
     #[test]
     fn installed_missing_suggestion_routes_absolute_path_to_pkg_install() {
-        let s = installed_missing_suggestion("local_pkg", "/abs/path/to/src");
+        let local = PackageSource::Path {
+            path: "/abs/path/to/src".to_string(),
+        };
+        let s = installed_missing_suggestion("local_pkg", &local);
         assert!(s.contains("alc_pkg_install"), "{s}");
         assert!(s.contains("/abs/path/to/src"), "{s}");
+    }
+
+    /// `Unknown` source (legacy pre-typed entry with no recorded source)
+    /// must route the user to `alc_hub_reindex` before attempting a
+    /// reinstall — mirrors the `Unrepairable` routing in `repair.rs`.
+    #[test]
+    fn installed_missing_suggestion_routes_unknown_to_reindex() {
+        let s = installed_missing_suggestion("legacy_pkg", &PackageSource::Unknown);
+        assert!(
+            s.contains("alc_hub_reindex"),
+            "Unknown must suggest alc_hub_reindex: {s}"
+        );
     }
 }

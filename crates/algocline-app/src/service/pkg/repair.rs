@@ -319,21 +319,15 @@ impl AppService {
     }
 }
 
-/// Apply the same URL normalization `classify_install_url` uses (prefix
-/// `https://` to bare domain-style URLs) without re-checking whether the
-/// string refers to a local directory. Repair has already established the
-/// source is Git; re-classifying via the directory heuristic would be both
-/// redundant and racy.
+/// Apply the same URL scheme normalization `classify_install_url` uses
+/// without re-checking whether the string refers to a local directory.
+/// Repair has already established the source is Git (typed
+/// `PackageSource::Git`); re-classifying via the directory heuristic would
+/// be both redundant and racy. Delegates to the shared
+/// [`super::install::prefix_git_scheme_if_missing`] helper so that install
+/// and repair stay in lockstep on scheme handling.
 fn normalize_git_url(url: &str) -> String {
-    if url.starts_with("http://")
-        || url.starts_with("https://")
-        || url.starts_with("file://")
-        || url.starts_with("git@")
-    {
-        url.to_string()
-    } else {
-        format!("https://{url}")
-    }
+    super::install::prefix_git_scheme_if_missing(url)
 }
 
 /// Scan `pkg_dir` for dangling symlinks whose name is *not* present in the

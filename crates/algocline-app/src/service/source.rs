@@ -381,6 +381,78 @@ mod tests {
         assert_eq!(PackageSource::default(), PackageSource::Unknown);
     }
 
+    // ─── serde: malformed-form rejection (no silent fallback) ─────
+    //
+    // `PackageSourceRepr` is `#[serde(untagged)]` with two arms:
+    //   1. Typed   — tagged object `{"type": "...", ...}`
+    //   2. Legacy  — bare string
+    //
+    // A worry with `untagged` is that a malformed tagged object (e.g. an
+    // unknown `type` tag, or a tagged shape missing a required field) could
+    // silently fall through to the Legacy arm and be coerced into a
+    // `Git { url: "" }` or `Unknown`. These tests pin the actual behavior:
+    // object-shaped inputs cannot match the Legacy `String` arm, so serde
+    // correctly surfaces an error when the Typed arm fails. Regression guard
+    // for the code review MEDIUM finding (malformed tagged → no silent coerce).
+
+    #[test]
+    fn deserialize_unknown_type_tag_is_error() {
+        // Unknown variant name in the `type` field. The Typed arm fails
+        // (no matching variant); the Legacy arm fails (input is an object,
+        // not a string). Net result: serde error, not a silent `Unknown`.
+        let result: Result<PackageSource, _> =
+            serde_json::from_str(r#"{"type":"unknown_variant","path":"/x"}"#);
+        assert!(
+            result.is_err(),
+            "malformed tagged form must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_git_missing_url_is_error() {
+        // `type: "git"` without the required `url` field. Typed arm fails
+        // (missing field); Legacy arm fails (object ≠ string). Must error.
+        let result: Result<PackageSource, _> = serde_json::from_str(r#"{"type":"git"}"#);
+        assert!(
+            result.is_err(),
+            "git variant with missing url must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_path_missing_path_is_error() {
+        // `type: "path"` without the required `path` field.
+        let result: Result<PackageSource, _> = serde_json::from_str(r#"{"type":"path"}"#);
+        assert!(
+            result.is_err(),
+            "path variant with missing path must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_object_without_type_key_is_error() {
+        // Arbitrary object without a `type` discriminator at all. Neither
+        // arm accepts it.
+        let result: Result<PackageSource, _> = serde_json::from_str(r#"{"foo":"bar"}"#);
+        assert!(
+            result.is_err(),
+            "object without type tag must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_non_string_non_object_scalar_is_error() {
+        // Numbers, booleans, null are all invalid shapes. Neither arm
+        // accepts them (Legacy requires String, Typed requires object).
+        for json in ["null", "42", "true", "[]"] {
+            let result: Result<PackageSource, _> = serde_json::from_str(json);
+            assert!(
+                result.is_err(),
+                "scalar/array {json} must be rejected, got {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn git_url_accessor_returns_url_only_for_git() {
         assert_eq!(

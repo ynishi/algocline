@@ -45,7 +45,18 @@ fn classify_install_url(url: &str) -> InstallSource {
         return InstallSource::LocalPath(local_path.to_path_buf());
     }
 
-    let git_url = if url.starts_with("http://")
+    InstallSource::GitUrl(prefix_git_scheme_if_missing(url))
+}
+
+/// Prepend `https://` to a Git remote-style string that lacks a scheme.
+///
+/// Accepts `http://`, `https://`, `file://`, and `git@` prefixes as-is; any
+/// other input (e.g. bare `github.com/a/b`) is prefixed with `https://`.
+/// Shared between `classify_install_url` (install path) and
+/// `pkg::repair::normalize_git_url` (repair path) — both need the same
+/// normalization when routing an already-decided Git URL through `git clone`.
+pub(super) fn prefix_git_scheme_if_missing(url: &str) -> String {
+    if url.starts_with("http://")
         || url.starts_with("https://")
         || url.starts_with("file://")
         || url.starts_with("git@")
@@ -53,8 +64,7 @@ fn classify_install_url(url: &str) -> InstallSource {
         url.to_string()
     } else {
         format!("https://{url}")
-    };
-    InstallSource::GitUrl(git_url)
+    }
 }
 
 impl AppService {

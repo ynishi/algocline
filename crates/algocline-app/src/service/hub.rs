@@ -1030,11 +1030,11 @@ impl AppService {
         };
 
         // Cards for this package (single call, reused for stats)
-        let card_rows = card::list(Some(pkg)).unwrap_or_default();
+        let card_rows = self.card_store.list(Some(pkg)).unwrap_or_default();
         let cards_json = card::summaries_to_json(&card_rows);
 
         // Aliases for this package
-        let aliases_json = match card::alias_list(Some(pkg)) {
+        let aliases_json = match self.card_store.alias_list(Some(pkg)) {
             Ok(rows) => card::aliases_to_json(&rows),
             Err(_) => serde_json::json!([]),
         };

@@ -102,7 +102,10 @@ mod tests {
             dir.hub_registries_json(),
             PathBuf::from("/tmp/alc-root/hub_registries.json")
         );
-        assert_eq!(dir.config_toml(), PathBuf::from("/tmp/alc-root/config.toml"));
+        assert_eq!(
+            dir.config_toml(),
+            PathBuf::from("/tmp/alc-root/config.toml")
+        );
         assert_eq!(dir.init_lua(), PathBuf::from("/tmp/alc-root/init.lua"));
     }
 

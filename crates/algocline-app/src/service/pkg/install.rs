@@ -228,8 +228,7 @@ impl AppService {
             for pkg_name in installed.iter().chain(skipped.iter()) {
                 let cards_subdir = staging.path().join(pkg_name).join("cards");
                 if cards_subdir.is_dir() {
-                    let imported =
-                        crate::AppService::import_pkg_bundled_cards(pkg_name, &cards_subdir);
+                    let imported = self.import_pkg_bundled_cards(pkg_name, &cards_subdir);
                     cards_installed.extend(imported);
                 }
             }
@@ -441,8 +440,7 @@ impl AppService {
             for pkg_name in installed.iter().chain(updated.iter()) {
                 let cards_subdir = source.join(pkg_name).join("cards");
                 if cards_subdir.is_dir() {
-                    let imported =
-                        crate::AppService::import_pkg_bundled_cards(pkg_name, &cards_subdir);
+                    let imported = self.import_pkg_bundled_cards(pkg_name, &cards_subdir);
                     cards_installed.extend(imported);
                 }
             }

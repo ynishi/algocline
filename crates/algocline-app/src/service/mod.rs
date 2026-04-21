@@ -33,7 +33,7 @@ mod tests;
 use std::path::Path;
 use std::sync::Arc;
 
-use algocline_engine::{Executor, SessionRegistry, VariantPkg};
+use algocline_engine::{Executor, FileCardStore, JsonFileStore, SessionRegistry, VariantPkg};
 
 pub use algocline_core::{EngineApi, TokenUsage};
 pub use config::{AppConfig, LogDirSource};
@@ -67,6 +67,15 @@ pub struct AppService {
     log_config: AppConfig,
     /// Package search paths in priority order (first = highest).
     search_paths: Vec<resolve::SearchPath>,
+    /// Persistent KV store backing `alc.state.*`.
+    ///
+    /// Rooted at `log_config.app_dir().state_dir()` and resolved once at
+    /// construction; `Arc`-wrapped so per-session clones are cheap.
+    state_store: Arc<JsonFileStore>,
+    /// Card store backing `alc.card.*`.
+    ///
+    /// Rooted at `log_config.app_dir().cards_dir()`, same `Arc` pattern.
+    card_store: Arc<FileCardStore>,
     /// session_id → strategy name for eval sessions (cleared on completion).
     eval_sessions: Arc<EvalSessions>,
     /// session_id → strategy name for log/stats tracking (cleared on session completion).
@@ -83,11 +92,16 @@ impl AppService {
         // TTL = 3 hours. Complex strategies may run 30–60 min; 3h covers
         // legitimate paused sessions while eventually reclaiming abandoned ones.
         registry.spawn_gc_task(std::time::Duration::from_secs(10800));
+        let app_dir = log_config.app_dir();
+        let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
+        let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
         Self {
             executor,
             registry,
             log_config,
             search_paths,
+            state_store,
+            card_store,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }

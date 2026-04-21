@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use algocline_core::QueryId;
 use algocline_engine::{FeedResult, VariantPkg};
 
@@ -160,9 +162,18 @@ impl AppService {
         extra_lib_paths: Vec<std::path::PathBuf>,
         variant_pkgs: Vec<VariantPkg>,
     ) -> Result<String, String> {
+        let scenarios_dir = self.log_config.app_dir().scenarios_dir();
         let session = self
             .executor
-            .start_session(code, ctx, extra_lib_paths, variant_pkgs)
+            .start_session(
+                code,
+                ctx,
+                extra_lib_paths,
+                variant_pkgs,
+                Arc::clone(&self.state_store),
+                Arc::clone(&self.card_store),
+                scenarios_dir,
+            )
             .await?;
         let (session_id, result) = self
             .registry

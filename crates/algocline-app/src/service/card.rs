@@ -27,13 +27,13 @@ pub struct SinkBackfillParams {
 impl AppService {
     /// List Cards as JSON summaries, optionally filtered by package.
     pub fn card_list(&self, pkg: Option<&str>) -> Result<String, String> {
-        let rows = card::list(pkg)?;
+        let rows = self.card_store.list(pkg)?;
         Ok(card::summaries_to_json(&rows).to_string())
     }
 
     /// Fetch full Card body (Tier 1) by id.
     pub fn card_get(&self, card_id: &str) -> Result<String, String> {
-        match card::get(card_id)? {
+        match self.card_store.get(card_id)? {
             Some(v) => Ok(v.to_string()),
             None => Err(format!("card '{card_id}' not found")),
         }
@@ -63,13 +63,13 @@ impl AppService {
             limit,
             offset,
         };
-        let rows = card::find(q)?;
+        let rows = self.card_store.find(q)?;
         Ok(card::summaries_to_json(&rows).to_string())
     }
 
     /// Resolve alias then fetch the full Card.
     pub fn card_get_by_alias(&self, name: &str) -> Result<String, String> {
-        match card::get_by_alias(name)? {
+        match self.card_store.get_by_alias(name)? {
             Some(v) => Ok(v.to_string()),
             None => Err(format!("alias '{name}' not found")),
         }
@@ -77,7 +77,7 @@ impl AppService {
 
     /// List aliases, optionally filtered by package.
     pub fn card_alias_list(&self, pkg: Option<&str>) -> Result<String, String> {
-        let rows = card::alias_list(pkg)?;
+        let rows = self.card_store.alias_list(pkg)?;
         Ok(card::aliases_to_json(&rows).to_string())
     }
 
@@ -89,7 +89,7 @@ impl AppService {
         pkg: Option<&str>,
         note: Option<&str>,
     ) -> Result<String, String> {
-        let alias = card::alias_set(name, card_id, pkg, note)?;
+        let alias = self.card_store.alias_set(name, card_id, pkg, note)?;
         let arr = card::aliases_to_json(std::slice::from_ref(&alias));
         let single = arr
             .as_array()
@@ -100,7 +100,7 @@ impl AppService {
 
     /// Additive-only annotation — new top-level keys only.
     pub fn card_append(&self, card_id: &str, fields: serde_json::Value) -> Result<String, String> {
-        let merged = card::append(card_id, fields)?;
+        let merged = self.card_store.append(card_id, fields)?;
         Ok(merged.to_string())
     }
 
@@ -190,7 +190,8 @@ impl AppService {
                 continue;
             }
 
-            let (imported, skipped) = card::import_from_dir(&path, &pkg_name)?;
+            let (imported, skipped) =
+                card::import_from_dir_with_store(&*self.card_store, &path, &pkg_name)?;
             if !imported.is_empty() || !skipped.is_empty() {
                 packages.push(pkg_name);
             }
@@ -219,8 +220,8 @@ impl AppService {
     ///
     /// Called by `pkg_install` when a package contains a `cards/` dir.
     /// Returns imported card_ids (may be empty if all were skipped).
-    pub(crate) fn import_pkg_bundled_cards(pkg_name: &str, cards_dir: &Path) -> Vec<String> {
-        match card::import_from_dir(cards_dir, pkg_name) {
+    pub(crate) fn import_pkg_bundled_cards(&self, pkg_name: &str, cards_dir: &Path) -> Vec<String> {
+        match card::import_from_dir_with_store(&*self.card_store, cards_dir, pkg_name) {
             Ok((imported, _)) => imported,
             Err(e) => {
                 tracing::warn!("Failed to import bundled cards for '{pkg_name}': {e}");
@@ -246,7 +247,7 @@ impl AppService {
             limit,
             where_: where_parsed,
         };
-        let rows = card::read_samples(card_id, q)?;
+        let rows = self.card_store.read_samples(card_id, q)?;
         Ok(serde_json::Value::Array(rows).to_string())
     }
 
@@ -270,7 +271,7 @@ impl AppService {
             include_stats: include_stats.unwrap_or(true),
             relation_filter,
         };
-        match card::lineage(q)? {
+        match self.card_store.lineage(q)? {
             Some(res) => Ok(card::lineage_to_json(&res).to_string()),
             None => Err(format!("card '{card_id}' not found")),
         }
@@ -282,7 +283,9 @@ impl AppService {
     /// [`card::SinkBackfillReport`] serialized as JSON for MCP
     /// transport.
     pub fn card_sink_backfill(&self, params: SinkBackfillParams) -> Result<String, String> {
-        let report = card::card_sink_backfill(&params.sink, params.dry_run)?;
+        let report = self
+            .card_store
+            .card_sink_backfill(&params.sink, params.dry_run)?;
         serde_json::to_string(&report)
             .map_err(|e| format!("failed to serialize SinkBackfillReport: {e}"))
     }

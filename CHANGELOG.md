@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `alc init` bundled-packages tag bumped `v0.17.0` → `v0.18.0`
+  - `evalframe` stays at `v0.3.0`
+  - v0.18.0 ships `hub_index.json` reindexed against the new typed
+    `PackageSource` wire shape (see next entry). Older v0.17.0 still loads
+    via the read-compat shim.
+
 ### Changed — `source` field wire format
 
 The `source` field in `alc_hub_info` / `alc_hub_search` responses and in the

@@ -1,3 +1,4 @@
+mod app_dir;
 mod budget;
 mod custom;
 pub mod domain;
@@ -11,6 +12,7 @@ mod spec;
 mod state;
 mod tokens;
 
+pub use app_dir::AppDir;
 pub use budget::{Budget, BudgetHandle};
 pub use custom::{CustomMetrics, CustomMetricsHandle};
 pub use engine_api::{EngineApi, QueryResponse};

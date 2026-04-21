@@ -29,6 +29,7 @@ pub(super) async fn make_app_service_with_search_paths(
             log_dir_source: LogDirSource::None,
             log_enabled: false,
             prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+            ..Default::default()
         },
         search_paths,
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

@@ -160,6 +160,7 @@ fn log_list_from_dir() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
 
     // Use log_list directly via the free function path
@@ -233,6 +234,7 @@ fn write_transcript_log_creates_meta_file() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
 
     let metrics = algocline_core::ExecutionMetrics::new();
@@ -285,6 +287,7 @@ fn write_transcript_log_strategy_none() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
 
     let metrics = algocline_core::ExecutionMetrics::new();
@@ -364,6 +367,7 @@ fn transcript_config_default_enabled() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     assert!(config.log_enabled);
 }
@@ -376,6 +380,7 @@ fn write_transcript_log_disabled_is_noop() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: false,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let metrics = algocline_core::ExecutionMetrics::new();
     let observer = metrics.create_observer();
@@ -406,6 +411,7 @@ fn write_transcript_log_empty_transcript_is_noop() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     // Metrics with no observer events → empty transcript
     let metrics = algocline_core::ExecutionMetrics::new();
@@ -457,6 +463,7 @@ fn write_transcript_log_truncates_long_prompt() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let metrics = algocline_core::ExecutionMetrics::new();
     let observer = metrics.create_observer();
@@ -533,6 +540,7 @@ fn log_list_prefers_meta_file() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -573,6 +581,7 @@ fn stats_empty_dir() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -627,6 +636,7 @@ fn stats_aggregates_by_strategy() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -685,6 +695,7 @@ fn stats_legacy_logs_without_strategy() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -716,6 +727,7 @@ fn info_returns_valid_json_with_expected_keys() {
         log_dir_source: LogDirSource::Home,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -751,6 +763,7 @@ fn info_stderr_only_when_no_log_dir() {
         log_dir_source: LogDirSource::None,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -784,6 +797,7 @@ fn require_log_dir_returns_path_when_present() {
         log_dir_source: LogDirSource::EnvVar,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -809,6 +823,7 @@ fn require_log_dir_returns_err_when_none() {
         log_dir_source: LogDirSource::None,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -835,6 +850,7 @@ fn write_transcript_log_noop_when_log_dir_none() {
         log_dir_source: LogDirSource::None,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let metrics = algocline_core::ExecutionMetrics::new();
     let observer = metrics.create_observer();
@@ -872,6 +888,7 @@ fn log_list_returns_empty_when_no_log_dir() {
         log_dir_source: LogDirSource::None,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -899,6 +916,7 @@ fn stats_returns_zero_when_no_log_dir() {
         log_dir_source: LogDirSource::None,
         log_enabled: true,
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
     };
     let app = AppService {
         executor: Arc::new(
@@ -935,6 +953,7 @@ async fn make_status_test_app() -> AppService {
             log_dir_source: LogDirSource::None,
             log_enabled: false,
             prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+            ..Default::default()
         },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

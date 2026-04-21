@@ -1,4 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use algocline_core::AppDir;
 
 // ─── Application Config ─────────────────────────────────────────
 
@@ -38,6 +41,12 @@ impl std::fmt::Display for LogDirSource {
 /// 4. Current working directory (sandbox fallback)
 /// 5. `None` — stderr-only mode (no file logging)
 ///
+/// Application root directory resolution:
+/// 1. `ALC_HOME` env var (explicit override — same pattern as `CARGO_HOME` /
+///    `RUSTUP_HOME`).
+/// 2. `~/.algocline/` — home-based default.
+/// 3. `./.algocline/` — fallback when `HOME` is not available (unusual).
+///
 /// - `ALC_LOG_LEVEL`: `full` (default) or `off`.
 /// - `ALC_PROMPT_PREVIEW_CHARS`: char count for `alc_status(pending_filter="preview")`
 ///   prompt truncation. Falls back to
@@ -52,6 +61,15 @@ pub struct AppConfig {
     pub log_enabled: bool,
     /// Char count for `alc_status` prompt_preview truncation.
     pub prompt_preview_chars: usize,
+    /// Resolved application root directory (`$ALC_HOME` or `~/.algocline/`).
+    ///
+    /// Wrapped in [`Arc`] so it can be shared across Service-layer
+    /// subsystems without cloning the underlying [`PathBuf`]. Exposed via
+    /// [`AppConfig::app_dir`] for read access; the `pub(super)` visibility
+    /// is only so that in-crate tests can use `..Default::default()` on
+    /// the struct literal (Service-layer production code MUST use the
+    /// accessor).
+    pub(super) app_dir: Arc<AppDir>,
 }
 
 impl AppConfig {
@@ -68,12 +86,45 @@ impl AppConfig {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS);
 
+        let app_dir = Arc::new(Self::resolve_app_dir());
+
         Self {
             log_dir,
             log_dir_source,
             log_enabled,
             prompt_preview_chars,
+            app_dir,
         }
+    }
+
+    /// Shared handle to the resolved application root directory.
+    pub fn app_dir(&self) -> Arc<AppDir> {
+        Arc::clone(&self.app_dir)
+    }
+
+    /// Override the application root directory — intended for tests that
+    /// need to redirect every `~/.algocline/` access to a `tempdir`.
+    pub fn with_app_dir(mut self, root: PathBuf) -> Self {
+        self.app_dir = Arc::new(AppDir::new(root));
+        self
+    }
+
+    /// Resolve the application root directory.
+    ///
+    /// 1. `ALC_HOME` env var (explicit override — highest priority).
+    /// 2. `~/.algocline/` — home-based default.
+    /// 3. `./.algocline/` — fallback when `HOME` is unavailable; matches
+    ///    the sandbox-friendly fallback used for log directories.
+    fn resolve_app_dir() -> AppDir {
+        if let Ok(path) = std::env::var("ALC_HOME") {
+            if !path.is_empty() {
+                return AppDir::new(PathBuf::from(path));
+            }
+        }
+        let root = dirs::home_dir()
+            .map(|h| h.join(".algocline"))
+            .unwrap_or_else(|| PathBuf::from(".algocline"));
+        AppDir::new(root)
     }
 
     /// Resolve log directory with fallback chain.
@@ -136,5 +187,55 @@ impl AppConfig {
     /// Try to create the directory. Returns true if it exists and is writable.
     fn ensure_dir(path: &Path) -> bool {
         std::fs::create_dir_all(path).is_ok() && path.is_dir()
+    }
+}
+
+impl Default for AppConfig {
+    /// Sensible default for tests and ad-hoc construction.
+    ///
+    /// File logging is disabled (`log_dir: None`, `log_enabled: false`) and
+    /// `app_dir` points to a relative `./.algocline/` so accidental use
+    /// outside of a tempdir does not clobber the real user directory.
+    /// Production code MUST go through [`AppConfig::from_env`].
+    fn default() -> Self {
+        Self {
+            log_dir: None,
+            log_dir_source: LogDirSource::None,
+            log_enabled: false,
+            prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+            app_dir: Arc::new(AppDir::new(PathBuf::from(".algocline"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_dir_env_overrides_home() {
+        let prev = std::env::var("ALC_HOME").ok();
+        std::env::set_var("ALC_HOME", "/tmp/alc-home-override");
+        let dir = AppConfig::resolve_app_dir();
+        assert_eq!(dir.root(), Path::new("/tmp/alc-home-override"));
+        match prev {
+            Some(v) => std::env::set_var("ALC_HOME", v),
+            None => std::env::remove_var("ALC_HOME"),
+        }
+    }
+
+    #[test]
+    fn with_app_dir_overrides_resolved() {
+        let cfg = AppConfig::default().with_app_dir(PathBuf::from("/tmp/alt"));
+        assert_eq!(cfg.app_dir().root(), Path::new("/tmp/alt"));
+    }
+
+    #[test]
+    fn app_dir_handle_is_shared() {
+        let cfg = AppConfig::default();
+        let a = cfg.app_dir();
+        let b = cfg.app_dir();
+        assert_eq!(Arc::strong_count(&a), 3); // cfg + a + b
+        assert_eq!(a.root(), b.root());
     }
 }

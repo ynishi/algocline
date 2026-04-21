@@ -770,10 +770,11 @@ do
             -- 2a. Try require (packages on package.path)
             load_ok, loaded = pcall(require, scenario)
 
-            -- 2b. Try ~/.algocline/scenarios/{name}.lua
+            -- 2b. Try {alc._dirs.scenarios}/{name}.lua (service layer injects
+            --     the absolute path so Lua never reads HOME directly).
             if not load_ok then
-                local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
-                local path = home .. "/.algocline/scenarios/" .. scenario .. ".lua"
+                local scenarios_dir = (alc and alc._dirs and alc._dirs.scenarios) or ""
+                local path = scenarios_dir .. "/" .. scenario .. ".lua"
                 local f = io.open(path, "r")
                 if f then
                     local code = f:read("*a")

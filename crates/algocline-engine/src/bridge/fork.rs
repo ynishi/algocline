@@ -5,6 +5,7 @@
 //! llm_tx, achieving true LLM parallelism.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use algocline_core::{BudgetHandle, ExecutionMetrics, QueryId};
 use mlua::prelude::*;
@@ -13,8 +14,10 @@ use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use mlua_pkg::Registry;
 
 use super::{register, BridgeConfig, PRELUDE};
+use crate::card::FileCardStore;
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 use crate::resolver_factory::make_resolver;
+use crate::state::JsonFileStore;
 use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
 
 /// Event from a child VM during fork execution.
@@ -48,6 +51,7 @@ struct ForkQuery {
 ///   -- results = { {strategy="cot", result=...}, {strategy="reflect", result=...}, ... }
 ///
 ///   local results = alc.fork({"cot", "reflect"}, ctx, { on_error = "skip" })
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn register_fork(
     lua: &Lua,
     alc_table: &LuaTable,
@@ -55,6 +59,9 @@ pub(crate) fn register_fork(
     budget: BudgetHandle,
     lib_paths: Vec<PathBuf>,
     variant_pkgs: Vec<VariantPkg>,
+    state_store: Arc<JsonFileStore>,
+    card_store: Arc<FileCardStore>,
+    scenarios_dir: PathBuf,
 ) -> LuaResult<()> {
     let fork_fn = lua.create_async_function(
         move |lua, (strategies, ctx, opts): (LuaTable, LuaTable, Option<LuaTable>)| {
@@ -62,6 +69,9 @@ pub(crate) fn register_fork(
             let bh = budget.clone();
             let paths = lib_paths.clone();
             let variants = variant_pkgs.clone();
+            let state_store = Arc::clone(&state_store);
+            let card_store = Arc::clone(&card_store);
+            let scenarios_dir = scenarios_dir.clone();
             async move {
                 let n = strategies.len()? as usize;
                 if n == 0 {
@@ -147,6 +157,9 @@ pub(crate) fn register_fork(
                         progress: child_metrics.progress_handle(),
                         lib_paths: vec![],    // Children don't need to fork further
                         variant_pkgs: vec![], // Children don't need to fork further
+                        state_store: Arc::clone(&state_store),
+                        card_store: Arc::clone(&card_store),
+                        scenarios_dir: scenarios_dir.clone(),
                     };
 
                     child_isle

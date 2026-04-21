@@ -18,6 +18,7 @@
 //!   when the session completes or is abandoned.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use algocline_core::{Budget, ExecutionMetrics, ExecutionSpec};
 use mlua::LuaSerdeExt;
@@ -25,9 +26,11 @@ use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
 use mlua_pkg::Registry;
 
 use crate::bridge;
+use crate::card::FileCardStore;
 use crate::llm_bridge::LlmRequest;
 use crate::resolver_factory::make_resolver;
 use crate::session::Session;
+use crate::state::JsonFileStore;
 use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
 
 /// Layer 1: Prelude combinators (map, reduce, vote, filter).
@@ -76,7 +79,7 @@ impl Executor {
     /// like reading package metadata.
     ///
     /// Uses the shared VM. `extra_lib_paths` must be empty — use
-    /// [`eval_simple_with_paths`] when project-local paths are needed.
+    /// [`Self::eval_simple_with_paths`] when project-local paths are needed.
     pub async fn eval_simple(&self, code: String) -> Result<serde_json::Value, String> {
         self.eval_simple_with_paths(code, vec![], vec![]).await
     }
@@ -88,6 +91,11 @@ impl Executor {
     /// shared VM (cheap). When either is non-empty, spawns a dedicated VM so
     /// the extra resolvers are active (slightly more expensive, but `pkg_list`
     /// is the only caller and it is low-frequency).
+    ///
+    /// The fast path does not register `alc.*` bridge primitives, so the
+    /// `state_store` / `card_store` / `scenarios_dir` handles that
+    /// [`Self::start_session`] requires are not threaded through here —
+    /// callers that need them go through `start_session`.
     pub async fn eval_simple_with_paths(
         &self,
         code: String,
@@ -156,12 +164,21 @@ impl Executor {
     /// packages take precedence over the global package directory.
     /// `variant_pkgs` come from `alc.local.toml` and override both layers
     /// (registered at the highest priority).
+    ///
+    /// `state_store` / `card_store` / `scenarios_dir` are resolved by the
+    /// service layer (typically from `AppConfig.app_dir()`) so the engine
+    /// crate never touches HOME. They flow through [`bridge::BridgeConfig`]
+    /// to back `alc.state.*` / `alc.card.*` / `alc._dirs.scenarios`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session(
         &self,
         code: String,
         ctx: serde_json::Value,
         extra_lib_paths: Vec<PathBuf>,
         variant_pkgs: Vec<VariantPkg>,
+        state_store: Arc<JsonFileStore>,
+        card_store: Arc<FileCardStore>,
+        scenarios_dir: PathBuf,
     ) -> Result<Session, String> {
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
@@ -187,6 +204,9 @@ impl Executor {
             progress: metrics.progress_handle(),
             lib_paths: effective.clone(), // fork child VMs inherit project paths
             variant_pkgs: variant_pkgs.clone(), // fork child VMs inherit variant overrides
+            state_store,
+            card_store,
+            scenarios_dir,
         };
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();

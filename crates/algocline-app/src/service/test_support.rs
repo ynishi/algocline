@@ -13,6 +13,12 @@ pub(super) async fn make_app_service() -> AppService {
 }
 
 /// Build a minimal `AppService` with custom search paths.
+///
+/// Goes through `AppService::new` so that the `state_store` / `card_store`
+/// fields added in Subtask 2a are populated from `log_config.app_dir()`.
+/// Subtask 2c formalises tempdir-backed `app_dir` for test isolation; until
+/// then `AppConfig::default()` points at a relative `./.algocline/`, which is
+/// enough for call-sites that never exercise `alc.state.*` / `alc.card.*`.
 pub(super) async fn make_app_service_with_search_paths(
     search_paths: Vec<SearchPath>,
 ) -> AppService {
@@ -21,20 +27,14 @@ pub(super) async fn make_app_service_with_search_paths(
             .await
             .expect("executor"),
     );
-    AppService {
-        executor,
-        registry: Arc::new(algocline_engine::SessionRegistry::new()),
-        log_config: AppConfig {
-            log_dir: None,
-            log_dir_source: LogDirSource::None,
-            log_enabled: false,
-            prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
-            ..Default::default()
-        },
-        search_paths,
-        eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    }
+    let log_config = AppConfig {
+        log_dir: None,
+        log_dir_source: LogDirSource::None,
+        log_enabled: false,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
+    };
+    AppService::new(executor, log_config, search_paths)
 }
 
 // Serialize tests that manipulate HOME to prevent races.

@@ -542,6 +542,11 @@ fn log_list_prefers_meta_file() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -551,6 +556,12 @@ fn log_list_prefers_meta_file() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -583,6 +594,11 @@ fn stats_empty_dir() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -592,6 +608,12 @@ fn stats_empty_dir() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -638,6 +660,11 @@ fn stats_aggregates_by_strategy() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -647,6 +674,12 @@ fn stats_aggregates_by_strategy() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -697,6 +730,11 @@ fn stats_legacy_logs_without_strategy() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -706,6 +744,12 @@ fn stats_legacy_logs_without_strategy() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -729,6 +773,11 @@ fn info_returns_valid_json_with_expected_keys() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -738,6 +787,12 @@ fn info_returns_valid_json_with_expected_keys() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -765,6 +820,11 @@ fn info_stderr_only_when_no_log_dir() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -774,6 +834,12 @@ fn info_stderr_only_when_no_log_dir() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -799,6 +865,11 @@ fn require_log_dir_returns_path_when_present() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -808,6 +879,12 @@ fn require_log_dir_returns_path_when_present() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -825,6 +902,11 @@ fn require_log_dir_returns_err_when_none() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -834,6 +916,12 @@ fn require_log_dir_returns_err_when_none() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -890,6 +978,11 @@ fn log_list_returns_empty_when_no_log_dir() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -899,6 +992,12 @@ fn log_list_returns_empty_when_no_log_dir() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -918,6 +1017,11 @@ fn stats_returns_zero_when_no_log_dir() {
         prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
         ..Default::default()
     };
+    // NOTE: Build `AppService` as a struct literal (not `AppService::new`)
+    // so the sync `#[test]` path does not require a Tokio runtime context —
+    // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
+    // when no reactor is running.  Subtask 2c swaps the relative
+    // `.algocline/` paths for a tempdir.
     let app = AppService {
         executor: Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -927,6 +1031,12 @@ fn stats_returns_zero_when_no_log_dir() {
         ),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         log_config: config,
+        state_store: Arc::new(algocline_engine::JsonFileStore::new(
+            std::path::PathBuf::from("."),
+        )),
+        card_store: Arc::new(algocline_engine::FileCardStore::new(
+            std::path::PathBuf::from("."),
+        )),
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -945,20 +1055,15 @@ fn stats_returns_zero_when_no_log_dir() {
 // on the Err path even without any Paused session in place.
 
 async fn make_status_test_app() -> AppService {
-    AppService {
-        executor: Arc::new(algocline_engine::Executor::new(vec![]).await.unwrap()),
-        registry: Arc::new(algocline_engine::SessionRegistry::new()),
-        log_config: AppConfig {
-            log_dir: None,
-            log_dir_source: LogDirSource::None,
-            log_enabled: false,
-            prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
-            ..Default::default()
-        },
-        eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        search_paths: vec![],
-    }
+    let executor = Arc::new(algocline_engine::Executor::new(vec![]).await.unwrap());
+    let log_config = AppConfig {
+        log_dir: None,
+        log_dir_source: LogDirSource::None,
+        log_enabled: false,
+        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
+        ..Default::default()
+    };
+    AppService::new(executor, log_config, vec![])
 }
 
 #[tokio::test]

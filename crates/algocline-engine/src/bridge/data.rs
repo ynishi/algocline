@@ -1,9 +1,12 @@
+use std::path::Path;
+use std::sync::Arc;
+
 use algocline_core::CustomMetricsHandle;
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 
-use crate::card;
-use crate::state;
+use crate::card::{self, FileCardStore};
+use crate::state::{JsonFileStore, StateStore};
 
 pub(super) fn register_json(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     let encode = lua.create_function(|lua, value: LuaValue| {
@@ -50,14 +53,22 @@ pub(super) fn register_log(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
 ///   alc.state.incr("counter")              -- 1 (init 0 + delta 1)
 ///   alc.state.incr("counter", 5)           -- 6
 ///   alc.state.incr("counter", 10, 100)     -- 16 (default ignored)
-pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> LuaResult<()> {
+pub(super) fn register_state(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    ns: String,
+    state_store: Arc<JsonFileStore>,
+) -> LuaResult<()> {
     let state_table = lua.create_table()?;
 
     // alc.state.get(key, default?)
     let ns_get = ns.clone();
+    let store_get = Arc::clone(&state_store);
     let get =
         lua.create_function(
-            move |lua, (key, default): (String, Option<LuaValue>)| match state::get(&ns_get, &key) {
+            move |lua, (key, default): (String, Option<LuaValue>)| match store_get
+                .get(&ns_get, &key)
+            {
                 Ok(Some(v)) => lua.to_value(&v),
                 Ok(None) => Ok(default.unwrap_or(LuaValue::Nil)),
                 Err(e) => Err(LuaError::external(e)),
@@ -66,42 +77,53 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
 
     // alc.state.set(key, value)
     let ns_set = ns.clone();
+    let store_set = Arc::clone(&state_store);
     let set = lua.create_function(move |lua, (key, value): (String, LuaValue)| {
         let json: serde_json::Value = lua.from_value(value)?;
-        state::set(&ns_set, &key, json).map_err(LuaError::external)
+        store_set
+            .set(&ns_set, &key, json)
+            .map_err(LuaError::external)
     })?;
 
     // alc.state.keys()
     let ns_keys = ns.clone();
+    let store_keys = Arc::clone(&state_store);
     let keys = lua.create_function(move |lua, ()| {
-        let k = state::keys(&ns_keys).map_err(LuaError::external)?;
+        let k = store_keys.keys(&ns_keys).map_err(LuaError::external)?;
         lua.to_value(&k)
     })?;
 
     // alc.state.delete(key)
     let ns_del = ns.clone();
+    let store_del = Arc::clone(&state_store);
     let delete = lua.create_function(move |_, key: String| {
-        state::delete(&ns_del, &key).map_err(LuaError::external)
+        store_del.delete(&ns_del, &key).map_err(LuaError::external)
     })?;
 
     // alc.state.has(key) -> bool
     let ns_has = ns.clone();
+    let store_has = Arc::clone(&state_store);
     let has = lua.create_function(move |_, key: String| {
-        state::has(&ns_has, &key).map_err(LuaError::external)
+        store_has.has(&ns_has, &key).map_err(LuaError::external)
     })?;
 
     // alc.state.set_nx(key, value) -> bool
     let ns_snx = ns.clone();
+    let store_snx = Arc::clone(&state_store);
     let set_nx = lua.create_function(move |lua, (key, value): (String, LuaValue)| {
         let json: serde_json::Value = lua.from_value(value)?;
-        state::set_nx(&ns_snx, &key, json).map_err(LuaError::external)
+        store_snx
+            .set_nx(&ns_snx, &key, json)
+            .map_err(LuaError::external)
     })?;
 
     // alc.state.incr(key, delta?, default?) -> number
     let ns_incr = ns;
+    let store_incr = Arc::clone(&state_store);
     let incr = lua.create_function(
         move |_, (key, delta, default): (String, Option<f64>, Option<f64>)| {
-            state::incr(&ns_incr, &key, delta.unwrap_or(1.0), default.unwrap_or(0.0))
+            store_incr
+                .incr(&ns_incr, &key, delta.unwrap_or(1.0), default.unwrap_or(0.0))
                 .map_err(LuaError::external)
         },
     )?;
@@ -115,6 +137,26 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
     state_table.set("incr", incr)?;
 
     alc_table.set("state", state_table)?;
+    Ok(())
+}
+
+/// Register `alc._dirs` — absolute paths that Lua prelude helpers
+/// (`alc.eval` scenario resolution, etc.) need from the service layer.
+///
+/// Values are plain strings so Lua can concat/`io.open` them without
+/// additional userdata binding.
+pub(super) fn register_dirs(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    state_dir: &Path,
+    cards_dir: &Path,
+    scenarios_dir: &Path,
+) -> LuaResult<()> {
+    let dirs = lua.create_table()?;
+    dirs.set("state", state_dir.to_string_lossy().into_owned())?;
+    dirs.set("cards", cards_dir.to_string_lossy().into_owned())?;
+    dirs.set("scenarios", scenarios_dir.to_string_lossy().into_owned())?;
+    alc_table.set("_dirs", dirs)?;
     Ok(())
 }
 
@@ -142,13 +184,18 @@ pub(super) fn register_state(lua: &Lua, alc_table: &LuaTable, ns: String) -> Lua
 ///   alc.card.get_by_alias("best_on_gsm8k")  -- resolve alias → full Card
 ///   alc.card.write_samples("cot_...", { {case="c0", passed=true}, ... })  -- write-once
 ///   alc.card.read_samples("cot_...", { offset = 0, limit = 100 })
-pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+pub(super) fn register_card(
+    lua: &Lua,
+    alc_table: &LuaTable,
+    card_store: Arc<FileCardStore>,
+) -> LuaResult<()> {
     let card_table = lua.create_table()?;
 
     // alc.card.create(table) -> { card_id, path }
-    let create = lua.create_function(|lua, input: LuaValue| {
+    let store_create = Arc::clone(&card_store);
+    let create = lua.create_function(move |lua, input: LuaValue| {
         let json: serde_json::Value = lua.from_value(input)?;
-        let (card_id, path) = card::create(json).map_err(LuaError::external)?;
+        let (card_id, path) = store_create.create(json).map_err(LuaError::external)?;
         let ret = lua.create_table()?;
         ret.set("card_id", card_id)?;
         ret.set("path", path.to_string_lossy().to_string())?;
@@ -156,40 +203,49 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     })?;
 
     // alc.card.get(card_id) -> table | nil
-    let get = lua.create_function(|lua, card_id: String| match card::get(&card_id) {
+    let store_get = Arc::clone(&card_store);
+    let get = lua.create_function(move |lua, card_id: String| match store_get.get(&card_id) {
         Ok(Some(v)) => lua.to_value(&v),
         Ok(None) => Ok(LuaValue::Nil),
         Err(e) => Err(LuaError::external(e)),
     })?;
 
     // alc.card.list(filter?) -> [summary]
-    let list = lua.create_function(|lua, filter: Option<LuaTable>| {
+    let store_list = Arc::clone(&card_store);
+    let list = lua.create_function(move |lua, filter: Option<LuaTable>| {
         let pkg = match filter {
             Some(t) => t.get::<Option<String>>("pkg")?,
             None => None,
         };
-        let rows = card::list(pkg.as_deref()).map_err(LuaError::external)?;
+        let rows = store_list
+            .list(pkg.as_deref())
+            .map_err(LuaError::external)?;
         lua.to_value(&card::summaries_to_json(&rows))
     })?;
 
     // alc.card.append(card_id, fields) -> merged_card
-    let append = lua.create_function(|lua, (card_id, fields): (String, LuaValue)| {
+    let store_append = Arc::clone(&card_store);
+    let append = lua.create_function(move |lua, (card_id, fields): (String, LuaValue)| {
         let json: serde_json::Value = lua.from_value(fields)?;
-        let merged = card::append(&card_id, json).map_err(LuaError::external)?;
+        let merged = store_append
+            .append(&card_id, json)
+            .map_err(LuaError::external)?;
         lua.to_value(&merged)
     })?;
 
     // alc.card.get_by_alias(name) -> table | nil
-    let get_by_alias = lua.create_function(|lua, name: String| {
-        match card::get_by_alias(&name).map_err(LuaError::external)? {
+    let store_gba = Arc::clone(&card_store);
+    let get_by_alias = lua.create_function(move |lua, name: String| {
+        match store_gba.get_by_alias(&name).map_err(LuaError::external)? {
             Some(v) => lua.to_value(&v),
             None => Ok(LuaValue::Nil),
         }
     })?;
 
     // alc.card.alias_set(name, card_id, opts?) -> alias
+    let store_aset = Arc::clone(&card_store);
     let alias_set = lua.create_function(
-        |lua, (name, card_id, opts): (String, String, Option<LuaTable>)| {
+        move |lua, (name, card_id, opts): (String, String, Option<LuaTable>)| {
             let (pkg, note) = match opts {
                 Some(t) => (
                     t.get::<Option<String>>("pkg")?,
@@ -197,7 +253,8 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
                 ),
                 None => (None, None),
             };
-            let a = card::alias_set(&name, &card_id, pkg.as_deref(), note.as_deref())
+            let a = store_aset
+                .alias_set(&name, &card_id, pkg.as_deref(), note.as_deref())
                 .map_err(LuaError::external)?;
             let arr = card::aliases_to_json(&[a]);
             let first = match arr {
@@ -209,12 +266,15 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     )?;
 
     // alc.card.alias_list(filter?) -> [alias]
-    let alias_list = lua.create_function(|lua, filter: Option<LuaTable>| {
+    let store_alist = Arc::clone(&card_store);
+    let alias_list = lua.create_function(move |lua, filter: Option<LuaTable>| {
         let pkg = match filter {
             Some(t) => t.get::<Option<String>>("pkg")?,
             None => None,
         };
-        let rows = card::alias_list(pkg.as_deref()).map_err(LuaError::external)?;
+        let rows = store_alist
+            .alias_list(pkg.as_deref())
+            .map_err(LuaError::external)?;
         lua.to_value(&card::aliases_to_json(&rows))
     })?;
 
@@ -222,7 +282,8 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     //
     // Accepts a Prisma-style `where` DSL + dotted-path `order_by`.
     // See `card::parse_where` / `card::parse_order_by` for semantics.
-    let find = lua.create_function(|lua, query: Option<LuaTable>| {
+    let store_find = Arc::clone(&card_store);
+    let find = lua.create_function(move |lua, query: Option<LuaTable>| {
         let q = match query {
             Some(t) => {
                 let pkg = t.get::<Option<String>>("pkg")?;
@@ -254,35 +315,40 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
             }
             None => card::FindQuery::default(),
         };
-        let rows = card::find(q).map_err(LuaError::external)?;
+        let rows = store_find.find(q).map_err(LuaError::external)?;
         lua.to_value(&card::summaries_to_json(&rows))
     })?;
 
     // alc.card.write_samples(card_id, samples) -> { path, count }
-    let write_samples = lua.create_function(|lua, (card_id, samples): (String, LuaValue)| {
-        let json: serde_json::Value = lua.from_value(samples)?;
-        let arr = match json {
-            serde_json::Value::Array(a) => a,
-            _ => {
-                return Err(LuaError::external(
-                    "alc.card.write_samples: samples must be an array",
-                ))
-            }
-        };
-        let count = arr.len();
-        let path = card::write_samples(&card_id, arr).map_err(LuaError::external)?;
-        let ret = lua.create_table()?;
-        ret.set("path", path.to_string_lossy().to_string())?;
-        ret.set("count", count)?;
-        Ok(ret)
-    })?;
+    let store_ws = Arc::clone(&card_store);
+    let write_samples =
+        lua.create_function(move |lua, (card_id, samples): (String, LuaValue)| {
+            let json: serde_json::Value = lua.from_value(samples)?;
+            let arr = match json {
+                serde_json::Value::Array(a) => a,
+                _ => {
+                    return Err(LuaError::external(
+                        "alc.card.write_samples: samples must be an array",
+                    ))
+                }
+            };
+            let count = arr.len();
+            let path = store_ws
+                .write_samples(&card_id, arr)
+                .map_err(LuaError::external)?;
+            let ret = lua.create_table()?;
+            ret.set("path", path.to_string_lossy().to_string())?;
+            ret.set("count", count)?;
+            Ok(ret)
+        })?;
 
     // alc.card.read_samples(card_id, opts?) -> [sample]
     //
     // opts.where applies the Prisma-style DSL to each row; offset/limit
     // page the post-filter stream. See `card::parse_where`.
+    let store_rs = Arc::clone(&card_store);
     let read_samples =
-        lua.create_function(|lua, (card_id, opts): (String, Option<LuaTable>)| {
+        lua.create_function(move |lua, (card_id, opts): (String, Option<LuaTable>)| {
             let (offset, limit, where_parsed) = match opts {
                 Some(t) => {
                     let offset = t.get::<Option<usize>>("offset")?.unwrap_or(0);
@@ -303,7 +369,9 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
                 limit,
                 where_: where_parsed,
             };
-            let rows = card::read_samples(&card_id, q).map_err(LuaError::external)?;
+            let rows = store_rs
+                .read_samples(&card_id, q)
+                .map_err(LuaError::external)?;
             lua.to_value(&serde_json::Value::Array(rows))
         })?;
 
@@ -311,10 +379,12 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     //
     // Backfill one subscriber with all cards from the primary store.
     // Drift-safe: existing cards on the subscriber are skipped.
-    let sink_backfill = lua.create_function(|lua, params: LuaTable| {
+    let store_sb = Arc::clone(&card_store);
+    let sink_backfill = lua.create_function(move |lua, params: LuaTable| {
         let sink: String = params.get("sink")?;
         let dry_run: Option<bool> = params.get("dry_run")?;
-        let report = card::card_sink_backfill(&sink, dry_run.unwrap_or(false))
+        let report = store_sb
+            .card_sink_backfill(&sink, dry_run.unwrap_or(false))
             .map_err(LuaError::external)?;
         lua.to_value(&report)
     })?;
@@ -323,7 +393,8 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     //
     // Walks `metadata.prior_card_id` ancestors (default), descendants, or
     // both. Relation filter and depth cap are both optional.
-    let lineage = lua.create_function(|lua, query: LuaTable| {
+    let store_lin = Arc::clone(&card_store);
+    let lineage = lua.create_function(move |lua, query: LuaTable| {
         let card_id: String = query.get("card_id")?;
         let direction_str: Option<String> = query.get("direction")?;
         let direction = match direction_str.as_deref() {
@@ -344,7 +415,7 @@ pub(super) fn register_card(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
             include_stats: include_stats.unwrap_or(true),
             relation_filter,
         };
-        match card::lineage(q).map_err(LuaError::external)? {
+        match store_lin.lineage(q).map_err(LuaError::external)? {
             Some(res) => lua.to_value(&card::lineage_to_json(&res)),
             None => Ok(LuaValue::Nil),
         }
@@ -406,21 +477,14 @@ mod tests {
     use super::*;
     use algocline_core::ExecutionMetrics;
 
-    fn test_config() -> crate::bridge::BridgeConfig {
+    /// Build a fresh [`BridgeConfig`] plus its owning state/card
+    /// tempdir stores. Returned together so callers can re-use the
+    /// store handles (e.g. for assertions / cleanup) after register.
+    fn test_config_with(ns: &str) -> crate::bridge::BridgeConfig {
         let metrics = ExecutionMetrics::new();
-        crate::bridge::BridgeConfig {
-            llm_tx: None,
-            ns: "default".into(),
-            custom_metrics: metrics.custom_metrics_handle(),
-            budget: metrics.budget_handle(),
-            progress: metrics.progress_handle(),
-            lib_paths: vec![],
-            variant_pkgs: vec![],
-        }
-    }
-
-    fn test_config_with_ns(ns: &str) -> crate::bridge::BridgeConfig {
-        let metrics = ExecutionMetrics::new();
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
         crate::bridge::BridgeConfig {
             llm_tx: None,
             ns: ns.into(),
@@ -429,7 +493,18 @@ mod tests {
             progress: metrics.progress_handle(),
             lib_paths: vec![],
             variant_pkgs: vec![],
+            state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+            card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+            scenarios_dir: root.join("scenarios"),
         }
+    }
+
+    fn test_config() -> crate::bridge::BridgeConfig {
+        test_config_with("default")
+    }
+
+    fn test_config_with_ns(ns: &str) -> crate::bridge::BridgeConfig {
+        test_config_with(ns)
     }
 
     #[test]
@@ -473,9 +548,9 @@ mod tests {
 
     #[test]
     fn state_get_set() {
+        // Each BridgeConfig comes with its own tempdir-rooted
+        // JsonFileStore so no cross-test cleanup is needed.
         let ns = "_test_bridge_state";
-        // Clean up
-        let _ = crate::state::delete(ns, "x");
 
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
@@ -500,16 +575,11 @@ mod tests {
             .eval()
             .unwrap();
         assert!(result.is_nil());
-
-        // Clean up
-        let _ = crate::state::delete(ns, "x");
     }
 
     #[test]
     fn state_has_set_nx_incr() {
         let ns = "_test_bridge_state_t1";
-        let _ = crate::state::delete(ns, "k");
-        let _ = crate::state::delete(ns, "counter");
 
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
@@ -558,10 +628,6 @@ mod tests {
             .eval()
             .unwrap();
         assert!((v - 16.0).abs() < f64::EPSILON);
-
-        // Clean up
-        let _ = crate::state::delete(ns, "k");
-        let _ = crate::state::delete(ns, "counter");
     }
 
     #[test]
@@ -607,10 +673,7 @@ mod tests {
         let count: i64 = lua.load(&list_script).eval().unwrap();
         assert_eq!(count, 1);
 
-        // Cleanup
-        if let Some(home) = dirs::home_dir() {
-            let _ = std::fs::remove_dir_all(home.join(".algocline").join("cards").join(&pkg));
-        }
+        // No cleanup needed: the card_store is tempdir-rooted via test_config().
     }
 
     #[test]
@@ -619,6 +682,9 @@ mod tests {
         let custom_handle = metrics.custom_metrics_handle();
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
         crate::bridge::register(
             &lua,
             &t,
@@ -630,6 +696,9 @@ mod tests {
                 progress: metrics.progress_handle(),
                 lib_paths: vec![],
                 variant_pkgs: vec![],
+                state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+                card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+                scenarios_dir: root.join("scenarios"),
             },
         )
         .unwrap();

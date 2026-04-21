@@ -4,9 +4,8 @@
 //!
 //! All state operations go through the [`StateStore`] trait, which
 //! abstracts the storage backend.  The default implementation,
-//! [`JsonFileStore`], persists each namespace as a JSON file under
-//! `~/.algocline/state/{namespace}.json` with atomic writes (tmp +
-//! rename).
+//! [`JsonFileStore`], persists each namespace as a JSON file under a
+//! caller-provided root directory with atomic writes (tmp + rename).
 //!
 //! ## Tier 1 — Current API
 //!
@@ -48,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -115,21 +114,42 @@ pub trait StateStore: Send + Sync {
 /// JSON-file-backed state store.
 ///
 /// Each namespace is a single JSON file at
-/// `~/.algocline/state/{namespace}.json`.  Writes are atomic: the new
-/// state is written to a `.tmp` sibling and then renamed.
-pub struct JsonFileStore;
+/// `{root}/{namespace}.json`.  Writes are atomic: the new state is
+/// written to a `.tmp` sibling and then renamed.
+///
+/// The root directory is provided at construction time; callers are
+/// expected to resolve it from the service-layer `AppDir` abstraction
+/// (typically `~/.algocline/state/`).
+pub struct JsonFileStore {
+    root: PathBuf,
+}
 
 impl JsonFileStore {
-    fn state_dir() -> Result<PathBuf, String> {
-        let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-        let dir = home.join(".algocline").join("state");
-        if !dir.exists() {
-            fs::create_dir_all(&dir).map_err(|e| format!("Failed to create state dir: {e}"))?;
-        }
-        Ok(dir)
+    /// Construct a store rooted at an explicit path.
+    ///
+    /// The directory is **not** created eagerly; it is created lazily
+    /// on the first `set` / `set_nx` / `incr` call via [`Self::state_path`].
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
     }
 
-    fn state_path(ns: &str) -> Result<PathBuf, String> {
+    /// Return the root directory this store writes under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Ensure the root directory exists, returning it.
+    fn ensure_root(&self) -> Result<&Path, String> {
+        if !self.root.exists() {
+            fs::create_dir_all(&self.root)
+                .map_err(|e| format!("Failed to create state dir: {e}"))?;
+        }
+        Ok(&self.root)
+    }
+
+    /// Resolve the JSON file path for a namespace, validating the name
+    /// and creating the root directory on demand.
+    pub fn state_path(&self, ns: &str) -> Result<PathBuf, String> {
         if ns.contains('/')
             || ns.contains('\\')
             || ns.contains("..")
@@ -138,11 +158,12 @@ impl JsonFileStore {
         {
             return Err(format!("Invalid namespace: '{ns}'"));
         }
-        Ok(Self::state_dir()?.join(format!("{ns}.json")))
+        let dir = self.ensure_root()?;
+        Ok(dir.join(format!("{ns}.json")))
     }
 
-    fn load(ns: &str) -> Result<HashMap<String, Value>, String> {
-        let path = Self::state_path(ns)?;
+    fn load(&self, ns: &str) -> Result<HashMap<String, Value>, String> {
+        let path = self.state_path(ns)?;
         if !path.exists() {
             return Ok(HashMap::new());
         }
@@ -151,8 +172,8 @@ impl JsonFileStore {
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse state '{ns}': {e}"))
     }
 
-    fn save(ns: &str, data: &HashMap<String, Value>) -> Result<(), String> {
-        let path = Self::state_path(ns)?;
+    fn save(&self, ns: &str, data: &HashMap<String, Value>) -> Result<(), String> {
+        let path = self.state_path(ns)?;
         let tmp = path.with_extension("json.tmp");
         let content = serde_json::to_string_pretty(data)
             .map_err(|e| format!("Failed to serialize state: {e}"))?;
@@ -164,47 +185,47 @@ impl JsonFileStore {
 
 impl StateStore for JsonFileStore {
     fn get(&self, ns: &str, key: &str) -> Result<Option<Value>, String> {
-        let state = Self::load(ns)?;
+        let state = self.load(ns)?;
         Ok(state.get(key).cloned())
     }
 
     fn set(&self, ns: &str, key: &str, value: Value) -> Result<(), String> {
-        let mut state = Self::load(ns)?;
+        let mut state = self.load(ns)?;
         state.insert(key.to_string(), value);
-        Self::save(ns, &state)
+        self.save(ns, &state)
     }
 
     fn delete(&self, ns: &str, key: &str) -> Result<bool, String> {
-        let mut state = Self::load(ns)?;
+        let mut state = self.load(ns)?;
         let existed = state.remove(key).is_some();
         if existed {
-            Self::save(ns, &state)?;
+            self.save(ns, &state)?;
         }
         Ok(existed)
     }
 
     fn keys(&self, ns: &str) -> Result<Vec<String>, String> {
-        let state = Self::load(ns)?;
+        let state = self.load(ns)?;
         Ok(state.keys().cloned().collect())
     }
 
     fn has(&self, ns: &str, key: &str) -> Result<bool, String> {
-        let state = Self::load(ns)?;
+        let state = self.load(ns)?;
         Ok(state.contains_key(key))
     }
 
     fn set_nx(&self, ns: &str, key: &str, value: Value) -> Result<bool, String> {
-        let mut state = Self::load(ns)?;
+        let mut state = self.load(ns)?;
         if state.contains_key(key) {
             return Ok(false);
         }
         state.insert(key.to_string(), value);
-        Self::save(ns, &state)?;
+        self.save(ns, &state)?;
         Ok(true)
     }
 
     fn incr(&self, ns: &str, key: &str, delta: f64, default: f64) -> Result<f64, String> {
-        let mut state = Self::load(ns)?;
+        let mut state = self.load(ns)?;
         let current = match state.get(key) {
             Some(v) => v
                 .as_f64()
@@ -213,159 +234,119 @@ impl StateStore for JsonFileStore {
         };
         let new_val = current + delta;
         state.insert(key.to_string(), serde_json::json!(new_val));
-        Self::save(ns, &state)?;
+        self.save(ns, &state)?;
         Ok(new_val)
     }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Module-level functions — delegate to JsonFileStore singleton
-// ═══════════════════════════════════════════════════════════════
-//
-// These preserve backwards compatibility with existing callers
-// (bridge, tests) that use the free-function API.
-
-static STORE: JsonFileStore = JsonFileStore;
-
-pub fn get(ns: &str, key: &str) -> Result<Option<Value>, String> {
-    STORE.get(ns, key)
-}
-
-pub fn set(ns: &str, key: &str, value: Value) -> Result<(), String> {
-    STORE.set(ns, key, value)
-}
-
-pub fn delete(ns: &str, key: &str) -> Result<bool, String> {
-    STORE.delete(ns, key)
-}
-
-pub fn keys(ns: &str) -> Result<Vec<String>, String> {
-    STORE.keys(ns)
-}
-
-pub fn has(ns: &str, key: &str) -> Result<bool, String> {
-    STORE.has(ns, key)
-}
-
-pub fn set_nx(ns: &str, key: &str, value: Value) -> Result<bool, String> {
-    STORE.set_nx(ns, key, value)
-}
-
-pub fn incr(ns: &str, key: &str, delta: f64, default: f64) -> Result<f64, String> {
-    STORE.incr(ns, key, delta, default)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    fn cleanup(ns: &str) {
-        let _ = std::fs::remove_file(JsonFileStore::state_path(ns).unwrap());
-    }
-
-    /// RAII guard that removes the namespace file on drop, so cleanup
-    /// runs even if the test panics mid-way.
-    struct CleanupGuard(&'static str);
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(JsonFileStore::state_path(self.0).unwrap());
-        }
+    /// Create a JsonFileStore rooted in a fresh tempdir, returning both
+    /// so the TempDir guard lives for the test duration.
+    fn new_store() -> (JsonFileStore, TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonFileStore::new(tmp.path().to_path_buf());
+        (store, tmp)
     }
 
     #[test]
     fn roundtrip() {
-        let ns = "_test_roundtrip";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "rt";
 
-        set(ns, "count", serde_json::json!(42)).unwrap();
-        set(ns, "name", serde_json::json!("algocline")).unwrap();
+        store.set(ns, "count", serde_json::json!(42)).unwrap();
+        store
+            .set(ns, "name", serde_json::json!("algocline"))
+            .unwrap();
 
-        assert_eq!(get(ns, "count").unwrap(), Some(serde_json::json!(42)));
+        assert_eq!(store.get(ns, "count").unwrap(), Some(serde_json::json!(42)));
         assert_eq!(
-            get(ns, "name").unwrap(),
+            store.get(ns, "name").unwrap(),
             Some(serde_json::json!("algocline"))
         );
-        assert_eq!(get(ns, "missing").unwrap(), None);
+        assert_eq!(store.get(ns, "missing").unwrap(), None);
 
-        let k = keys(ns).unwrap();
+        let k = store.keys(ns).unwrap();
         assert!(k.contains(&"count".to_string()));
         assert!(k.contains(&"name".to_string()));
 
-        assert!(delete(ns, "count").unwrap());
-        assert!(!delete(ns, "count").unwrap());
-        assert_eq!(get(ns, "count").unwrap(), None);
+        assert!(store.delete(ns, "count").unwrap());
+        assert!(!store.delete(ns, "count").unwrap());
+        assert_eq!(store.get(ns, "count").unwrap(), None);
     }
 
     #[test]
     fn invalid_namespace() {
-        assert!(JsonFileStore::state_path("../evil").is_err());
-        assert!(JsonFileStore::state_path("foo/bar").is_err());
-        assert!(JsonFileStore::state_path("foo\\bar").is_err());
-        assert!(JsonFileStore::state_path("").is_err());
-        assert!(JsonFileStore::state_path("foo\0bar").is_err());
+        let (store, _tmp) = new_store();
+        assert!(store.state_path("../evil").is_err());
+        assert!(store.state_path("foo/bar").is_err());
+        assert!(store.state_path("foo\\bar").is_err());
+        assert!(store.state_path("").is_err());
+        assert!(store.state_path("foo\0bar").is_err());
     }
 
     #[test]
     fn get_nonexistent_namespace_returns_empty() {
-        let result = get("_test_nonexistent_ns_12345", "any_key").unwrap();
+        let (store, _tmp) = new_store();
+        let result = store.get("ghost_ns", "any_key").unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
     fn keys_nonexistent_namespace_returns_empty() {
-        let result = keys("_test_nonexistent_ns_12345").unwrap();
+        let (store, _tmp) = new_store();
+        let result = store.keys("ghost_ns").unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn delete_nonexistent_key_returns_false() {
-        let ns = "_test_delete_nonexistent";
-        cleanup(ns);
-        assert!(!delete(ns, "nope").unwrap());
+        let (store, _tmp) = new_store();
+        assert!(!store.delete("delns", "nope").unwrap());
     }
 
     #[test]
     fn set_overwrites_existing_value() {
-        let ns = "_test_overwrite";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "ow";
 
-        set(ns, "k", serde_json::json!(1)).unwrap();
-        set(ns, "k", serde_json::json!(2)).unwrap();
-        assert_eq!(get(ns, "k").unwrap(), Some(serde_json::json!(2)));
+        store.set(ns, "k", serde_json::json!(1)).unwrap();
+        store.set(ns, "k", serde_json::json!(2)).unwrap();
+        assert_eq!(store.get(ns, "k").unwrap(), Some(serde_json::json!(2)));
     }
 
     #[test]
     fn state_path_valid_namespaces() {
-        assert!(JsonFileStore::state_path("default").is_ok());
-        assert!(JsonFileStore::state_path("my-app").is_ok());
-        assert!(JsonFileStore::state_path("test_123").is_ok());
+        let (store, _tmp) = new_store();
+        assert!(store.state_path("default").is_ok());
+        assert!(store.state_path("my-app").is_ok());
+        assert!(store.state_path("test_123").is_ok());
     }
 
     // ─── Tier 1: has / set_nx / incr ──────────────────────────
 
     #[test]
     fn has_returns_existence() {
-        let ns = "_test_has";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "hasns";
 
-        assert!(!has(ns, "x").unwrap());
-        set(ns, "x", serde_json::json!(1)).unwrap();
-        assert!(has(ns, "x").unwrap());
+        assert!(!store.has(ns, "x").unwrap());
+        store.set(ns, "x", serde_json::json!(1)).unwrap();
+        assert!(store.has(ns, "x").unwrap());
     }
 
     #[test]
     fn set_nx_only_sets_if_absent() {
-        let ns = "_test_set_nx";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "snx";
 
-        assert!(set_nx(ns, "k", serde_json::json!("first")).unwrap());
-        assert!(!set_nx(ns, "k", serde_json::json!("second")).unwrap());
+        assert!(store.set_nx(ns, "k", serde_json::json!("first")).unwrap());
+        assert!(!store.set_nx(ns, "k", serde_json::json!("second")).unwrap());
         assert_eq!(
-            get(ns, "k").unwrap(),
+            store.get(ns, "k").unwrap(),
             Some(serde_json::json!("first")),
             "set_nx should not overwrite"
         );
@@ -373,41 +354,38 @@ mod tests {
 
     #[test]
     fn incr_initialises_and_increments() {
-        let ns = "_test_incr";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "inc";
 
         // Missing key: initialise from default (0) + delta (1) = 1
-        let v = incr(ns, "counter", 1.0, 0.0).unwrap();
+        let v = store.incr(ns, "counter", 1.0, 0.0).unwrap();
         assert!((v - 1.0).abs() < f64::EPSILON);
 
         // Increment existing
-        let v = incr(ns, "counter", 5.0, 0.0).unwrap();
+        let v = store.incr(ns, "counter", 5.0, 0.0).unwrap();
         assert!((v - 6.0).abs() < f64::EPSILON);
 
         // Negative delta
-        let v = incr(ns, "counter", -2.0, 0.0).unwrap();
+        let v = store.incr(ns, "counter", -2.0, 0.0).unwrap();
         assert!((v - 4.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn incr_rejects_non_numeric() {
-        let ns = "_test_incr_err";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "incerr";
 
-        set(ns, "s", serde_json::json!("hello")).unwrap();
-        let err = incr(ns, "s", 1.0, 0.0).unwrap_err();
+        store.set(ns, "s", serde_json::json!("hello")).unwrap();
+        let err = store.incr(ns, "s", 1.0, 0.0).unwrap_err();
         assert!(err.contains("not a number"), "got: {err}");
     }
 
     #[test]
     fn incr_custom_default() {
-        let ns = "_test_incr_default";
-        cleanup(ns);
-        let _g = CleanupGuard(ns);
+        let (store, _tmp) = new_store();
+        let ns = "incdef";
 
-        let v = incr(ns, "score", 10.0, 100.0).unwrap();
+        let v = store.incr(ns, "score", 10.0, 100.0).unwrap();
         assert!((v - 110.0).abs() < f64::EPSILON, "100 + 10 = 110");
     }
 }
@@ -417,6 +395,12 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    fn new_store() -> (JsonFileStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = JsonFileStore::new(tmp.path().to_path_buf());
+        (store, tmp)
+    }
+
     proptest! {
         /// Any valid namespace (alphanumeric + hyphen/underscore) round-trips through set/get.
         #[test]
@@ -424,12 +408,13 @@ mod proptests {
             key in "[a-z]{1,20}",
             val in any::<i64>(),
         ) {
-            let ns = "_proptest_rt";
+            let (store, _tmp) = new_store();
+            let ns = "rt";
             let json_val = serde_json::json!(val);
-            set(ns, &key, json_val.clone()).unwrap();
-            let got = get(ns, &key).unwrap();
+            store.set(ns, &key, json_val.clone()).unwrap();
+            let got = store.get(ns, &key).unwrap();
             prop_assert_eq!(got, Some(json_val));
-            let _ = delete(ns, &key);
+            let _ = store.delete(ns, &key);
         }
 
         /// Path traversal patterns are always rejected.
@@ -438,8 +423,9 @@ mod proptests {
             prefix in "[a-z]{0,5}",
             suffix in "[a-z]{0,5}",
         ) {
+            let (store, _tmp) = new_store();
             let evil = format!("{prefix}/../{suffix}");
-            prop_assert!(JsonFileStore::state_path(&evil).is_err());
+            prop_assert!(store.state_path(&evil).is_err());
         }
 
         /// state_path rejects NUL bytes anywhere in the namespace.
@@ -448,8 +434,9 @@ mod proptests {
             prefix in "[a-z]{0,10}",
             suffix in "[a-z]{0,10}",
         ) {
+            let (store, _tmp) = new_store();
             let evil = format!("{prefix}\0{suffix}");
-            prop_assert!(JsonFileStore::state_path(&evil).is_err());
+            prop_assert!(store.state_path(&evil).is_err());
         }
     }
 }

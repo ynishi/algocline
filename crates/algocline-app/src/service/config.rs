@@ -190,13 +190,14 @@ impl AppConfig {
     }
 }
 
+#[cfg(test)]
 impl Default for AppConfig {
-    /// Sensible default for tests and ad-hoc construction.
-    ///
-    /// File logging is disabled (`log_dir: None`, `log_enabled: false`) and
-    /// `app_dir` points to a relative `./.algocline/` so accidental use
-    /// outside of a tempdir does not clobber the real user directory.
-    /// Production code MUST go through [`AppConfig::from_env`].
+    /// Test-only default. `app_dir` points to a relative `./.algocline/`
+    /// — do not rely on this in production code; it would clobber
+    /// whatever the cwd happens to be. Production code constructs
+    /// [`AppConfig`] via [`AppConfig::from_env`] which resolves
+    /// `ALC_HOME` / `~/.algocline/` properly. The trait impl is
+    /// `#[cfg(test)]`-gated so a misuse in production won't compile.
     fn default() -> Self {
         Self {
             log_dir: None,

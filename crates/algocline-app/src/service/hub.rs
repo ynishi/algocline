@@ -400,14 +400,22 @@ fn discover_index_urls(app_dir: &AppDir) -> Vec<String> {
     // 2. From manifest (catch sources registered before hub_registries existed).
     // Only Git-variant sources can host a remote hub_index.json; other variants
     // (Path / Installed / Bundled / Unknown) are skipped by `git_url()` returning None.
-    if let Ok(m) = manifest::load_manifest(app_dir) {
-        for entry in m.packages.values() {
-            if let Some(url) = entry.source.git_url() {
-                let normalized = url.trim_end_matches('/').to_string();
-                if !normalized.is_empty() {
-                    repo_urls.insert(normalized);
+    match manifest::load_manifest(app_dir) {
+        Ok(m) => {
+            for entry in m.packages.values() {
+                if let Some(url) = entry.source.git_url() {
+                    let normalized = url.trim_end_matches('/').to_string();
+                    if !normalized.is_empty() {
+                        repo_urls.insert(normalized);
+                    }
                 }
             }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "hub: failed to load installed.json for registry discovery ({}); skipping manifest-derived sources. Error: {e}",
+                app_dir.installed_json().display()
+            );
         }
     }
 
@@ -561,9 +569,17 @@ fn installed_packages(app_dir: &AppDir) -> HashMap<String, Option<String>> {
     let mut map = HashMap::new();
 
     // From manifest (has version info)
-    if let Ok(m) = manifest::load_manifest(app_dir) {
-        for (name, entry) in &m.packages {
-            map.insert(name.clone(), entry.version.clone());
+    match manifest::load_manifest(app_dir) {
+        Ok(m) => {
+            for (name, entry) in &m.packages {
+                map.insert(name.clone(), entry.version.clone());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "hub: failed to load installed.json when building installed-pkg set ({}); falling back to packages/ dir scan only. Error: {e}",
+                app_dir.installed_json().display()
+            );
         }
     }
 
@@ -825,7 +841,13 @@ fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> HubInd
         HashMap::new()
     };
     let manifest = if use_local_state {
-        manifest::load_manifest(app_dir).unwrap_or_default()
+        manifest::load_manifest(app_dir).unwrap_or_else(|e| {
+            tracing::warn!(
+                "hub: failed to load installed.json for build_index ({}); proceeding without manifest-derived metadata. Error: {e}",
+                app_dir.installed_json().display()
+            );
+            manifest::Manifest::default()
+        })
     } else {
         manifest::Manifest::default()
     };
@@ -970,10 +992,20 @@ impl AppService {
                 // behaviour.
                 let init_lua = app_dir.packages_dir().join(pkg).join("init.lua");
                 let entity = PkgEntity::parse_from_init_lua(&init_lua);
-                let manifest_source = manifest::load_manifest(&app_dir)
-                    .ok()
-                    .and_then(|m| m.packages.get(pkg).map(|e| e.source.clone()))
-                    .unwrap_or_default();
+                let manifest_source = match manifest::load_manifest(&app_dir) {
+                    Ok(m) => m
+                        .packages
+                        .get(pkg)
+                        .map(|e| e.source.clone())
+                        .unwrap_or_default(),
+                    Err(e) => {
+                        tracing::warn!(
+                            "hub: failed to load installed.json for local fallback source lookup of '{pkg}' ({}); returning Unknown source. Error: {e}",
+                            app_dir.installed_json().display()
+                        );
+                        Default::default()
+                    }
+                };
                 match entity {
                     Some(e) => (
                         e.version.unwrap_or_default(),

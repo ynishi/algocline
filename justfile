@@ -6,9 +6,9 @@ _default:
 
 # ─── Check ──────────────────────────────────────────────────────
 
-# Run all checks (fmt, clippy, test) — CI equivalent
+# Run all checks (fmt, clippy, test, V0 invariants) — CI equivalent
 [group: 'agent']
-ci: fmt-check clippy test
+ci: fmt-check clippy test check-invariants
 
 # Lint with clippy (warnings = errors)
 [group: 'agent']
@@ -71,6 +71,56 @@ ready:
     just fmt
     just clippy
     just test
+
+# ─── Invariants ─────────────────────────────────────────────────
+
+# Check V0 AppDir-guard invariants:
+#   Inv-1: Service layer (algocline-app) no longer reads HOME / ALC_HOME
+#          directly — `AppConfig::resolve_app_dir` / `resolve_log_dir` in
+#          `service/config.rs` are the single whitelisted resolvers.
+#   Inv-2: Execution layer (algocline-engine, incl. `prelude.lua`) no
+#          longer reads HOME / ALC_HOME directly.
+#   Inv-3: `algocline_core::AppDir` / `AppConfig` are not referenced from
+#          inside the engine crate (engine public API stays free of the
+#          service-layer abstractions).
+[group: 'agent']
+check-invariants:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail=0
+    # Inv-1: Service layer must route every HOME access through AppConfig.
+    # Whitelist:
+    #   `config.rs`     — single source for AppConfig::resolve_app_dir / resolve_log_dir.
+    #   `test_support.rs` — `FakeHome` test fixture (軸 A defer; guards HOME for
+    #                      integration tests while parallel isolation is not yet in place).
+    if grep -rn -E 'dirs::home_dir\(\)|std::env::var(_os)?\("(HOME|ALC_HOME)"\)' \
+            crates/algocline-app/src/service/ --include='*.rs' \
+            | grep -v -E '^crates/algocline-app/src/service/(config|test_support)\.rs:'; then
+        echo "Inv-1 FAILED: HOME/ALC_HOME read outside service/config.rs (or FakeHome)" >&2
+        fail=1
+    fi
+    # Inv-2 (Rust): Execution layer (engine crate) must not read HOME.
+    if grep -rn -E 'dirs::home_dir\(\)|std::env::var(_os)?\("(HOME|ALC_HOME)"\)' \
+            crates/algocline-engine/src/ --include='*.rs'; then
+        echo "Inv-2 (Rust) FAILED: HOME/ALC_HOME read in engine crate" >&2
+        fail=1
+    fi
+    # Inv-2 (Lua): prod Lua (prelude.lua) must not call os.getenv("HOME"|"ALC_HOME").
+    if grep -n -E 'os\.getenv\("(HOME|ALC_HOME)"\)' \
+            crates/algocline-engine/src/prelude.lua; then
+        echo "Inv-2 (Lua) FAILED: HOME/ALC_HOME read in prod Lua" >&2
+        fail=1
+    fi
+    # Inv-3: engine crate must not import AppDir/AppConfig from core.
+    if grep -rn -E 'algocline_core::(AppDir|AppConfig)' \
+            crates/algocline-engine/src/ --include='*.rs'; then
+        echo "Inv-3 FAILED: engine references algocline_core::AppDir/AppConfig" >&2
+        fail=1
+    fi
+    if [ "$fail" -ne 0 ]; then
+        exit 1
+    fi
+    echo "All AppDir-guard invariants PASS"
 
 # ─── Publish ────────────────────────────────────────────────────
 

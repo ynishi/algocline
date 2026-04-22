@@ -378,7 +378,13 @@ fn repo_to_index_url(repo_url: &str) -> Option<String> {
 }
 
 /// Collect unique index URLs from config + registries + manifest + bundled seeds.
-fn discover_index_urls(app_dir: &AppDir) -> Vec<String> {
+///
+/// Returns `Err` if the installed manifest cannot be read (corrupt JSON /
+/// permission denied). The function intentionally surfaces manifest-read
+/// failures rather than silently skipping — callers feed these URLs into
+/// hub resolution, and a partial URL set is indistinguishable from a
+/// corrupt manifest without the signal.
+fn discover_index_urls(app_dir: &AppDir) -> Result<Vec<String>, String> {
     let mut index_urls: Vec<String> = Vec::new();
 
     // 0. From config.toml [hub].collection_url (Tier 0 — aggregated collection)
@@ -400,22 +406,13 @@ fn discover_index_urls(app_dir: &AppDir) -> Vec<String> {
     // 2. From manifest (catch sources registered before hub_registries existed).
     // Only Git-variant sources can host a remote hub_index.json; other variants
     // (Path / Installed / Bundled / Unknown) are skipped by `git_url()` returning None.
-    match manifest::load_manifest(app_dir) {
-        Ok(m) => {
-            for entry in m.packages.values() {
-                if let Some(url) = entry.source.git_url() {
-                    let normalized = url.trim_end_matches('/').to_string();
-                    if !normalized.is_empty() {
-                        repo_urls.insert(normalized);
-                    }
-                }
+    let m = manifest::load_manifest(app_dir)?;
+    for entry in m.packages.values() {
+        if let Some(url) = entry.source.git_url() {
+            let normalized = url.trim_end_matches('/').to_string();
+            if !normalized.is_empty() {
+                repo_urls.insert(normalized);
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "hub: failed to load installed.json for registry discovery ({}); skipping manifest-derived sources. Error: {e}",
-                app_dir.installed_json().display()
-            );
         }
     }
 
@@ -435,7 +432,7 @@ fn discover_index_urls(app_dir: &AppDir) -> Vec<String> {
     derived.dedup();
     index_urls.extend(derived);
 
-    index_urls
+    Ok(index_urls)
 }
 
 // ─── Per-source cache ─────────────────────────────────────────
@@ -524,8 +521,8 @@ fn fetch_one(app_dir: &AppDir, url: &str) -> Result<HubIndex, String> {
 
 /// Fetch all discovered remote indices and merge into one.
 /// Falls back gracefully: failed sources are skipped with warnings.
-fn fetch_remote_indices(app_dir: &AppDir) -> (HubIndex, Vec<String>) {
-    let urls = discover_index_urls(app_dir);
+fn fetch_remote_indices(app_dir: &AppDir) -> Result<(HubIndex, Vec<String>), String> {
+    let urls = discover_index_urls(app_dir)?;
     let mut all_packages: Vec<IndexEntry> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -558,29 +555,20 @@ fn fetch_remote_indices(app_dir: &AppDir) -> (HubIndex, Vec<String>) {
         updated_at: String::new(),
         packages: all_packages,
     };
-    (merged, warnings)
+    Ok((merged, warnings))
 }
 
 // ─── Local state ───────────────────────────────────────────────
 
 /// Build a set of locally installed package names from `installed.json`
 /// and the `~/.algocline/packages/` directory.
-fn installed_packages(app_dir: &AppDir) -> HashMap<String, Option<String>> {
+fn installed_packages(app_dir: &AppDir) -> Result<HashMap<String, Option<String>>, String> {
     let mut map = HashMap::new();
 
     // From manifest (has version info)
-    match manifest::load_manifest(app_dir) {
-        Ok(m) => {
-            for (name, entry) in &m.packages {
-                map.insert(name.clone(), entry.version.clone());
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "hub: failed to load installed.json when building installed-pkg set ({}); falling back to packages/ dir scan only. Error: {e}",
-                app_dir.installed_json().display()
-            );
-        }
+    let m = manifest::load_manifest(app_dir)?;
+    for (name, entry) in &m.packages {
+        map.insert(name.clone(), entry.version.clone());
     }
 
     // Also scan packages/ dir in case manifest is stale
@@ -595,7 +583,7 @@ fn installed_packages(app_dir: &AppDir) -> HashMap<String, Option<String>> {
         }
     }
 
-    map
+    Ok(map)
 }
 
 /// Count local cards per package from `{app_dir}/cards/{pkg}/`.
@@ -701,8 +689,8 @@ fn count_evals_for_pkg(app_dir: &AppDir, pkg: &str) -> usize {
 /// When a package is installed locally and the remote index lacks a
 /// docstring (pre-v0.21 indices), the docstring is extracted from the
 /// local `init.lua` so that full-text search works immediately.
-fn merge(app_dir: &AppDir, remote: &HubIndex) -> Vec<SearchResult> {
-    let installed = installed_packages(app_dir);
+fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, String> {
+    let installed = installed_packages(app_dir)?;
     let card_counts = local_card_counts(app_dir);
     let pkg_dir: Option<PathBuf> = Some(app_dir.packages_dir());
 
@@ -776,7 +764,7 @@ fn merge(app_dir: &AppDir, remote: &HubIndex) -> Vec<SearchResult> {
         });
     }
 
-    results
+    Ok(results)
 }
 
 // ─── Search (filtering) ───────────────────────────────────────
@@ -822,7 +810,10 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
 ///
 /// When `source_dir` is `None`, scans `~/.algocline/packages/` and
 /// enriches entries with manifest source and local card counts.
-fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> HubIndex {
+fn build_index(
+    app_dir: &AppDir,
+    source_dir: Option<&std::path::Path>,
+) -> Result<HubIndex, String> {
     let empty = || HubIndex {
         schema_version: "hub_index/v0".into(),
         updated_at: super::manifest::now_iso8601(),
@@ -840,23 +831,26 @@ fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> HubInd
     } else {
         HashMap::new()
     };
+    // Manifest read errors surface as `Err` rather than degrading to an
+    // empty manifest — when building the local hub index, a corrupt
+    // `installed.json` silently turning all package sources into
+    // `PackageSource::Unknown` would be indistinguishable from the
+    // legitimate "no source recorded" state, and would ship into
+    // generated `hub_index.json` files verbatim.
     let manifest = if use_local_state {
-        manifest::load_manifest(app_dir).unwrap_or_else(|e| {
-            tracing::warn!(
-                "hub: failed to load installed.json for build_index ({}); proceeding without manifest-derived metadata. Error: {e}",
-                app_dir.installed_json().display()
-            );
-            manifest::Manifest::default()
-        })
+        manifest::load_manifest(app_dir)?
     } else {
         manifest::Manifest::default()
     };
 
     let mut entries = Vec::new();
 
+    // Missing / unreadable `pkg_dir` is a legitimate "no packages yet"
+    // state on a fresh install — distinct from manifest corruption
+    // above, and safe to surface as an empty index.
     let dir_entries = match std::fs::read_dir(&pkg_dir) {
         Ok(e) => e,
-        Err(_) => return empty(),
+        Err(_) => return Ok(empty()),
     };
 
     for entry in dir_entries.flatten() {
@@ -902,11 +896,11 @@ fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> HubInd
 
     entries.sort_by(|a, b| a.entity.name.cmp(&b.entity.name));
 
-    HubIndex {
+    Ok(HubIndex {
         schema_version: "hub_index/v0".into(),
         updated_at: super::manifest::now_iso8601(),
         packages: entries,
-    }
+    })
 }
 
 // ─── Public API ────────────────────────────────────────────────
@@ -932,7 +926,7 @@ impl AppService {
             }
         }
         let app_dir = self.log_config.app_dir();
-        let index = build_index(&app_dir, src);
+        let index = build_index(&app_dir, src)?;
 
         let written_path = if let Some(path) = output_path {
             let json = serde_json::to_string_pretty(&index)
@@ -967,7 +961,7 @@ impl AppService {
 
         // Package metadata: try remote index first, fall back to local
         let app_dir = self.log_config.app_dir();
-        let installed = installed_packages(&app_dir);
+        let installed = installed_packages(&app_dir)?;
         let is_installed = installed.contains_key(pkg);
 
         // Resolve package metadata: try remote index first, fall back to
@@ -976,7 +970,7 @@ impl AppService {
         // we flatten `None` to empty string so the wire shape (non-null
         // JSON string fields) stays unchanged for existing consumers.
         let (version, description, category, source) = {
-            let (remote, _) = fetch_remote_indices(&app_dir);
+            let (remote, _) = fetch_remote_indices(&app_dir)?;
             if let Some(entry) = remote.packages.iter().find(|e| e.entity.name == pkg) {
                 (
                     entry.entity.version.clone().unwrap_or_default(),
@@ -992,20 +986,11 @@ impl AppService {
                 // behaviour.
                 let init_lua = app_dir.packages_dir().join(pkg).join("init.lua");
                 let entity = PkgEntity::parse_from_init_lua(&init_lua);
-                let manifest_source = match manifest::load_manifest(&app_dir) {
-                    Ok(m) => m
-                        .packages
-                        .get(pkg)
-                        .map(|e| e.source.clone())
-                        .unwrap_or_default(),
-                    Err(e) => {
-                        tracing::warn!(
-                            "hub: failed to load installed.json for local fallback source lookup of '{pkg}' ({}); returning Unknown source. Error: {e}",
-                            app_dir.installed_json().display()
-                        );
-                        Default::default()
-                    }
-                };
+                let manifest_source = manifest::load_manifest(&app_dir)?
+                    .packages
+                    .get(pkg)
+                    .map(|e| e.source.clone())
+                    .unwrap_or_default();
                 match entity {
                     Some(e) => (
                         e.version.unwrap_or_default(),
@@ -1111,8 +1096,8 @@ impl AppService {
         opts: ListOpts,
     ) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
-        let (remote, warnings) = fetch_remote_indices(&app_dir);
-        let mut results = merge(&app_dir, &remote);
+        let (remote, warnings) = fetch_remote_indices(&app_dir)?;
+        let mut results = merge(&app_dir, &remote)?;
 
         // Filter by query (internal signal covers name/description/
         // category/docstring — `matches_query` unchanged).
@@ -1224,7 +1209,7 @@ impl AppService {
             .collect();
 
         // Collect discovered sources for transparency.
-        let sources = discover_index_urls(&app_dir);
+        let sources = discover_index_urls(&app_dir)?;
 
         let mut json = serde_json::json!({
             "results": projected,
@@ -1330,7 +1315,7 @@ mod tests {
             }],
         };
 
-        let results = merge(&app_dir, &remote);
+        let results = merge(&app_dir, &remote).expect("merge over empty app_dir should succeed");
         // Should include remote_only + any locally installed packages
         assert!(results.iter().any(|r| r.entity.name == "remote_only"));
     }

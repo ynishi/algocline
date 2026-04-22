@@ -227,18 +227,12 @@ impl AppService {
         )?;
 
         // ── Load manifest once upfront ─────────────────────────────────────
+        // Errors here (I/O, JSON corruption, permission denied) are
+        // propagated to the caller — a Claude Code UI that silently
+        // shows "0 packages" for a corrupted `installed.json` is worse
+        // than a structured error the operator can act on.
         let app_dir = self.log_config.app_dir();
-        // Fall through to an empty manifest on I/O / parse errors so the UI
-        // still renders something, but surface the error — otherwise a
-        // corrupted `installed.json` is silently indistinguishable from
-        // "no packages installed".
-        let manifest_data = manifest::load_manifest(&app_dir).unwrap_or_else(|e| {
-            tracing::warn!(
-                "pkg_list: failed to load installed.json ({}); rendering as empty. Error: {e}",
-                app_dir.installed_json().display()
-            );
-            manifest::Manifest::default()
-        });
+        let manifest_data = manifest::load_manifest(&app_dir)?;
 
         // ── Project-local packages (from alc.toml + alc.lock) ─────────────
         let resolved_root = resolve_project_root(project_root.as_deref());

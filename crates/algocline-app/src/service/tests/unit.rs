@@ -74,12 +74,10 @@ fn make_require_code_different_names() {
 
 #[test]
 fn packages_dir_ends_with_expected_path() {
-    let dir = packages_dir().unwrap();
-    assert!(
-        dir.ends_with(".algocline/packages"),
-        "dir: {}",
-        dir.display()
-    );
+    let tmp = tempfile::tempdir().unwrap();
+    let app_dir = algocline_core::AppDir::new(tmp.path().to_path_buf());
+    let dir = packages_dir(&app_dir);
+    assert!(dir.ends_with("packages"), "dir: {}", dir.display());
 }
 
 // ─── append_note tests ───

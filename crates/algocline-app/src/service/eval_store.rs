@@ -1,22 +1,20 @@
 use std::path::PathBuf;
 
+use algocline_core::AppDir;
+
 use super::path::ContainedPath;
 
 // ─── Eval Result Store ──────────────────────────────────────────
 
-pub(super) fn evals_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("evals"))
+pub(super) fn evals_dir(app_dir: &AppDir) -> PathBuf {
+    app_dir.evals_dir()
 }
 
-/// Persist eval result to `~/.algocline/evals/{strategy}_{timestamp}.json`.
+/// Persist eval result to `{app_dir}/evals/{strategy}_{timestamp}.json`.
 ///
 /// Silently returns on I/O errors — storage must not break eval execution.
-pub(super) fn save_eval_result(strategy: &str, result_json: &str) {
-    let dir = match evals_dir() {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+pub(super) fn save_eval_result(app_dir: &AppDir, strategy: &str, result_json: &str) {
+    let dir = evals_dir(app_dir);
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -167,12 +165,14 @@ pub(super) fn extract_strategy_from_id(eval_id: &str) -> Option<&str> {
     eval_id.rsplit_once('_').map(|(prefix, _)| prefix)
 }
 
-/// Persist a comparison result to `~/.algocline/evals/`.
-pub(super) fn save_compare_result(eval_id_a: &str, eval_id_b: &str, result_json: &str) {
-    let dir = match evals_dir() {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+/// Persist a comparison result to `{app_dir}/evals/`.
+pub(super) fn save_compare_result(
+    app_dir: &AppDir,
+    eval_id_a: &str,
+    eval_id_b: &str,
+    result_json: &str,
+) {
+    let dir = evals_dir(app_dir);
     let filename = format!("compare_{eval_id_a}_vs_{eval_id_b}.json");
     if let Ok(path) = ContainedPath::child(&dir, &filename) {
         let _ = std::fs::write(&path, result_json);

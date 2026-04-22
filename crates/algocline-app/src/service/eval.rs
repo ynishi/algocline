@@ -58,9 +58,10 @@ impl AppService {
         auto_card: bool,
     ) -> Result<String, String> {
         // Auto-install bundled packages if evalframe is missing
-        if !is_package_installed("evalframe") {
+        let app_dir = self.log_config.app_dir();
+        if !is_package_installed(&app_dir, "evalframe") {
             self.auto_install_bundled_packages().await?;
-            if !is_package_installed("evalframe") {
+            if !is_package_installed(&app_dir, "evalframe") {
                 return Err(
                     "Package 'evalframe' not found after installing bundled collection. \
                      Use alc_pkg_install to install it manually."
@@ -69,7 +70,8 @@ impl AppService {
             }
         }
 
-        let scenario_code = resolve_scenario_code(scenario, scenario_file, scenario_name.clone())?;
+        let scenario_code =
+            resolve_scenario_code(&app_dir, scenario, scenario_file, scenario_name.clone())?;
 
         // Build strategy opts Lua table literal
         let opts_lua = match &strategy_opts {
@@ -107,7 +109,7 @@ return alc.eval(scenario, "{strategy}", {{
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
             match parsed.get("status").and_then(|s| s.as_str()) {
                 Some("completed") => {
-                    save_eval_result(strategy, &result);
+                    save_eval_result(&app_dir, strategy, &result);
                 }
                 Some("needs_response") => {
                     if let Some(sid) = parsed.get("session_id").and_then(|s| s.as_str()) {
@@ -125,13 +127,13 @@ return alc.eval(scenario, "{strategy}", {{
 
     /// List eval history, optionally filtered by strategy.
     pub fn eval_history(&self, strategy: Option<&str>, limit: usize) -> Result<String, String> {
-        let dir = evals_dir()?;
+        let dir = evals_dir(&self.log_config.app_dir());
         list_eval_history(&dir, strategy, limit)
     }
 
     /// View a specific eval result by ID.
     pub fn eval_detail(&self, eval_id: &str) -> Result<String, String> {
-        let evals_dir = evals_dir()?;
+        let evals_dir = evals_dir(&self.log_config.app_dir());
         let path = ContainedPath::child(&evals_dir, &format!("{eval_id}.json"))
             .map_err(|e| format!("Invalid eval_id: {e}"))?;
         if !path.exists() {
@@ -149,9 +151,11 @@ return alc.eval(scenario, "{strategy}", {{
     /// The comparison result is persisted to `~/.algocline/evals/` so repeated
     /// lookups of the same pair are file reads only.
     pub async fn eval_compare(&self, eval_id_a: &str, eval_id_b: &str) -> Result<String, String> {
+        let app_dir = self.log_config.app_dir();
         // Check for cached comparison
         let cache_filename = format!("compare_{eval_id_a}_vs_{eval_id_b}.json");
-        if let Ok(dir) = evals_dir() {
+        {
+            let dir = evals_dir(&app_dir);
             if let Ok(cached_path) = ContainedPath::child(&dir, &cache_filename) {
                 if cached_path.exists() {
                     return std::fs::read_to_string(&*cached_path)
@@ -161,9 +165,9 @@ return alc.eval(scenario, "{strategy}", {{
         }
 
         // Auto-install bundled packages if evalframe is missing
-        if !is_package_installed("evalframe") {
+        if !is_package_installed(&app_dir, "evalframe") {
             self.auto_install_bundled_packages().await?;
-            if !is_package_installed("evalframe") {
+            if !is_package_installed(&app_dir, "evalframe") {
                 return Err(
                     "Package 'evalframe' not found after installing bundled collection. \
                      Use alc_pkg_install to install it manually."
@@ -276,7 +280,7 @@ return {{
             .await?;
 
         // Persist comparison result
-        save_compare_result(eval_id_a, eval_id_b, &raw_result);
+        save_compare_result(&app_dir, eval_id_a, eval_id_b, &raw_result);
 
         Ok(raw_result)
     }

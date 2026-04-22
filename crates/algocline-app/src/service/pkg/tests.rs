@@ -618,8 +618,10 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
     use crate::service::test_support::FakeHome;
 
     let _fake_home = FakeHome::new();
+    let app_dir = crate::service::config::AppConfig::from_env().app_dir();
 
     record_install(
+        &app_dir,
         "ghost_pkg",
         Some("0.1.0"),
         crate::service::source::PackageSource::Path {
@@ -627,7 +629,10 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
         },
     )
     .unwrap();
-    assert!(load_manifest().unwrap().packages.contains_key("ghost_pkg"));
+    assert!(load_manifest(&app_dir)
+        .unwrap()
+        .packages
+        .contains_key("ghost_pkg"));
 
     let svc = make_app_service().await;
     let result = svc
@@ -646,7 +651,10 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
     assert!(json["installed_json"].is_string());
 
     assert!(
-        !load_manifest().unwrap().packages.contains_key("ghost_pkg"),
+        !load_manifest(&app_dir)
+            .unwrap()
+            .packages
+            .contains_key("ghost_pkg"),
         "global manifest still contains the entry"
     );
 }
@@ -688,7 +696,9 @@ async fn pkg_remove_global_scope_preserves_physical_dir() {
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+    let app_dir = crate::service::config::AppConfig::from_env().app_dir();
     record_install(
+        &app_dir,
         "kept",
         Some("0.1.0"),
         crate::service::source::PackageSource::Path {
@@ -722,7 +732,9 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     use crate::service::test_support::FakeHome;
 
     let _fake_home = FakeHome::new();
+    let app_dir = crate::service::config::AppConfig::from_env().app_dir();
     record_install(
+        &app_dir,
         "orphan",
         None,
         crate::service::source::PackageSource::Path {
@@ -744,7 +756,10 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     assert_eq!(json["global_removed"], true);
     assert_eq!(json["project_removed"], false);
     assert!(
-        !load_manifest().unwrap().packages.contains_key("orphan"),
+        !load_manifest(&app_dir)
+            .unwrap()
+            .packages
+            .contains_key("orphan"),
         "global manifest still contains the entry"
     );
 }

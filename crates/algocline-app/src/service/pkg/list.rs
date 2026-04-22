@@ -227,7 +227,8 @@ impl AppService {
         )?;
 
         // ── Load manifest once upfront ─────────────────────────────────────
-        let manifest_data = manifest::load_manifest().unwrap_or_default();
+        let app_dir = self.log_config.app_dir();
+        let manifest_data = manifest::load_manifest(&app_dir).unwrap_or_default();
 
         // ── Project-local packages (from alc.toml + alc.lock) ─────────────
         let resolved_root = resolve_project_root(project_root.as_deref());
@@ -291,15 +292,9 @@ impl AppService {
                                 } else {
                                     ResolvedSourceKind::Installed
                                 };
-                                match packages_dir() {
-                                    Ok(dir) => {
-                                        (resolve_source_path(&dir.join(name)), Some(kind), None)
-                                    }
-                                    Err(e) => (
-                                        None,
-                                        Some(kind),
-                                        Some(format!("cannot resolve packages_dir: {e}")),
-                                    ),
+                                {
+                                    let dir = packages_dir(&app_dir);
+                                    (resolve_source_path(&dir.join(name)), Some(kind), None)
                                 }
                             }
                             None => (None, None, None),

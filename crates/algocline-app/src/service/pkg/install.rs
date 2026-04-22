@@ -86,7 +86,8 @@ impl AppService {
         source: InstallSource,
         name: Option<String>,
     ) -> Result<String, String> {
-        let pkg_dir = packages_dir()?;
+        let app_dir = self.log_config.app_dir();
+        let pkg_dir = packages_dir(&app_dir);
         let _ = std::fs::create_dir_all(&pkg_dir);
 
         let git_url = match source {
@@ -162,6 +163,7 @@ impl AppService {
 
             // Record in manifest (best-effort; install itself already succeeded)
             let _ = manifest::record_install(
+                &app_dir,
                 &name,
                 None,
                 super::super::source::PackageSource::Git {
@@ -169,7 +171,7 @@ impl AppService {
                     rev: None,
                 },
             );
-            hub::register_source(&url, "pkg_install");
+            hub::register_source(&app_dir, &url, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(std::slice::from_ref(&name))
@@ -179,7 +181,7 @@ impl AppService {
                 "installed": [name],
                 "mode": "single",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
             }
             Ok(response.to_string())
@@ -238,9 +240,10 @@ impl AppService {
             let mut scenarios_installed: Vec<String> = Vec::new();
             let mut scenarios_failures: DirEntryFailures = Vec::new();
             if scenarios_subdir.is_dir() {
-                if let Ok(sc_dir) = scenarios_dir() {
-                    std::fs::create_dir_all(&sc_dir)
-                        .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
+                let sc_dir = scenarios_dir(&app_dir);
+                std::fs::create_dir_all(&sc_dir)
+                    .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
+                {
                     if let Ok(result) = install_scenarios_from_dir(&scenarios_subdir, &sc_dir) {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
                             if let Some(arr) = parsed.get("installed").and_then(|v| v.as_array()) {
@@ -269,13 +272,14 @@ impl AppService {
 
             // Record in manifest (best-effort)
             let _ = manifest::record_install_batch(
+                &app_dir,
                 &installed,
                 super::super::source::PackageSource::Git {
                     url: url.clone(),
                     rev: None,
                 },
             );
-            hub::register_source(&url, "pkg_install");
+            hub::register_source(&app_dir, &url, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(&installed).await;
@@ -288,7 +292,7 @@ impl AppService {
                 "scenarios_failures": scenarios_failures,
                 "mode": "collection",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
             }
             Ok(response.to_string())
@@ -302,6 +306,7 @@ impl AppService {
         pkg_dir: &Path,
         name: Option<String>,
     ) -> Result<String, String> {
+        let app_dir = self.log_config.app_dir();
         // Reject a missing source dir up front. Without this check, a missing
         // path falls through to the Collection branch (since `init.lua` isn't
         // present) and surfaces as the misleading "'name' parameter is only
@@ -357,13 +362,14 @@ impl AppService {
             // form fixes that regression by carrying `path` explicitly.)
             let source_str_local = source.display().to_string();
             let _ = manifest::record_install(
+                &app_dir,
                 &name,
                 None,
                 super::super::source::PackageSource::Path {
                     path: source_str_local.clone(),
                 },
             );
-            hub::register_source(&source_str_local, "pkg_install");
+            hub::register_source(&app_dir, &source_str_local, "pkg_install");
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(std::slice::from_ref(&name))
@@ -373,7 +379,7 @@ impl AppService {
                 "installed": [name],
                 "mode": "local_single",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
             }
             Ok(response.to_string())
@@ -451,12 +457,13 @@ impl AppService {
             let source_str = source.display().to_string();
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
             let _ = manifest::record_install_batch(
+                &app_dir,
                 &all_names,
                 super::super::source::PackageSource::Path {
                     path: source_str.clone(),
                 },
             );
-            hub::register_source(&source_str, "pkg_install");
+            hub::register_source(&app_dir, &source_str, "pkg_install");
 
             // Update alc.toml + alc.lock for newly installed packages
             self.update_project_files_for_install(&installed).await;
@@ -467,7 +474,7 @@ impl AppService {
                 "cards_installed": cards_installed,
                 "mode": "local_collection",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
             }
             Ok(response.to_string())

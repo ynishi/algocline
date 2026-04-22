@@ -28,6 +28,7 @@ tempfile = "3"
 toml = { workspace = true }
 toml_edit = "0.22"
 ureq = "3"
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
 
 [dev-dependencies]
 proptest = "1"

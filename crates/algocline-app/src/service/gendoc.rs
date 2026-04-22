@@ -17,9 +17,9 @@
 //!   satisfied by minimal stubs — `gen_docs` only uses them for
 //!   shape-validation side effects that are not load-bearing for the
 //!   artifacts.
-//! - `config_path` (optional) is a caller-supplied Lua file returning
-//!   `{ context7 = {...}, devin = {...} }`. When supplied, its
-//!   `context7` / `devin` sub-tables are exposed under the
+//! - `config_path` (optional) is a caller-supplied TOML file with
+//!   top-level `[context7]` and/or `[devin]` tables. When supplied,
+//!   those `context7` / `devin` tables are exposed under the
 //!   `tools.docs.context7_config` / `tools.docs.devin_wiki_config`
 //!   module names that `gen_docs` `require`s.
 //! - `print` / `io.stdout.write` / `io.stderr.write` are redirected
@@ -38,6 +38,7 @@
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, Table, Value};
+use serde::Deserialize;
 
 use super::AppService;
 
@@ -201,6 +202,24 @@ const EXIT_MARKER: &str = "__gendoc_exit";
 impl AppService {
     /// See [`crate::EngineApi::hub_gendoc`] for parameter semantics.
     ///
+    /// `config_path` format (TOML):
+    ///
+    /// ```toml
+    /// [context7]
+    /// projectTitle = "my project"
+    /// description = "..."
+    /// rules = []
+    ///
+    /// [devin]
+    /// project_name = "my project"
+    /// ```
+    ///
+    /// Notes:
+    /// - `context7` / `devin` are optional individually.
+    /// - When present, each key must be a table.
+    /// - TOML arrays/tables are converted recursively to Lua tables.
+    /// - See `docs/hub-gendoc-config.md` for a concrete schema example.
+    ///
     /// Returns a JSON string of the form:
     ///
     /// ```json
@@ -218,7 +237,7 @@ impl AppService {
         config_path: Option<&str>,
         lint_strict: Option<bool>,
     ) -> Result<String, String> {
-        let projection_flags = ProjectionFlags::from_list(projections);
+        let projection_flags = ProjectionFlags::from_list(projections)?;
         if (projection_flags.context7 || projection_flags.devin) && config_path.is_none() {
             return Err(
                 "gendoc: config_path is required when projections include context7 or devin"
@@ -306,7 +325,7 @@ impl AppService {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 struct ProjectionFlags {
     hub: bool,
     context7: bool,
@@ -316,10 +335,10 @@ struct ProjectionFlags {
 }
 
 impl ProjectionFlags {
-    fn from_list(projections: Option<&[String]>) -> Self {
+    fn from_list(projections: Option<&[String]>) -> Result<Self, String> {
         let mut f = ProjectionFlags::default();
         let Some(list) = projections else {
-            return f;
+            return Ok(f);
         };
         for p in list {
             match p.as_str() {
@@ -332,13 +351,13 @@ impl ProjectionFlags {
                     f.lint = true;
                 }
                 _ => {
-                    // Unknown projections are ignored (the Lua side
-                    // will ignore them too — gen_docs.lua only looks
-                    // at the specific flags it knows).
+                    return Err(format!(
+                        "gendoc: unknown projection '{p}' (allowed: hub, context7, devin, lint, lint_only)"
+                    ));
                 }
             }
         }
-        f
+        Ok(f)
     }
 }
 
@@ -385,12 +404,8 @@ fn register_single_preload(
 fn inject_config_preloads(lua: &Lua, config_path: &str) -> Result<(), String> {
     let src = std::fs::read_to_string(config_path)
         .map_err(|e| format!("gendoc: config_path '{config_path}' load failed: {e}"))?;
-    let chunk_name = format!("@gendoc-config:{config_path}");
-    let config_table: Table = lua
-        .load(&src)
-        .set_name(chunk_name)
-        .eval()
-        .map_err(|e| format!("gendoc: config_path '{config_path}' eval failed: {e}"))?;
+    let config: GendocConfig = toml::from_str(&src)
+        .map_err(|e| format!("gendoc: config_path '{config_path}' parse failed: {e}"))?;
 
     // Move the two sub-tables into the Lua registry via globals
     // stashes so the preload closures can retrieve them on require.
@@ -401,7 +416,7 @@ fn inject_config_preloads(lua: &Lua, config_path: &str) -> Result<(), String> {
     inject_config_subtable(
         lua,
         &preload,
-        &config_table,
+        config.context7,
         "context7",
         "_gendoc_context7_config",
         "tools.docs.context7_config",
@@ -409,7 +424,7 @@ fn inject_config_preloads(lua: &Lua, config_path: &str) -> Result<(), String> {
     inject_config_subtable(
         lua,
         &preload,
-        &config_table,
+        config.devin,
         "devin",
         "_gendoc_devin_config",
         "tools.docs.devin_wiki_config",
@@ -418,40 +433,89 @@ fn inject_config_preloads(lua: &Lua, config_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Stash the `key` sub-table from `config_table` into a Lua global
+/// Stash the `key` sub-table into a Lua global
 /// and register a `package.preload` loader that returns it.
 ///
-/// - Missing key (`Value::Nil`) is a legitimate caller choice: the
+/// - Missing key (`None`) is a legitimate caller choice: the
 ///   preload entry is simply omitted so a downstream `require` of
 ///   `module_name` raises Lua's standard "module not found" error
 ///   (clearer than registering a Nil loader that produces an opaque
 ///   nil-index error).
-/// - Non-nil, non-table values are rejected up front with an
+/// - Non-table values are rejected up front with an
 ///   explicit `Err` — far more actionable than letting the Lua side
 ///   try to index a string/number later.
 fn inject_config_subtable(
     lua: &Lua,
     preload: &Table,
-    config_table: &Table,
+    value: Option<toml::Value>,
     key: &'static str,
     global_key: &'static str,
     module_name: &'static str,
 ) -> Result<(), String> {
-    let value: Value = config_table
-        .get(key)
-        .map_err(|e| format!("gendoc: config_table.get {key:?} failed: {e}"))?;
     match value {
-        Value::Nil => Ok(()),
-        Value::Table(_) => {
-            lua.globals()
-                .set(global_key, value)
-                .map_err(|e| format!("gendoc: stash {global_key} failed: {e}"))?;
-            register_config_loader(lua, preload, module_name, global_key)
+        None => Ok(()),
+        Some(v) => {
+            let lua_value = toml_to_lua_value(lua, &v)
+                .map_err(|e| format!("gendoc: config '{key}' conversion failed: {e}"))?;
+            match lua_value {
+                Value::Table(_) => {
+                    lua.globals()
+                        .set(global_key, lua_value)
+                        .map_err(|e| format!("gendoc: stash {global_key} failed: {e}"))?;
+                    register_config_loader(lua, preload, module_name, global_key)
+                }
+                other => Err(format!(
+                    "gendoc: config '{key}' must be a table, got {}",
+                    other.type_name()
+                )),
+            }
         }
-        other => Err(format!(
-            "gendoc: config '{key}' must be a table, got {}",
-            other.type_name()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GendocConfig {
+    context7: Option<toml::Value>,
+    devin: Option<toml::Value>,
+}
+
+fn toml_to_lua_value(lua: &Lua, value: &toml::Value) -> Result<Value, String> {
+    match value {
+        toml::Value::String(s) => Ok(Value::String(
+            lua.create_string(s)
+                .map_err(|e| format!("create string failed: {e}"))?,
         )),
+        toml::Value::Integer(i) => Ok(Value::Integer(*i)),
+        toml::Value::Float(f) => Ok(Value::Number(*f)),
+        toml::Value::Boolean(b) => Ok(Value::Boolean(*b)),
+        toml::Value::Datetime(dt) => Ok(Value::String(
+            lua.create_string(dt.to_string())
+                .map_err(|e| format!("create datetime string failed: {e}"))?,
+        )),
+        toml::Value::Array(arr) => {
+            let table = lua
+                .create_table()
+                .map_err(|e| format!("create array table failed: {e}"))?;
+            for (idx, item) in arr.iter().enumerate() {
+                let v = toml_to_lua_value(lua, item)?;
+                table
+                    .set((idx + 1) as i64, v)
+                    .map_err(|e| format!("set array item [{idx}] failed: {e}"))?;
+            }
+            Ok(Value::Table(table))
+        }
+        toml::Value::Table(map) => {
+            let table = lua
+                .create_table()
+                .map_err(|e| format!("create map table failed: {e}"))?;
+            for (k, v) in map {
+                let vv = toml_to_lua_value(lua, v)?;
+                table
+                    .set(k.as_str(), vv)
+                    .map_err(|e| format!("set map key '{k}' failed: {e}"))?;
+            }
+            Ok(Value::Table(table))
+        }
     }
 }
 
@@ -643,7 +707,7 @@ mod tests {
 
     #[test]
     fn projection_flags_defaults_are_false() {
-        let f = ProjectionFlags::from_list(None);
+        let f = ProjectionFlags::from_list(None).expect("projection parse");
         assert!(!f.hub);
         assert!(!f.context7);
         assert!(!f.devin);
@@ -658,7 +722,7 @@ mod tests {
             "context7".to_string(),
             "devin".to_string(),
         ];
-        let f = ProjectionFlags::from_list(Some(&list));
+        let f = ProjectionFlags::from_list(Some(&list)).expect("projection parse");
         assert!(f.hub);
         assert!(f.context7);
         assert!(f.devin);
@@ -668,17 +732,16 @@ mod tests {
     #[test]
     fn projection_flags_lint_only_implies_lint() {
         let list = vec!["lint_only".to_string()];
-        let f = ProjectionFlags::from_list(Some(&list));
+        let f = ProjectionFlags::from_list(Some(&list)).expect("projection parse");
         assert!(f.lint);
         assert!(f.lint_only);
     }
 
     #[test]
-    fn projection_flags_ignore_unknown() {
+    fn projection_flags_unknown_is_rejected() {
         let list = vec!["nope".to_string(), "hub".to_string()];
-        let f = ProjectionFlags::from_list(Some(&list));
-        assert!(f.hub);
-        assert!(!f.context7);
+        let err = ProjectionFlags::from_list(Some(&list)).expect_err("must reject unknown");
+        assert!(err.contains("unknown projection"));
     }
 
     #[test]
@@ -689,7 +752,7 @@ mod tests {
         // return in `hub_gendoc`. Directly calling `hub_gendoc`
         // would require a full test fixture — covered in e2e.
         let list = vec!["context7".to_string()];
-        let flags = ProjectionFlags::from_list(Some(&list));
+        let flags = ProjectionFlags::from_list(Some(&list)).expect("projection parse");
         assert!(flags.context7);
         // Simulate the guard:
         let err_expected =

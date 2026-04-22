@@ -372,9 +372,12 @@ pub trait EngineApi: Send + Sync {
     /// - `"lint"`      → run V0 lint pass (warnings only)
     /// - `"lint_only"` → run lint, skip file generation
     ///
-    /// `config_path` points at a Lua file returning a table
-    /// `{ context7 = {...}, devin = {...} }`. It is required only when
+    /// `config_path` points at a TOML file with top-level
+    /// `[context7]` / `[devin]` tables. It is required only when
     /// `projections` includes `"context7"` or `"devin"`.
+    ///
+    /// Projection names are validated strictly and unknown values are
+    /// rejected with `Err("gendoc: unknown projection ...")`.
     ///
     /// `lint_strict = true` upgrades lint errors to a hard failure
     /// (equivalent to the `--strict` CLI flag).

@@ -597,10 +597,11 @@ pub struct HubGendocParams {
     pub out_dir: Option<String>,
     /// Projections to emit. Any subset of
     /// `["hub", "context7", "devin", "lint", "lint_only"]`.
+    /// Unknown values are rejected with a typed `gendoc:` error.
     /// When omitted, only `narrative/{pkg}.md` + `llms.txt` +
     /// `llms-full.txt` are produced.
     pub projections: Option<Vec<String>>,
-    /// Path to a Lua file returning `{ context7 = {...}, devin = {...} }`.
+    /// Path to a TOML file with top-level `[context7]` / `[devin]` tables.
     /// Required when `projections` includes `"context7"` or `"devin"`.
     pub config_path: Option<String>,
     /// Treat lint errors as a hard failure (equivalent to `--strict`).
@@ -619,8 +620,9 @@ pub struct HubDistParams {
     /// Defaults to `{source_dir}/docs`.
     pub out_dir: Option<String>,
     /// Projections to emit (see `alc_hub_gendoc`).
+    /// Unknown values are rejected with a typed `gendoc:` error.
     pub projections: Option<Vec<String>>,
-    /// Path to a Lua config file (see `alc_hub_gendoc`). Required
+    /// Path to a TOML config file (see `alc_hub_gendoc`). Required
     /// when `projections` includes `"context7"` or `"devin"`.
     pub config_path: Option<String>,
     /// Treat lint errors as a hard failure (see `alc_hub_gendoc`).

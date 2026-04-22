@@ -1112,18 +1112,21 @@ return M
     )
     .expect("write init.lua");
 
-    // Optional config file (not used unless projections include
+    // Optional TOML config (not used unless projections include
     // context7/devin). Kept around so tests can opt into config-
     // requiring projections without re-writing the fixture.
     std::fs::write(
-        tmp.path().join("configs.lua"),
-        r#"return {
-  context7 = { projectTitle = "test", description = "test", rules = {} },
-  devin = { project_name = "test" },
-}
+        tmp.path().join("configs.toml"),
+        r#"[context7]
+projectTitle = "test"
+description = "test"
+rules = []
+
+[devin]
+project_name = "test"
 "#,
     )
-    .expect("write configs.lua");
+    .expect("write configs.toml");
 
     tmp
 }
@@ -1213,6 +1216,56 @@ async fn test_alc_hub_gendoc_ok() {
     client.cancel().await.expect("cancel failed");
 }
 
+#[tokio::test]
+async fn test_alc_hub_gendoc_with_toml_config_context7() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let config_path = tmp
+        .path()
+        .join("configs.toml")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // gendoc requires an existing hub_index.json in source_dir.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let _resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir.clone(),
+            "projections": ["context7"],
+            "config_path": config_path,
+        }),
+    )
+    .await;
+
+    let context7_json = tmp.path().join("context7.json");
+    assert!(
+        context7_json.exists(),
+        "expected context7 projection to be generated at {}",
+        context7_json.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Typed-error case: requesting the `context7` projection without a
 /// `config_path` must surface as a handler-level error (MCP caller sees
 /// `is_error=true` + text mentioning `config_path`).
@@ -1261,6 +1314,59 @@ async fn test_alc_hub_gendoc_missing_config() {
             assert!(
                 text.contains("config_path"),
                 "expected error text to mention config_path, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_gendoc_unknown_projection_rejected() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Need a hub_index.json first so projection validation is evaluated
+    // in the normal gendoc flow.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_gendoc",
+            json!({
+                "source_dir": source_dir,
+                "projections": ["unknown_projection"],
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for unknown projection, got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("unknown projection"),
+                "expected unknown projection error text, got: {text}"
             );
         }
         Err(e) => panic!("unexpected call_tool Err: {e}"),
@@ -1321,6 +1427,145 @@ async fn test_alc_hub_dist_ok() {
         gendoc.get("stdout").is_some(),
         "dist.gendoc must include stdout field",
     );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_dist_with_toml_config_context7() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let config_path = tmp
+        .path()
+        .join("configs.toml")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    let _resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir": source_dir,
+            "output_path": output_path,
+            "projections": ["context7"],
+            "config_path": config_path,
+        }),
+    )
+    .await;
+
+    let context7_json = tmp.path().join("context7.json");
+    assert!(
+        context7_json.exists(),
+        "expected context7 projection to be generated at {}",
+        context7_json.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_dist_gendoc_failure_includes_reindex_result() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Reindex should succeed, then gendoc should fail because context7
+    // projection requires config_path.
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_dist",
+            json!({
+                "source_dir": source_dir,
+                "output_path": output_path,
+                "projections": ["context7"],
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true when gendoc fails after reindex, got: is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("dist: gendoc failed"),
+                "expected dist gendoc failure prefix, got: {text}"
+            );
+            assert!(
+                text.contains("reindex result (succeeded):"),
+                "expected reindex result to be embedded in error text, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_gendoc_rejects_unknown_projection() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_gendoc",
+            json!({
+                "source_dir": source_dir,
+                "projections": ["contex7"],
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for unknown projection, got: is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("unknown projection"),
+                "expected unknown projection message, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
 
     client.cancel().await.expect("cancel failed");
 }

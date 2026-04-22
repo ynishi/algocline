@@ -16,7 +16,10 @@
 //!   dependency used by `extract.lua` / `projections.lua` etc.) are
 //!   satisfied by minimal stubs — `gen_docs` only uses them for
 //!   shape-validation side effects that are not load-bearing for the
-//!   artifacts.
+//!   artifacts. Stubs must still load real `init.lua` files: packages
+//!   import `local T = S.T`, chain `:describe`, and wrap entrypoints with
+//!   `S.instrument`; `alc_shapes.t` must expose at least `boolean` /
+//!   `table` alongside `string` / `number` / `bool`.
 //! - `config_path` (optional) is a caller-supplied TOML file with
 //!   top-level `[context7]` and/or `[devin]` tables. When supplied,
 //!   those `context7` / `devin` tables are exposed under the
@@ -60,13 +63,21 @@ const LUA_DOCS_ENTITY_SCHEMAS: &str = include_str!("lua/gendoc/docs/entity_schem
 /// authoritative validation lives in the bundled-packages CI, not in
 /// the embedded runner. The surface required by the embedded docs
 /// modules is limited to `check` / `assert_dev` / `fields` /
-/// `infer`.
+/// `infer`, plus `T` / `instrument` for real bundled `init.lua` loads.
 const LUA_ALC_SHAPES_STUB: &str = r#"
 local M = {}
+-- Bundled packages use `local S = require("alc_shapes"); local T = S.T` and
+-- `M.run = S.instrument(M, "run")` at module tail — the publish-time VM must
+-- satisfy both without loading the full alc_shapes tree from disk.
+local t = require("alc_shapes.t")
+M.T = t
 M.check = function(_v, _schema, _opts) return true, nil end
 M.assert_dev = function(_v, _schema, _opts) return true end
 M.fields = function(schema) return (schema and schema.fields) or {} end
 M.infer = function(v) return v end
+M.instrument = function(mod, entry_name, _spec)
+    return mod[entry_name]
+end
 return M
 "#;
 
@@ -85,21 +96,31 @@ local T = {}
 -- Method table installed on every schema object. `is_optional()`
 -- wraps the receiver in an optional variant (used by
 -- entity_schemas.lua for structurally-optional fields).
+--
+-- `make_schema` MUST be declared before `schema_mt.__index`: Lua does not
+-- back-patch closures created earlier in the chunk, so `describe` would
+-- otherwise resolve `make_schema` as a (nil) global.
 local schema_mt = {}
+local function make_schema(tbl)
+    return setmetatable(tbl, schema_mt)
+end
+
 schema_mt.__index = {
     is_optional = function(self)
         return setmetatable({ kind = "optional", inner = self }, schema_mt)
     end,
+    describe = function(self, text)
+        return make_schema({ kind = "described", inner = self, desc = text })
+    end,
 }
-
-local function make_schema(tbl)
-    return setmetatable(tbl, schema_mt)
-end
 
 T.any    = make_schema({ kind = "any" })
 T.string = make_schema({ kind = "prim", name = "string" })
 T.number = make_schema({ kind = "prim", name = "number" })
 T.bool   = make_schema({ kind = "prim", name = "bool" })
+-- Bundled packages use the Malli-style names from `alc_shapes.t`.
+T.boolean = make_schema({ kind = "prim", name = "boolean" })
+T.table   = make_schema({ kind = "prim", name = "table" })
 -- Aliases occasionally used by older docs modules.
 T.str    = T.string
 T.num    = T.number

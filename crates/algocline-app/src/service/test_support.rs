@@ -14,11 +14,12 @@ pub(super) async fn make_app_service() -> AppService {
 
 /// Build a minimal `AppService` with custom search paths.
 ///
-/// Goes through `AppService::new` so that the `state_store` / `card_store`
-/// fields added in Subtask 2a are populated from `log_config.app_dir()`.
-/// Subtask 2c formalises tempdir-backed `app_dir` for test isolation; until
-/// then `AppConfig::default()` points at a relative `./.algocline/`, which is
-/// enough for call-sites that never exercise `alc.state.*` / `alc.card.*`.
+/// Uses `AppConfig::from_env()` as the base so tests running under
+/// `FakeHome` pick up the tempdir `$HOME` the guard installed — the Service
+/// layer no longer reads `HOME` directly (Subtask 2b Inv-1), every path
+/// flows from `AppConfig::app_dir()`. Subtask 2c replaces this indirection
+/// with an explicit tempdir override so `FakeHome` / `HOME_MUTEX` can be
+/// retired (軸 A).
 pub(super) async fn make_app_service_with_search_paths(
     search_paths: Vec<SearchPath>,
 ) -> AppService {
@@ -27,13 +28,10 @@ pub(super) async fn make_app_service_with_search_paths(
             .await
             .expect("executor"),
     );
-    let log_config = AppConfig {
-        log_dir: None,
-        log_dir_source: LogDirSource::None,
-        log_enabled: false,
-        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
-        ..Default::default()
-    };
+    let mut log_config = AppConfig::from_env();
+    log_config.log_dir = None;
+    log_config.log_dir_source = LogDirSource::None;
+    log_config.log_enabled = false;
     AppService::new(executor, log_config, search_paths)
 }
 

@@ -98,7 +98,7 @@ impl AppService {
             let mode = detect_mode(&source)?;
 
             // 3. Get packages_dir.
-            let pkgs = packages_dir()?;
+            let pkgs = packages_dir(&self.log_config.app_dir());
             std::fs::create_dir_all(&pkgs)
                 .map_err(|e| format!("Cannot create packages dir {}: {e}", pkgs.display()))?;
 

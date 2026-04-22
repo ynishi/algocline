@@ -41,9 +41,10 @@ impl AppService {
         project_root: Option<String>,
     ) -> Result<String, String> {
         // Auto-install bundled packages if the requested strategy is missing
-        if !is_package_installed(strategy) {
+        let app_dir = self.log_config.app_dir();
+        if !is_package_installed(&app_dir, strategy) {
             self.auto_install_bundled_packages().await?;
-            if !is_package_installed(strategy) {
+            if !is_package_installed(&app_dir, strategy) {
                 return Err(format!(
                     "Package '{strategy}' not found after installing bundled collection. \
                      Use alc_pkg_install to install it manually."
@@ -150,7 +151,7 @@ impl AppService {
             map.remove(session_id)
         };
         if let Some(strategy) = info {
-            super::eval_store::save_eval_result(&strategy, result_json);
+            super::eval_store::save_eval_result(&self.log_config.app_dir(), &strategy, result_json);
         }
     }
 

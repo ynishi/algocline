@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use algocline_core::AppDir;
 use serde::{Deserialize, Serialize};
 
 use super::source::PackageSource;
@@ -41,15 +42,13 @@ pub(crate) struct Manifest {
 
 // ─── Paths ─────────────────────────────────────────────────────
 
-fn manifest_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("installed.json"))
+fn manifest_path(app_dir: &AppDir) -> PathBuf {
+    app_dir.installed_json()
 }
 
 /// Path to the advisory lock companion file for the manifest.
-fn manifest_lock_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("installed.json.lock"))
+fn manifest_lock_path(app_dir: &AppDir) -> PathBuf {
+    app_dir.installed_json().with_extension("json.lock")
 }
 
 /// Execute `f` while holding an exclusive `flock` on the manifest's
@@ -68,19 +67,19 @@ fn manifest_lock_path() -> Result<PathBuf, String> {
 /// unwinding runs `File`'s destructor, which calls `close(2)` and thus
 /// releases the advisory `flock`. The explicit `drop(file)` after `f`
 /// is just ordering insurance for the success path.
-fn with_manifest_lock<F, R>(f: F) -> Result<R, String>
+fn with_manifest_lock<F, R>(app_dir: &AppDir, f: F) -> Result<R, String>
 where
     F: FnOnce() -> Result<R, String>,
 {
-    let lock_path = manifest_lock_path()?;
+    let lock_path = manifest_lock_path(app_dir);
     crate::service::lock::with_exclusive_lock(&lock_path, f)
 }
 
 // ─── Read / Write ──────────────────────────────────────────────
 
 /// Load the manifest from disk. Returns empty manifest if file is missing.
-pub(crate) fn load_manifest() -> Result<Manifest, String> {
-    let path = manifest_path()?;
+pub(crate) fn load_manifest(app_dir: &AppDir) -> Result<Manifest, String> {
+    let path = manifest_path(app_dir);
     if !path.exists() {
         return Ok(Manifest::default());
     }
@@ -98,8 +97,8 @@ pub(crate) fn load_manifest() -> Result<Manifest, String> {
 /// written JSON document. Without the temp-and-rename dance, a concurrent
 /// reader could see a truncated file between `open(TRUNC)` and the final
 /// `write`, producing a spurious "Failed to parse manifest" error.
-fn save_manifest(manifest: &Manifest) -> Result<(), String> {
-    let path = manifest_path()?;
+fn save_manifest(app_dir: &AppDir, manifest: &Manifest) -> Result<(), String> {
+    let path = manifest_path(app_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create manifest dir: {e}"))?;
@@ -173,12 +172,13 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 ///
 /// `version` is extracted from the package's `M.meta.version` field if provided.
 pub(crate) fn record_install(
+    app_dir: &AppDir,
     name: &str,
     version: Option<&str>,
     source: PackageSource,
 ) -> Result<(), String> {
-    with_manifest_lock(|| {
-        let mut manifest = load_manifest()?;
+    with_manifest_lock(app_dir, || {
+        let mut manifest = load_manifest(app_dir)?;
         let now = now_iso8601();
 
         manifest
@@ -198,17 +198,21 @@ pub(crate) fn record_install(
                 updated_at: now,
             });
 
-        save_manifest(&manifest)
+        save_manifest(app_dir, &manifest)
     })
 }
 
 /// Record a batch of installs (e.g. collection mode).
-pub(crate) fn record_install_batch(names: &[String], source: PackageSource) -> Result<(), String> {
+pub(crate) fn record_install_batch(
+    app_dir: &AppDir,
+    names: &[String],
+    source: PackageSource,
+) -> Result<(), String> {
     if names.is_empty() {
         return Ok(());
     }
-    with_manifest_lock(|| {
-        let mut manifest = load_manifest()?;
+    with_manifest_lock(app_dir, || {
+        let mut manifest = load_manifest(app_dir)?;
         let now = now_iso8601();
 
         for name in names {
@@ -227,17 +231,17 @@ pub(crate) fn record_install_batch(names: &[String], source: PackageSource) -> R
                 });
         }
 
-        save_manifest(&manifest)
+        save_manifest(app_dir, &manifest)
     })
 }
 
 /// Remove a package from the manifest (`installed.json`). Used by
 /// `pkg_remove` scope `"global"` / `"all"`.
-pub(crate) fn record_remove(name: &str) -> Result<(), String> {
-    with_manifest_lock(|| {
-        let mut manifest = load_manifest()?;
+pub(crate) fn record_remove(app_dir: &AppDir, name: &str) -> Result<(), String> {
+    with_manifest_lock(app_dir, || {
+        let mut manifest = load_manifest(app_dir)?;
         manifest.packages.remove(name);
-        save_manifest(&manifest)
+        save_manifest(app_dir, &manifest)
     })
 }
 
@@ -377,7 +381,11 @@ mod tests {
         // conditional assignment, re-installing a git-cloned single pkg
         // (which passes `version = None`) silently erased the stored version
         // displayed by `pkg_list`. Guarantee: `None` preserves; `Some` overwrites.
-        let _fake_home = super::super::test_support::FakeHome::new();
+        //
+        // Uses a tempdir-rooted `AppDir` directly so the test does not rely on
+        // the `FakeHome` HOME_MUTEX (軸 A defer).
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
 
         let git_src = || PackageSource::Git {
             url: "https://github.com/ynishi/algocline-bundled-packages".to_string(),
@@ -385,16 +393,16 @@ mod tests {
         };
 
         // Seed: insert an entry with a known version.
-        record_install("cot", Some("0.1.0"), git_src()).unwrap();
-        let before = load_manifest().unwrap();
+        record_install(&app_dir, "cot", Some("0.1.0"), git_src()).unwrap();
+        let before = load_manifest(&app_dir).unwrap();
         assert_eq!(
             before.packages.get("cot").unwrap().version.as_deref(),
             Some("0.1.0")
         );
 
         // Re-install with `None` — should keep "0.1.0", not clobber.
-        record_install("cot", None, git_src()).unwrap();
-        let after_none = load_manifest().unwrap();
+        record_install(&app_dir, "cot", None, git_src()).unwrap();
+        let after_none = load_manifest(&app_dir).unwrap();
         assert_eq!(
             after_none.packages.get("cot").unwrap().version.as_deref(),
             Some("0.1.0"),
@@ -402,8 +410,8 @@ mod tests {
         );
 
         // Re-install with `Some("0.2.0")` — should overwrite.
-        record_install("cot", Some("0.2.0"), git_src()).unwrap();
-        let after_some = load_manifest().unwrap();
+        record_install(&app_dir, "cot", Some("0.2.0"), git_src()).unwrap();
+        let after_some = load_manifest(&app_dir).unwrap();
         assert_eq!(
             after_some.packages.get("cot").unwrap().version.as_deref(),
             Some("0.2.0"),

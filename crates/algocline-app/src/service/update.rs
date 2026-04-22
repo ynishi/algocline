@@ -16,7 +16,7 @@ impl AppService {
         let toml = load_alc_toml(&root)?
             .ok_or_else(|| "alc.toml not found at resolved project root".to_string())?;
 
-        let pkg_dir = packages_dir()?;
+        let pkg_dir = packages_dir(&self.log_config.app_dir());
         let mut resolved: Vec<LockPackage> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
 

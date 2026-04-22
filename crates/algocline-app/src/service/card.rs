@@ -204,7 +204,7 @@ impl AppService {
         }
 
         // Register source for Hub index discovery
-        hub::register_source(source, "card_install");
+        hub::register_source(&self.log_config.app_dir(), source, "card_install");
 
         let response = serde_json::json!({
             "installed_cards": all_imported,

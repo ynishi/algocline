@@ -15,7 +15,7 @@ impl AppService {
     pub async fn pkg_unlink(&self, name: String) -> Result<String, String> {
         validate_package_name(&name)?;
 
-        let pkgs = packages_dir()?;
+        let pkgs = packages_dir(&self.log_config.app_dir());
         let dest = pkgs.join(&name);
 
         // Use symlink_metadata so dangling symlinks are also detected.

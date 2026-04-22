@@ -201,11 +201,9 @@ impl AppService {
         info["search_paths"] = serde_json::json!(search_paths_json);
 
         // packages dir (kept for backward compatibility)
-        if let Some(home) = dirs::home_dir() {
-            let packages = home.join(".algocline").join("packages");
-            if packages.is_dir() {
-                info["packages_dir"] = serde_json::json!(packages.display().to_string());
-            }
+        let packages = self.log_config.app_dir().packages_dir();
+        if packages.is_dir() {
+            info["packages_dir"] = serde_json::json!(packages.display().to_string());
         }
 
         serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())

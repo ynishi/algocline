@@ -42,6 +42,92 @@ pub(crate) struct Manifest {
     pub packages: BTreeMap<String, ManifestEntry>,
 }
 
+// ─── Typed error ──────────────────────────────────────────────
+//
+// `InstalledManifestStoreError` classifies the ways `installed.json`
+// CRUD can fail. The variants carry the path and the underlying cause
+// (`std::io::Error` / `serde_json::Error` / lock subsystem message) so
+// callers — and, via the `From` bridge below, the MCP wire response —
+// can tell a missing-file case (which we normalise to an empty
+// `Manifest` at the `load` layer) from a corrupt-JSON case from a
+// locked-file case.
+//
+// The `From<InstalledManifestStoreError> for String` bridge keeps the
+// existing service-layer `Result<_, String>` surfaces compiling; each
+// caller's `?` runs through this conversion at the call site. Upgrading
+// the service layer to its own typed `Result<_, ServiceError>` (and
+// re-threading the error through the MCP wire layer) is tracked as the
+// follow-up to Issue `1776825898-48820`.
+
+/// CRUD failure modes for the installed-packages manifest.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InstalledManifestStoreError {
+    /// Failed to read `installed.json`. Distinct from "file absent" —
+    /// that case is normalised to an empty `Manifest` at the `load`
+    /// boundary and never reaches this variant.
+    #[error("failed to read installed manifest at {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to parse `installed.json` as JSON. Indicates on-disk
+    /// corruption or a hand-edit that violated the schema.
+    #[error("failed to parse installed manifest at {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Failed to serialise the in-memory `Manifest` to JSON. Indicates
+    /// a programming error (non-representable value) — the serde model
+    /// is total under normal use.
+    #[error("failed to serialize installed manifest: {source}")]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Failed to create the parent directory for `installed.json`.
+    #[error("failed to create installed manifest directory at {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to write the temp file that precedes the atomic rename.
+    #[error("failed to write installed manifest temp file at {path}: {source}")]
+    WriteTmp {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to atomically rename the temp file into `installed.json`.
+    #[error("failed to atomically rename installed manifest onto {path}: {source}")]
+    Rename {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The advisory lock subsystem (`service::lock::with_exclusive_lock`)
+    /// returned an error. We carry its message verbatim until the lock
+    /// subsystem is also typed.
+    #[error("installed manifest lock failed at {path}: {message}")]
+    Lock { path: PathBuf, message: String },
+}
+
+/// Bridge for callers still on `Result<_, String>`. Each service-layer
+/// caller's `?` runs through this conversion, so a corrupt
+/// `installed.json` surfaces as a populated error string on the MCP
+/// wire response rather than degrading silently. The conversion is one
+/// way: the service layer loses variant identity, but a future upgrade
+/// to a typed service error can absorb `InstalledManifestStoreError`
+/// through `#[from]` without a call-site churn.
+impl From<InstalledManifestStoreError> for String {
+    fn from(e: InstalledManifestStoreError) -> Self {
+        e.to_string()
+    }
+}
+
 // ─── Store trait ──────────────────────────────────────────────
 //
 // `InstalledManifestStore` abstracts the `installed.json` CRUD surface so
@@ -77,8 +163,8 @@ pub(crate) struct Manifest {
 /// symlink registry).
 pub(crate) trait InstalledManifestStore: Send + Sync {
     /// Load the manifest. Returns an empty manifest if the backing store
-    /// is missing.
-    fn load(&self) -> Result<Manifest, String>;
+    /// is missing; I/O / parse failures are returned as typed errors.
+    fn load(&self) -> Result<Manifest, InstalledManifestStoreError>;
 
     /// Record a successful install / update (see `record_install` free-fn
     /// docs for semantics).
@@ -87,14 +173,18 @@ pub(crate) trait InstalledManifestStore: Send + Sync {
         name: &str,
         version: Option<&str>,
         source: PackageSource,
-    ) -> Result<(), String>;
+    ) -> Result<(), InstalledManifestStoreError>;
 
     /// Batch variant of `record_install`.
-    fn record_install_batch(&self, names: &[String], source: PackageSource) -> Result<(), String>;
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError>;
 
     /// Remove a package from the manifest (used by `pkg_remove` scope
     /// `"global"` / `"all"`).
-    fn record_remove(&self, name: &str) -> Result<(), String>;
+    fn record_remove(&self, name: &str) -> Result<(), InstalledManifestStoreError>;
 }
 
 // ─── FS-backed impl ───────────────────────────────────────────
@@ -124,45 +214,76 @@ impl FsInstalledManifestStore {
         self.app_dir.installed_json().with_extension("json.lock")
     }
 
-    fn with_lock<F, R>(&self, f: F) -> Result<R, String>
+    /// Run `f` under an exclusive advisory file lock on the companion
+    /// `.lock` path. Wraps the lock subsystem's stringly-typed errors
+    /// into the typed `Lock` variant; `f`'s own errors (already typed)
+    /// are passed through.
+    fn with_lock<F, R>(&self, f: F) -> Result<R, InstalledManifestStoreError>
     where
-        F: FnOnce() -> Result<R, String>,
+        F: FnOnce() -> Result<R, InstalledManifestStoreError>,
     {
         let lock_path = self.manifest_lock_path();
-        crate::service::lock::with_exclusive_lock(&lock_path, f)
+        // `with_exclusive_lock` encodes both its own acquisition errors
+        // and the inner closure's error as `String`. We cannot tell
+        // them apart after the fact, so we return the whole string
+        // under the `Lock` variant. Once the lock subsystem is typed,
+        // this merging can be replaced with `#[from]` absorption.
+        crate::service::lock::with_exclusive_lock(&lock_path, || {
+            f().map_err(|e| e.to_string())
+        })
+        .map_err(|message| InstalledManifestStoreError::Lock {
+            path: lock_path.clone(),
+            message,
+        })
     }
 
-    fn save(&self, manifest: &Manifest) -> Result<(), String> {
+    fn save(&self, manifest: &Manifest) -> Result<(), InstalledManifestStoreError> {
         let path = self.manifest_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create manifest dir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|source| {
+                InstalledManifestStoreError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
         }
         let content = serde_json::to_string_pretty(manifest)
-            .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
+            .map_err(|source| InstalledManifestStoreError::Serialize { source })?;
 
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &content)
-            .map_err(|e| format!("Failed to write manifest temp file {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| {
+        std::fs::write(&tmp, &content).map_err(|source| {
+            InstalledManifestStoreError::WriteTmp {
+                path: tmp.clone(),
+                source,
+            }
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|source| {
+            // Best-effort cleanup: the tmp file's presence is not a
+            // correctness hazard (next `save` overwrites it) but
+            // leaving it behind clutters the app dir.
             let _ = std::fs::remove_file(&tmp);
-            format!(
-                "Failed to atomically rename manifest temp onto {}: {e}",
-                path.display()
-            )
+            InstalledManifestStoreError::Rename {
+                path: path.clone(),
+                source,
+            }
         })
     }
 }
 
 impl InstalledManifestStore for FsInstalledManifestStore {
-    fn load(&self) -> Result<Manifest, String> {
+    fn load(&self) -> Result<Manifest, InstalledManifestStoreError> {
         let path = self.manifest_path();
         if !path.exists() {
             return Ok(Manifest::default());
         }
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| format!("Failed to read manifest: {e}"))?;
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
+        let content = std::fs::read_to_string(&path).map_err(|source| {
+            InstalledManifestStoreError::Read {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        serde_json::from_str(&content)
+            .map_err(|source| InstalledManifestStoreError::Parse { path, source })
     }
 
     fn record_install(
@@ -170,7 +291,7 @@ impl InstalledManifestStore for FsInstalledManifestStore {
         name: &str,
         version: Option<&str>,
         source: PackageSource,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstalledManifestStoreError> {
         self.with_lock(|| {
             let mut manifest = self.load()?;
             let now = now_iso8601();
@@ -196,7 +317,11 @@ impl InstalledManifestStore for FsInstalledManifestStore {
         })
     }
 
-    fn record_install_batch(&self, names: &[String], source: PackageSource) -> Result<(), String> {
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError> {
         if names.is_empty() {
             return Ok(());
         }
@@ -224,7 +349,7 @@ impl InstalledManifestStore for FsInstalledManifestStore {
         })
     }
 
-    fn record_remove(&self, name: &str) -> Result<(), String> {
+    fn record_remove(&self, name: &str) -> Result<(), InstalledManifestStoreError> {
         self.with_lock(|| {
             let mut manifest = self.load()?;
             manifest.packages.remove(name);
@@ -245,7 +370,7 @@ pub(crate) struct InMemoryInstalledManifestStore {
 
 #[cfg(test)]
 impl InstalledManifestStore for InMemoryInstalledManifestStore {
-    fn load(&self) -> Result<Manifest, String> {
+    fn load(&self) -> Result<Manifest, InstalledManifestStoreError> {
         Ok(self.data.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
@@ -254,7 +379,7 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
         name: &str,
         version: Option<&str>,
         source: PackageSource,
-    ) -> Result<(), String> {
+    ) -> Result<(), InstalledManifestStoreError> {
         let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_iso8601();
         guard
@@ -276,7 +401,11 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
         Ok(())
     }
 
-    fn record_install_batch(&self, names: &[String], source: PackageSource) -> Result<(), String> {
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError> {
         if names.is_empty() {
             return Ok(());
         }
@@ -300,7 +429,7 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
         Ok(())
     }
 
-    fn record_remove(&self, name: &str) -> Result<(), String> {
+    fn record_remove(&self, name: &str) -> Result<(), InstalledManifestStoreError> {
         let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
         guard.packages.remove(name);
         Ok(())
@@ -318,7 +447,9 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
 // refactor in this commit.
 
 /// Load the manifest from disk. Returns empty manifest if file is missing.
-pub(crate) fn load_manifest(app_dir: &AppDir) -> Result<Manifest, String> {
+pub(crate) fn load_manifest(
+    app_dir: &AppDir,
+) -> Result<Manifest, InstalledManifestStoreError> {
     FsInstalledManifestStore::new(app_dir.clone()).load()
 }
 
@@ -379,7 +510,7 @@ pub(crate) fn record_install(
     name: &str,
     version: Option<&str>,
     source: PackageSource,
-) -> Result<(), String> {
+) -> Result<(), InstalledManifestStoreError> {
     FsInstalledManifestStore::new(app_dir.clone()).record_install(name, version, source)
 }
 
@@ -388,25 +519,37 @@ pub(crate) fn record_install_batch(
     app_dir: &AppDir,
     names: &[String],
     source: PackageSource,
-) -> Result<(), String> {
+) -> Result<(), InstalledManifestStoreError> {
     FsInstalledManifestStore::new(app_dir.clone()).record_install_batch(names, source)
 }
 
 /// Remove a package from the manifest (`installed.json`). Used by
 /// `pkg_remove` scope `"global"` / `"all"`.
-pub(crate) fn record_remove(app_dir: &AppDir, name: &str) -> Result<(), String> {
+pub(crate) fn record_remove(
+    app_dir: &AppDir,
+    name: &str,
+) -> Result<(), InstalledManifestStoreError> {
     FsInstalledManifestStore::new(app_dir.clone()).record_remove(name)
 }
 
 /// Load manifest for test with custom path.
 #[cfg(test)]
-pub(crate) fn load_manifest_from(path: &std::path::Path) -> Result<Manifest, String> {
+pub(crate) fn load_manifest_from(
+    path: &std::path::Path,
+) -> Result<Manifest, InstalledManifestStoreError> {
     if !path.exists() {
         return Ok(Manifest::default());
     }
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read manifest: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
+    let content = std::fs::read_to_string(path).map_err(|source| {
+        InstalledManifestStoreError::Read {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    serde_json::from_str(&content).map_err(|source| InstalledManifestStoreError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

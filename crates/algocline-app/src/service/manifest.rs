@@ -549,10 +549,9 @@ mod tests {
     #[test]
     fn in_memory_installed_manifest_store_roundtrip() {
         // Demonstrates that `InMemoryInstalledManifestStore` satisfies the trait
-        // end-to-end without touching the filesystem, so future unit
-        // tests can exercise caller logic in parallel without the
-        // `FakeHome` + `HOME_MUTEX` serialisation the FS-backed repo
-        // currently forces.
+        // end-to-end without touching the filesystem, so unit tests can
+        // exercise caller logic in parallel against an in-memory backend
+        // when fs IO is not the property under test.
         let repo = InMemoryInstalledManifestStore::default();
         let git_src = || PackageSource::Git {
             url: "https://example.test/mock".to_string(),
@@ -697,9 +696,6 @@ mod tests {
         // conditional assignment, re-installing a git-cloned single pkg
         // (which passes `version = None`) silently erased the stored version
         // displayed by `pkg_list`. Guarantee: `None` preserves; `Some` overwrites.
-        //
-        // Uses a tempdir-rooted `AppDir` directly so the test does not rely on
-        // the `FakeHome` HOME_MUTEX (軸 A defer).
         let tmp = tempfile::tempdir().unwrap();
         let app_dir = AppDir::new(tmp.path().to_path_buf());
 

@@ -1,26 +1,51 @@
 //! Shared test helpers for `service` module tests.
+//!
+//! Every helper here roots the resulting `AppService` at an explicit
+//! tempdir via `AppConfig::with_app_dir`, so tests never read or write
+//! the developer's real `$HOME`. The no-arg `make_app_service()`
+//! variants leak a per-call tempdir guard with `mem::forget` — the OS
+//! reclaims the directory when the test binary exits, and concurrent
+//! tests get their own isolated roots without shared-state contention.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
-use super::config::{AppConfig, LogDirSource};
+use algocline_core::AppDir;
+
+use super::config::AppConfig;
 use super::resolve::SearchPath;
 use super::AppService;
 
-/// Build a minimal `AppService` for tests (no search paths).
+/// Build a minimal `AppService` for tests (no search paths). Roots the
+/// `AppDir` at a fresh leaked tempdir so the test never touches `$HOME`.
 pub(super) async fn make_app_service() -> AppService {
     make_app_service_with_search_paths(vec![]).await
 }
 
-/// Build a minimal `AppService` with custom search paths.
-///
-/// Uses `AppConfig::from_env()` as the base so tests running under
-/// `FakeHome` pick up the tempdir `$HOME` the guard installed — the Service
-/// layer no longer reads `HOME` directly (Subtask 2b Inv-1), every path
-/// flows from `AppConfig::app_dir()`. Subtask 2c replaces this indirection
-/// with an explicit tempdir override so `FakeHome` / `HOME_MUTEX` can be
-/// retired (軸 A).
+/// `make_app_service` with a custom package search path list.
 pub(super) async fn make_app_service_with_search_paths(
+    search_paths: Vec<SearchPath>,
+) -> AppService {
+    let tmp = tempfile::tempdir().expect("test tempdir");
+    let root = tmp.path().to_path_buf();
+    // Leak the guard so the dir survives for the test duration. The OS
+    // reclaims it when the test binary exits — equivalent lifetime to a
+    // `OnceLock`-backed shared dir, but per-call so concurrent tests
+    // do not race on shared paths.
+    std::mem::forget(tmp);
+    make_app_service_at_with_search_paths(root, search_paths).await
+}
+
+/// Build an `AppService` rooted at the caller-provided directory. Use
+/// when the test asserts on paths under the `AppDir` and therefore
+/// needs to know where the root lives.
+pub(super) async fn make_app_service_at(root: PathBuf) -> AppService {
+    make_app_service_at_with_search_paths(root, vec![]).await
+}
+
+/// `make_app_service_at` with a custom package search path list.
+pub(super) async fn make_app_service_at_with_search_paths(
+    root: PathBuf,
     search_paths: Vec<SearchPath>,
 ) -> AppService {
     let executor = Arc::new(
@@ -28,60 +53,17 @@ pub(super) async fn make_app_service_with_search_paths(
             .await
             .expect("executor"),
     );
-    let mut log_config = AppConfig::from_env();
-    log_config.log_dir = None;
-    log_config.log_dir_source = LogDirSource::None;
-    log_config.log_enabled = false;
+    let log_config = AppConfig::default().with_app_dir(root).with_log_disabled();
     AppService::new(executor, log_config, search_paths)
 }
 
-// Serialize tests that manipulate HOME to prevent races.
-static HOME_MUTEX: Mutex<()> = Mutex::new(());
-
-/// RAII guard that sets `HOME` to a fresh tempdir for the test duration.
-///
-/// Acquires `HOME_MUTEX` to prevent parallel tests from racing on the
-/// environment variable. Restores the previous value on drop.
-///
-/// Works with `#[tokio::test]` — unlike the closure-based `with_fake_home`,
-/// this does not force `block_on` nesting.
-pub(super) struct FakeHome {
-    _tmp: tempfile::TempDir,
-    _lock: MutexGuard<'static, ()>,
-    prev: Option<String>,
-    /// The temporary home directory path.
-    pub home: PathBuf,
+/// Build an `AppDir` rooted at `root`. Tiny helper to keep tests from
+/// importing `algocline_core::AppDir` directly when they only need it
+/// to drive a free-fn that takes `&AppDir`.
+pub(super) fn test_app_dir(root: &std::path::Path) -> AppDir {
+    AppDir::new(root.to_path_buf())
 }
 
-impl FakeHome {
-    pub(super) fn new() -> Self {
-        let lock = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("HOME").ok();
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        std::env::set_var("HOME", &home);
-        Self {
-            _tmp: tmp,
-            _lock: lock,
-            prev,
-            home,
-        }
-    }
-}
-
-impl Drop for FakeHome {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-}
-
-/// Acquire the HOME mutex without changing HOME.
-///
-/// Use this in tests that read HOME (e.g. `is_package_installed`) to ensure
-/// they do not run while a `FakeHome` is active.
-pub(super) fn lock_home() -> MutexGuard<'static, ()> {
-    HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
-}
+// `AppConfig::with_log_disabled` lives in the production module
+// (`config.rs`) — tests reuse it via the builder chain above so
+// log-related fields stay private to that module.

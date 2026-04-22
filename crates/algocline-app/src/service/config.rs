@@ -109,6 +109,18 @@ impl AppConfig {
         self
     }
 
+    /// Disable file logging — sets `log_dir = None`, `log_dir_source =
+    /// LogDirSource::None`, and `log_enabled = false`. Builder-chain
+    /// shorthand used by tests that want a quiet `AppService` rooted at
+    /// a tempdir without touching the developer's real log paths.
+    #[cfg(test)]
+    pub(crate) fn with_log_disabled(mut self) -> Self {
+        self.log_dir = None;
+        self.log_dir_source = LogDirSource::None;
+        self.log_enabled = false;
+        self
+    }
+
     /// Resolve the application root directory.
     ///
     /// 1. `ALC_HOME` env var (explicit override — highest priority).

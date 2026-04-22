@@ -1,6 +1,6 @@
 use super::eval_store::{
     escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, save_compare_result,
-    save_eval_result,
+    save_eval_result, splice_response_string,
 };
 use super::path::ContainedPath;
 use super::resolve::{is_package_installed, resolve_scenario_code};
@@ -106,10 +106,13 @@ return alc.eval(scenario, "{strategy}", {{
 
         // Persist eval result for history/comparison.
         // Card emission is handled by alc.eval() Lua-side when auto_card=true.
+        let mut save_warning: Option<String> = None;
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
             match parsed.get("status").and_then(|s| s.as_str()) {
                 Some("completed") => {
-                    save_eval_result(&app_dir, strategy, &result);
+                    if let Err(e) = save_eval_result(&app_dir, strategy, &result) {
+                        save_warning = Some(e);
+                    }
                 }
                 Some("needs_response") => {
                     if let Some(sid) = parsed.get("session_id").and_then(|s| s.as_str()) {
@@ -122,7 +125,10 @@ return alc.eval(scenario, "{strategy}", {{
             }
         }
 
-        Ok(result)
+        match save_warning {
+            Some(msg) => Ok(splice_response_string(&result, "save_warning", &msg)),
+            None => Ok(result),
+        }
     }
 
     /// List eval history, optionally filtered by strategy.
@@ -279,9 +285,12 @@ return {{
             .start_and_tick(lua_code, ctx, None, vec![], vec![])
             .await?;
 
-        // Persist comparison result
-        save_compare_result(&app_dir, eval_id_a, eval_id_b, &raw_result);
-
-        Ok(raw_result)
+        // Persist comparison result. Storage failure surfaces as an
+        // additive `save_warning` field on the response — the comparison
+        // itself ran to completion and remains valid in memory.
+        match save_compare_result(&app_dir, eval_id_a, eval_id_b, &raw_result) {
+            Ok(()) => Ok(raw_result),
+            Err(e) => Ok(splice_response_string(&raw_result, "save_warning", &e)),
+        }
     }
 }

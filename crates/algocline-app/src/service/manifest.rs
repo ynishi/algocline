@@ -54,10 +54,10 @@ pub(crate) struct Manifest {
 //
 // The `From<InstalledManifestStoreError> for String` bridge keeps the
 // existing service-layer `Result<_, String>` surfaces compiling; each
-// caller's `?` runs through this conversion at the call site. Upgrading
-// the service layer to its own typed `Result<_, ServiceError>` (and
-// re-threading the error through the MCP wire layer) is tracked as the
-// follow-up to Issue `1776825898-48820`.
+// caller's `?` runs through this conversion at the call site. A future
+// upgrade to a typed service-layer `Result<_, ServiceError>` can absorb
+// `InstalledManifestStoreError` through `#[from]` without a call-site
+// churn.
 
 /// CRUD failure modes for the installed-packages manifest.
 #[derive(Debug, thiserror::Error)]
@@ -143,11 +143,9 @@ impl From<InstalledManifestStoreError> for String {
 // `Repository` seat — a proper Aggregate Repo on top of a `Pkg` domain
 // entity that orchestrates `installed.json` + `alc.toml` + `alc.lock` +
 // the `packages/{name}/` fs layout + symlink state — is deliberately
-// left vacant for the follow-up `PkgRepository` work. Schema-proximate
-// naming (`ManifestRepo`) would have pre-committed that seat to a
-// 1-physical-file adapter and obscured the Aggregate boundary.
-// See workspace/tasks/1776766389-appdir-guard-v0/wf-sim-pkgrepo-20260421.md
-// §Counter-WF A for the DDD argument and the follow-up task body.
+// left vacant. Schema-proximate naming (`ManifestRepo`) would have
+// pre-committed that seat to a 1-physical-file adapter and obscured the
+// Aggregate boundary.
 
 /// CRUD surface for the installed-packages manifest (`installed.json`).
 ///
@@ -228,13 +226,11 @@ impl FsInstalledManifestStore {
         // them apart after the fact, so we return the whole string
         // under the `Lock` variant. Once the lock subsystem is typed,
         // this merging can be replaced with `#[from]` absorption.
-        crate::service::lock::with_exclusive_lock(&lock_path, || {
-            f().map_err(|e| e.to_string())
-        })
-        .map_err(|message| InstalledManifestStoreError::Lock {
-            path: lock_path.clone(),
-            message,
-        })
+        crate::service::lock::with_exclusive_lock(&lock_path, || f().map_err(|e| e.to_string()))
+            .map_err(|message| InstalledManifestStoreError::Lock {
+                path: lock_path.clone(),
+                message,
+            })
     }
 
     fn save(&self, manifest: &Manifest) -> Result<(), InstalledManifestStoreError> {
@@ -251,11 +247,9 @@ impl FsInstalledManifestStore {
             .map_err(|source| InstalledManifestStoreError::Serialize { source })?;
 
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &content).map_err(|source| {
-            InstalledManifestStoreError::WriteTmp {
-                path: tmp.clone(),
-                source,
-            }
+        std::fs::write(&tmp, &content).map_err(|source| InstalledManifestStoreError::WriteTmp {
+            path: tmp.clone(),
+            source,
         })?;
         std::fs::rename(&tmp, &path).map_err(|source| {
             // Best-effort cleanup: the tmp file's presence is not a
@@ -276,12 +270,11 @@ impl InstalledManifestStore for FsInstalledManifestStore {
         if !path.exists() {
             return Ok(Manifest::default());
         }
-        let content = std::fs::read_to_string(&path).map_err(|source| {
-            InstalledManifestStoreError::Read {
+        let content =
+            std::fs::read_to_string(&path).map_err(|source| InstalledManifestStoreError::Read {
                 path: path.clone(),
                 source,
-            }
-        })?;
+            })?;
         serde_json::from_str(&content)
             .map_err(|source| InstalledManifestStoreError::Parse { path, source })
     }
@@ -447,9 +440,7 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
 // refactor in this commit.
 
 /// Load the manifest from disk. Returns empty manifest if file is missing.
-pub(crate) fn load_manifest(
-    app_dir: &AppDir,
-) -> Result<Manifest, InstalledManifestStoreError> {
+pub(crate) fn load_manifest(app_dir: &AppDir) -> Result<Manifest, InstalledManifestStoreError> {
     FsInstalledManifestStore::new(app_dir.clone()).load()
 }
 
@@ -540,12 +531,11 @@ pub(crate) fn load_manifest_from(
     if !path.exists() {
         return Ok(Manifest::default());
     }
-    let content = std::fs::read_to_string(path).map_err(|source| {
-        InstalledManifestStoreError::Read {
+    let content =
+        std::fs::read_to_string(path).map_err(|source| InstalledManifestStoreError::Read {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     serde_json::from_str(&content).map_err(|source| InstalledManifestStoreError::Parse {
         path: path.to_path_buf(),
         source,

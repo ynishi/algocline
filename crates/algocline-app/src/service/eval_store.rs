@@ -10,14 +10,38 @@ pub(super) fn evals_dir(app_dir: &AppDir) -> PathBuf {
     app_dir.evals_dir()
 }
 
+/// Insert a top-level string field into a JSON object response so that
+/// storage failures (eval persistence, comparison persistence) surface
+/// on the MCP wire response. If `json_str` is not a JSON object the
+/// helper returns it unchanged — callers should never pass a
+/// non-object payload here, but staying defensive avoids a crash on
+/// malformed strategy output.
+pub(super) fn splice_response_string(json_str: &str, key: &str, value: &str) -> String {
+    if let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(json_str) {
+        map.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+        return serde_json::Value::Object(map).to_string();
+    }
+    json_str.to_string()
+}
+
 /// Persist eval result to `{app_dir}/evals/{strategy}_{timestamp}.json`.
 ///
-/// Silently returns on I/O errors — storage must not break eval execution.
-pub(super) fn save_eval_result(app_dir: &AppDir, strategy: &str, result_json: &str) {
+/// Returns `Ok(())` on success, `Err(String)` when the on-disk write
+/// fails. Storage failures must not break eval execution itself, so the
+/// caller surfaces the error as an additive warning on the response
+/// rather than aborting the eval — but the caller MUST surface it,
+/// otherwise the operator silently loses eval history.
+pub(super) fn save_eval_result(
+    app_dir: &AppDir,
+    strategy: &str,
+    result_json: &str,
+) -> Result<(), String> {
     let dir = evals_dir(app_dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create evals dir {}: {e}", dir.display()))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -25,25 +49,26 @@ pub(super) fn save_eval_result(app_dir: &AppDir, strategy: &str, result_json: &s
     let timestamp = now.as_secs();
     let eval_id = format!("{strategy}_{timestamp}");
 
-    // Parse result to extract summary fields for meta file
-    let parsed: serde_json::Value = match serde_json::from_str(result_json) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    // Parse result to extract summary fields for meta file. A parse
+    // failure here means the caller passed a malformed JSON blob —
+    // return it as Err rather than silently dropping the persistence.
+    let parsed: serde_json::Value = serde_json::from_str(result_json)
+        .map_err(|e| format!("failed to parse eval result JSON: {e}"))?;
 
     // Write full result
-    let path = match ContainedPath::child(&dir, &format!("{eval_id}.json")) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let _ = std::fs::write(&path, result_json);
+    let path = ContainedPath::child(&dir, &format!("{eval_id}.json"))
+        .map_err(|e| format!("invalid eval_id {eval_id}: {e}"))?;
+    std::fs::write(&path, result_json)
+        .map_err(|e| format!("failed to write eval result {}: {e}", path.display()))?;
 
     // Write lightweight meta file for listing
     let meta = build_meta(&eval_id, strategy, timestamp, &parsed);
-
-    if let Ok(meta_path) = ContainedPath::child(&dir, &format!("{eval_id}.meta.json")) {
-        let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
-    }
+    let meta_path = ContainedPath::child(&dir, &format!("{eval_id}.meta.json"))
+        .map_err(|e| format!("invalid eval_id meta {eval_id}: {e}"))?;
+    let meta_str =
+        serde_json::to_string(&meta).map_err(|e| format!("failed to serialize eval meta: {e}"))?;
+    std::fs::write(&meta_path, meta_str)
+        .map_err(|e| format!("failed to write eval meta {}: {e}", meta_path.display()))
 }
 
 /// Build the lightweight meta JSON from a full eval result.
@@ -166,15 +191,21 @@ pub(super) fn extract_strategy_from_id(eval_id: &str) -> Option<&str> {
 }
 
 /// Persist a comparison result to `{app_dir}/evals/`.
+///
+/// Returns `Ok(())` on success or `Err(String)` when the on-disk write
+/// fails. The caller is expected to surface failures as an additive
+/// warning on the response so the operator notices that the cache layer
+/// is degraded.
 pub(super) fn save_compare_result(
     app_dir: &AppDir,
     eval_id_a: &str,
     eval_id_b: &str,
     result_json: &str,
-) {
+) -> Result<(), String> {
     let dir = evals_dir(app_dir);
     let filename = format!("compare_{eval_id_a}_vs_{eval_id_b}.json");
-    if let Ok(path) = ContainedPath::child(&dir, &filename) {
-        let _ = std::fs::write(&path, result_json);
-    }
+    let path = ContainedPath::child(&dir, &filename)
+        .map_err(|e| format!("invalid compare filename {filename}: {e}"))?;
+    std::fs::write(&path, result_json)
+        .map_err(|e| format!("failed to write compare result {}: {e}", path.display()))
 }

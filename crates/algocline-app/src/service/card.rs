@@ -203,16 +203,24 @@ impl AppService {
             return Err("No Card files found in any subdirectory.".into());
         }
 
-        // Register source for Hub index discovery
-        hub::register_source(&self.log_config.app_dir(), source, "card_install");
+        // Register source for Hub index discovery. Storage failure here
+        // surfaces as `storage_warnings` rather than aborting the
+        // import — the Cards themselves are already on disk.
+        let mut storage_warnings: Vec<String> = Vec::new();
+        if let Err(e) = hub::register_source(&self.log_config.app_dir(), source, "card_install") {
+            storage_warnings.push(format!("hub register_source: {e}"));
+        }
 
-        let response = serde_json::json!({
+        let mut response = serde_json::json!({
             "installed_cards": all_imported,
             "skipped_cards": all_skipped,
             "packages": packages,
             "source": source,
             "mode": "card_collection",
         });
+        if !storage_warnings.is_empty() {
+            response["storage_warnings"] = serde_json::json!(storage_warnings);
+        }
         Ok(response.to_string())
     }
 

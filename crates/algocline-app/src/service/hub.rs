@@ -260,23 +260,35 @@ fn load_registries(app_dir: &AppDir) -> HubRegistries {
 
 /// Register a source URL.  Deduplicates by normalized URL.
 ///
+/// Returns `Ok(())` on success or when the input is skipped (empty /
+/// local path / already registered). Filesystem failures are returned
+/// as `Err(String)` so callers can surface them on the MCP wire
+/// response — the registry is best-effort relative to the `pkg_install`
+/// itself, but the caller still needs to know when it silently failed
+/// (otherwise hub discovery degrades without any signal).
+///
 /// Uses atomic write (tempfile + rename) to avoid partial writes if
-/// the process is interrupted.  Read-modify-write is not locked across
+/// the process is interrupted. Read-modify-write is not locked across
 /// processes, but MCP servers are single-process so this is safe in
 /// practice.
-pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) {
+pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) -> Result<(), String> {
     let normalized = source.trim_end_matches('/').to_string();
     if normalized.is_empty() {
-        return;
+        return Ok(());
     }
     // Skip local paths — they can't host a remote index
     if normalized.starts_with('/') || normalized.starts_with('.') {
-        return;
+        return Ok(());
     }
 
     let path = registries_path(app_dir);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create hub registries dir {}: {e}",
+                parent.display()
+            )
+        })?;
     }
 
     // Re-read from disk right before write to minimize TOCTOU window
@@ -288,7 +300,7 @@ pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) {
         .iter()
         .any(|e| e.source.trim_end_matches('/') == normalized)
     {
-        return;
+        return Ok(());
     }
 
     reg.registries.push(RegistryEntry {
@@ -298,21 +310,23 @@ pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) {
     });
 
     // Atomic write: write to temp file, then rename
-    match serde_json::to_string_pretty(&reg) {
-        Ok(json) => {
-            let tmp_path = path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp_path, &json) {
-                tracing::warn!("failed to write hub registries tmp: {e}");
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                tracing::warn!("failed to rename hub registries: {e}");
-                // Clean up tmp on failure
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-        }
-        Err(e) => tracing::warn!("failed to serialize hub registries: {e}"),
-    }
+    let json = serde_json::to_string_pretty(&reg)
+        .map_err(|e| format!("failed to serialize hub registries: {e}"))?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json).map_err(|e| {
+        format!(
+            "failed to write hub registries tmp {}: {e}",
+            tmp_path.display()
+        )
+    })?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        // Best-effort cleanup of the stale tmp file on rename failure.
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "failed to atomically rename hub registries onto {}: {e}",
+            path.display()
+        )
+    })
 }
 
 // ─── Hub config ──────────────────────────────────────────────
@@ -474,29 +488,34 @@ fn load_cached(app_dir: &AppDir, url: &str) -> Option<HubIndex> {
 }
 
 /// Save remote index to per-source cache file.
-fn save_cached(app_dir: &AppDir, url: &str, index: &HubIndex) {
+///
+/// Returns `Ok(())` on success. Cache write failures are returned as
+/// `Err(String)`; the caller (`fetch_one`) carries them out of band so
+/// hub fetch still completes (the index is in memory) but the warning
+/// surfaces to the MCP wire response via the existing `warnings` channel.
+fn save_cached(app_dir: &AppDir, url: &str, index: &HubIndex) -> Result<(), String> {
     let dir = cache_dir(app_dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("failed to create hub cache dir: {e}");
-        return;
-    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create hub cache dir {}: {e}", dir.display()))?;
     let path = dir.join(format!("{}.json", cache_key(url)));
-    match serde_json::to_string_pretty(index) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!("failed to write hub cache {}: {e}", path.display());
-            }
-        }
-        Err(e) => tracing::warn!("failed to serialize hub cache: {e}"),
-    }
+    let json = serde_json::to_string_pretty(index)
+        .map_err(|e| format!("failed to serialize hub cache: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("failed to write hub cache {}: {e}", path.display()))
 }
 
 // ─── Remote fetch ──────────────────────────────────────────────
 
 /// Fetch a single remote index by URL, using per-source cache.
-fn fetch_one(app_dir: &AppDir, url: &str) -> Result<HubIndex, String> {
+///
+/// Returns the index plus an optional cache-write warning. The warning
+/// is `Some(_)` only when the network fetch succeeded but persisting
+/// the cache to disk failed — the data flow is unaffected, but the
+/// caller surfaces the warning so the operator can fix the underlying
+/// disk issue.
+fn fetch_one(app_dir: &AppDir, url: &str) -> Result<(HubIndex, Option<String>), String> {
     if let Some(cached) = load_cached(app_dir, url) {
-        return Ok(cached);
+        return Ok((cached, None));
     }
 
     let agent = ureq::Agent::new_with_config(
@@ -515,8 +534,10 @@ fn fetch_one(app_dir: &AppDir, url: &str) -> Result<HubIndex, String> {
     let index: HubIndex = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse index from {url}: {e}"))?;
 
-    save_cached(app_dir, url, &index);
-    Ok(index)
+    let cache_warning = save_cached(app_dir, url, &index)
+        .err()
+        .map(|e| format!("hub cache write for {url}: {e}"));
+    Ok((index, cache_warning))
 }
 
 /// Fetch all discovered remote indices and merge into one.
@@ -529,12 +550,15 @@ fn fetch_remote_indices(app_dir: &AppDir) -> Result<(HubIndex, Vec<String>), Str
 
     for url in &urls {
         match fetch_one(app_dir, url) {
-            Ok(index) => {
+            Ok((index, cache_warning)) => {
                 for entry in index.packages {
                     if seen_names.insert(entry.entity.name.clone()) {
                         all_packages.push(entry);
                     }
                     // If duplicate name across sources, first wins
+                }
+                if let Some(w) = cache_warning {
+                    warnings.push(w);
                 }
             }
             Err(e) => {
@@ -810,10 +834,7 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
 ///
 /// When `source_dir` is `None`, scans `~/.algocline/packages/` and
 /// enriches entries with manifest source and local card counts.
-fn build_index(
-    app_dir: &AppDir,
-    source_dir: Option<&std::path::Path>,
-) -> Result<HubIndex, String> {
+fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> Result<HubIndex, String> {
     let empty = || HubIndex {
         schema_version: "hub_index/v0".into(),
         updated_at: super::manifest::now_iso8601(),

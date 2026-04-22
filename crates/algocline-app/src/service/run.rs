@@ -3,9 +3,20 @@ use std::sync::Arc;
 use algocline_core::QueryId;
 use algocline_engine::{FeedResult, VariantPkg};
 
+use super::eval_store::splice_response_string;
 use super::resolve::{is_package_installed, make_require_code, resolve_code, QueryResponse};
 use super::transcript::write_transcript_log;
 use super::AppService;
+
+/// Splice `save_warning` into the JSON `result` when the optional
+/// warning is `Some(_)`. Returns the original string unchanged when
+/// there is no warning.
+fn splice_save_warning(result_json: &str, warning: Option<String>) -> String {
+    match warning {
+        Some(msg) => splice_response_string(result_json, "save_warning", &msg),
+        None => result_json.to_string(),
+    }
+}
 
 impl AppService {
     /// Execute Lua code with optional JSON context.
@@ -88,8 +99,8 @@ impl AppService {
         let result = last_result.ok_or("Empty responses array")?;
         self.maybe_log_transcript(&result, session_id);
         let json = result.to_json(session_id).to_string();
-        self.maybe_save_eval(&result, session_id, &json);
-        Ok(json)
+        let save_warning = self.maybe_save_eval(&result, session_id, &json);
+        Ok(splice_save_warning(&json, save_warning))
     }
 
     /// Continue a paused execution — single response (with optional query_id).
@@ -117,8 +128,8 @@ impl AppService {
 
         self.maybe_log_transcript(&result, session_id);
         let json = result.to_json(session_id).to_string();
-        self.maybe_save_eval(&result, session_id, &json);
-        Ok(json)
+        let save_warning = self.maybe_save_eval(&result, session_id, &json);
+        Ok(splice_save_warning(&json, save_warning))
     }
 
     // ─── Internal ───────────────────────────────────────────────
@@ -139,20 +150,27 @@ impl AppService {
         }
     }
 
-    pub(super) fn maybe_save_eval(&self, result: &FeedResult, session_id: &str, result_json: &str) {
+    /// Persist eval result for a finished session, returning any storage
+    /// failure as `Some(msg)` so the caller can surface it on the wire
+    /// response. `None` covers both "not an eval session" and
+    /// "successfully saved" — they are indistinguishable to the caller
+    /// because both produce the same wire shape.
+    pub(super) fn maybe_save_eval(
+        &self,
+        result: &FeedResult,
+        session_id: &str,
+        result_json: &str,
+    ) -> Option<String> {
         if !matches!(result, FeedResult::Finished(_)) {
-            return;
+            return None;
         }
-        let info = {
-            let mut map = match self.eval_sessions.lock() {
-                Ok(m) => m,
-                Err(_) => return,
-            };
+        let strategy = {
+            let mut map = self.eval_sessions.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(session_id)
         };
-        if let Some(strategy) = info {
-            super::eval_store::save_eval_result(&self.log_config.app_dir(), &strategy, result_json);
-        }
+        strategy.and_then(|s| {
+            super::eval_store::save_eval_result(&self.log_config.app_dir(), &s, result_json).err()
+        })
     }
 
     pub(super) async fn start_and_tick(

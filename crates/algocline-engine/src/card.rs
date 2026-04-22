@@ -764,8 +764,6 @@ pub fn aliases_to_json(rows: &[Alias]) -> Json {
 // Where DSL — Prisma/Mongo-style nested predicates
 // ═══════════════════════════════════════════════════════════════
 //
-// See `workspace/tasks/card-dsl/design.md` for the full spec.
-//
 // Syntax (JSON form, as received from Lua / MCP):
 //
 //   where = {

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-04-23
+
+### Fixed
+
+- **Embedded `hub_gendoc` / `alc_hub_dist`**: extend the in-process
+  `alc_shapes` / `alc_shapes.t` stubs so bundled package `init.lua`
+  modules load under `gen_docs` (real trees use `local T = S.T`,
+  `S.instrument`, `:describe`, and `T.boolean` / `T.table`). Fixes
+  `dist` / `gendoc` failures against full `algocline-bundled-packages`
+  that were unrelated to hub TOML config. Also fixes Lua closure
+  ordering so `describe` captures `make_schema` as a local.
+
 ## [0.25.0] - 2026-04-23
 
 ### Added

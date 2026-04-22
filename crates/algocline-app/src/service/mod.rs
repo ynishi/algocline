@@ -1,6 +1,7 @@
 pub(crate) mod alc_toml;
 mod card;
 mod config;
+mod dist;
 mod engine_api_impl;
 mod eval;
 mod eval_store;

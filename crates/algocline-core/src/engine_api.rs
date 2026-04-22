@@ -390,6 +390,41 @@ pub trait EngineApi: Send + Sync {
         lint_strict: Option<bool>,
     ) -> Result<String, String>;
 
+    /// Run `hub_reindex` followed by `hub_gendoc` as a single facade.
+    ///
+    /// This is a convenience wrapper for downstream hub repositories that
+    /// want to regenerate the index and the public docs in one call. The
+    /// composed response is a JSON object:
+    ///
+    /// ```json
+    /// { "reindex": <hub_reindex response>, "gendoc": <hub_gendoc response> }
+    /// ```
+    ///
+    /// Error propagation:
+    ///
+    /// - If `hub_reindex` fails, `hub_dist` returns immediately with
+    ///   `Err("dist: reindex failed: {inner}")` and does not invoke
+    ///   `hub_gendoc`.
+    /// - If `hub_gendoc` fails, the error text includes the reindex JSON
+    ///   that already succeeded:
+    ///   `Err("dist: gendoc failed: {inner}\nreindex result (succeeded): {json}")`.
+    ///   The reindex-side side effects (written `hub_index.json`) are not
+    ///   rolled back.
+    ///
+    /// `output_path` is the `hub_index.json` destination (reindex arg).
+    /// Callers typically pass `{source_dir}/hub_index.json` so the
+    /// subsequent gendoc step can read it back. The other arguments are
+    /// forwarded to `hub_gendoc` unchanged.
+    async fn hub_dist(
+        &self,
+        source_dir: String,
+        output_path: Option<String>,
+        out_dir: Option<String>,
+        projections: Option<Vec<String>>,
+        config_path: Option<String>,
+        lint_strict: Option<bool>,
+    ) -> Result<String, String>;
+
     /// Show detailed information for a single package.
     async fn hub_info(&self, pkg: String) -> Result<String, String>;
 

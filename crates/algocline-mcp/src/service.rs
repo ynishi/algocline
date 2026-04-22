@@ -608,6 +608,26 @@ pub struct HubGendocParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HubDistParams {
+    /// Directory containing the repository (package directories).
+    pub source_dir: String,
+    /// Path to write the generated `hub_index.json` (reindex step).
+    /// Callers typically pass `{source_dir}/hub_index.json` so the
+    /// subsequent gendoc step can read it back.
+    pub output_path: Option<String>,
+    /// Output directory for generated docs (see `alc_hub_gendoc`).
+    /// Defaults to `{source_dir}/docs`.
+    pub out_dir: Option<String>,
+    /// Projections to emit (see `alc_hub_gendoc`).
+    pub projections: Option<Vec<String>>,
+    /// Path to a Lua config file (see `alc_hub_gendoc`). Required
+    /// when `projections` includes `"context7"` or `"devin"`.
+    pub config_path: Option<String>,
+    /// Treat lint errors as a hard failure (see `alc_hub_gendoc`).
+    pub lint_strict: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HubSearchParams {
     /// Search query (matched against package name, description, category,
     /// and docstring). Omit to list all available packages. When the
@@ -1436,6 +1456,42 @@ impl AlcService {
             .await
     }
 
+    /// Run `alc_hub_reindex` and `alc_hub_gendoc` in sequence.
+    ///
+    /// This is a facade for hub maintainers who always want the index
+    /// and the public docs to move together. The response is a JSON
+    /// object `{ "reindex": ..., "gendoc": ... }` embedding the two
+    /// underlying tool responses verbatim.
+    ///
+    /// Error semantics (caller-visible via MCP wire `Err`):
+    ///
+    /// - If the reindex step fails, `gendoc` is not invoked and the
+    ///   error text starts with `dist: reindex failed:`.
+    /// - If the gendoc step fails after a successful reindex, the
+    ///   error text is `dist: gendoc failed: {inner}\nreindex result
+    ///   (succeeded): {json}` so callers see both outcomes. The
+    ///   reindex-side side effect (the updated `hub_index.json`) is
+    ///   not rolled back.
+    #[tool(
+        name = "alc_hub_dist",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn hub_dist(
+        &self,
+        Parameters(params): Parameters<HubDistParams>,
+    ) -> Result<String, String> {
+        self.app
+            .hub_dist(
+                params.source_dir,
+                params.output_path,
+                params.out_dir,
+                params.projections,
+                params.config_path,
+                params.lint_strict,
+            )
+            .await
+    }
+
     /// Search packages across remote Hub indices and local install state.
     ///
     /// Discovers index URLs from installed package sources and bundled
@@ -1555,7 +1611,8 @@ impl ServerHandler for AlcService {
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
                  - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\
                  - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Writes to a file for CI publishing.\n\
-                 - alc_hub_gendoc: Generate human-readable documentation artifacts (narrative/{pkg}.md, llms.txt, llms-full.txt, optional hub/context7/devin projections) from a hub_index.json. Runs the embedded gen_docs Lua pipeline.\n\n\
+                 - alc_hub_gendoc: Generate human-readable documentation artifacts (narrative/{pkg}.md, llms.txt, llms-full.txt, optional hub/context7/devin projections) from a hub_index.json. Runs the embedded gen_docs Lua pipeline.\n\
+                 - alc_hub_dist: Facade that runs alc_hub_reindex followed by alc_hub_gendoc and returns a composed `{ reindex, gendoc }` response. Fails fast on reindex error; surfaces reindex result in the error text on gendoc failure.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

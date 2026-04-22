@@ -54,30 +54,79 @@ const LUA_DOCS_ENTITY_SCHEMAS: &str = include_str!("lua/gendoc/docs/entity_schem
 
 /// Minimal pass-through stub for `alc_shapes`.
 ///
-/// `gen_docs` uses `S.check` for non-load-bearing shape validation.
-/// Returning `true` unconditionally preserves artifact output.
+/// `gen_docs` uses the shapes module for non-load-bearing validation
+/// that is tolerated to pass unconditionally at publish time — the
+/// authoritative validation lives in the bundled-packages CI, not in
+/// the embedded runner. The surface required by the embedded docs
+/// modules is limited to `check` / `assert_dev` / `fields` /
+/// `infer`.
 const LUA_ALC_SHAPES_STUB: &str = r#"
 local M = {}
 M.check = function(_v, _schema, _opts) return true, nil end
+M.assert_dev = function(_v, _schema, _opts) return true end
+M.fields = function(schema) return (schema and schema.fields) or {} end
 M.infer = function(v) return v end
 return M
 "#;
 
 /// Minimal stub for `alc_shapes.t` — just enough type constructors to
-/// satisfy top-level `local T = require("alc_shapes.t")` imports in
+/// satisfy the top-level `local T = require("alc_shapes.t")` imports in
 /// `entity_schemas.lua`, `extract.lua`, `projections.lua`, `lint.lua`.
-const LUA_ALC_SHAPES_T_STUB: &str = r#"
+///
+/// Constructors return opaque `{ kind = "...", ... }` tables. The only
+/// structural invariant any embedded caller relies on is the presence
+/// of `.kind`, so these stubs preserve that. `_internal.is_schema`
+/// accepts anything table-shaped so downstream `is_schema` guards
+/// don't accidentally reject stub-produced schemas.
+const LUA_ALC_SHAPES_T_STUB: &str = r##"
 local T = {}
-T.str   = { kind = "scalar", name = "string" }
-T.num   = { kind = "scalar", name = "number" }
-T.bool  = { kind = "scalar", name = "bool" }
-T.any   = { kind = "any" }
-T.ref   = function(name) return { kind = "ref", name = name } end
-T.list  = function(t) return { kind = "list", item = t } end
-T.map   = function(k, v) return { kind = "map", key = k, value = v } end
-T.opt   = function(t) return { kind = "optional", inner = t } end
+
+-- Method table installed on every schema object. `is_optional()`
+-- wraps the receiver in an optional variant (used by
+-- entity_schemas.lua for structurally-optional fields).
+local schema_mt = {}
+schema_mt.__index = {
+    is_optional = function(self)
+        return setmetatable({ kind = "optional", inner = self }, schema_mt)
+    end,
+}
+
+local function make_schema(tbl)
+    return setmetatable(tbl, schema_mt)
+end
+
+T.any    = make_schema({ kind = "any" })
+T.string = make_schema({ kind = "prim", name = "string" })
+T.number = make_schema({ kind = "prim", name = "number" })
+T.bool   = make_schema({ kind = "prim", name = "bool" })
+-- Aliases occasionally used by older docs modules.
+T.str    = T.string
+T.num    = T.number
+
+T.ref           = function(name) return make_schema({ kind = "ref", name = name }) end
+T.list          = function(t) return make_schema({ kind = "list", item = t }) end
+T.array_of      = function(t) return make_schema({ kind = "array_of", item = t }) end
+T.map           = function(k, v) return make_schema({ kind = "map", key = k, value = v }) end
+T.map_of        = function(k, v) return make_schema({ kind = "map_of", key = k, value = v }) end
+T.opt           = function(t) return make_schema({ kind = "optional", inner = t }) end
+T.optional      = T.opt
+T.one_of        = function(values) return make_schema({ kind = "one_of", values = values }) end
+T.shape         = function(fields, opts)
+    return make_schema({ kind = "shape", fields = fields, opts = opts or {} })
+end
+T.described     = function(schema, desc)
+    return make_schema({ kind = "described", inner = schema, desc = desc })
+end
+T.discriminated = function(tag, variants)
+    return make_schema({ kind = "discriminated", tag = tag, variants = variants })
+end
+
+T._internal = {
+    is_schema = function(v) return type(v) == "table" end,
+}
+
 return T
-"#;
+"##;
 
 /// Lua module name → embedded source. Registered on `package.preload`
 /// inside `register_preloads`.
@@ -96,6 +145,15 @@ const PRELOAD_MODULES: &[(&str, &str)] = &[
 /// IO / exit hooks installed into the VM right before `gen_docs.lua`
 /// runs. `_gendoc_out_append` / `_gendoc_err_append` are Rust
 /// closures registered under the same names on `_G`.
+///
+/// `io.stdout` / `io.stderr` are in mlua exposed as `FILE*` userdata
+/// whose metatable rejects arbitrary `__newindex` writes — so we
+/// cannot patch `io.stdout.write` in place. Instead we replace
+/// `io.stdout` / `io.stderr` wholesale with plain Lua tables that
+/// expose a `write` method delegating to the Rust-side append
+/// closures. Both method-style (`io.stdout:write(x)`) and
+/// function-style (`io.stdout.write(io.stdout, x)`) calls are
+/// supported; both are used in the bundled `gen_docs.lua`.
 const HOOK_SCRIPT: &str = r##"
 os.exit = function(code)
     local c = code or 0
@@ -108,22 +166,26 @@ os.exit = function(code)
     end })
     error(tbl, 0)
 end
-io.stdout.write = function(self, ...)
-    local args = { ... }
-    for i = 1, select("#", ...) do
-        args[i] = tostring(args[i])
-    end
-    _gendoc_out_append(table.concat(args))
-    return self
-end
-io.stderr.write = function(self, ...)
-    local args = { ... }
-    for i = 1, select("#", ...) do
-        args[i] = tostring(args[i])
-    end
-    _gendoc_err_append(table.concat(args))
-    return self
-end
+io.stdout = {
+    write = function(self, ...)
+        local args = { ... }
+        for i = 1, select("#", ...) do
+            args[i] = tostring(args[i])
+        end
+        _gendoc_out_append(table.concat(args))
+        return self
+    end,
+}
+io.stderr = {
+    write = function(self, ...)
+        local args = { ... }
+        for i = 1, select("#", ...) do
+            args[i] = tostring(args[i])
+        end
+        _gendoc_err_append(table.concat(args))
+        return self
+    end,
+}
 print = function(...)
     local args = { ... }
     for i = 1, select("#", ...) do
@@ -201,8 +263,15 @@ impl AppService {
             .map_err(|e| format!("gendoc: hooks inject failed: {e}"))?;
 
         // Execute `gen_docs.lua`. The file ends with `main(arg)`.
+        //
+        // `lua.load()` uses the string path of `luaL_loadbuffer`
+        // which does NOT strip a `#!` shebang line (the shebang is
+        // only accepted by `luaL_loadfile`). The embedded
+        // `gen_docs.lua` starts with `#!/usr/bin/env lua`, so we
+        // skip the first line before loading.
+        let gen_docs_body = strip_shebang(LUA_GEN_DOCS);
         let exec_result = lua
-            .load(LUA_GEN_DOCS)
+            .load(gen_docs_body)
             .set_name("@embedded:gendoc/gen_docs.lua")
             .exec();
 
@@ -484,6 +553,23 @@ fn install_argv(
     Ok(())
 }
 
+/// Strip a leading `#!` shebang line from a Lua source.
+///
+/// `lua.load()` (buffer-based) does not strip the shebang the way
+/// `luaL_loadfile` does. The embedded `gen_docs.lua` starts with
+/// `#!/usr/bin/env lua`, so we strip the first line before feeding
+/// the buffer to the VM.
+fn strip_shebang(src: &str) -> &str {
+    if let Some(body) = src.strip_prefix("#!") {
+        match body.find('\n') {
+            Some(i) => &body[i + 1..],
+            None => "",
+        }
+    } else {
+        src
+    }
+}
+
 fn read_buf(buf: &Arc<Mutex<String>>) -> Result<String, String> {
     Ok(buf
         .lock()
@@ -634,6 +720,24 @@ mod tests {
     fn extract_exit_code_returns_none_for_unrelated_errors() {
         let err = mlua::Error::RuntimeError("some other Lua error".to_string());
         assert!(extract_exit_code(&err).is_none());
+    }
+
+    #[test]
+    fn strip_shebang_removes_first_line_when_prefixed() {
+        let src = "#!/usr/bin/env lua\nreturn 1\n";
+        assert_eq!(strip_shebang(src), "return 1\n");
+    }
+
+    #[test]
+    fn strip_shebang_preserves_source_without_shebang() {
+        let src = "-- no shebang\nreturn 1\n";
+        assert_eq!(strip_shebang(src), src);
+    }
+
+    #[test]
+    fn strip_shebang_handles_shebang_only_without_trailing_newline() {
+        let src = "#!/usr/bin/env lua";
+        assert_eq!(strip_shebang(src), "");
     }
 
     #[test]

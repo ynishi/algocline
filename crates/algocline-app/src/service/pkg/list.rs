@@ -227,7 +227,12 @@ impl AppService {
         )?;
 
         // ── Load manifest once upfront ─────────────────────────────────────
-        let manifest_data = manifest::load_manifest().unwrap_or_default();
+        // Errors here (I/O, JSON corruption, permission denied) are
+        // propagated to the caller — a Claude Code UI that silently
+        // shows "0 packages" for a corrupted `installed.json` is worse
+        // than a structured error the operator can act on.
+        let app_dir = self.log_config.app_dir();
+        let manifest_data = manifest::load_manifest(&app_dir)?;
 
         // ── Project-local packages (from alc.toml + alc.lock) ─────────────
         let resolved_root = resolve_project_root(project_root.as_deref());
@@ -291,15 +296,9 @@ impl AppService {
                                 } else {
                                     ResolvedSourceKind::Installed
                                 };
-                                match packages_dir() {
-                                    Ok(dir) => {
-                                        (resolve_source_path(&dir.join(name)), Some(kind), None)
-                                    }
-                                    Err(e) => (
-                                        None,
-                                        Some(kind),
-                                        Some(format!("cannot resolve packages_dir: {e}")),
-                                    ),
+                                {
+                                    let dir = packages_dir(&app_dir);
+                                    (resolve_source_path(&dir.join(name)), Some(kind), None)
                                 }
                             }
                             None => (None, None, None),

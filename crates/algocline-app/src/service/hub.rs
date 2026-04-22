@@ -78,7 +78,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use algocline_core::PkgEntity;
+use algocline_core::{AppDir, PkgEntity};
 
 use super::list_opts::{
     apply_sort_by_value, matches_filter, parse_sort, project_fields, resolve_fields, ListOpts,
@@ -242,17 +242,13 @@ pub(crate) struct HubRegistries {
     pub registries: Vec<RegistryEntry>,
 }
 
-fn registries_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("hub_registries.json"))
+fn registries_path(app_dir: &AppDir) -> PathBuf {
+    app_dir.hub_registries_json()
 }
 
 /// Load registries from disk.  Returns empty list if file is missing.
-fn load_registries() -> HubRegistries {
-    let path = match registries_path() {
-        Ok(p) => p,
-        Err(_) => return HubRegistries::default(),
-    };
+fn load_registries(app_dir: &AppDir) -> HubRegistries {
+    let path = registries_path(app_dir);
     if !path.exists() {
         return HubRegistries::default();
     }
@@ -264,30 +260,39 @@ fn load_registries() -> HubRegistries {
 
 /// Register a source URL.  Deduplicates by normalized URL.
 ///
+/// Returns `Ok(())` on success or when the input is skipped (empty /
+/// local path / already registered). Filesystem failures are returned
+/// as `Err(String)` so callers can surface them on the MCP wire
+/// response — the registry is best-effort relative to the `pkg_install`
+/// itself, but the caller still needs to know when it silently failed
+/// (otherwise hub discovery degrades without any signal).
+///
 /// Uses atomic write (tempfile + rename) to avoid partial writes if
-/// the process is interrupted.  Read-modify-write is not locked across
+/// the process is interrupted. Read-modify-write is not locked across
 /// processes, but MCP servers are single-process so this is safe in
 /// practice.
-pub(crate) fn register_source(source: &str, origin: &str) {
+pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) -> Result<(), String> {
     let normalized = source.trim_end_matches('/').to_string();
     if normalized.is_empty() {
-        return;
+        return Ok(());
     }
     // Skip local paths — they can't host a remote index
     if normalized.starts_with('/') || normalized.starts_with('.') {
-        return;
+        return Ok(());
     }
 
-    let path = match registries_path() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let path = registries_path(app_dir);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create hub registries dir {}: {e}",
+                parent.display()
+            )
+        })?;
     }
 
     // Re-read from disk right before write to minimize TOCTOU window
-    let mut reg = load_registries();
+    let mut reg = load_registries(app_dir);
 
     // Already registered?
     if reg
@@ -295,7 +300,7 @@ pub(crate) fn register_source(source: &str, origin: &str) {
         .iter()
         .any(|e| e.source.trim_end_matches('/') == normalized)
     {
-        return;
+        return Ok(());
     }
 
     reg.registries.push(RegistryEntry {
@@ -305,21 +310,23 @@ pub(crate) fn register_source(source: &str, origin: &str) {
     });
 
     // Atomic write: write to temp file, then rename
-    match serde_json::to_string_pretty(&reg) {
-        Ok(json) => {
-            let tmp_path = path.with_extension("json.tmp");
-            if let Err(e) = std::fs::write(&tmp_path, &json) {
-                tracing::warn!("failed to write hub registries tmp: {e}");
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp_path, &path) {
-                tracing::warn!("failed to rename hub registries: {e}");
-                // Clean up tmp on failure
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-        }
-        Err(e) => tracing::warn!("failed to serialize hub registries: {e}"),
-    }
+    let json = serde_json::to_string_pretty(&reg)
+        .map_err(|e| format!("failed to serialize hub registries: {e}"))?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &json).map_err(|e| {
+        format!(
+            "failed to write hub registries tmp {}: {e}",
+            tmp_path.display()
+        )
+    })?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| {
+        // Best-effort cleanup of the stale tmp file on rename failure.
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "failed to atomically rename hub registries onto {}: {e}",
+            path.display()
+        )
+    })
 }
 
 // ─── Hub config ──────────────────────────────────────────────
@@ -333,9 +340,8 @@ pub(crate) fn register_source(source: &str, origin: &str) {
 // index containing all known packages, including uninstalled ones).
 
 /// Read the `[hub].collection_url` from `~/.algocline/config.toml`.
-fn collection_url_from_config() -> Option<String> {
-    let home = dirs::home_dir()?;
-    let path = home.join(".algocline").join("config.toml");
+fn collection_url_from_config(app_dir: &AppDir) -> Option<String> {
+    let path = app_dir.config_toml();
     let content = std::fs::read_to_string(&path).ok()?;
     let doc: toml_edit::DocumentMut = content.parse().ok()?;
     let url = doc
@@ -386,18 +392,24 @@ fn repo_to_index_url(repo_url: &str) -> Option<String> {
 }
 
 /// Collect unique index URLs from config + registries + manifest + bundled seeds.
-fn discover_index_urls() -> Vec<String> {
+///
+/// Returns `Err` if the installed manifest cannot be read (corrupt JSON /
+/// permission denied). The function intentionally surfaces manifest-read
+/// failures rather than silently skipping — callers feed these URLs into
+/// hub resolution, and a partial URL set is indistinguishable from a
+/// corrupt manifest without the signal.
+fn discover_index_urls(app_dir: &AppDir) -> Result<Vec<String>, String> {
     let mut index_urls: Vec<String> = Vec::new();
 
     // 0. From config.toml [hub].collection_url (Tier 0 — aggregated collection)
-    if let Some(url) = collection_url_from_config() {
+    if let Some(url) = collection_url_from_config(app_dir) {
         index_urls.push(url);
     }
 
     let mut repo_urls: HashSet<String> = HashSet::new();
 
     // 1. From hub registries (primary)
-    let reg = load_registries();
+    let reg = load_registries(app_dir);
     for entry in &reg.registries {
         let normalized = entry.source.trim_end_matches('/').to_string();
         if !normalized.is_empty() {
@@ -408,13 +420,12 @@ fn discover_index_urls() -> Vec<String> {
     // 2. From manifest (catch sources registered before hub_registries existed).
     // Only Git-variant sources can host a remote hub_index.json; other variants
     // (Path / Installed / Bundled / Unknown) are skipped by `git_url()` returning None.
-    if let Ok(m) = manifest::load_manifest() {
-        for entry in m.packages.values() {
-            if let Some(url) = entry.source.git_url() {
-                let normalized = url.trim_end_matches('/').to_string();
-                if !normalized.is_empty() {
-                    repo_urls.insert(normalized);
-                }
+    let m = manifest::load_manifest(app_dir)?;
+    for entry in m.packages.values() {
+        if let Some(url) = entry.source.git_url() {
+            let normalized = url.trim_end_matches('/').to_string();
+            if !normalized.is_empty() {
+                repo_urls.insert(normalized);
             }
         }
     }
@@ -435,7 +446,7 @@ fn discover_index_urls() -> Vec<String> {
     derived.dedup();
     index_urls.extend(derived);
 
-    index_urls
+    Ok(index_urls)
 }
 
 // ─── Per-source cache ─────────────────────────────────────────
@@ -445,9 +456,8 @@ fn discover_index_urls() -> Vec<String> {
 // the index URL. This avoids mixing data from different registries
 // and allows per-source TTL validation.
 
-fn cache_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("hub_cache"))
+fn cache_dir(app_dir: &AppDir) -> PathBuf {
+    app_dir.hub_cache_dir()
 }
 
 fn cache_key(url: &str) -> String {
@@ -462,8 +472,8 @@ fn cache_key(url: &str) -> String {
 }
 
 /// Load cached remote index for a specific URL if fresh (within TTL).
-fn load_cached(url: &str) -> Option<HubIndex> {
-    let dir = cache_dir().ok()?;
+fn load_cached(app_dir: &AppDir, url: &str) -> Option<HubIndex> {
+    let dir = cache_dir(app_dir);
     let path = dir.join(format!("{}.json", cache_key(url)));
     if !path.exists() {
         return None;
@@ -478,35 +488,34 @@ fn load_cached(url: &str) -> Option<HubIndex> {
 }
 
 /// Save remote index to per-source cache file.
-fn save_cached(url: &str, index: &HubIndex) {
-    let dir = match cache_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("hub cache dir unavailable: {e}");
-            return;
-        }
-    };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!("failed to create hub cache dir: {e}");
-        return;
-    }
+///
+/// Returns `Ok(())` on success. Cache write failures are returned as
+/// `Err(String)`; the caller (`fetch_one`) carries them out of band so
+/// hub fetch still completes (the index is in memory) but the warning
+/// surfaces to the MCP wire response via the existing `warnings` channel.
+fn save_cached(app_dir: &AppDir, url: &str, index: &HubIndex) -> Result<(), String> {
+    let dir = cache_dir(app_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create hub cache dir {}: {e}", dir.display()))?;
     let path = dir.join(format!("{}.json", cache_key(url)));
-    match serde_json::to_string_pretty(index) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!("failed to write hub cache {}: {e}", path.display());
-            }
-        }
-        Err(e) => tracing::warn!("failed to serialize hub cache: {e}"),
-    }
+    let json = serde_json::to_string_pretty(index)
+        .map_err(|e| format!("failed to serialize hub cache: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("failed to write hub cache {}: {e}", path.display()))
 }
 
 // ─── Remote fetch ──────────────────────────────────────────────
 
 /// Fetch a single remote index by URL, using per-source cache.
-fn fetch_one(url: &str) -> Result<HubIndex, String> {
-    if let Some(cached) = load_cached(url) {
-        return Ok(cached);
+///
+/// Returns the index plus an optional cache-write warning. The warning
+/// is `Some(_)` only when the network fetch succeeded but persisting
+/// the cache to disk failed — the data flow is unaffected, but the
+/// caller surfaces the warning so the operator can fix the underlying
+/// disk issue.
+fn fetch_one(app_dir: &AppDir, url: &str) -> Result<(HubIndex, Option<String>), String> {
+    if let Some(cached) = load_cached(app_dir, url) {
+        return Ok((cached, None));
     }
 
     let agent = ureq::Agent::new_with_config(
@@ -525,26 +534,31 @@ fn fetch_one(url: &str) -> Result<HubIndex, String> {
     let index: HubIndex = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse index from {url}: {e}"))?;
 
-    save_cached(url, &index);
-    Ok(index)
+    let cache_warning = save_cached(app_dir, url, &index)
+        .err()
+        .map(|e| format!("hub cache write for {url}: {e}"));
+    Ok((index, cache_warning))
 }
 
 /// Fetch all discovered remote indices and merge into one.
 /// Falls back gracefully: failed sources are skipped with warnings.
-fn fetch_remote_indices() -> (HubIndex, Vec<String>) {
-    let urls = discover_index_urls();
+fn fetch_remote_indices(app_dir: &AppDir) -> Result<(HubIndex, Vec<String>), String> {
+    let urls = discover_index_urls(app_dir)?;
     let mut all_packages: Vec<IndexEntry> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut warnings: Vec<String> = Vec::new();
 
     for url in &urls {
-        match fetch_one(url) {
-            Ok(index) => {
+        match fetch_one(app_dir, url) {
+            Ok((index, cache_warning)) => {
                 for entry in index.packages {
                     if seen_names.insert(entry.entity.name.clone()) {
                         all_packages.push(entry);
                     }
                     // If duplicate name across sources, first wins
+                }
+                if let Some(w) = cache_warning {
+                    warnings.push(w);
                 }
             }
             Err(e) => {
@@ -565,48 +579,41 @@ fn fetch_remote_indices() -> (HubIndex, Vec<String>) {
         updated_at: String::new(),
         packages: all_packages,
     };
-    (merged, warnings)
+    Ok((merged, warnings))
 }
 
 // ─── Local state ───────────────────────────────────────────────
 
 /// Build a set of locally installed package names from `installed.json`
 /// and the `~/.algocline/packages/` directory.
-fn installed_packages() -> HashMap<String, Option<String>> {
+fn installed_packages(app_dir: &AppDir) -> Result<HashMap<String, Option<String>>, String> {
     let mut map = HashMap::new();
 
     // From manifest (has version info)
-    if let Ok(m) = manifest::load_manifest() {
-        for (name, entry) in &m.packages {
-            map.insert(name.clone(), entry.version.clone());
-        }
+    let m = manifest::load_manifest(app_dir)?;
+    for (name, entry) in &m.packages {
+        map.insert(name.clone(), entry.version.clone());
     }
 
     // Also scan packages/ dir in case manifest is stale
-    if let Some(home) = dirs::home_dir() {
-        let pkg_dir = home.join(".algocline").join("packages");
-        if let Ok(entries) = std::fs::read_dir(&pkg_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        map.entry(name.to_string()).or_insert(None);
-                    }
+    let pkg_dir = app_dir.packages_dir();
+    if let Ok(entries) = std::fs::read_dir(&pkg_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    map.entry(name.to_string()).or_insert(None);
                 }
             }
         }
     }
 
-    map
+    Ok(map)
 }
 
-/// Count local cards per package from `~/.algocline/cards/{pkg}/`.
-fn local_card_counts() -> HashMap<String, usize> {
+/// Count local cards per package from `{app_dir}/cards/{pkg}/`.
+fn local_card_counts(app_dir: &AppDir) -> HashMap<String, usize> {
     let mut map = HashMap::new();
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return map,
-    };
-    let cards_dir = home.join(".algocline").join("cards");
+    let cards_dir = app_dir.cards_dir();
     let entries = match std::fs::read_dir(&cards_dir) {
         Ok(e) => e,
         Err(_) => return map,
@@ -633,16 +640,12 @@ fn local_card_counts() -> HashMap<String, usize> {
     map
 }
 
-/// Count eval results for a specific package by scanning `~/.algocline/evals/`.
+/// Count eval results for a specific package by scanning `{app_dir}/evals/`.
 ///
 /// Reads only `.meta.json` files (lightweight) to check the strategy field.
 /// Falls back to reading full eval JSON if meta is missing.
-fn count_evals_for_pkg(pkg: &str) -> usize {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return 0,
-    };
-    let evals_dir = home.join(".algocline").join("evals");
+fn count_evals_for_pkg(app_dir: &AppDir, pkg: &str) -> usize {
+    let evals_dir = app_dir.evals_dir();
     let entries = match std::fs::read_dir(&evals_dir) {
         Ok(e) => e,
         Err(_) => return 0,
@@ -710,10 +713,10 @@ fn count_evals_for_pkg(pkg: &str) -> usize {
 /// When a package is installed locally and the remote index lacks a
 /// docstring (pre-v0.21 indices), the docstring is extracted from the
 /// local `init.lua` so that full-text search works immediately.
-fn merge(remote: &HubIndex) -> Vec<SearchResult> {
-    let installed = installed_packages();
-    let card_counts = local_card_counts();
-    let pkg_dir = dirs::home_dir().map(|h| h.join(".algocline").join("packages"));
+fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, String> {
+    let installed = installed_packages(app_dir)?;
+    let card_counts = local_card_counts(app_dir);
+    let pkg_dir: Option<PathBuf> = Some(app_dir.packages_dir());
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut results: Vec<SearchResult> = Vec::new();
@@ -785,7 +788,7 @@ fn merge(remote: &HubIndex) -> Vec<SearchResult> {
         });
     }
 
-    results
+    Ok(results)
 }
 
 // ─── Search (filtering) ───────────────────────────────────────
@@ -831,7 +834,7 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
 ///
 /// When `source_dir` is `None`, scans `~/.algocline/packages/` and
 /// enriches entries with manifest source and local card counts.
-fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
+fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> Result<HubIndex, String> {
     let empty = || HubIndex {
         schema_version: "hub_index/v0".into(),
         updated_at: super::manifest::now_iso8601(),
@@ -840,32 +843,35 @@ fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
 
     let pkg_dir = match source_dir {
         Some(d) => d.to_path_buf(),
-        None => {
-            let home = match dirs::home_dir() {
-                Some(h) => h,
-                None => return empty(),
-            };
-            home.join(".algocline").join("packages")
-        }
+        None => app_dir.packages_dir(),
     };
 
     let use_local_state = source_dir.is_none();
     let card_counts = if use_local_state {
-        local_card_counts()
+        local_card_counts(app_dir)
     } else {
         HashMap::new()
     };
+    // Manifest read errors surface as `Err` rather than degrading to an
+    // empty manifest — when building the local hub index, a corrupt
+    // `installed.json` silently turning all package sources into
+    // `PackageSource::Unknown` would be indistinguishable from the
+    // legitimate "no source recorded" state, and would ship into
+    // generated `hub_index.json` files verbatim.
     let manifest = if use_local_state {
-        manifest::load_manifest().unwrap_or_default()
+        manifest::load_manifest(app_dir)?
     } else {
         manifest::Manifest::default()
     };
 
     let mut entries = Vec::new();
 
+    // Missing / unreadable `pkg_dir` is a legitimate "no packages yet"
+    // state on a fresh install — distinct from manifest corruption
+    // above, and safe to surface as an empty index.
     let dir_entries = match std::fs::read_dir(&pkg_dir) {
         Ok(e) => e,
-        Err(_) => return empty(),
+        Err(_) => return Ok(empty()),
     };
 
     for entry in dir_entries.flatten() {
@@ -911,11 +917,11 @@ fn build_index(source_dir: Option<&std::path::Path>) -> HubIndex {
 
     entries.sort_by(|a, b| a.entity.name.cmp(&b.entity.name));
 
-    HubIndex {
+    Ok(HubIndex {
         schema_version: "hub_index/v0".into(),
         updated_at: super::manifest::now_iso8601(),
         packages: entries,
-    }
+    })
 }
 
 // ─── Public API ────────────────────────────────────────────────
@@ -940,7 +946,8 @@ impl AppService {
                 return Err(format!("source_dir '{}' is not a directory", d.display()));
             }
         }
-        let index = build_index(src);
+        let app_dir = self.log_config.app_dir();
+        let index = build_index(&app_dir, src)?;
 
         let written_path = if let Some(path) = output_path {
             let json = serde_json::to_string_pretty(&index)
@@ -974,7 +981,8 @@ impl AppService {
         }
 
         // Package metadata: try remote index first, fall back to local
-        let installed = installed_packages();
+        let app_dir = self.log_config.app_dir();
+        let installed = installed_packages(&app_dir)?;
         let is_installed = installed.contains_key(pkg);
 
         // Resolve package metadata: try remote index first, fall back to
@@ -983,7 +991,7 @@ impl AppService {
         // we flatten `None` to empty string so the wire shape (non-null
         // JSON string fields) stays unchanged for existing consumers.
         let (version, description, category, source) = {
-            let (remote, _) = fetch_remote_indices();
+            let (remote, _) = fetch_remote_indices(&app_dir)?;
             if let Some(entry) = remote.packages.iter().find(|e| e.entity.name == pkg) {
                 (
                     entry.entity.version.clone().unwrap_or_default(),
@@ -997,16 +1005,12 @@ impl AppService {
                 // degrade gracefully by returning the manifest-recorded
                 // version and empty string fields — mirroring the pre-typed
                 // behaviour.
-                let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-                let init_lua = home
-                    .join(".algocline")
-                    .join("packages")
-                    .join(pkg)
-                    .join("init.lua");
+                let init_lua = app_dir.packages_dir().join(pkg).join("init.lua");
                 let entity = PkgEntity::parse_from_init_lua(&init_lua);
-                let manifest_source = manifest::load_manifest()
-                    .ok()
-                    .and_then(|m| m.packages.get(pkg).map(|e| e.source.clone()))
+                let manifest_source = manifest::load_manifest(&app_dir)?
+                    .packages
+                    .get(pkg)
+                    .map(|e| e.source.clone())
                     .unwrap_or_default();
                 match entity {
                     Some(e) => (
@@ -1030,11 +1034,11 @@ impl AppService {
         };
 
         // Cards for this package (single call, reused for stats)
-        let card_rows = card::list(Some(pkg)).unwrap_or_default();
+        let card_rows = self.card_store.list(Some(pkg)).unwrap_or_default();
         let cards_json = card::summaries_to_json(&card_rows);
 
         // Aliases for this package
-        let aliases_json = match card::alias_list(Some(pkg)) {
+        let aliases_json = match self.card_store.alias_list(Some(pkg)) {
             Ok(rows) => card::aliases_to_json(&rows),
             Err(_) => serde_json::json!([]),
         };
@@ -1052,7 +1056,7 @@ impl AppService {
         };
 
         // Eval count from evals directory
-        let eval_count = count_evals_for_pkg(pkg);
+        let eval_count = count_evals_for_pkg(&app_dir, pkg);
 
         let response = serde_json::json!({
             "pkg": {
@@ -1112,8 +1116,9 @@ impl AppService {
         installed_only: Option<bool>,
         opts: ListOpts,
     ) -> Result<String, String> {
-        let (remote, warnings) = fetch_remote_indices();
-        let mut results = merge(&remote);
+        let app_dir = self.log_config.app_dir();
+        let (remote, warnings) = fetch_remote_indices(&app_dir)?;
+        let mut results = merge(&app_dir, &remote)?;
 
         // Filter by query (internal signal covers name/description/
         // category/docstring — `matches_query` unchanged).
@@ -1225,7 +1230,7 @@ impl AppService {
             .collect();
 
         // Collect discovered sources for transparency.
-        let sources = discover_index_urls();
+        let sources = discover_index_urls(&app_dir)?;
 
         let mut json = serde_json::json!({
             "results": projected,
@@ -1312,6 +1317,8 @@ mod tests {
     fn merge_dedup_uses_hashset() {
         // Verify that merge correctly handles local-only packages
         // without O(n*m) behavior (structural test).
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
         let remote = HubIndex {
             schema_version: "hub_index/v0".into(),
             updated_at: String::new(),
@@ -1329,7 +1336,7 @@ mod tests {
             }],
         };
 
-        let results = merge(&remote);
+        let results = merge(&app_dir, &remote).expect("merge over empty app_dir should succeed");
         // Should include remote_only + any locally installed packages
         assert!(results.iter().any(|r| r.entity.name == "remote_only"));
     }

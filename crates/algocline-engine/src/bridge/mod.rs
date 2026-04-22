@@ -9,6 +9,7 @@
 //! without explicit `require()`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use algocline_core::{BudgetHandle, CustomMetricsHandle, ProgressHandle};
 use mlua::prelude::*;
@@ -19,7 +20,9 @@ mod fuzzy;
 mod llm;
 mod text;
 
+use crate::card::FileCardStore;
 use crate::llm_bridge::LlmRequest;
+use crate::state::JsonFileStore;
 use crate::variant_pkg::VariantPkg;
 
 /// Layer 1 prelude (also used by fork to setup child VMs).
@@ -44,6 +47,12 @@ pub struct BridgeConfig {
     pub lib_paths: Vec<PathBuf>,
     /// Variant pkg overrides (`alc.local.toml`) — propagated to fork children.
     pub variant_pkgs: Vec<VariantPkg>,
+    /// State store for `alc.state.*` (service layer resolves the root).
+    pub state_store: Arc<JsonFileStore>,
+    /// Card store for `alc.card.*` (service layer resolves the root).
+    pub card_store: Arc<FileCardStore>,
+    /// Scenarios directory exposed to Lua via `alc._dirs.scenarios`.
+    pub scenarios_dir: PathBuf,
 }
 
 /// Register all Layer 0 runtime primitives onto the given table.
@@ -51,8 +60,15 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     data::register_json(lua, alc_table)?;
     fuzzy::register_fuzzy(lua, alc_table)?;
     data::register_log(lua, alc_table)?;
-    data::register_state(lua, alc_table, config.ns)?;
-    data::register_card(lua, alc_table)?;
+    data::register_state(lua, alc_table, config.ns, Arc::clone(&config.state_store))?;
+    data::register_card(lua, alc_table, Arc::clone(&config.card_store))?;
+    data::register_dirs(
+        lua,
+        alc_table,
+        config.state_store.root(),
+        config.card_store.root(),
+        &config.scenarios_dir,
+    )?;
     text::register_chunk(lua, alc_table)?;
     data::register_stats(lua, alc_table, config.custom_metrics)?;
     register_time(lua, alc_table)?;
@@ -69,6 +85,9 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
             config.budget,
             config.lib_paths,
             config.variant_pkgs,
+            config.state_store,
+            config.card_store,
+            config.scenarios_dir,
         )?;
     }
     Ok(())
@@ -108,6 +127,9 @@ mod tests {
 
     fn test_config() -> BridgeConfig {
         let metrics = ExecutionMetrics::new();
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
         BridgeConfig {
             llm_tx: None,
             ns: "default".into(),
@@ -116,6 +138,9 @@ mod tests {
             progress: metrics.progress_handle(),
             lib_paths: vec![],
             variant_pkgs: vec![],
+            state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+            card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+            scenarios_dir: root.join("scenarios"),
         }
     }
 

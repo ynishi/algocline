@@ -125,8 +125,9 @@ impl AppService {
         name: Option<String>,
         project_root: Option<String>,
     ) -> Result<String, String> {
-        let manifest = load_manifest()?;
-        let pkg_dir = packages_dir()?;
+        let app_dir = self.log_config.app_dir();
+        let manifest = load_manifest(&app_dir)?;
+        let pkg_dir = packages_dir(&app_dir);
         let resolved_root = resolve_project_root(project_root.as_deref());
 
         let mut buckets = Buckets::default();

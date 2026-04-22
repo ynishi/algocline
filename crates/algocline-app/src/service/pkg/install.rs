@@ -86,7 +86,8 @@ impl AppService {
         source: InstallSource,
         name: Option<String>,
     ) -> Result<String, String> {
-        let pkg_dir = packages_dir()?;
+        let app_dir = self.log_config.app_dir();
+        let pkg_dir = packages_dir(&app_dir);
         let _ = std::fs::create_dir_all(&pkg_dir);
 
         let git_url = match source {
@@ -160,16 +161,25 @@ impl AppService {
             copy_dir(staging.path(), dest.as_ref())
                 .map_err(|e| format!("Failed to copy package: {e}"))?;
 
-            // Record in manifest (best-effort; install itself already succeeded)
-            let _ = manifest::record_install(
+            // Record in manifest + hub registry. Storage failures here
+            // do not roll back the on-disk copy (install already
+            // succeeded) — they surface as `storage_warnings` so the
+            // operator notices that the metadata layer drifted.
+            let mut storage_warnings: Vec<String> = Vec::new();
+            if let Err(e) = manifest::record_install(
+                &app_dir,
                 &name,
                 None,
                 super::super::source::PackageSource::Git {
                     url: url.clone(),
                     rev: None,
                 },
-            );
-            hub::register_source(&url, "pkg_install");
+            ) {
+                storage_warnings.push(format!("manifest record_install: {e}"));
+            }
+            if let Err(e) = hub::register_source(&app_dir, &url, "pkg_install") {
+                storage_warnings.push(format!("hub register_source: {e}"));
+            }
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(std::slice::from_ref(&name))
@@ -179,8 +189,11 @@ impl AppService {
                 "installed": [name],
                 "mode": "single",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
+            }
+            if !storage_warnings.is_empty() {
+                response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
             Ok(response.to_string())
         } else {
@@ -228,8 +241,7 @@ impl AppService {
             for pkg_name in installed.iter().chain(skipped.iter()) {
                 let cards_subdir = staging.path().join(pkg_name).join("cards");
                 if cards_subdir.is_dir() {
-                    let imported =
-                        crate::AppService::import_pkg_bundled_cards(pkg_name, &cards_subdir);
+                    let imported = self.import_pkg_bundled_cards(pkg_name, &cards_subdir);
                     cards_installed.extend(imported);
                 }
             }
@@ -239,9 +251,10 @@ impl AppService {
             let mut scenarios_installed: Vec<String> = Vec::new();
             let mut scenarios_failures: DirEntryFailures = Vec::new();
             if scenarios_subdir.is_dir() {
-                if let Ok(sc_dir) = scenarios_dir() {
-                    std::fs::create_dir_all(&sc_dir)
-                        .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
+                let sc_dir = scenarios_dir(&app_dir);
+                std::fs::create_dir_all(&sc_dir)
+                    .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
+                {
                     if let Ok(result) = install_scenarios_from_dir(&scenarios_subdir, &sc_dir) {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result) {
                             if let Some(arr) = parsed.get("installed").and_then(|v| v.as_array()) {
@@ -268,15 +281,22 @@ impl AppService {
                 );
             }
 
-            // Record in manifest (best-effort)
-            let _ = manifest::record_install_batch(
+            // Record in manifest + hub registry. Same propagation
+            // discipline as the single-package branch above.
+            let mut storage_warnings: Vec<String> = Vec::new();
+            if let Err(e) = manifest::record_install_batch(
+                &app_dir,
                 &installed,
                 super::super::source::PackageSource::Git {
                     url: url.clone(),
                     rev: None,
                 },
-            );
-            hub::register_source(&url, "pkg_install");
+            ) {
+                storage_warnings.push(format!("manifest record_install_batch: {e}"));
+            }
+            if let Err(e) = hub::register_source(&app_dir, &url, "pkg_install") {
+                storage_warnings.push(format!("hub register_source: {e}"));
+            }
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(&installed).await;
@@ -289,8 +309,11 @@ impl AppService {
                 "scenarios_failures": scenarios_failures,
                 "mode": "collection",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
+            }
+            if !storage_warnings.is_empty() {
+                response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
             Ok(response.to_string())
         }
@@ -303,6 +326,7 @@ impl AppService {
         pkg_dir: &Path,
         name: Option<String>,
     ) -> Result<String, String> {
+        let app_dir = self.log_config.app_dir();
         // Reject a missing source dir up front. Without this check, a missing
         // path falls through to the Collection branch (since `init.lua` isn't
         // present) and surfaces as the misleading "'name' parameter is only
@@ -348,23 +372,31 @@ impl AppService {
                 }
             }
 
-            // Record in manifest (best-effort). Local-path installs are
-            // recorded as `Path { path }` so the original source location
-            // is preserved in the typed form — this keeps `pkg_repair` able
+            // Record in manifest. Local-path installs are recorded as
+            // `Path { path }` so the original source location is
+            // preserved in the typed form — this keeps `pkg_repair` able
             // to re-copy from the same source, and `pkg_list` can show
             // where the bytes came from. (Pre-typed manifests stored the
             // path as a bare string; `infer_from_legacy_source_string`
             // coerced it to `Installed`, which lost the path — the typed
             // form fixes that regression by carrying `path` explicitly.)
+            // Storage failures surface as `storage_warnings` so the
+            // operator notices when metadata drifts from the on-disk copy.
             let source_str_local = source.display().to_string();
-            let _ = manifest::record_install(
+            let mut storage_warnings: Vec<String> = Vec::new();
+            if let Err(e) = manifest::record_install(
+                &app_dir,
                 &name,
                 None,
                 super::super::source::PackageSource::Path {
                     path: source_str_local.clone(),
                 },
-            );
-            hub::register_source(&source_str_local, "pkg_install");
+            ) {
+                storage_warnings.push(format!("manifest record_install: {e}"));
+            }
+            if let Err(e) = hub::register_source(&app_dir, &source_str_local, "pkg_install") {
+                storage_warnings.push(format!("hub register_source: {e}"));
+            }
 
             // Update alc.toml + alc.lock if project root is found
             self.update_project_files_for_install(std::slice::from_ref(&name))
@@ -374,8 +406,11 @@ impl AppService {
                 "installed": [name],
                 "mode": "local_single",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
+            }
+            if !storage_warnings.is_empty() {
+                response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
             Ok(response.to_string())
         } else {
@@ -441,24 +476,30 @@ impl AppService {
             for pkg_name in installed.iter().chain(updated.iter()) {
                 let cards_subdir = source.join(pkg_name).join("cards");
                 if cards_subdir.is_dir() {
-                    let imported =
-                        crate::AppService::import_pkg_bundled_cards(pkg_name, &cards_subdir);
+                    let imported = self.import_pkg_bundled_cards(pkg_name, &cards_subdir);
                     cards_installed.extend(imported);
                 }
             }
 
-            // Record in manifest (best-effort). Batch local-path installs
-            // use `Path { path }` for the same reason as single-install
-            // (preserve the source path in the typed form).
+            // Record in manifest. Batch local-path installs use
+            // `Path { path }` for the same reason as single-install
+            // (preserve the source path in the typed form). Storage
+            // failures surface via `storage_warnings`.
             let source_str = source.display().to_string();
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
-            let _ = manifest::record_install_batch(
+            let mut storage_warnings: Vec<String> = Vec::new();
+            if let Err(e) = manifest::record_install_batch(
+                &app_dir,
                 &all_names,
                 super::super::source::PackageSource::Path {
                     path: source_str.clone(),
                 },
-            );
-            hub::register_source(&source_str, "pkg_install");
+            ) {
+                storage_warnings.push(format!("manifest record_install_batch: {e}"));
+            }
+            if let Err(e) = hub::register_source(&app_dir, &source_str, "pkg_install") {
+                storage_warnings.push(format!("hub register_source: {e}"));
+            }
 
             // Update alc.toml + alc.lock for newly installed packages
             self.update_project_files_for_install(&installed).await;
@@ -469,8 +510,11 @@ impl AppService {
                 "cards_installed": cards_installed,
                 "mode": "local_collection",
             });
-            if let Some(tp) = super::super::resolve::types_stub_path() {
+            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
+            }
+            if !storage_warnings.is_empty() {
+                response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
             Ok(response.to_string())
         }

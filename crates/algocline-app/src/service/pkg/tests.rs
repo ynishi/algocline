@@ -3,7 +3,10 @@
 use crate::service::list_opts::ListOpts;
 use crate::service::lockfile::{load_lockfile, LockFile, LockPackage};
 use crate::service::source::PackageSource;
-use crate::service::test_support::{make_app_service, make_app_service_with_search_paths};
+use crate::service::test_support::{
+    make_app_service, make_app_service_at, make_app_service_at_with_search_paths,
+    make_app_service_with_search_paths,
+};
 
 /// Build a `ListOpts` for tests. All fields default to `None`; override
 /// individual fields with struct-update syntax.
@@ -615,11 +618,13 @@ async fn pkg_remove_project_scope_not_found_returns_error() {
 #[tokio::test]
 async fn pkg_remove_global_scope_removes_manifest_entry() {
     use crate::service::manifest::{load_manifest, record_install};
-    use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let app_dir = crate::service::test_support::test_app_dir(home);
 
     record_install(
+        &app_dir,
         "ghost_pkg",
         Some("0.1.0"),
         crate::service::source::PackageSource::Path {
@@ -627,9 +632,12 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
         },
     )
     .unwrap();
-    assert!(load_manifest().unwrap().packages.contains_key("ghost_pkg"));
+    assert!(load_manifest(&app_dir)
+        .unwrap()
+        .packages
+        .contains_key("ghost_pkg"));
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = svc
         .pkg_remove(
             "ghost_pkg",
@@ -646,7 +654,10 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
     assert!(json["installed_json"].is_string());
 
     assert!(
-        !load_manifest().unwrap().packages.contains_key("ghost_pkg"),
+        !load_manifest(&app_dir)
+            .unwrap()
+            .packages
+            .contains_key("ghost_pkg"),
         "global manifest still contains the entry"
     );
 }
@@ -656,11 +667,10 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
 /// check in `scope = "project"`.
 #[tokio::test]
 async fn pkg_remove_global_scope_not_found_returns_error() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let _fake_home = FakeHome::new();
-
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = svc
         .pkg_remove("never_installed", None, None, Some("global".to_string()))
         .await;
@@ -677,18 +687,16 @@ async fn pkg_remove_global_scope_not_found_returns_error() {
 #[tokio::test]
 async fn pkg_remove_global_scope_preserves_physical_dir() {
     use crate::service::manifest::record_install;
-    use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
-    let pkg_dir = fake_home
-        .home
-        .join(".algocline")
-        .join("packages")
-        .join("kept");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let pkg_dir = home.join("packages").join("kept");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+    let app_dir = crate::service::test_support::test_app_dir(home);
     record_install(
+        &app_dir,
         "kept",
         Some("0.1.0"),
         crate::service::source::PackageSource::Path {
@@ -697,7 +705,7 @@ async fn pkg_remove_global_scope_preserves_physical_dir() {
     )
     .unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     svc.pkg_remove("kept", None, None, Some("global".to_string()))
         .await
         .unwrap();
@@ -719,10 +727,12 @@ async fn pkg_remove_global_scope_preserves_physical_dir() {
 #[tokio::test]
 async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     use crate::service::manifest::{load_manifest, record_install};
-    use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let app_dir = crate::service::test_support::test_app_dir(home);
     record_install(
+        &app_dir,
         "orphan",
         None,
         crate::service::source::PackageSource::Path {
@@ -731,7 +741,7 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     )
     .unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     // No project_root supplied — project scope will fail to resolve.
     let result = svc
         .pkg_remove("orphan", None, None, Some("all".to_string()))
@@ -744,7 +754,10 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     assert_eq!(json["global_removed"], true);
     assert_eq!(json["project_removed"], false);
     assert!(
-        !load_manifest().unwrap().packages.contains_key("orphan"),
+        !load_manifest(&app_dir)
+            .unwrap()
+            .packages
+            .contains_key("orphan"),
         "global manifest still contains the entry"
     );
 }
@@ -753,11 +766,10 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
 /// scope-specific error strings are surfaced so the caller can diagnose.
 #[tokio::test]
 async fn pkg_remove_all_scope_errors_when_neither_scope_has_entry() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let _fake_home = FakeHome::new();
-
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let err = svc
         .pkg_remove("never_anywhere", None, None, Some("all".to_string()))
         .await
@@ -901,10 +913,9 @@ async fn pkg_list_project_path_with_symlink_vendor_follows_target() {
 /// `{packages_dir()}/{name}` canonicalized; `resolved_source_kind = "installed"`.
 #[tokio::test]
 async fn pkg_list_project_installed_entry_has_resolved_source() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
-    let packages_dir = fake_home.home.join(".algocline").join("packages");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let packages_dir = home.join("packages");
     let pkg_dir = packages_dir.join("installed_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
@@ -928,13 +939,13 @@ async fn pkg_list_project_installed_entry_has_resolved_source() {
     };
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     let expected_canonical = std::fs::canonicalize(&pkg_dir)
         .unwrap()
         .display()
         .to_string();
-    drop(fake_home);
+    drop(tmp);
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
@@ -956,14 +967,13 @@ async fn pkg_list_project_installed_entry_has_resolved_source() {
 /// a symlink (linked package). The resolved path follows through to the real target.
 #[tokio::test]
 async fn pkg_list_project_installed_resolves_through_linked_pkg() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
-    let packages_dir = fake_home.home.join(".algocline").join("packages");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let packages_dir = home.join("packages");
     std::fs::create_dir_all(&packages_dir).unwrap();
 
     // The "real" development directory (what the symlink points to).
-    let real_dev_dir = fake_home.home.join("dev").join("linked_pkg_real");
+    let real_dev_dir = home.join("dev").join("linked_pkg_real");
     std::fs::create_dir_all(&real_dev_dir).unwrap();
     std::fs::write(real_dev_dir.join("init.lua"), "return {}").unwrap();
 
@@ -990,14 +1000,14 @@ async fn pkg_list_project_installed_resolves_through_linked_pkg() {
     };
     crate::service::lockfile::save_lockfile(project_root, &lock).unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = pkg_list_summary(&svc, Some(project_root.to_string_lossy().to_string())).await;
     // canonicalize follows the symlink to the real dev dir.
     let expected_canonical = std::fs::canonicalize(&real_dev_dir)
         .unwrap()
         .display()
         .to_string();
-    drop(fake_home);
+    drop(tmp);
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
@@ -1295,10 +1305,9 @@ async fn pkg_list_override_paths_project_shadows_global() {
 /// occurrence is not a genuine shadow and must be filtered out.
 #[tokio::test]
 async fn pkg_list_project_installed_does_not_self_shadow() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
-    let packages_dir = fake_home.home.join(".algocline").join("packages");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let packages_dir = home.join("packages");
     let pkg_dir = packages_dir.join("self_shadow_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
     std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
@@ -1324,14 +1333,17 @@ async fn pkg_list_project_installed_does_not_self_shadow() {
 
     // Include packages_dir as a search path — this is the real production
     // topology (see `resolve_lib_paths` in src/main.rs).
-    let svc = make_app_service_with_search_paths(vec![crate::service::resolve::SearchPath {
-        path: packages_dir.clone(),
-        source: crate::service::resolve::SearchPathSource::Default,
-    }])
+    let svc = make_app_service_at_with_search_paths(
+        home.to_path_buf(),
+        vec![crate::service::resolve::SearchPath {
+            path: packages_dir.clone(),
+            source: crate::service::resolve::SearchPathSource::Default,
+        }],
+    )
     .await;
 
     let result = pkg_list_full(&svc, Some(project_root.to_string_lossy().to_string())).await;
-    drop(fake_home);
+    drop(tmp);
 
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
     let packages = json["packages"].as_array().unwrap();
@@ -1596,12 +1608,11 @@ async fn pkg_list_variant_shadows_project() {
 /// the dest dir, then pkg_repair must restore it via reinstall.
 #[tokio::test]
 async fn pkg_repair_reinstalls_missing_installed_dir() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
     // Build a source pkg dir outside of HOME.
-    let source = fake_home.home.join("src_repo").join("repair_pkg");
+    let source = home.join("src_repo").join("repair_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(
         source.join("init.lua"),
@@ -1609,18 +1620,14 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
     )
     .unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
 
     // Initial install — populates installed.json and creates dest dir.
     svc.pkg_install(source.display().to_string(), None)
         .await
         .expect("initial install");
 
-    let dest = fake_home
-        .home
-        .join(".algocline")
-        .join("packages")
-        .join("repair_pkg");
+    let dest = home.join("packages").join("repair_pkg");
     assert!(dest.exists(), "dest must exist after install");
 
     // Simulate breakage: remove the dest dir.
@@ -1642,15 +1649,14 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
 /// Healthy package — manifest entry + dest exist → Skipped.
 #[tokio::test]
 async fn pkg_repair_skips_healthy_pkg() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let fake_home = FakeHome::new();
-
-    let source = fake_home.home.join("src_repo").join("healthy_pkg");
+    let source = home.join("src_repo").join("healthy_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     svc.pkg_install(source.display().to_string(), None)
         .await
         .unwrap();
@@ -1672,19 +1678,18 @@ async fn pkg_repair_skips_healthy_pkg() {
 /// (A) global symlink dangling — surfaced as unrepairable.
 #[tokio::test]
 async fn pkg_repair_reports_dangling_symlink_as_unrepairable() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
     // Create the packages dir and a dangling symlink in it.
-    let pkg_dir = fake_home.home.join(".algocline").join("packages");
+    let pkg_dir = home.join("packages");
     std::fs::create_dir_all(&pkg_dir).unwrap();
 
-    let target = fake_home.home.join("does_not_exist");
+    let target = home.join("does_not_exist");
     let link = pkg_dir.join("dangling_pkg");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = svc.pkg_repair(None, None).await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
 
@@ -1707,13 +1712,9 @@ async fn pkg_repair_reports_dangling_symlink_as_unrepairable() {
 /// exist on disk — surfaced as unrepairable with `scope: "project"`.
 #[tokio::test]
 async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
-    use crate::service::test_support::FakeHome;
-
-    // FakeHome acquires HOME_MUTEX at struct-field level — matches the
-    // other pkg_repair tests and avoids `await_holding_lock` on a local
-    // `MutexGuard` binding.
-    let fake_home = FakeHome::new();
-    let project_root = fake_home.home.join("proj");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let project_root = home.join("proj");
     std::fs::create_dir_all(&project_root).unwrap();
 
     std::fs::write(
@@ -1722,7 +1723,7 @@ async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
     )
     .unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = svc
         .pkg_repair(None, Some(project_root.to_string_lossy().to_string()))
         .await
@@ -1742,10 +1743,9 @@ async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
 /// doesn't exist on disk — surfaced as unrepairable with `scope: "variant"`.
 #[tokio::test]
 async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
-    let project_root = fake_home.home.join("proj");
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let project_root = home.join("proj");
     std::fs::create_dir_all(&project_root).unwrap();
 
     let absent = project_root.join("nope_pkg");
@@ -1758,7 +1758,7 @@ async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
     )
     .unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let result = svc
         .pkg_repair(None, Some(project_root.to_string_lossy().to_string()))
         .await
@@ -1780,13 +1780,12 @@ async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
 /// `name` filter that matches nothing → Err with informative message.
 #[tokio::test]
 async fn pkg_repair_unknown_name_returns_error() {
-    use crate::service::test_support::FakeHome;
+    // Tempdir-rooted AppDir isolates the test from the developer's
+    // real `~/.algocline/packages/` so no probe name conflicts.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    // FakeHome isolates HOME so this test doesn't depend on whether the
-    // developer happens to have a package with the probe name installed.
-    let _fake_home = FakeHome::new();
-
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let err = svc
         .pkg_repair(Some("nonexistent_pkg".to_string()), None)
         .await
@@ -1803,25 +1802,20 @@ async fn pkg_repair_unknown_name_returns_error() {
 /// so the operator can act on it without reading installed.json by hand.
 #[tokio::test]
 async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let fake_home = FakeHome::new();
-
-    let source = fake_home.home.join("gone").join("ghost_pkg");
+    let source = home.join("gone").join("ghost_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     svc.pkg_install(source.display().to_string(), None)
         .await
         .expect("initial install");
 
     // Break both the installed dest AND the source so repair can't auto-heal.
-    let dest = fake_home
-        .home
-        .join(".algocline")
-        .join("packages")
-        .join("ghost_pkg");
+    let dest = home.join("packages").join("ghost_pkg");
     std::fs::remove_dir_all(&dest).unwrap();
     std::fs::remove_dir_all(&source).unwrap();
 
@@ -1855,16 +1849,15 @@ async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
 /// impossibility) rather than Failed.
 #[tokio::test]
 async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
-    use crate::service::test_support::FakeHome;
-
-    let fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
     // Build a valid source first so pkg_install succeeds and writes manifest.
-    let source = fake_home.home.join("shell").join("shell_pkg");
+    let source = home.join("shell").join("shell_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     svc.pkg_install(source.display().to_string(), None)
         .await
         .expect("initial install");
@@ -1872,11 +1865,7 @@ async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
     // Break the installed dest, then mutate the source into an empty-dir
     // shape (remove init.lua) so repair's pre-check lands on the
     // "no init.lua at root" branch rather than the source-missing one.
-    let dest = fake_home
-        .home
-        .join(".algocline")
-        .join("packages")
-        .join("shell_pkg");
+    let dest = home.join("packages").join("shell_pkg");
     std::fs::remove_dir_all(&dest).unwrap();
     std::fs::remove_file(source.join("init.lua")).unwrap();
 
@@ -1909,11 +1898,10 @@ async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
 /// fell through to the collection branch).
 #[tokio::test]
 async fn pkg_install_rejects_missing_local_source_with_clear_error() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let _fake_home = FakeHome::new();
-
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let missing = "/tmp/alc-nonexistent-source-for-test-2e8f3a";
     let err = svc
         .pkg_install(missing.to_string(), Some("anything".to_string()))
@@ -1963,9 +1951,8 @@ fn fnv1a_hex(url: &str) -> String {
 /// leaves ~34% headroom for natural field churn.
 #[tokio::test]
 async fn pkg_list_default_summary_is_compact() {
-    use crate::service::test_support::FakeHome;
-
-    let _fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
     let tmp = tempfile::tempdir().unwrap();
     let search_dir = tmp.path().join("pkgs");
@@ -1983,7 +1970,7 @@ async fn pkg_list_default_summary_is_compact() {
         path: search_dir,
         source: crate::service::resolve::SearchPathSource::Env,
     };
-    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+    let svc = make_app_service_at_with_search_paths(home.to_path_buf(), vec![search_path]).await;
     let out = pkg_list_summary(&svc, None).await;
 
     assert!(
@@ -2003,7 +1990,8 @@ async fn pkg_list_default_summary_is_compact() {
 /// `alc_hub_search` default summary (`verbose="summary"`) must stay under
 /// 10_000 chars. To keep the test deterministic (and offline), the
 /// per-source cache is primed with empty `HubIndex` entries for every
-/// URL that `discover_index_urls` can surface under a `FakeHome`:
+/// URL that `discover_index_urls` can surface under the tempdir-rooted
+/// `AppDir` this test installs:
 ///
 /// - `hub.collection_url` is unset → no Tier 0 entry.
 /// - No registries / manifest → only the compiled-in `AUTO_INSTALL_SOURCES`
@@ -2015,11 +2003,10 @@ async fn pkg_list_default_summary_is_compact() {
 /// works offline and finishes in milliseconds.
 #[tokio::test]
 async fn hub_search_default_summary_is_compact() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let fake_home = FakeHome::new();
-
-    let cache_dir = fake_home.home.join(".algocline").join("hub_cache");
+    let cache_dir = home.join("hub_cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     // Empty HubIndex JSON — matches the schema `fetch_one` deserializes.
@@ -2030,11 +2017,12 @@ async fn hub_search_default_summary_is_compact() {
     })
     .to_string();
 
-    // Seed cache for every URL `discover_index_urls` may surface under
-    // FakeHome. The compiled-in seeds live in `AUTO_INSTALL_SOURCES`;
-    // they are passed through `repo_to_index_url` before hitting the
-    // cache layer. If this list drifts the test must follow —
-    // `repo_to_index_url` is verified verbatim by `hub.rs` unit tests.
+    // Seed cache for every URL `discover_index_urls` may surface
+    // under the tempdir-rooted `AppDir`. The compiled-in seeds live
+    // in `AUTO_INSTALL_SOURCES`; they are passed through
+    // `repo_to_index_url` before hitting the cache layer. If this
+    // list drifts the test must follow — `repo_to_index_url` is
+    // verified verbatim by `hub.rs` unit tests.
     for repo in [
         "https://github.com/ynishi/algocline-bundled-packages",
         "https://github.com/ynishi/evalframe",
@@ -2046,7 +2034,7 @@ async fn hub_search_default_summary_is_compact() {
         std::fs::write(&cache_path, &empty_index).unwrap();
     }
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     // Call the internal `AppService::hub_search` directly (same form
     // `engine_api_impl::hub_search` uses after folding MCP params into
     // `ListOpts`). Keeps the test at the app-layer boundary and avoids
@@ -2071,9 +2059,8 @@ async fn hub_search_default_summary_is_compact() {
 /// `alc_pkg_list` with `limit = Some(0)` returns every entry (no cap).
 #[tokio::test]
 async fn pkg_list_limit_zero_returns_all() {
-    use crate::service::test_support::FakeHome;
-
-    let _fake_home = FakeHome::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
     let tmp = tempfile::tempdir().unwrap();
     let search_dir = tmp.path().join("pkgs");
@@ -2092,7 +2079,7 @@ async fn pkg_list_limit_zero_returns_all() {
         path: search_dir,
         source: crate::service::resolve::SearchPathSource::Env,
     };
-    let svc = make_app_service_with_search_paths(vec![search_path]).await;
+    let svc = make_app_service_at_with_search_paths(home.to_path_buf(), vec![search_path]).await;
 
     let out = svc
         .pkg_list(
@@ -2122,11 +2109,10 @@ async fn pkg_list_limit_zero_returns_all() {
 /// confirmed by both sides agreeing.
 #[tokio::test]
 async fn hub_search_limit_zero_returns_all() {
-    use crate::service::test_support::FakeHome;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
 
-    let fake_home = FakeHome::new();
-
-    let cache_dir = fake_home.home.join(".algocline").join("hub_cache");
+    let cache_dir = home.join("hub_cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     let empty_index = serde_json::json!({
@@ -2147,7 +2133,7 @@ async fn hub_search_limit_zero_returns_all() {
         std::fs::write(&cache_path, &empty_index).unwrap();
     }
 
-    let svc = make_app_service().await;
+    let svc = make_app_service_at(home.to_path_buf()).await;
     let out = svc
         .hub_search(
             None,

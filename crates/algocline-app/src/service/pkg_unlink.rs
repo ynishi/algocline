@@ -15,7 +15,7 @@ impl AppService {
     pub async fn pkg_unlink(&self, name: String) -> Result<String, String> {
         validate_package_name(&name)?;
 
-        let pkgs = packages_dir()?;
+        let pkgs = packages_dir(&self.log_config.app_dir());
         let dest = pkgs.join(&name);
 
         // Use symlink_metadata so dangling symlinks are also detected.
@@ -46,14 +46,14 @@ impl AppService {
 mod tests {
     use std::os::unix::fs::symlink;
 
-    use crate::service::test_support::{make_app_service, FakeHome};
+    use crate::service::test_support::make_app_service_at;
 
     #[tokio::test]
     async fn pkg_unlink_removes_symlink() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
 
         let target = home.join("my_pkg");
@@ -61,7 +61,7 @@ mod tests {
         let dest = pkgs.join("my_pkg");
         symlink(&target, &dest).unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc.pkg_unlink("my_pkg".to_string()).await.unwrap();
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -71,14 +71,14 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_real_dir_returns_error() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         let dest = pkgs.join("my_pkg");
         std::fs::create_dir_all(&dest).unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc.pkg_unlink("my_pkg".to_string()).await.unwrap_err();
 
         assert!(err.contains("not a symlink"), "got: {err}");
@@ -86,13 +86,13 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_not_installed_returns_error() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc.pkg_unlink("nonexistent".to_string()).await.unwrap_err();
 
         assert!(err.contains("not installed"), "got: {err}");
@@ -100,17 +100,17 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_dangling_symlink_removed() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
 
         let dest = pkgs.join("dangling_pkg");
         symlink(home.join("nowhere"), &dest).unwrap();
         assert!(!dest.exists()); // dangling
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc.pkg_unlink("dangling_pkg".to_string()).await.unwrap();
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();

@@ -7,8 +7,10 @@
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
 -- ── 1. Package path: make evalframe requireable ──────────────
-local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
-local pkg_root = home .. "/.algocline/packages"
+-- ALC_TEST_APP_DIR is set by the Rust test harness to a tempdir that
+-- stands in for the app_dir root. Lua tests MUST NOT read HOME.
+local app_dir = os.getenv("ALC_TEST_APP_DIR") or ""
+local pkg_root = app_dir .. "/packages"
 package.path = pkg_root .. "/?.lua;"
     .. pkg_root .. "/?/init.lua;"
     .. package.path

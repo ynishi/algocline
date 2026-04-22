@@ -98,7 +98,7 @@ impl AppService {
             let mode = detect_mode(&source)?;
 
             // 3. Get packages_dir.
-            let pkgs = packages_dir()?;
+            let pkgs = packages_dir(&self.log_config.app_dir());
             std::fs::create_dir_all(&pkgs)
                 .map_err(|e| format!("Cannot create packages dir {}: {e}", pkgs.display()))?;
 
@@ -389,18 +389,18 @@ fn create_symlink(source: &Path, dest: &Path, force: bool) -> Result<(), String>
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::service::test_support::{make_app_service, FakeHome};
+    use crate::service::test_support::make_app_service_at;
 
     #[tokio::test]
     async fn pkg_link_single_creates_symlink() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
         let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
             .await
@@ -411,15 +411,15 @@ mod tests {
         assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
         assert_eq!(json["targets"]["my_pkg"], src.to_string_lossy().as_ref());
 
-        let dest = home.join(".algocline").join("packages").join("my_pkg");
+        let dest = home.join("packages").join("my_pkg");
         assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_link(&dest).unwrap(), src);
     }
 
     #[tokio::test]
     async fn pkg_link_collection_creates_symlinks() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
         let coll = home.join("collection");
         std::fs::create_dir_all(coll.join("pkg_a")).unwrap();
@@ -427,7 +427,7 @@ mod tests {
         std::fs::write(coll.join("pkg_a").join("init.lua"), "return {}").unwrap();
         std::fs::write(coll.join("pkg_b").join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(coll.to_string_lossy().to_string(), None, None, None, None)
             .await
@@ -441,7 +441,7 @@ mod tests {
         names.sort();
         assert_eq!(names, ["pkg_a", "pkg_b"]);
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         assert!(pkgs
             .join("pkg_a")
             .symlink_metadata()
@@ -458,19 +458,19 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_overwrites_existing_symlink() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
         let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
         let dest = pkgs.join("my_pkg");
         symlink(&src, &dest).unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
             .await
@@ -483,18 +483,18 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_real_dir_requires_force() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
         let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         let dest = pkgs.join("my_pkg");
         std::fs::create_dir_all(&dest).unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
 
         let err = svc
             .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
@@ -522,20 +522,20 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_dangling_symlink_overwritten() {
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
         let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let pkgs = home.join(".algocline").join("packages");
+        let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
         let dest = pkgs.join("my_pkg");
         symlink(home.join("nonexistent"), &dest).unwrap();
         assert!(!dest.exists()); // dangling
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
             .await
@@ -549,10 +549,11 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_path_not_found_returns_error() {
-        let env = FakeHome::new();
-        let nonexistent = env.home.join("does_not_exist");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let nonexistent = home.join("does_not_exist");
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc
             .pkg_link(
                 nonexistent.to_string_lossy().to_string(),
@@ -570,15 +571,16 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_appends_to_alc_local_toml() {
-        let env = FakeHome::new();
-        let root = env.home.join("proj");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         // Source pkg.
-        let src = env.home.join("my_pkg");
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
                 src.to_string_lossy().to_string(),
@@ -605,14 +607,15 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_no_symlink_created() {
-        let env = FakeHome::new();
-        let root = env.home.join("proj");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = env.home.join("my_pkg");
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         svc.pkg_link(
             src.to_string_lossy().to_string(),
             None,
@@ -623,7 +626,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cache_link = env.home.join(".algocline").join("packages").join("my_pkg");
+        let cache_link = home.join("packages").join("my_pkg");
         assert!(
             cache_link.symlink_metadata().is_err(),
             "variant scope must not create a symlink in ~/.algocline/packages/"
@@ -632,14 +635,15 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_second_call_is_noop_for_existing_entry() {
-        let env = FakeHome::new();
-        let root = env.home.join("proj");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = env.home.join("my_pkg");
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         svc.pkg_link(
             src.to_string_lossy().to_string(),
             None,
@@ -681,16 +685,17 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_requires_project_root() {
-        let env = FakeHome::new();
-        let src = env.home.join("my_pkg");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         // No project_root, no ALC_PROJECT_ROOT (test env doesn't set it).
         // cwd walks up from test runner cwd — unlikely to find alc.toml ancestor.
         // Use an invalid explicit path to force fallback + fail.
-        let nonexistent = env.home.join("no_such_project_root_zzz");
+        let nonexistent = home.join("no_such_project_root_zzz");
         let err = svc
             .pkg_link(
                 src.to_string_lossy().to_string(),
@@ -711,12 +716,13 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_invalid_scope_returns_error() {
-        let env = FakeHome::new();
-        let src = env.home.join("my_pkg");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc
             .pkg_link(
                 src.to_string_lossy().to_string(),
@@ -734,14 +740,14 @@ mod tests {
     async fn pkg_link_scope_global_default_matches_existing_behavior() {
         // Explicit scope=Some("global") should behave exactly as scope=None
         // (the default path).
-        let env = FakeHome::new();
-        let home = &env.home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
 
         let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
                 src.to_string_lossy().to_string(),
@@ -756,22 +762,23 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["scope"], "global");
         assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
-        let dest = home.join(".algocline").join("packages").join("my_pkg");
+        let dest = home.join("packages").join("my_pkg");
         assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[tokio::test]
     async fn pkg_link_scope_variant_collection_appends_all() {
-        let env = FakeHome::new();
-        let root = env.home.join("proj");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let coll = env.home.join("collection");
+        let coll = home.join("collection");
         std::fs::create_dir_all(coll.join("pkg_a")).unwrap();
         std::fs::create_dir_all(coll.join("pkg_b")).unwrap();
         std::fs::write(coll.join("pkg_a").join("init.lua"), "return {}").unwrap();
         std::fs::write(coll.join("pkg_b").join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
                 coll.to_string_lossy().to_string(),
@@ -801,14 +808,15 @@ mod tests {
     /// would mask caller intent.
     #[tokio::test]
     async fn pkg_link_scope_variant_rejects_force() {
-        let env = FakeHome::new();
-        let root = env.home.join("proj");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = env.home.join("my_pkg");
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc
             .pkg_link(
                 src.to_string_lossy().to_string(),
@@ -834,14 +842,15 @@ mod tests {
     /// `scope = variant` with `force = Some(false)` is allowed (same as None).
     #[tokio::test]
     async fn pkg_link_scope_variant_accepts_force_false() {
-        let env = FakeHome::new();
-        let root = env.home.join("proj");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = env.home.join("my_pkg");
+        let src = home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
 
-        let svc = make_app_service().await;
+        let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
                 src.to_string_lossy().to_string(),

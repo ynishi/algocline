@@ -8,15 +8,26 @@
 //! accessors here rather than reading `HOME` / `ALC_HOME` directly.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+/// Application root directory.
+///
+/// The inner `root` is stored behind an [`Arc`] so `AppDir::clone` is
+/// `O(1)` (refcount bump, no path allocation). Downstream services call
+/// `clone()` on `AppDir` freely as part of per-request delegate
+/// construction (see `FsInstalledManifestStore` and siblings in `algocline-app`);
+/// keeping clone cheap avoids the per-call `PathBuf` allocation that an
+/// owned `PathBuf` field would incur.
 #[derive(Clone, Debug)]
 pub struct AppDir {
-    root: PathBuf,
+    root: Arc<PathBuf>,
 }
 
 impl AppDir {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root: Arc::new(root),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -102,7 +113,10 @@ mod tests {
             dir.hub_registries_json(),
             PathBuf::from("/tmp/alc-root/hub_registries.json")
         );
-        assert_eq!(dir.config_toml(), PathBuf::from("/tmp/alc-root/config.toml"));
+        assert_eq!(
+            dir.config_toml(),
+            PathBuf::from("/tmp/alc-root/config.toml")
+        );
         assert_eq!(dir.init_lua(), PathBuf::from("/tmp/alc-root/init.lua"));
     }
 

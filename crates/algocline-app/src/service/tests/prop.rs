@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use crate::service::config::{AppConfig, LogDirSource};
+use crate::service::config::AppConfig;
 use crate::service::eval_store::{build_meta, extract_strategy_from_id, list_eval_history};
 use crate::service::path::{copy_dir, ContainedPath};
 use crate::service::resolve::{
-    display_name, install_scenarios_from_dir, is_package_installed, make_require_code,
-    resolve_code, resolve_scenario_code, resolve_scenario_source, scenarios_dir,
+    display_name, install_scenarios_from_dir, make_require_code, resolve_code,
+    resolve_scenario_code, resolve_scenario_source, scenarios_dir,
 };
 use crate::service::AppService;
 
@@ -68,40 +68,56 @@ proptest! {
 
 // ─── eval tests ───
 
+fn test_app_dir() -> (algocline_core::AppDir, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = algocline_core::AppDir::new(tmp.path().to_path_buf());
+    (dir, tmp)
+}
+
 #[test]
 fn eval_rejects_no_scenario() {
-    let result = resolve_scenario_code(None, None, None);
+    let (app_dir, _tmp) = test_app_dir();
+    let result = resolve_scenario_code(&app_dir, None, None, None);
     assert!(result.is_err());
 }
 
 #[test]
 fn resolve_scenario_code_inline() {
-    let result = resolve_scenario_code(Some("return 1".into()), None, None);
+    let (app_dir, _tmp) = test_app_dir();
+    let result = resolve_scenario_code(&app_dir, Some("return 1".into()), None, None);
     assert_eq!(result.unwrap(), "return 1");
 }
 
 #[test]
 fn resolve_scenario_code_from_file() {
+    let (app_dir, _tmp) = test_app_dir();
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut tmp, b"return 42").unwrap();
-    let result = resolve_scenario_code(None, Some(tmp.path().to_string_lossy().into()), None);
+    let result = resolve_scenario_code(
+        &app_dir,
+        None,
+        Some(tmp.path().to_string_lossy().into()),
+        None,
+    );
     assert_eq!(result.unwrap(), "return 42");
 }
 
 #[test]
 fn resolve_scenario_code_rejects_multiple() {
-    let result = resolve_scenario_code(Some("code".into()), Some("file".into()), None);
+    let (app_dir, _tmp) = test_app_dir();
+    let result = resolve_scenario_code(&app_dir, Some("code".into()), Some("file".into()), None);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("only one"));
 
-    let result2 = resolve_scenario_code(Some("code".into()), None, Some("name".into()));
+    let result2 = resolve_scenario_code(&app_dir, Some("code".into()), None, Some("name".into()));
     assert!(result2.is_err());
 }
 
 #[test]
 fn resolve_scenario_code_by_name_not_found() {
-    // scenario_name resolves from ~/.algocline/scenarios/ which won't have this
-    let result = resolve_scenario_code(None, None, Some("nonexistent_test_xyz".into()));
+    // scenario_name resolves from the app_dir scenarios dir which won't have this
+    let (app_dir, _tmp) = test_app_dir();
+    let result = resolve_scenario_code(&app_dir, None, None, Some("nonexistent_test_xyz".into()));
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found"));
 }
@@ -110,12 +126,9 @@ fn resolve_scenario_code_by_name_not_found() {
 
 #[test]
 fn scenarios_dir_ends_with_expected_path() {
-    let dir = scenarios_dir().unwrap();
-    assert!(
-        dir.ends_with(".algocline/scenarios"),
-        "dir: {}",
-        dir.display()
-    );
+    let (app_dir, _tmp) = test_app_dir();
+    let dir = scenarios_dir(&app_dir);
+    assert!(dir.ends_with("scenarios"), "dir: {}", dir.display());
 }
 
 #[test]
@@ -219,37 +232,34 @@ fn resolve_scenario_source_falls_back_to_root() {
     assert_eq!(source, root.path());
 }
 
+// `AppService::eval` first checks whether `evalframe` is installed and, if
+// missing, invokes `auto_install_bundled_packages` which performs a real
+// `git clone` against the bundled-packages remote. The clone is the
+// network-dependent step that makes this test ignored by default — leave
+// it `#[ignore]`d until a sandboxed registry fixture is in place.
 #[test]
+#[ignore = "network-dependent: auto_install_bundled_packages performs git clone"]
 fn eval_auto_installs_evalframe_on_missing() {
-    // Serialize with FakeHome tests to prevent HOME env var races.
-    let _home_lock = super::super::test_support::lock_home();
-
-    // Skip if evalframe is already installed globally
-    if is_package_installed("evalframe") {
-        return;
-    }
+    // Tempdir-rooted `AppDir` keeps the test fully isolated from the
+    // developer's real `~/.algocline/` without mutating `$HOME`.
+    let tmp = tempfile::tempdir().unwrap();
+    let app_root = tmp.path().to_path_buf();
+    let fake_pkg_dir = tmp.path().join("empty_packages");
+    std::fs::create_dir_all(&fake_pkg_dir).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
-    let fake_pkg_dir = tmp.path().join("empty_packages");
-    std::fs::create_dir_all(&fake_pkg_dir).unwrap();
-
     let executor = Arc::new(rt.block_on(async {
         algocline_engine::Executor::new(vec![fake_pkg_dir])
             .await
             .unwrap()
     }));
-    let config = AppConfig {
-        log_dir: Some(tmp.path().join("logs")),
-        log_dir_source: LogDirSource::EnvVar,
-        log_enabled: false,
-        prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
-        ..Default::default()
-    };
+    let config = AppConfig::default()
+        .with_app_dir(app_root)
+        .with_log_disabled();
     // AppService::new() calls spawn_gc_task() which requires a tokio runtime context.
     // Scope the enter guard so it is dropped before rt.block_on() below.
     let svc = {

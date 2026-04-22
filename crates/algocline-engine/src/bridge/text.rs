@@ -80,7 +80,13 @@ mod tests {
     use algocline_core::ExecutionMetrics;
 
     fn test_config() -> crate::bridge::BridgeConfig {
+        use crate::card::FileCardStore;
+        use crate::state::JsonFileStore;
+        use std::sync::Arc;
         let metrics = ExecutionMetrics::new();
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
         crate::bridge::BridgeConfig {
             llm_tx: None,
             ns: "default".into(),
@@ -89,6 +95,9 @@ mod tests {
             progress: metrics.progress_handle(),
             lib_paths: vec![],
             variant_pkgs: vec![],
+            state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+            card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+            scenarios_dir: root.join("scenarios"),
         }
     }
 

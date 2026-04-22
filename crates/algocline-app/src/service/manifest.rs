@@ -6,7 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Mutex;
 
+use algocline_core::AppDir;
 use serde::{Deserialize, Serialize};
 
 use super::source::PackageSource;
@@ -39,85 +42,406 @@ pub(crate) struct Manifest {
     pub packages: BTreeMap<String, ManifestEntry>,
 }
 
-// ─── Paths ─────────────────────────────────────────────────────
+// ─── Typed error ──────────────────────────────────────────────
+//
+// `InstalledManifestStoreError` classifies the ways `installed.json`
+// CRUD can fail. The variants carry the path and the underlying cause
+// (`std::io::Error` / `serde_json::Error` / lock subsystem message) so
+// callers — and, via the `From` bridge below, the MCP wire response —
+// can tell a missing-file case (which we normalise to an empty
+// `Manifest` at the `load` layer) from a corrupt-JSON case from a
+// locked-file case.
+//
+// The `From<InstalledManifestStoreError> for String` bridge keeps the
+// existing service-layer `Result<_, String>` surfaces compiling; each
+// caller's `?` runs through this conversion at the call site. A future
+// upgrade to a typed service-layer `Result<_, ServiceError>` can absorb
+// `InstalledManifestStoreError` through `#[from]` without a call-site
+// churn.
 
-fn manifest_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("installed.json"))
+/// CRUD failure modes for the installed-packages manifest.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InstalledManifestStoreError {
+    /// Failed to read `installed.json`. Distinct from "file absent" —
+    /// that case is normalised to an empty `Manifest` at the `load`
+    /// boundary and never reaches this variant.
+    #[error("failed to read installed manifest at {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to parse `installed.json` as JSON. Indicates on-disk
+    /// corruption or a hand-edit that violated the schema.
+    #[error("failed to parse installed manifest at {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Failed to serialise the in-memory `Manifest` to JSON. Indicates
+    /// a programming error (non-representable value) — the serde model
+    /// is total under normal use.
+    #[error("failed to serialize installed manifest: {source}")]
+    Serialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Failed to create the parent directory for `installed.json`.
+    #[error("failed to create installed manifest directory at {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to write the temp file that precedes the atomic rename.
+    #[error("failed to write installed manifest temp file at {path}: {source}")]
+    WriteTmp {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to atomically rename the temp file into `installed.json`.
+    #[error("failed to atomically rename installed manifest onto {path}: {source}")]
+    Rename {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The advisory lock subsystem (`service::lock::with_exclusive_lock`)
+    /// returned an error. We carry its message verbatim until the lock
+    /// subsystem is also typed.
+    #[error("installed manifest lock failed at {path}: {message}")]
+    Lock { path: PathBuf, message: String },
 }
 
-/// Path to the advisory lock companion file for the manifest.
-fn manifest_lock_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("installed.json.lock"))
+/// Bridge for callers still on `Result<_, String>`. Each service-layer
+/// caller's `?` runs through this conversion, so a corrupt
+/// `installed.json` surfaces as a populated error string on the MCP
+/// wire response rather than degrading silently. The conversion is one
+/// way: the service layer loses variant identity, but a future upgrade
+/// to a typed service error can absorb `InstalledManifestStoreError`
+/// through `#[from]` without a call-site churn.
+impl From<InstalledManifestStoreError> for String {
+    fn from(e: InstalledManifestStoreError) -> Self {
+        e.to_string()
+    }
 }
 
-/// Execute `f` while holding an exclusive `flock` on the manifest's
-/// companion lock file.
+// ─── Store trait ──────────────────────────────────────────────
+//
+// `InstalledManifestStore` abstracts the `installed.json` CRUD surface so
+// unit tests can substitute an in-memory impl for the fs-backed one. The
+// store owns the IO — every `std::fs::read_to_string(installed.json)` /
+// `std::fs::write(installed.json)` in this module is confined to the
+// `FsInstalledManifestStore` impl block, which is what Inv-4 greps for.
+//
+// Naming note (intentional): this is a `Store`, not a `Repo`. It is a
+// 1:1 adapter around a single physical file (`installed.json`) — the
+// infrastructure-layer `Store` shape mirrors the engine-crate
+// `JsonFileStore` / `FileCardStore` split. The service-layer
+// `Repository` seat — a proper Aggregate Repo on top of a `Pkg` domain
+// entity that orchestrates `installed.json` + `alc.toml` + `alc.lock` +
+// the `packages/{name}/` fs layout + symlink state — is deliberately
+// left vacant. Schema-proximate naming (`ManifestRepo`) would have
+// pre-committed that seat to a 1-physical-file adapter and obscured the
+// Aggregate boundary.
+
+/// CRUD surface for the installed-packages manifest (`installed.json`).
 ///
-/// `record_install`, `record_install_batch`, and `record_remove` all
-/// perform an unguarded read-modify-write sequence on `installed.json`.
-/// When two `pkg_install` calls overlap (e.g. the e2e suite running
-/// multiple `test_*` in-process tests against the same `$HOME`), one
-/// writer can load the manifest, the other completes its own
-/// load-modify-write, and the first writer then overwrites with its
-/// now-stale copy — losing entries.
+/// `record_*` are responsible for their own locking (`with_lock`); they
+/// do not expose the lock handle to callers.
 ///
-/// The lock is released when the `File` is dropped. Dropping happens on
-/// every exit from this function, including a panic in `f`: stack
-/// unwinding runs `File`'s destructor, which calls `close(2)` and thus
-/// releases the advisory `flock`. The explicit `drop(file)` after `f`
-/// is just ordering insurance for the success path.
-fn with_manifest_lock<F, R>(f: F) -> Result<R, String>
-where
-    F: FnOnce() -> Result<R, String>,
-{
-    let lock_path = manifest_lock_path()?;
-    crate::service::lock::with_exclusive_lock(&lock_path, f)
+/// The `Send + Sync` bounds are preemptive: no `Arc<dyn InstalledManifestStore>`
+/// exists in-tree yet (callers still reach `FsInstalledManifestStore` via
+/// the free-fn delegates at the bottom of this module), but the trait is
+/// designed to slot into that shape once a proper `PkgRepository`
+/// aggregate is introduced and takes ownership of this store alongside
+/// the other per-file stores (`alc.toml` / `alc.lock` / fs layout /
+/// symlink registry).
+pub(crate) trait InstalledManifestStore: Send + Sync {
+    /// Load the manifest. Returns an empty manifest if the backing store
+    /// is missing; I/O / parse failures are returned as typed errors.
+    fn load(&self) -> Result<Manifest, InstalledManifestStoreError>;
+
+    /// Record a successful install / update (see `record_install` free-fn
+    /// docs for semantics).
+    fn record_install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError>;
+
+    /// Batch variant of `record_install`.
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError>;
+
+    /// Remove a package from the manifest (used by `pkg_remove` scope
+    /// `"global"` / `"all"`).
+    fn record_remove(&self, name: &str) -> Result<(), InstalledManifestStoreError>;
 }
 
-// ─── Read / Write ──────────────────────────────────────────────
+// ─── FS-backed impl ───────────────────────────────────────────
+
+/// `installed.json` on disk, rooted at `{app_dir}/installed.json`.
+///
+/// Holds `AppDir` by value rather than `Arc<AppDir>` because `AppDir`'s
+/// internal `Arc<PathBuf>` already makes `clone` `O(1)`, and the struct
+/// is constructed per-call as a short-lived delegate (see the free-fn
+/// section at the bottom of this module). An additional outer `Arc`
+/// would introduce a per-call heap allocation with no sharing benefit.
+#[derive(Clone)]
+pub(crate) struct FsInstalledManifestStore {
+    app_dir: AppDir,
+}
+
+impl FsInstalledManifestStore {
+    pub(crate) fn new(app_dir: AppDir) -> Self {
+        Self { app_dir }
+    }
+
+    fn manifest_path(&self) -> PathBuf {
+        self.app_dir.installed_json()
+    }
+
+    fn manifest_lock_path(&self) -> PathBuf {
+        self.app_dir.installed_json().with_extension("json.lock")
+    }
+
+    /// Run `f` under an exclusive advisory file lock on the companion
+    /// `.lock` path. Wraps the lock subsystem's stringly-typed errors
+    /// into the typed `Lock` variant; `f`'s own errors (already typed)
+    /// are passed through.
+    fn with_lock<F, R>(&self, f: F) -> Result<R, InstalledManifestStoreError>
+    where
+        F: FnOnce() -> Result<R, InstalledManifestStoreError>,
+    {
+        let lock_path = self.manifest_lock_path();
+        // `with_exclusive_lock` encodes both its own acquisition errors
+        // and the inner closure's error as `String`. We cannot tell
+        // them apart after the fact, so we return the whole string
+        // under the `Lock` variant. Once the lock subsystem is typed,
+        // this merging can be replaced with `#[from]` absorption.
+        crate::service::lock::with_exclusive_lock(&lock_path, || f().map_err(|e| e.to_string()))
+            .map_err(|message| InstalledManifestStoreError::Lock {
+                path: lock_path.clone(),
+                message,
+            })
+    }
+
+    fn save(&self, manifest: &Manifest) -> Result<(), InstalledManifestStoreError> {
+        let path = self.manifest_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| {
+                InstalledManifestStoreError::CreateDir {
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
+        let content = serde_json::to_string_pretty(manifest)
+            .map_err(|source| InstalledManifestStoreError::Serialize { source })?;
+
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &content).map_err(|source| InstalledManifestStoreError::WriteTmp {
+            path: tmp.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|source| {
+            // Best-effort cleanup: the tmp file's presence is not a
+            // correctness hazard (next `save` overwrites it) but
+            // leaving it behind clutters the app dir.
+            let _ = std::fs::remove_file(&tmp);
+            InstalledManifestStoreError::Rename {
+                path: path.clone(),
+                source,
+            }
+        })
+    }
+}
+
+impl InstalledManifestStore for FsInstalledManifestStore {
+    fn load(&self) -> Result<Manifest, InstalledManifestStoreError> {
+        let path = self.manifest_path();
+        if !path.exists() {
+            return Ok(Manifest::default());
+        }
+        let content =
+            std::fs::read_to_string(&path).map_err(|source| InstalledManifestStoreError::Read {
+                path: path.clone(),
+                source,
+            })?;
+        serde_json::from_str(&content)
+            .map_err(|source| InstalledManifestStoreError::Parse { path, source })
+    }
+
+    fn record_install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError> {
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            let now = now_iso8601();
+
+            manifest
+                .packages
+                .entry(name.to_string())
+                .and_modify(|e| {
+                    if let Some(v) = version {
+                        e.version = Some(v.to_string());
+                    }
+                    e.source = source.clone();
+                    e.updated_at = now.clone();
+                })
+                .or_insert_with(|| ManifestEntry {
+                    version: version.map(String::from),
+                    source: source.clone(),
+                    installed_at: now.clone(),
+                    updated_at: now,
+                });
+
+            self.save(&manifest)
+        })
+    }
+
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            let now = now_iso8601();
+
+            for name in names {
+                manifest
+                    .packages
+                    .entry(name.clone())
+                    .and_modify(|e| {
+                        e.source = source.clone();
+                        e.updated_at = now.clone();
+                    })
+                    .or_insert_with(|| ManifestEntry {
+                        version: None,
+                        source: source.clone(),
+                        installed_at: now.clone(),
+                        updated_at: now.clone(),
+                    });
+            }
+
+            self.save(&manifest)
+        })
+    }
+
+    fn record_remove(&self, name: &str) -> Result<(), InstalledManifestStoreError> {
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            manifest.packages.remove(name);
+            self.save(&manifest)
+        })
+    }
+}
+
+// ─── In-memory mock (tests only) ──────────────────────────────
+
+/// In-memory manifest backed by a `Mutex<Manifest>`. Used by tests that
+/// need parallel-safe isolation without touching the filesystem.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct InMemoryInstalledManifestStore {
+    data: Mutex<Manifest>,
+}
+
+#[cfg(test)]
+impl InstalledManifestStore for InMemoryInstalledManifestStore {
+    fn load(&self) -> Result<Manifest, InstalledManifestStoreError> {
+        Ok(self.data.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    fn record_install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError> {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_iso8601();
+        guard
+            .packages
+            .entry(name.to_string())
+            .and_modify(|e| {
+                if let Some(v) = version {
+                    e.version = Some(v.to_string());
+                }
+                e.source = source.clone();
+                e.updated_at = now.clone();
+            })
+            .or_insert_with(|| ManifestEntry {
+                version: version.map(String::from),
+                source: source.clone(),
+                installed_at: now.clone(),
+                updated_at: now,
+            });
+        Ok(())
+    }
+
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), InstalledManifestStoreError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_iso8601();
+        for name in names {
+            guard
+                .packages
+                .entry(name.clone())
+                .and_modify(|e| {
+                    e.source = source.clone();
+                    e.updated_at = now.clone();
+                })
+                .or_insert_with(|| ManifestEntry {
+                    version: None,
+                    source: source.clone(),
+                    installed_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+        }
+        Ok(())
+    }
+
+    fn record_remove(&self, name: &str) -> Result<(), InstalledManifestStoreError> {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        guard.packages.remove(name);
+        Ok(())
+    }
+}
+
+// ─── Free-fn delegates (call-site compatibility) ──────────────
+//
+// Existing callers (`pkg/install.rs`, `pkg/list.rs`, `pkg/doctor.rs`,
+// `pkg/repair.rs`, `pkg/remove.rs`, `hub.rs`) still hold `&AppDir`
+// rather than an `Arc<dyn InstalledManifestStore>`, so the free functions are
+// retained as thin delegates onto a per-call `FsInstalledManifestStore`. This
+// keeps Inv-4 (all filesystem writes confined to the `FsInstalledManifestStore`
+// impl block) intact while avoiding a crate-wide `Arc<dyn>` plumbing
+// refactor in this commit.
 
 /// Load the manifest from disk. Returns empty manifest if file is missing.
-pub(crate) fn load_manifest() -> Result<Manifest, String> {
-    let path = manifest_path()?;
-    if !path.exists() {
-        return Ok(Manifest::default());
-    }
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read manifest: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
-}
-
-/// Save the manifest to disk (pretty-printed for human readability).
-///
-/// Writes atomically: serialize into `installed.json.tmp`, then `rename` onto
-/// `installed.json`. POSIX `rename(2)` is atomic within the same filesystem,
-/// so an unguarded reader — e.g. `load_manifest` in `pkg_list` or `pkg_repair`,
-/// which does not take `with_manifest_lock` — never observes a partially
-/// written JSON document. Without the temp-and-rename dance, a concurrent
-/// reader could see a truncated file between `open(TRUNC)` and the final
-/// `write`, producing a spurious "Failed to parse manifest" error.
-fn save_manifest(manifest: &Manifest) -> Result<(), String> {
-    let path = manifest_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create manifest dir: {e}"))?;
-    }
-    let content = serde_json::to_string_pretty(manifest)
-        .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
-
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &content)
-        .map_err(|e| format!("Failed to write manifest temp file {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        // Best-effort cleanup of the stale temp file on rename failure.
-        let _ = std::fs::remove_file(&tmp);
-        format!(
-            "Failed to atomically rename manifest temp onto {}: {e}",
-            path.display()
-        )
-    })
+pub(crate) fn load_manifest(app_dir: &AppDir) -> Result<Manifest, InstalledManifestStoreError> {
+    FsInstalledManifestStore::new(app_dir.clone()).load()
 }
 
 // ─── Operations ────────────────────────────────────────────────
@@ -173,88 +497,83 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 ///
 /// `version` is extracted from the package's `M.meta.version` field if provided.
 pub(crate) fn record_install(
+    app_dir: &AppDir,
     name: &str,
     version: Option<&str>,
     source: PackageSource,
-) -> Result<(), String> {
-    with_manifest_lock(|| {
-        let mut manifest = load_manifest()?;
-        let now = now_iso8601();
-
-        manifest
-            .packages
-            .entry(name.to_string())
-            .and_modify(|e| {
-                if let Some(v) = version {
-                    e.version = Some(v.to_string());
-                }
-                e.source = source.clone();
-                e.updated_at = now.clone();
-            })
-            .or_insert_with(|| ManifestEntry {
-                version: version.map(String::from),
-                source: source.clone(),
-                installed_at: now.clone(),
-                updated_at: now,
-            });
-
-        save_manifest(&manifest)
-    })
+) -> Result<(), InstalledManifestStoreError> {
+    FsInstalledManifestStore::new(app_dir.clone()).record_install(name, version, source)
 }
 
 /// Record a batch of installs (e.g. collection mode).
-pub(crate) fn record_install_batch(names: &[String], source: PackageSource) -> Result<(), String> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    with_manifest_lock(|| {
-        let mut manifest = load_manifest()?;
-        let now = now_iso8601();
-
-        for name in names {
-            manifest
-                .packages
-                .entry(name.clone())
-                .and_modify(|e| {
-                    e.source = source.clone();
-                    e.updated_at = now.clone();
-                })
-                .or_insert_with(|| ManifestEntry {
-                    version: None, // batch installs don't have per-package version info readily
-                    source: source.clone(),
-                    installed_at: now.clone(),
-                    updated_at: now.clone(),
-                });
-        }
-
-        save_manifest(&manifest)
-    })
+pub(crate) fn record_install_batch(
+    app_dir: &AppDir,
+    names: &[String],
+    source: PackageSource,
+) -> Result<(), InstalledManifestStoreError> {
+    FsInstalledManifestStore::new(app_dir.clone()).record_install_batch(names, source)
 }
 
 /// Remove a package from the manifest (`installed.json`). Used by
 /// `pkg_remove` scope `"global"` / `"all"`.
-pub(crate) fn record_remove(name: &str) -> Result<(), String> {
-    with_manifest_lock(|| {
-        let mut manifest = load_manifest()?;
-        manifest.packages.remove(name);
-        save_manifest(&manifest)
-    })
+pub(crate) fn record_remove(
+    app_dir: &AppDir,
+    name: &str,
+) -> Result<(), InstalledManifestStoreError> {
+    FsInstalledManifestStore::new(app_dir.clone()).record_remove(name)
 }
 
 /// Load manifest for test with custom path.
 #[cfg(test)]
-pub(crate) fn load_manifest_from(path: &std::path::Path) -> Result<Manifest, String> {
+pub(crate) fn load_manifest_from(
+    path: &std::path::Path,
+) -> Result<Manifest, InstalledManifestStoreError> {
     if !path.exists() {
         return Ok(Manifest::default());
     }
     let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read manifest: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
+        std::fs::read_to_string(path).map_err(|source| InstalledManifestStoreError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    serde_json::from_str(&content).map_err(|source| InstalledManifestStoreError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_memory_installed_manifest_store_roundtrip() {
+        // Demonstrates that `InMemoryInstalledManifestStore` satisfies the trait
+        // end-to-end without touching the filesystem, so unit tests can
+        // exercise caller logic in parallel against an in-memory backend
+        // when fs IO is not the property under test.
+        let repo = InMemoryInstalledManifestStore::default();
+        let git_src = || PackageSource::Git {
+            url: "https://example.test/mock".to_string(),
+            rev: None,
+        };
+
+        repo.record_install("alpha", Some("1.0.0"), git_src())
+            .unwrap();
+        repo.record_install("alpha", None, git_src()).unwrap();
+        repo.record_install_batch(&["beta".to_string(), "gamma".to_string()], git_src())
+            .unwrap();
+        repo.record_remove("beta").unwrap();
+
+        let loaded = repo.load().unwrap();
+        assert_eq!(
+            loaded.packages.get("alpha").unwrap().version.as_deref(),
+            Some("1.0.0"),
+            "version=None should preserve existing entry"
+        );
+        assert!(loaded.packages.contains_key("gamma"));
+        assert!(!loaded.packages.contains_key("beta"));
+    }
 
     #[test]
     fn days_to_ymd_epoch() {
@@ -377,7 +696,8 @@ mod tests {
         // conditional assignment, re-installing a git-cloned single pkg
         // (which passes `version = None`) silently erased the stored version
         // displayed by `pkg_list`. Guarantee: `None` preserves; `Some` overwrites.
-        let _fake_home = super::super::test_support::FakeHome::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
 
         let git_src = || PackageSource::Git {
             url: "https://github.com/ynishi/algocline-bundled-packages".to_string(),
@@ -385,16 +705,16 @@ mod tests {
         };
 
         // Seed: insert an entry with a known version.
-        record_install("cot", Some("0.1.0"), git_src()).unwrap();
-        let before = load_manifest().unwrap();
+        record_install(&app_dir, "cot", Some("0.1.0"), git_src()).unwrap();
+        let before = load_manifest(&app_dir).unwrap();
         assert_eq!(
             before.packages.get("cot").unwrap().version.as_deref(),
             Some("0.1.0")
         );
 
         // Re-install with `None` — should keep "0.1.0", not clobber.
-        record_install("cot", None, git_src()).unwrap();
-        let after_none = load_manifest().unwrap();
+        record_install(&app_dir, "cot", None, git_src()).unwrap();
+        let after_none = load_manifest(&app_dir).unwrap();
         assert_eq!(
             after_none.packages.get("cot").unwrap().version.as_deref(),
             Some("0.1.0"),
@@ -402,8 +722,8 @@ mod tests {
         );
 
         // Re-install with `Some("0.2.0")` — should overwrite.
-        record_install("cot", Some("0.2.0"), git_src()).unwrap();
-        let after_some = load_manifest().unwrap();
+        record_install(&app_dir, "cot", Some("0.2.0"), git_src()).unwrap();
+        let after_some = load_manifest(&app_dir).unwrap();
         assert_eq!(
             after_some.packages.get("cot").unwrap().version.as_deref(),
             Some("0.2.0"),

@@ -193,21 +193,6 @@ pub trait CardStore: Send + Sync {
     ) -> Result<(Vec<String>, Vec<String>), String>;
 }
 
-/// Return the default backend (File-backed, `~/.algocline/cards/`).
-fn default_store() -> Result<FileCardStore, String> {
-    FileCardStore::from_home()
-}
-
-/// Resolve the cards root directory, creating it if needed.
-fn cards_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let dir = home.join(".algocline").join("cards");
-    if !dir.exists() {
-        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create cards dir: {e}"))?;
-    }
-    Ok(dir)
-}
-
 fn validate_name(name: &str, kind: &str) -> Result<(), String> {
     if name.is_empty()
         || name.contains('/')
@@ -426,12 +411,7 @@ fn require_pkg_name(input: &Json) -> Result<String, String> {
     Ok(name)
 }
 
-/// Main create entry. Returns (card_id, absolute_path).
-pub fn create(input: Json) -> Result<(String, PathBuf), String> {
-    create_with_store(&default_store()?, input)
-}
-
-/// Create a new Card backed by `store`. See [`create`] for the default-store variant.
+/// Create a new Card backed by `store`.
 pub fn create_with_store(
     store: &dyn CardStore,
     mut input: Json,
@@ -491,12 +471,7 @@ pub fn create_with_store(
     Ok((card_id, path))
 }
 
-/// Read a Card by id. Returns None if not found.
-pub fn get(card_id: &str) -> Result<Option<Json>, String> {
-    get_with_store(&default_store()?, card_id)
-}
-
-/// Read a Card from `store`. See [`get`] for the default-store variant.
+/// Read a Card from `store` by id. Returns None if not found.
 pub fn get_with_store(store: &dyn CardStore, card_id: &str) -> Result<Option<Json>, String> {
     let text = match store.read_card_text(card_id)? {
         Some(t) => t,
@@ -575,12 +550,7 @@ fn summarize(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Opt
     })
 }
 
-/// List cards. `pkg_filter = Some("name")` restricts to that pkg subdir.
-pub fn list(pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
-    list_with_store(&default_store()?, pkg_filter)
-}
-
-/// List cards from `store`. See [`list`] for the default-store variant.
+/// List cards from `store`. `pkg_filter = Some("name")` restricts to that pkg subdir.
 pub fn list_with_store(
     store: &dyn CardStore,
     pkg_filter: Option<&str>,
@@ -620,11 +590,6 @@ pub fn summaries_to_json(rows: &[Summary]) -> Json {
 /// atomically.
 ///
 /// Returns the merged Card JSON.
-pub fn append(card_id: &str, fields: Json) -> Result<Json, String> {
-    append_with_store(&default_store()?, card_id, fields)
-}
-
-/// Append to a Card in `store`. See [`append`] for the default-store variant.
 pub fn append_with_store(
     store: &dyn CardStore,
     card_id: &str,
@@ -694,21 +659,11 @@ impl Alias {
     }
 }
 
-/// Bind (or rebind) an alias to a Card.
+/// Bind (or rebind) an alias to a Card in `store`.
 ///
 /// Validates that `card_id` exists. If an alias with the same `name` already
 /// exists it is overwritten — the alias table is intentionally mutable even
 /// though the Cards themselves are not.
-pub fn alias_set(
-    name: &str,
-    card_id: &str,
-    pkg: Option<&str>,
-    note: Option<&str>,
-) -> Result<Alias, String> {
-    alias_set_with_store(&default_store()?, name, card_id, pkg, note)
-}
-
-/// Bind an alias in `store`. See [`alias_set`] for the default-store variant.
 pub fn alias_set_with_store(
     store: &dyn CardStore,
     name: &str,
@@ -774,11 +729,6 @@ fn serialize_aliases_toml(aliases: &[Alias]) -> Result<String, String> {
 /// Shortcut for `alias_list → filter → get`. Returns `None` when the alias
 /// does not exist. Errors when the alias points at a missing Card — that
 /// would indicate a corrupt alias table (the target was deleted out of band).
-pub fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
-    get_by_alias_with_store(&default_store()?, name)
-}
-
-/// Resolve an alias in `store`. See [`get_by_alias`] for the default-store variant.
 pub fn get_by_alias_with_store(store: &dyn CardStore, name: &str) -> Result<Option<Json>, String> {
     validate_name(name, "alias")?;
     let aliases = store.read_aliases()?;
@@ -794,12 +744,7 @@ pub fn get_by_alias_with_store(store: &dyn CardStore, name: &str) -> Result<Opti
     }
 }
 
-/// List aliases, optionally filtered by pkg.
-pub fn alias_list(pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
-    alias_list_with_store(&default_store()?, pkg_filter)
-}
-
-/// List aliases from `store`. See [`alias_list`] for the default-store variant.
+/// List aliases from `store`, optionally filtered by pkg.
 pub fn alias_list_with_store(
     store: &dyn CardStore,
     pkg_filter: Option<&str>,
@@ -818,8 +763,6 @@ pub fn aliases_to_json(rows: &[Alias]) -> Json {
 // ═══════════════════════════════════════════════════════════════
 // Where DSL — Prisma/Mongo-style nested predicates
 // ═══════════════════════════════════════════════════════════════
-//
-// See `workspace/tasks/card-dsl/design.md` for the full spec.
 //
 // Syntax (JSON form, as received from Lua / MCP):
 //
@@ -1280,13 +1223,8 @@ fn order_summaries(a: &Summary, b: &Summary, keys: &[OrderKey]) -> std::cmp::Ord
 /// Filter/sort Cards across the store using the `where` DSL.
 ///
 /// When no `where` clause is specified and `order_by` only references
-/// summary-level fields, uses the lightweight `list()` path to avoid
-/// loading full TOML.  Otherwise loads full TOML per Card.
-pub fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
-    find_with_store(&default_store()?, q)
-}
-
-/// Filter/sort Cards from `store`. See [`find`] for the default-store variant.
+/// summary-level fields, uses the lightweight `list_with_store` path to
+/// avoid loading full TOML.  Otherwise loads full TOML per Card.
 pub fn find_with_store(store: &dyn CardStore, q: FindQuery) -> Result<Vec<Summary>, String> {
     // Fast path: lightweight query, no full-TOML load needed.
     if is_lightweight_query(&q) {
@@ -1635,12 +1573,7 @@ fn walk_down(start_id: &str, ctx: &LineageCtx<'_>, acc: &mut LineageAccum) {
     }
 }
 
-/// Walk the lineage tree from `q.card_id`.
-pub fn lineage(q: LineageQuery) -> Result<Option<LineageResult>, String> {
-    lineage_with_store(&default_store()?, q)
-}
-
-/// Walk the lineage tree in `store`. See [`lineage`] for the default-store variant.
+/// Walk the lineage tree from `q.card_id` in `store`.
 pub fn lineage_with_store(
     store: &dyn CardStore,
     q: LineageQuery,
@@ -1737,20 +1670,12 @@ pub fn lineage_to_json(r: &LineageResult) -> Json {
 // and by `alc_pkg_install` (Pkg-bundled cards/).
 // ───────────────────────────────────────────────────────────────
 
-/// Import Card files from `source_dir` into `~/.algocline/cards/{pkg}/`.
+/// Import Card files into `store` from `source_dir` under `pkg`.
 ///
 /// Copies `*.toml` and `*.samples.jsonl` files. Existing cards with the
 /// same id are skipped (first-writer wins — Card immutability).
 ///
 /// Returns `(imported, skipped)` card_id lists.
-pub fn import_from_dir(
-    source_dir: &std::path::Path,
-    pkg: &str,
-) -> Result<(Vec<String>, Vec<String>), String> {
-    import_from_dir_with_store(&default_store()?, source_dir, pkg)
-}
-
-/// Import Card files into `store`. See [`import_from_dir`] for the default-store variant.
 pub fn import_from_dir_with_store(
     store: &dyn CardStore,
     source_dir: &std::path::Path,
@@ -1802,11 +1727,6 @@ pub fn import_from_dir_with_store(
 /// Each `samples` entry is serialized as one compact JSON line.
 /// Fails if a samples file already exists for this card — mirrors
 /// the immutability guarantee of Cards themselves.
-pub fn write_samples(card_id: &str, samples: Vec<Json>) -> Result<PathBuf, String> {
-    write_samples_with_store(&default_store()?, card_id, samples)
-}
-
-/// Write samples via `store`. See [`write_samples`] for the default-store variant.
 pub fn write_samples_with_store(
     store: &dyn CardStore,
     card_id: &str,
@@ -1856,11 +1776,6 @@ pub struct SamplesQuery {
 ///
 /// Returns an empty Vec if no samples file exists (Cards without
 /// per-case details are the common case, not an error).
-pub fn read_samples(card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String> {
-    read_samples_with_store(&default_store()?, card_id, q)
-}
-
-/// Read samples from `store`. See [`read_samples`] for the default-store variant.
 pub fn read_samples_with_store(
     store: &dyn CardStore,
     card_id: &str,
@@ -1906,8 +1821,9 @@ pub fn read_samples_with_store(
 // samples as `{root}/{pkg}/{card_id}.samples.jsonl`, and the alias
 // table as `{root}/_aliases.toml`.
 //
-// `root` defaults to `~/.algocline/cards/` via `from_home()`. Tests
-// may use `new(tmpdir)` to redirect storage to a scratch directory.
+// `root` is provided at construction time via `new(root)`; callers
+// (typically the service layer) resolve it from the `AppDir`
+// abstraction. Tests use a tempdir via `new(tmpdir)`.
 
 /// File-backed implementation of [`CardStore`].
 pub struct FileCardStore {
@@ -1920,9 +1836,74 @@ impl FileCardStore {
         Self { root }
     }
 
-    /// Construct the default store rooted at `~/.algocline/cards/`.
-    pub fn from_home() -> Result<Self, String> {
-        Ok(Self { root: cards_dir()? })
+    /// Return the root directory this store writes under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // ─── Thin `self` delegations to the `*_with_store` free fns ────
+    //
+    // These let callers that hold an `Arc<FileCardStore>` (bridge/data
+    // register_card closures, service layer) invoke domain logic via
+    // instance methods without re-importing the `_with_store` free
+    // functions. Semantics are identical to the free-fn variants.
+
+    pub fn create(&self, input: Json) -> Result<(String, PathBuf), String> {
+        create_with_store(self, input)
+    }
+
+    pub fn get(&self, card_id: &str) -> Result<Option<Json>, String> {
+        get_with_store(self, card_id)
+    }
+
+    pub fn list(&self, pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
+        list_with_store(self, pkg_filter)
+    }
+
+    pub fn append(&self, card_id: &str, fields: Json) -> Result<Json, String> {
+        append_with_store(self, card_id, fields)
+    }
+
+    pub fn alias_set(
+        &self,
+        name: &str,
+        card_id: &str,
+        pkg: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<Alias, String> {
+        alias_set_with_store(self, name, card_id, pkg, note)
+    }
+
+    pub fn alias_list(&self, pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
+        alias_list_with_store(self, pkg_filter)
+    }
+
+    pub fn get_by_alias(&self, name: &str) -> Result<Option<Json>, String> {
+        get_by_alias_with_store(self, name)
+    }
+
+    pub fn find(&self, q: FindQuery) -> Result<Vec<Summary>, String> {
+        find_with_store(self, q)
+    }
+
+    pub fn write_samples(&self, card_id: &str, samples: Vec<Json>) -> Result<PathBuf, String> {
+        write_samples_with_store(self, card_id, samples)
+    }
+
+    pub fn read_samples(&self, card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String> {
+        read_samples_with_store(self, card_id, q)
+    }
+
+    pub fn lineage(&self, q: LineageQuery) -> Result<Option<LineageResult>, String> {
+        lineage_with_store(self, q)
+    }
+
+    pub fn card_sink_backfill(
+        &self,
+        sink: &str,
+        dry_run: bool,
+    ) -> Result<SinkBackfillReport, String> {
+        card_sink_backfill_with_store(self, sink, dry_run)
     }
 
     /// Returns the absolute path to the per-pkg subdirectory,
@@ -2842,14 +2823,10 @@ pub struct SinkBackfillReport {
 /// 4. `dry_run = true` short-circuits step 3: the report lists
 ///    what would have been pushed but no `publish_to` is issued,
 ///    so `SubscriberStats` does not increment.
-pub fn card_sink_backfill(sink: &str, dry_run: bool) -> Result<SinkBackfillReport, String> {
-    let store = default_store()?;
-    card_sink_backfill_with_store(&store, sink, dry_run)
-}
-
-/// `card_sink_backfill` with an injectable [`CardStore`]. Tests drive
-/// this directly against a tempdir-backed [`FileCardStore`] to avoid
-/// touching the user's real `~/.algocline/cards/`.
+///
+/// `card_sink_backfill` operates with an injectable [`CardStore`]; tests
+/// drive this directly against a tempdir-backed [`FileCardStore`] so they
+/// never touch the user's real cards directory.
 pub fn card_sink_backfill_with_store(
     store: &dyn CardStore,
     sink: &str,
@@ -3089,6 +3066,84 @@ fn percent_decode(src: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Test-only shared [`FileCardStore`] rooted at a process-wide tempdir.
+    ///
+    /// The legacy module-level free-fn tests (originally backed by
+    /// `~/.algocline/cards/`) now target this store so no test reads
+    /// the real HOME directory. Each test still uses `unique_pkg()`
+    /// for cross-test isolation under a single root, mirroring the
+    /// legacy pkg-namespaced layout.
+    fn shared_store() -> &'static FileCardStore {
+        static STORE: OnceLock<FileCardStore> = OnceLock::new();
+        STORE.get_or_init(|| {
+            let tmp = tempfile::tempdir().expect("test tempdir");
+            // Leak the guard: the dir survives for the whole test
+            // binary lifetime which matches the OnceLock lifetime.
+            let root = tmp.path().to_path_buf();
+            std::mem::forget(tmp);
+            FileCardStore::new(root)
+        })
+    }
+
+    // ─── Back-compat free-fn shims over `shared_store()` ──────────
+    //
+    // These wrap the same `*_with_store` free fns that the production
+    // `Arc<FileCardStore>` path calls, but through a tempdir-rooted
+    // store so tests never touch HOME. Kept private to the test module.
+
+    fn create(input: Json) -> Result<(String, PathBuf), String> {
+        create_with_store(shared_store(), input)
+    }
+
+    fn get(card_id: &str) -> Result<Option<Json>, String> {
+        get_with_store(shared_store(), card_id)
+    }
+
+    fn list(pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
+        list_with_store(shared_store(), pkg_filter)
+    }
+
+    fn append(card_id: &str, fields: Json) -> Result<Json, String> {
+        append_with_store(shared_store(), card_id, fields)
+    }
+
+    fn alias_set(
+        name: &str,
+        card_id: &str,
+        pkg: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<Alias, String> {
+        alias_set_with_store(shared_store(), name, card_id, pkg, note)
+    }
+
+    fn alias_list(pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
+        alias_list_with_store(shared_store(), pkg_filter)
+    }
+
+    fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
+        get_by_alias_with_store(shared_store(), name)
+    }
+
+    fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
+        find_with_store(shared_store(), q)
+    }
+
+    // Shim names used only by a subset of tests; remaining back-compat
+    // wrappers for functions exercised directly here. Tests for paths
+    // not covered by a shim call the `_with_store` variants against
+    // their own tempdir stores.
+
+    fn lineage(q: LineageQuery) -> Result<Option<LineageResult>, String> {
+        lineage_with_store(shared_store(), q)
+    }
+
+    fn import_from_dir(
+        source_dir: &std::path::Path,
+        pkg: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        import_from_dir_with_store(shared_store(), source_dir, pkg)
+    }
+
     fn unique_pkg() -> String {
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3098,10 +3153,8 @@ mod tests {
     }
 
     fn cleanup(pkg: &str) {
-        if let Ok(store) = default_store() {
-            if let Ok(d) = store.pkg_dir(pkg) {
-                let _ = fs::remove_dir_all(&d);
-            }
+        if let Ok(d) = shared_store().pkg_dir(pkg) {
+            let _ = fs::remove_dir_all(&d);
         }
     }
 
@@ -3346,7 +3399,7 @@ mod tests {
         assert_eq!(matching[0].card_id, id2);
 
         // Cleanup: remove our alias from the file
-        let store = default_store().unwrap();
+        let store = shared_store();
         let remaining: Vec<Alias> = store
             .read_aliases()
             .unwrap()

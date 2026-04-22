@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use algocline_core::AppDir;
+
 use super::path::ContainedPath;
 
 // ─── Search path (package resolution chain) ─────────────────────
@@ -91,26 +93,27 @@ return pkg.run(ctx)"#
     )
 }
 
-pub(crate) fn types_stub_path() -> Option<String> {
-    dirs::home_dir()
-        .map(|h| h.join(".algocline").join("types").join("alc.d.lua"))
-        .filter(|p| p.exists())
-        .map(|p| p.display().to_string())
+pub(crate) fn types_stub_path(app_dir: &AppDir) -> Option<String> {
+    let p = app_dir.types_dir().join("alc.d.lua");
+    if p.exists() {
+        Some(p.display().to_string())
+    } else {
+        None
+    }
 }
 
-pub(crate) fn packages_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("packages"))
+pub(crate) fn packages_dir(app_dir: &AppDir) -> PathBuf {
+    app_dir.packages_dir()
 }
 
-pub(crate) fn scenarios_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".algocline").join("scenarios"))
+pub(crate) fn scenarios_dir(app_dir: &AppDir) -> PathBuf {
+    app_dir.scenarios_dir()
 }
 
 /// Resolve scenario code from one of three mutually exclusive sources:
-/// inline code, file path, or scenario name (looked up in `~/.algocline/scenarios/`).
+/// inline code, file path, or scenario name (looked up in `{app_dir}/scenarios/`).
 pub(crate) fn resolve_scenario_code(
+    app_dir: &AppDir,
     scenario: Option<String>,
     scenario_file: Option<String>,
     scenario_name: Option<String>,
@@ -120,7 +123,7 @@ pub(crate) fn resolve_scenario_code(
         (None, Some(path), None) => std::fs::read_to_string(Path::new(&path))
             .map_err(|e| format!("Failed to read {path}: {e}")),
         (None, None, Some(name)) => {
-            let dir = scenarios_dir()?;
+            let dir = scenarios_dir(app_dir);
             let path = ContainedPath::child(&dir, &format!("{name}.lua"))
                 .map_err(|e| format!("Invalid scenario name: {e}"))?;
             if !path.as_ref().exists() {
@@ -158,10 +161,8 @@ pub(super) fn is_system_package(name: &str) -> bool {
 }
 
 /// Check whether a package is installed (has `init.lua`).
-pub(super) fn is_package_installed(name: &str) -> bool {
-    packages_dir()
-        .map(|dir| dir.join(name).join("init.lua").exists())
-        .unwrap_or(false)
+pub(super) fn is_package_installed(app_dir: &AppDir, name: &str) -> bool {
+    packages_dir(app_dir).join(name).join("init.lua").exists()
 }
 
 /// Per-entry I/O failures collected during resilient batch operations.

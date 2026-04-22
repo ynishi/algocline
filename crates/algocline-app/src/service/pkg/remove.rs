@@ -7,6 +7,8 @@
 //! scope. See `PkgRemoveScope` in the MCP layer for the enum definition and
 //! CHANGELOG for the semantic difference from the historical 0.14.0 `scope`.
 
+use algocline_core::AppDir;
+
 use super::super::alc_toml::{load_alc_toml_document, remove_package_entry, save_alc_toml};
 use super::super::lockfile::{load_lockfile, lockfile_path, save_lockfile};
 use super::super::manifest::{load_manifest, record_remove};
@@ -32,10 +34,11 @@ impl AppService {
         scope: Option<String>,
     ) -> Result<String, String> {
         let scope = scope.as_deref().unwrap_or("project");
+        let app_dir = self.log_config.app_dir();
         match scope {
             "project" => remove_from_project(name, project_root, version),
-            "global" => remove_from_global(name),
-            "all" => remove_from_all(name, project_root, version),
+            "global" => remove_from_global(&app_dir, name),
+            "all" => remove_from_all(&app_dir, name, project_root, version),
             other => Err(format!(
                 "invalid scope '{other}': expected one of project, global, all"
             )),
@@ -109,22 +112,23 @@ fn remove_from_project(
     .to_string())
 }
 
-/// Remove from `~/.algocline/installed.json`. Physical `packages/{name}/` is
+/// Remove from `{app_dir}/installed.json`. Physical `packages/{name}/` is
 /// untouched — symmetric with the project scope's no-delete policy.
-fn remove_from_global(name: &str) -> Result<String, String> {
-    let manifest = load_manifest()?;
+fn remove_from_global(app_dir: &AppDir, name: &str) -> Result<String, String> {
+    let manifest = load_manifest(app_dir)?;
     if !manifest.packages.contains_key(name) {
         return Err(format!(
-            "Package '{name}' not found in global manifest (~/.algocline/installed.json)"
+            "Package '{name}' not found in global manifest ({})",
+            app_dir.installed_json().display()
         ));
     }
 
-    record_remove(name)?;
+    record_remove(app_dir, name)?;
 
     Ok(serde_json::json!({
         "removed": name,
         "scope": "global",
-        "installed_json": manifest_path_display(),
+        "installed_json": manifest_path_display(app_dir),
     })
     .to_string())
 }
@@ -132,12 +136,13 @@ fn remove_from_global(name: &str) -> Result<String, String> {
 /// Remove from both project and global. Lenient: success if either scope
 /// had the entry; only errors when neither did.
 fn remove_from_all(
+    app_dir: &AppDir,
     name: &str,
     project_root: Option<String>,
     version: Option<String>,
 ) -> Result<String, String> {
     let project_res = remove_from_project(name, project_root, version);
-    let global_res = remove_from_global(name);
+    let global_res = remove_from_global(app_dir, name);
 
     let (project_ok, project_err) = match project_res {
         Ok(_) => (true, None),
@@ -167,16 +172,8 @@ fn remove_from_all(
     .to_string())
 }
 
-/// Best-effort display string for `~/.algocline/installed.json`. Returns an
-/// empty string if `$HOME` cannot be resolved — the caller surfaces this only
-/// for informational JSON, never for correctness.
-fn manifest_path_display() -> String {
-    dirs::home_dir()
-        .map(|h| {
-            h.join(".algocline")
-                .join("installed.json")
-                .display()
-                .to_string()
-        })
-        .unwrap_or_default()
+/// Display string for `{app_dir}/installed.json`, used only in the
+/// informational JSON response — never for correctness.
+fn manifest_path_display(app_dir: &AppDir) -> String {
+    app_dir.installed_json().display().to_string()
 }

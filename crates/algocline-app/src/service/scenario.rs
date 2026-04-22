@@ -11,7 +11,7 @@ impl AppService {
     ///
     /// Per-entry I/O errors are collected in `"failures"` rather than aborting.
     pub fn scenario_list(&self) -> Result<String, String> {
-        let dir = scenarios_dir()?;
+        let dir = scenarios_dir(&self.log_config.app_dir());
         if !dir.exists() {
             return Ok(serde_json::json!({ "scenarios": [], "failures": [] }).to_string());
         }
@@ -62,7 +62,7 @@ impl AppService {
 
     /// Show the content of a named scenario.
     pub fn scenario_show(&self, name: &str) -> Result<String, String> {
-        let dir = scenarios_dir()?;
+        let dir = scenarios_dir(&self.log_config.app_dir());
         let path = ContainedPath::child(&dir, &format!("{name}.lua"))
             .map_err(|e| format!("Invalid scenario name: {e}"))?;
         if !path.as_ref().exists() {
@@ -82,7 +82,7 @@ impl AppService {
     ///
     /// Expects the source to contain `.lua` files (at root or in a `scenarios/` subdirectory).
     pub async fn scenario_install(&self, url: String) -> Result<String, String> {
-        let dest_dir = scenarios_dir()?;
+        let dest_dir = scenarios_dir(&self.log_config.app_dir());
         std::fs::create_dir_all(&dest_dir)
             .map_err(|e| format!("Failed to create scenarios dir: {e}"))?;
 

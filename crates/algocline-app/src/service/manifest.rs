@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -43,20 +42,40 @@ pub(crate) struct Manifest {
     pub packages: BTreeMap<String, ManifestEntry>,
 }
 
-// ─── Repo trait (Subtask 3a) ──────────────────────────────────
+// ─── Store trait ──────────────────────────────────────────────
 //
-// `ManifestRepo` abstracts the `installed.json` CRUD surface so unit
-// tests can substitute an in-memory impl for the fs-backed one. The
-// repo owns the IO — every `std::fs::read_to_string(installed.json)` /
+// `InstalledManifestStore` abstracts the `installed.json` CRUD surface so
+// unit tests can substitute an in-memory impl for the fs-backed one. The
+// store owns the IO — every `std::fs::read_to_string(installed.json)` /
 // `std::fs::write(installed.json)` in this module is confined to the
-// `FsManifestRepo` impl block, which is what Inv-4 (Subtask 3b) greps
-// for.
+// `FsInstalledManifestStore` impl block, which is what Inv-4 greps for.
+//
+// Naming note (intentional): this is a `Store`, not a `Repo`. It is a
+// 1:1 adapter around a single physical file (`installed.json`) — the
+// infrastructure-layer `Store` shape mirrors the engine-crate
+// `JsonFileStore` / `FileCardStore` split. The service-layer
+// `Repository` seat — a proper Aggregate Repo on top of a `Pkg` domain
+// entity that orchestrates `installed.json` + `alc.toml` + `alc.lock` +
+// the `packages/{name}/` fs layout + symlink state — is deliberately
+// left vacant for the follow-up `PkgRepository` work. Schema-proximate
+// naming (`ManifestRepo`) would have pre-committed that seat to a
+// 1-physical-file adapter and obscured the Aggregate boundary.
+// See workspace/tasks/1776766389-appdir-guard-v0/wf-sim-pkgrepo-20260421.md
+// §Counter-WF A for the DDD argument and the follow-up task body.
 
-/// CRUD surface for the installed-packages manifest.
+/// CRUD surface for the installed-packages manifest (`installed.json`).
 ///
 /// `record_*` are responsible for their own locking (`with_lock`); they
 /// do not expose the lock handle to callers.
-pub(crate) trait ManifestRepo: Send + Sync {
+///
+/// The `Send + Sync` bounds are preemptive: no `Arc<dyn InstalledManifestStore>`
+/// exists in-tree yet (callers still reach `FsInstalledManifestStore` via
+/// the free-fn delegates at the bottom of this module), but the trait is
+/// designed to slot into that shape once a proper `PkgRepository`
+/// aggregate is introduced and takes ownership of this store alongside
+/// the other per-file stores (`alc.toml` / `alc.lock` / fs layout /
+/// symlink registry).
+pub(crate) trait InstalledManifestStore: Send + Sync {
     /// Load the manifest. Returns an empty manifest if the backing store
     /// is missing.
     fn load(&self) -> Result<Manifest, String>;
@@ -81,13 +100,19 @@ pub(crate) trait ManifestRepo: Send + Sync {
 // ─── FS-backed impl ───────────────────────────────────────────
 
 /// `installed.json` on disk, rooted at `{app_dir}/installed.json`.
+///
+/// Holds `AppDir` by value rather than `Arc<AppDir>` because `AppDir`'s
+/// internal `Arc<PathBuf>` already makes `clone` `O(1)`, and the struct
+/// is constructed per-call as a short-lived delegate (see the free-fn
+/// section at the bottom of this module). An additional outer `Arc`
+/// would introduce a per-call heap allocation with no sharing benefit.
 #[derive(Clone)]
-pub(crate) struct FsManifestRepo {
-    app_dir: Arc<AppDir>,
+pub(crate) struct FsInstalledManifestStore {
+    app_dir: AppDir,
 }
 
-impl FsManifestRepo {
-    pub(crate) fn new(app_dir: Arc<AppDir>) -> Self {
+impl FsInstalledManifestStore {
+    pub(crate) fn new(app_dir: AppDir) -> Self {
         Self { app_dir }
     }
 
@@ -129,7 +154,7 @@ impl FsManifestRepo {
     }
 }
 
-impl ManifestRepo for FsManifestRepo {
+impl InstalledManifestStore for FsInstalledManifestStore {
     fn load(&self) -> Result<Manifest, String> {
         let path = self.manifest_path();
         if !path.exists() {
@@ -214,12 +239,12 @@ impl ManifestRepo for FsManifestRepo {
 /// need parallel-safe isolation without touching the filesystem.
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct InMemoryManifestRepo {
+pub(crate) struct InMemoryInstalledManifestStore {
     data: Mutex<Manifest>,
 }
 
 #[cfg(test)]
-impl ManifestRepo for InMemoryManifestRepo {
+impl InstalledManifestStore for InMemoryInstalledManifestStore {
     fn load(&self) -> Result<Manifest, String> {
         Ok(self.data.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
@@ -286,15 +311,15 @@ impl ManifestRepo for InMemoryManifestRepo {
 //
 // Existing callers (`pkg/install.rs`, `pkg/list.rs`, `pkg/doctor.rs`,
 // `pkg/repair.rs`, `pkg/remove.rs`, `hub.rs`) still hold `&AppDir`
-// rather than an `Arc<dyn ManifestRepo>`, so the free functions are
-// retained as thin delegates onto a per-call `FsManifestRepo`. This
-// keeps Inv-4 (all filesystem writes confined to the `FsManifestRepo`
+// rather than an `Arc<dyn InstalledManifestStore>`, so the free functions are
+// retained as thin delegates onto a per-call `FsInstalledManifestStore`. This
+// keeps Inv-4 (all filesystem writes confined to the `FsInstalledManifestStore`
 // impl block) intact while avoiding a crate-wide `Arc<dyn>` plumbing
 // refactor in this commit.
 
 /// Load the manifest from disk. Returns empty manifest if file is missing.
 pub(crate) fn load_manifest(app_dir: &AppDir) -> Result<Manifest, String> {
-    FsManifestRepo::new(Arc::new(app_dir.clone())).load()
+    FsInstalledManifestStore::new(app_dir.clone()).load()
 }
 
 // ─── Operations ────────────────────────────────────────────────
@@ -355,7 +380,7 @@ pub(crate) fn record_install(
     version: Option<&str>,
     source: PackageSource,
 ) -> Result<(), String> {
-    FsManifestRepo::new(Arc::new(app_dir.clone())).record_install(name, version, source)
+    FsInstalledManifestStore::new(app_dir.clone()).record_install(name, version, source)
 }
 
 /// Record a batch of installs (e.g. collection mode).
@@ -364,13 +389,13 @@ pub(crate) fn record_install_batch(
     names: &[String],
     source: PackageSource,
 ) -> Result<(), String> {
-    FsManifestRepo::new(Arc::new(app_dir.clone())).record_install_batch(names, source)
+    FsInstalledManifestStore::new(app_dir.clone()).record_install_batch(names, source)
 }
 
 /// Remove a package from the manifest (`installed.json`). Used by
 /// `pkg_remove` scope `"global"` / `"all"`.
 pub(crate) fn record_remove(app_dir: &AppDir, name: &str) -> Result<(), String> {
-    FsManifestRepo::new(Arc::new(app_dir.clone())).record_remove(name)
+    FsInstalledManifestStore::new(app_dir.clone()).record_remove(name)
 }
 
 /// Load manifest for test with custom path.
@@ -389,13 +414,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn in_memory_manifest_repo_roundtrip() {
-        // Demonstrates that `InMemoryManifestRepo` satisfies the trait
+    fn in_memory_installed_manifest_store_roundtrip() {
+        // Demonstrates that `InMemoryInstalledManifestStore` satisfies the trait
         // end-to-end without touching the filesystem, so future unit
         // tests can exercise caller logic in parallel without the
         // `FakeHome` + `HOME_MUTEX` serialisation the FS-backed repo
         // currently forces.
-        let repo = InMemoryManifestRepo::default();
+        let repo = InMemoryInstalledManifestStore::default();
         let git_src = || PackageSource::Git {
             url: "https://example.test/mock".to_string(),
             rev: None,

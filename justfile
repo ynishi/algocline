@@ -83,10 +83,10 @@ ready:
 #   Inv-3: `algocline_core::AppDir` / `AppConfig` are not referenced from
 #          inside the engine crate (engine public API stays free of the
 #          service-layer abstractions).
-#   Inv-4: ManifestRepo encapsulation — no `installed.json` filesystem
-#          calls live outside `service/manifest.rs` (the `FsManifestRepo`
+#   Inv-4: InstalledManifestStore encapsulation — no `installed.json` filesystem
+#          calls live outside `service/manifest.rs` (the `FsInstalledManifestStore`
 #          impl block is the single source). Added in Subtask 3b together
-#          with the `ManifestRepo` trait extraction (Subtask 3a).
+#          with the `InstalledManifestStore` trait extraction (Subtask 3a).
 [group: 'agent']
 check-invariants:
     #!/usr/bin/env bash
@@ -121,12 +121,23 @@ check-invariants:
         echo "Inv-3 FAILED: engine references algocline_core::AppDir/AppConfig" >&2
         fail=1
     fi
-    # Inv-4: ManifestRepo encapsulation — every `std::fs::*` call that
+    # Inv-4: InstalledManifestStore encapsulation — every `std::fs::*` call that
     # touches `installed.json` / `installed.json.lock` / `installed.json.tmp`
-    # must sit inside `service/manifest.rs` (the `FsManifestRepo` impl
+    # must sit inside `service/manifest.rs` (the `FsInstalledManifestStore` impl
     # block). Call sites in sibling service files may still read the
     # *path* via `app_dir.installed_json()` for diagnostics — that is not
     # filesystem IO and does not surface here.
+    #
+    # Limitation: this grep is literal-only. An indirection pattern like
+    #   let p = app_dir.installed_json();
+    #   std::fs::write(p, ...)
+    # would evade it because the `installed.json` literal is no longer
+    # on the `std::fs::*` line. The real guard is the `FsInstalledManifestStore`
+    # impl boundary itself (the trait confines IO); this grep is a
+    # belt-and-braces sanity check. The follow-up that plumbs
+    # `Arc<dyn InstalledManifestStore>` through `AppService` (alongside the
+    # sibling `HubRepo` / `EvalRepo` extractions) will let us delete
+    # this grep once the trait boundary is fully exercised.
     if grep -rn -E 'std::fs::[A-Za-z_]+[^;]*installed\.json' \
             crates/algocline-app/src/service/ --include='*.rs' \
             | grep -v -E '^crates/algocline-app/src/service/manifest\.rs:'; then

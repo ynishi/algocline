@@ -7,6 +7,7 @@ mod eval;
 mod eval_store;
 mod gendoc;
 mod hub;
+pub mod hub_dist_preset;
 mod init;
 pub(crate) mod list_opts;
 pub(crate) mod lock;

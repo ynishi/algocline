@@ -1,3 +1,4 @@
+use super::hub_dist_preset::PRESET_CATALOG_VERSION;
 use super::path::ContainedPath;
 use super::transcript::append_note;
 use super::AppService;
@@ -179,6 +180,7 @@ impl AppService {
     pub fn info(&self) -> String {
         let mut info = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
+            "preset_catalog_version": PRESET_CATALOG_VERSION,
             "log_dir": {
                 "resolved": self.log_config.log_dir.as_ref().map(|p| p.display().to_string()),
                 "source": self.log_config.log_dir_source.to_string(),

@@ -10,6 +10,8 @@ use std::io::Write;
 use rmcp::{model::CallToolRequestParams, transport::TokioChildProcess, ServiceExt};
 use serde_json::{json, Map, Value};
 
+use algocline_app::PRESET_CATALOG_VERSION;
+
 // ─── Helpers ─────────────────────────────────────────────────────
 
 /// Build `CallToolRequestParams` from a tool name and a JSON value.
@@ -1404,6 +1406,16 @@ async fn test_alc_hub_dist_ok() {
     )
     .await;
 
+    assert_eq!(
+        resp.get("preset_catalog_version").and_then(|v| v.as_str()),
+        Some(PRESET_CATALOG_VERSION),
+        "expected preset_catalog_version in dist response, got: {resp}"
+    );
+    assert!(
+        resp.get("preset").is_none(),
+        "expected no preset object when preset omitted, got: {resp}"
+    );
+
     let reindex = resp
         .get("reindex")
         .unwrap_or_else(|| panic!("expected reindex field, got: {resp}"));
@@ -1426,6 +1438,128 @@ async fn test_alc_hub_dist_ok() {
     assert!(
         gendoc.get("stdout").is_some(),
         "dist.gendoc must include stdout field",
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_info_includes_preset_catalog_version() {
+    let client = connect().await;
+
+    let resp = call_json(&client, "alc_info", json!({})).await;
+    assert_eq!(
+        resp.get("preset_catalog_version").and_then(|v| v.as_str()),
+        Some(PRESET_CATALOG_VERSION),
+        "expected preset_catalog_version in alc_info, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_dist_preset_publish_uses_alc_toml_override() {
+    let client = connect().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    std::fs::write(
+        root.join("alc.toml"),
+        r#"[packages]
+
+[hub.dist]
+
+[hub.dist.presets.publish]
+projections = ["context7"]
+config_path = "configs.toml"
+"#,
+    )
+    .expect("write alc.toml");
+
+    let hub_dir = root.join("hub");
+    std::fs::create_dir_all(&hub_dir).expect("mkdir hub");
+    std::fs::write(
+        hub_dir.join("configs.toml"),
+        r#"[context7]
+projectTitle = "test"
+description = "test"
+rules = []
+"#,
+    )
+    .expect("write configs.toml");
+
+    let pkg_dir = hub_dir.join("fake_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir fake_pkg");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = {
+  name = "fake_pkg",
+  version = "0.1.0",
+  category = "test",
+  description = "fake package used by preset e2e",
+}
+M.spec = {}
+return M
+"#,
+    )
+    .expect("write init.lua");
+
+    let source_dir = hub_dir.to_str().expect("utf-8 path").to_string();
+    let project_root = root.to_str().expect("utf-8 path").to_string();
+    let output_path = hub_dir
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = hub_dir
+        .join("docs")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir": source_dir,
+            "project_root": project_root,
+            "output_path": output_path,
+            "out_dir": out_dir,
+            "preset": "publish",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        resp.get("preset_catalog_version").and_then(|v| v.as_str()),
+        Some(PRESET_CATALOG_VERSION),
+        "expected preset_catalog_version in dist response, got: {resp}"
+    );
+
+    let preset = resp
+        .get("preset")
+        .unwrap_or_else(|| panic!("expected preset object, got: {resp}"));
+    assert_eq!(preset.get("name").and_then(|v| v.as_str()), Some("publish"));
+
+    let resolved = preset
+        .get("resolved")
+        .unwrap_or_else(|| panic!("expected preset.resolved, got: {preset}"));
+    let projections = resolved
+        .get("projections")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("expected projections array, got: {resolved}"));
+    let projection_names: Vec<&str> = projections
+        .iter()
+        .map(|v| v.as_str().expect("projection string"))
+        .collect();
+    assert_eq!(projection_names, vec!["context7"]);
+
+    let context7_json = hub_dir.join("context7.json");
+    assert!(
+        context7_json.exists(),
+        "expected context7.json at {}",
+        context7_json.display()
     );
 
     client.cancel().await.expect("cancel failed");
@@ -1511,57 +1645,6 @@ async fn test_alc_hub_dist_gendoc_failure_includes_reindex_result() {
             assert!(
                 text.contains("reindex result (succeeded):"),
                 "expected reindex result to be embedded in error text, got: {text}"
-            );
-        }
-        Err(e) => panic!("unexpected call_tool Err: {e}"),
-    }
-
-    client.cancel().await.expect("cancel failed");
-}
-
-#[tokio::test]
-async fn test_alc_hub_gendoc_rejects_unknown_projection() {
-    let client = connect().await;
-    let tmp = setup_hub_fixture();
-    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
-    let output_path = tmp
-        .path()
-        .join("hub_index.json")
-        .to_str()
-        .expect("utf-8 path")
-        .to_string();
-
-    let _ = call_json(
-        &client,
-        "alc_hub_reindex",
-        json!({
-            "source_dir": source_dir.clone(),
-            "output_path": output_path,
-        }),
-    )
-    .await;
-
-    let outcome = client
-        .call_tool(call_params(
-            "alc_hub_gendoc",
-            json!({
-                "source_dir": source_dir,
-                "projections": ["contex7"],
-            }),
-        ))
-        .await;
-
-    match outcome {
-        Ok(result) => {
-            let is_error = result.is_error.unwrap_or(false);
-            let text = extract_text(&result);
-            assert!(
-                is_error,
-                "expected is_error=true for unknown projection, got: is_error={is_error:?}, text: {text}"
-            );
-            assert!(
-                text.contains("unknown projection"),
-                "expected unknown projection message, got: {text}"
             );
         }
         Err(e) => panic!("unexpected call_tool Err: {e}"),

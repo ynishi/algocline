@@ -1,6 +1,6 @@
 ---
 source: tests/e2e.rs
-assertion_line: 124
+assertion_line: 126
 expression: redacted
 ---
 {
@@ -10,6 +10,7 @@ expression: redacted
   },
   "log_enabled": true,
   "packages_dir": "<HOME>/.algocline/packages",
+  "preset_catalog_version": "preset-catalog@2026-04-23",
   "search_paths": [
     {
       "path": "<HOME>/.algocline/packages",

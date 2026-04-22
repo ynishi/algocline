@@ -619,6 +619,12 @@ pub struct HubDistParams {
     /// Output directory for generated docs (see `alc_hub_gendoc`).
     /// Defaults to `{source_dir}/docs`.
     pub out_dir: Option<String>,
+    /// Optional preset name expanded by `alc_hub_dist` into primitive
+    /// `alc_hub_gendoc` arguments (currently supports `"publish"`).
+    pub preset: Option<String>,
+    /// Optional project root containing `alc.toml` used to resolve
+    /// `[hub.dist.presets.<preset>]` overrides.
+    pub project_root: Option<String>,
     /// Projections to emit (see `alc_hub_gendoc`).
     /// Unknown values are rejected with a typed `gendoc:` error.
     pub projections: Option<Vec<String>>,
@@ -1462,8 +1468,10 @@ impl AlcService {
     ///
     /// This is a facade for hub maintainers who always want the index
     /// and the public docs to move together. The response is a JSON
-    /// object `{ "reindex": ..., "gendoc": ... }` embedding the two
-    /// underlying tool responses verbatim.
+    /// object `{ "reindex": ..., "gendoc": ..., "preset_catalog_version": ..., "preset?": ... }`
+    /// embedding the two underlying tool responses verbatim plus preset
+    /// catalog metadata (and an optional `preset` object when `preset`
+    /// was requested).
     ///
     /// Error semantics (caller-visible via MCP wire `Err`):
     ///
@@ -1487,6 +1495,8 @@ impl AlcService {
                 params.source_dir,
                 params.output_path,
                 params.out_dir,
+                params.preset,
+                params.project_root,
                 params.projections,
                 params.config_path,
                 params.lint_strict,
@@ -1614,7 +1624,7 @@ impl ServerHandler for AlcService {
                  - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\
                  - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Writes to a file for CI publishing.\n\
                  - alc_hub_gendoc: Generate human-readable documentation artifacts (narrative/{pkg}.md, llms.txt, llms-full.txt, optional hub/context7/devin projections) from a hub_index.json. Runs the embedded gen_docs Lua pipeline.\n\
-                 - alc_hub_dist: Facade that runs alc_hub_reindex followed by alc_hub_gendoc and returns a composed `{ reindex, gendoc }` response. Fails fast on reindex error; surfaces reindex result in the error text on gendoc failure.\n\n\
+                 - alc_hub_dist: Facade that runs alc_hub_reindex followed by alc_hub_gendoc and returns a composed `{ reindex, gendoc, preset_catalog_version, preset? }` response (optional `preset` expands into primitive gendoc args; `preset_catalog_version` is always included for observability). Fails fast on reindex error; surfaces reindex result in the error text on gendoc failure.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

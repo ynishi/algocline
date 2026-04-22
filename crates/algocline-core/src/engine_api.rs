@@ -400,7 +400,12 @@ pub trait EngineApi: Send + Sync {
     /// composed response is a JSON object:
     ///
     /// ```json
-    /// { "reindex": <hub_reindex response>, "gendoc": <hub_gendoc response> }
+    /// {
+    ///   "reindex": <hub_reindex response>,
+    ///   "gendoc": <hub_gendoc response>,
+    ///   "preset_catalog_version": "...",
+    ///   "preset": { "name": ..., "catalog_version": ..., "resolved": { ... } }
+    /// }
     /// ```
     ///
     /// Error propagation:
@@ -416,13 +421,26 @@ pub trait EngineApi: Send + Sync {
     ///
     /// `output_path` is the `hub_index.json` destination (reindex arg).
     /// Callers typically pass `{source_dir}/hub_index.json` so the
-    /// subsequent gendoc step can read it back. The other arguments are
-    /// forwarded to `hub_gendoc` unchanged.
+    /// subsequent gendoc step can read it back.
+    ///
+    /// Presets (`preset`) are expanded inside `hub_dist` into primitive
+    /// `hub_gendoc` arguments (`projections` / `config_path` /
+    /// `lint_strict`). When `preset` is set, the successful JSON response
+    /// includes a `preset` object with `catalog_version` plus the fully
+    /// resolved knobs for observability.
+    ///
+    /// Merge order (strongest wins):
+    /// 1) explicit MCP arguments (`projections` / `config_path` / `lint_strict`)
+    /// 2) optional `alc.toml` overrides under `[hub.dist.presets.<name>]`
+    ///    (keyed by `project_root`) — only fills **omitted** knobs
+    /// 3) builtin `Current` defaults for the selected preset
     async fn hub_dist(
         &self,
         source_dir: String,
         output_path: Option<String>,
         out_dir: Option<String>,
+        preset: Option<String>,
+        project_root: Option<String>,
         projections: Option<Vec<String>>,
         config_path: Option<String>,
         lint_strict: Option<bool>,

@@ -38,6 +38,50 @@ project_name = "my project"
 - Unknown projection token:
   - `gendoc: unknown projection '<token>' (allowed: hub, context7, devin, lint, lint_only)`
 
+## `alc_hub_dist` presets (`preset`)
+
+`alc_hub_dist` can expand a named preset into primitive `alc_hub_gendoc`
+arguments.
+
+Successful `alc_hub_dist` responses always include:
+
+- `preset_catalog_version`: revision marker for the builtin preset dictionary
+  bundled with the running `alc` binary.
+
+When `preset` is provided, responses also include a `preset` object with the
+resolved primitive args (`projections` / `config_path` / `lint_strict`) for
+debuggability.
+
+### Builtin `publish` (`Current`)
+
+When `preset = "publish"` and `projections` is omitted, the builtin default is:
+
+- `projections`: `["hub", "lint"]`
+- `lint_strict`: `false`
+
+This avoids requiring optional projection configs (`context7` / `devin`)
+unless the caller (or `alc.toml`) explicitly opts in.
+
+### Optional `alc.toml` overrides
+
+In the resolved project root (`project_root`, or ancestor-discovered
+`alc.toml`):
+
+```toml
+[hub.dist]
+
+[hub.dist.presets.publish]
+projections = ["context7", "hub"]
+config_path = "configs/gendoc.toml"
+lint_strict = false
+```
+
+Merge order (strongest wins):
+
+1. explicit MCP arguments (`projections` / `config_path` / `lint_strict`)
+2. `alc.toml` preset overrides (`[hub.dist.presets.<name>]`) — only fills **omitted** knobs
+3. builtin defaults for the selected preset
+
 # hub_gendoc config TOML schema
 
 `alc_hub_gendoc` and `alc_hub_dist` accept `config_path` as a TOML file.

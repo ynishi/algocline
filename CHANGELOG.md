@@ -17,9 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via the `config_path` argument.
 - `alc_hub_dist` MCP tool — facade that runs `alc_hub_reindex` followed
   by `alc_hub_gendoc` in sequence, returning a composed
-  `{ reindex, gendoc }` response. Fails fast on reindex error; on
-  gendoc failure the error text embeds the (already-succeeded) reindex
-  JSON so the caller sees both outcomes.
+  `{ reindex, gendoc, preset_catalog_version, preset? }` response. Optional `preset` expands into
+  primitive `alc_hub_gendoc` arguments (builtin `Current` recipes +
+  optional `alc.toml` overrides under `[hub.dist.presets.<name>]`).
+  Successful responses always include `preset_catalog_version`; when
+  `preset` is used, an additional `preset` object includes the resolved
+  primitive args for observability. `alc_info` also reports
+  `preset_catalog_version`.
+  Fails fast on reindex error; on gendoc failure the error text embeds
+  the (already-succeeded) reindex JSON so the caller sees both outcomes.
 
 ### Changed
 

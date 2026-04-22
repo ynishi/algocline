@@ -393,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_single_creates_symlink() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let src = home.join("my_pkg");
@@ -418,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_collection_creates_symlinks() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let coll = home.join("collection");
@@ -458,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_overwrites_existing_symlink() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let src = home.join("my_pkg");
@@ -483,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_real_dir_requires_force() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let src = home.join("my_pkg");
@@ -522,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_dangling_symlink_overwritten() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let src = home.join("my_pkg");
@@ -549,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_path_not_found_returns_error() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let nonexistent = env.home.join("does_not_exist");
 
         let svc = make_app_service().await;
@@ -570,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_appends_to_alc_local_toml() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let root = env.home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         // Source pkg.
@@ -605,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_no_symlink_created() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let root = env.home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let src = env.home.join("my_pkg");
@@ -632,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_second_call_is_noop_for_existing_entry() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let root = env.home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let src = env.home.join("my_pkg");
@@ -681,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_requires_project_root() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let src = env.home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
@@ -711,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_invalid_scope_returns_error() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let src = env.home.join("my_pkg");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("init.lua"), "return {}").unwrap();
@@ -734,7 +734,7 @@ mod tests {
     async fn pkg_link_scope_global_default_matches_existing_behavior() {
         // Explicit scope=Some("global") should behave exactly as scope=None
         // (the default path).
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let src = home.join("my_pkg");
@@ -762,7 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_link_scope_variant_collection_appends_all() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let root = env.home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let coll = env.home.join("collection");
@@ -801,7 +801,7 @@ mod tests {
     /// would mask caller intent.
     #[tokio::test]
     async fn pkg_link_scope_variant_rejects_force() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let root = env.home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let src = env.home.join("my_pkg");
@@ -834,7 +834,7 @@ mod tests {
     /// `scope = variant` with `force = Some(false)` is allowed (same as None).
     #[tokio::test]
     async fn pkg_link_scope_variant_accepts_force_false() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let root = env.home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         let src = env.home.join("my_pkg");

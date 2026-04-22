@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use algocline_core::AppDir;
 use serde::{Deserialize, Serialize};
@@ -69,11 +71,7 @@ pub(crate) trait ManifestRepo: Send + Sync {
     ) -> Result<(), String>;
 
     /// Batch variant of `record_install`.
-    fn record_install_batch(
-        &self,
-        names: &[String],
-        source: PackageSource,
-    ) -> Result<(), String>;
+    fn record_install_batch(&self, names: &[String], source: PackageSource) -> Result<(), String>;
 
     /// Remove a package from the manifest (used by `pkg_remove` scope
     /// `"global"` / `"all"`).
@@ -137,8 +135,8 @@ impl ManifestRepo for FsManifestRepo {
         if !path.exists() {
             return Ok(Manifest::default());
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read manifest: {e}"))?;
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| format!("Failed to read manifest: {e}"))?;
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
     }
 
@@ -173,11 +171,7 @@ impl ManifestRepo for FsManifestRepo {
         })
     }
 
-    fn record_install_batch(
-        &self,
-        names: &[String],
-        source: PackageSource,
-    ) -> Result<(), String> {
+    fn record_install_batch(&self, names: &[String], source: PackageSource) -> Result<(), String> {
         if names.is_empty() {
             return Ok(());
         }
@@ -257,11 +251,7 @@ impl ManifestRepo for InMemoryManifestRepo {
         Ok(())
     }
 
-    fn record_install_batch(
-        &self,
-        names: &[String],
-        source: PackageSource,
-    ) -> Result<(), String> {
+    fn record_install_batch(&self, names: &[String], source: PackageSource) -> Result<(), String> {
         if names.is_empty() {
             return Ok(());
         }
@@ -411,7 +401,8 @@ mod tests {
             rev: None,
         };
 
-        repo.record_install("alpha", Some("1.0.0"), git_src()).unwrap();
+        repo.record_install("alpha", Some("1.0.0"), git_src())
+            .unwrap();
         repo.record_install("alpha", None, git_src()).unwrap();
         repo.record_install_batch(&["beta".to_string(), "gamma".to_string()], git_src())
             .unwrap();

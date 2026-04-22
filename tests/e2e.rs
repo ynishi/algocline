@@ -1085,3 +1085,278 @@ async fn test_pkg_doctor_shape_error() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── Hub tools (alc_hub_reindex / alc_hub_gendoc / alc_hub_dist) ────
+
+/// Create a minimal hub fixture directory containing a single fake package
+/// whose `init.lua` has a `meta` table. Shared by hub_reindex / hub_gendoc
+/// / hub_dist tests — each test owns its own tempdir so runs are parallel-
+/// safe.
+fn setup_hub_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("fake_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir fake_pkg");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = {
+  name = "fake_pkg",
+  version = "0.1.0",
+  category = "test",
+  description = "fake package used by e2e tests",
+}
+M.spec = {}
+return M
+"#,
+    )
+    .expect("write init.lua");
+
+    // Optional config file (not used unless projections include
+    // context7/devin). Kept around so tests can opt into config-
+    // requiring projections without re-writing the fixture.
+    std::fs::write(
+        tmp.path().join("configs.lua"),
+        r#"return {
+  context7 = { projectTitle = "test", description = "test", rules = {} },
+  devin = { project_name = "test" },
+}
+"#,
+    )
+    .expect("write configs.lua");
+
+    tmp
+}
+
+#[tokio::test]
+async fn test_alc_hub_reindex_ok() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir,
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let pkg_count = resp
+        .get("package_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("expected package_count u64 in response: {resp}"));
+    assert!(
+        pkg_count > 0,
+        "expected at least one package in reindex output, got {pkg_count}: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_gendoc_ok() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // gendoc requires an existing hub_index.json in source_dir.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let out_dir_path = tmp.path().join("docs");
+    let out_dir = out_dir_path.to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir,
+            "out_dir": out_dir,
+        }),
+    )
+    .await;
+
+    assert!(
+        resp.get("source_dir").is_some(),
+        "expected source_dir in gendoc response, got: {resp}"
+    );
+
+    let narrative = out_dir_path.join("narrative").join("fake_pkg.md");
+    assert!(
+        narrative.exists(),
+        "expected narrative/fake_pkg.md to be generated at {} (gendoc resp: {resp})",
+        narrative.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Typed-error case: requesting the `context7` projection without a
+/// `config_path` must surface as a handler-level error (MCP caller sees
+/// `is_error=true` + text mentioning `config_path`).
+#[tokio::test]
+async fn test_alc_hub_gendoc_missing_config() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Need a hub_index.json first so gendoc gets past its "read index"
+    // step and can reach the projection-config validation.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_gendoc",
+            json!({
+                "source_dir": source_dir,
+                "projections": ["context7"],
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for missing config_path, got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("config_path"),
+                "expected error text to mention config_path, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_hub_dist_ok() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = tmp
+        .path()
+        .join("docs")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir": source_dir,
+            "output_path": output_path,
+            "out_dir": out_dir,
+        }),
+    )
+    .await;
+
+    let reindex = resp
+        .get("reindex")
+        .unwrap_or_else(|| panic!("expected reindex field, got: {resp}"));
+    let pkg_count = reindex
+        .get("package_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("expected reindex.package_count u64, got: {resp}"));
+    assert!(
+        pkg_count > 0,
+        "expected reindex.package_count > 0, got {pkg_count}: {resp}"
+    );
+
+    let gendoc = resp
+        .get("gendoc")
+        .unwrap_or_else(|| panic!("expected gendoc field, got: {resp}"));
+    assert!(
+        gendoc.is_object(),
+        "expected gendoc to be a JSON object, got: {resp}"
+    );
+    assert!(
+        gendoc.get("stdout").is_some(),
+        "dist.gendoc must include stdout field",
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Mid-way failure: an invalid `source_dir` causes reindex to fail. The
+/// caller must see `is_error=true` with text starting `dist: reindex
+/// failed:`, proving that `gendoc` was not invoked and the caller was
+/// not silently given a partial success.
+#[tokio::test]
+async fn test_alc_hub_dist_reindex_failure() {
+    let client = connect().await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_dist",
+            json!({
+                "source_dir": "/nonexistent/path/for/dist/test",
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true on reindex failure, got: is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("reindex failed"),
+                "expected 'reindex failed' in error text, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}

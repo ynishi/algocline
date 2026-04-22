@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alc_hub_gendoc` MCP tool — generate human-readable docs (narrative /
+  hub / llms / context7 / devin projections) from a `hub_index.json`.
+  Embeds `gen_docs.lua` + docs modules from algocline-bundled-packages so
+  downstream hub repos no longer need to vendor the generator. Bundled-
+  specific `context7_config.lua` / `devin_wiki_config.lua` are injected
+  via the `config_path` argument.
+- `alc_hub_dist` MCP tool — facade that runs `alc_hub_reindex` followed
+  by `alc_hub_gendoc` in sequence, returning a composed
+  `{ reindex, gendoc }` response. Fails fast on reindex error; on
+  gendoc failure the error text embeds the (already-succeeded) reindex
+  JSON so the caller sees both outcomes.
+
 ### Changed
 
 - `alc init` bundled-packages tag bumped `v0.17.0` → `v0.18.0`

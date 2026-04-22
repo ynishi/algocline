@@ -46,6 +46,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "fs4",
+ "mlua",
  "proptest",
  "serde",
  "serde_json",

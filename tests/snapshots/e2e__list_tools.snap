@@ -21,6 +21,8 @@ expression: names
   "alc_eval_compare",
   "alc_eval_detail",
   "alc_eval_history",
+  "alc_hub_dist",
+  "alc_hub_gendoc",
   "alc_hub_info",
   "alc_hub_reindex",
   "alc_hub_search",

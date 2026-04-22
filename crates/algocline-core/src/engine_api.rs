@@ -357,6 +357,74 @@ pub trait EngineApi: Send + Sync {
         source_dir: Option<String>,
     ) -> Result<String, String>;
 
+    /// Generate human-readable documentation artifacts from a hub index.
+    ///
+    /// Runs the embedded Lua `gen_docs` pipeline (originally shipped
+    /// with `algocline-bundled-packages`) against `source_dir`, which
+    /// must contain a fresh `hub_index.json`. Emits
+    /// `narrative/{pkg}.md`, `llms.txt`, `llms-full.txt` under
+    /// `out_dir` (defaults to `{source_dir}/docs`), plus optional
+    /// projections depending on `projections`:
+    ///
+    /// - `"hub"`       → `{out_dir}/hub/{pkg}.json`
+    /// - `"context7"`  → `{source_dir}/context7.json` (requires `config_path`)
+    /// - `"devin"`     → `{source_dir}/.devin/wiki.json` (requires `config_path`)
+    /// - `"lint"`      → run V0 lint pass (warnings only)
+    /// - `"lint_only"` → run lint, skip file generation
+    ///
+    /// `config_path` points at a Lua file returning a table
+    /// `{ context7 = {...}, devin = {...} }`. It is required only when
+    /// `projections` includes `"context7"` or `"devin"`.
+    ///
+    /// `lint_strict = true` upgrades lint errors to a hard failure
+    /// (equivalent to the `--strict` CLI flag).
+    ///
+    /// Returns a JSON string containing the collected stdout / stderr
+    /// plus the resolved `source_dir` / `out_dir` for observability.
+    async fn hub_gendoc(
+        &self,
+        source_dir: String,
+        out_dir: Option<String>,
+        projections: Option<Vec<String>>,
+        config_path: Option<String>,
+        lint_strict: Option<bool>,
+    ) -> Result<String, String>;
+
+    /// Run `hub_reindex` followed by `hub_gendoc` as a single facade.
+    ///
+    /// This is a convenience wrapper for downstream hub repositories that
+    /// want to regenerate the index and the public docs in one call. The
+    /// composed response is a JSON object:
+    ///
+    /// ```json
+    /// { "reindex": <hub_reindex response>, "gendoc": <hub_gendoc response> }
+    /// ```
+    ///
+    /// Error propagation:
+    ///
+    /// - If `hub_reindex` fails, `hub_dist` returns immediately with
+    ///   `Err("dist: reindex failed: {inner}")` and does not invoke
+    ///   `hub_gendoc`.
+    /// - If `hub_gendoc` fails, the error text includes the reindex JSON
+    ///   that already succeeded:
+    ///   `Err("dist: gendoc failed: {inner}\nreindex result (succeeded): {json}")`.
+    ///   The reindex-side side effects (written `hub_index.json`) are not
+    ///   rolled back.
+    ///
+    /// `output_path` is the `hub_index.json` destination (reindex arg).
+    /// Callers typically pass `{source_dir}/hub_index.json` so the
+    /// subsequent gendoc step can read it back. The other arguments are
+    /// forwarded to `hub_gendoc` unchanged.
+    async fn hub_dist(
+        &self,
+        source_dir: String,
+        output_path: Option<String>,
+        out_dir: Option<String>,
+        projections: Option<Vec<String>>,
+        config_path: Option<String>,
+        lint_strict: Option<bool>,
+    ) -> Result<String, String>;
+
     /// Show detailed information for a single package.
     async fn hub_info(&self, pkg: String) -> Result<String, String>;
 

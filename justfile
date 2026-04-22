@@ -83,6 +83,10 @@ ready:
 #   Inv-3: `algocline_core::AppDir` / `AppConfig` are not referenced from
 #          inside the engine crate (engine public API stays free of the
 #          service-layer abstractions).
+#   Inv-4: ManifestRepo encapsulation — no `installed.json` filesystem
+#          calls live outside `service/manifest.rs` (the `FsManifestRepo`
+#          impl block is the single source). Added in Subtask 3b together
+#          with the `ManifestRepo` trait extraction (Subtask 3a).
 [group: 'agent']
 check-invariants:
     #!/usr/bin/env bash
@@ -115,6 +119,18 @@ check-invariants:
     if grep -rn -E 'algocline_core::(AppDir|AppConfig)' \
             crates/algocline-engine/src/ --include='*.rs'; then
         echo "Inv-3 FAILED: engine references algocline_core::AppDir/AppConfig" >&2
+        fail=1
+    fi
+    # Inv-4: ManifestRepo encapsulation — every `std::fs::*` call that
+    # touches `installed.json` / `installed.json.lock` / `installed.json.tmp`
+    # must sit inside `service/manifest.rs` (the `FsManifestRepo` impl
+    # block). Call sites in sibling service files may still read the
+    # *path* via `app_dir.installed_json()` for diagnostics — that is not
+    # filesystem IO and does not surface here.
+    if grep -rn -E 'std::fs::[A-Za-z_]+[^;]*installed\.json' \
+            crates/algocline-app/src/service/ --include='*.rs' \
+            | grep -v -E '^crates/algocline-app/src/service/manifest\.rs:'; then
+        echo "Inv-4 FAILED: installed.json filesystem access outside service/manifest.rs" >&2
         fail=1
     fi
     if [ "$fail" -ne 0 ]; then

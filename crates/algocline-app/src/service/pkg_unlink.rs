@@ -50,7 +50,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_removes_symlink() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let pkgs = home.join(".algocline").join("packages");
@@ -71,7 +71,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_real_dir_returns_error() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let pkgs = home.join(".algocline").join("packages");
@@ -86,7 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_not_installed_returns_error() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let pkgs = home.join(".algocline").join("packages");
@@ -100,7 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn pkg_unlink_dangling_symlink_removed() {
-        let env = FakeHome::new();
+        let env = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
         let home = &env.home;
 
         let pkgs = home.join(".algocline").join("packages");

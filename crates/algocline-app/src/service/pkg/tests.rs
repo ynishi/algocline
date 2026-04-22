@@ -617,7 +617,7 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
     use crate::service::manifest::{load_manifest, record_install};
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let app_dir = crate::service::config::AppConfig::from_env().app_dir();
 
     record_install(
@@ -666,7 +666,7 @@ async fn pkg_remove_global_scope_removes_manifest_entry() {
 async fn pkg_remove_global_scope_not_found_returns_error() {
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let svc = make_app_service().await;
     let result = svc
@@ -687,7 +687,7 @@ async fn pkg_remove_global_scope_preserves_physical_dir() {
     use crate::service::manifest::record_install;
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let pkg_dir = fake_home
         .home
         .join(".algocline")
@@ -731,7 +731,7 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
     use crate::service::manifest::{load_manifest, record_install};
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let app_dir = crate::service::config::AppConfig::from_env().app_dir();
     record_install(
         &app_dir,
@@ -770,7 +770,7 @@ async fn pkg_remove_all_scope_is_lenient_when_only_global_has_entry() {
 async fn pkg_remove_all_scope_errors_when_neither_scope_has_entry() {
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let svc = make_app_service().await;
     let err = svc
@@ -918,7 +918,7 @@ async fn pkg_list_project_path_with_symlink_vendor_follows_target() {
 async fn pkg_list_project_installed_entry_has_resolved_source() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let packages_dir = fake_home.home.join(".algocline").join("packages");
     let pkg_dir = packages_dir.join("installed_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -973,7 +973,7 @@ async fn pkg_list_project_installed_entry_has_resolved_source() {
 async fn pkg_list_project_installed_resolves_through_linked_pkg() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let packages_dir = fake_home.home.join(".algocline").join("packages");
     std::fs::create_dir_all(&packages_dir).unwrap();
 
@@ -1312,7 +1312,7 @@ async fn pkg_list_override_paths_project_shadows_global() {
 async fn pkg_list_project_installed_does_not_self_shadow() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let packages_dir = fake_home.home.join(".algocline").join("packages");
     let pkg_dir = packages_dir.join("self_shadow_pkg");
     std::fs::create_dir_all(&pkg_dir).unwrap();
@@ -1613,7 +1613,7 @@ async fn pkg_list_variant_shadows_project() {
 async fn pkg_repair_reinstalls_missing_installed_dir() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     // Build a source pkg dir outside of HOME.
     let source = fake_home.home.join("src_repo").join("repair_pkg");
@@ -1659,7 +1659,7 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
 async fn pkg_repair_skips_healthy_pkg() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let source = fake_home.home.join("src_repo").join("healthy_pkg");
     std::fs::create_dir_all(&source).unwrap();
@@ -1689,7 +1689,7 @@ async fn pkg_repair_skips_healthy_pkg() {
 async fn pkg_repair_reports_dangling_symlink_as_unrepairable() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     // Create the packages dir and a dangling symlink in it.
     let pkg_dir = fake_home.home.join(".algocline").join("packages");
@@ -1727,7 +1727,7 @@ async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
     // FakeHome acquires HOME_MUTEX at struct-field level — matches the
     // other pkg_repair tests and avoids `await_holding_lock` on a local
     // `MutexGuard` binding.
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let project_root = fake_home.home.join("proj");
     std::fs::create_dir_all(&project_root).unwrap();
 
@@ -1759,7 +1759,7 @@ async fn pkg_repair_reports_project_path_missing_as_unrepairable() {
 async fn pkg_repair_reports_variant_path_missing_as_unrepairable() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
     let project_root = fake_home.home.join("proj");
     std::fs::create_dir_all(&project_root).unwrap();
 
@@ -1799,7 +1799,7 @@ async fn pkg_repair_unknown_name_returns_error() {
 
     // FakeHome isolates HOME so this test doesn't depend on whether the
     // developer happens to have a package with the probe name installed.
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let svc = make_app_service().await;
     let err = svc
@@ -1820,7 +1820,7 @@ async fn pkg_repair_unknown_name_returns_error() {
 async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let source = fake_home.home.join("gone").join("ghost_pkg");
     std::fs::create_dir_all(&source).unwrap();
@@ -1872,7 +1872,7 @@ async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
 async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     // Build a valid source first so pkg_install succeeds and writes manifest.
     let source = fake_home.home.join("shell").join("shell_pkg");
@@ -1926,7 +1926,7 @@ async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
 async fn pkg_install_rejects_missing_local_source_with_clear_error() {
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let svc = make_app_service().await;
     let missing = "/tmp/alc-nonexistent-source-for-test-2e8f3a";
@@ -1980,7 +1980,7 @@ fn fnv1a_hex(url: &str) -> String {
 async fn pkg_list_default_summary_is_compact() {
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let tmp = tempfile::tempdir().unwrap();
     let search_dir = tmp.path().join("pkgs");
@@ -2032,7 +2032,7 @@ async fn pkg_list_default_summary_is_compact() {
 async fn hub_search_default_summary_is_compact() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let cache_dir = fake_home.home.join(".algocline").join("hub_cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -2088,7 +2088,7 @@ async fn hub_search_default_summary_is_compact() {
 async fn pkg_list_limit_zero_returns_all() {
     use crate::service::test_support::FakeHome;
 
-    let _fake_home = FakeHome::new();
+    let _fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let tmp = tempfile::tempdir().unwrap();
     let search_dir = tmp.path().join("pkgs");
@@ -2139,7 +2139,7 @@ async fn pkg_list_limit_zero_returns_all() {
 async fn hub_search_limit_zero_returns_all() {
     use crate::service::test_support::FakeHome;
 
-    let fake_home = FakeHome::new();
+    let fake_home = FakeHome::new(); // FakeHome: deferred to 軸 A (fs backing isolation)
 
     let cache_dir = fake_home.home.join(".algocline").join("hub_cache");
     std::fs::create_dir_all(&cache_dir).unwrap();

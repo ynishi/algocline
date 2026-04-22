@@ -357,6 +357,39 @@ pub trait EngineApi: Send + Sync {
         source_dir: Option<String>,
     ) -> Result<String, String>;
 
+    /// Generate human-readable documentation artifacts from a hub index.
+    ///
+    /// Runs the embedded Lua `gen_docs` pipeline (originally shipped
+    /// with `algocline-bundled-packages`) against `source_dir`, which
+    /// must contain a fresh `hub_index.json`. Emits
+    /// `narrative/{pkg}.md`, `llms.txt`, `llms-full.txt` under
+    /// `out_dir` (defaults to `{source_dir}/docs`), plus optional
+    /// projections depending on `projections`:
+    ///
+    /// - `"hub"`       → `{out_dir}/hub/{pkg}.json`
+    /// - `"context7"`  → `{source_dir}/context7.json` (requires `config_path`)
+    /// - `"devin"`     → `{source_dir}/.devin/wiki.json` (requires `config_path`)
+    /// - `"lint"`      → run V0 lint pass (warnings only)
+    /// - `"lint_only"` → run lint, skip file generation
+    ///
+    /// `config_path` points at a Lua file returning a table
+    /// `{ context7 = {...}, devin = {...} }`. It is required only when
+    /// `projections` includes `"context7"` or `"devin"`.
+    ///
+    /// `lint_strict = true` upgrades lint errors to a hard failure
+    /// (equivalent to the `--strict` CLI flag).
+    ///
+    /// Returns a JSON string containing the collected stdout / stderr
+    /// plus the resolved `source_dir` / `out_dir` for observability.
+    async fn hub_gendoc(
+        &self,
+        source_dir: String,
+        out_dir: Option<String>,
+        projections: Option<Vec<String>>,
+        config_path: Option<String>,
+        lint_strict: Option<bool>,
+    ) -> Result<String, String>;
+
     /// Show detailed information for a single package.
     async fn hub_info(&self, pkg: String) -> Result<String, String>;
 

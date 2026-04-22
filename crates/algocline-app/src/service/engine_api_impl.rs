@@ -341,6 +341,29 @@ impl EngineApi for AppService {
         .map_err(|e| format!("hub_reindex task panicked: {e}"))?
     }
 
+    async fn hub_gendoc(
+        &self,
+        source_dir: String,
+        out_dir: Option<String>,
+        projections: Option<Vec<String>>,
+        config_path: Option<String>,
+        lint_strict: Option<bool>,
+    ) -> Result<String, String> {
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::AppService::hub_gendoc(
+                &svc,
+                &source_dir,
+                out_dir.as_deref(),
+                projections.as_deref(),
+                config_path.as_deref(),
+                lint_strict,
+            )
+        })
+        .await
+        .map_err(|e| format!("hub_gendoc task panicked: {e}"))?
+    }
+
     async fn hub_info(&self, pkg: String) -> Result<String, String> {
         let svc = self.clone();
         tokio::task::spawn_blocking(move || AppService::hub_info(&svc, &pkg))

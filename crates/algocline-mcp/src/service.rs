@@ -588,6 +588,26 @@ pub struct HubReindexParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HubGendocParams {
+    /// Directory containing the repository (`hub_index.json` plus
+    /// the per-package directories referenced by it).
+    pub source_dir: String,
+    /// Output directory for generated documentation. Defaults to
+    /// `{source_dir}/docs`.
+    pub out_dir: Option<String>,
+    /// Projections to emit. Any subset of
+    /// `["hub", "context7", "devin", "lint", "lint_only"]`.
+    /// When omitted, only `narrative/{pkg}.md` + `llms.txt` +
+    /// `llms-full.txt` are produced.
+    pub projections: Option<Vec<String>>,
+    /// Path to a Lua file returning `{ context7 = {...}, devin = {...} }`.
+    /// Required when `projections` includes `"context7"` or `"devin"`.
+    pub config_path: Option<String>,
+    /// Treat lint errors as a hard failure (equivalent to `--strict`).
+    pub lint_strict: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HubSearchParams {
     /// Search query (matched against package name, description, category,
     /// and docstring). Omit to list all available packages. When the
@@ -1383,6 +1403,39 @@ impl AlcService {
             .await
     }
 
+    /// Generate human-readable documentation artifacts from a hub
+    /// index.
+    ///
+    /// Runs the embedded `gen_docs` pipeline (the same pipeline
+    /// previously shipped under `algocline-bundled-packages/tools/`)
+    /// against the repository at `source_dir`, which must contain a
+    /// fresh `hub_index.json`. Emits `narrative/{pkg}.md`,
+    /// `llms.txt`, `llms-full.txt` under `out_dir` (defaulting to
+    /// `{source_dir}/docs`), plus optional projections
+    /// (`hub` / `context7` / `devin`) and optional lint output.
+    ///
+    /// Returns a JSON string containing `source_dir`, `out_dir`,
+    /// and the captured Lua-side `stdout` / `stderr` for
+    /// observability.
+    #[tool(
+        name = "alc_hub_gendoc",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn hub_gendoc(
+        &self,
+        Parameters(params): Parameters<HubGendocParams>,
+    ) -> Result<String, String> {
+        self.app
+            .hub_gendoc(
+                params.source_dir,
+                params.out_dir,
+                params.projections,
+                params.config_path,
+                params.lint_strict,
+            )
+            .await
+    }
+
     /// Search packages across remote Hub indices and local install state.
     ///
     /// Discovers index URLs from installed package sources and bundled
@@ -1501,7 +1554,8 @@ impl ServerHandler for AlcService {
                  Hub:\n\
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
                  - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\
-                 - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Writes to a file for CI publishing.\n\n\
+                 - alc_hub_reindex: Rebuild the Hub index from locally installed packages. Extracts M.meta from init.lua without Lua VM. Writes to a file for CI publishing.\n\
+                 - alc_hub_gendoc: Generate human-readable documentation artifacts (narrative/{pkg}.md, llms.txt, llms-full.txt, optional hub/context7/devin projections) from a hub_index.json. Runs the embedded gen_docs Lua pipeline.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),

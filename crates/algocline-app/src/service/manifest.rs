@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use algocline_core::AppDir;
 use serde::{Deserialize, Serialize};
@@ -40,83 +41,270 @@ pub(crate) struct Manifest {
     pub packages: BTreeMap<String, ManifestEntry>,
 }
 
-// ─── Paths ─────────────────────────────────────────────────────
+// ─── Repo trait (Subtask 3a) ──────────────────────────────────
+//
+// `ManifestRepo` abstracts the `installed.json` CRUD surface so unit
+// tests can substitute an in-memory impl for the fs-backed one. The
+// repo owns the IO — every `std::fs::read_to_string(installed.json)` /
+// `std::fs::write(installed.json)` in this module is confined to the
+// `FsManifestRepo` impl block, which is what Inv-4 (Subtask 3b) greps
+// for.
 
-fn manifest_path(app_dir: &AppDir) -> PathBuf {
-    app_dir.installed_json()
-}
-
-/// Path to the advisory lock companion file for the manifest.
-fn manifest_lock_path(app_dir: &AppDir) -> PathBuf {
-    app_dir.installed_json().with_extension("json.lock")
-}
-
-/// Execute `f` while holding an exclusive `flock` on the manifest's
-/// companion lock file.
+/// CRUD surface for the installed-packages manifest.
 ///
-/// `record_install`, `record_install_batch`, and `record_remove` all
-/// perform an unguarded read-modify-write sequence on `installed.json`.
-/// When two `pkg_install` calls overlap (e.g. the e2e suite running
-/// multiple `test_*` in-process tests against the same `$HOME`), one
-/// writer can load the manifest, the other completes its own
-/// load-modify-write, and the first writer then overwrites with its
-/// now-stale copy — losing entries.
-///
-/// The lock is released when the `File` is dropped. Dropping happens on
-/// every exit from this function, including a panic in `f`: stack
-/// unwinding runs `File`'s destructor, which calls `close(2)` and thus
-/// releases the advisory `flock`. The explicit `drop(file)` after `f`
-/// is just ordering insurance for the success path.
-fn with_manifest_lock<F, R>(app_dir: &AppDir, f: F) -> Result<R, String>
-where
-    F: FnOnce() -> Result<R, String>,
-{
-    let lock_path = manifest_lock_path(app_dir);
-    crate::service::lock::with_exclusive_lock(&lock_path, f)
+/// `record_*` are responsible for their own locking (`with_lock`); they
+/// do not expose the lock handle to callers.
+pub(crate) trait ManifestRepo: Send + Sync {
+    /// Load the manifest. Returns an empty manifest if the backing store
+    /// is missing.
+    fn load(&self) -> Result<Manifest, String>;
+
+    /// Record a successful install / update (see `record_install` free-fn
+    /// docs for semantics).
+    fn record_install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        source: PackageSource,
+    ) -> Result<(), String>;
+
+    /// Batch variant of `record_install`.
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), String>;
+
+    /// Remove a package from the manifest (used by `pkg_remove` scope
+    /// `"global"` / `"all"`).
+    fn record_remove(&self, name: &str) -> Result<(), String>;
 }
 
-// ─── Read / Write ──────────────────────────────────────────────
+// ─── FS-backed impl ───────────────────────────────────────────
+
+/// `installed.json` on disk, rooted at `{app_dir}/installed.json`.
+#[derive(Clone)]
+pub(crate) struct FsManifestRepo {
+    app_dir: Arc<AppDir>,
+}
+
+impl FsManifestRepo {
+    pub(crate) fn new(app_dir: Arc<AppDir>) -> Self {
+        Self { app_dir }
+    }
+
+    fn manifest_path(&self) -> PathBuf {
+        self.app_dir.installed_json()
+    }
+
+    fn manifest_lock_path(&self) -> PathBuf {
+        self.app_dir.installed_json().with_extension("json.lock")
+    }
+
+    fn with_lock<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce() -> Result<R, String>,
+    {
+        let lock_path = self.manifest_lock_path();
+        crate::service::lock::with_exclusive_lock(&lock_path, f)
+    }
+
+    fn save(&self, manifest: &Manifest) -> Result<(), String> {
+        let path = self.manifest_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create manifest dir: {e}"))?;
+        }
+        let content = serde_json::to_string_pretty(manifest)
+            .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
+
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &content)
+            .map_err(|e| format!("Failed to write manifest temp file {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!(
+                "Failed to atomically rename manifest temp onto {}: {e}",
+                path.display()
+            )
+        })
+    }
+}
+
+impl ManifestRepo for FsManifestRepo {
+    fn load(&self) -> Result<Manifest, String> {
+        let path = self.manifest_path();
+        if !path.exists() {
+            return Ok(Manifest::default());
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read manifest: {e}"))?;
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
+    }
+
+    fn record_install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        source: PackageSource,
+    ) -> Result<(), String> {
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            let now = now_iso8601();
+
+            manifest
+                .packages
+                .entry(name.to_string())
+                .and_modify(|e| {
+                    if let Some(v) = version {
+                        e.version = Some(v.to_string());
+                    }
+                    e.source = source.clone();
+                    e.updated_at = now.clone();
+                })
+                .or_insert_with(|| ManifestEntry {
+                    version: version.map(String::from),
+                    source: source.clone(),
+                    installed_at: now.clone(),
+                    updated_at: now,
+                });
+
+            self.save(&manifest)
+        })
+    }
+
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), String> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            let now = now_iso8601();
+
+            for name in names {
+                manifest
+                    .packages
+                    .entry(name.clone())
+                    .and_modify(|e| {
+                        e.source = source.clone();
+                        e.updated_at = now.clone();
+                    })
+                    .or_insert_with(|| ManifestEntry {
+                        version: None,
+                        source: source.clone(),
+                        installed_at: now.clone(),
+                        updated_at: now.clone(),
+                    });
+            }
+
+            self.save(&manifest)
+        })
+    }
+
+    fn record_remove(&self, name: &str) -> Result<(), String> {
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            manifest.packages.remove(name);
+            self.save(&manifest)
+        })
+    }
+}
+
+// ─── In-memory mock (tests only) ──────────────────────────────
+
+/// In-memory manifest backed by a `Mutex<Manifest>`. Used by tests that
+/// need parallel-safe isolation without touching the filesystem.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct InMemoryManifestRepo {
+    data: Mutex<Manifest>,
+}
+
+#[cfg(test)]
+impl ManifestRepo for InMemoryManifestRepo {
+    fn load(&self) -> Result<Manifest, String> {
+        Ok(self.data.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    fn record_install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        source: PackageSource,
+    ) -> Result<(), String> {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_iso8601();
+        guard
+            .packages
+            .entry(name.to_string())
+            .and_modify(|e| {
+                if let Some(v) = version {
+                    e.version = Some(v.to_string());
+                }
+                e.source = source.clone();
+                e.updated_at = now.clone();
+            })
+            .or_insert_with(|| ManifestEntry {
+                version: version.map(String::from),
+                source: source.clone(),
+                installed_at: now.clone(),
+                updated_at: now,
+            });
+        Ok(())
+    }
+
+    fn record_install_batch(
+        &self,
+        names: &[String],
+        source: PackageSource,
+    ) -> Result<(), String> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_iso8601();
+        for name in names {
+            guard
+                .packages
+                .entry(name.clone())
+                .and_modify(|e| {
+                    e.source = source.clone();
+                    e.updated_at = now.clone();
+                })
+                .or_insert_with(|| ManifestEntry {
+                    version: None,
+                    source: source.clone(),
+                    installed_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+        }
+        Ok(())
+    }
+
+    fn record_remove(&self, name: &str) -> Result<(), String> {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        guard.packages.remove(name);
+        Ok(())
+    }
+}
+
+// ─── Free-fn delegates (call-site compatibility) ──────────────
+//
+// Existing callers (`pkg/install.rs`, `pkg/list.rs`, `pkg/doctor.rs`,
+// `pkg/repair.rs`, `pkg/remove.rs`, `hub.rs`) still hold `&AppDir`
+// rather than an `Arc<dyn ManifestRepo>`, so the free functions are
+// retained as thin delegates onto a per-call `FsManifestRepo`. This
+// keeps Inv-4 (all filesystem writes confined to the `FsManifestRepo`
+// impl block) intact while avoiding a crate-wide `Arc<dyn>` plumbing
+// refactor in this commit.
 
 /// Load the manifest from disk. Returns empty manifest if file is missing.
 pub(crate) fn load_manifest(app_dir: &AppDir) -> Result<Manifest, String> {
-    let path = manifest_path(app_dir);
-    if !path.exists() {
-        return Ok(Manifest::default());
-    }
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read manifest: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse manifest: {e}"))
-}
-
-/// Save the manifest to disk (pretty-printed for human readability).
-///
-/// Writes atomically: serialize into `installed.json.tmp`, then `rename` onto
-/// `installed.json`. POSIX `rename(2)` is atomic within the same filesystem,
-/// so an unguarded reader — e.g. `load_manifest` in `pkg_list` or `pkg_repair`,
-/// which does not take `with_manifest_lock` — never observes a partially
-/// written JSON document. Without the temp-and-rename dance, a concurrent
-/// reader could see a truncated file between `open(TRUNC)` and the final
-/// `write`, producing a spurious "Failed to parse manifest" error.
-fn save_manifest(app_dir: &AppDir, manifest: &Manifest) -> Result<(), String> {
-    let path = manifest_path(app_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create manifest dir: {e}"))?;
-    }
-    let content = serde_json::to_string_pretty(manifest)
-        .map_err(|e| format!("Failed to serialize manifest: {e}"))?;
-
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &content)
-        .map_err(|e| format!("Failed to write manifest temp file {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        // Best-effort cleanup of the stale temp file on rename failure.
-        let _ = std::fs::remove_file(&tmp);
-        format!(
-            "Failed to atomically rename manifest temp onto {}: {e}",
-            path.display()
-        )
-    })
+    FsManifestRepo::new(Arc::new(app_dir.clone())).load()
 }
 
 // ─── Operations ────────────────────────────────────────────────
@@ -177,29 +365,7 @@ pub(crate) fn record_install(
     version: Option<&str>,
     source: PackageSource,
 ) -> Result<(), String> {
-    with_manifest_lock(app_dir, || {
-        let mut manifest = load_manifest(app_dir)?;
-        let now = now_iso8601();
-
-        manifest
-            .packages
-            .entry(name.to_string())
-            .and_modify(|e| {
-                if let Some(v) = version {
-                    e.version = Some(v.to_string());
-                }
-                e.source = source.clone();
-                e.updated_at = now.clone();
-            })
-            .or_insert_with(|| ManifestEntry {
-                version: version.map(String::from),
-                source: source.clone(),
-                installed_at: now.clone(),
-                updated_at: now,
-            });
-
-        save_manifest(app_dir, &manifest)
-    })
+    FsManifestRepo::new(Arc::new(app_dir.clone())).record_install(name, version, source)
 }
 
 /// Record a batch of installs (e.g. collection mode).
@@ -208,41 +374,13 @@ pub(crate) fn record_install_batch(
     names: &[String],
     source: PackageSource,
 ) -> Result<(), String> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    with_manifest_lock(app_dir, || {
-        let mut manifest = load_manifest(app_dir)?;
-        let now = now_iso8601();
-
-        for name in names {
-            manifest
-                .packages
-                .entry(name.clone())
-                .and_modify(|e| {
-                    e.source = source.clone();
-                    e.updated_at = now.clone();
-                })
-                .or_insert_with(|| ManifestEntry {
-                    version: None, // batch installs don't have per-package version info readily
-                    source: source.clone(),
-                    installed_at: now.clone(),
-                    updated_at: now.clone(),
-                });
-        }
-
-        save_manifest(app_dir, &manifest)
-    })
+    FsManifestRepo::new(Arc::new(app_dir.clone())).record_install_batch(names, source)
 }
 
 /// Remove a package from the manifest (`installed.json`). Used by
 /// `pkg_remove` scope `"global"` / `"all"`.
 pub(crate) fn record_remove(app_dir: &AppDir, name: &str) -> Result<(), String> {
-    with_manifest_lock(app_dir, || {
-        let mut manifest = load_manifest(app_dir)?;
-        manifest.packages.remove(name);
-        save_manifest(app_dir, &manifest)
-    })
+    FsManifestRepo::new(Arc::new(app_dir.clone())).record_remove(name)
 }
 
 /// Load manifest for test with custom path.
@@ -259,6 +397,35 @@ pub(crate) fn load_manifest_from(path: &std::path::Path) -> Result<Manifest, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_memory_manifest_repo_roundtrip() {
+        // Demonstrates that `InMemoryManifestRepo` satisfies the trait
+        // end-to-end without touching the filesystem, so future unit
+        // tests can exercise caller logic in parallel without the
+        // `FakeHome` + `HOME_MUTEX` serialisation the FS-backed repo
+        // currently forces.
+        let repo = InMemoryManifestRepo::default();
+        let git_src = || PackageSource::Git {
+            url: "https://example.test/mock".to_string(),
+            rev: None,
+        };
+
+        repo.record_install("alpha", Some("1.0.0"), git_src()).unwrap();
+        repo.record_install("alpha", None, git_src()).unwrap();
+        repo.record_install_batch(&["beta".to_string(), "gamma".to_string()], git_src())
+            .unwrap();
+        repo.record_remove("beta").unwrap();
+
+        let loaded = repo.load().unwrap();
+        assert_eq!(
+            loaded.packages.get("alpha").unwrap().version.as_deref(),
+            Some("1.0.0"),
+            "version=None should preserve existing entry"
+        );
+        assert!(loaded.packages.contains_key("gamma"));
+        assert!(!loaded.packages.contains_key("beta"));
+    }
 
     #[test]
     fn days_to_ymd_epoch() {

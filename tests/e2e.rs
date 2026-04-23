@@ -2236,6 +2236,202 @@ async fn test_alc_hub_dist_compat_declared_out_of_range() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── alc_pkg_scaffold E2E tests ──────────────────────────────────────────────
+
+/// Basic scaffold: `my_pkg` with no optional fields.
+///
+/// Checks:
+/// - Response has `status = "ok"`.
+/// - `<tempdir>/my_pkg/init.lua` is created on disk.
+/// - Content contains expected Lua skeleton markers.
+#[tokio::test]
+async fn test_alc_pkg_scaffold_basic() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_scaffold",
+        json!({
+            "name": "my_pkg",
+            "target_dir": target_dir,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        resp.get("status").and_then(|v| v.as_str()),
+        Some("ok"),
+        "expected status=ok, got: {resp}"
+    );
+
+    let init_lua = tmp.path().join("my_pkg").join("init.lua");
+    assert!(
+        init_lua.exists(),
+        "expected init.lua at {}",
+        init_lua.display()
+    );
+
+    let content = std::fs::read_to_string(&init_lua).expect("read init.lua");
+    assert!(
+        content.contains(r#"name = "my_pkg""#),
+        "expected name field in content"
+    );
+    assert!(
+        content.contains("alc_shapes_compat = \">=0.25.0, <0.26\""),
+        "expected compat range in content, got excerpt: {}",
+        &content[..content.len().min(400)]
+    );
+    assert!(
+        content.contains("function M.run(ctx)"),
+        "expected M.run stub"
+    );
+    assert!(content.contains("T.shape"), "expected T.shape reference");
+    assert!(content.contains("return M"), "expected return M");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Scaffold with category and description provided — both fields must appear
+/// uncommented in the generated `M.meta` table.
+#[tokio::test]
+async fn test_alc_pkg_scaffold_with_category_and_description() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_scaffold",
+        json!({
+            "name": "my_pkg",
+            "target_dir": target_dir,
+            "category": "selection",
+            "description": "test pkg",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        resp.get("status").and_then(|v| v.as_str()),
+        Some("ok"),
+        "expected status=ok, got: {resp}"
+    );
+
+    let content =
+        std::fs::read_to_string(tmp.path().join("my_pkg").join("init.lua")).expect("read init.lua");
+
+    assert!(
+        content.contains(r#"category = "selection""#),
+        "expected uncommented category in content"
+    );
+    assert!(
+        content.contains(r#"description = "test pkg""#),
+        "expected uncommented description in content"
+    );
+    // Commented-out placeholder lines must NOT appear.
+    assert!(
+        !content.contains("-- category ="),
+        "unexpected commented-out category placeholder"
+    );
+    assert!(
+        !content.contains("-- description ="),
+        "unexpected commented-out description placeholder"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// AlreadyExists error: pre-create the init.lua then call scaffold.
+///
+/// The MCP response must carry `is_error = true` and the text must mention
+/// "already exists".
+#[tokio::test]
+async fn test_alc_pkg_scaffold_already_exists() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pkg_dir = tmp.path().join("my_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create dir");
+    std::fs::write(pkg_dir.join("init.lua"), "-- existing").expect("write existing");
+
+    let target_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_pkg_scaffold",
+            json!({
+                "name": "my_pkg",
+                "target_dir": target_dir,
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for AlreadyExists, got: is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("already exists"),
+                "expected 'already exists' in error text, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// NameInvalid error: empty name, digit-starting name, and slash name.
+///
+/// Each must produce `is_error = true` with text mentioning the problematic
+/// name.
+#[tokio::test]
+async fn test_alc_pkg_scaffold_name_invalid() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+
+    for bad_name in &["", "1bad", "has/slash"] {
+        let outcome = client
+            .call_tool(call_params(
+                "alc_pkg_scaffold",
+                json!({
+                    "name": bad_name,
+                    "target_dir": target_dir,
+                }),
+            ))
+            .await;
+
+        match outcome {
+            Ok(result) => {
+                let is_error = result.is_error.unwrap_or(false);
+                let text = extract_text(&result);
+                assert!(
+                    is_error,
+                    "expected is_error=true for name={bad_name:?}, got text: {text}"
+                );
+                // The error message must contain "invalid" (from NameInvalid display).
+                assert!(
+                    text.contains("invalid"),
+                    "expected 'invalid' in error text for name={bad_name:?}, got: {text}"
+                );
+            }
+            Err(e) => panic!("unexpected call_tool Err for name={bad_name:?}: {e}"),
+        }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Fixture-based E2E: `alc_hub_dist` where the single package has no
 /// `alc_shapes_compat` field in `M.meta`.
 ///

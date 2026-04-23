@@ -51,7 +51,7 @@ use super::AppService;
 
 /// Version string embedded in the vendored `alc_shapes/init.lua`.
 /// Must match the `M.VERSION` declaration in that file exactly.
-const EMBEDDED_ALC_SHAPES_VERSION: &str = "0.25.1";
+pub(crate) const EMBEDDED_ALC_SHAPES_VERSION: &str = "0.25.1";
 
 #[derive(Debug, Error)]
 enum ShapesVersionError {

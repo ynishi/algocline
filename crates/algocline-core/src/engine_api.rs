@@ -478,6 +478,26 @@ pub trait EngineApi: Send + Sync {
         verbose: Option<String>,
     ) -> Result<String, String>;
 
+    // ─── Package scaffold ─────────────────────────────────────
+
+    /// Generate a minimal package skeleton at `<target_dir>/<name>/init.lua`.
+    ///
+    /// Writes an `M.meta` / `M.spec.entries.run` / `M.run` template with a
+    /// pre-filled `alc_shapes_compat` range derived from the embedded
+    /// alc_shapes version.  Optional `category` / `description` are emitted
+    /// as uncommented fields in `M.meta` when provided.
+    ///
+    /// Returns `{ "status": "ok", "path": "...", "bytes_written": N }` on
+    /// success. Typed errors (`NameInvalid`, `AlreadyExists`, `IoError`) are
+    /// propagated via `Err(String)` to the MCP wire response.
+    async fn pkg_scaffold(
+        &self,
+        name: String,
+        target_dir: Option<String>,
+        category: Option<String>,
+        description: Option<String>,
+    ) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

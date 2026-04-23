@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   No runtime `allow_mirror` / source_dir-mirror preload path is
   introduced — a pkg author who needs a patched alc_shapes is expected
   to fork core or upstream the patch rather than run a parallel mirror.
+- **`alc_pkg_scaffold` MCP tool**: generates a minimal package skeleton
+  at `<target_dir>/<name>/init.lua` with an `M.meta` / `M.spec.entries.run`
+  / `M.run` template and a pre-filled `alc_shapes_compat` range derived
+  from the embedded alc_shapes version (e.g. current core 0.25.1 →
+  `">=0.25.0, <0.26"`). Optional `category` / `description` params flow
+  into `M.meta`. Typed errors on name validation failure
+  (`PkgScaffoldError::NameInvalid`) or pre-existing init.lua
+  (`AlreadyExists`) are surfaced via the MCP wire response. Companions
+  the v0.26 pkg compat contract (commit `bce529a`): scaffolded packages
+  are ecosystem-ready the moment they're created.
 
 ## [0.25.1] - 2026-04-23
 

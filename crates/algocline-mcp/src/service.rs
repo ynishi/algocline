@@ -571,6 +571,24 @@ pub struct CardInstallParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PkgScaffoldParams {
+    /// Package name (snake_case recommended).
+    ///
+    /// Must start with a lowercase ASCII letter followed by zero or more
+    /// lowercase ASCII letters, digits, or underscores.  Length ≤ 64.
+    pub name: String,
+    /// Directory under which `<name>/init.lua` is created.
+    /// Defaults to `"."` (the algocline server's current working directory).
+    pub target_dir: Option<String>,
+    /// Optional category written into `M.meta.category` (uncommented).
+    /// When omitted, a commented-out placeholder line is emitted instead.
+    pub category: Option<String>,
+    /// Optional one-line description written into `M.meta.description` (uncommented).
+    /// When omitted, a commented-out placeholder line is emitted instead.
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HubInfoParams {
     /// Package name to get detailed information for.
     pub pkg: String,
@@ -1087,6 +1105,40 @@ impl AlcService {
         Parameters(params): Parameters<PkgDoctorParams>,
     ) -> Result<String, String> {
         self.app.pkg_doctor(params.name, params.project_root).await
+    }
+
+    /// Generate a minimal package skeleton at `<target_dir>/<name>/init.lua`.
+    ///
+    /// Creates `<target_dir>/<name>/` (via `fs::create_dir_all`) and writes a
+    /// single `init.lua` containing:
+    /// - `M.meta` with `name`, `version = "0.1.0"`, and a pre-filled
+    ///   `alc_shapes_compat` range derived from the embedded alc_shapes
+    ///   version (e.g. embedded `0.25.1` → `">=0.25.0, <0.26"`).
+    ///   Optional `category` / `description` are written as uncommented fields
+    ///   when provided; otherwise commented-out placeholder lines are emitted.
+    /// - `M.spec.entries.run` stub with commented-out `T.shape` declarations.
+    /// - `M.run(ctx)` stub using `alc.llm(prompt)`.
+    ///
+    /// Typed errors are surfaced via the MCP wire response:
+    /// - `NameInvalid` — name empty / too long / wrong character set.
+    /// - `AlreadyExists` — `<target_dir>/<name>/init.lua` already present.
+    /// - `IoError` — filesystem operation failed.
+    #[tool(
+        name = "alc_pkg_scaffold",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn pkg_scaffold(
+        &self,
+        Parameters(params): Parameters<PkgScaffoldParams>,
+    ) -> Result<String, String> {
+        self.app
+            .pkg_scaffold(
+                params.name,
+                params.target_dir,
+                params.category,
+                params.description,
+            )
+            .await
     }
 
     // ─── Logging ─────────────────────────────────────────────

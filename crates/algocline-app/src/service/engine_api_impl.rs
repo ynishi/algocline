@@ -457,6 +457,29 @@ impl EngineApi for AppService {
         .map_err(|e| format!("hub_search task panicked: {e}"))?
     }
 
+    // ─── Package scaffold ─────────────────────────────────────
+
+    async fn pkg_scaffold(
+        &self,
+        name: String,
+        target_dir: Option<String>,
+        category: Option<String>,
+        description: Option<String>,
+    ) -> Result<String, String> {
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || {
+            AppService::pkg_scaffold(
+                &svc,
+                &name,
+                target_dir.as_deref(),
+                category.as_deref(),
+                description.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| format!("pkg_scaffold task panicked: {e}"))?
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

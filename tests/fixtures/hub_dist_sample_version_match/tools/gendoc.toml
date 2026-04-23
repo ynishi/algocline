@@ -1,0 +1,7 @@
+[context7]
+projectTitle = "hub_dist_sample_version_match"
+description = "Fixture for alc_shapes version match E2E test"
+rules = []
+
+[devin]
+project_name = "hub_dist_sample_version_match"

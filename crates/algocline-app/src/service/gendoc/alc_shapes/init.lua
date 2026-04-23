@@ -34,6 +34,8 @@ local instrument = require("alc_shapes.instrument")
 
 local M = {}
 
+M.VERSION = "0.25.1"
+
 -- ── shape dictionary ─────────────────────────────────────────────────
 
 M.voted = T.shape({

@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP wire shape unchanged; `source_dir` is still accepted. Any third-party
   package author can now invoke `alc_hub_dist` against their own source tree
   without vendoring `alc_shapes` themselves.
+- **`alc_shapes` version pinning**: the embedded `alc_shapes` now declares
+  `M.VERSION` and the `hub_gendoc` / `alc_hub_dist` resolver reads it from
+  any on-disk mirror at `source_dir/alc_shapes/init.lua`. When the mirror's
+  `M.VERSION` differs from the embedded constant, dist fails with a typed
+  `ShapesVersionMismatch { embedded, mirror, hint }` error surfaced via the
+  MCP wire response — catches drift between core's vendored copy and a
+  downstream repository's mirror at the earliest possible point.
 
 ### Removed
 

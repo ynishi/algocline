@@ -1693,7 +1693,7 @@ async fn test_alc_hub_dist_fixture() {
             if ty.is_dir() {
                 copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
             } else {
-                std::fs::copy(&entry.path(), dst.join(entry.file_name()))?;
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
             }
         }
         Ok(())
@@ -1803,6 +1803,163 @@ async fn test_alc_hub_dist_fixture() {
         "expected .devin/wiki.json at {}",
         devin_wiki.display()
     );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Fixture-based E2E: `alc_hub_dist` with a mirror `alc_shapes/init.lua`
+/// whose `M.VERSION` matches `EMBEDDED_ALC_SHAPES_VERSION` (0.25.1).
+///
+/// The mirror file is read for VERSION extraction only; actual Lua API
+/// still comes from the embedded vendored copy. Dist must succeed.
+#[tokio::test]
+async fn test_alc_hub_dist_fixture_mirror_version_match() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hub_dist_sample_version_match");
+
+    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+            } else {
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    copy_dir_all(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = root.join("docs").to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir":  source_dir,
+            "output_path": output_path,
+            "out_dir":     out_dir,
+        }),
+    )
+    .await;
+
+    // Dist must succeed: response contains reindex + gendoc fields.
+    assert!(
+        resp.get("reindex").is_some(),
+        "expected reindex field on version-match success, got: {resp}"
+    );
+    assert!(
+        resp.get("gendoc").is_some(),
+        "expected gendoc field on version-match success, got: {resp}"
+    );
+
+    // Signal token must appear in llms-full.txt.
+    let out_dir_path = root.join("docs");
+    let llms_full_path = out_dir_path.join("llms-full.txt");
+    assert!(
+        llms_full_path.exists(),
+        "expected llms-full.txt at {}",
+        llms_full_path.display()
+    );
+    let llms_full = std::fs::read_to_string(&llms_full_path).expect("read llms-full.txt");
+    assert!(
+        llms_full.contains("VMATCH_SIGNAL_ALPHA"),
+        "expected VMATCH_SIGNAL_ALPHA signal token in llms-full.txt"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Fixture-based E2E: `alc_hub_dist` with a mirror `alc_shapes/init.lua`
+/// whose `M.VERSION` ("9.9.9") differs from the embedded constant.
+///
+/// Dist must fail early with a typed `ShapesVersionMismatch` error
+/// surfaced in the MCP wire response, containing both version strings
+/// and the canonical hint.
+#[tokio::test]
+async fn test_alc_hub_dist_fixture_mirror_version_mismatch() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hub_dist_sample_version_mismatch");
+
+    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+            } else {
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    copy_dir_all(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = root.join("docs").to_str().expect("utf-8 path").to_string();
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_dist",
+            json!({
+                "source_dir":  source_dir,
+                "output_path": output_path,
+                "out_dir":     out_dir,
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true on version mismatch, got: is_error={is_error:?}, text: {text}"
+            );
+            // Both version strings must appear in the error text.
+            assert!(
+                text.contains("0.25.1"),
+                "expected embedded version '0.25.1' in error text, got: {text}"
+            );
+            assert!(
+                text.contains("9.9.9"),
+                "expected mirror version '9.9.9' in error text, got: {text}"
+            );
+            // The canonical hint must be present.
+            assert!(
+                text.contains("CHANGELOG"),
+                "expected CHANGELOG hint in error text, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
 
     client.cancel().await.expect("cancel failed");
 }

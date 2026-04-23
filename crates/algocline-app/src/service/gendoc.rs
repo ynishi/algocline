@@ -37,12 +37,79 @@
 //! surfaced via `?` with a `gendoc:` prefix — no `warn!` drops, no
 //! `unwrap_or_default`, no silent `Err(_) =>` branches.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, Table, Value};
 use serde::Deserialize;
+use thiserror::Error;
 
 use super::AppService;
+
+// ── alc_shapes version pinning ────────────────────────────────────────
+
+/// Version string embedded in the vendored `alc_shapes/init.lua`.
+/// Must match the `M.VERSION` declaration in that file exactly.
+const EMBEDDED_ALC_SHAPES_VERSION: &str = "0.25.1";
+
+#[derive(Debug, Error)]
+enum ShapesVersionError {
+    #[error("alc_shapes version mismatch: embedded={embedded}, mirror={mirror}. {hint}")]
+    Mismatch {
+        embedded: String,
+        mirror: String,
+        hint: &'static str,
+    },
+    #[error("alc_shapes mirror init.lua at '{path}' has no parseable M.VERSION declaration")]
+    Malformed { path: PathBuf },
+}
+
+const SHAPES_VERSION_HINT: &str = "Align bundled alc_shapes/ to match core, \
+    or upgrade algocline core to the mirror version. See CHANGELOG for details.";
+
+/// Check the mirror's `M.VERSION` against `EMBEDDED_ALC_SHAPES_VERSION`.
+///
+/// If `source_dir` is `None` or its `alc_shapes/init.lua` does not
+/// exist, returns `Ok(())` immediately (no-op path). Otherwise reads
+/// the file, extracts `M.VERSION = "x.y.z"` with a hand-rolled parser
+/// (no `regex` dep), and fails with a typed error on mismatch.
+fn check_mirror_shapes_version(source_dir: Option<&str>) -> Result<(), ShapesVersionError> {
+    let Some(dir) = source_dir else {
+        return Ok(());
+    };
+    let path: PathBuf = [dir, "alc_shapes", "init.lua"].iter().collect();
+    if !path.exists() {
+        return Ok(());
+    }
+    let src = std::fs::read_to_string(&path)
+        .map_err(|_| ShapesVersionError::Malformed { path: path.clone() })?;
+    let mirror_ver = extract_m_version(&src)
+        .ok_or_else(|| ShapesVersionError::Malformed { path: path.clone() })?;
+    if mirror_ver != EMBEDDED_ALC_SHAPES_VERSION {
+        return Err(ShapesVersionError::Mismatch {
+            embedded: EMBEDDED_ALC_SHAPES_VERSION.to_string(),
+            mirror: mirror_ver,
+            hint: SHAPES_VERSION_HINT,
+        });
+    }
+    Ok(())
+}
+
+/// Hand-rolled parser for `M.VERSION = "x.y.z"` in a Lua source string.
+///
+/// Finds the first occurrence of `M.VERSION` followed (with optional
+/// whitespace) by `=` and then a double-quoted string. Returns the
+/// quoted content on success.
+fn extract_m_version(src: &str) -> Option<String> {
+    let marker = "M.VERSION";
+    let start = src.find(marker)?;
+    let after_marker = src[start + marker.len()..].trim_start();
+    let after_eq = after_marker.strip_prefix('=')?;
+    let after_eq = after_eq.trim_start();
+    let after_quote = after_eq.strip_prefix('"')?;
+    let end = after_quote.find('"')?;
+    Some(after_quote[..end].to_string())
+}
 
 // ── Embedded Lua sources ──────────────────────────────────────────
 
@@ -196,6 +263,12 @@ impl AppService {
         let resolved_out_dir = out_dir
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{source_dir}/docs"));
+
+        // Reject mismatched mirror before starting the VM: if the
+        // caller's source_dir has an alc_shapes/init.lua whose
+        // M.VERSION differs from the embedded constant, fail early with
+        // a structured error (propagated to the MCP wire response).
+        check_mirror_shapes_version(Some(source_dir)).map_err(|e| format!("gendoc: {e}"))?;
 
         let lua = Lua::new();
 
@@ -764,6 +837,100 @@ mod tests {
         assert_eq!(parsed["out_dir"], "/src/docs");
         assert_eq!(parsed["stdout"], "hi");
         assert_eq!(parsed["stderr"], "warn");
+    }
+
+    // ── alc_shapes version resolver unit tests ────────────────────────
+
+    #[test]
+    fn extract_m_version_parses_standard_format() {
+        let src = r#"local M = {}
+M.VERSION = "0.25.1"
+"#;
+        assert_eq!(extract_m_version(src).as_deref(), Some("0.25.1"));
+    }
+
+    #[test]
+    fn extract_m_version_tolerates_no_space_around_eq() {
+        let src = r#"M.VERSION="1.2.3""#;
+        assert_eq!(extract_m_version(src).as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn extract_m_version_tolerates_leading_whitespace() {
+        let src = r#"  M.VERSION = "9.9.9"  "#;
+        assert_eq!(extract_m_version(src).as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn extract_m_version_returns_none_when_absent() {
+        let src = r#"local M = {}
+return M
+"#;
+        assert!(extract_m_version(src).is_none());
+    }
+
+    #[test]
+    fn check_mirror_shapes_version_ok_when_source_dir_none() {
+        assert!(check_mirror_shapes_version(None).is_ok());
+    }
+
+    #[test]
+    fn check_mirror_shapes_version_ok_when_no_mirror_file() {
+        // A tempdir with no alc_shapes/ subdirectory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_str().expect("utf-8").to_string();
+        assert!(check_mirror_shapes_version(Some(&dir)).is_ok());
+    }
+
+    #[test]
+    fn check_mirror_shapes_version_ok_on_version_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let alc_dir = tmp.path().join("alc_shapes");
+        std::fs::create_dir_all(&alc_dir).expect("mkdir alc_shapes");
+        let init = alc_dir.join("init.lua");
+        std::fs::write(
+            &init,
+            format!(
+                "local M = {{}}\nM.VERSION = \"{}\"\nreturn M\n",
+                EMBEDDED_ALC_SHAPES_VERSION
+            ),
+        )
+        .expect("write init.lua");
+        let dir = tmp.path().to_str().expect("utf-8").to_string();
+        assert!(check_mirror_shapes_version(Some(&dir)).is_ok());
+    }
+
+    #[test]
+    fn check_mirror_shapes_version_err_on_version_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let alc_dir = tmp.path().join("alc_shapes");
+        std::fs::create_dir_all(&alc_dir).expect("mkdir alc_shapes");
+        let init = alc_dir.join("init.lua");
+        std::fs::write(&init, "local M = {}\nM.VERSION = \"9.9.9\"\nreturn M\n")
+            .expect("write init.lua");
+        let dir = tmp.path().to_str().expect("utf-8").to_string();
+        let err =
+            check_mirror_shapes_version(Some(&dir)).expect_err("must fail on version mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(EMBEDDED_ALC_SHAPES_VERSION),
+            "embedded ver in msg: {msg}"
+        );
+        assert!(msg.contains("9.9.9"), "mirror ver in msg: {msg}");
+        assert!(msg.contains("CHANGELOG"), "hint in msg: {msg}");
+    }
+
+    #[test]
+    fn check_mirror_shapes_version_err_on_malformed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let alc_dir = tmp.path().join("alc_shapes");
+        std::fs::create_dir_all(&alc_dir).expect("mkdir alc_shapes");
+        let init = alc_dir.join("init.lua");
+        std::fs::write(&init, "-- no version here\nreturn {}\n").expect("write init.lua");
+        let dir = tmp.path().to_str().expect("utf-8").to_string();
+        let err = check_mirror_shapes_version(Some(&dir)).expect_err("must fail on malformed");
+        let msg = err.to_string();
+        assert!(msg.contains("no parseable"), "malformed msg: {msg}");
     }
 
     /// Regression harness: vendored `alc_shapes` must satisfy the

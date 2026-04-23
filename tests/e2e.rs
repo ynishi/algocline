@@ -1964,6 +1964,97 @@ async fn test_alc_hub_dist_fixture_mirror_version_mismatch() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Fixture-based E2E: `alc_hub_dist` with the `luacats` projection emits
+/// `source_dir/types/alc_shapes.d.lua` containing LuaCATS class declarations
+/// generated from the embedded `alc_shapes` SSoT.
+///
+/// Verifications:
+///   A. dist response contains `reindex` and `gendoc` fields (no is_error)
+///   B. `source_dir/types/alc_shapes.d.lua` exists after the call
+///   C. File contains at least three `---@class ` lines (one per registered shape)
+///   D. File contains the `AlcResultVoted` class name (from `M.voted` in alc_shapes)
+#[tokio::test]
+async fn test_alc_hub_dist_luacats_projection() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hub_dist_sample");
+
+    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+            } else {
+                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    copy_dir_all(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = root.join("docs").to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir":  source_dir,
+            "output_path": output_path,
+            "out_dir":     out_dir,
+            "projections": ["luacats"],
+        }),
+    )
+    .await;
+
+    // A. dist response must contain reindex and gendoc fields.
+    assert!(
+        resp.get("reindex").is_some(),
+        "expected reindex field in response, got: {resp}"
+    );
+    assert!(
+        resp.get("gendoc").is_some(),
+        "expected gendoc field in response, got: {resp}"
+    );
+
+    // B. types/alc_shapes.d.lua must exist under source_dir.
+    let luacats_path = root.join("types").join("alc_shapes.d.lua");
+    assert!(
+        luacats_path.exists(),
+        "expected types/alc_shapes.d.lua at {}",
+        luacats_path.display()
+    );
+
+    let content = std::fs::read_to_string(&luacats_path).expect("read alc_shapes.d.lua");
+
+    // C. At least three `---@class ` declarations (one per registered shape).
+    let class_count = content.matches("---@class ").count();
+    assert!(
+        class_count >= 3,
+        "expected at least 3 '---@class ' lines in alc_shapes.d.lua, got {class_count}"
+    );
+
+    // D. AlcResultVoted class must be present (from M.voted in alc_shapes/init.lua).
+    assert!(
+        content.contains("---@class AlcResultVoted"),
+        "expected '---@class AlcResultVoted' in alc_shapes.d.lua"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Mid-way failure: an invalid `source_dir` causes reindex to fail. The
 /// caller must see `is_error=true` with text starting `dist: reindex
 /// failed:`, proving that `gendoc` was not invoked and the caller was

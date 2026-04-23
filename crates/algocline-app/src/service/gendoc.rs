@@ -353,6 +353,7 @@ struct ProjectionFlags {
     devin: bool,
     lint: bool,
     lint_only: bool,
+    luacats: bool,
 }
 
 impl ProjectionFlags {
@@ -371,9 +372,10 @@ impl ProjectionFlags {
                     f.lint_only = true;
                     f.lint = true;
                 }
+                "luacats" => f.luacats = true,
                 _ => {
                     return Err(format!(
-                        "gendoc: unknown projection '{p}' (allowed: hub, context7, devin, lint, lint_only)"
+                        "gendoc: unknown projection '{p}' (allowed: hub, context7, devin, lint, lint_only, luacats)"
                     ));
                 }
             }
@@ -635,6 +637,9 @@ fn install_argv(
     if lint_strict {
         push("--strict")?;
     }
+    if flags.luacats {
+        push("--luacats")?;
+    }
 
     lua.globals()
         .set("arg", argv)
@@ -761,6 +766,15 @@ mod tests {
         let f = ProjectionFlags::from_list(Some(&list)).expect("projection parse");
         assert!(f.lint);
         assert!(f.lint_only);
+    }
+
+    #[test]
+    fn projection_flags_luacats_parses() {
+        let list = vec!["luacats".to_string()];
+        let f = ProjectionFlags::from_list(Some(&list)).expect("projection parse");
+        assert!(f.luacats);
+        assert!(!f.hub);
+        assert!(!f.lint);
     }
 
     #[test]

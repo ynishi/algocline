@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`luacats` projection for `alc_hub_dist` / `alc_hub_gendoc`**: emits
+  `source_dir/types/alc_shapes.d.lua` from the embedded alc_shapes SSoT
+  via `S.LuaCats.gen`. This unifies bundled-side `just gen-shapes`
+  behavior into core so any third-party package author can regenerate
+  lua-ls type definitions in a single `alc_hub_dist` call. Opt-in:
+  caller must include `"luacats"` in `projections`.
+
 ## [0.25.1] - 2026-04-23
 
 ### Changed

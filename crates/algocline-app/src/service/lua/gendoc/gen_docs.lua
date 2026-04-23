@@ -59,6 +59,7 @@ local function parse_argv(argv)
     local opts = {
         lint = false, strict = false, lint_only = false,
         hub = false, context7 = false, devin = false,
+        luacats = false,
         hub_index = nil,
     }
     local positional = {}
@@ -78,6 +79,8 @@ local function parse_argv(argv)
             opts.context7 = true
         elseif a == "--devin" then
             opts.devin = true
+        elseif a == "--luacats" then
+            opts.luacats = true
         elseif a:sub(1, 12) == "--hub-index=" then
             opts.hub_index = a:sub(13)
         elseif a:sub(1, 2) == "--" then
@@ -205,6 +208,19 @@ local function main(argv)
             write_file(repo_root .. "/.devin/wiki.json",
                        Projections.devin_wiki(DevinConfig))
             io.stdout:write("  [ok]   .devin/wiki.json (repo root)\n")
+        end
+        if opts.luacats then
+            local S = require("alc_shapes")
+            local shapes = {}
+            for k, v in pairs(S) do
+                if type(v) == "table" and rawget(v, "kind") == "shape" then
+                    shapes[k] = v
+                end
+            end
+            ensure_dir(repo_root .. "/types")
+            write_file(repo_root .. "/types/alc_shapes.d.lua",
+                       S.LuaCats.gen(shapes, "AlcResult"))
+            io.stdout:write("  [ok]   types/alc_shapes.d.lua (repo root)\n")
         end
     end
 

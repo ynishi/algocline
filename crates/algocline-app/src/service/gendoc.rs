@@ -12,14 +12,14 @@
 //!   `include_str!` at compile time and registered on
 //!   `package.preload` so that `require("tools.docs.X")` resolves
 //!   without touching the filesystem.
-//! - `alc_shapes` / `alc_shapes.t` (bundled-packages runtime
-//!   dependency used by `extract.lua` / `projections.lua` etc.) are
-//!   satisfied by minimal stubs — `gen_docs` only uses them for
-//!   shape-validation side effects that are not load-bearing for the
-//!   artifacts. Stubs must still load real `init.lua` files: packages
-//!   import `local T = S.T`, chain `:describe`, and wrap entrypoints with
-//!   `S.instrument`; `alc_shapes.t` must expose at least `boolean` /
-//!   `table` alongside `string` / `number` / `bool`.
+//! - `alc_shapes` / `alc_shapes.t`: when `source_dir/alc_shapes/init.lua`
+//!   exists (hub / bundled-packages checkout), those modules are read from
+//!   disk and registered on `package.preload` so `T.ref("voted")` etc.
+//!   resolve like standalone `lua tools/gen_docs.lua`. Otherwise minimal
+//!   in-binary stubs are used (e2e tempdirs). Stubs must still satisfy the
+//!   same surface: `local T = S.T`, `:describe`, `S.instrument`, and
+//!   `alc_shapes.t` primitives including `boolean` / `table` alongside
+//!   `string` / `number` / `bool`.
 //! - `config_path` (optional) is a caller-supplied TOML file with
 //!   top-level `[context7]` and/or `[devin]` tables. When supplied,
 //!   those `context7` / `devin` tables are exposed under the
@@ -38,6 +38,7 @@
 //! surfaced via `?` with a `gendoc:` prefix — no `warn!` drops, no
 //! `unwrap_or_default`, no silent `Err(_) =>` branches.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, Table, Value};
@@ -61,19 +62,64 @@ const LUA_DOCS_ENTITY_SCHEMAS: &str = include_str!("lua/gendoc/docs/entity_schem
 /// `gen_docs` uses the shapes module for non-load-bearing validation
 /// that is tolerated to pass unconditionally at publish time — the
 /// authoritative validation lives in the bundled-packages CI, not in
-/// the embedded runner. The surface required by the embedded docs
-/// modules is limited to `check` / `assert_dev` / `fields` /
-/// `infer`, plus `T` / `instrument` for real bundled `init.lua` loads.
+/// the embedded runner. `M.fields` must match bundled
+/// `alc_shapes.reflect.fields` (sorted `{ name, type, optional, doc? }`)
+/// because `tools/docs/projections.lua` calls it for Parameters / Result
+/// tables and `shape_type_string` recursion.
 const LUA_ALC_SHAPES_STUB: &str = r#"
 local M = {}
--- Bundled packages use `local S = require("alc_shapes"); local T = S.T` and
--- `M.run = S.instrument(M, "run")` at module tail — the publish-time VM must
--- satisfy both without loading the full alc_shapes tree from disk.
 local t = require("alc_shapes.t")
 M.T = t
 M.check = function(_v, _schema, _opts) return true, nil end
 M.assert_dev = function(_v, _schema, _opts) return true end
-M.fields = function(schema) return (schema and schema.fields) or {} end
+
+-- Mirror `alc_shapes/reflect.lua` `unwrap` + `fields` (subset: no walk()).
+local function unwrap_field_schema(schema)
+    local optional = false
+    local doc = nil
+    while true do
+        local kind = rawget(schema, "kind")
+        if kind == "optional" then
+            optional = true
+            schema = rawget(schema, "inner")
+        elseif kind == "described" then
+            if doc == nil then doc = rawget(schema, "doc") end
+            schema = rawget(schema, "inner")
+        else
+            break
+        end
+    end
+    return schema, optional, doc
+end
+
+local function reflect_fields(schema)
+    if type(schema) ~= "table" then
+        error("alc_shapes.reflect.fields: expected table, got " .. type(schema), 2)
+    end
+    if rawget(schema, "kind") ~= "shape" then
+        error("alc_shapes.reflect.fields: schema must be kind='shape'", 2)
+    end
+    local fields_tbl = rawget(schema, "fields")
+    if type(fields_tbl) ~= "table" then
+        error("alc_shapes.reflect.fields: schema.fields is not a table", 2)
+    end
+    local names = {}
+    for name in pairs(fields_tbl) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    local out = {}
+    for i = 1, #names do
+        local name = names[i]
+        local inner, optional, doc = unwrap_field_schema(fields_tbl[name])
+        local entry = { name = name, type = inner, optional = optional }
+        if doc ~= nil then entry.doc = doc end
+        out[i] = entry
+    end
+    return out
+end
+
+M.fields = reflect_fields
 M.infer = function(v) return v end
 M.instrument = function(mod, entry_name, _spec)
     return mod[entry_name]
@@ -81,22 +127,13 @@ end
 return M
 "#;
 
-/// Minimal stub for `alc_shapes.t` — just enough type constructors to
-/// satisfy the top-level `local T = require("alc_shapes.t")` imports in
-/// `entity_schemas.lua`, `extract.lua`, `projections.lua`, `lint.lua`.
-///
-/// Constructors return opaque `{ kind = "...", ... }` tables. The only
-/// structural invariant any embedded caller relies on is the presence
-/// of `.kind`, so these stubs preserve that. `_internal.is_schema`
-/// accepts anything table-shaped so downstream `is_schema` guards
-/// don't accidentally reject stub-produced schemas.
+/// Minimal stub for `alc_shapes.t` — constructors must emit the same
+/// `kind` / field names as bundled `alc_shapes/t.lua` so
+/// `tools/docs/projections.lua` (`rawget(..., "prim")`, `"elem"`, `"val"`,
+/// peel `doc`) stays aligned without embedding the full module (plan A).
 const LUA_ALC_SHAPES_T_STUB: &str = r##"
 local T = {}
 
--- Method table installed on every schema object. `is_optional()`
--- wraps the receiver in an optional variant (used by
--- entity_schemas.lua for structurally-optional fields).
---
 -- `make_schema` MUST be declared before `schema_mt.__index`: Lua does not
 -- back-patch closures created earlier in the chunk, so `describe` would
 -- otherwise resolve `make_schema` as a (nil) global.
@@ -110,37 +147,76 @@ schema_mt.__index = {
         return setmetatable({ kind = "optional", inner = self }, schema_mt)
     end,
     describe = function(self, text)
-        return make_schema({ kind = "described", inner = self, desc = text })
+        if type(text) ~= "string" then
+            error("alc_shapes.t: describe expects string doc", 2)
+        end
+        return make_schema({ kind = "described", inner = self, doc = text })
     end,
 }
 
-T.any    = make_schema({ kind = "any" })
-T.string = make_schema({ kind = "prim", name = "string" })
-T.number = make_schema({ kind = "prim", name = "number" })
-T.bool   = make_schema({ kind = "prim", name = "bool" })
--- Bundled packages use the Malli-style names from `alc_shapes.t`.
-T.boolean = make_schema({ kind = "prim", name = "boolean" })
-T.table   = make_schema({ kind = "prim", name = "table" })
--- Aliases occasionally used by older docs modules.
-T.str    = T.string
-T.num    = T.number
+-- Primitives use `prim = "..."` (not `name`) — see bundled `alc_shapes/t.lua`.
+T.any     = make_schema({ kind = "any" })
+T.string  = make_schema({ kind = "prim", prim = "string" })
+T.number  = make_schema({ kind = "prim", prim = "number" })
+T.boolean = make_schema({ kind = "prim", prim = "boolean" })
+T.table   = make_schema({ kind = "prim", prim = "table" })
+T.str     = T.string
+T.num     = T.number
+T.bool    = T.boolean
 
-T.ref           = function(name) return make_schema({ kind = "ref", name = name }) end
-T.list          = function(t) return make_schema({ kind = "list", item = t }) end
-T.array_of      = function(t) return make_schema({ kind = "array_of", item = t }) end
-T.map           = function(k, v) return make_schema({ kind = "map", key = k, value = v }) end
-T.map_of        = function(k, v) return make_schema({ kind = "map_of", key = k, value = v }) end
-T.opt           = function(t) return make_schema({ kind = "optional", inner = t }) end
-T.optional      = T.opt
-T.one_of        = function(values) return make_schema({ kind = "one_of", values = values }) end
-T.shape         = function(fields, opts)
-    return make_schema({ kind = "shape", fields = fields, opts = opts or {} })
+T.ref = function(name)
+    return make_schema({ kind = "ref", name = name })
 end
-T.described     = function(schema, desc)
-    return make_schema({ kind = "described", inner = schema, desc = desc })
+
+T.array_of = function(elem)
+    return make_schema({ kind = "array_of", elem = elem })
 end
+
+-- Legacy alias (not in bundled `t.lua`; some older snippets used `list`).
+T.list = function(elem)
+    return T.array_of(elem)
+end
+
+T.map_of = function(key, val)
+    return make_schema({ kind = "map_of", key = key, val = val })
+end
+
+T.opt = function(t)
+    return make_schema({ kind = "optional", inner = t })
+end
+T.optional = T.opt
+
+T.one_of = function(values)
+    return make_schema({ kind = "one_of", values = values })
+end
+
+T.shape = function(fields, opts)
+    local copy = {}
+    for k, v in pairs(fields) do
+        copy[k] = v
+    end
+    local open = true
+    if opts and type(opts) == "table" and opts.open ~= nil then
+        open = opts.open
+    end
+    return make_schema({
+        kind = "shape",
+        fields = copy,
+        opts = opts or {},
+        open = open,
+    })
+end
+
+T.described = function(schema, doc)
+    return make_schema({ kind = "described", inner = schema, doc = doc })
+end
+
 T.discriminated = function(tag, variants)
-    return make_schema({ kind = "discriminated", tag = tag, variants = variants })
+    local copy = {}
+    for k, v in pairs(variants) do
+        copy[k] = v
+    end
+    return make_schema({ kind = "discriminated", tag = tag, variants = copy })
 end
 
 T._internal = {
@@ -150,9 +226,10 @@ T._internal = {
 return T
 "##;
 
-/// Lua module name → embedded source. Registered on `package.preload`
-/// inside `register_preloads`.
-const PRELOAD_MODULES: &[(&str, &str)] = &[
+/// Embedded `tools/docs/*` sources (always from `include_str!`).
+/// `alc_shapes` is registered separately — disk-backed when
+/// `{source_dir}/alc_shapes/init.lua` exists, else minimal stubs.
+const EMBEDDED_TOOL_PRELOADS: &[(&str, &str)] = &[
     ("tools.docs.list", LUA_DOCS_LIST),
     ("tools.docs.extract", LUA_DOCS_EXTRACT),
     ("tools.docs.projections", LUA_DOCS_PROJECTIONS),
@@ -160,8 +237,6 @@ const PRELOAD_MODULES: &[(&str, &str)] = &[
     ("tools.docs.json", LUA_DOCS_JSON),
     ("tools.docs.lint", LUA_DOCS_LINT),
     ("tools.docs.entity_schemas", LUA_DOCS_ENTITY_SCHEMAS),
-    ("alc_shapes", LUA_ALC_SHAPES_STUB),
-    ("alc_shapes.t", LUA_ALC_SHAPES_T_STUB),
 ];
 
 /// IO / exit hooks installed into the VM right before `gen_docs.lua`
@@ -272,7 +347,7 @@ impl AppService {
 
         let lua = Lua::new();
 
-        register_preloads(&lua)?;
+        register_preloads(&lua, source_dir)?;
 
         // Optional config_path injection — must be wired as preload
         // *before* `gen_docs.lua` executes so that its
@@ -382,11 +457,89 @@ impl ProjectionFlags {
     }
 }
 
-fn register_preloads(lua: &Lua) -> Result<(), String> {
+/// Register embedded `gen_docs` modules. When `source_dir/alc_shapes/`
+/// contains the real library (bundled-packages / hub repos), load it from
+/// disk so `T.ref(...)` resolves against the same registry as standalone
+/// `lua tools/gen_docs.lua`. Otherwise use minimal in-binary stubs (e2e
+/// fixtures, smoke tempdirs).
+fn register_preloads(lua: &Lua, source_dir: &str) -> Result<(), String> {
+    let used_disk = try_register_disk_alc_shapes(lua, source_dir)?;
+    if !used_disk {
+        let preload = preload_table(lua)?;
+        register_single_preload(lua, &preload, "alc_shapes.t", LUA_ALC_SHAPES_T_STUB)?;
+        register_single_preload(lua, &preload, "alc_shapes", LUA_ALC_SHAPES_STUB)?;
+    }
+
     let preload = preload_table(lua)?;
-    for (mod_name, src) in PRELOAD_MODULES.iter().copied() {
+    for (mod_name, src) in EMBEDDED_TOOL_PRELOADS.iter().copied() {
         register_single_preload(lua, &preload, mod_name, src)?;
     }
+    Ok(())
+}
+
+fn try_register_disk_alc_shapes(lua: &Lua, source_dir: &str) -> Result<bool, String> {
+    let dir = Path::new(source_dir).join("alc_shapes");
+    let init = dir.join("init.lua");
+    if !init.is_file() {
+        return Ok(false);
+    }
+
+    let read = |rel: &str| -> Result<String, String> {
+        let p = dir.join(rel);
+        std::fs::read_to_string(&p)
+            .map_err(|e| format!("gendoc: failed to read {}: {e}", p.display()))
+    };
+
+    // Order follows bundled `alc_shapes/init.lua` `require` chain.
+    register_owned_string_preload(lua, "alc_shapes.t", read("t.lua")?, "alc_shapes/t.lua")?;
+    register_owned_string_preload(
+        lua,
+        "alc_shapes.reflect",
+        read("reflect.lua")?,
+        "alc_shapes/reflect.lua",
+    )?;
+    register_owned_string_preload(lua, "alc_shapes.check", read("check.lua")?, "alc_shapes/check.lua")?;
+    register_owned_string_preload(
+        lua,
+        "alc_shapes.luacats",
+        read("luacats.lua")?,
+        "alc_shapes/luacats.lua",
+    )?;
+    register_owned_string_preload(
+        lua,
+        "alc_shapes.spec_resolver",
+        read("spec_resolver.lua")?,
+        "alc_shapes/spec_resolver.lua",
+    )?;
+    register_owned_string_preload(
+        lua,
+        "alc_shapes.instrument",
+        read("instrument.lua")?,
+        "alc_shapes/instrument.lua",
+    )?;
+    register_owned_string_preload(lua, "alc_shapes", read("init.lua")?, "alc_shapes/init.lua")?;
+
+    Ok(true)
+}
+
+fn register_owned_string_preload(
+    lua: &Lua,
+    mod_name: &'static str,
+    src: String,
+    diag_path: &str,
+) -> Result<(), String> {
+    let preload = preload_table(lua)?;
+    let label = format!("@disk:gendoc/{diag_path}");
+    let loader = lua
+        .create_function(move |lua, ()| {
+            lua.load(src.as_str())
+                .set_name(label.as_str())
+                .eval::<Value>()
+        })
+        .map_err(|e| format!("gendoc: preload create_function failed for {mod_name}: {e}"))?;
+    preload
+        .set(mod_name, loader)
+        .map_err(|e| format!("gendoc: preload.set failed for {mod_name}: {e}"))?;
     Ok(())
 }
 
@@ -832,5 +985,79 @@ mod tests {
         assert_eq!(parsed["out_dir"], "/src/docs");
         assert_eq!(parsed["stdout"], "hi");
         assert_eq!(parsed["stderr"], "warn");
+    }
+
+    /// Regression harness: embedded `alc_shapes` stubs must match the
+    /// contracts exercised by `tools/docs/projections.lua` (sorted
+    /// `S.fields`, `prim` / `elem` / `val` / `doc` keys). Catches the
+    /// class of drift that collapsed bundled `llms-full.txt` generation.
+    #[test]
+    fn embedded_gendoc_shapes_contract_harness() {
+        let lua = Lua::new();
+        register_preloads(&lua, env!("CARGO_MANIFEST_DIR")).expect("register_preloads");
+
+        let script = r#"
+            local S = require("alc_shapes")
+            local T = require("alc_shapes.t")
+            local P = require("tools.docs.projections")
+
+            local shape = T.shape({
+                task = T.string:describe("Problem"),
+                n = T.number:is_optional(),
+            })
+            local entries = S.fields(shape)
+            assert(#entries == 2, "expected two fields")
+            assert(entries[1].name == "n" and entries[1].optional == true)
+            assert(entries[2].name == "task" and entries[2].optional == false)
+            assert(entries[2].doc == "Problem")
+            assert(P.shape_type_string(entries[2].type) == "string")
+
+            assert(P.shape_type_string(T.array_of(T.string)) == "array of string")
+            assert(P.shape_type_string(T.map_of(T.string, T.number)) == "map of string to number")
+
+            local inner = T.shape({ flag = T.boolean })
+            assert(P.shape_type_string(inner) == "shape { flag: boolean }")
+
+            local listed = T.list(T.number)
+            assert(P.shape_type_string(listed) == "array of number")
+        "#;
+
+        lua.load(script)
+            .set_name("@test/embedded_gendoc_shapes_contract.lua")
+            .exec()
+            .expect("embedded shapes contract harness");
+    }
+
+    /// When a sibling `algocline-bundled-packages` checkout exists, disk
+    /// preloads must register the full `alc_shapes` registry so
+    /// `projections.shape_type_string(T.ref(...))` matches standalone
+    /// `lua tools/gen_docs.lua` (closes `llms-full.txt` drift vs HEAD).
+    #[test]
+    fn disk_alc_shapes_preload_resolves_pkg_refs_when_bundled_checkout_present() {
+        // `CARGO_MANIFEST_DIR` = `.../algocline/crates/algocline-app`; sibling repo
+        // lives at `.../algocline-bundled-packages` (three levels up from manifest).
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../algocline-bundled-packages");
+        let init = bundled.join("alc_shapes/init.lua");
+        if !init.is_file() {
+            return;
+        }
+        let root = bundled
+            .to_str()
+            .expect("bundled-packages path must be valid UTF-8");
+        let lua = Lua::new();
+        register_preloads(&lua, root).expect("register_preloads");
+
+        let script = r#"
+            local S = require("alc_shapes")
+            assert(type(S.voted) == "table" and rawget(S.voted, "kind") == "shape")
+            local T = require("alc_shapes.t")
+            local P = require("tools.docs.projections")
+            assert(P.shape_type_string(T.ref("voted")) == "voted")
+        "#;
+
+        lua.load(script)
+            .set_name("@test/disk_alc_shapes_ref.lua")
+            .exec()
+            .expect("disk alc_shapes ref resolution");
     }
 }

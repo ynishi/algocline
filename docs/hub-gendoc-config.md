@@ -46,7 +46,7 @@ arguments.
 Successful `alc_hub_dist` responses always include:
 
 - `preset_catalog_version`: revision marker for the builtin preset dictionary
-  bundled with the running `alc` binary.
+bundled with the running `alc` binary.
 
 When `preset` is provided, responses also include a `preset` object with the
 resolved primitive args (`projections` / `config_path` / `lint_strict`) for

@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Embedded `hub_gendoc` parity with standalone Lua**: `register_preloads`
+  now accepts `source_dir` and loads `alc_shapes` / `alc_shapes.t` from disk
+  when available (`{source_dir}/alc_shapes/init.lua`), falling back to
+  in-binary stubs for fixture-only runs. Also adds a disk-backed preload test
+  (`T.ref("voted")` via `tools.docs.projections`) and hardens
+  `T.discriminated` by copying `variants` before schema construction.
 - **Embedded `hub_gendoc` / `alc_hub_dist`**: extend the in-process
   `alc_shapes` / `alc_shapes.t` stubs so bundled package `init.lua`
   modules load under `gen_docs` (real trees use `local T = S.T`,

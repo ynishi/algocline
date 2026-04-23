@@ -90,6 +90,25 @@ enum ShapesCompatError {
         value: String,
         cause: String,
     },
+    #[error("I/O error reading pkg compat from '{path}': {cause}")]
+    Io { path: PathBuf, cause: String },
+}
+
+/// Top-level error type for `AppService::hub_gendoc`.
+///
+/// Wraps the typed pre-flight errors (`ShapesVersionError`,
+/// `ShapesCompatError`) via `#[from]` so callers in this module can
+/// `?`-propagate without stringifying. The MCP wire layer converts the
+/// variant to a `gendoc:`-prefixed string at the AppService boundary
+/// (`Result<String, String>`), but the structure is preserved inside
+/// this module so future consumers (telemetry, CLI JSON output) can
+/// match on the variant rather than parsing a formatted string.
+#[derive(Debug, Error)]
+enum HubGendocError {
+    #[error("{0}")]
+    ShapesVersion(#[from] ShapesVersionError),
+    #[error("{0}")]
+    ShapesCompat(#[from] ShapesCompatError),
 }
 
 const SHAPES_COMPAT_VIOLATION_HINT: &str = "Declare a wider alc_shapes_compat range in M.meta, \
@@ -184,14 +203,18 @@ fn check_pkg_compat(source_dir: &str) -> Result<Vec<String>, ShapesCompatError> 
         .expect("EMBEDDED_ALC_SHAPES_VERSION is a valid semver constant");
 
     let pkg_dir = std::path::Path::new(source_dir);
-    let dir_entries = match std::fs::read_dir(pkg_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
+    let dir_entries = std::fs::read_dir(pkg_dir).map_err(|e| ShapesCompatError::Io {
+        path: pkg_dir.to_path_buf(),
+        cause: e.to_string(),
+    })?;
 
     let mut warnings = Vec::new();
 
-    for entry in dir_entries.flatten() {
+    for entry in dir_entries {
+        let entry = entry.map_err(|e| ShapesCompatError::Io {
+            path: pkg_dir.to_path_buf(),
+            cause: e.to_string(),
+        })?;
         if !entry.path().is_dir() {
             continue;
         }
@@ -205,10 +228,10 @@ fn check_pkg_compat(source_dir: &str) -> Result<Vec<String>, ShapesCompatError> 
             continue;
         }
 
-        let src = match std::fs::read_to_string(&init_lua) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let src = std::fs::read_to_string(&init_lua).map_err(|e| ShapesCompatError::Io {
+            path: init_lua.clone(),
+            cause: e.to_string(),
+        })?;
 
         match extract_m_meta_compat(&src) {
             None => {
@@ -396,14 +419,10 @@ impl AppService {
         // Reject mismatched mirror before starting the VM: if the
         // caller's source_dir has an alc_shapes/init.lua whose
         // M.VERSION differs from the embedded constant, fail early with
-        // a structured error (propagated to the MCP wire response).
-        check_mirror_shapes_version(Some(source_dir)).map_err(|e| format!("gendoc: {e}"))?;
-
-        // Compat-range check: scan every package directory under source_dir
-        // and verify declared alc_shapes_compat ranges. Packages with no
-        // declaration receive a warning; out-of-range packages fail with a
-        // typed ShapesCompatViolation surfaced in the MCP wire response.
-        let compat_warnings = check_pkg_compat(source_dir).map_err(|e| format!("gendoc: {e}"))?;
+        // a structured error. Variant structure is preserved via
+        // `HubGendocError` (`?` + `#[from]`) and stringified only at
+        // this function's `Result<String, String>` boundary.
+        let compat_warnings = run_preflight(source_dir).map_err(|e| format!("gendoc: {e}"))?;
 
         let lua = Lua::new();
 
@@ -478,6 +497,18 @@ impl AppService {
             &compat_warnings,
         ))
     }
+}
+
+/// Pre-flight: mirror version check, then compat-range scan.
+///
+/// Returns the list of compat warnings on success. Typed
+/// `HubGendocError` variants (`ShapesVersion` / `ShapesCompat`) are
+/// propagated via `?` and `#[from]` so the caller preserves variant
+/// structure until the MCP wire boundary stringifies.
+fn run_preflight(source_dir: &str) -> Result<Vec<String>, HubGendocError> {
+    check_mirror_shapes_version(Some(source_dir))?;
+    let warnings = check_pkg_compat(source_dir)?;
+    Ok(warnings)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────

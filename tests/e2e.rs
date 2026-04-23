@@ -1684,22 +1684,7 @@ async fn test_alc_hub_dist_fixture() {
     let fixture_src =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hub_dist_sample");
 
-    // Helper: recursively copy a directory tree.
-    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-            } else {
-                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
-
-    copy_dir_all(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root
@@ -1822,21 +1807,7 @@ async fn test_alc_hub_dist_fixture_mirror_version_match() {
     let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/hub_dist_sample_version_match");
 
-    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-            } else {
-                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
-
-    copy_dir_all(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root
@@ -1900,21 +1871,7 @@ async fn test_alc_hub_dist_fixture_mirror_version_mismatch() {
     let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/hub_dist_sample_version_mismatch");
 
-    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-            } else {
-                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
-
-    copy_dir_all(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root
@@ -1983,21 +1940,7 @@ async fn test_alc_hub_dist_luacats_projection() {
     let fixture_src =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hub_dist_sample");
 
-    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-            } else {
-                std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
-
-    copy_dir_all(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root
@@ -2093,13 +2036,18 @@ async fn test_alc_hub_dist_reindex_failure() {
 
 // ─── pkg compat-range E2E tests ──────────────────────────────────────────────
 
-fn copy_dir_all_compat(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+/// Shared fixture helper: recursively copy a directory tree.
+///
+/// Used by every fixture-based E2E test. Previously the same function
+/// was redefined nested inside four separate test bodies plus a fifth
+/// `_compat` variant at module scope; consolidated here.
+fn copy_fixture_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ty = entry.file_type()?;
         if ty.is_dir() {
-            copy_dir_all_compat(&entry.path(), &dst.join(entry.file_name()))?;
+            copy_fixture_tree(&entry.path(), &dst.join(entry.file_name()))?;
         } else {
             std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
         }
@@ -2123,7 +2071,7 @@ async fn test_alc_hub_dist_compat_declared_in_range() {
     let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/hub_dist_sample_compat_declared");
 
-    copy_dir_all_compat(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root
@@ -2185,7 +2133,7 @@ async fn test_alc_hub_dist_compat_declared_out_of_range() {
     let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/hub_dist_sample_compat_out_of_range");
 
-    copy_dir_all_compat(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root
@@ -2447,7 +2395,7 @@ async fn test_alc_hub_dist_compat_undeclared_warns() {
     let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/hub_dist_sample_compat_undeclared");
 
-    copy_dir_all_compat(&fixture_src, root).expect("copy fixture");
+    copy_fixture_tree(&fixture_src, root).expect("copy fixture");
 
     let source_dir = root.to_str().expect("utf-8 path").to_string();
     let output_path = root

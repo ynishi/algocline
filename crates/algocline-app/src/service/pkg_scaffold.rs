@@ -147,17 +147,54 @@ fn default_compat_range() -> String {
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
+/// Escape a Rust `&str` for safe embedding inside a Lua double-quoted
+/// string literal.
+///
+/// Without this, a `category` / `description` value containing a bare
+/// `"` or `\n` would break out of the string literal in the generated
+/// `init.lua` and, in the worst case, let a caller inject arbitrary
+/// Lua code. We escape `\`, `"`, `\n`, `\r`, and `\0` — the minimal
+/// set required by Lua's lexer.
+///
+/// The `header_line` substitution lands in a `---` comment rather than
+/// a string literal, but may still contain newlines; callers should
+/// collapse newlines before passing a description used as a header.
+fn escape_lua_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Collapse any CR/LF in a header substitution (lands in a `---` comment).
+/// Comment lines terminate at `\n`, so an unescaped newline in the header
+/// would silently break the doc comment structure.
+fn sanitize_header_line(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
+}
+
 fn render_template(
     name: &str,
     compat: &str,
     category: Option<&str>,
     description: Option<&str>,
 ) -> String {
-    let header_line = description.unwrap_or("TODO: one-line description");
+    let header_line = match description {
+        Some(d) => sanitize_header_line(d),
+        None => "TODO: one-line description".to_string(),
+    };
 
     // Category line: uncommented when provided, commented-out placeholder otherwise.
     let category_line = match category {
-        Some(cat) => format!("        category = \"{cat}\",\n"),
+        Some(cat) => format!("        category = \"{}\",\n", escape_lua_string(cat)),
         None => {
             "        -- category = \"<category>\",       -- uncomment if provided\n".to_string()
         }
@@ -165,16 +202,20 @@ fn render_template(
 
     // Description line: uncommented when provided, commented-out placeholder otherwise.
     let description_line = match description {
-        Some(desc) => format!("        description = \"{desc}\",\n"),
+        Some(desc) => format!("        description = \"{}\",\n", escape_lua_string(desc)),
         None => {
             "        -- description = \"<description>\", -- uncomment if provided\n".to_string()
         }
     };
 
+    // `name` and `compat` are validated separately (name: strict charset;
+    // compat: produced internally from EMBEDDED_ALC_SHAPES_VERSION), so
+    // they cannot contain characters requiring escaping. Still escape
+    // defensively to keep the template rendering layer self-contained.
     TEMPLATE
-        .replace("{{NAME}}", name)
-        .replace("{{COMPAT}}", compat)
-        .replace("{{HEADER_LINE}}", header_line)
+        .replace("{{NAME}}", &escape_lua_string(name))
+        .replace("{{COMPAT}}", &escape_lua_string(compat))
+        .replace("{{HEADER_LINE}}", &header_line)
         .replace("{{CATEGORY_LINE}}", &category_line)
         .replace("{{DESCRIPTION_LINE}}", &description_line)
 }
@@ -336,6 +377,57 @@ mod tests {
         // "0.25.1" → ">=0.25.0, <0.26"
         let range = default_compat_range();
         assert_eq!(range, ">=0.25.0, <0.26");
+    }
+
+    // ── escape_lua_string ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_escape_lua_string_passes_through_plain() {
+        assert_eq!(escape_lua_string("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_escape_lua_string_escapes_quote_and_backslash() {
+        assert_eq!(
+            escape_lua_string(r#"he said "hi" \n"#),
+            r#"he said \"hi\" \\n"#
+        );
+    }
+
+    #[test]
+    fn test_escape_lua_string_escapes_newline_cr_nul() {
+        assert_eq!(escape_lua_string("a\nb\rc\0d"), "a\\nb\\rc\\0d");
+    }
+
+    #[test]
+    fn test_render_template_escapes_injection_payload() {
+        // Attempted breakout via closing quote + injected Lua code.
+        let payload = r#"x",injected=os.execute("rm -rf /"),y=""#;
+        let out = render_template("my_pkg", ">=0.25.0, <0.26", Some(payload), Some(payload));
+        // Every `"` in the payload must be emitted as `\"` in the
+        // rendered Lua string literal. The payload contains 4 quotes;
+        // they must all be preceded by a backslash.
+        let expected_escaped = r#"x\",injected=os.execute(\"rm -rf /\"),y=\""#;
+        assert!(
+            out.contains(expected_escaped),
+            "payload must be fully escaped; render was:\n{out}"
+        );
+        // The `category` / `description` Lua string literals must
+        // contain the escaped form only. Scan the rendered lines that
+        // begin the field declaration.
+        for line in out.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("category = \"") || trimmed.starts_with("description = \"") {
+                assert!(
+                    line.contains(expected_escaped),
+                    "field line must contain escaped payload: {line}"
+                );
+                assert!(
+                    !line.contains(payload),
+                    "field line must not contain raw payload: {line}"
+                );
+            }
+        }
     }
 
     // ── render_template ──────────────────────────────────────────────────────

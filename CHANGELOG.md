@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Embedded `hub_gendoc` / `alc_hub_dist`: `alc_shapes` Lua library now fully
+  vendored.** `algocline-app` now embeds the full `alc_shapes` module set
+  (`init.lua` / `t.lua` / `reflect.lua` / `check.lua` / `instrument.lua` /
+  `luacats.lua` / `spec_resolver.lua`) via `include_str!`, eliminating the
+  disk fallback path in `register_preloads`. The `source_dir`'s on-disk
+  `alc_shapes/` directory is no longer consulted at runtime. Non-breaking:
+  MCP wire shape unchanged; `source_dir` is still accepted. Any third-party
+  package author can now invoke `alc_hub_dist` against their own source tree
+  without vendoring `alc_shapes` themselves.
+
+### Removed
+
+- `gendoc_bundled_smoke.rs` — the `#[ignore]`d bundled-packages parity smoke
+  test is retired in favour of a plain rmcp-based E2E
+  (`test_alc_hub_dist_fixture` in `tests/e2e.rs`) that runs against an in-repo
+  fixture (`tests/fixtures/hub_dist_sample/`) and is CI-default.
+
 ## [0.25.1] - 2026-04-23
 
 ### Fixed

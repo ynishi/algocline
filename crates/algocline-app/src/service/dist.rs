@@ -34,6 +34,7 @@ impl AppService {
     /// `hub_index.json` destination (callers typically point this at
     /// `{source_dir}/hub_index.json`); the remaining arguments are
     /// forwarded to `hub_gendoc` unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub fn hub_dist(
         &self,
         source_dir: &str,

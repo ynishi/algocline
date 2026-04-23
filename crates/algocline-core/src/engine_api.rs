@@ -434,6 +434,7 @@ pub trait EngineApi: Send + Sync {
     /// 2) optional `alc.toml` overrides under `[hub.dist.presets.<name>]`
     ///    (keyed by `project_root`) — only fills **omitted** knobs
     /// 3) builtin `Current` defaults for the selected preset
+    #[allow(clippy::too_many_arguments)]
     async fn hub_dist(
         &self,
         source_dir: String,

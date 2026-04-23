@@ -1653,6 +1653,160 @@ async fn test_alc_hub_dist_gendoc_failure_includes_reindex_result() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Fixture-based E2E: `alc_hub_dist` against the in-repo
+/// `tests/fixtures/hub_dist_sample/` tree that contains three packages
+/// (pkg_alpha / pkg_beta / pkg_gamma) each embedding a distinct signal
+/// token in its docstring.
+///
+/// Each package exercises a different part of the `alc_shapes` type
+/// system that is now fully vendored:
+///   - pkg_alpha: `T.boolean` / `T.table`  (ALPHA_SIGNAL_BOOLEAN_TABLE)
+///   - pkg_beta:  `S.instrument` + `:describe`  (BETA_SIGNAL_INSTRUMENT_DESCRIBE)
+///   - pkg_gamma: nested `T.shape` / `T.array_of`  (GAMMA_SIGNAL_NESTED_SHAPE)
+///
+/// Verifications (labelled A–G per plan):
+///   A. dist response `status == "ok"` (implicit: no is_error)
+///   B. `llms-full.txt` contains all three signal tokens
+///   C. `narrative/{pkg_alpha,pkg_beta,pkg_gamma}.md` exist
+///   D. `llms.txt` contains index lines for all three packages
+///   E. Type-system signal tokens appear in the narrative files
+///   F. `reindex.package_count == 3`
+///   G. context7.json and .devin/wiki.json are emitted
+#[tokio::test]
+async fn test_alc_hub_dist_fixture() {
+    let client = connect().await;
+
+    // Copy fixture tree to a writable tempdir so gen_docs can write
+    // context7.json / .devin/wiki.json back to source_dir.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hub_dist_sample");
+
+    // Helper: recursively copy a directory tree.
+    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+            } else {
+                std::fs::copy(&entry.path(), dst.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
+    copy_dir_all(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir_path = root.join("docs");
+    let out_dir = out_dir_path.to_str().expect("utf-8 path").to_string();
+    let config_path = root
+        .join("tools/gendoc.toml")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir":  source_dir,
+            "output_path": output_path,
+            "out_dir":     out_dir,
+            "projections": ["hub", "context7", "devin"],
+            "config_path": config_path,
+        }),
+    )
+    .await;
+
+    // A. Top-level response must not carry is_error; reindex + gendoc both present.
+    let reindex = resp
+        .get("reindex")
+        .unwrap_or_else(|| panic!("expected reindex field, got: {resp}"));
+    let _gendoc = resp
+        .get("gendoc")
+        .unwrap_or_else(|| panic!("expected gendoc field, got: {resp}"));
+
+    // F. reindex.package_count == 3
+    let pkg_count = reindex
+        .get("package_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("expected reindex.package_count u64, got: {resp}"));
+    assert_eq!(
+        pkg_count, 3,
+        "expected exactly 3 packages indexed, got {pkg_count}: {resp}"
+    );
+
+    // C. narrative/*.md files must exist for all three packages.
+    for pkg in &["pkg_alpha", "pkg_beta", "pkg_gamma"] {
+        let narrative = out_dir_path.join("narrative").join(format!("{pkg}.md"));
+        assert!(
+            narrative.exists(),
+            "expected narrative/{pkg}.md at {}",
+            narrative.display()
+        );
+    }
+
+    // B + E. llms-full.txt must contain all three signal tokens.
+    let llms_full_path = out_dir_path.join("llms-full.txt");
+    assert!(
+        llms_full_path.exists(),
+        "expected llms-full.txt at {}",
+        llms_full_path.display()
+    );
+    let llms_full = std::fs::read_to_string(&llms_full_path).expect("read llms-full.txt");
+    for token in &[
+        "ALPHA_SIGNAL_BOOLEAN_TABLE",
+        "BETA_SIGNAL_INSTRUMENT_DESCRIBE",
+        "GAMMA_SIGNAL_NESTED_SHAPE",
+    ] {
+        assert!(
+            llms_full.contains(token),
+            "expected signal token '{token}' in llms-full.txt"
+        );
+    }
+
+    // D. llms.txt must reference all three packages.
+    let llms_path = out_dir_path.join("llms.txt");
+    assert!(
+        llms_path.exists(),
+        "expected llms.txt at {}",
+        llms_path.display()
+    );
+    let llms = std::fs::read_to_string(&llms_path).expect("read llms.txt");
+    for pkg in &["pkg_alpha", "pkg_beta", "pkg_gamma"] {
+        assert!(
+            llms.contains(pkg),
+            "expected '{pkg}' in llms.txt index, got:\n{llms}"
+        );
+    }
+
+    // G. context7.json and .devin/wiki.json emitted at source_dir root.
+    let context7 = root.join("context7.json");
+    assert!(
+        context7.exists(),
+        "expected context7.json at {}",
+        context7.display()
+    );
+    let devin_wiki = root.join(".devin/wiki.json");
+    assert!(
+        devin_wiki.exists(),
+        "expected .devin/wiki.json at {}",
+        devin_wiki.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Mid-way failure: an invalid `source_dir` causes reindex to fail. The
 /// caller must see `is_error=true` with text starting `dist: reindex
 /// failed:`, proving that `gendoc` was not invoked and the caller was

@@ -41,6 +41,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, Table, Value};
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -66,6 +67,33 @@ enum ShapesVersionError {
 
 const SHAPES_VERSION_HINT: &str = "Align bundled alc_shapes/ to match core, \
     or upgrade algocline core to the mirror version. See CHANGELOG for details.";
+
+// ── pkg compat-range error variants ──────────────────────────────
+
+#[derive(Debug, Error)]
+enum ShapesCompatError {
+    #[error(
+        "pkg '{pkg_name}': alc_shapes_compat range '{declared_range}' does not match \
+         embedded alc_shapes@{actual_version}. {hint}"
+    )]
+    Violation {
+        pkg_name: String,
+        declared_range: String,
+        actual_version: String,
+        hint: &'static str,
+    },
+    #[error(
+        "pkg '{pkg_name}': alc_shapes_compat value '{value}' is not a valid semver range: {cause}"
+    )]
+    Malformed {
+        pkg_name: String,
+        value: String,
+        cause: String,
+    },
+}
+
+const SHAPES_COMPAT_VIOLATION_HINT: &str = "Declare a wider alc_shapes_compat range in M.meta, \
+     or upgrade/downgrade algocline core to a matching version.";
 
 /// Check the mirror's `M.VERSION` against `EMBEDDED_ALC_SHAPES_VERSION`.
 ///
@@ -95,20 +123,121 @@ fn check_mirror_shapes_version(source_dir: Option<&str>) -> Result<(), ShapesVer
     Ok(())
 }
 
-/// Hand-rolled parser for `M.VERSION = "x.y.z"` in a Lua source string.
+/// Hand-rolled parser that extracts the double-quoted value after a
+/// `<marker> = "..."` pattern in a Lua source string.
 ///
-/// Finds the first occurrence of `M.VERSION` followed (with optional
+/// Finds the first occurrence of `marker` followed (with optional
 /// whitespace) by `=` and then a double-quoted string. Returns the
-/// quoted content on success.
-fn extract_m_version(src: &str) -> Option<String> {
-    let marker = "M.VERSION";
+/// quoted content on success, `None` when the pattern is absent or
+/// malformed.
+///
+/// Both `extract_m_version` and `extract_m_meta_compat` delegate to
+/// this shared helper to avoid duplicating the parsing logic.
+fn extract_quoted_value<'a>(src: &'a str, marker: &str) -> Option<&'a str> {
     let start = src.find(marker)?;
     let after_marker = src[start + marker.len()..].trim_start();
     let after_eq = after_marker.strip_prefix('=')?;
     let after_eq = after_eq.trim_start();
     let after_quote = after_eq.strip_prefix('"')?;
     let end = after_quote.find('"')?;
-    Some(after_quote[..end].to_string())
+    Some(&after_quote[..end])
+}
+
+/// Hand-rolled parser for `M.VERSION = "x.y.z"` in a Lua source string.
+///
+/// Finds the first occurrence of `M.VERSION` followed (with optional
+/// whitespace) by `=` and then a double-quoted string. Returns the
+/// quoted content on success.
+fn extract_m_version(src: &str) -> Option<String> {
+    extract_quoted_value(src, "M.VERSION").map(str::to_string)
+}
+
+/// Hand-rolled parser for `alc_shapes_compat = "..."` in a pkg `init.lua`.
+///
+/// Matches the pattern `alc_shapes_compat` (optionally preceded by
+/// `M.meta.` or other context) followed by `= "..."`. Returns a borrow
+/// into `src` on success, `None` when the field is absent.
+fn extract_m_meta_compat(src: &str) -> Option<&str> {
+    extract_quoted_value(src, "alc_shapes_compat")
+}
+
+/// Scan every package directory under `source_dir` and verify that each
+/// package's declared `alc_shapes_compat` semver range includes the
+/// embedded alc_shapes version.
+///
+/// **Dispatch rules** (applied per package `init.lua`):
+/// - No `alc_shapes_compat` field → push a warning string (undeclared,
+///   backward compat) and continue.
+/// - Malformed range → return `Err(ShapesCompatMalformed)`.
+/// - Range declared and in-range → continue silently.
+/// - Range declared but out-of-range → return `Err(ShapesCompatViolation)`.
+///
+/// Packages whose directories do not contain an `init.lua` are silently
+/// skipped (same rule as `build_index`). The `alc_shapes/` directory
+/// (no `M.meta.name`) is naturally excluded because `extract_m_meta_compat`
+/// will return `None` and the warning path handles that without error.
+///
+/// Returns `(warnings, ())` on success; the first package that violates
+/// its declared range terminates the scan with `Err`.
+fn check_pkg_compat(source_dir: &str) -> Result<Vec<String>, ShapesCompatError> {
+    let current = Version::parse(EMBEDDED_ALC_SHAPES_VERSION)
+        .expect("EMBEDDED_ALC_SHAPES_VERSION is a valid semver constant");
+
+    let pkg_dir = std::path::Path::new(source_dir);
+    let dir_entries = match std::fs::read_dir(pkg_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut warnings = Vec::new();
+
+    for entry in dir_entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let dir_name = match entry.file_name().to_str() {
+            Some(n) if !n.starts_with('.') && !n.starts_with('_') => n.to_string(),
+            _ => continue,
+        };
+
+        let init_lua = entry.path().join("init.lua");
+        if !init_lua.exists() {
+            continue;
+        }
+
+        let src = match std::fs::read_to_string(&init_lua) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        match extract_m_meta_compat(&src) {
+            None => {
+                warnings.push(format!(
+                    "pkg {dir_name}: alc_shapes_compat not declared, \
+                     continuing with current alc_shapes@{EMBEDDED_ALC_SHAPES_VERSION}"
+                ));
+            }
+            Some(raw) => {
+                let range = VersionReq::parse(raw).map_err(|e| ShapesCompatError::Malformed {
+                    pkg_name: dir_name.clone(),
+                    value: raw.to_string(),
+                    cause: e.to_string(),
+                })?;
+
+                if !range.matches(&current) {
+                    return Err(ShapesCompatError::Violation {
+                        pkg_name: dir_name,
+                        declared_range: raw.to_string(),
+                        actual_version: EMBEDDED_ALC_SHAPES_VERSION.to_string(),
+                        hint: SHAPES_COMPAT_VIOLATION_HINT,
+                    });
+                }
+                // In-range: continue silently.
+            }
+        }
+    }
+
+    Ok(warnings)
 }
 
 // ── Embedded Lua sources ──────────────────────────────────────────
@@ -270,6 +399,12 @@ impl AppService {
         // a structured error (propagated to the MCP wire response).
         check_mirror_shapes_version(Some(source_dir)).map_err(|e| format!("gendoc: {e}"))?;
 
+        // Compat-range check: scan every package directory under source_dir
+        // and verify declared alc_shapes_compat ranges. Packages with no
+        // declaration receive a warning; out-of-range packages fail with a
+        // typed ShapesCompatViolation surfaced in the MCP wire response.
+        let compat_warnings = check_pkg_compat(source_dir).map_err(|e| format!("gendoc: {e}"))?;
+
         let lua = Lua::new();
 
         register_preloads(&lua)?;
@@ -340,6 +475,7 @@ impl AppService {
             &resolved_out_dir,
             &stdout_txt,
             &stderr_txt,
+            &compat_warnings,
         ))
     }
 }
@@ -718,6 +854,7 @@ fn build_response_json(
     out_dir: &str,
     stdout_txt: &str,
     stderr_txt: &str,
+    warnings: &[String],
 ) -> String {
     // Keep dependency-free — we already depend on serde_json
     // transitively but using it here avoids hand-rolled escaping
@@ -728,6 +865,7 @@ fn build_response_json(
         "out_dir": out_dir,
         "stdout": stdout_txt,
         "stderr": stderr_txt,
+        "warnings": warnings,
     });
     value.to_string()
 }
@@ -845,12 +983,24 @@ mod tests {
 
     #[test]
     fn build_response_json_round_trips() {
-        let out = build_response_json("/src", "/src/docs", "hi", "warn");
+        let out = build_response_json("/src", "/src/docs", "hi", "warn", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["source_dir"], "/src");
         assert_eq!(parsed["out_dir"], "/src/docs");
         assert_eq!(parsed["stdout"], "hi");
         assert_eq!(parsed["stderr"], "warn");
+        assert_eq!(parsed["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn build_response_json_includes_warnings() {
+        let warnings = vec![
+            "pkg foo: alc_shapes_compat not declared, continuing with current alc_shapes@0.25.1"
+                .to_string(),
+        ];
+        let out = build_response_json("/src", "/src/docs", "", "", &warnings);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["warnings"][0], warnings[0].as_str());
     }
 
     // ── alc_shapes version resolver unit tests ────────────────────────
@@ -1005,5 +1155,119 @@ return M
             .set_name("@test/vendored_alc_shapes_ref.lua")
             .exec()
             .expect("vendored alc_shapes ref resolution");
+    }
+
+    // ── alc_shapes_compat extraction / dispatcher unit tests ──────────
+
+    #[test]
+    fn extract_quoted_value_finds_marker() {
+        let src = r#"M.meta.alc_shapes_compat = ">=0.25.0, <0.26""#;
+        assert_eq!(
+            extract_quoted_value(src, "alc_shapes_compat"),
+            Some(">=0.25.0, <0.26")
+        );
+    }
+
+    #[test]
+    fn extract_quoted_value_returns_none_when_absent() {
+        let src = "local M = {}\nreturn M\n";
+        assert!(extract_quoted_value(src, "alc_shapes_compat").is_none());
+    }
+
+    #[test]
+    fn extract_m_meta_compat_finds_field() {
+        let src = r#"M.meta = { alc_shapes_compat = ">=0.25.0, <0.26", name = "pkg" }"#;
+        assert_eq!(extract_m_meta_compat(src), Some(">=0.25.0, <0.26"));
+    }
+
+    #[test]
+    fn extract_m_meta_compat_returns_none_when_absent() {
+        let src = r#"M.meta = { name = "pkg", version = "0.1.0" }"#;
+        assert!(extract_m_meta_compat(src).is_none());
+    }
+
+    #[test]
+    fn check_pkg_compat_warns_on_undeclared() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = tmp.path().join("pkg_foo");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_foo");
+        std::fs::write(
+            pkg_dir.join("init.lua"),
+            "local M = {}\nM.meta = { name = 'pkg_foo' }\nreturn M\n",
+        )
+        .expect("write init.lua");
+
+        let result = check_pkg_compat(tmp.path().to_str().expect("utf-8")).expect("no error");
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].contains("alc_shapes_compat not declared"),
+            "expected undeclared warning, got: {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn check_pkg_compat_ok_on_in_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = tmp.path().join("pkg_bar");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_bar");
+        // 0.25.1 is in >=0.25.0, <0.26 — note: double-quoted Lua strings
+        std::fs::write(
+            pkg_dir.join("init.lua"),
+            "local M = {}\nM.meta = { name = \"pkg_bar\", alc_shapes_compat = \">=0.25.0, <0.26\" }\nreturn M\n",
+        )
+        .expect("write init.lua");
+
+        let result = check_pkg_compat(tmp.path().to_str().expect("utf-8")).expect("no error");
+        assert!(result.is_empty(), "expected no warnings for in-range pkg");
+    }
+
+    #[test]
+    fn check_pkg_compat_err_on_out_of_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = tmp.path().join("pkg_baz");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_baz");
+        // 0.25.1 is NOT in >=0.26.0, <0.27
+        std::fs::write(
+            pkg_dir.join("init.lua"),
+            "local M = {}\nM.meta = { name = \"pkg_baz\", alc_shapes_compat = \">=0.26.0, <0.27\" }\nreturn M\n",
+        )
+        .expect("write init.lua");
+
+        let err = check_pkg_compat(tmp.path().to_str().expect("utf-8"))
+            .expect_err("must fail on out-of-range");
+        let msg = err.to_string();
+        assert!(msg.contains("pkg_baz"), "pkg_name in error: {msg}");
+        assert!(msg.contains(">=0.26.0, <0.27"), "range in error: {msg}");
+        assert!(
+            msg.contains(EMBEDDED_ALC_SHAPES_VERSION),
+            "version in error: {msg}"
+        );
+        assert!(
+            msg.contains("ShapesCompatViolation") || msg.contains("does not match"),
+            "violation in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_pkg_compat_err_on_malformed_range() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = tmp.path().join("pkg_qux");
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_qux");
+        std::fs::write(
+            pkg_dir.join("init.lua"),
+            "local M = {}\nM.meta = { name = \"pkg_qux\", alc_shapes_compat = \"not a semver range\" }\nreturn M\n",
+        )
+        .expect("write init.lua");
+
+        let err = check_pkg_compat(tmp.path().to_str().expect("utf-8"))
+            .expect_err("must fail on malformed range");
+        let msg = err.to_string();
+        assert!(msg.contains("pkg_qux"), "pkg_name in error: {msg}");
+        assert!(msg.contains("not a semver range"), "value in error: {msg}");
+        assert!(
+            msg.contains("Malformed") || msg.contains("valid semver"),
+            "malformed label in error: {msg}"
+        );
     }
 }

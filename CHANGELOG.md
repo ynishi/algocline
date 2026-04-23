@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior into core so any third-party package author can regenerate
   lua-ls type definitions in a single `alc_hub_dist` call. Opt-in:
   caller must include `"luacats"` in `projections`.
+- **pkg compat contract (`M.meta.alc_shapes_compat`)**: packages can declare
+  a semver range of alc_shapes versions they are known to work with
+  (e.g. `alc_shapes_compat = ">=0.25.0, <0.26"`). On load the
+  `alc_hub_dist` / `alc_hub_gendoc` path reads the declared range and
+  rejects out-of-range loads with a typed `ShapesCompatViolation
+  { pkg_name, declared_range, actual_version, hint }` error surfaced via
+  the MCP wire response. Malformed ranges return `ShapesCompatMalformed`
+  with the `semver` parse error. Undeclared packages continue loading
+  with a warning (backward compat; the bundled pkg set will be migrated
+  in a separate commit in the same v0.26 release window).
+  Drift is resolved **declaratively**: core vendors alc_shapes (v0.25.1
+  refactor `f9d6260`), and pkg authors declare their supported range.
+  No runtime `allow_mirror` / source_dir-mirror preload path is
+  introduced — a pkg author who needs a patched alc_shapes is expected
+  to fork core or upstream the patch rather than run a parallel mirror.
 
 ## [0.25.1] - 2026-04-23
 

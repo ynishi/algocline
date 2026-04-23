@@ -48,6 +48,7 @@ dependencies = [
  "fs4",
  "mlua",
  "proptest",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

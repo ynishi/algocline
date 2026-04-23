@@ -2090,3 +2090,205 @@ async fn test_alc_hub_dist_reindex_failure() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── pkg compat-range E2E tests ──────────────────────────────────────────────
+
+fn copy_dir_all_compat(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all_compat(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Fixture-based E2E: `alc_hub_dist` where the single package declares
+/// `alc_shapes_compat = ">=0.25.0, <0.26"`, which includes embedded
+/// alc_shapes 0.25.1.
+///
+/// Dist must succeed: response contains `reindex` and `gendoc` fields,
+/// and the `gendoc.warnings` array must NOT contain any compat warning.
+#[tokio::test]
+async fn test_alc_hub_dist_compat_declared_in_range() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hub_dist_sample_compat_declared");
+
+    copy_dir_all_compat(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = root.join("docs").to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir":  source_dir,
+            "output_path": output_path,
+            "out_dir":     out_dir,
+        }),
+    )
+    .await;
+
+    assert!(
+        resp.get("reindex").is_some(),
+        "expected reindex field on compat-declared success, got: {resp}"
+    );
+    assert!(
+        resp.get("gendoc").is_some(),
+        "expected gendoc field on compat-declared success, got: {resp}"
+    );
+
+    // Warnings array should not contain any alc_shapes_compat warning —
+    // the package declared an in-range compat range.
+    if let Some(gendoc) = resp.get("gendoc") {
+        if let Some(warnings) = gendoc.get("warnings") {
+            let warnings_str = warnings.to_string();
+            assert!(
+                !warnings_str.contains("alc_shapes_compat not declared"),
+                "unexpected compat-undeclared warning for declared package: {warnings_str}"
+            );
+        }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Fixture-based E2E: `alc_hub_dist` where the single package declares
+/// `alc_shapes_compat = ">=0.26.0, <0.27"`, which does NOT include
+/// embedded alc_shapes 0.25.1.
+///
+/// Dist must fail with `is_error=true`. The error text must contain
+/// `ShapesCompatViolation`-related substrings: the pkg_name, declared_range,
+/// and actual_version.
+#[tokio::test]
+async fn test_alc_hub_dist_compat_declared_out_of_range() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hub_dist_sample_compat_out_of_range");
+
+    copy_dir_all_compat(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = root.join("docs").to_str().expect("utf-8 path").to_string();
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_dist",
+            json!({
+                "source_dir":  source_dir,
+                "output_path": output_path,
+                "out_dir":     out_dir,
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true on out-of-range compat, got: is_error={is_error:?}, text: {text}"
+            );
+            // pkg_name must appear
+            assert!(
+                text.contains("pkg_alpha"),
+                "expected pkg_name 'pkg_alpha' in error text, got: {text}"
+            );
+            // declared range must appear
+            assert!(
+                text.contains(">=0.26.0, <0.27"),
+                "expected declared_range '>=0.26.0, <0.27' in error text, got: {text}"
+            );
+            // actual embedded version must appear
+            assert!(
+                text.contains("0.25.1"),
+                "expected actual_version '0.25.1' in error text, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Fixture-based E2E: `alc_hub_dist` where the single package has no
+/// `alc_shapes_compat` field in `M.meta`.
+///
+/// Dist must succeed (backward compat), and the `gendoc.warnings` array
+/// must contain the `"alc_shapes_compat not declared"` substring.
+#[tokio::test]
+async fn test_alc_hub_dist_compat_undeclared_warns() {
+    let client = connect().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    let fixture_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/hub_dist_sample_compat_undeclared");
+
+    copy_dir_all_compat(&fixture_src, root).expect("copy fixture");
+
+    let source_dir = root.to_str().expect("utf-8 path").to_string();
+    let output_path = root
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir = root.join("docs").to_str().expect("utf-8 path").to_string();
+
+    let resp = call_json(
+        &client,
+        "alc_hub_dist",
+        json!({
+            "source_dir":  source_dir,
+            "output_path": output_path,
+            "out_dir":     out_dir,
+        }),
+    )
+    .await;
+
+    assert!(
+        resp.get("reindex").is_some(),
+        "expected reindex field on undeclared compat success, got: {resp}"
+    );
+    assert!(
+        resp.get("gendoc").is_some(),
+        "expected gendoc field on undeclared compat success, got: {resp}"
+    );
+
+    // The gendoc.warnings array must contain the undeclared warning.
+    let gendoc = resp.get("gendoc").expect("gendoc field present");
+    let warnings = gendoc.get("warnings").expect("warnings field in gendoc");
+    let warnings_str = warnings.to_string();
+    assert!(
+        warnings_str.contains("alc_shapes_compat not declared"),
+        "expected 'alc_shapes_compat not declared' in warnings, got: {warnings_str}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

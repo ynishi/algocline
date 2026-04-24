@@ -1377,6 +1377,135 @@ async fn test_alc_hub_gendoc_unknown_projection_rejected() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// narrative projection: `projections=["narrative"]` must be accepted and
+/// generate `docs/narrative/{pkg}.md`.
+///
+/// Note: narrative/{pkg}.md files are unconditionally emitted by the embedded
+/// gen_docs.lua when lint_only=false regardless of which other projections are
+/// requested — this test confirms the Rust allowlist gate passes "narrative"
+/// through (approach A: no --narrative argv is pushed to gen_docs.lua).
+#[tokio::test]
+async fn test_alc_hub_gendoc_narrative_projection_generates_per_pkg_md() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir_path = tmp.path().join("docs_narrative");
+    let out_dir = out_dir_path.to_str().expect("utf-8 path").to_string();
+
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir,
+            "out_dir": out_dir,
+            "projections": ["narrative"],
+        }),
+    )
+    .await;
+
+    let narrative = out_dir_path.join("narrative").join("fake_pkg.md");
+    assert!(
+        narrative.exists(),
+        "expected narrative/fake_pkg.md at {} (resp: {resp})",
+        narrative.display()
+    );
+    let len = std::fs::metadata(&narrative).expect("metadata").len();
+    assert!(
+        len > 0,
+        "expected non-empty narrative/fake_pkg.md at {} (resp: {resp})",
+        narrative.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// llms projection: `projections=["llms"]` must be accepted and generate
+/// `docs/llms.txt` + `docs/llms-full.txt`.
+///
+/// Note: llms.txt and llms-full.txt are unconditionally emitted by the embedded
+/// gen_docs.lua when lint_only=false — this test confirms the Rust allowlist
+/// gate passes "llms" through (approach A: no --llms argv is pushed to
+/// gen_docs.lua).
+#[tokio::test]
+async fn test_alc_hub_gendoc_llms_projection_generates_llms_txt() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let out_dir_path = tmp.path().join("docs_llms");
+    let out_dir = out_dir_path.to_str().expect("utf-8 path").to_string();
+
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir,
+            "out_dir": out_dir,
+            "projections": ["llms"],
+        }),
+    )
+    .await;
+
+    let llms_txt = out_dir_path.join("llms.txt");
+    assert!(
+        llms_txt.exists(),
+        "expected llms.txt at {} (resp: {resp})",
+        llms_txt.display()
+    );
+    let len = std::fs::metadata(&llms_txt).expect("metadata").len();
+    assert!(
+        len > 0,
+        "expected non-empty llms.txt at {} (resp: {resp})",
+        llms_txt.display()
+    );
+
+    let llms_full_txt = out_dir_path.join("llms-full.txt");
+    assert!(
+        llms_full_txt.exists(),
+        "expected llms-full.txt at {} (resp: {resp})",
+        llms_full_txt.display()
+    );
+    let len_full = std::fs::metadata(&llms_full_txt).expect("metadata").len();
+    assert!(
+        len_full > 0,
+        "expected non-empty llms-full.txt at {} (resp: {resp})",
+        llms_full_txt.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 #[tokio::test]
 async fn test_alc_hub_dist_ok() {
     let client = connect().await;

@@ -372,9 +372,10 @@ pub trait EngineApi: Send + Sync {
     /// - `"lint"`      → run V0 lint pass (warnings only)
     /// - `"lint_only"` → run lint, skip file generation
     ///
-    /// `config_path` points at a TOML file with top-level
-    /// `[context7]` / `[devin]` tables. It is required only when
-    /// `projections` includes `"context7"` or `"devin"`.
+    /// `config_path` points at a TOML or Lua file (selected by extension:
+    /// `.toml` / `.lua`) with top-level `context7` / `devin` sub-tables.
+    /// It is required only when `projections` includes `"context7"` or
+    /// `"devin"`. See `docs/hub-gendoc-config.md` for the Lua schema.
     ///
     /// Projection names are validated strictly and unknown values are
     /// rejected with `Err("gendoc: unknown projection ...")`.

@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also updated to list all accepted projection values, including the previously
   undocumented `luacats`.
 
+### Changed
+
+- `alc_hub_gendoc` / `alc_hub_dist`: `config_path` now accepts a Lua file in addition to TOML. Parser is selected by extension (`.lua` / `.toml`). Lua files must return a table with the same shape as the TOML wrapped form (`{ context7 = {...}, devin = {...} }`). See `docs/hub-gendoc-config.md` for the Lua schema.
+
 ## [0.25.1] - 2026-04-23
 
 ### Changed

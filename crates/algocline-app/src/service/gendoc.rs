@@ -19,12 +19,16 @@
 //!   consulted at runtime. This ensures parity for any third-party
 //!   package author invoking `alc_hub_dist` against their own source
 //!   tree without vendoring `alc_shapes` themselves.
-//! - `config_path` (optional) is a caller-supplied TOML **or Lua** file
-//!   (selected by extension) with top-level `context7` and/or `devin`
-//!   tables. TOML uses `[context7]` / `[devin]` sections; Lua returns
-//!   `{ context7 = {...}, devin = {...} }`. When supplied, those tables
-//!   are exposed under the `tools.docs.context7_config` /
-//!   `tools.docs.devin_wiki_config` module names that `gen_docs` `require`s.
+//! - `config_path` (optional, backward-compat) is a caller-supplied TOML file
+//!   with top-level `context7` and/or `devin` tables.  When `config_path` is
+//!   omitted and the active projections include `context7` or `devin`, the
+//!   project root's `alc.toml` is auto-explored for `[hub.context7]` /
+//!   `[hub.devin]` sections; core defaults are used when those sections are
+//!   absent.  In all cases the resolved tables are exposed under the
+//!   `tools.docs.context7_config` / `tools.docs.devin_wiki_config` module
+//!   names that `gen_docs` `require`s.  `.lua` config files are no longer
+//!   accepted (retired in v0.26); see `docs/hub-gendoc-config.md` for the
+//!   migration guide.
 //! - `print` / `io.stdout.write` / `io.stderr.write` are redirected
 //!   into Rust-side `String` buffers so callers observe the Lua
 //!   progress log through the MCP response instead of dropping it to
@@ -46,6 +50,8 @@ use semver::{Version, VersionReq};
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::hub_dist_preset::load_hub_projection_config;
+use super::project::resolve_project_root;
 use super::AppService;
 
 pub mod templates;
@@ -408,12 +414,6 @@ impl AppService {
         lint_strict: Option<bool>,
     ) -> Result<String, String> {
         let projection_flags = ProjectionFlags::from_list(projections)?;
-        if (projection_flags.context7 || projection_flags.devin) && config_path.is_none() {
-            return Err(
-                "gendoc: config_path is required when projections include context7 or devin"
-                    .to_string(),
-            );
-        }
 
         let resolved_out_dir = out_dir
             .map(|s| s.to_string())
@@ -431,11 +431,49 @@ impl AppService {
 
         register_preloads(&lua)?;
 
-        // Optional config_path injection — must be wired as preload
-        // *before* `gen_docs.lua` executes so that its
-        // `require("tools.docs.context7_config")` resolves.
-        if let Some(path) = config_path {
-            inject_config_preloads(&lua, path)?;
+        // Config injection — must be wired as preload *before* `gen_docs.lua`
+        // executes so that `require("tools.docs.context7_config")` resolves.
+        //
+        // Dispatch order:
+        //   1. `.lua` config_path → explicit error (.lua support retired in v0.26)
+        //   2. `.toml` config_path → flat [context7]/[devin] backward-compat path
+        //   3. None + context7/devin projection → alc.toml auto-explore + core defaults
+        //   4. None + no context7/devin → skip (no config needed)
+        match config_path {
+            Some(path) if path.to_lowercase().ends_with(".lua") => {
+                return Err(
+                    "gendoc: config_path extension '.lua' is no longer supported; use .toml"
+                        .to_string(),
+                );
+            }
+            Some(path) => {
+                // Backward-compat: flat [context7] / [devin] TOML file.
+                inject_config_preloads_toml(&lua, &preload_table(&lua)?, path)?;
+            }
+            None if projection_flags.context7 || projection_flags.devin => {
+                // New path: auto-explore alc.toml and merge with core defaults.
+                let project_root = resolve_project_root(Some(source_dir));
+                let merged = load_hub_projection_config(project_root.as_deref())?;
+                inject_config_subtable(
+                    &lua,
+                    &preload_table(&lua)?,
+                    Some(merged.to_context7_toml()),
+                    "context7",
+                    "_gendoc_context7_config",
+                    "tools.docs.context7_config",
+                )?;
+                inject_config_subtable(
+                    &lua,
+                    &preload_table(&lua)?,
+                    Some(merged.to_devin_toml()),
+                    "devin",
+                    "_gendoc_devin_config",
+                    "tools.docs.devin_wiki_config",
+                )?;
+            }
+            None => {
+                // No context7/devin projections requested — config injection not needed.
+            }
         }
 
         let out_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -609,6 +647,11 @@ fn register_single_preload(
     Ok(())
 }
 
+/// Extension-dispatch shim retained for unit tests.  The hot path in
+/// `hub_gendoc` dispatches directly; this function is used by the
+/// `inject_config_preloads_{lua_rejected,unknown_extension}` unit tests to
+/// verify the error messages in isolation.
+#[cfg(test)]
 fn inject_config_preloads(lua: &Lua, config_path: &str) -> Result<(), String> {
     let ext = std::path::Path::new(config_path)
         .extension()
@@ -618,12 +661,12 @@ fn inject_config_preloads(lua: &Lua, config_path: &str) -> Result<(), String> {
     let preload = preload_table(lua)?;
 
     if ext.eq_ignore_ascii_case("lua") {
-        inject_config_preloads_lua(lua, &preload, config_path)
+        Err("gendoc: config_path extension '.lua' is no longer supported; use .toml".to_string())
     } else if ext.eq_ignore_ascii_case("toml") {
         inject_config_preloads_toml(lua, &preload, config_path)
     } else {
         Err(format!(
-            "gendoc: config_path '{config_path}' unsupported extension (expected .toml or .lua)"
+            "gendoc: config_path '{config_path}' unsupported extension (expected .toml)"
         ))
     }
 }
@@ -635,7 +678,7 @@ fn inject_config_preloads_toml(
 ) -> Result<(), String> {
     let src = std::fs::read_to_string(config_path)
         .map_err(|e| format!("gendoc: config_path '{config_path}' load failed: {e}"))?;
-    let config: GendocConfig = toml::from_str(&src)
+    let config: FlatGendocConfig = toml::from_str(&src)
         .map_err(|e| format!("gendoc: config_path '{config_path}' parse failed: {e}"))?;
 
     // Move the two sub-tables into the Lua registry via globals
@@ -654,59 +697,6 @@ fn inject_config_preloads_toml(
         lua,
         preload,
         config.devin,
-        "devin",
-        "_gendoc_devin_config",
-        "tools.docs.devin_wiki_config",
-    )?;
-
-    Ok(())
-}
-
-fn inject_config_preloads_lua(lua: &Lua, preload: &Table, config_path: &str) -> Result<(), String> {
-    let src = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("gendoc: config_path '{config_path}' load failed: {e}"))?;
-
-    // Evaluate the Lua chunk, expecting a table return value.
-    // Use eval::<Value>() first so we can produce a more actionable
-    // error message when the return type is wrong (eval::<Table>()
-    // would emit an opaque "expected table" mlua error without the
-    // "gendoc:" prefix).
-    let val: Value = lua
-        .load(&*src)
-        .set_name(config_path)
-        .eval()
-        .map_err(|e| format!("gendoc: config_path '{config_path}' lua eval failed: {e}"))?;
-
-    let tbl = match val {
-        Value::Table(t) => t,
-        other => {
-            return Err(format!(
-                "gendoc: config_path '{config_path}' must return a table, got {}",
-                other.type_name()
-            ))
-        }
-    };
-
-    // Extract optional sub-tables for context7 and devin projections.
-    let ctx7: Option<Value> = tbl
-        .get("context7")
-        .map_err(|e| format!("gendoc: config_path '{config_path}' get context7 failed: {e}"))?;
-    let devin: Option<Value> = tbl
-        .get("devin")
-        .map_err(|e| format!("gendoc: config_path '{config_path}' get devin failed: {e}"))?;
-
-    inject_lua_config_subtable(
-        lua,
-        preload,
-        ctx7,
-        "context7",
-        "_gendoc_context7_config",
-        "tools.docs.context7_config",
-    )?;
-    inject_lua_config_subtable(
-        lua,
-        preload,
-        devin,
         "devin",
         "_gendoc_devin_config",
         "tools.docs.devin_wiki_config",
@@ -755,37 +745,13 @@ fn inject_config_subtable(
     }
 }
 
-/// Lua-path variant of [`inject_config_subtable`].
+/// Flat TOML config file shape for backward-compat `config_path=*.toml` callers.
 ///
-/// Unlike the TOML path, the value is already a native `mlua::Value`
-/// so we skip `toml_to_lua_value` conversion and stash it directly.
-/// `None` / `Value::Nil` means the projection is absent — skip silently.
-/// Any non-table value is rejected with an explicit error.
-fn inject_lua_config_subtable(
-    lua: &Lua,
-    preload: &Table,
-    value: Option<Value>,
-    key: &'static str,
-    global_key: &'static str,
-    module_name: &'static str,
-) -> Result<(), String> {
-    match value {
-        None | Some(Value::Nil) => Ok(()),
-        Some(tbl @ Value::Table(_)) => {
-            lua.globals()
-                .set(global_key, tbl)
-                .map_err(|e| format!("gendoc: stash {global_key} failed: {e}"))?;
-            register_config_loader(lua, preload, module_name, global_key)
-        }
-        Some(other) => Err(format!(
-            "gendoc: config '{key}' must be a table, got {}",
-            other.type_name()
-        )),
-    }
-}
-
+/// Consumers using the old flat `[context7]` / `[devin]` schema continue to
+/// work unchanged.  The new `alc.toml [hub.*]` path uses
+/// `load_hub_projection_config` instead.
 #[derive(Debug, Deserialize)]
-struct GendocConfig {
+struct FlatGendocConfig {
     context7: Option<toml::Value>,
     devin: Option<toml::Value>,
 }
@@ -1410,86 +1376,20 @@ return M
         );
     }
 
-    // ── inject_config_preloads (Lua path) unit tests ─────────────────
+    // ── inject_config_preloads unit tests ────────────────────────────
 
     #[test]
-    fn inject_config_preloads_lua_wrapped_shape() {
+    fn inject_config_preloads_lua_rejected() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = tmp.path().join("config.lua");
-        std::fs::write(
-            &cfg,
-            r#"return {
-    context7 = { projectTitle = "MyProject", description = "desc" },
-    devin = { repo_notes = { "note1", "note2" } },
-}"#,
-        )
-        .expect("write config.lua");
-
-        let lua = Lua::new();
-        register_preloads(&lua).expect("register_preloads");
-        inject_config_preloads(&lua, cfg.to_str().expect("utf-8"))
-            .expect("inject_config_preloads must succeed");
-
-        // Verify context7 sub-table was registered and is require-able.
-        let result: String = lua
-            .load(r#"return require("tools.docs.context7_config").projectTitle"#)
-            .eval()
-            .expect("require context7_config.projectTitle");
-        assert_eq!(result, "MyProject");
-
-        // Verify devin sub-table was registered and is require-able.
-        let result: String = lua
-            .load(r#"return require("tools.docs.devin_wiki_config").repo_notes[1]"#)
-            .eval()
-            .expect("require devin_wiki_config.repo_notes[1]");
-        assert_eq!(result, "note1");
-    }
-
-    #[test]
-    fn inject_config_preloads_lua_eval_error() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("bad.lua");
-        // Intentional syntax error: unclosed brace.
-        std::fs::write(&cfg, "return { unclosed").expect("write bad.lua");
+        std::fs::write(&cfg, "return {}").expect("write config.lua");
 
         let lua = Lua::new();
         let err = inject_config_preloads(&lua, cfg.to_str().expect("utf-8"))
-            .expect_err("must fail on eval error");
+            .expect_err("must fail for .lua extension");
         assert!(
-            err.contains("lua eval failed"),
-            "expected 'lua eval failed' in: {err}"
-        );
-    }
-
-    #[test]
-    fn inject_config_preloads_lua_not_a_table() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("scalar.lua");
-        std::fs::write(&cfg, "return 42").expect("write scalar.lua");
-
-        let lua = Lua::new();
-        let err = inject_config_preloads(&lua, cfg.to_str().expect("utf-8"))
-            .expect_err("must fail when not a table");
-        assert!(
-            err.contains("must return a table"),
-            "expected 'must return a table' in: {err}"
-        );
-    }
-
-    #[test]
-    fn inject_config_preloads_lua_subfield_not_table() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg = tmp.path().join("bad_field.lua");
-        // context7 value is a string, not a table.
-        std::fs::write(&cfg, r#"return { context7 = "not a table" }"#)
-            .expect("write bad_field.lua");
-
-        let lua = Lua::new();
-        let err = inject_config_preloads(&lua, cfg.to_str().expect("utf-8"))
-            .expect_err("must fail when context7 is not a table");
-        assert!(
-            err.contains("config 'context7' must be a table"),
-            "expected config 'context7' must be a table in: {err}"
+            err.contains("'.lua' is no longer supported"),
+            "expected '.lua' is no longer supported in: {err}"
         );
     }
 
@@ -1503,8 +1403,8 @@ return M
         let err = inject_config_preloads(&lua, cfg.to_str().expect("utf-8"))
             .expect_err("must fail on unknown extension");
         assert!(
-            err.contains("unsupported extension"),
-            "expected 'unsupported extension' in: {err}"
+            err.contains("unsupported extension (expected .toml)"),
+            "expected 'unsupported extension (expected .toml)' in: {err}"
         );
     }
 

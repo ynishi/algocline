@@ -501,6 +501,14 @@ pub trait EngineApi: Send + Sync {
         description: Option<String>,
     ) -> Result<String, String>;
 
+    /// Read the `init.lua` source of an installed package.
+    ///
+    /// Searches global (`~/.algocline/packages/`) and variant
+    /// (`alc.local.toml`) scope in priority order (variant wins).
+    /// Returns the raw Lua source on success, or an `Err(String)` describing
+    /// why the package was not found or could not be read.
+    async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

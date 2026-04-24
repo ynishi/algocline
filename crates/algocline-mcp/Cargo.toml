@@ -14,8 +14,15 @@ readme = "../../README.md"
 
 [dependencies]
 algocline-app = { workspace = true }
+algocline-core = { workspace = true }
 
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }

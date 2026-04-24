@@ -52,9 +52,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also updated to list all accepted projection values, including the previously
   undocumented `luacats`.
 
-### Changed
+### Changed — **BREAKING**: `alc_hub_gendoc` `config_path` retires `.lua`; new `alc.toml [hub.*]` sections
 
-- `alc_hub_gendoc` / `alc_hub_dist`: `config_path` now accepts a Lua file in addition to TOML. Parser is selected by extension (`.lua` / `.toml`). Lua files must return a table with the same shape as the TOML wrapped form (`{ context7 = {...}, devin = {...} }`). See `docs/hub-gendoc-config.md` for the Lua schema.
+- `config_path` no longer accepts `.lua` files.  Passing a `.lua` path returns
+  `gendoc: config_path extension '.lua' is no longer supported; use .toml`.
+- When `projections` includes `"context7"` or `"devin"` and `config_path` is
+  omitted, the project root's `alc.toml` is auto-explored.  New subsections
+  `[hub]`, `[hub.context7]`, `[hub.devin]` are recognized.  See
+  `docs/hub-gendoc-config.md` for the full schema.
+- C7 / Devin rules and repo notes now ship as core defaults embedded in
+  `algocline`.  User config may append (`extra_rules` / `extra_repo_notes`),
+  override wholesale (`rules_override` / `repo_notes_override`), or read from
+  an external file (`rules_file` / `repo_notes_file`).  `rules_file` and
+  `rules_override` are mutually exclusive (typed error on both set).
+- Migration: move `context7_config.lua` / `devin_wiki_config.lua` contents
+  into the repo's `alc.toml` under the new subsections.  Callers using an
+  explicit flat `config_path=*.toml` with `[context7]` / `[devin]` sections
+  continue to work unchanged.
+
+### Changed
 
 ## [0.25.1] - 2026-04-23
 

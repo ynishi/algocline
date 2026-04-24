@@ -16,10 +16,6 @@ pub const DEFAULT_NAME_FALLBACK: &str = "algocline-hub";
 pub const DEFAULT_C7_DESCRIPTION: &str =
     "A collection of packages and tools for the algocline ecosystem.";
 
-/// Default description for Devin wiki projections.
-pub const DEFAULT_DEVIN_DESCRIPTION: &str =
-    "Repository notes and guidelines for the algocline hub.";
-
 /// Default rules injected into context7 projections when neither
 /// `rules_file` nor `rules_override` is specified in `[hub.context7]`.
 /// Extra rules from `extra_rules` are appended after these defaults.
@@ -36,8 +32,8 @@ pub const DEFAULT_C7_RULES: &[&str] = &[
 /// Extra notes from `extra_repo_notes` are appended after these defaults.
 ///
 /// These strings are stored as plain `&str` in-memory. When converted to
-/// `toml::Value` via `ResolvedDevin::to_devin_toml()`, each entry is wrapped
-/// into `{content = "<str>"}` inline-table form to satisfy the
+/// `toml::Value` via `HubProjectionConfig::to_devin_toml`, each entry is
+/// wrapped into `{content = "<str>"}` inline-table form to satisfy the
 /// `validate_note` contract in `projections.lua:664-670`.
 pub const DEFAULT_DEVIN_REPO_NOTES: &[&str] = &[
     "This repository is managed with algocline. Use `alc` commands for package operations.",

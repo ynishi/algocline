@@ -70,6 +70,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit flat `config_path=*.toml` with `[context7]` / `[devin]` sections
   continue to work unchanged.
 
+### Fixed
+
+- **`alc_hub_gendoc` / `alc_hub_dist` context7 projection: `projectTitle` was
+  always `null`.**  `HubProjectionConfig::to_context7_toml` now populates
+  `projectTitle` from the resolved name chain
+  (`[hub.<proj>].name > [hub].name > hub_index repo basename >
+  DEFAULT_NAME_FALLBACK`) and `description` from the resolved description
+  chain (`[hub.context7].description > [hub].description >
+  DEFAULT_C7_DESCRIPTION`).  The precedence chains were already computed;
+  the output keys were simply never written.  Devin identity fields
+  (`project_name`, `description`) are not emitted: the DeepWiki schema
+  (<https://docs.devin.ai/work-with-devin/deepwiki>) only documents
+  `repo_notes` and `pages` as recognised top-level keys.
+
 ### Changed
 
 ## [0.25.1] - 2026-04-23

@@ -99,14 +99,14 @@ pub struct HubContext7Config {
 }
 
 /// `[hub.devin]` TOML section — Devin wiki projection overrides.
+///
+/// Only `repo_notes`-related fields are retained here because the DeepWiki
+/// schema (<https://docs.devin.ai/work-with-devin/deepwiki>) only documents
+/// `repo_notes` and `pages` as recognised top-level keys.  Identity fields
+/// (`project_name`, `description`) are not part of the schema and are
+/// therefore out of scope.
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct HubDevinConfig {
-    /// Override project name for the Devin wiki projection.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Override project description for the Devin wiki projection.
-    #[serde(default)]
-    pub description: Option<String>,
     /// Fully replace the default repo notes with this list (mutually
     /// exclusive with `repo_notes_file`).
     #[serde(default)]
@@ -137,14 +137,10 @@ pub struct ResolvedContext7 {
 /// Resolved, merged configuration for a single Devin wiki projection.
 #[derive(Debug, Clone)]
 pub struct ResolvedDevin {
-    /// Project name to surface in the Devin wiki output.
-    pub name: String,
-    /// Project description to surface in the Devin wiki output.
-    pub description: String,
     /// Merged repo notes list stored as plain strings in memory.
     ///
     /// **Important**: when converting to `toml::Value` via
-    /// [`ResolvedDevin::to_devin_toml`], each entry is wrapped into a
+    /// [`HubProjectionConfig::to_devin_toml`], each entry is wrapped into a
     /// `{content = "<str>"}` inline table to satisfy the `validate_note`
     /// contract in `projections.lua:664-670`.  Passing plain strings
     /// produces a Lua runtime error at projection time.
@@ -164,11 +160,11 @@ impl HubProjectionConfig {
     /// suitable for passing to `inject_config_subtable` as the
     /// `tools.docs.context7_config` preload.
     ///
-    /// Shape: `{ name = "...", description = "...", rules = ["...", ...] }`
+    /// Shape: `{ projectTitle = "...", description = "...", rules = ["...", ...] }`
     pub fn to_context7_toml(&self) -> toml::Value {
         let mut map = toml::value::Table::new();
         map.insert(
-            "name".to_string(),
+            "projectTitle".to_string(),
             toml::Value::String(self.context7.name.clone()),
         );
         map.insert(
@@ -194,17 +190,13 @@ impl HubProjectionConfig {
     /// requires `type(note) == "table"` with a `note.content` string field.
     /// Passing plain strings produces a Lua runtime error at projection time.
     ///
-    /// Shape: `{ name = "...", description = "...", repo_notes = [{content = "..."}, ...] }`
+    /// Only `repo_notes` is emitted.  Identity fields (`project_name`,
+    /// `description`) are not part of the DeepWiki schema
+    /// (<https://docs.devin.ai/work-with-devin/deepwiki>).
+    ///
+    /// Shape: `{ repo_notes = [{content = "..."}, ...] }`
     pub fn to_devin_toml(&self) -> toml::Value {
         let mut map = toml::value::Table::new();
-        map.insert(
-            "name".to_string(),
-            toml::Value::String(self.devin.name.clone()),
-        );
-        map.insert(
-            "description".to_string(),
-            toml::Value::String(self.devin.description.clone()),
-        );
         // Wrap each plain string into {content = "<str>"} inline table.
         let repo_notes: Vec<toml::Value> = self
             .devin
@@ -306,18 +298,6 @@ pub fn load_hub_projection_config(
     )?;
 
     // 4. Resolve devin.
-    let dv_name = dv_cfg
-        .and_then(|d| d.name.as_deref())
-        .or(shared_name)
-        .unwrap_or(templates::DEFAULT_NAME_FALLBACK)
-        .to_string();
-
-    let dv_description = dv_cfg
-        .and_then(|d| d.description.as_deref())
-        .or(shared_description)
-        .unwrap_or(templates::DEFAULT_DEVIN_DESCRIPTION)
-        .to_string();
-
     let dv_repo_notes = resolve_rules(
         dv_cfg.and_then(|d| d.repo_notes_file.as_deref()),
         dv_cfg.and_then(|d| d.repo_notes_override.as_deref()),
@@ -333,8 +313,6 @@ pub fn load_hub_projection_config(
             rules: c7_rules,
         },
         devin: ResolvedDevin {
-            name: dv_name,
-            description: dv_description,
             repo_notes: dv_repo_notes,
         },
     })
@@ -633,8 +611,6 @@ config_path = "configs.toml"
                 .collect::<Vec<_>>()
         );
 
-        assert_eq!(cfg.devin.name, templates::DEFAULT_NAME_FALLBACK);
-        assert_eq!(cfg.devin.description, templates::DEFAULT_DEVIN_DESCRIPTION);
         assert_eq!(
             cfg.devin.repo_notes,
             templates::DEFAULT_DEVIN_REPO_NOTES
@@ -659,12 +635,10 @@ name = "my-project"
 
         let cfg = load_hub_projection_config(Some(root)).expect("load");
 
-        // [hub].name propagates to both c7 and devin.
+        // [hub].name propagates to c7.
         assert_eq!(cfg.context7.name, "my-project");
-        assert_eq!(cfg.devin.name, "my-project");
         // Descriptions fall back to defaults.
         assert_eq!(cfg.context7.description, templates::DEFAULT_C7_DESCRIPTION);
-        assert_eq!(cfg.devin.description, templates::DEFAULT_DEVIN_DESCRIPTION);
     }
 
     #[test]
@@ -876,14 +850,11 @@ projections = ["hub", "lint"]
         // → falls back to defaults.
         let cfg = load_hub_projection_config(Some(root)).expect("load projection");
         assert_eq!(cfg.context7.name, templates::DEFAULT_NAME_FALLBACK);
-        assert_eq!(cfg.devin.name, templates::DEFAULT_NAME_FALLBACK);
     }
 
     #[test]
     fn to_devin_toml_wraps_repo_notes_as_content_table() {
         let resolved = ResolvedDevin {
-            name: "test".to_string(),
-            description: "desc".to_string(),
             repo_notes: vec!["a".to_string(), "b".to_string()],
         };
         let cfg = HubProjectionConfig {
@@ -923,5 +894,87 @@ projections = ["hub", "lint"]
                 _ => panic!("expected each repo_note to be a Table, got: {item:?}"),
             }
         }
+    }
+
+    #[test]
+    fn to_context7_toml_wires_project_title_from_hub_name() {
+        let cfg = HubProjectionConfig {
+            context7: ResolvedContext7 {
+                name: "my-project".to_string(),
+                description: "A description".to_string(),
+                rules: vec!["Rule 1".to_string()],
+            },
+            devin: ResolvedDevin { repo_notes: vec![] },
+        };
+
+        let val = cfg.to_context7_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        // Key must be "projectTitle", not "name".
+        assert!(
+            table.get("name").is_none(),
+            "unexpected 'name' key in context7 output"
+        );
+        assert_eq!(
+            table.get("projectTitle"),
+            Some(&toml::Value::String("my-project".to_string())),
+            "expected projectTitle = 'my-project'"
+        );
+        assert_eq!(
+            table.get("description"),
+            Some(&toml::Value::String("A description".to_string())),
+            "expected description to be present"
+        );
+    }
+
+    #[test]
+    fn to_context7_toml_uses_default_name_fallback_when_no_name_configured() {
+        // No alc.toml → load_hub_projection_config uses DEFAULT_NAME_FALLBACK.
+        let cfg = load_hub_projection_config(None).expect("load");
+
+        let val = cfg.to_context7_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        assert_eq!(
+            table.get("projectTitle"),
+            Some(&toml::Value::String(
+                templates::DEFAULT_NAME_FALLBACK.to_string()
+            )),
+            "expected DEFAULT_NAME_FALLBACK as projectTitle when no name configured"
+        );
+    }
+
+    #[test]
+    fn to_context7_toml_propagates_hub_name_via_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::write(
+            root.join("alc.toml"),
+            r#"[hub]
+name = "test-hub"
+"#,
+        )
+        .expect("write alc.toml");
+
+        let cfg = load_hub_projection_config(Some(root)).expect("load");
+
+        let val = cfg.to_context7_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        assert_eq!(
+            table.get("projectTitle"),
+            Some(&toml::Value::String("test-hub".to_string())),
+            "expected [hub].name to propagate to projectTitle"
+        );
     }
 }

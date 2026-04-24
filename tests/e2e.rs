@@ -1317,6 +1317,28 @@ async fn test_alc_hub_gendoc_core_defaults_without_alc_toml() {
         "expected .devin/wiki.json from core defaults, got resp: {resp}"
     );
 
+    // Verify projectTitle and description are non-null in context7.json (core defaults).
+    // The context7 Lua projection emits these when present in the injected config table.
+    let c7_text = std::fs::read_to_string(&context7_json).expect("read context7.json");
+    let c7: serde_json::Value = serde_json::from_str(&c7_text).expect("parse context7.json");
+    assert!(
+        c7.get("projectTitle").and_then(|v| v.as_str()).is_some(),
+        "expected projectTitle to be a non-null string in context7.json, got: {c7_text}"
+    );
+    assert!(
+        c7.get("description").and_then(|v| v.as_str()).is_some(),
+        "expected description to be a non-null string in context7.json, got: {c7_text}"
+    );
+
+    // The devin wiki schema only contains repo_notes / pages (no project_name or description
+    // at the top level per docs.devin.ai schema). Verify repo_notes is populated.
+    let dv_text = std::fs::read_to_string(&devin_wiki).expect("read wiki.json");
+    let dv: serde_json::Value = serde_json::from_str(&dv_text).expect("parse wiki.json");
+    assert!(
+        dv.get("repo_notes").and_then(|v| v.as_array()).is_some(),
+        "expected repo_notes array in wiki.json, got: {dv_text}"
+    );
+
     client.cancel().await.expect("cancel failed");
 }
 
@@ -1381,6 +1403,29 @@ extra_repo_notes = ["Use Rust for performance-critical paths"]
     assert!(
         devin_wiki.exists(),
         "expected .devin/wiki.json with alc.toml hub sections, got resp: {resp}"
+    );
+
+    // Verify projectTitle and description are wired from alc.toml in context7.json.
+    let c7_text = std::fs::read_to_string(&context7_json).expect("read context7.json");
+    let c7: serde_json::Value = serde_json::from_str(&c7_text).expect("parse context7.json");
+    assert_eq!(
+        c7.get("projectTitle").and_then(|v| v.as_str()),
+        Some("e2e-test-project"),
+        "expected projectTitle = 'e2e-test-project' from [hub].name, got: {c7_text}"
+    );
+    assert_eq!(
+        c7.get("description").and_then(|v| v.as_str()),
+        Some("E2E test project description"),
+        "expected description from [hub.context7].description, got: {c7_text}"
+    );
+
+    // The devin wiki schema only contains repo_notes / pages (no project_name or description
+    // at the top level per docs.devin.ai schema). Verify repo_notes is populated.
+    let dv_text = std::fs::read_to_string(&devin_wiki).expect("read wiki.json");
+    let dv: serde_json::Value = serde_json::from_str(&dv_text).expect("parse wiki.json");
+    assert!(
+        dv.get("repo_notes").and_then(|v| v.as_array()).is_some(),
+        "expected repo_notes array in wiki.json, got: {dv_text}"
     );
 
     client.cancel().await.expect("cancel failed");

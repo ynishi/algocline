@@ -130,7 +130,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Distribute type stubs (non-fatal: log warning on failure)
     match init::distribute_types() {
-        Ok(path) => tracing::debug!("types installed: {}", path.display()),
+        Ok(init::DistributedTypes { alc, alc_shapes }) => {
+            tracing::debug!(
+                "types installed: {} + {}",
+                alc.display(),
+                alc_shapes.display()
+            )
+        }
         Err(e) => tracing::warn!("failed to install type stubs: {e}"),
     }
 

@@ -158,3 +158,10 @@ publish-dry:
     cargo publish -p algocline-app --dry-run
     cargo publish -p algocline-mcp --dry-run
     cargo publish -p algocline --dry-run
+
+# ─── Codegen ────────────────────────────────────────────────────
+
+# Regenerate types/alc_shapes.d.lua from embedded alc_shapes Lua sources
+[group('allow-agent')]
+gen-shapes:
+    cargo run -p algocline-app --example gen_alc_shapes_dlua

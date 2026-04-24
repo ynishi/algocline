@@ -9,7 +9,7 @@
 //! The output file path is `<workspace-root>/types/alc_shapes.d.lua`,
 //! resolved relative to this crate's `CARGO_MANIFEST_DIR`.
 
-use algocline_app::service::gendoc::alc_shapes_codegen::gen_alc_shapes_dlua_contents;
+use algocline_app::gen_alc_shapes_dlua_contents;
 
 fn main() -> anyhow::Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR"); // .../crates/algocline-app

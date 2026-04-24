@@ -5,7 +5,7 @@ mod dist;
 mod engine_api_impl;
 mod eval;
 mod eval_store;
-mod gendoc;
+pub(crate) mod gendoc;
 mod hub;
 pub mod hub_dist_preset;
 mod init;

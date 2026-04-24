@@ -9,7 +9,7 @@
 //! cargo run -p algocline-app --example gen_alc_shapes_dlua
 //! ```
 
-use algocline_app::service::gendoc::alc_shapes_codegen::gen_alc_shapes_dlua_contents;
+use algocline_app::gen_alc_shapes_dlua_contents;
 
 #[test]
 fn alc_shapes_dlua_not_drifted() {

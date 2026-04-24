@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `alc init` now also distributes `alc_shapes.d.lua` to `~/.algocline/types/` alongside `alc.d.lua`, enabling zero-config LuaCats completion for `alc_shapes` combinators (T.string, T.number, ...) and registered shapes. `pkg_install` response adds a new `alc_shapes_types_path` field (additive; existing `types_path` unchanged).
+
 ## [0.26.2] - 2026-04-24
 
 ### Fixed

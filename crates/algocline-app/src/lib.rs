@@ -8,3 +8,6 @@ pub use service::hub_dist_preset::{
 pub use service::{
     AppConfig, AppService, EngineApi, LogDirSource, QueryResponse, SearchPath, TokenUsage,
 };
+
+#[doc(hidden)]
+pub use service::gendoc::alc_shapes_codegen::gen_alc_shapes_dlua_contents;

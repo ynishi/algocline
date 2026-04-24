@@ -742,6 +742,61 @@ return M"#,
     client.cancel().await.expect("cancel failed");
 }
 
+#[tokio::test]
+async fn test_pkg_install_returns_alc_shapes_types_path() {
+    let client = connect().await;
+
+    // Create a temporary package
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let pkg_dir = tmp_dir.path().join("e2e_alc_shapes_types_test");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_alc_shapes_types_test", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    // Install and check response
+    let resp = call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_dir.to_string_lossy() }),
+    )
+    .await;
+
+    assert_eq!(resp["installed"], json!(["e2e_alc_shapes_types_test"]));
+
+    // alc_shapes_types_path is present when alc init has been run (types/alc_shapes.d.lua exists)
+    if resp["alc_shapes_types_path"].is_string() {
+        let alc_shapes_path = resp["alc_shapes_types_path"].as_str().unwrap();
+        assert!(
+            alc_shapes_path.ends_with("types/alc_shapes.d.lua"),
+            "alc_shapes_types_path should end with types/alc_shapes.d.lua, got: {alc_shapes_path}"
+        );
+    }
+    // alc_shapes_types_path is null when alc init has not distributed the file yet —
+    // that is the expected behaviour (Option<String> → JSON null).
+
+    // Regression guard: existing types_path field is unaffected
+    if resp["types_path"].is_string() {
+        let types_path = resp["types_path"].as_str().unwrap();
+        assert!(
+            types_path.ends_with("types/alc.d.lua"),
+            "types_path should end with types/alc.d.lua, got: {types_path}"
+        );
+    }
+
+    // Cleanup (physical delete from cache — pkg_remove no longer does this)
+    if let Some(home) = dirs::home_dir() {
+        let pkg_cache = home.join(".algocline").join("packages");
+        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_alc_shapes_types_test"));
+    }
+    client.cancel().await.expect("cancel failed");
+}
+
 /// `alc_pkg_remove` with `scope = "global"` deletes the entry from the
 /// global manifest `~/.algocline/installed.json` while leaving the cached
 /// directory `~/.algocline/packages/{name}/` intact. Regression against

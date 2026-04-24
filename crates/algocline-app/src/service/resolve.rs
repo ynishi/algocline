@@ -102,6 +102,15 @@ pub(crate) fn types_stub_path(app_dir: &AppDir) -> Option<String> {
     }
 }
 
+pub(crate) fn alc_shapes_types_stub_path(app_dir: &AppDir) -> Option<String> {
+    let p = app_dir.types_dir().join("alc_shapes.d.lua");
+    if p.exists() {
+        Some(p.display().to_string())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn packages_dir(app_dir: &AppDir) -> PathBuf {
     app_dir.packages_dir()
 }

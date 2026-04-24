@@ -1,0 +1,154 @@
+---@meta
+
+---@class AlcResultAssessed
+---@field answer string
+---@field confidence number @Self-assessed confidence 0.0–1.0
+---@field total_llm_calls number
+
+---@class AlcResultCalibrated
+---@field answer string
+---@field confidence number @Initial self-assessed confidence
+---@field escalated boolean @Whether fallback was triggered
+---@field fallback_detail? table @Fallback strategy result (voted/paneled)
+---@field strategy "direct"|"retry"|"panel"|"ensemble"
+---@field total_llm_calls number
+
+---@class AlcResultConformalDecided
+---@field action "commit"|"escalate"|"anomaly" @Three-way decision per Proposition 3
+---@field card_id? string @Emitted Card id (only when auto_card=true)
+---@field coverage_level number @1 - alpha (finite-sample guarantee)
+---@field p_social table<string, number> @Linear opinion pool output { [label] = prob }
+---@field prediction_set string[] @Labels y with P_social(y|x) >= tau
+---@field q_hat number @Calibration quantile of nonconformity scores
+---@field selected? string @Committed label (nil when action != 'commit')
+---@field tau number @1 - q_hat (prediction-set threshold)
+
+---@class AlcResultDeepPaneled
+---@field abort_reason? string @Abort reason (nil when not aborted)
+---@field aborted boolean @True if early-abort triggered
+---@field answer any @Plurality answer (nil on abort)
+---@field anti_jury boolean @Condorcet anti-jury detection at Stage 1
+---@field branches table @{ [bkey] = { approach, answer, best_score, tree_stats } }
+---@field confidence number @Meta-confidence estimate
+---@field decomp? table @ensemble_div.decompose output (nil if Stage 3b skipped)
+---@field diversity? table @{ n_distinct, distinctness, decomp_status }
+---@field expected_accuracy number @Condorcet expected majority accuracy
+---@field margin_gap number @(top - runner_up) / n
+---@field n_branches_completed number @Branches actually finished
+---@field n_distinct_answers number @Count of unique normalized answers
+---@field needs_investigation boolean @True if meta-confidence below threshold
+---@field panel_size number @Requested panel size
+---@field plurality_fraction number @Top-answer vote fraction
+---@field stages table[] @Per-stage detail (heterogeneous)
+---@field target_met boolean @Whether expected accuracy >= ctx.target_accuracy
+---@field total_llm_calls number
+---@field unanimous boolean @All normalized votes identical
+---@field vote_counts table<string, number> @{ [normalized_answer] = count } tally
+
+---@class AlcResultDeliberated
+---@field answer string @Selected option's final answer text
+---@field card_id? string @Emitted Card id (only when auto_card=true)
+---@field convergence "dominance"|"no_blocking"|"fallback" @How the session converged
+---@field decision_packet { minority_report: { confidence: number, position: string, rationale: string }[], next_actions: string[], reopen_triggers: string[], residual_objections: string[], selected_option: { answer: string, evidence: string[], rationale: string } } @5-component decision packet; all 5 fields MUST be non-nil
+---@field history table[] @Per-stage typed-act log (14-act typed)
+---@field stats { options_count: number, rounds_used: number, total_acts: number, total_llm_calls: number } @Execution statistics
+---@field workspace { emerging_ideas: string[], key_frames: string[], next_actions: string[], problem_view: string, synthesis_in_progress: string, tensions: string[] } @Shared workspace 6 fields after finalization
+
+---@class AlcResultFunnelRanked
+---@field best string @Top-ranked text
+---@field best_index number @Top-ranked original index (1-based)
+---@field bypass_reason? string @Reason for bypass (nil when not bypassed)
+---@field funnel_bypassed boolean @True when N < 6 bypasses funnel stages
+---@field funnel_shape number[] @Candidate counts per stage [N, s1_out, s2_out]
+---@field naive_baseline_calls number @Hypothetical full-pairwise call count
+---@field naive_baseline_kind string @Baseline method identifier
+---@field ranking { original_index: number, pairwise_score: number, rank: number, text: string }[] @Final ranking
+---@field savings_percent? number @LLM call savings vs baseline (nil on bypass)
+---@field stages ({ both_tie_pairs: number, input_count: number, llm_calls: number, name: "direct_pairwise", output_count: number, position_bias_splits: number }|{ input_count: number, llm_calls: number, name: "listwise_rank", output_count: number, window_size: number }|{ input_count: number, llm_calls: number, name: "listwise_skipped", output_count: number, reason: string }|{ axes_count: number, input_count: number, llm_calls: number, name: "multi_axis_scoring", output_count: number, parse_failures: number, score_range: { max: number, min: number } }|{ both_tie_pairs: number, input_count: number, llm_calls: number, name: "pairwise_rank_allpair", output_count: number, position_bias_splits: number }|{ input_count: number, llm_calls: number, name: "scoring_skipped", output_count: number, reason: string })[] @Per-stage detail (discriminated by name)
+---@field total_llm_calls number
+---@field warnings { code: string, data: table, message: string, severity: "warn"|"critical" }[] @Diagnostic warnings
+
+---@class AlcResultListwiseRanked
+---@field best string @Top-ranked text
+---@field best_index number @Top-ranked original index (1-based)
+---@field killed { index: number, rank: number, text: string }[] @Eliminated candidates
+---@field n_candidates number
+---@field ranked { index: number, rank: number, text: string }[] @Full ranking
+---@field top_k { index: number, rank: number, text: string }[] @Top-k subset
+---@field total_llm_calls number
+
+---@class AlcResultPairwiseRanked
+---@field best string @Top-ranked text
+---@field best_index number @Top-ranked original index (1-based)
+---@field both_tie_pairs number @Pairs that tied in both directions
+---@field killed { index: number, rank: number, score: number, text: string }[] @Eliminated candidates
+---@field method "allpair"|"sorting" @Comparison strategy
+---@field n_candidates number
+---@field position_bias_splits number @Position-bias correction splits
+---@field ranked { index: number, rank: number, score: number, text: string }[] @Full ranking with scores
+---@field score_semantics "copeland"|"rank_inverse" @Score interpretation
+---@field top_k { index: number, rank: number, score: number, text: string }[] @Top-k subset
+---@field total_llm_calls number
+
+---@class AlcResultPaneled
+---@field arguments { role: string, text: string }[] @Per-role position statements
+---@field synthesis string @Moderator synthesis
+
+---@class AlcResultQuickVoted
+---@field answer string @Leader answer from sample 1 (cleaned, not normalized)
+---@field leader_norm string @Normalized leader key used for agreement tests
+---@field n_samples number @Total samples drawn (1 leader + k agreement observations)
+---@field needs_investigation boolean @True only when outcome == 'truncated' (evidence inconclusive at declared α/β). 'rejected' is a conclusive verdict and does NOT set this flag.
+---@field outcome "confirmed"|"rejected"|"truncated" @Terminal state: confirmed=H1 accepted, rejected=H0 accepted, truncated=no verdict at max_n
+---@field params { alpha: number, beta: number, max_n: number, min_n: number, p0: number, p1: number } @Echoed parameter values
+---@field samples { answer: string, norm: string, reasoning: string }[] @Per-sample reasoning + extracted answer
+---@field sprt { a_bound: number, b_bound: number, log_lr: number, n: number } @Final SPRT state snapshot
+---@field total_llm_calls number @2 × n_samples (reasoning + extract per sample)
+---@field verdict "accept_h1"|"accept_h0"|"continue" @Underlying SPRT verdict from the final decide()
+---@field vote_counts table<string, number> @{ [norm] = count } tally across all samples
+
+---@class AlcResultSafePaneled
+---@field abort_reason? string @Abort reason (nil when not aborted)
+---@field aborted boolean @True if early-abort triggered
+---@field answer? string @Consensus answer (nil on abort)
+---@field anti_jury boolean @Condorcet anti-jury detection
+---@field confidence number @Meta-confidence estimate
+---@field expected_accuracy number @Condorcet expected majority accuracy
+---@field is_safe boolean @Vote-prefix stability safe flag
+---@field margin_gap number @(top - runner_up) / n
+---@field n_distinct_answers number @Count of unique answers
+---@field needs_investigation boolean @True if meta-confidence below threshold
+---@field panel_size number @Actual panel size used
+---@field plurality_fraction number @Top-answer vote fraction
+---@field stages ({ confidence: number, escalated: boolean, llm_calls: number, name: "calibrate", needs_investigation: boolean, threshold: number }|{ expected_accuracy: number, name: "condorcet", p_estimate: number, recommended_n: number, target_accuracy: number, target_met: boolean }|{ is_anti_jury: boolean, name: "condorcet_anti_jury", p_estimate: number }|{ is_anti_jury: boolean, name: "condorcet_coin_flip", p_estimate: number }|{ answer: string, llm_calls: number, margin_gap: number, n_distinct_answers: number, name: "sc", panel_size: number, plurality_fraction: number, unanimous: boolean }|{ consecutive_drops: number, is_safe: boolean, name: "vote_prefix_stability", peak_idx: number, series_length: number, signal_type: string }|{ is_safe: boolean, name: "vote_prefix_stability_skipped", reason: string, series_length: number, signal_type: string })[] @Per-stage detail (discriminated by name)
+---@field target_met boolean @Whether expected accuracy >= target
+---@field total_llm_calls number
+---@field unanimous boolean @All votes identical
+---@field vote_counts table<string, number> @{ [normalized_answer] = count } tally
+
+---@class AlcResultSmcSampled
+---@field answer string @Argmax-weight particle's answer text
+---@field card_id? string @Emitted Card id (only when auto_card=true)
+---@field ess_trace number[] @ESS recorded at the start of each iteration (length K)
+---@field iterations number @K SMC rounds actually executed
+---@field particles { answer: string, history: table[], reward: number, weight: number }[] @All N particles in their final state
+---@field resample_count number @Number of iterations that triggered multinomial resample
+---@field stats { total_llm_calls: number, total_reward_calls: number } @Execution counters (open for diagnostics like mh_rejected)
+---@field weights number[] @Final normalized weights (Σ ≈ 1)
+
+---@class AlcResultTournament
+---@field best string @Winner text
+---@field best_index number @Winner original index (1-based)
+---@field candidates string[] @Input candidate texts
+---@field matches { a: number, b: number, reason: string, winner: number }[] @Pairwise match log
+---@field total_wins number @Winner's win count
+
+---@class AlcResultVoted
+---@field answer? string @Majority answer (nil when no paths converge)
+---@field answer_norm? string @Normalized vote key
+---@field consensus string @LLM-synthesized majority summary
+---@field n_sampled number @Number of sampled paths
+---@field paths { answer: string, reasoning: string }[] @Per-path reasoning + extracted answer
+---@field total_llm_calls number
+---@field vote_counts table<string, number> @{ [norm] = count } tally
+---@field votes string[] @Normalized vote per path, 1-indexed

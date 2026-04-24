@@ -1268,11 +1268,11 @@ async fn test_alc_hub_gendoc_with_toml_config_context7() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// Typed-error case: requesting the `context7` projection without a
-/// `config_path` must surface as a handler-level error (MCP caller sees
-/// `is_error=true` + text mentioning `config_path`).
+/// Core-defaults case: requesting `context7`/`devin` projections without a
+/// `config_path` and without an `alc.toml` must succeed using core-embedded
+/// default rules and repo notes (no `is_error`).
 #[tokio::test]
-async fn test_alc_hub_gendoc_missing_config() {
+async fn test_alc_hub_gendoc_core_defaults_without_alc_toml() {
     let client = connect().await;
     let tmp = setup_hub_fixture();
     let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
@@ -1283,8 +1283,195 @@ async fn test_alc_hub_gendoc_missing_config() {
         .expect("utf-8 path")
         .to_string();
 
-    // Need a hub_index.json first so gendoc gets past its "read index"
-    // step and can reach the projection-config validation.
+    // Need a hub_index.json first so gendoc reaches the projection step.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    // No config_path, no alc.toml in fixture → core defaults only.
+    let resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir.clone(),
+            "projections": ["context7", "devin"],
+        }),
+    )
+    .await;
+
+    // Both projection output files must be generated.
+    let context7_json = tmp.path().join("context7.json");
+    let devin_wiki = tmp.path().join(".devin").join("wiki.json");
+    assert!(
+        context7_json.exists(),
+        "expected context7.json from core defaults, got resp: {resp}"
+    );
+    assert!(
+        devin_wiki.exists(),
+        "expected .devin/wiki.json from core defaults, got resp: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Happy-path: `alc_hub_gendoc` with `alc.toml` containing `[hub.context7]`
+/// and `[hub.devin]` sections and no explicit `config_path` must generate both
+/// `context7.json` and `.devin/wiki.json`.
+#[tokio::test]
+async fn test_alc_hub_gendoc_with_alc_toml_hub_sections() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Write alc.toml with [hub.context7] / [hub.devin] sections.
+    std::fs::write(
+        tmp.path().join("alc.toml"),
+        r#"[hub]
+name = "e2e-test-project"
+
+[hub.context7]
+description = "E2E test project description"
+extra_rules = ["Always write tests"]
+
+[hub.devin]
+extra_repo_notes = ["Use Rust for performance-critical paths"]
+"#,
+    )
+    .expect("write alc.toml");
+
+    // gendoc requires an existing hub_index.json.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir.clone(),
+            "projections": ["context7", "devin"],
+        }),
+    )
+    .await;
+
+    let context7_json = tmp.path().join("context7.json");
+    let devin_wiki = tmp.path().join(".devin").join("wiki.json");
+    assert!(
+        context7_json.exists(),
+        "expected context7.json with alc.toml hub sections, got resp: {resp}"
+    );
+    assert!(
+        devin_wiki.exists(),
+        "expected .devin/wiki.json with alc.toml hub sections, got resp: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error-path: `alc_hub_gendoc` with a `.lua` `config_path` must return
+/// `is_error=true` with a message stating that `.lua` is no longer supported.
+#[tokio::test]
+async fn test_alc_hub_gendoc_rejects_lua_config_path() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Write a (valid) Lua file — the error must fire on extension alone,
+    // before any file I/O.
+    let lua_path = tmp.path().join("config.lua");
+    std::fs::write(&lua_path, "return {}").expect("write config.lua");
+    let config_path = lua_path.to_str().expect("utf-8 path").to_string();
+
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_gendoc",
+            json!({
+                "source_dir": source_dir,
+                "projections": ["context7"],
+                "config_path": config_path,
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for .lua config_path, got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("'.lua' is no longer supported"),
+                "expected '.lua' is no longer supported in error text, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error-path: `alc_hub_gendoc` with `alc.toml` containing both `rules_file`
+/// and `rules_override` must return `is_error=true` with a message stating
+/// the fields are mutually exclusive.
+#[tokio::test]
+async fn test_alc_hub_gendoc_rejects_mutually_exclusive_rules() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Write rules file and alc.toml with both rules_file + rules_override set.
+    std::fs::write(tmp.path().join("rules.txt"), "Rule one\n").expect("write rules.txt");
+    std::fs::write(
+        tmp.path().join("alc.toml"),
+        r#"[hub.context7]
+rules_file = "rules.txt"
+rules_override = ["Conflict rule"]
+"#,
+    )
+    .expect("write alc.toml");
+
     let _ = call_json(
         &client,
         "alc_hub_reindex",
@@ -1311,11 +1498,11 @@ async fn test_alc_hub_gendoc_missing_config() {
             let text = extract_text(&result);
             assert!(
                 is_error,
-                "expected is_error=true for missing config_path, got is_error={is_error:?}, text: {text}"
+                "expected is_error=true for mutually-exclusive rules, got is_error={is_error:?}, text: {text}"
             );
             assert!(
-                text.contains("config_path"),
-                "expected error text to mention config_path, got: {text}"
+                text.contains("mutually exclusive"),
+                "expected 'mutually exclusive' in error text, got: {text}"
             );
         }
         Err(e) => panic!("unexpected call_tool Err: {e}"),
@@ -1734,144 +1921,6 @@ async fn test_alc_hub_dist_with_toml_config_context7() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// Create a hub fixture directory like `setup_hub_fixture`, but write a
-/// Lua config file (`configs.lua`) instead of (or alongside) `configs.toml`.
-/// The Lua file uses the wrapped shape:
-/// `return { context7 = {...}, devin = {...} }`.
-fn setup_hub_fixture_with_lua_config() -> tempfile::TempDir {
-    let tmp = setup_hub_fixture();
-
-    std::fs::write(
-        tmp.path().join("configs.lua"),
-        r#"return {
-    context7 = {
-        projectTitle = "e2e-test",
-        description = "e2e",
-        rules = {},
-    },
-    devin = {
-        project_name = "e2e-test",
-    },
-}
-"#,
-    )
-    .expect("write configs.lua");
-
-    tmp
-}
-
-/// Happy-path: `alc_hub_gendoc` with a `.lua` config_path must accept the
-/// Lua wrapped shape and generate `context7.json`.
-#[tokio::test]
-async fn test_alc_hub_gendoc_with_lua_config_context7() {
-    let client = connect().await;
-    let tmp = setup_hub_fixture_with_lua_config();
-    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
-    let output_path = tmp
-        .path()
-        .join("hub_index.json")
-        .to_str()
-        .expect("utf-8 path")
-        .to_string();
-    let config_path = tmp
-        .path()
-        .join("configs.lua")
-        .to_str()
-        .expect("utf-8 path")
-        .to_string();
-
-    // gendoc requires an existing hub_index.json in source_dir.
-    let _ = call_json(
-        &client,
-        "alc_hub_reindex",
-        json!({
-            "source_dir": source_dir.clone(),
-            "output_path": output_path,
-        }),
-    )
-    .await;
-
-    let _resp = call_json(
-        &client,
-        "alc_hub_gendoc",
-        json!({
-            "source_dir": source_dir.clone(),
-            "projections": ["context7"],
-            "config_path": config_path,
-        }),
-    )
-    .await;
-
-    let context7_json = tmp.path().join("context7.json");
-    assert!(
-        context7_json.exists(),
-        "expected context7 projection to be generated at {} when using .lua config",
-        context7_json.display()
-    );
-
-    client.cancel().await.expect("cancel failed");
-}
-
-/// Error-path: `alc_hub_gendoc` with a `.lua` config that has a syntax error
-/// must surface `is_error=true` with a message containing "lua eval failed".
-#[tokio::test]
-async fn test_alc_hub_gendoc_lua_config_eval_error() {
-    let client = connect().await;
-    let tmp = setup_hub_fixture();
-    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
-    let output_path = tmp
-        .path()
-        .join("hub_index.json")
-        .to_str()
-        .expect("utf-8 path")
-        .to_string();
-
-    // Write a Lua file with a deliberate syntax error.
-    let broken_lua_path = tmp.path().join("broken.lua");
-    std::fs::write(&broken_lua_path, "return { unclosed").expect("write broken.lua");
-    let config_path = broken_lua_path.to_str().expect("utf-8 path").to_string();
-
-    // Need a hub_index.json first so gendoc reaches the config parsing step.
-    let _ = call_json(
-        &client,
-        "alc_hub_reindex",
-        json!({
-            "source_dir": source_dir.clone(),
-            "output_path": output_path,
-        }),
-    )
-    .await;
-
-    let outcome = client
-        .call_tool(call_params(
-            "alc_hub_gendoc",
-            json!({
-                "source_dir": source_dir,
-                "projections": ["context7"],
-                "config_path": config_path,
-            }),
-        ))
-        .await;
-
-    match outcome {
-        Ok(result) => {
-            let is_error = result.is_error.unwrap_or(false);
-            let text = extract_text(&result);
-            assert!(
-                is_error,
-                "expected is_error=true for broken lua config, got is_error={is_error:?}, text: {text}"
-            );
-            assert!(
-                text.contains("lua eval failed"),
-                "expected error text to contain 'lua eval failed', got: {text}"
-            );
-        }
-        Err(e) => panic!("unexpected call_tool Err: {e}"),
-    }
-
-    client.cancel().await.expect("cancel failed");
-}
-
 #[tokio::test]
 async fn test_alc_hub_dist_gendoc_failure_includes_reindex_result() {
     let client = connect().await;
@@ -1884,15 +1933,17 @@ async fn test_alc_hub_dist_gendoc_failure_includes_reindex_result() {
         .expect("utf-8 path")
         .to_string();
 
-    // Reindex should succeed, then gendoc should fail because context7
-    // projection requires config_path.
+    // Reindex should succeed, then gendoc should fail because an unknown
+    // projection value is invalid.  This verifies that dist embeds the
+    // reindex result in the gendoc failure message regardless of the
+    // failure reason.
     let outcome = client
         .call_tool(call_params(
             "alc_hub_dist",
             json!({
                 "source_dir": source_dir,
                 "output_path": output_path,
-                "projections": ["context7"],
+                "projections": ["invalid_projection_xyz"],
             }),
         ))
         .await;

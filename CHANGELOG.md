@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`AlreadyExists`) are surfaced via the MCP wire response. Companions
   the v0.26 pkg compat contract (commit `bce529a`): scaffolded packages
   are ecosystem-ready the moment they're created.
+- **`narrative` and `llms` projections for `alc_hub_dist` / `alc_hub_gendoc`**:
+  these projections were previously rejected with `unknown projection` even
+  though the embedded `gen_docs.lua` already emits `docs/narrative/{pkg}.md`,
+  `docs/llms.txt`, and `docs/llms-full.txt` unconditionally when
+  `lint_only=false`. The Rust-side allowlist now accepts `"narrative"` and
+  `"llms"` as valid `projections` values. No `gen_docs.lua` argv change is
+  needed (approach A): the files are produced whenever any non-lint-only
+  projection set is requested, regardless of whether `narrative`/`llms` appear
+  in the list. The MCP doc string for `alc_hub_gendoc` / `alc_hub_dist` is
+  also updated to list all accepted projection values, including the previously
+  undocumented `luacats`.
 
 ## [0.25.1] - 2026-04-23
 

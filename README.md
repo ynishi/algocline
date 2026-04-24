@@ -226,6 +226,9 @@ alc_continue({ session_id, response })
 | `alc_hub_search` | Search packages across remote Hub indices + local state |
 | `alc_hub_info` | Show detailed info for a single package (metadata, Cards, aliases, stats) |
 | `alc_hub_reindex` | Rebuild Hub index from locally installed packages |
+| `alc_hub_dist` | Generate and distribute documentation for a package hub (`hub`, `context7`, `devin`, `lint`, `lint_only`, `luacats`, `narrative`, `llms` projections) |
+| `alc_hub_gendoc` | Generate documentation for a single package (`hub`, `context7`, `devin`, `lint`, `lint_only`, `luacats`, `narrative`, `llms` projections) |
+| `alc_pkg_scaffold` | Generate a minimal package skeleton with `M.meta` / `M.run` template and pre-filled `alc_shapes_compat` range |
 | `alc_scenario_list` | List installed eval scenarios |
 | `alc_scenario_show` | Show an installed scenario's content |
 | `alc_scenario_install` | Install scenarios from Git URL or local path |

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.2] - 2026-04-24
+
+### Fixed
+
+- **`alc_pkg_install` no longer aborts on pre-existing `pkg_link` dev
+  symlinks.** In collection install mode, any entry whose destination
+  at `~/.algocline/packages/<name>` already points outside the packages
+  base (the canonical `pkg_link` case) previously produced a hard
+  `Path '<name>' escapes base directory` error from `ContainedPath::child`
+  and aborted the entire batch. The symlink is now detected via
+  `symlink_metadata()` before the containment check, routed to a new
+  `skipped_symlinks: [<name>, ...]` field in the response JSON, emitted
+  as a `tracing::warn!` line, and the installer continues with the
+  remaining pkgs. Operators run `alc_pkg_unlink <name>` if they want
+  the git-clone copy to replace the dev link.
+
 ## [0.26.1] - 2026-04-24
 
 ### Changed

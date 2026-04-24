@@ -209,6 +209,13 @@ impl AppService {
 
             let mut installed = Vec::new();
             let mut skipped = Vec::new();
+            // Dev symlinks (pkg_link scope=global) previously blocked collection
+            // install with a hard `ContainedPath::child` error because their
+            // `canonicalize` target lives outside the packages base. Collect
+            // them as a distinct "symlink-skipped" bucket, skip install for the
+            // affected pkg, and continue with the rest — the user runs
+            // `pkg_unlink <name>` if they want the git-clone copy to win.
+            let mut skipped_symlinks: Vec<String> = Vec::new();
 
             let entries = std::fs::read_dir(staging.path())
                 .map_err(|e| format!("Failed to read staging dir: {e}"))?;
@@ -223,6 +230,26 @@ impl AppService {
                     continue;
                 }
                 let pkg_name = entry.file_name().to_string_lossy().to_string();
+
+                // Pre-check: a legitimate `pkg_link` symlink at the destination
+                // points outside the packages base, which would fail
+                // `ContainedPath::child`'s canonicalize-escape check and abort
+                // the whole batch. Detect the symlink first and route to
+                // `skipped_symlinks` so the install proceeds for other pkgs.
+                let candidate = pkg_dir.join(&pkg_name);
+                if candidate
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    tracing::warn!(
+                        "pkg_install: skipping '{pkg_name}' — destination is an existing symlink \
+                         (likely a `pkg_link` dev link); run `pkg_unlink {pkg_name}` to replace it"
+                    );
+                    skipped_symlinks.push(pkg_name);
+                    continue;
+                }
+
                 // Go through ContainedPath::child to block path traversal from
                 // a malicious subdir name (`..`, `foo/../bar`) — the staging
                 // dir is untrusted input in the general case.
@@ -274,7 +301,7 @@ impl AppService {
                 }
             }
 
-            if installed.is_empty() && skipped.is_empty() {
+            if installed.is_empty() && skipped.is_empty() && skipped_symlinks.is_empty() {
                 return Err(
                     "No packages found. Expected init.lua at root (single) or */init.lua (collection)."
                         .to_string(),
@@ -304,6 +331,7 @@ impl AppService {
             let mut response = serde_json::json!({
                 "installed": installed,
                 "skipped": skipped,
+                "skipped_symlinks": skipped_symlinks,
                 "cards_installed": cards_installed,
                 "scenarios_installed": scenarios_installed,
                 "scenarios_failures": scenarios_failures,

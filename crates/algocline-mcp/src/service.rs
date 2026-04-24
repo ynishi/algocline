@@ -619,10 +619,11 @@ pub struct HubGendocParams {
     /// When omitted, only `narrative/{pkg}.md` + `llms.txt` +
     /// `llms-full.txt` are produced.
     pub projections: Option<Vec<String>>,
-    /// Path to a TOML or Lua file (selected by extension: `.toml` / `.lua`)
-    /// with top-level `context7` / `devin` tables. See
-    /// `docs/hub-gendoc-config.md` for the Lua schema. Required when
-    /// `projections` includes `"context7"` or `"devin"`.
+    /// Path to a TOML config file (optional). When omitted, the project
+    /// root's `alc.toml` is auto-explored and `[hub.context7]` / `[hub.devin]`
+    /// sections are used. Core defaults are applied when neither a
+    /// `config_path` nor `alc.toml` provides projection config. Passing a
+    /// `.lua` file is a typed error (retired in this version).
     pub config_path: Option<String>,
     /// Treat lint errors as a hard failure (equivalent to `--strict`).
     pub lint_strict: Option<bool>,
@@ -648,9 +649,11 @@ pub struct HubDistParams {
     /// Projections to emit (see `alc_hub_gendoc`).
     /// Unknown values are rejected with a typed `gendoc:` error.
     pub projections: Option<Vec<String>>,
-    /// Path to a TOML or Lua config file (see `alc_hub_gendoc`, selected by
-    /// extension). Required when `projections` includes `"context7"` or
-    /// `"devin"`.
+    /// Path to a TOML config file (optional). When omitted, the project
+    /// root's `alc.toml` is auto-explored and `[hub.context7]` / `[hub.devin]`
+    /// sections are used. Core defaults are applied when neither a
+    /// `config_path` nor `alc.toml` provides projection config. Passing a
+    /// `.lua` file is a typed error (retired in this version).
     pub config_path: Option<String>,
     /// Treat lint errors as a hard failure (see `alc_hub_gendoc`).
     pub lint_strict: Option<bool>,

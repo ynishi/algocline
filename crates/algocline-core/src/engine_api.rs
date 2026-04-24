@@ -367,15 +367,17 @@ pub trait EngineApi: Send + Sync {
     /// projections depending on `projections`:
     ///
     /// - `"hub"`       → `{out_dir}/hub/{pkg}.json`
-    /// - `"context7"`  → `{source_dir}/context7.json` (requires `config_path`)
-    /// - `"devin"`     → `{source_dir}/.devin/wiki.json` (requires `config_path`)
+    /// - `"context7"`  → `{source_dir}/context7.json`
+    /// - `"devin"`     → `{source_dir}/.devin/wiki.json`
     /// - `"lint"`      → run V0 lint pass (warnings only)
     /// - `"lint_only"` → run lint, skip file generation
     ///
-    /// `config_path` points at a TOML or Lua file (selected by extension:
-    /// `.toml` / `.lua`) with top-level `context7` / `devin` sub-tables.
-    /// It is required only when `projections` includes `"context7"` or
-    /// `"devin"`. See `docs/hub-gendoc-config.md` for the Lua schema.
+    /// `config_path` — optional path to a TOML config file. When omitted,
+    /// the project root's `alc.toml` is auto-explored for `[hub.context7]`
+    /// and `[hub.devin]` sections. Core defaults apply when neither a
+    /// `config_path` nor `alc.toml` provides projection config. Passing a
+    /// `.lua` path is a typed error (retired). See
+    /// `docs/hub-gendoc-config.md` for the full schema.
     ///
     /// Projection names are validated strictly and unknown values are
     /// rejected with `Err("gendoc: unknown projection ...")`.

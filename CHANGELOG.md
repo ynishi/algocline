@@ -70,6 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit flat `config_path=*.toml` with `[context7]` / `[devin]` sections
   continue to work unchanged.
 
+### Fixed
+
+- **`alc_hub_gendoc` / `alc_hub_dist` context7 projection: `projectTitle` was
+  always `null`.**  `HubProjectionConfig::to_context7_toml` now populates
+  `projectTitle` from the resolved name chain
+  (`[hub.<proj>].name > [hub].name > hub_index repo basename >
+  DEFAULT_NAME_FALLBACK`).  The precedence chain was already computed by
+  `resolved_name`; the output key was simply never written.
+- **`alc_hub_gendoc` / `alc_hub_dist` devin projection: `project_name` and
+  `description` were always `null`.**  `HubProjectionConfig::to_devin_toml`
+  now populates `project_name` from the same resolved name chain and
+  `description` from the resolved description chain
+  (`[hub.devin].description > [hub].description > DEFAULT_DEVIN_DESCRIPTION`).
+  The C7 `description` path was already wired; the Devin path was missing.
+
 ### Changed
 
 ## [0.25.1] - 2026-04-23

@@ -76,14 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always `null`.**  `HubProjectionConfig::to_context7_toml` now populates
   `projectTitle` from the resolved name chain
   (`[hub.<proj>].name > [hub].name > hub_index repo basename >
-  DEFAULT_NAME_FALLBACK`).  The precedence chain was already computed by
-  `resolved_name`; the output key was simply never written.
-- **`alc_hub_gendoc` / `alc_hub_dist` devin projection: `project_name` and
-  `description` were always `null`.**  `HubProjectionConfig::to_devin_toml`
-  now populates `project_name` from the same resolved name chain and
-  `description` from the resolved description chain
-  (`[hub.devin].description > [hub].description > DEFAULT_DEVIN_DESCRIPTION`).
-  The C7 `description` path was already wired; the Devin path was missing.
+  DEFAULT_NAME_FALLBACK`) and `description` from the resolved description
+  chain (`[hub.context7].description > [hub].description >
+  DEFAULT_C7_DESCRIPTION`).  The precedence chains were already computed;
+  the output keys were simply never written.  Devin identity fields
+  (`project_name`, `description`) are not emitted: the DeepWiki schema
+  (<https://docs.devin.ai/work-with-devin/deepwiki>) only documents
+  `repo_notes` and `pages` as recognised top-level keys.
 
 ### Changed
 

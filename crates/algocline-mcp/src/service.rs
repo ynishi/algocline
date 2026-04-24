@@ -614,7 +614,7 @@ pub struct HubGendocParams {
     /// `{source_dir}/docs`.
     pub out_dir: Option<String>,
     /// Projections to emit. Any subset of
-    /// `["hub", "context7", "devin", "lint", "lint_only"]`.
+    /// `["hub", "context7", "devin", "lint", "lint_only", "luacats", "narrative", "llms"]`.
     /// Unknown values are rejected with a typed `gendoc:` error.
     /// When omitted, only `narrative/{pkg}.md` + `llms.txt` +
     /// `llms-full.txt` are produced.

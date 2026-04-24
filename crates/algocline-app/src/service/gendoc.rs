@@ -54,6 +54,7 @@ use super::hub_dist_preset::load_hub_projection_config;
 use super::project::resolve_project_root;
 use super::AppService;
 
+pub mod alc_shapes_codegen;
 pub mod templates;
 
 // ── alc_shapes version pinning ────────────────────────────────────────

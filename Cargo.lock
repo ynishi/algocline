@@ -101,9 +101,13 @@ name = "algocline-mcp"
 version = "0.26.3"
 dependencies = [
  "algocline-app",
+ "algocline-core",
+ "async-trait",
  "rmcp",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

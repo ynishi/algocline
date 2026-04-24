@@ -164,11 +164,11 @@ impl HubProjectionConfig {
     /// suitable for passing to `inject_config_subtable` as the
     /// `tools.docs.context7_config` preload.
     ///
-    /// Shape: `{ name = "...", description = "...", rules = ["...", ...] }`
+    /// Shape: `{ projectTitle = "...", description = "...", rules = ["...", ...] }`
     pub fn to_context7_toml(&self) -> toml::Value {
         let mut map = toml::value::Table::new();
         map.insert(
-            "name".to_string(),
+            "projectTitle".to_string(),
             toml::Value::String(self.context7.name.clone()),
         );
         map.insert(
@@ -194,11 +194,11 @@ impl HubProjectionConfig {
     /// requires `type(note) == "table"` with a `note.content` string field.
     /// Passing plain strings produces a Lua runtime error at projection time.
     ///
-    /// Shape: `{ name = "...", description = "...", repo_notes = [{content = "..."}, ...] }`
+    /// Shape: `{ project_name = "...", description = "...", repo_notes = [{content = "..."}, ...] }`
     pub fn to_devin_toml(&self) -> toml::Value {
         let mut map = toml::value::Table::new();
         map.insert(
-            "name".to_string(),
+            "project_name".to_string(),
             toml::Value::String(self.devin.name.clone()),
         );
         map.insert(
@@ -923,5 +923,169 @@ projections = ["hub", "lint"]
                 _ => panic!("expected each repo_note to be a Table, got: {item:?}"),
             }
         }
+    }
+
+    #[test]
+    fn to_context7_toml_wires_project_title_from_hub_name() {
+        let cfg = HubProjectionConfig {
+            context7: ResolvedContext7 {
+                name: "my-project".to_string(),
+                description: "A description".to_string(),
+                rules: vec!["Rule 1".to_string()],
+            },
+            devin: ResolvedDevin {
+                name: "my-project".to_string(),
+                description: "desc".to_string(),
+                repo_notes: vec![],
+            },
+        };
+
+        let val = cfg.to_context7_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        // Key must be "projectTitle", not "name".
+        assert!(
+            table.get("name").is_none(),
+            "unexpected 'name' key in context7 output"
+        );
+        assert_eq!(
+            table.get("projectTitle"),
+            Some(&toml::Value::String("my-project".to_string())),
+            "expected projectTitle = 'my-project'"
+        );
+        assert_eq!(
+            table.get("description"),
+            Some(&toml::Value::String("A description".to_string())),
+            "expected description to be present"
+        );
+    }
+
+    #[test]
+    fn to_devin_toml_wires_project_name_from_hub_name() {
+        let cfg = HubProjectionConfig {
+            context7: ResolvedContext7 {
+                name: "my-project".to_string(),
+                description: "desc".to_string(),
+                rules: vec![],
+            },
+            devin: ResolvedDevin {
+                name: "my-project".to_string(),
+                description: "Devin description".to_string(),
+                repo_notes: vec![],
+            },
+        };
+
+        let val = cfg.to_devin_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        // Key must be "project_name", not "name".
+        assert!(
+            table.get("name").is_none(),
+            "unexpected 'name' key in devin output"
+        );
+        assert_eq!(
+            table.get("project_name"),
+            Some(&toml::Value::String("my-project".to_string())),
+            "expected project_name = 'my-project'"
+        );
+        assert_eq!(
+            table.get("description"),
+            Some(&toml::Value::String("Devin description".to_string())),
+            "expected description to be present"
+        );
+    }
+
+    #[test]
+    fn to_devin_toml_wires_description_core_default() {
+        // No alc.toml → load_hub_projection_config uses DEFAULT_DEVIN_DESCRIPTION.
+        let cfg = load_hub_projection_config(None).expect("load");
+
+        let val = cfg.to_devin_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        assert_eq!(
+            table.get("description"),
+            Some(&toml::Value::String(
+                templates::DEFAULT_DEVIN_DESCRIPTION.to_string()
+            )),
+            "expected DEFAULT_DEVIN_DESCRIPTION in devin output"
+        );
+    }
+
+    #[test]
+    fn to_context7_toml_uses_default_name_fallback_when_no_name_configured() {
+        // No alc.toml → load_hub_projection_config uses DEFAULT_NAME_FALLBACK.
+        let cfg = load_hub_projection_config(None).expect("load");
+
+        let val = cfg.to_context7_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        assert_eq!(
+            table.get("projectTitle"),
+            Some(&toml::Value::String(
+                templates::DEFAULT_NAME_FALLBACK.to_string()
+            )),
+            "expected DEFAULT_NAME_FALLBACK as projectTitle when no name configured"
+        );
+    }
+
+    #[test]
+    fn to_devin_toml_uses_default_name_fallback_when_no_name_configured() {
+        // No alc.toml → load_hub_projection_config uses DEFAULT_NAME_FALLBACK.
+        let cfg = load_hub_projection_config(None).expect("load");
+
+        let val = cfg.to_devin_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        assert_eq!(
+            table.get("project_name"),
+            Some(&toml::Value::String(
+                templates::DEFAULT_NAME_FALLBACK.to_string()
+            )),
+            "expected DEFAULT_NAME_FALLBACK as project_name when no name configured"
+        );
+    }
+
+    #[test]
+    fn to_context7_toml_propagates_hub_name_via_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::write(
+            root.join("alc.toml"),
+            r#"[hub]
+name = "test-hub"
+"#,
+        )
+        .expect("write alc.toml");
+
+        let cfg = load_hub_projection_config(Some(root)).expect("load");
+
+        let val = cfg.to_context7_toml();
+        let table = match &val {
+            toml::Value::Table(t) => t,
+            _ => panic!("expected Table"),
+        };
+
+        assert_eq!(
+            table.get("projectTitle"),
+            Some(&toml::Value::String("test-hub".to_string())),
+            "expected [hub].name to propagate to projectTitle"
+        );
     }
 }

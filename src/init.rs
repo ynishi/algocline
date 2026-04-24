@@ -73,15 +73,28 @@ fn types_dir() -> anyhow::Result<PathBuf> {
 /// Embedded at compile time, distributed to ~/.algocline/types/ on init.
 const ALC_TYPE_STUB: &str = include_str!("../types/alc.d.lua");
 
-/// Distribute alc.d.lua type stub to ~/.algocline/types/.
+/// LuaCats type definitions for alc_shapes editor completion (alc_shapes.d.lua).
+/// Embedded at compile time, distributed to ~/.algocline/types/ on init.
+const ALC_SHAPES_TYPE_STUB: &str = include_str!("../types/alc_shapes.d.lua");
+
+/// Paths to the installed type stub files distributed by [`distribute_types`].
+#[derive(Debug)]
+pub struct DistributedTypes {
+    pub alc: PathBuf,
+    pub alc_shapes: PathBuf,
+}
+
+/// Distribute alc.d.lua and alc_shapes.d.lua type stubs to ~/.algocline/types/.
 /// Always overwrites (version upgrade support).
-/// Returns the path to the installed type stub file.
-pub fn distribute_types() -> anyhow::Result<PathBuf> {
+/// Returns the paths to both installed type stub files.
+pub fn distribute_types() -> anyhow::Result<DistributedTypes> {
     let dir = types_dir()?;
     std::fs::create_dir_all(&dir)?;
-    let dest = dir.join("alc.d.lua");
-    std::fs::write(&dest, ALC_TYPE_STUB)?;
-    Ok(dest)
+    let alc = dir.join("alc.d.lua");
+    std::fs::write(&alc, ALC_TYPE_STUB)?;
+    let alc_shapes = dir.join("alc_shapes.d.lua");
+    std::fs::write(&alc_shapes, ALC_SHAPES_TYPE_STUB)?;
+    Ok(DistributedTypes { alc, alc_shapes })
 }
 
 /// Print .luarc.json setup guidance if not present in current directory.
@@ -102,9 +115,10 @@ fn print_luarc_guidance(types_path: &Path) {
 /// Distribute type stubs and print guidance. Non-fatal: warnings only on error.
 fn finalize_init() {
     match distribute_types() {
-        Ok(path) => {
-            eprintln!("Types installed: {}", path.display());
-            print_luarc_guidance(&path);
+        Ok(DistributedTypes { alc, alc_shapes }) => {
+            eprintln!("installed: {}", alc.display());
+            eprintln!("installed: {}", alc_shapes.display());
+            print_luarc_guidance(&alc);
         }
         Err(e) => {
             eprintln!("Warning: failed to install type stubs: {e}");

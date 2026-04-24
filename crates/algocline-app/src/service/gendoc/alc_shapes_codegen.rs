@@ -5,10 +5,8 @@
 //! consumed by the `gen_alc_shapes_dlua` example binary (manual regen)
 //! and the `alc_shapes_dlua_drift` integration test (drift-check CI guard).
 //!
-//! The `pub` items here are re-exported from `lib.rs` once the parent
-//! module chain gains public visibility (Subtask 2).  Until then the
-//! `dead_code` lint is suppressed at the module level.
-#![allow(dead_code)]
+//! The `pub` items here are re-exported from `lib.rs` via the visibility
+//! chain opened in Subtask 2 (`pub(crate) mod gendoc` in `service/mod.rs`).
 
 use mlua::Lua;
 

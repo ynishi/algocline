@@ -11,8 +11,8 @@ use std::sync::Arc;
 use algocline_app::EngineApi;
 use algocline_core::AppDir;
 use rmcp::model::{
-    Annotated, ListResourceTemplatesResult, ListResourcesResult, RawResource, ReadResourceResult,
-    Resource, ResourceContents, ResourceTemplate,
+    Annotated, ListResourceTemplatesResult, ListResourcesResult, RawResource, RawResourceTemplate,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
 };
 use rmcp::ErrorData as McpError;
 
@@ -153,7 +153,6 @@ fn parse_query(qs: &str, full_uri: &str) -> Result<HashMap<String, String>, UriP
 /// files under `AppDir::types_dir()`. Template resources are dispatched via
 /// the `EngineApi` trait and will be added in Subtask 2.
 pub struct ResourceCatalog {
-    #[allow(dead_code)]
     app: Arc<dyn EngineApi>,
     app_dir: Arc<AppDir>,
 }
@@ -191,24 +190,71 @@ impl ResourceCatalog {
 
     /// Return the list of resource templates (URI template notation, RFC 6570 level 1).
     ///
-    /// Template dispatch is implemented in Subtask 2. Returns an empty Vec
-    /// as a placeholder.
+    /// Returns the 7 approved V1 templates. `packages/{name}/narrative` is out
+    /// of scope for V1.
     pub fn list_templates(&self) -> Vec<ResourceTemplate> {
-        Vec::new()
+        vec![
+            make_template(
+                "alc://packages/{name}/init.lua",
+                "package-init-lua",
+                "Lua source of an installed package",
+                Some("text/x-lua"),
+            ),
+            make_template(
+                "alc://packages/{name}/meta",
+                "package-meta",
+                "Package metadata JSON (description, category, alc_shapes_compat)",
+                Some("application/json"),
+            ),
+            make_template(
+                "alc://cards/{card_id}",
+                "card",
+                "Immutable Card snapshot",
+                Some("application/json"),
+            ),
+            make_template(
+                "alc://cards/{card_id}/samples",
+                "card-samples",
+                "Per-case sample rows (paginate with ?offset=N&limit=M)",
+                Some("application/json"),
+            ),
+            make_template(
+                "alc://scenarios/{name}",
+                "scenario",
+                "Scenario Lua source",
+                Some("text/x-lua"),
+            ),
+            make_template(
+                "alc://eval/{result_id}",
+                "eval-result",
+                "Eval result detail ({strategy}_{timestamp_secs} id)",
+                Some("application/json"),
+            ),
+            make_template(
+                "alc://logs/{session_id}",
+                "session-log",
+                "Session log (paginate with ?limit=N&max_chars=M)",
+                Some("application/json"),
+            ),
+        ]
     }
 
     /// Read a resource by URI.
     ///
     /// Fixed resources (`alc://types/...`) are backed by `AppDir::types_dir()`.
-    /// Template resources are not yet implemented (Subtask 2) and will return
-    /// `McpError::invalid_params` with a pending stub message.
-    pub fn read(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+    /// Template resources are dispatched via `EngineApi`.
+    pub async fn read(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let parsed = parse_uri(uri).map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         match parsed.service.as_str() {
             "types" => self.read_types(uri, &parsed),
-            _ => Err(McpError::invalid_params(
-                format!("template dispatch: pending subtask-2 (uri={uri})"),
+            "packages" => self.read_packages(uri, &parsed).await,
+            "cards" => self.read_cards(uri, &parsed).await,
+            "scenarios" => self.read_scenarios(uri, &parsed).await,
+            "eval" => self.read_eval(uri, &parsed).await,
+            "logs" => self.read_logs(uri, &parsed).await,
+            other => Err(McpError::invalid_params(
+                format!("unknown service: {other}"),
                 None,
             )),
         }
@@ -217,6 +263,12 @@ impl ResourceCatalog {
     // ── Private dispatch helpers ──────────────────────────────────────────
 
     fn read_types(&self, uri: &str, parsed: &ParsedUri) -> Result<ReadResourceResult, McpError> {
+        if !parsed.query.is_empty() {
+            return Err(McpError::invalid_params(
+                format!("query params not supported on {uri}"),
+                None,
+            ));
+        }
         let file_name = parsed.segments.join("/");
         let path = self.app_dir.types_dir().join(&file_name);
 
@@ -239,7 +291,218 @@ impl ResourceCatalog {
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
+
+    async fn read_packages(
+        &self,
+        uri: &str,
+        parsed: &ParsedUri,
+    ) -> Result<ReadResourceResult, McpError> {
+        // Accepted: alc://packages/{name}/init.lua  or  alc://packages/{name}/meta
+        match parsed.segments.as_slice() {
+            [name, sub] if sub == "init.lua" => {
+                if !parsed.query.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("query params not supported on {uri}"),
+                        None,
+                    ));
+                }
+                let text = self.app.pkg_read_init_lua(name).await.map_err(err_to_mcp)?;
+                Ok(text_result(uri, text, "text/x-lua"))
+            }
+            [name, sub] if sub == "meta" => {
+                if !parsed.query.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("query params not supported on {uri}"),
+                        None,
+                    ));
+                }
+                // Use pkg_list with a name filter to retrieve metadata for a
+                // single package.  An empty result means the package is unknown.
+                let filter = serde_json::json!({ "name": name });
+                let json_str = self
+                    .app
+                    .pkg_list(
+                        None,
+                        None,
+                        None,
+                        Some(filter),
+                        None,
+                        Some("full".to_string()),
+                    )
+                    .await
+                    .map_err(err_to_mcp)?;
+                // Extract first entry from the `packages` array.
+                let val: serde_json::Value =
+                    serde_json::from_str(&json_str).map_err(|e| err_to_mcp(e.to_string()))?;
+                let pkgs = val
+                    .get("packages")
+                    .and_then(|p| p.as_array())
+                    .ok_or_else(|| {
+                        err_to_mcp("pkg_list response missing 'packages' field".into())
+                    })?;
+                if pkgs.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("resource not found: {uri}"),
+                        None,
+                    ));
+                }
+                let entry_json =
+                    serde_json::to_string(&pkgs[0]).map_err(|e| err_to_mcp(e.to_string()))?;
+                Ok(text_result(uri, entry_json, "application/json"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
+
+    async fn read_cards(
+        &self,
+        uri: &str,
+        parsed: &ParsedUri,
+    ) -> Result<ReadResourceResult, McpError> {
+        match parsed.segments.as_slice() {
+            [card_id] => {
+                // alc://cards/{card_id} — no query params allowed
+                if !parsed.query.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("query params not supported on {uri}"),
+                        None,
+                    ));
+                }
+                let json_str = self.app.card_get(card_id).await.map_err(err_to_mcp)?;
+                Ok(text_result(uri, json_str, "application/json"))
+            }
+            [card_id, sub] if sub == "samples" => {
+                // alc://cards/{card_id}/samples?offset=N&limit=M
+                let offset = parse_usize_param(&parsed.query, "offset", uri)?;
+                let limit = parse_usize_param(&parsed.query, "limit", uri)?
+                    .or(Some(DEFAULT_CARD_SAMPLES_LIMIT));
+                // Reject unknown query keys (only offset and limit are valid)
+                for key in parsed.query.keys() {
+                    if key != "offset" && key != "limit" {
+                        return Err(McpError::invalid_params(
+                            format!("unsupported query param '{key}' on {uri}"),
+                            None,
+                        ));
+                    }
+                }
+                let json_str = self
+                    .app
+                    .card_samples(card_id, offset, limit, None)
+                    .await
+                    .map_err(err_to_mcp)?;
+                Ok(text_result(uri, json_str, "application/json"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
+
+    async fn read_scenarios(
+        &self,
+        uri: &str,
+        parsed: &ParsedUri,
+    ) -> Result<ReadResourceResult, McpError> {
+        match parsed.segments.as_slice() {
+            [name] => {
+                if !parsed.query.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("query params not supported on {uri}"),
+                        None,
+                    ));
+                }
+                let text = self.app.scenario_show(name).await.map_err(err_to_mcp)?;
+                Ok(text_result(uri, text, "text/x-lua"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
+
+    async fn read_eval(
+        &self,
+        uri: &str,
+        parsed: &ParsedUri,
+    ) -> Result<ReadResourceResult, McpError> {
+        match parsed.segments.as_slice() {
+            [result_id] => {
+                if !parsed.query.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("query params not supported on {uri}"),
+                        None,
+                    ));
+                }
+                // Minimal format validation: must contain at least one '_'
+                // (strategy names themselves may contain underscores, so we
+                // only verify the minimum requirement).
+                if !result_id.contains('_') {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "invalid eval_id: must be {{strategy}}_{{timestamp}}, got '{result_id}'"
+                        ),
+                        None,
+                    ));
+                }
+                let json_str = self.app.eval_detail(result_id).await.map_err(err_to_mcp)?;
+                Ok(text_result(uri, json_str, "application/json"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
+
+    async fn read_logs(
+        &self,
+        uri: &str,
+        parsed: &ParsedUri,
+    ) -> Result<ReadResourceResult, McpError> {
+        match parsed.segments.as_slice() {
+            [session_id] => {
+                // alc://logs/{session_id}?limit=N&max_chars=M
+                let limit =
+                    parse_usize_param(&parsed.query, "limit", uri)?.or(Some(DEFAULT_LOGS_LIMIT));
+                let max_chars = parse_usize_param(&parsed.query, "max_chars", uri)?
+                    .or(Some(DEFAULT_LOGS_MAX_CHARS));
+                // Reject unknown query keys (only limit and max_chars are valid)
+                for key in parsed.query.keys() {
+                    if key != "limit" && key != "max_chars" {
+                        return Err(McpError::invalid_params(
+                            format!("unsupported query param '{key}' on {uri}"),
+                            None,
+                        ));
+                    }
+                }
+                let json_str = self
+                    .app
+                    .log_view(Some(session_id), limit, max_chars)
+                    .await
+                    .map_err(err_to_mcp)?;
+                Ok(text_result(uri, json_str, "application/json"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
 }
+
+// ─── Pagination defaults ──────────────────────────────────────────────────────
+
+/// Default `limit` for `alc://cards/{id}/samples` when `?limit=` is absent.
+pub const DEFAULT_CARD_SAMPLES_LIMIT: usize = 100;
+/// Default `limit` for `alc://logs/{session_id}` when `?limit=` is absent.
+pub const DEFAULT_LOGS_LIMIT: usize = 50;
+/// Default `max_chars` for `alc://logs/{session_id}` when `?max_chars=` is absent.
+pub const DEFAULT_LOGS_MAX_CHARS: usize = 20_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -254,10 +517,40 @@ pub fn build_list_templates_result(catalog: &ResourceCatalog) -> ListResourceTem
 }
 
 /// Convert an `EngineApi` `Err(String)` to a `McpError`.
-///
-/// Provided as a shared helper for Subtask 2's template dispatch.
 pub fn err_to_mcp(s: String) -> McpError {
     McpError::internal_error(s, None)
+}
+
+/// Parse a single usize query parameter by key.
+///
+/// Returns `Ok(None)` when the key is absent, `Err` when the value is present
+/// but cannot be parsed as `usize`. Never silently coerces parse failures to 0.
+fn parse_usize_param(
+    query: &HashMap<String, String>,
+    key: &str,
+    uri: &str,
+) -> Result<Option<usize>, McpError> {
+    match query.get(key) {
+        None => Ok(None),
+        Some(s) => s.parse::<usize>().map(Some).map_err(|e| {
+            McpError::invalid_params(
+                format!("invalid query param '{key}={s}' on {uri}: {e}"),
+                None,
+            )
+        }),
+    }
+}
+
+/// Produce a single-content `ReadResourceResult` with text content.
+fn text_result(uri: &str, text: String, mime_type: &str) -> ReadResourceResult {
+    ReadResourceResult {
+        contents: vec![ResourceContents::TextResourceContents {
+            uri: uri.to_string(),
+            mime_type: Some(mime_type.to_string()),
+            text,
+            meta: None,
+        }],
+    }
 }
 
 fn make_resource(uri: &str, name: &str, description: &str, mime_type: &str) -> Resource {
@@ -270,6 +563,23 @@ fn make_resource(uri: &str, name: &str, description: &str, mime_type: &str) -> R
         size: None,
         icons: None,
         meta: None,
+    };
+    Annotated::new(raw, None)
+}
+
+fn make_template(
+    uri_template: &str,
+    name: &str,
+    description: &str,
+    mime_type: Option<&str>,
+) -> ResourceTemplate {
+    let raw = RawResourceTemplate {
+        uri_template: uri_template.to_string(),
+        name: name.to_string(),
+        title: None,
+        description: Some(description.to_string()),
+        mime_type: mime_type.map(|s| s.to_string()),
+        icons: None,
     };
     Annotated::new(raw, None)
 }
@@ -634,22 +944,25 @@ mod tests {
         ) -> Result<String, String> {
             Err("noop".into())
         }
+        async fn pkg_read_init_lua(&self, _name: &str) -> Result<String, String> {
+            Err("noop".into())
+        }
         async fn info(&self) -> String {
             "noop".into()
         }
     }
 
-    // ── ResourceCatalog read tests ────────────────────────────────────────
+    // ── ResourceCatalog read tests (types — sync-converted to async) ─────
 
-    #[test]
-    fn read_types_alc_d_lua_ok() {
+    #[tokio::test]
+    async fn read_types_alc_d_lua_ok() {
         let tmp = tempfile::tempdir().unwrap();
         let types_dir = tmp.path().join("types");
         std::fs::create_dir_all(&types_dir).unwrap();
         std::fs::write(types_dir.join("alc.d.lua"), "-- stub content").unwrap();
 
         let catalog = make_test_catalog(tmp.path().to_path_buf());
-        let result = catalog.read("alc://types/alc.d.lua").unwrap();
+        let result = catalog.read("alc://types/alc.d.lua").await.unwrap();
         assert_eq!(result.contents.len(), 1);
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -662,11 +975,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_types_missing_file() {
+    #[tokio::test]
+    async fn read_types_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = make_test_catalog(tmp.path().to_path_buf());
-        let err = catalog.read("alc://types/alc.d.lua").unwrap_err();
+        let err = catalog.read("alc://types/alc.d.lua").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("resource not found"), "got: {msg}");
     }
@@ -682,9 +995,848 @@ mod tests {
     }
 
     #[test]
-    fn list_templates_is_empty_placeholder() {
+    fn list_templates_returns_7() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = make_test_catalog(tmp.path().to_path_buf());
-        assert!(catalog.list_templates().is_empty());
+        let templates = catalog.list_templates();
+        assert_eq!(templates.len(), 7, "expected exactly 7 templates");
+        // Spot-check uri_template and name fields.
+        assert_eq!(
+            templates[0].raw.uri_template,
+            "alc://packages/{name}/init.lua"
+        );
+        assert_eq!(templates[6].raw.uri_template, "alc://logs/{session_id}");
     }
+
+    // ── Template dispatch tests ───────────────────────────────────────────
+    //
+    // For these tests we use a custom `FakeEngine` that returns controlled
+    // responses for the specific methods under test.
+
+    struct FakeEngine {
+        pkg_init_lua: Option<Result<String, String>>,
+        pkg_list: Option<Result<String, String>>,
+        card_get: Option<Result<String, String>>,
+        card_samples: Option<(Option<usize>, Option<usize>, Result<String, String>)>,
+        scenario_show: Option<Result<String, String>>,
+        eval_detail: Option<Result<String, String>>,
+        log_view: Option<(Option<usize>, Option<usize>, Result<String, String>)>,
+    }
+
+    impl FakeEngine {
+        fn ok_init_lua(src: &str) -> Self {
+            Self {
+                pkg_init_lua: Some(Ok(src.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_pkg_list(json: &str) -> Self {
+            Self {
+                pkg_list: Some(Ok(json.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_card_get(json: &str) -> Self {
+            Self {
+                card_get: Some(Ok(json.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_card_samples(
+            expected_offset: Option<usize>,
+            expected_limit: Option<usize>,
+            json: &str,
+        ) -> Self {
+            Self {
+                card_samples: Some((expected_offset, expected_limit, Ok(json.to_string()))),
+                ..Self::noop()
+            }
+        }
+        fn ok_scenario_show(src: &str) -> Self {
+            Self {
+                scenario_show: Some(Ok(src.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_eval_detail(json: &str) -> Self {
+            Self {
+                eval_detail: Some(Ok(json.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_log_view(
+            expected_limit: Option<usize>,
+            expected_max_chars: Option<usize>,
+            json: &str,
+        ) -> Self {
+            Self {
+                log_view: Some((expected_limit, expected_max_chars, Ok(json.to_string()))),
+                ..Self::noop()
+            }
+        }
+        fn noop() -> Self {
+            Self {
+                pkg_init_lua: None,
+                pkg_list: None,
+                card_get: None,
+                card_samples: None,
+                scenario_show: None,
+                eval_detail: None,
+                log_view: None,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EngineApi for FakeEngine {
+        async fn pkg_read_init_lua(&self, _name: &str) -> Result<String, String> {
+            self.pkg_init_lua
+                .clone()
+                .unwrap_or(Err("not configured".into()))
+        }
+        async fn pkg_list(
+            &self,
+            _project_root: Option<String>,
+            _limit: Option<i32>,
+            _sort: Option<String>,
+            _filter: Option<serde_json::Value>,
+            _fields: Option<Vec<String>>,
+            _verbose: Option<String>,
+        ) -> Result<String, String> {
+            self.pkg_list
+                .clone()
+                .unwrap_or(Err("not configured".into()))
+        }
+        async fn card_get(&self, _card_id: &str) -> Result<String, String> {
+            self.card_get
+                .clone()
+                .unwrap_or(Err("not configured".into()))
+        }
+        async fn card_samples(
+            &self,
+            _card_id: &str,
+            offset: Option<usize>,
+            limit: Option<usize>,
+            _where_: Option<serde_json::Value>,
+        ) -> Result<String, String> {
+            if let Some((exp_offset, exp_limit, ref result)) = self.card_samples {
+                assert_eq!(offset, exp_offset, "card_samples offset mismatch");
+                assert_eq!(limit, exp_limit, "card_samples limit mismatch");
+                result.clone()
+            } else {
+                Err("not configured".into())
+            }
+        }
+        async fn scenario_show(&self, _name: &str) -> Result<String, String> {
+            self.scenario_show
+                .clone()
+                .unwrap_or(Err("not configured".into()))
+        }
+        async fn eval_detail(&self, _eval_id: &str) -> Result<String, String> {
+            self.eval_detail
+                .clone()
+                .unwrap_or(Err("not configured".into()))
+        }
+        async fn log_view(
+            &self,
+            _session_id: Option<&str>,
+            limit: Option<usize>,
+            max_chars: Option<usize>,
+        ) -> Result<String, String> {
+            if let Some((exp_limit, exp_max_chars, ref result)) = self.log_view {
+                assert_eq!(limit, exp_limit, "log_view limit mismatch");
+                assert_eq!(max_chars, exp_max_chars, "log_view max_chars mismatch");
+                result.clone()
+            } else {
+                Err("not configured".into())
+            }
+        }
+        // ── All other methods are noop stubs ────────────────────────────────
+        async fn run(
+            &self,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn advice(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn continue_single(
+            &self,
+            _: &str,
+            _: String,
+            _: Option<&str>,
+            _: Option<algocline_core::TokenUsage>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn continue_batch(
+            &self,
+            _: &str,
+            _: Vec<algocline_core::QueryResponse>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn status(
+            &self,
+            _: Option<&str>,
+            _: Option<serde_json::Value>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn eval(
+            &self,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<String>,
+            _: &str,
+            _: Option<serde_json::Value>,
+            _: bool,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn eval_history(&self, _: Option<&str>, _: usize) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn eval_compare(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn scenario_list(&self) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn scenario_install(&self, _: String) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_link(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: Option<bool>,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_install(&self, _: String, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_unlink(&self, _: String) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_remove(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_repair(&self, _: Option<String>, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_doctor(&self, _: Option<String>, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn add_note(&self, _: &str, _: &str, _: Option<&str>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn stats(&self, _: Option<&str>, _: Option<u64>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn init(&self, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn update(&self, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn migrate(&self, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_list(&self, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_find(
+            &self,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<serde_json::Value>,
+            _: Option<usize>,
+            _: Option<usize>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_alias_list(&self, _: Option<String>) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_get_by_alias(&self, _: &str) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_alias_set(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_append(&self, _: &str, _: serde_json::Value) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_install(&self, _: String) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn card_lineage(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<bool>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn hub_reindex(
+            &self,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn hub_gendoc(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: Option<Vec<String>>,
+            _: Option<String>,
+            _: Option<bool>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn hub_dist(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<Vec<String>>,
+            _: Option<String>,
+            _: Option<bool>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn hub_info(&self, _: String) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn hub_search(
+            &self,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<bool>,
+            _: Option<i32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<Vec<String>>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn pkg_scaffold(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn info(&self) -> String {
+            "fake".into()
+        }
+    }
+
+    fn make_fake_catalog(engine: FakeEngine) -> ResourceCatalog {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = Arc::new(AppDir::new(tmp.path().to_path_buf()));
+        // Leak the tempdir — tests are short-lived and OS reclaims on exit.
+        std::mem::forget(tmp);
+        ResourceCatalog::new(Arc::new(engine), app_dir)
+    }
+
+    // 1. read_pkg_init_lua_ok
+    #[tokio::test]
+    async fn read_pkg_init_lua_ok() {
+        let cat = make_fake_catalog(FakeEngine::ok_init_lua("return 42"));
+        let result = cat.read("alc://packages/mypkg/init.lua").await.unwrap();
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => {
+                assert_eq!(text, "return 42");
+                assert_eq!(mime_type.as_deref(), Some("text/x-lua"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    // 2. read_pkg_init_lua_not_found
+    #[tokio::test]
+    async fn read_pkg_init_lua_not_found() {
+        struct NotFoundEngine;
+        #[async_trait::async_trait]
+        impl EngineApi for NotFoundEngine {
+            async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String> {
+                Err(format!("pkg not found: {name}"))
+            }
+            async fn run(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn advice(
+                &self,
+                _: &str,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn continue_single(
+                &self,
+                _: &str,
+                _: String,
+                _: Option<&str>,
+                _: Option<algocline_core::TokenUsage>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn continue_batch(
+                &self,
+                _: &str,
+                _: Vec<algocline_core::QueryResponse>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn status(
+                &self,
+                _: Option<&str>,
+                _: Option<serde_json::Value>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn eval(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+                _: &str,
+                _: Option<serde_json::Value>,
+                _: bool,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn eval_history(&self, _: Option<&str>, _: usize) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn eval_detail(&self, _: &str) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn eval_compare(&self, _: &str, _: &str) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn scenario_list(&self) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn scenario_show(&self, _: &str) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn scenario_install(&self, _: String) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_link(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<bool>,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_list(
+                &self,
+                _: Option<String>,
+                _: Option<i32>,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+                _: Option<Vec<String>>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_install(&self, _: String, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_unlink(&self, _: String) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_remove(
+                &self,
+                _: &str,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_repair(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_doctor(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn add_note(&self, _: &str, _: &str, _: Option<&str>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn log_view(
+                &self,
+                _: Option<&str>,
+                _: Option<usize>,
+                _: Option<usize>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn stats(&self, _: Option<&str>, _: Option<u64>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn init(&self, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn update(&self, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn migrate(&self, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_list(&self, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_get(&self, _: &str) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_find(
+                &self,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+                _: Option<serde_json::Value>,
+                _: Option<usize>,
+                _: Option<usize>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_alias_list(&self, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_get_by_alias(&self, _: &str) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_alias_set(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_append(&self, _: &str, _: serde_json::Value) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_install(&self, _: String) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_samples(
+                &self,
+                _: &str,
+                _: Option<usize>,
+                _: Option<usize>,
+                _: Option<serde_json::Value>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn card_lineage(
+                &self,
+                _: &str,
+                _: Option<String>,
+                _: Option<usize>,
+                _: Option<bool>,
+                _: Option<Vec<String>>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn hub_reindex(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn hub_gendoc(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<Vec<String>>,
+                _: Option<String>,
+                _: Option<bool>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn hub_dist(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<Vec<String>>,
+                _: Option<String>,
+                _: Option<bool>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn hub_info(&self, _: String) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn hub_search(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<bool>,
+                _: Option<i32>,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+                _: Option<Vec<String>>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pkg_scaffold(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn info(&self) -> String {
+                "fake".into()
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = Arc::new(AppDir::new(tmp.path().to_path_buf()));
+        let cat = ResourceCatalog::new(Arc::new(NotFoundEngine), app_dir);
+        let err = cat
+            .read("alc://packages/missing/init.lua")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pkg not found") || msg.contains("internal"),
+            "got: {msg}"
+        );
+    }
+
+    // 3. read_pkg_meta_ok
+    #[tokio::test]
+    async fn read_pkg_meta_ok() {
+        let list_json = r#"{"packages":[{"name":"foo","version":"1.0"}]}"#;
+        let cat = make_fake_catalog(FakeEngine::ok_pkg_list(list_json));
+        let result = cat.read("alc://packages/foo/meta").await.unwrap();
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => {
+                assert!(text.contains("foo"));
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    // 4. read_pkg_meta_not_found
+    #[tokio::test]
+    async fn read_pkg_meta_not_found() {
+        let list_json = r#"{"packages":[]}"#;
+        let cat = make_fake_catalog(FakeEngine::ok_pkg_list(list_json));
+        let err = cat.read("alc://packages/unknown/meta").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("resource not found"), "got: {msg}");
+    }
+
+    // 5. read_card_get_ok
+    #[tokio::test]
+    async fn read_card_get_ok() {
+        let cat = make_fake_catalog(FakeEngine::ok_card_get(r#"{"id":"abc"}"#));
+        let result = cat.read("alc://cards/abc").await.unwrap();
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => {
+                assert!(text.contains("abc"));
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    // 6. read_card_get_not_found (engine returns error)
+    #[tokio::test]
+    async fn read_card_get_not_found() {
+        let cat = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://cards/missing").await.unwrap_err();
+        // NoopEngine returns "not configured" which becomes internal_error
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "expected non-empty error");
+    }
+
+    // 7. read_card_samples_with_pagination
+    #[tokio::test]
+    async fn read_card_samples_with_pagination() {
+        let cat = make_fake_catalog(FakeEngine::ok_card_samples(
+            Some(10),
+            Some(50),
+            r#"{"samples":[]}"#,
+        ));
+        let result = cat
+            .read("alc://cards/abc/samples?offset=10&limit=50")
+            .await
+            .unwrap();
+        assert_eq!(result.contents.len(), 1);
+    }
+
+    // 8. read_card_samples_default_limit
+    #[tokio::test]
+    async fn read_card_samples_default_limit() {
+        // When no limit query param, default should be Some(DEFAULT_CARD_SAMPLES_LIMIT).
+        let cat = make_fake_catalog(FakeEngine::ok_card_samples(
+            None,
+            Some(DEFAULT_CARD_SAMPLES_LIMIT),
+            r#"{"samples":[]}"#,
+        ));
+        let result = cat.read("alc://cards/abc/samples").await.unwrap();
+        assert_eq!(result.contents.len(), 1);
+    }
+
+    // 9. read_card_samples_rejects_unknown_query_param
+    #[tokio::test]
+    async fn read_card_samples_rejects_unknown_query_param() {
+        // Unknown key "foo" must be rejected even when offset/limit are valid.
+        let cat = make_fake_catalog(FakeEngine::noop());
+        let err = cat
+            .read("alc://cards/abc/samples?offset=0&limit=10&foo=bar")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported query param") && msg.contains("foo"),
+            "got: {msg}"
+        );
+    }
+
+    // 10. read_scenario_ok
+    #[tokio::test]
+    async fn read_scenario_ok() {
+        let cat = make_fake_catalog(FakeEngine::ok_scenario_show("-- scenario lua"));
+        let result = cat.read("alc://scenarios/myscenario").await.unwrap();
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => {
+                assert_eq!(text, "-- scenario lua");
+                assert_eq!(mime_type.as_deref(), Some("text/x-lua"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    // 10. read_eval_ok
+    #[tokio::test]
+    async fn read_eval_ok() {
+        let cat = make_fake_catalog(FakeEngine::ok_eval_detail(r#"{"id":"sc_1234"}"#));
+        let result = cat.read("alc://eval/sc_1234").await.unwrap();
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents { mime_type, .. } => {
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    // 11. read_eval_bad_id_format
+    #[tokio::test]
+    async fn read_eval_bad_id_format() {
+        let cat = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://eval/nounderscore").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid eval_id"), "got: {msg}");
+    }
+
+    // 12. read_logs_ok
+    #[tokio::test]
+    async fn read_logs_ok() {
+        let cat = make_fake_catalog(FakeEngine::ok_log_view(
+            Some(DEFAULT_LOGS_LIMIT),
+            Some(DEFAULT_LOGS_MAX_CHARS),
+            r#"{"entries":[]}"#,
+        ));
+        let result = cat.read("alc://logs/ses-abc123").await.unwrap();
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents { mime_type, .. } => {
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    // 13. read_logs_with_pagination
+    #[tokio::test]
+    async fn read_logs_with_pagination() {
+        let cat = make_fake_catalog(FakeEngine::ok_log_view(
+            Some(20),
+            Some(5000),
+            r#"{"entries":[]}"#,
+        ));
+        let result = cat
+            .read("alc://logs/ses-abc123?limit=20&max_chars=5000")
+            .await
+            .unwrap();
+        assert_eq!(result.contents.len(), 1);
+    }
+
+    // 14. list_templates_returns_7 — already covered above
 }

@@ -62,6 +62,7 @@
 mod doctor;
 mod install;
 mod list;
+pub(crate) mod read;
 mod remove;
 mod repair;
 

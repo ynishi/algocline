@@ -457,6 +457,12 @@ impl EngineApi for AppService {
         .map_err(|e| format!("hub_search task panicked: {e}"))?
     }
 
+    // ─── Package read ─────────────────────────────────────────
+
+    async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String> {
+        AppService::pkg_read_init_lua(self, name)
+    }
+
     // ─── Package scaffold ─────────────────────────────────────
 
     async fn pkg_scaffold(

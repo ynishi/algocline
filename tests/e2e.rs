@@ -1734,6 +1734,144 @@ async fn test_alc_hub_dist_with_toml_config_context7() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Create a hub fixture directory like `setup_hub_fixture`, but write a
+/// Lua config file (`configs.lua`) instead of (or alongside) `configs.toml`.
+/// The Lua file uses the wrapped shape:
+/// `return { context7 = {...}, devin = {...} }`.
+fn setup_hub_fixture_with_lua_config() -> tempfile::TempDir {
+    let tmp = setup_hub_fixture();
+
+    std::fs::write(
+        tmp.path().join("configs.lua"),
+        r#"return {
+    context7 = {
+        projectTitle = "e2e-test",
+        description = "e2e",
+        rules = {},
+    },
+    devin = {
+        project_name = "e2e-test",
+    },
+}
+"#,
+    )
+    .expect("write configs.lua");
+
+    tmp
+}
+
+/// Happy-path: `alc_hub_gendoc` with a `.lua` config_path must accept the
+/// Lua wrapped shape and generate `context7.json`.
+#[tokio::test]
+async fn test_alc_hub_gendoc_with_lua_config_context7() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture_with_lua_config();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let config_path = tmp
+        .path()
+        .join("configs.lua")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // gendoc requires an existing hub_index.json in source_dir.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let _resp = call_json(
+        &client,
+        "alc_hub_gendoc",
+        json!({
+            "source_dir": source_dir.clone(),
+            "projections": ["context7"],
+            "config_path": config_path,
+        }),
+    )
+    .await;
+
+    let context7_json = tmp.path().join("context7.json");
+    assert!(
+        context7_json.exists(),
+        "expected context7 projection to be generated at {} when using .lua config",
+        context7_json.display()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error-path: `alc_hub_gendoc` with a `.lua` config that has a syntax error
+/// must surface `is_error=true` with a message containing "lua eval failed".
+#[tokio::test]
+async fn test_alc_hub_gendoc_lua_config_eval_error() {
+    let client = connect().await;
+    let tmp = setup_hub_fixture();
+    let source_dir = tmp.path().to_str().expect("utf-8 path").to_string();
+    let output_path = tmp
+        .path()
+        .join("hub_index.json")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+
+    // Write a Lua file with a deliberate syntax error.
+    let broken_lua_path = tmp.path().join("broken.lua");
+    std::fs::write(&broken_lua_path, "return { unclosed").expect("write broken.lua");
+    let config_path = broken_lua_path.to_str().expect("utf-8 path").to_string();
+
+    // Need a hub_index.json first so gendoc reaches the config parsing step.
+    let _ = call_json(
+        &client,
+        "alc_hub_reindex",
+        json!({
+            "source_dir": source_dir.clone(),
+            "output_path": output_path,
+        }),
+    )
+    .await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_hub_gendoc",
+            json!({
+                "source_dir": source_dir,
+                "projections": ["context7"],
+                "config_path": config_path,
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for broken lua config, got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("lua eval failed"),
+                "expected error text to contain 'lua eval failed', got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
 #[tokio::test]
 async fn test_alc_hub_dist_gendoc_failure_includes_reindex_result() {
     let client = connect().await;

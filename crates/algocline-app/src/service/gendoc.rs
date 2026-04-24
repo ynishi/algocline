@@ -521,6 +521,14 @@ struct ProjectionFlags {
     lint: bool,
     lint_only: bool,
     luacats: bool,
+    /// narrative/{pkg}.md files are unconditionally emitted by the embedded
+    /// gen_docs.lua when lint_only=false, so this flag only acts as an
+    /// allowlist gate on the Rust side (approach A).
+    narrative: bool,
+    /// llms.txt and llms-full.txt are unconditionally emitted by the embedded
+    /// gen_docs.lua when lint_only=false, so this flag only acts as an
+    /// allowlist gate on the Rust side (approach A).
+    llms: bool,
 }
 
 impl ProjectionFlags {
@@ -540,9 +548,11 @@ impl ProjectionFlags {
                     f.lint = true;
                 }
                 "luacats" => f.luacats = true,
+                "narrative" => f.narrative = true,
+                "llms" => f.llms = true,
                 _ => {
                     return Err(format!(
-                        "gendoc: unknown projection '{p}' (allowed: hub, context7, devin, lint, lint_only, luacats)"
+                        "gendoc: unknown projection '{p}' (allowed: hub, context7, devin, lint, lint_only, luacats, narrative, llms)"
                     ));
                 }
             }
@@ -951,6 +961,20 @@ mod tests {
         let list = vec!["nope".to_string(), "hub".to_string()];
         let err = ProjectionFlags::from_list(Some(&list)).expect_err("must reject unknown");
         assert!(err.contains("unknown projection"));
+    }
+
+    #[test]
+    fn projection_flags_narrative_and_llms_parse() {
+        // narrative and llms are accepted as valid projections.
+        // On the gen_docs.lua side these are unconditionally emitted when
+        // lint_only=false, so the Rust flags act only as an allowlist gate
+        // (approach A: no argv is pushed to gen_docs.lua for these).
+        let list = vec!["narrative".to_string(), "llms".to_string()];
+        let f = ProjectionFlags::from_list(Some(&list)).expect("projection parse");
+        assert!(f.narrative, "narrative flag must be set");
+        assert!(f.llms, "llms flag must be set");
+        assert!(!f.hub, "hub must remain false");
+        assert!(!f.lint, "lint must remain false");
     }
 
     #[test]

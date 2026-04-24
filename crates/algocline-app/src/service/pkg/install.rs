@@ -192,6 +192,9 @@ impl AppService {
             if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
             }
+            if let Some(tp) = super::super::resolve::alc_shapes_types_stub_path(&app_dir) {
+                response["alc_shapes_types_path"] = serde_json::Value::String(tp);
+            }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
@@ -340,6 +343,9 @@ impl AppService {
             if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
             }
+            if let Some(tp) = super::super::resolve::alc_shapes_types_stub_path(&app_dir) {
+                response["alc_shapes_types_path"] = serde_json::Value::String(tp);
+            }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
@@ -436,6 +442,9 @@ impl AppService {
             });
             if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
+            }
+            if let Some(tp) = super::super::resolve::alc_shapes_types_stub_path(&app_dir) {
+                response["alc_shapes_types_path"] = serde_json::Value::String(tp);
             }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
@@ -540,6 +549,9 @@ impl AppService {
             });
             if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
                 response["types_path"] = serde_json::Value::String(tp);
+            }
+            if let Some(tp) = super::super::resolve::alc_shapes_types_stub_path(&app_dir) {
+                response["alc_shapes_types_path"] = serde_json::Value::String(tp);
             }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);

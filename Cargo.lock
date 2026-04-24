@@ -43,6 +43,7 @@ version = "0.26.2"
 dependencies = [
  "algocline-core",
  "algocline-engine",
+ "anyhow",
  "async-trait",
  "dirs",
  "fs4",

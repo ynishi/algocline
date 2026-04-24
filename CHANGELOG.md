@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-04-24
+
+### Changed
+
+- **BUNDLED_VERSION bump**: `BUNDLED_SOURCES` for
+  `algocline-bundled-packages` moved from `v0.18.0` → `v0.19.0`.
+  `v0.19.0` is the first bundled release that tracks the v0.26 core
+  migration — Lua `context7_config.lua` / `devin_wiki_config.lua`
+  retired, project-specific content migrated to `alc.toml`
+  `[hub] / [hub.context7] / [hub.devin]` sections, and the `just dist`
+  pipeline streamlined to a single `alc_hub_dist` MCP call without
+  `config_path`. `alc init` now pulls the v0.26-ready bundled repo.
+
 ## [0.26.0] - 2026-04-24
 
 ### Added

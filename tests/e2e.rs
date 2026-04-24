@@ -7,7 +7,11 @@
 use std::borrow::Cow;
 use std::io::Write;
 
-use rmcp::{model::CallToolRequestParams, transport::TokioChildProcess, ServiceExt};
+use rmcp::{
+    model::{CallToolRequestParams, ReadResourceRequestParams},
+    transport::TokioChildProcess,
+    ServiceExt,
+};
 use serde_json::{json, Map, Value};
 
 use algocline_app::PRESET_CATALOG_VERSION;
@@ -78,6 +82,51 @@ fn redact_paths(text: &str) -> String {
 /// Apply all redactions.
 fn redact(text: &str) -> String {
     redact_paths(&redact_uuids(text))
+}
+
+/// Connect with a specific ALC_HOME directory.
+///
+/// Also sets `ALC_PACKAGES_PATH` to `{alc_home}/packages` so that the server's
+/// package search path is scoped to the tmp directory. Without this, `pkg_list`
+/// would scan `~/.algocline/packages/` instead of the test fixture.
+async fn connect_with_alc_home(
+    alc_home: &std::path::Path,
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let bin = std::env::var("CARGO_BIN_EXE_alc")
+        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
+    let packages_path = alc_home.join("packages");
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("ALC_HOME", alc_home)
+        .env("ALC_PACKAGES_PATH", &packages_path);
+    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
+    ().serve(transport)
+        .await
+        .expect("failed to initialize MCP session")
+}
+
+/// Read a resource by URI, returning the result.
+async fn read_resource(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    uri: &str,
+) -> Result<rmcp::model::ReadResourceResult, rmcp::service::ServiceError> {
+    client
+        .read_resource(ReadResourceRequestParams {
+            uri: uri.to_string(),
+            meta: None,
+        })
+        .await
+}
+
+/// Extract text from a `ResourceContents` variant.
+fn resource_text(contents: &rmcp::model::ResourceContents) -> (&str, &str) {
+    match contents {
+        rmcp::model::ResourceContents::TextResourceContents { uri, text, .. } => {
+            (uri.as_str(), text.as_str())
+        }
+        rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => {
+            panic!("expected TextResourceContents, got BlobResourceContents for URI {uri}")
+        }
+    }
 }
 
 /// Call a tool, extract text, parse as JSON.
@@ -2851,6 +2900,275 @@ async fn test_alc_hub_dist_compat_undeclared_warns() {
         warnings_str.contains("alc_shapes_compat not declared"),
         "expected 'alc_shapes_compat not declared' in warnings, got: {warnings_str}"
     );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+// ─── MCP Resources E2E ──────────────────────────────────────────
+
+/// `resources/list` must return exactly 2 fixed resources.
+#[tokio::test]
+async fn test_mcp_resources_list_returns_two_fixed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .list_resources(None)
+        .await
+        .expect("list_resources failed");
+
+    assert_eq!(
+        result.resources.len(),
+        2,
+        "expected 2 fixed resources, got: {:?}",
+        result
+            .resources
+            .iter()
+            .map(|r| r.raw.uri.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let uris: Vec<&str> = result
+        .resources
+        .iter()
+        .map(|r| r.raw.uri.as_str())
+        .collect();
+    assert!(
+        uris.contains(&"alc://types/alc.d.lua"),
+        "expected alc://types/alc.d.lua in fixed list"
+    );
+    assert!(
+        uris.contains(&"alc://types/alc_shapes.d.lua"),
+        "expected alc://types/alc_shapes.d.lua in fixed list"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `resources/templates/list` must return exactly 7 templates.
+#[tokio::test]
+async fn test_mcp_resource_templates_list_returns_seven() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .list_resource_templates(None)
+        .await
+        .expect("list_resource_templates failed");
+
+    assert_eq!(
+        result.resource_templates.len(),
+        7,
+        "expected 7 resource templates, got: {:?}",
+        result
+            .resource_templates
+            .iter()
+            .map(|t| t.raw.uri_template.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://types/alc.d.lua` when the file exists.
+#[tokio::test]
+async fn test_mcp_resource_read_types_alc_d_lua() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let types_dir = tmp.path().join("types");
+    std::fs::create_dir_all(&types_dir).expect("create types dir");
+    std::fs::write(
+        types_dir.join("alc.d.lua"),
+        "-- alc type stubs\n---@class alc\nalc = {}\n",
+    )
+    .expect("write alc.d.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://types/alc.d.lua")
+        .await
+        .expect("read_resource alc.d.lua failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (uri, text) = resource_text(&result.contents[0]);
+    assert!(
+        text.contains("alc type stubs"),
+        "unexpected content: {text}"
+    );
+    assert_eq!(uri, "alc://types/alc.d.lua");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://types/alc_shapes.d.lua` when the file exists.
+#[tokio::test]
+async fn test_mcp_resource_read_types_alc_shapes_d_lua() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let types_dir = tmp.path().join("types");
+    std::fs::create_dir_all(&types_dir).expect("create types dir");
+    std::fs::write(
+        types_dir.join("alc_shapes.d.lua"),
+        "-- alc_shapes type stubs\n",
+    )
+    .expect("write alc_shapes.d.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://types/alc_shapes.d.lua")
+        .await
+        .expect("read_resource alc_shapes.d.lua failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    assert!(text.contains("alc_shapes"), "unexpected content: {text}");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://packages/{name}/init.lua` when the package exists.
+#[tokio::test]
+async fn test_mcp_resource_read_pkg_init_lua() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("my_e2e_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'my_e2e_pkg', version = '0.1.0' }\nreturn M\n",
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://packages/my_e2e_pkg/init.lua")
+        .await
+        .expect("read_resource pkg init.lua failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (uri, text) = resource_text(&result.contents[0]);
+    assert!(text.contains("my_e2e_pkg"), "unexpected content: {text}");
+    assert_eq!(uri, "alc://packages/my_e2e_pkg/init.lua");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://packages/{name}/meta` when a package is pre-installed in ALC_HOME.
+///
+/// The package directory is created before starting the server so that the
+/// server's startup search-path resolution includes `$ALC_HOME/packages/`.
+#[tokio::test]
+async fn test_mcp_resource_read_pkg_meta() {
+    let home_tmp = tempfile::tempdir().expect("home tempdir");
+
+    // Pre-create the packages directory and the package so the server startup
+    // includes it in `ALC_PACKAGES_PATH` search path resolution.
+    let pkg_dir = home_tmp.path().join("packages").join("my_e2e_meta_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'my_e2e_meta_pkg', version = '0.2.0', description = 'test' }\n",
+            "return M\n"
+        ),
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(home_tmp.path()).await;
+
+    let result = read_resource(&client, "alc://packages/my_e2e_meta_pkg/meta")
+        .await
+        .expect("read_resource pkg meta failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    let meta: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("meta JSON parse failed: {e}\nraw: {text}"));
+    assert_eq!(meta["name"], "my_e2e_meta_pkg");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read an unknown service → `McpError` returned to the client.
+#[tokio::test]
+async fn test_mcp_resource_read_unknown_uri_returns_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let err = read_resource(&client, "alc://unknown/resource")
+        .await
+        .expect_err("expected error for unknown URI");
+
+    let msg = err.to_string();
+    assert!(
+        !msg.is_empty(),
+        "expected non-empty error for unknown URI, got empty"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read a URI with an invalid scheme → `McpError` returned to the client.
+#[tokio::test]
+async fn test_mcp_resource_read_invalid_scheme_returns_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let err = read_resource(&client, "https://example.com/foo")
+        .await
+        .expect_err("expected error for invalid scheme");
+
+    let msg = err.to_string();
+    assert!(
+        !msg.is_empty(),
+        "expected non-empty error for invalid scheme, got empty"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read a URI with a path traversal segment → `McpError` returned.
+#[tokio::test]
+async fn test_mcp_resource_read_traversal_uri_returns_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let err = read_resource(&client, "alc://types/../etc/passwd")
+        .await
+        .expect_err("expected error for traversal URI");
+
+    let msg = err.to_string();
+    assert!(
+        !msg.is_empty(),
+        "expected non-empty error for traversal URI, got empty"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://scenarios/{name}` when the scenario exists.
+#[tokio::test]
+async fn test_mcp_resource_read_scenario() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let scenarios_dir = tmp.path().join("scenarios");
+    std::fs::create_dir_all(&scenarios_dir).expect("create scenarios dir");
+    std::fs::write(
+        scenarios_dir.join("my_scenario.lua"),
+        "-- scenario\nlocal S = {}\nS.cases = {}\nreturn S\n",
+    )
+    .expect("write scenario");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://scenarios/my_scenario")
+        .await
+        .expect("read_resource scenario failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    assert!(text.contains("scenario"), "unexpected content: {text}");
 
     client.cancel().await.expect("cancel failed");
 }

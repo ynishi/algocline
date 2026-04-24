@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP Resources capability** — `algocline-mcp` now advertises `resources`
+  alongside `tools`. Service-layer read-only paths are projected as MCP
+  resources under the `alc://` scheme:
+  - Fixed (`resources/list`): `alc://types/alc.d.lua`, `alc://types/alc_shapes.d.lua`
+  - Templates (`resources/templates/list`): `alc://packages/{name}/init.lua`,
+    `alc://packages/{name}/meta`, `alc://cards/{card_id}`,
+    `alc://cards/{card_id}/samples`, `alc://scenarios/{name}`,
+    `alc://eval/{result_id}`, `alc://logs/{session_id}`
+  - Pagination via query string for samples/logs (`?offset=N&limit=M`).
+  - MIME: `.lua` → `text/x-lua`, JSON → `application/json`.
+  - See `docs/mcp-resources.md` for the full catalog and `@alc:<uri>` mention examples.
+
+  Out of scope for this release (candidates for follow-up):
+  - `alc://hub/index` — pending canonical AppDir path for `hub_reindex` default output.
+  - `alc://packages/{name}/narrative` — `hub_gendoc` currently emits to an external `out_dir`.
+  - `list_changed` notifications and `resources/subscribe` — static capability only in V1.
+
+### Changed
+
+- `EngineApi` trait: added `pkg_read_init_lua(name)` (breaking for `EngineApi`
+  implementors only; MCP wire shape is additive).
+- `AlcService::new` now takes `Arc<AppDir>` as a second argument (additive
+  constructor change for library embedders; MCP wire shape unchanged).
+  `AppConfig::app_dir()` accessor can be used to obtain the handle before
+  casting `Arc<AppService>` to `Arc<dyn EngineApi>`.
+
 ## [0.26.3] - 2026-04-24
 
 ### Changed

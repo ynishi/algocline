@@ -145,8 +145,9 @@ async fn main() -> anyhow::Result<()> {
     let search_paths = resolve_lib_paths();
     let lib_paths: Vec<_> = search_paths.iter().map(|sp| sp.path.clone()).collect();
     let executor = Arc::new(Executor::new(lib_paths).await?);
+    let app_dir = config.app_dir(); // Arc<AppDir> — resolved before AppService construction
     let app = Arc::new(AppService::new(executor, config, search_paths));
-    let server = AlcService::new(app as Arc<dyn EngineApi>);
+    let server = AlcService::new(app as Arc<dyn EngineApi>, app_dir);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

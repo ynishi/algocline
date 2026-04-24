@@ -1,13 +1,22 @@
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, ServerHandler,
+    model::{
+        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ServerCapabilities, ServerInfo,
+    },
+    schemars,
+    service::RequestContext,
+    service::RoleServer,
+    tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
 
 use std::sync::Arc;
 
 use algocline_app::{EngineApi, QueryResponse};
+use algocline_core::AppDir;
+
+use crate::resources::{build_list_resources_result, build_list_templates_result, ResourceCatalog};
 
 // ─── MCP Parameter types (schemars-annotated) ───────────────────
 
@@ -745,14 +754,17 @@ pub struct HubSearchParams {
 pub struct AlcService {
     tool_router: ToolRouter<Self>,
     app: Arc<dyn EngineApi>,
+    resource_catalog: Arc<ResourceCatalog>,
 }
 
 #[tool_router]
 impl AlcService {
-    pub fn new(app: Arc<dyn EngineApi>) -> Self {
+    pub fn new(app: Arc<dyn EngineApi>, app_dir: Arc<AppDir>) -> Self {
+        let resource_catalog = Arc::new(ResourceCatalog::new(app.clone(), app_dir));
         Self {
             tool_router: Self::tool_router(),
             app,
+            resource_catalog,
         }
     }
 
@@ -1687,9 +1699,36 @@ impl ServerHandler for AlcService {
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
                     .into(),
             ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             ..Default::default()
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        Ok(build_list_resources_result(&self.resource_catalog))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
+        Ok(build_list_templates_result(&self.resource_catalog))
+    }
+
+    async fn read_resource(
+        &self,
+        req: ReadResourceRequestParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResult, rmcp::ErrorData> {
+        self.resource_catalog.read(&req.uri).await
     }
 }
 

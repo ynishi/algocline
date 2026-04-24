@@ -48,6 +48,8 @@ use thiserror::Error;
 
 use super::AppService;
 
+pub mod templates;
+
 // ── alc_shapes version pinning ────────────────────────────────────────
 
 /// Version string embedded in the vendored `alc_shapes/init.lua`.

@@ -152,12 +152,46 @@ check-invariants:
 # ─── Publish ────────────────────────────────────────────────────
 
 # Dry-run publish check (dependency order)
+#
+# NOTE: only the leaf (algocline-core) actually verifies — intermediate crates
+# (engine/app/mcp/root) fail on dry-run because they reference the new version
+# of upstream crates not yet on crates.io (cargo-release issue #691). Use this
+# for syntax / Cargo.toml metadata checks; real verification happens during
+# `just publish`.
 publish-dry:
     cargo publish -p algocline-core --dry-run
     cargo publish -p algocline-engine --dry-run
     cargo publish -p algocline-app --dry-run
     cargo publish -p algocline-mcp --dry-run
     cargo publish -p algocline --dry-run
+
+# Publish to crates.io in dependency order, then tag + push.
+#
+# Usage: just publish 0.27.0
+#
+# Pre-check verifies the passed VERSION matches Cargo.toml workspace version
+# to prevent typos. Each `cargo publish` is followed by a 60s sleep so the
+# crates.io index propagates before the next dependent crate is uploaded
+# (CLAUDE.md §crates.io公開).
+#
+# NOT allow-agent — irreversible upload + git push. Human-only execution.
+publish VERSION:
+    @ACTUAL=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2); \
+        if [ "$ACTUAL" != "{{VERSION}}" ]; then \
+            echo "ERROR: Cargo.toml workspace.package.version is $ACTUAL, but you passed {{VERSION}}"; \
+            exit 1; \
+        fi
+    cargo publish -p algocline-core
+    sleep 60
+    cargo publish -p algocline-engine
+    sleep 60
+    cargo publish -p algocline-app
+    sleep 60
+    cargo publish -p algocline-mcp
+    sleep 60
+    cargo publish
+    git tag v{{VERSION}}
+    git push origin v{{VERSION}}
 
 # ─── Codegen ────────────────────────────────────────────────────
 

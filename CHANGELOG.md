@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.27.0] - 2026-04-25
 
 ### Added
 
@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor change for library embedders; MCP wire shape unchanged).
   `AppConfig::app_dir()` accessor can be used to obtain the handle before
   casting `Arc<AppService>` to `Arc<dyn EngineApi>`.
+- `EngineApi` trait: added `pkg_meta(name)` method so the MCP `read_packages`
+  meta arm avoids a JSON round-trip via `pkg_list` (breaking for `EngineApi`
+  implementors only; MCP wire shape is additive).
+
+### Internal
+
+- Extracted `engine_default_err!` macro in `algocline-mcp` test module to
+  deduplicate `EngineApi` test stub boilerplate (45-method trait — eliminates
+  per-stub edits when adding new methods). Applied to `NoopEngine`;
+  `FakeEngine` builder and `NotFoundEngine` overrides remain handwritten.
 
 ## [0.26.3] - 2026-04-24
 

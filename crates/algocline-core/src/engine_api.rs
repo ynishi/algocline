@@ -509,6 +509,13 @@ pub trait EngineApi: Send + Sync {
     /// why the package was not found or could not be read.
     async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String>;
 
+    /// Read metadata for a single installed package.
+    ///
+    /// Returns the JSON object string for one package entry (the same shape
+    /// `pkg_list` returns inside `packages[*]`). `Err("pkg not found: ...")`
+    /// when the package is unknown.
+    async fn pkg_meta(&self, name: &str) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

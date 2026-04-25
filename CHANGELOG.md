@@ -26,6 +26,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `alc://packages/{name}/narrative` — `hub_gendoc` currently emits to an external `out_dir`.
   - `list_changed` notifications and `resources/subscribe` — static capability only in V1.
 
+### Fixed
+
+- **MCP Resources — pagination caps**: `?limit=` and `?offset=` on
+  `alc://cards/{id}/samples` and `alc://logs/{session_id}` are now capped
+  (10,000 / 10,000,000 / 10,000 / 1,000,000 respectively). Values above the
+  cap return `invalid_params`. Prevents MCP-DoS via unbounded allocation.
+- **MCP Resources — ID reserved-char rejection**: card_id, session_id, eval
+  result_id, package name, and scenario name are now validated at the MCP
+  boundary. URI-reserved characters (`& = ? / % SPACE`) return `invalid_params`.
+- **MCP Resources — eval ID strict validation**: `alc://eval/{result_id}` now
+  validates `^[A-Za-z0-9-]+_\d+$` instead of a bare `contains('_')` check.
+- **MCP Resources — `read_types` explicit match**: only `alc.d.lua` and
+  `alc_shapes.d.lua` are accepted as file names; any multi-segment or
+  unrecognized path returns `invalid_params`.
+- **MCP Resources — `parse_query` `=` in value**: removed erroneous rejection
+  of query values containing `=` (e.g. `?key=a=b` is now accepted; `split_once`
+  already splits on the first `=` only).
+- **`pkg_read_init_lua` — malformed `alc.local.toml` propagation**: a corrupt
+  local TOML file now returns `Err` (surfaced to MCP caller) instead of being
+  silently swallowed via `tracing::warn!`. (CLAUDE.md §Service 層の Error 伝播規律)
+- **MCP Resources — `pkg_meta` trait method**: extracted `EngineApi::pkg_meta`
+  to avoid a JSON round-trip in the MCP layer; `read_packages` meta arm now
+  delegates to the new method. (breaking for `EngineApi` implementors only)
+- **MCP Resources — tempdir leak in test helper**: `make_fake_catalog` now
+  returns `(ResourceCatalog, TempDir)` instead of leaking via `mem::forget`.
+- **MCP Resources — 4 missing E2E smoke tests**: added
+  `test_mcp_resource_read_card`, `test_mcp_resource_read_card_samples_pagination`,
+  `test_mcp_resource_read_eval_detail`, and `test_mcp_resource_read_logs_pagination`.
+
 ### Changed
 
 - `EngineApi` trait: added `pkg_read_init_lua(name)` (breaking for `EngineApi`

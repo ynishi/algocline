@@ -3320,3 +3320,161 @@ async fn test_mcp_resource_read_logs_pagination() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_pkg_doctor — incomplete_pkg bucket ──────────────────────
+
+/// Happy path: multi-file package with all subs present → `healthy` bucket.
+///
+/// Fixture layout:
+///   source/e2e_doctor_complete/
+///     init.lua   (requires "e2e_doctor_complete.sub")
+///     sub.lua
+///
+/// After install via `alc_pkg_install`, doctor should classify the package as
+/// `healthy` (all required submodule files are present).
+#[tokio::test]
+async fn test_pkg_doctor_multifile_healthy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Build source package with init.lua + sub.lua.
+    let source_root = tempfile::tempdir().expect("source tempdir");
+    let pkg_src = source_root.path().join("e2e_doctor_complete");
+    std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
+    std::fs::write(
+        pkg_src.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_doctor_complete", version = "0.1.0" }
+local sub = require("e2e_doctor_complete.sub")
+function M.run(ctx) return sub.hello() end
+return M"#,
+    )
+    .expect("write init.lua");
+    std::fs::write(
+        pkg_src.join("sub.lua"),
+        r#"return { hello = function() return "hi" end }"#,
+    )
+    .expect("write sub.lua");
+
+    // Install the package into the isolated ALC_HOME.
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_src.to_string_lossy() }),
+    )
+    .await;
+
+    // Doctor should report the package as healthy.
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_doctor_complete" }),
+    )
+    .await;
+
+    let healthy = resp["healthy"].as_array().expect("healthy array missing");
+    assert!(
+        healthy.iter().any(|e| e["name"] == "e2e_doctor_complete"),
+        "e2e_doctor_complete should be in healthy bucket, got: {resp}"
+    );
+    let incomplete = resp["incomplete_pkg"]
+        .as_array()
+        .expect("incomplete_pkg array missing");
+    assert!(
+        incomplete.is_empty(),
+        "incomplete_pkg should be empty for complete package, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Defect path: init.lua requires a sibling submodule that is missing →
+/// `incomplete_pkg` bucket with the sub name and a suggestion.
+///
+/// Fixture layout after install + manual removal:
+///   packages/e2e_doctor_incomplete/
+///     init.lua   (requires "e2e_doctor_incomplete.missing_sub")
+///     (missing_sub.lua intentionally removed after install)
+#[tokio::test]
+async fn test_pkg_doctor_incomplete_pkg_detected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Build source package with init.lua + missing_sub.lua.
+    let source_root = tempfile::tempdir().expect("source tempdir");
+    let pkg_src = source_root.path().join("e2e_doctor_incomplete");
+    std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
+    std::fs::write(
+        pkg_src.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_doctor_incomplete", version = "0.1.0" }
+local sub = require("e2e_doctor_incomplete.missing_sub")
+function M.run(ctx) return sub.run(ctx) end
+return M"#,
+    )
+    .expect("write init.lua");
+    std::fs::write(
+        pkg_src.join("missing_sub.lua"),
+        r#"return { run = function(ctx) return "ok" end }"#,
+    )
+    .expect("write missing_sub.lua");
+
+    // Install.
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_src.to_string_lossy() }),
+    )
+    .await;
+
+    // Simulate partial deletion: remove `missing_sub.lua` from the installed dest.
+    let installed_dest = tmp.path().join("packages").join("e2e_doctor_incomplete");
+    assert!(
+        installed_dest.exists(),
+        "package should be installed at {installed_dest:?}"
+    );
+    std::fs::remove_file(installed_dest.join("missing_sub.lua")).expect("remove missing_sub.lua");
+
+    // Doctor should detect the incomplete package.
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_doctor_incomplete" }),
+    )
+    .await;
+
+    let incomplete = resp["incomplete_pkg"]
+        .as_array()
+        .expect("incomplete_pkg array missing");
+    let entry = incomplete
+        .iter()
+        .find(|e| e["name"] == "e2e_doctor_incomplete")
+        .unwrap_or_else(|| {
+            panic!("e2e_doctor_incomplete not in incomplete_pkg bucket, got: {resp}")
+        });
+
+    assert_eq!(entry["kind"], "incomplete_pkg", "kind field: {entry}");
+
+    let missing = entry["missing_subs"]
+        .as_array()
+        .expect("missing_subs array missing");
+    assert!(
+        missing.iter().any(|s| s == "missing_sub"),
+        "missing_subs should contain 'missing_sub', got: {missing:?}"
+    );
+
+    let suggestion = entry["suggestion"].as_str().unwrap_or("");
+    assert!(
+        !suggestion.is_empty(),
+        "suggestion should not be empty: {entry}"
+    );
+
+    // healthy and installed_missing must NOT contain this package.
+    let healthy = resp["healthy"].as_array().expect("healthy array");
+    assert!(
+        !healthy.iter().any(|e| e["name"] == "e2e_doctor_incomplete"),
+        "incomplete pkg must not appear in healthy: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

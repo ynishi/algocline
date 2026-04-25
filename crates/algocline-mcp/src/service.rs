@@ -1105,8 +1105,11 @@ impl AlcService {
     /// Diagnose package state without side effects (read-only counterpart
     /// of `alc_pkg_repair`).
     ///
-    /// Returns JSON with four arrays:
+    /// Returns JSON with five arrays:
     ///   - `healthy` — package directory exists and is reachable
+    ///   - `incomplete_pkg` — package dir exists but `init.lua` requires
+    ///     sibling submodule files (`pkg.sub`) that are missing; use
+    ///     `alc_pkg_install --force` or `alc_pkg_link` to restore
     ///   - `installed_missing` — manifest entry exists but install dir is gone;
     ///     use `alc_pkg_install` to reinstall
     ///   - `symlink_dangling` — symlink target missing; use `alc_pkg_unlink`
@@ -1663,7 +1666,7 @@ impl ServerHandler for AlcService {
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
                  - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
-                 - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/installed_missing/symlink_dangling/path_missing buckets. Use pkg_unlink to remove dangling symlinks.\n\
+                 - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/incomplete_pkg/installed_missing/symlink_dangling/path_missing buckets. incomplete_pkg fires when init.lua requires sibling submodules that are missing. Use pkg_unlink to remove dangling symlinks.\n\
                  - alc_pkg_repair: Heal broken packages — reinstalls entries whose installed dir is missing; surfaces dangling symlinks and missing path = ... declarations as unrepairable with suggestions.\n\
                  - alc_init: Initialize alc.toml in the project root and ensure alc.local.toml is listed in .gitignore.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\

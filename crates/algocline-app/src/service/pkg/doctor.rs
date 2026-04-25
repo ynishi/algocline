@@ -1,7 +1,7 @@
 //! `pkg_doctor` — read-only diagnosis for package state (Wave 2 of local-first DX).
 //!
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
-//! classifies packages into four buckets without touching the filesystem:
+//! classifies packages into five buckets without touching the filesystem:
 //!
 //! | Bucket              | Source-of-truth                                         | Condition                                          |
 //! |---------------------|---------------------------------------------------------|----------------------------------------------------|
@@ -9,6 +9,8 @@
 //! | `installed_missing` | `installed.json`                                        | dest missing (non-symlink), `pkg_install` can heal |
 //! | `symlink_dangling`  | `installed.json` (manifest-pass) + filesystem scan      | dest is a symlink whose target is missing          |
 //! | `path_missing`      | `alc.toml` / `alc.local.toml`                           | declared `path = ...` does not exist               |
+//! | `incomplete_pkg`    | `installed.json` + `{pkg_dir}/{name}/init.lua`          | init.lua requires sibling sub (`pkg.sub`) but      |
+//! |                     |                                                         | `sub.lua` / `sub/init.lua` is missing              |
 //!
 //! Contract:
 //! - **No side effects.** No `fs::write`, `fs::remove_*`, `fs::create_*`,
@@ -17,11 +19,21 @@
 //!   logic authoritative in one place (symlink-dangling suggestion wording and
 //!   the path-missing scan in particular).
 //!
-//! The JSON output schema always contains these four top-level buckets:
-//! `healthy`, `installed_missing`, `symlink_dangling`, `path_missing`. Key
-//! order within the serialized string follows `serde_json`'s default
-//! (alphabetical when `preserve_order` is off, as it is in this workspace) —
-//! the contract is "these four keys always present", not textual ordering.
+//! The JSON output schema always contains five top-level buckets:
+//! `healthy`, `incomplete_pkg`, `installed_missing`, `path_missing`,
+//! `symlink_dangling`. Key order within the serialized string follows
+//! `serde_json`'s default (alphabetical when `preserve_order` is off, as it is
+//! in this workspace) — the contract is "these five keys always present", not
+//! textual ordering.
+//!
+//! ## `incomplete_pkg` detection
+//!
+//! Only **static string-literal `require`** calls of the form
+//! `require("pkg_name.sub")` or `require('pkg_name.sub')` are scanned.
+//! Dynamic require forms (`require(variable)`) and non-quoted forms
+//! (`require "foo.bar"`) are **not** detected (MVP scope — false negatives
+//! are acceptable; false positives are not). A future version may use mlua
+//! to perform a real module resolution dry-run.
 
 use std::path::Path;
 
@@ -38,6 +50,7 @@ use super::repair::{
 };
 
 /// Classification of a single manifest-tracked package (read-only).
+#[derive(Debug)]
 enum DoctorOutcome {
     /// Destination exists and is reachable — no action required.
     Healthy,
@@ -45,15 +58,22 @@ enum DoctorOutcome {
     SymlinkDangling { reason: String, suggestion: String },
     /// Destination is missing (non-symlink). Install can heal from `source`.
     InstalledMissing { reason: String, suggestion: String },
+    /// Package directory exists but one or more submodule files required by
+    /// `init.lua` are missing.
+    IncompletePkg {
+        missing_subs: Vec<String>,
+        suggestion: String,
+    },
 }
 
-/// Accumulator for the four JSON output buckets.
+/// Accumulator for the five JSON output buckets.
 #[derive(Default)]
 struct DoctorBuckets {
     healthy: Vec<serde_json::Value>,
     installed_missing: Vec<serde_json::Value>,
     symlink_dangling: Vec<serde_json::Value>,
     path_missing: Vec<serde_json::Value>,
+    incomplete_pkg: Vec<serde_json::Value>,
 }
 
 impl DoctorBuckets {
@@ -62,19 +82,89 @@ impl DoctorBuckets {
             || !self.installed_missing.is_empty()
             || !self.symlink_dangling.is_empty()
             || !self.path_missing.is_empty()
+            || !self.incomplete_pkg.is_empty()
     }
 
     fn into_json(self) -> String {
-        // All four buckets are always emitted (empty arrays when no entries).
+        // All five buckets are always emitted (empty arrays when no entries).
         // `serde_json::json!` serializes keys alphabetically without the
         // `preserve_order` feature — consumers parse as a Map, not by order.
         serde_json::json!({
             "healthy": self.healthy,
+            "incomplete_pkg": self.incomplete_pkg,
             "installed_missing": self.installed_missing,
             "symlink_dangling": self.symlink_dangling,
             "path_missing": self.path_missing,
         })
         .to_string()
+    }
+}
+
+/// Parse static string-literal `require` calls from Lua source and return the
+/// list of submodule names that belong to `pkg_name`.
+///
+/// Recognized pattern (parenthesised string literal, single or double quote):
+/// ```text
+/// require("pkg_name.sub")
+/// require('pkg_name.sub')
+/// ```
+///
+/// **Not** recognized (MVP scope — false negatives are acceptable):
+/// - `require "foo.bar"` (no parentheses)
+/// - `require(variable)` (dynamic)
+/// - `require([[foo.bar]])` (long-string literal)
+fn extract_required_subs(lua_src: &str, pkg_name: &str) -> Vec<String> {
+    let mut subs = Vec::new();
+    let prefix = format!("{pkg_name}.");
+    let mut remaining = lua_src;
+
+    while let Some(pos) = remaining.find("require") {
+        remaining = &remaining[pos + "require".len()..];
+
+        // Skip whitespace after `require`.
+        let trimmed = remaining.trim_start_matches([' ', '\t']);
+
+        // Must be followed by `(`.
+        if !trimmed.starts_with('(') {
+            continue;
+        }
+        let after_paren = &trimmed[1..];
+        let after_paren = after_paren.trim_start_matches([' ', '\t']);
+
+        // Must be followed by a string quote.
+        let quote = match after_paren.chars().next() {
+            Some(q @ '"') | Some(q @ '\'') => q,
+            _ => continue,
+        };
+        let content = &after_paren[1..];
+        let end = match content.find(quote) {
+            Some(i) => i,
+            None => continue,
+        };
+        let module = &content[..end];
+
+        if let Some(sub) = module.strip_prefix(&prefix) {
+            if !sub.is_empty() && !sub.contains('.') {
+                // Only direct children: `pkg.sub`, not `pkg.sub.deeper`.
+                subs.push(sub.to_string());
+            }
+        }
+    }
+
+    subs.sort();
+    subs.dedup();
+    subs
+}
+
+/// Build the suggestion string for an `incomplete_pkg` entry, branched by
+/// whether the package came from a symlink (link path) or an installed copy.
+fn incomplete_pkg_suggestion(name: &str, is_symlink: bool) -> String {
+    if is_symlink {
+        format!("Re-run alc_pkg_link <path> to re-link {name:?} with the complete source directory")
+    } else {
+        format!(
+            "Run alc_pkg_install --force {name:?} to reinstall {name:?} with all submodule files"
+        )
     }
 }
 
@@ -136,12 +226,74 @@ fn push_doctor_outcome(name: &str, outcome: DoctorOutcome, buckets: &mut DoctorB
                 "suggestion": suggestion,
             }))
         }
+        DoctorOutcome::IncompletePkg {
+            missing_subs,
+            suggestion,
+        } => buckets.incomplete_pkg.push(serde_json::json!({
+            "name": name,
+            "kind": "incomplete_pkg",
+            "missing_subs": missing_subs,
+            "suggestion": suggestion,
+        })),
     }
+}
+
+/// Check whether the package directory at `dest` is incomplete: read
+/// `init.lua`, extract static `require("pkg.sub")` calls, and verify that
+/// each referenced sub-file exists as `{dest}/{sub}.lua` or
+/// `{dest}/{sub}/init.lua`.
+///
+/// Returns `Some(DoctorOutcome::IncompletePkg { .. })` when one or more
+/// submodule files are missing, `None` when everything is present or when
+/// `init.lua` cannot be read (IO errors are logged as warnings and treated as
+/// "no incomplete evidence" rather than propagated — the directory-level
+/// `Healthy` classification already passed and the init.lua read is
+/// best-effort).
+fn check_incomplete(name: &str, dest: &Path, is_symlink: bool) -> Option<DoctorOutcome> {
+    let init_lua = dest.join("init.lua");
+    let src = match std::fs::read_to_string(&init_lua) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %init_lua.display(),
+                "could not read init.lua for incomplete check; skipping"
+            );
+            return None;
+        }
+    };
+
+    let required_subs = extract_required_subs(&src, name);
+    if required_subs.is_empty() {
+        return None;
+    }
+
+    let missing: Vec<String> = required_subs
+        .into_iter()
+        .filter(|sub| {
+            let as_file = dest.join(format!("{sub}.lua"));
+            let as_dir = dest.join(sub).join("init.lua");
+            !as_file.exists() && !as_dir.exists()
+        })
+        .collect();
+
+    if missing.is_empty() {
+        return None;
+    }
+
+    Some(DoctorOutcome::IncompletePkg {
+        missing_subs: missing,
+        suggestion: incomplete_pkg_suggestion(name, is_symlink),
+    })
 }
 
 /// Classify a manifest entry by inspecting only the destination directory.
 /// Mirrors the pre-install branch of [`super::repair::repair_installed`] but
 /// never attempts an install.
+///
+/// After confirming the package directory is reachable, performs an additional
+/// best-effort incomplete check: reads `init.lua` to detect missing sibling
+/// submodule files. See [`check_incomplete`].
 fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> DoctorOutcome {
     let dest = pkg_dir.join(name);
 
@@ -159,6 +311,10 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
             }
         };
         if target_alive {
+            // Symlink alive — check for missing submodule files.
+            if let Some(incomplete) = check_incomplete(name, &dest, true) {
+                return incomplete;
+            }
             return DoctorOutcome::Healthy;
         }
         let link_target = match dest.read_link() {
@@ -175,6 +331,10 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
     }
 
     if dest.exists() {
+        // Directory exists — check for missing submodule files.
+        if let Some(incomplete) = check_incomplete(name, &dest, false) {
+            return incomplete;
+        }
         return DoctorOutcome::Healthy;
     }
 
@@ -251,8 +411,8 @@ fn run_path_missing_pass(
 
 impl AppService {
     /// Diagnose package state without any side effects. Returns a JSON string
-    /// with four arrays (`healthy`, `installed_missing`, `symlink_dangling`,
-    /// `path_missing`).
+    /// with five arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
+    /// `symlink_dangling`, `path_missing`).
     ///
     /// `name` restricts the report to a single package; `None` inspects every
     /// known package. `project_root` is only consulted for the
@@ -263,6 +423,8 @@ impl AppService {
     /// - `load_manifest()` / `packages_dir()` failures propagate via `?`.
     /// - Per-entry `fs::read_dir` errors inside the unattached-symlink scan
     ///   are logged via `tracing::warn!` and skipped (helper's behavior).
+    /// - `init.lua` read errors during the incomplete check are logged via
+    ///   `tracing::warn!` and skipped (best-effort, no propagation).
     /// - When `name = Some(target)` and every bucket ends empty, returns
     ///   `Err` with the same wording used by `pkg_repair`.
     pub async fn pkg_doctor(
@@ -385,11 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn buckets_into_json_emits_all_four_keys() {
+    fn buckets_into_json_emits_all_five_keys() {
         // NOTE: `serde_json` without the `preserve_order` feature emits JSON
         // object keys in alphabetical order, matching `pkg_repair`'s actual
         // behavior. The spec's "fixed order" requirement is satisfied by
-        // always emitting these four top-level keys; consumers parse as a
+        // always emitting these five top-level keys; consumers parse as a
         // Map rather than relying on textual key order.
         let mut b = DoctorBuckets::default();
         b.healthy.push(serde_json::json!({"name": "h"}));
@@ -399,6 +561,8 @@ mod tests {
             .push(serde_json::json!({"name": "s", "kind": "symlink_dangling"}));
         b.path_missing
             .push(serde_json::json!({"name": "p", "kind": "path_missing"}));
+        b.incomplete_pkg
+            .push(serde_json::json!({"name": "c", "kind": "incomplete_pkg"}));
 
         let out = b.into_json();
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
@@ -407,12 +571,14 @@ mod tests {
         assert!(obj.contains_key("installed_missing"));
         assert!(obj.contains_key("symlink_dangling"));
         assert!(obj.contains_key("path_missing"));
-        assert_eq!(obj.len(), 4, "exactly four top-level buckets: {out}");
+        assert!(obj.contains_key("incomplete_pkg"));
+        assert_eq!(obj.len(), 5, "exactly five top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
         assert_eq!(obj["symlink_dangling"][0]["name"], "s");
         assert_eq!(obj["path_missing"][0]["name"], "p");
+        assert_eq!(obj["incomplete_pkg"][0]["name"], "c");
     }
 
     #[test]
@@ -432,6 +598,10 @@ mod tests {
 
         let mut b = DoctorBuckets::default();
         b.path_missing.push(serde_json::json!({}));
+        assert!(b.any_matched());
+
+        let mut b = DoctorBuckets::default();
+        b.incomplete_pkg.push(serde_json::json!({}));
         assert!(b.any_matched());
     }
 
@@ -487,6 +657,222 @@ mod tests {
         assert!(
             s.contains("alc_hub_reindex"),
             "Unknown must suggest alc_hub_reindex: {s}"
+        );
+    }
+
+    // ── extract_required_subs ────────────────────────────────────────────
+
+    #[test]
+    fn extract_subs_double_quote() {
+        let src = r#"
+local M = {}
+local check = require("mypkg.check")
+local t = require("mypkg.t")
+return M
+"#;
+        let subs = extract_required_subs(src, "mypkg");
+        assert_eq!(subs, vec!["check", "t"]);
+    }
+
+    #[test]
+    fn extract_subs_single_quote() {
+        let src = "local x = require('mypkg.sub')";
+        let subs = extract_required_subs(src, "mypkg");
+        assert_eq!(subs, vec!["sub"]);
+    }
+
+    #[test]
+    fn extract_subs_ignores_other_packages() {
+        let src = r#"
+local x = require("other.sub")
+local y = require("mypkg.mine")
+"#;
+        let subs = extract_required_subs(src, "mypkg");
+        assert_eq!(subs, vec!["mine"]);
+    }
+
+    #[test]
+    fn extract_subs_deduplicates() {
+        let src = r#"
+local a = require("mypkg.check")
+local b = require("mypkg.check")
+"#;
+        let subs = extract_required_subs(src, "mypkg");
+        assert_eq!(subs, vec!["check"]);
+    }
+
+    #[test]
+    fn extract_subs_ignores_dynamic_require() {
+        // Dynamic require (no parenthesised string literal) must not be detected.
+        let src = r#"local x = require(mod_name)"#;
+        let subs = extract_required_subs(src, "mypkg");
+        assert!(subs.is_empty(), "dynamic require must be ignored: {subs:?}");
+    }
+
+    #[test]
+    fn extract_subs_ignores_nested_dots() {
+        // Only direct children: `pkg.sub`, not `pkg.sub.deeper`.
+        let src = r#"local x = require("mypkg.sub.deeper")"#;
+        let subs = extract_required_subs(src, "mypkg");
+        assert!(
+            subs.is_empty(),
+            "nested dotted require must be ignored: {subs:?}"
+        );
+    }
+
+    #[test]
+    fn extract_subs_empty_for_no_require() {
+        let src = r#"local M = {} return M"#;
+        let subs = extract_required_subs(src, "mypkg");
+        assert!(subs.is_empty());
+    }
+
+    // ── check_incomplete ─────────────────────────────────────────────────
+
+    #[test]
+    fn check_incomplete_returns_none_when_all_subs_present_as_lua() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            r#"local c = require("mypkg.check") return {}"#,
+        )
+        .unwrap();
+        std::fs::write(dest.join("check.lua"), "return {}").unwrap();
+
+        assert!(check_incomplete("mypkg", &dest, false).is_none());
+    }
+
+    #[test]
+    fn check_incomplete_returns_none_when_sub_is_dir_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            r#"local c = require("mypkg.sub") return {}"#,
+        )
+        .unwrap();
+        // sub/ directory with init.lua
+        std::fs::create_dir(dest.join("sub")).unwrap();
+        std::fs::write(dest.join("sub").join("init.lua"), "return {}").unwrap();
+
+        assert!(check_incomplete("mypkg", &dest, false).is_none());
+    }
+
+    #[test]
+    fn check_incomplete_detects_missing_sub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            r#"
+local check = require("mypkg.check")
+local t = require("mypkg.t")
+return {}
+"#,
+        )
+        .unwrap();
+        // only `check.lua` present, `t.lua` missing
+        std::fs::write(dest.join("check.lua"), "return {}").unwrap();
+
+        let outcome = check_incomplete("mypkg", &dest, false).expect("should detect incomplete");
+        match outcome {
+            DoctorOutcome::IncompletePkg {
+                missing_subs,
+                suggestion,
+            } => {
+                assert_eq!(missing_subs, vec!["t"], "missing_subs: {missing_subs:?}");
+                assert!(
+                    suggestion.contains("alc_pkg_install"),
+                    "non-symlink suggestion: {suggestion}"
+                );
+            }
+            _ => panic!("expected IncompletePkg"),
+        }
+    }
+
+    #[test]
+    fn check_incomplete_suggestion_uses_link_for_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            r#"local x = require("mypkg.missing") return {}"#,
+        )
+        .unwrap();
+        // `missing.lua` absent
+
+        let outcome = check_incomplete("mypkg", &dest, true).expect("should detect incomplete");
+        match outcome {
+            DoctorOutcome::IncompletePkg { suggestion, .. } => {
+                assert!(
+                    suggestion.contains("alc_pkg_link"),
+                    "symlink suggestion: {suggestion}"
+                );
+            }
+            _ => panic!("expected IncompletePkg"),
+        }
+    }
+
+    #[test]
+    fn check_incomplete_returns_none_when_no_init_lua() {
+        // Package with no init.lua at all — best-effort skip, returns None.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+
+        assert!(check_incomplete("mypkg", &dest, false).is_none());
+    }
+
+    #[test]
+    fn classify_installed_incomplete_pkg() {
+        // classify_installed should return IncompletePkg when sub.lua is missing.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path();
+        let dest = pkg_dir.join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            r#"local x = require("mypkg.sub") return {}"#,
+        )
+        .unwrap();
+        // sub.lua intentionally absent
+
+        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        match outcome {
+            DoctorOutcome::IncompletePkg {
+                missing_subs,
+                suggestion,
+            } => {
+                assert_eq!(missing_subs, vec!["sub"]);
+                assert!(suggestion.contains("alc_pkg_install"), "{suggestion}");
+            }
+            _ => panic!("expected IncompletePkg, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_installed_healthy_when_all_subs_present() {
+        // classify_installed should return Healthy when all required subs exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path();
+        let dest = pkg_dir.join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            r#"local x = require("mypkg.sub") return {}"#,
+        )
+        .unwrap();
+        std::fs::write(dest.join("sub.lua"), "return {}").unwrap();
+
+        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        assert!(
+            matches!(outcome, DoctorOutcome::Healthy),
+            "expected Healthy, got {outcome:?}"
         );
     }
 }

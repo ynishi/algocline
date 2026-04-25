@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc_pkg_doctor`: detect `incomplete_pkg` defect when a package's `init.lua`
+  requires sibling submodules (`pkg.sub`) but the corresponding `sub.lua` /
+  `sub/init.lua` is missing. Static string-literal `require` only (parenthesised
+  form: `require("pkg.sub")` / `require('pkg.sub')`); dynamic / non-quoted forms
+  are out of scope for MVP.
+
 - **MCP Resources capability** — `algocline-mcp` now advertises `resources`
   alongside `tools`. Service-layer read-only paths are projected as MCP
   resources under the `alc://` scheme:

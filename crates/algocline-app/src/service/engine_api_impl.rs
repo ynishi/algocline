@@ -463,6 +463,30 @@ impl EngineApi for AppService {
         AppService::pkg_read_init_lua(self, name)
     }
 
+    async fn pkg_meta(&self, name: &str) -> Result<String, String> {
+        let filter = serde_json::json!({ "name": name });
+        let json_str = EngineApi::pkg_list(
+            self,
+            None,
+            None,
+            None,
+            Some(filter),
+            None,
+            Some("full".to_string()),
+        )
+        .await?;
+        let val: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("pkg_meta: failed to parse pkg_list response: {e}"))?;
+        let pkgs = val
+            .get("packages")
+            .and_then(|p| p.as_array())
+            .ok_or_else(|| "pkg_meta: pkg_list response missing 'packages' field".to_string())?;
+        if pkgs.is_empty() {
+            return Err(format!("pkg not found: {name}"));
+        }
+        serde_json::to_string(&pkgs[0]).map_err(|e| format!("pkg_meta: serialize entry: {e}"))
+    }
+
     // ─── Package scaffold ─────────────────────────────────────
 
     async fn pkg_scaffold(

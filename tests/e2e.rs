@@ -3172,3 +3172,151 @@ async fn test_mcp_resource_read_scenario() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// Read `alc://cards/{card_id}` for a pre-written card fixture.
+#[tokio::test]
+async fn test_mcp_resource_read_card() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let card_id = "mypkg_20260401T000000_aabbcc";
+    let card_dir = tmp.path().join("cards").join("mypkg");
+    std::fs::create_dir_all(&card_dir).expect("create card dir");
+    std::fs::write(
+        card_dir.join(format!("{card_id}.toml")),
+        concat!(
+            "schema_version = \"card/v0\"\n",
+            "card_id = \"mypkg_20260401T000000_aabbcc\"\n",
+            "created_at = \"2026-04-01T00:00:00Z\"\n",
+            "[pkg]\n",
+            "name = \"mypkg\"\n",
+        ),
+    )
+    .expect("write card toml");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, &format!("alc://cards/{card_id}"))
+        .await
+        .expect("read_resource card failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    let card: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("card JSON parse failed: {e}\nraw: {text}"));
+    assert_eq!(card["card_id"], card_id);
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://cards/{card_id}/samples` with pagination, verifying response shape.
+#[tokio::test]
+async fn test_mcp_resource_read_card_samples_pagination() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let card_id = "mypkg_20260401T000000_aabbcc";
+    let card_dir = tmp.path().join("cards").join("mypkg");
+    std::fs::create_dir_all(&card_dir).expect("create card dir");
+    std::fs::write(
+        card_dir.join(format!("{card_id}.toml")),
+        concat!(
+            "schema_version = \"card/v0\"\n",
+            "card_id = \"mypkg_20260401T000000_aabbcc\"\n",
+            "created_at = \"2026-04-01T00:00:00Z\"\n",
+            "[pkg]\n",
+            "name = \"mypkg\"\n",
+        ),
+    )
+    .expect("write card toml");
+    // Write a two-row sidecar JSONL so pagination is exercisable.
+    let jsonl = "{\"case_idx\":0,\"score\":1.0}\n{\"case_idx\":1,\"score\":0.5}\n";
+    std::fs::write(card_dir.join(format!("{card_id}.samples.jsonl")), jsonl)
+        .expect("write samples jsonl");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(
+        &client,
+        &format!("alc://cards/{card_id}/samples?offset=0&limit=2"),
+    )
+    .await
+    .expect("read_resource card samples failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    // Verify the response is valid JSON (array or object — implementation detail).
+    let body: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("samples JSON parse failed: {e}\nraw: {text}"));
+    assert!(
+        body.is_array() || body.is_object(),
+        "expected JSON array or object response, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://eval/{result_id}` for a pre-written eval result fixture.
+#[tokio::test]
+async fn test_mcp_resource_read_eval_detail() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let eval_id = "mystrategy_1745000000";
+    let evals_dir = tmp.path().join("evals");
+    std::fs::create_dir_all(&evals_dir).expect("create evals dir");
+    std::fs::write(
+        evals_dir.join(format!("{eval_id}.json")),
+        r#"{"eval_id":"mystrategy_1745000000","strategy":"mystrategy","pass_rate":0.8}"#,
+    )
+    .expect("write eval json");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, &format!("alc://eval/{eval_id}"))
+        .await
+        .expect("read_resource eval detail failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    let eval: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("eval JSON parse failed: {e}\nraw: {text}"));
+    assert_eq!(eval["eval_id"], eval_id);
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://logs/{session_id}` with pagination params.
+///
+/// Log files are resolved via `ALC_LOG_DIR` (not `ALC_HOME/logs`), so we set
+/// both env vars to ensure the server's `log_view` call finds the fixture.
+#[tokio::test]
+async fn test_mcp_resource_read_logs_pagination() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let session_id = "ses-e2e-log-test";
+    let logs_dir = tmp.path().join("logs");
+    std::fs::create_dir_all(&logs_dir).expect("create logs dir");
+    // Write a minimal log JSON in the transcript format the server can parse.
+    std::fs::write(
+        logs_dir.join(format!("{session_id}.json")),
+        r#"{"session_id":"ses-e2e-log-test","rounds":[]}"#,
+    )
+    .expect("write log json");
+
+    let bin = std::env::var("CARGO_BIN_EXE_alc")
+        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
+    let packages_path = tmp.path().join("packages");
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("ALC_HOME", tmp.path())
+        .env("ALC_PACKAGES_PATH", &packages_path)
+        .env("ALC_LOG_DIR", &logs_dir);
+    let transport = TokioChildProcess::new(cmd).expect("spawn alc server");
+    let client = ().serve(transport).await.expect("initialize MCP session");
+
+    let result = read_resource(
+        &client,
+        &format!("alc://logs/{session_id}?limit=10&max_chars=500"),
+    )
+    .await
+    .expect("read_resource logs failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (_uri, text) = resource_text(&result.contents[0]);
+    assert!(!text.is_empty(), "expected non-empty log response");
+
+    client.cancel().await.expect("cancel failed");
+}

@@ -70,6 +70,27 @@ Pagination is expressed via URI query string parameters.
 | `limit` | `usize` | `50` | Maximum log entries to return |
 | `max_chars` | `usize` | `20000` | Maximum total characters in the response |
 
+## Pagination Caps
+
+MCP-exposed pagination parameters have hard upper bounds to prevent denial-of-service.
+Exceeding a cap returns `invalid_params` with the message `query param '{key}={v}' on {uri} exceeds cap of {max}`.
+
+| Template | Parameter | Cap |
+|---|---|---|
+| `alc://cards/{card_id}/samples` | `limit` | 10,000 |
+| `alc://cards/{card_id}/samples` | `offset` | 10,000,000 |
+| `alc://logs/{session_id}` | `limit` | 10,000 |
+| `alc://logs/{session_id}` | `max_chars` | 1,000,000 |
+
+## ID Character Set
+
+Resource IDs (card_id, session_id, eval result_id, package name, scenario name) must
+consist of characters from `[A-Za-z0-9_.-]`. URI-reserved characters
+(`& = ? / % SPACE`) are rejected at the MCP boundary with an `invalid_params` error.
+
+Eval result IDs additionally must match `^[A-Za-z0-9-]+_\d+$`
+(strategy name followed by `_` and a decimal timestamp).
+
 ## MIME Types
 
 | Extension / Format | MIME Type |

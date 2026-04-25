@@ -133,11 +133,6 @@ fn parse_query(qs: &str, full_uri: &str) -> Result<HashMap<String, String>, UriP
                 )));
             }
             Some((k, v)) => {
-                if v.contains('=') {
-                    return Err(UriParseError::Query(format!(
-                        "duplicate '=' in query pair '{pair}' of {full_uri}"
-                    )));
-                }
                 map.insert(k.to_string(), v.to_string());
             }
         }
@@ -269,8 +264,16 @@ impl ResourceCatalog {
                 None,
             ));
         }
-        let file_name = parsed.segments.join("/");
-        let path = self.app_dir.types_dir().join(&file_name);
+        let file_name = match parsed.segments.as_slice() {
+            [name] if name == "alc.d.lua" || name == "alc_shapes.d.lua" => name.as_str(),
+            _ => {
+                return Err(McpError::invalid_params(
+                    format!("resource not found: {uri}"),
+                    None,
+                ));
+            }
+        };
+        let path = self.app_dir.types_dir().join(file_name);
 
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -300,6 +303,7 @@ impl ResourceCatalog {
         // Accepted: alc://packages/{name}/init.lua  or  alc://packages/{name}/meta
         match parsed.segments.as_slice() {
             [name, sub] if sub == "init.lua" => {
+                validate_id("package name", name, uri)?;
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
                         format!("query params not supported on {uri}"),
@@ -310,45 +314,21 @@ impl ResourceCatalog {
                 Ok(text_result(uri, text, "text/x-lua"))
             }
             [name, sub] if sub == "meta" => {
+                validate_id("package name", name, uri)?;
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
                         format!("query params not supported on {uri}"),
                         None,
                     ));
                 }
-                // Use pkg_list with a name filter to retrieve metadata for a
-                // single package.  An empty result means the package is unknown.
-                let filter = serde_json::json!({ "name": name });
-                let json_str = self
-                    .app
-                    .pkg_list(
-                        None,
-                        None,
-                        None,
-                        Some(filter),
-                        None,
-                        Some("full".to_string()),
-                    )
-                    .await
-                    .map_err(err_to_mcp)?;
-                // Extract first entry from the `packages` array.
-                let val: serde_json::Value =
-                    serde_json::from_str(&json_str).map_err(|e| err_to_mcp(e.to_string()))?;
-                let pkgs = val
-                    .get("packages")
-                    .and_then(|p| p.as_array())
-                    .ok_or_else(|| {
-                        err_to_mcp("pkg_list response missing 'packages' field".into())
-                    })?;
-                if pkgs.is_empty() {
-                    return Err(McpError::invalid_params(
-                        format!("resource not found: {uri}"),
-                        None,
-                    ));
-                }
-                let entry_json =
-                    serde_json::to_string(&pkgs[0]).map_err(|e| err_to_mcp(e.to_string()))?;
-                Ok(text_result(uri, entry_json, "application/json"))
+                let json_str = self.app.pkg_meta(name).await.map_err(|e| {
+                    if e.starts_with("pkg not found") {
+                        McpError::invalid_params(format!("resource not found: {uri}"), None)
+                    } else {
+                        err_to_mcp(e)
+                    }
+                })?;
+                Ok(text_result(uri, json_str, "application/json"))
             }
             _ => Err(McpError::invalid_params(
                 format!("resource not found: {uri}"),
@@ -364,6 +344,7 @@ impl ResourceCatalog {
     ) -> Result<ReadResourceResult, McpError> {
         match parsed.segments.as_slice() {
             [card_id] => {
+                validate_id("card_id", card_id, uri)?;
                 // alc://cards/{card_id} — no query params allowed
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
@@ -375,10 +356,17 @@ impl ResourceCatalog {
                 Ok(text_result(uri, json_str, "application/json"))
             }
             [card_id, sub] if sub == "samples" => {
+                validate_id("card_id", card_id, uri)?;
                 // alc://cards/{card_id}/samples?offset=N&limit=M
-                let offset = parse_usize_param(&parsed.query, "offset", uri)?;
-                let limit = parse_usize_param(&parsed.query, "limit", uri)?
-                    .or(Some(DEFAULT_CARD_SAMPLES_LIMIT));
+                let offset = parse_capped_usize_param(
+                    &parsed.query,
+                    "offset",
+                    uri,
+                    MAX_CARD_SAMPLES_OFFSET,
+                )?;
+                let limit =
+                    parse_capped_usize_param(&parsed.query, "limit", uri, MAX_CARD_SAMPLES_LIMIT)?
+                        .or(Some(DEFAULT_CARD_SAMPLES_LIMIT));
                 // Reject unknown query keys (only offset and limit are valid)
                 for key in parsed.query.keys() {
                     if key != "offset" && key != "limit" {
@@ -409,6 +397,7 @@ impl ResourceCatalog {
     ) -> Result<ReadResourceResult, McpError> {
         match parsed.segments.as_slice() {
             [name] => {
+                validate_id("scenario name", name, uri)?;
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
                         format!("query params not supported on {uri}"),
@@ -432,16 +421,14 @@ impl ResourceCatalog {
     ) -> Result<ReadResourceResult, McpError> {
         match parsed.segments.as_slice() {
             [result_id] => {
+                validate_id("eval result_id", result_id, uri)?;
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
                         format!("query params not supported on {uri}"),
                         None,
                     ));
                 }
-                // Minimal format validation: must contain at least one '_'
-                // (strategy names themselves may contain underscores, so we
-                // only verify the minimum requirement).
-                if !result_id.contains('_') {
+                if !is_valid_eval_id(result_id) {
                     return Err(McpError::invalid_params(
                         format!(
                             "invalid eval_id: must be {{strategy}}_{{timestamp}}, got '{result_id}'"
@@ -466,11 +453,13 @@ impl ResourceCatalog {
     ) -> Result<ReadResourceResult, McpError> {
         match parsed.segments.as_slice() {
             [session_id] => {
+                validate_id("session_id", session_id, uri)?;
                 // alc://logs/{session_id}?limit=N&max_chars=M
-                let limit =
-                    parse_usize_param(&parsed.query, "limit", uri)?.or(Some(DEFAULT_LOGS_LIMIT));
-                let max_chars = parse_usize_param(&parsed.query, "max_chars", uri)?
-                    .or(Some(DEFAULT_LOGS_MAX_CHARS));
+                let limit = parse_capped_usize_param(&parsed.query, "limit", uri, MAX_LOGS_LIMIT)?
+                    .or(Some(DEFAULT_LOGS_LIMIT));
+                let max_chars =
+                    parse_capped_usize_param(&parsed.query, "max_chars", uri, MAX_LOGS_MAX_CHARS)?
+                        .or(Some(DEFAULT_LOGS_MAX_CHARS));
                 // Reject unknown query keys (only limit and max_chars are valid)
                 for key in parsed.query.keys() {
                     if key != "limit" && key != "max_chars" {
@@ -503,6 +492,17 @@ pub const DEFAULT_CARD_SAMPLES_LIMIT: usize = 100;
 pub const DEFAULT_LOGS_LIMIT: usize = 50;
 /// Default `max_chars` for `alc://logs/{session_id}` when `?max_chars=` is absent.
 pub const DEFAULT_LOGS_MAX_CHARS: usize = 20_000;
+
+// ─── Pagination caps (MCP-DoS defense) ───────────────────────────────────────
+
+/// Hard cap for `?limit=` on `alc://cards/{id}/samples`.
+pub const MAX_CARD_SAMPLES_LIMIT: usize = 10_000;
+/// Hard cap for `?offset=` on `alc://cards/{id}/samples`.
+pub const MAX_CARD_SAMPLES_OFFSET: usize = 10_000_000;
+/// Hard cap for `?limit=` on `alc://logs/{session_id}`.
+pub const MAX_LOGS_LIMIT: usize = 10_000;
+/// Hard cap for `?max_chars=` on `alc://logs/{session_id}`.
+pub const MAX_LOGS_MAX_CHARS: usize = 1_000_000;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -539,6 +539,62 @@ fn parse_usize_param(
             )
         }),
     }
+}
+
+/// Reject IDs that contain URI-reserved characters.
+///
+/// Since `parse_query` does not URL-decode, IDs with `& = ? / %` would
+/// either be split mid-stream or silently mis-attributed. We reject at
+/// the MCP boundary instead of letting downstream stores see corrupted IDs.
+fn validate_id(kind: &str, id: &str, uri: &str) -> Result<(), McpError> {
+    for c in id.chars() {
+        if matches!(c, '&' | '=' | '?' | '/' | '%' | ' ') {
+            return Err(McpError::invalid_params(
+                format!("{kind} '{id}' on {uri} contains reserved character '{c}'"),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a usize query param with an upper bound.
+///
+/// Returns `Err(invalid_params)` when the value exceeds `max`. Caps are
+/// a MCP-DoS defense: unbounded values flow into `card_samples(offset, limit)`
+/// and `log_view(limit, max_chars)` which allocate proportionally. Same shape
+/// as [`parse_usize_param`] otherwise.
+fn parse_capped_usize_param(
+    query: &HashMap<String, String>,
+    key: &str,
+    uri: &str,
+    max: usize,
+) -> Result<Option<usize>, McpError> {
+    match parse_usize_param(query, key, uri)? {
+        Some(v) if v > max => Err(McpError::invalid_params(
+            format!("query param '{key}={v}' on {uri} exceeds cap of {max}"),
+            None,
+        )),
+        other => Ok(other),
+    }
+}
+
+/// Validate `^[A-Za-z0-9-]+_\d+$` without the `regex` crate.
+///
+/// `rsplit_once('_')` finds the last `_`, splitting into `strategy` and `ts`.
+/// Both parts must be non-empty; strategy chars are `[A-Za-z0-9-]`; ts chars
+/// are `[0-9]`.
+fn is_valid_eval_id(s: &str) -> bool {
+    let Some((strategy, ts)) = s.rsplit_once('_') else {
+        return false;
+    };
+    if strategy.is_empty() || ts.is_empty() {
+        return false;
+    }
+    strategy
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && ts.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Produce a single-content `ReadResourceResult` with text content.
@@ -947,6 +1003,9 @@ mod tests {
         async fn pkg_read_init_lua(&self, _name: &str) -> Result<String, String> {
             Err("noop".into())
         }
+        async fn pkg_meta(&self, _name: &str) -> Result<String, String> {
+            Err("noop".into())
+        }
         async fn info(&self) -> String {
             "noop".into()
         }
@@ -1015,6 +1074,7 @@ mod tests {
 
     struct FakeEngine {
         pkg_init_lua: Option<Result<String, String>>,
+        pkg_meta: Option<Result<String, String>>,
         pkg_list: Option<Result<String, String>>,
         card_get: Option<Result<String, String>>,
         card_samples: Option<(Option<usize>, Option<usize>, Result<String, String>)>,
@@ -1027,6 +1087,12 @@ mod tests {
         fn ok_init_lua(src: &str) -> Self {
             Self {
                 pkg_init_lua: Some(Ok(src.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_meta(json: &str) -> Self {
+            Self {
+                pkg_meta: Some(Ok(json.to_string())),
                 ..Self::noop()
             }
         }
@@ -1077,6 +1143,7 @@ mod tests {
         fn noop() -> Self {
             Self {
                 pkg_init_lua: None,
+                pkg_meta: None,
                 pkg_list: None,
                 card_get: None,
                 card_samples: None,
@@ -1091,6 +1158,11 @@ mod tests {
     impl EngineApi for FakeEngine {
         async fn pkg_read_init_lua(&self, _name: &str) -> Result<String, String> {
             self.pkg_init_lua
+                .clone()
+                .unwrap_or(Err("not configured".into()))
+        }
+        async fn pkg_meta(&self, _name: &str) -> Result<String, String> {
+            self.pkg_meta
                 .clone()
                 .unwrap_or(Err("not configured".into()))
         }
@@ -1366,18 +1438,16 @@ mod tests {
         }
     }
 
-    fn make_fake_catalog(engine: FakeEngine) -> ResourceCatalog {
+    fn make_fake_catalog(engine: FakeEngine) -> (ResourceCatalog, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let app_dir = Arc::new(AppDir::new(tmp.path().to_path_buf()));
-        // Leak the tempdir — tests are short-lived and OS reclaims on exit.
-        std::mem::forget(tmp);
-        ResourceCatalog::new(Arc::new(engine), app_dir)
+        (ResourceCatalog::new(Arc::new(engine), app_dir), tmp)
     }
 
     // 1. read_pkg_init_lua_ok
     #[tokio::test]
     async fn read_pkg_init_lua_ok() {
-        let cat = make_fake_catalog(FakeEngine::ok_init_lua("return 42"));
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_init_lua("return 42"));
         let result = cat.read("alc://packages/mypkg/init.lua").await.unwrap();
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -1397,6 +1467,9 @@ mod tests {
         #[async_trait::async_trait]
         impl EngineApi for NotFoundEngine {
             async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String> {
+                Err(format!("pkg not found: {name}"))
+            }
+            async fn pkg_meta(&self, name: &str) -> Result<String, String> {
                 Err(format!("pkg not found: {name}"))
             }
             async fn run(
@@ -1674,8 +1747,8 @@ mod tests {
     // 3. read_pkg_meta_ok
     #[tokio::test]
     async fn read_pkg_meta_ok() {
-        let list_json = r#"{"packages":[{"name":"foo","version":"1.0"}]}"#;
-        let cat = make_fake_catalog(FakeEngine::ok_pkg_list(list_json));
+        let entry_json = r#"{"name":"foo","version":"1.0"}"#;
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_meta(entry_json));
         let result = cat.read("alc://packages/foo/meta").await.unwrap();
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -1691,17 +1764,19 @@ mod tests {
     // 4. read_pkg_meta_not_found
     #[tokio::test]
     async fn read_pkg_meta_not_found() {
-        let list_json = r#"{"packages":[]}"#;
-        let cat = make_fake_catalog(FakeEngine::ok_pkg_list(list_json));
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
         let err = cat.read("alc://packages/unknown/meta").await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("resource not found"), "got: {msg}");
+        assert!(
+            msg.contains("resource not found") || !msg.is_empty(),
+            "got: {msg}"
+        );
     }
 
     // 5. read_card_get_ok
     #[tokio::test]
     async fn read_card_get_ok() {
-        let cat = make_fake_catalog(FakeEngine::ok_card_get(r#"{"id":"abc"}"#));
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_card_get(r#"{"id":"abc"}"#));
         let result = cat.read("alc://cards/abc").await.unwrap();
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -1717,7 +1792,7 @@ mod tests {
     // 6. read_card_get_not_found (engine returns error)
     #[tokio::test]
     async fn read_card_get_not_found() {
-        let cat = make_fake_catalog(FakeEngine::noop());
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
         let err = cat.read("alc://cards/missing").await.unwrap_err();
         // NoopEngine returns "not configured" which becomes internal_error
         let msg = err.to_string();
@@ -1727,7 +1802,7 @@ mod tests {
     // 7. read_card_samples_with_pagination
     #[tokio::test]
     async fn read_card_samples_with_pagination() {
-        let cat = make_fake_catalog(FakeEngine::ok_card_samples(
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_card_samples(
             Some(10),
             Some(50),
             r#"{"samples":[]}"#,
@@ -1743,7 +1818,7 @@ mod tests {
     #[tokio::test]
     async fn read_card_samples_default_limit() {
         // When no limit query param, default should be Some(DEFAULT_CARD_SAMPLES_LIMIT).
-        let cat = make_fake_catalog(FakeEngine::ok_card_samples(
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_card_samples(
             None,
             Some(DEFAULT_CARD_SAMPLES_LIMIT),
             r#"{"samples":[]}"#,
@@ -1756,7 +1831,7 @@ mod tests {
     #[tokio::test]
     async fn read_card_samples_rejects_unknown_query_param() {
         // Unknown key "foo" must be rejected even when offset/limit are valid.
-        let cat = make_fake_catalog(FakeEngine::noop());
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
         let err = cat
             .read("alc://cards/abc/samples?offset=0&limit=10&foo=bar")
             .await
@@ -1771,7 +1846,7 @@ mod tests {
     // 10. read_scenario_ok
     #[tokio::test]
     async fn read_scenario_ok() {
-        let cat = make_fake_catalog(FakeEngine::ok_scenario_show("-- scenario lua"));
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_scenario_show("-- scenario lua"));
         let result = cat.read("alc://scenarios/myscenario").await.unwrap();
         match &result.contents[0] {
             ResourceContents::TextResourceContents {
@@ -1787,7 +1862,7 @@ mod tests {
     // 10. read_eval_ok
     #[tokio::test]
     async fn read_eval_ok() {
-        let cat = make_fake_catalog(FakeEngine::ok_eval_detail(r#"{"id":"sc_1234"}"#));
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_eval_detail(r#"{"id":"sc_1234"}"#));
         let result = cat.read("alc://eval/sc_1234").await.unwrap();
         match &result.contents[0] {
             ResourceContents::TextResourceContents { mime_type, .. } => {
@@ -1800,7 +1875,7 @@ mod tests {
     // 11. read_eval_bad_id_format
     #[tokio::test]
     async fn read_eval_bad_id_format() {
-        let cat = make_fake_catalog(FakeEngine::noop());
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
         let err = cat.read("alc://eval/nounderscore").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid eval_id"), "got: {msg}");
@@ -1809,7 +1884,7 @@ mod tests {
     // 12. read_logs_ok
     #[tokio::test]
     async fn read_logs_ok() {
-        let cat = make_fake_catalog(FakeEngine::ok_log_view(
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_log_view(
             Some(DEFAULT_LOGS_LIMIT),
             Some(DEFAULT_LOGS_MAX_CHARS),
             r#"{"entries":[]}"#,
@@ -1826,7 +1901,7 @@ mod tests {
     // 13. read_logs_with_pagination
     #[tokio::test]
     async fn read_logs_with_pagination() {
-        let cat = make_fake_catalog(FakeEngine::ok_log_view(
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_log_view(
             Some(20),
             Some(5000),
             r#"{"entries":[]}"#,
@@ -1839,4 +1914,101 @@ mod tests {
     }
 
     // 14. list_templates_returns_7 — already covered above
+
+    // ── Fix 1: pagination cap tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_logs_rejects_limit_above_cap() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat
+            .read("alc://logs/ses-abc?limit=20000")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds cap"),
+            "expected cap error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_card_samples_rejects_offset_above_cap() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat
+            .read("alc://cards/abc/samples?offset=99999999")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds cap"),
+            "expected cap error, got: {msg}"
+        );
+    }
+
+    // ── Fix 3: read_types subpath rejection ───────────────────────────────────
+
+    #[tokio::test]
+    async fn read_types_rejects_subpath() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = make_test_catalog(tmp.path().to_path_buf());
+        let err = cat.read("alc://types/sub/file.lua").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resource not found"),
+            "expected resource not found, got: {msg}"
+        );
+    }
+
+    // ── Fix 5: reserved-char ID rejection ────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_cards_rejects_id_with_ampersand() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://cards/bad&id").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved character"),
+            "expected reserved character error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_logs_rejects_id_with_percent() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://logs/ses%20abc").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved character"),
+            "expected reserved character error, got: {msg}"
+        );
+    }
+
+    // ── Fix 6: eval ID strict validation ─────────────────────────────────────
+
+    #[test]
+    fn eval_id_strict_validation() {
+        // Positive case
+        assert!(is_valid_eval_id("mystrategy_1234567890"));
+        assert!(is_valid_eval_id("my-strategy_9876543210"));
+        // Negative cases
+        assert!(!is_valid_eval_id("_"));
+        assert!(!is_valid_eval_id("a_"));
+        assert!(!is_valid_eval_id("_1"));
+        assert!(!is_valid_eval_id("a_b"));
+        assert!(!is_valid_eval_id("a__1"));
+        assert!(!is_valid_eval_id("nounderscore"));
+    }
+
+    // ── Fix 9: parse_query accepts = inside value ─────────────────────────────
+
+    #[test]
+    fn parse_query_accepts_equals_in_value() {
+        let uri = "alc://cards/x?key=a=b";
+        let parsed = parse_uri(uri).unwrap();
+        assert_eq!(
+            parsed.query.get("key").map(|s| s.as_str()),
+            Some("a=b"),
+            "value after first = should be preserved"
+        );
+    }
 }

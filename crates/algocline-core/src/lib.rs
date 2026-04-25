@@ -8,6 +8,7 @@ mod observer;
 pub mod pkg;
 mod progress;
 mod query;
+pub mod recent_log;
 mod spec;
 mod state;
 mod tokens;
@@ -21,6 +22,7 @@ pub use observer::ExecutionObserver;
 pub use pkg::PkgEntity;
 pub use progress::{ProgressHandle, ProgressInfo};
 pub use query::{LlmQuery, QueryId};
+pub use recent_log::{LogEntry, LogSink};
 pub use spec::ExecutionSpec;
 pub use state::{
     ExecutionState, FeedError, PendingQueries, ResumeOutcome, TerminalState, TransitionError,

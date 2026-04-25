@@ -1,3 +1,4 @@
+use crate::recent_log::LogEntry;
 use crate::{ExecutionSpec, LlmQuery, QueryId, TokenUsage};
 
 /// Observer for execution state transitions.
@@ -19,4 +20,9 @@ pub trait ExecutionObserver: Send + Sync {
     fn on_failed(&self, _error: &str) {}
     /// Host-initiated cancellation.
     fn on_cancelled(&self) {}
+    /// A log entry was emitted by the session (Lua `print`, `alc.log`, or engine).
+    ///
+    /// Default implementation is a no-op.  Override in observers that capture
+    /// per-session log output (e.g. [`MetricsObserver`](crate::MetricsObserver)).
+    fn on_log(&self, _entry: &LogEntry) {}
 }

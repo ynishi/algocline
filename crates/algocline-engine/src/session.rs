@@ -438,7 +438,7 @@ impl Session {
             "state": state_label,
         });
 
-        let metrics = self.metrics.snapshot();
+        let metrics = self.metrics.snapshot(false);
         if !metrics.is_null() {
             json["metrics"] = metrics;
         }

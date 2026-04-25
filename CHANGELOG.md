@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-04-25
+
 ### Fixed
 
 - `JsonFileStore`: per-namespace lock to prevent lost updates under concurrent
@@ -21,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdout and corrupted the rmcp JSON-RPC transport, manifesting as
   `serde error expected value at line 1 column 1` in agent-block ↔ algocline
   sessions with ~50% reproducibility.
+
+### Changed
+
+- Bundled-packages tag bumped from `v0.19.0` to `v0.20.0`. v0.20.0 adds new packages (`particle_infer`, `isp_aggregate`) and includes the missing `abm/{mc,stats,sweep}.lua` + `abm/frame/` + `optimize/{eval,search,stop}.lua` files that `alc_pkg_doctor` previously flagged as `incomplete_pkg`.
 
 ## [0.27.0] - 2026-04-25
 

@@ -18,6 +18,16 @@ fn splice_save_warning(result_json: &str, warning: Option<String>) -> String {
     }
 }
 
+/// Splice `transcript_warning` into the JSON `result` when the optional
+/// warning is `Some(_)`. Returns the original string unchanged when
+/// there is no warning.
+fn splice_transcript_warning(result_json: &str, warning: Option<String>) -> String {
+    match warning {
+        Some(msg) => splice_response_string(result_json, "transcript_warning", &msg),
+        None => result_json.to_string(),
+    }
+}
+
 impl AppService {
     /// Execute Lua code with optional JSON context.
     ///
@@ -97,8 +107,9 @@ impl AppService {
             last_result = Some(result);
         }
         let result = last_result.ok_or("Empty responses array")?;
-        self.maybe_log_transcript(&result, session_id);
+        let transcript_warning = self.maybe_log_transcript(&result, session_id);
         let json = result.to_json(session_id).to_string();
+        let json = splice_transcript_warning(&json, transcript_warning);
         let save_warning = self.maybe_save_eval(&result, session_id, &json);
         Ok(splice_save_warning(&json, save_warning))
     }
@@ -126,15 +137,20 @@ impl AppService {
             .await
             .map_err(|e| format!("Continue failed: {e}"))?;
 
-        self.maybe_log_transcript(&result, session_id);
+        let transcript_warning = self.maybe_log_transcript(&result, session_id);
         let json = result.to_json(session_id).to_string();
+        let json = splice_transcript_warning(&json, transcript_warning);
         let save_warning = self.maybe_save_eval(&result, session_id, &json);
         Ok(splice_save_warning(&json, save_warning))
     }
 
     // ─── Internal ───────────────────────────────────────────────
 
-    pub(super) fn maybe_log_transcript(&self, result: &FeedResult, session_id: &str) {
+    pub(super) fn maybe_log_transcript(
+        &self,
+        result: &FeedResult,
+        session_id: &str,
+    ) -> Option<String> {
         if let FeedResult::Finished(exec_result) = result {
             let strategy = self
                 .session_strategies
@@ -146,7 +162,11 @@ impl AppService {
                 session_id,
                 &exec_result.metrics,
                 strategy.as_deref(),
-            );
+            )
+            .err()
+            .map(|e| e.to_string())
+        } else {
+            None
         }
     }
 
@@ -204,7 +224,121 @@ impl AppService {
                 map.insert(session_id.clone(), s.to_string());
             }
         }
-        self.maybe_log_transcript(&result, &session_id);
-        Ok(result.to_json(&session_id).to_string())
+        let transcript_warning = self.maybe_log_transcript(&result, &session_id);
+        let json = result.to_json(&session_id).to_string();
+        Ok(splice_transcript_warning(&json, transcript_warning))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use algocline_core::{
+        AppDir, ExecutionMetrics, ExecutionObserver, LlmQuery, QueryId, TerminalState,
+    };
+    use algocline_engine::{ExecutionResult, FeedResult};
+
+    use super::super::config::{AppConfig, LogDirSource};
+    use super::{splice_transcript_warning, AppService};
+
+    fn make_metrics_with_transcript() -> ExecutionMetrics {
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+        observer.on_paused(&[LlmQuery {
+            id: QueryId::single(),
+            prompt: "test prompt".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+        }]);
+        metrics
+    }
+
+    fn make_finished_result(metrics: ExecutionMetrics) -> FeedResult {
+        FeedResult::Finished(ExecutionResult {
+            state: TerminalState::Completed {
+                result: serde_json::json!({"ok": true}),
+            },
+            metrics,
+        })
+    }
+
+    /// Build a minimal AppService with log_enabled and a custom log_dir.
+    async fn make_app_service_with_log_dir(log_dir: PathBuf) -> AppService {
+        let executor = Arc::new(
+            algocline_engine::Executor::new(vec![])
+                .await
+                .expect("executor"),
+        );
+        let tmp_app = tempfile::tempdir().expect("test tempdir");
+        let log_config = AppConfig {
+            log_dir: Some(log_dir),
+            log_dir_source: LogDirSource::EnvVar,
+            log_enabled: true,
+            prompt_preview_chars: 200,
+            app_dir: Arc::new(AppDir::new(tmp_app.path().to_path_buf())),
+        };
+        std::mem::forget(tmp_app);
+        AppService::new(executor, log_config, vec![])
+    }
+
+    // ── (b) maybe_log_transcript returns Some when write fails ──────────
+
+    #[tokio::test]
+    async fn maybe_log_transcript_returns_some_on_write_failure() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let log_dir = tmp.path().to_path_buf();
+        // Block write by creating a directory at the session file path.
+        std::fs::create_dir_all(log_dir.join("fail-session.json"))
+            .expect("pre-create dir to block write");
+        let svc = make_app_service_with_log_dir(log_dir).await;
+        let metrics = make_metrics_with_transcript();
+        let result = make_finished_result(metrics);
+        let warning = svc.maybe_log_transcript(&result, "fail-session");
+        assert!(warning.is_some(), "expected Some warning on write failure");
+        let msg = warning.unwrap();
+        assert!(
+            msg.contains("transcript"),
+            "warning should mention 'transcript', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_log_transcript_returns_none_on_non_finished() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let svc = make_app_service_with_log_dir(tmp.path().to_path_buf()).await;
+        let result = FeedResult::Accepted { remaining: 1 };
+        let warning = svc.maybe_log_transcript(&result, "any-session");
+        assert!(warning.is_none(), "Accepted result should return None");
+    }
+
+    // ── (c) splice_transcript_warning inserts field into JSON ───────────
+
+    #[test]
+    fn splice_transcript_warning_injects_field_when_some() {
+        let json = r#"{"status":"finished","result":{}}"#;
+        let out = splice_transcript_warning(json, Some("write failed".to_string()));
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            v["transcript_warning"].as_str(),
+            Some("write failed"),
+            "transcript_warning field should be present"
+        );
+        // Original fields are preserved.
+        assert_eq!(v["status"].as_str(), Some("finished"));
+    }
+
+    #[test]
+    fn splice_transcript_warning_passthrough_when_none() {
+        let json = r#"{"status":"finished"}"#;
+        let out = splice_transcript_warning(json, None);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(
+            v.get("transcript_warning").is_none(),
+            "transcript_warning must be absent when warning is None"
+        );
     }
 }

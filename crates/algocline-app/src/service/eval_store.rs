@@ -117,6 +117,11 @@ pub(super) fn build_meta(
 /// List eval history from a given directory, optionally filtered by strategy.
 ///
 /// Pure directory-scanning function — testable with tmpdir.
+///
+/// Per-file meta.json parse failures (corruption) are collected into a
+/// `"warnings"` array in the returned JSON so the caller (MCP wire layer)
+/// can surface them to the UI. Meta file absent is the legitimate
+/// pre-v0.x case and stays silent.
 pub(super) fn list_eval_history(
     dir: &std::path::Path,
     strategy: Option<&str>,
@@ -127,6 +132,7 @@ pub(super) fn list_eval_history(
     }
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     let read_dir = std::fs::read_dir(dir).map_err(|e| format!("Failed to read evals dir: {e}"))?;
 
@@ -153,10 +159,21 @@ pub(super) fn list_eval_history(
             Ok(p) => p,
             Err(_) => continue,
         };
-        let meta = if meta_path.exists() {
-            std::fs::read_to_string(&*meta_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        // Distinguish absent (legitimate) from corrupted (surface as warning).
+        let meta: Option<serde_json::Value> = if meta_path.exists() {
+            match std::fs::read_to_string(&*meta_path) {
+                Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warnings.push(format!("eval meta parse {}: {e}", meta_path.display()));
+                        None
+                    }
+                },
+                Err(e) => {
+                    warnings.push(format!("eval meta read {}: {e}", meta_path.display()));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -185,7 +202,11 @@ pub(super) fn list_eval_history(
     });
     entries.truncate(limit);
 
-    Ok(serde_json::json!({ "evals": entries }).to_string())
+    let mut response = serde_json::json!({ "evals": entries });
+    if !warnings.is_empty() {
+        response["warnings"] = serde_json::json!(warnings);
+    }
+    Ok(response.to_string())
 }
 
 // ─── Eval Comparison Helpers ─────────────────────────────────────
@@ -254,4 +275,100 @@ pub(super) fn save_compare_result(
         .map_err(|e| format!("invalid compare filename {filename}: {e}"))?;
     std::fs::write(&path, result_json)
         .map_err(|e| format!("failed to write compare result {}: {e}", path.display()))
+}
+
+// ─── Phase 3 MED batch: list_eval_history error-propagation tests ─
+
+#[cfg(test)]
+mod list_eval_history_tests {
+    use super::list_eval_history;
+
+    /// Helper: parse the returned JSON and extract optional `warnings` array.
+    fn warnings_from_json(json: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("must be valid JSON");
+        v.get("warnings")
+            .and_then(|w| w.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn absent_dir_returns_empty_no_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("evals");
+        // dir does not exist
+        let result = list_eval_history(&dir, None, 50).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let evals = v["evals"].as_array().unwrap();
+        assert!(evals.is_empty(), "absent dir must return empty evals");
+        let warns = warnings_from_json(&result);
+        assert!(
+            warns.is_empty(),
+            "absent dir must produce no warnings, got {warns:?}"
+        );
+    }
+
+    #[test]
+    fn meta_absent_is_silent_no_warning() {
+        // A .json eval file exists but no .meta.json — that is the
+        // pre-meta legacy case; it should produce no warning.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("evals");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cot_1.json"), b"{}").unwrap();
+        // No cot_1.meta.json written.
+
+        let result = list_eval_history(&dir, None, 50).unwrap();
+        let warns = warnings_from_json(&result);
+        assert!(
+            warns.is_empty(),
+            "absent meta file must produce no warnings, got {warns:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_meta_surfaces_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("evals");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write the eval result file and a corrupt meta file.
+        std::fs::write(dir.join("cot_1.json"), b"{}").unwrap();
+        std::fs::write(dir.join("cot_1.meta.json"), b"not json {{{{").unwrap();
+
+        let result = list_eval_history(&dir, None, 50).unwrap();
+        let warns = warnings_from_json(&result);
+        assert!(
+            !warns.is_empty(),
+            "corrupt meta.json must produce at least one warning, got {warns:?}"
+        );
+        assert!(
+            warns[0].contains("parse"),
+            "warning must mention parse: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn valid_meta_included_no_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("evals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = r#"{"eval_id":"cot_1","strategy":"cot","timestamp":1}"#;
+        std::fs::write(dir.join("cot_1.json"), b"{}").unwrap();
+        std::fs::write(dir.join("cot_1.meta.json"), meta).unwrap();
+
+        let result = list_eval_history(&dir, None, 50).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let evals = v["evals"].as_array().unwrap();
+        assert_eq!(evals.len(), 1, "valid meta must appear in evals");
+        let warns = warnings_from_json(&result);
+        assert!(
+            warns.is_empty(),
+            "valid meta must produce no warnings, got {warns:?}"
+        );
+    }
 }

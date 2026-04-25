@@ -699,6 +699,7 @@ mod tests {
                     &self,
                     _session_id: Option<&str>,
                     _pending_filter: Option<serde_json::Value>,
+                    _include_history: bool,
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1288,6 +1289,7 @@ mod tests {
             &self,
             _: Option<&str>,
             _: Option<serde_json::Value>,
+            _: bool,
         ) -> Result<String, String> {
             Err("noop".into())
         }
@@ -1536,6 +1538,7 @@ mod tests {
                 &self,
                 _: Option<&str>,
                 _: Option<serde_json::Value>,
+                _: bool,
             ) -> Result<String, String> {
                 Err("noop".into())
             }

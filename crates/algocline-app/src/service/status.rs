@@ -3,34 +3,33 @@ use algocline_engine::PendingFilter;
 use super::AppService;
 
 impl AppService {
-    /// Snapshot of all active sessions for external observation.
+    /// Snapshot of all active sessions (or one by ID) for external observation.
     ///
-    /// Returns JSON with session status, metrics, progress, and strategy name.
-    /// Only includes sessions currently held in the registry (paused, awaiting
-    /// host LLM responses). Completed sessions are not listed here — use
-    /// `alc_log_view` for historical data.
+    /// # Arguments
     ///
-    /// `pending_filter` resolution:
-    /// - `None`  → legacy snapshot (count-only `pending_queries: N`).
-    /// - `Some(String)` → preset name: `"meta"` / `"preview"` / `"full"`.
-    ///   Unknown names return `Err` (typo protection).
-    /// - `Some(Object)` → free-form `PendingFilter` custom filter.
-    /// - Any other JSON shape → `Err`.
+    /// * `session_id` - When `Some`, returns detail for one session; when `None`, lists all.
+    /// * `pending_filter` - Optional preset name or custom field-filter for pending query projection.
+    /// * `include_history` - When `true`, each snapshot includes `conversation_history` (cap=10).
+    ///   Pass `false` (the default) for lightweight high-frequency polling snapshots.
     ///
-    /// The `preview` preset reads the char limit from
-    /// [`AppConfig::prompt_preview_chars`] (env `ALC_PROMPT_PREVIEW_CHARS`).
-    /// A custom filter that specifies its own `prompt: { mode: "preview",
-    /// chars: N }` wins outright — the per-request value is not clamped
-    /// by the env setting.
+    /// # Returns
+    ///
+    /// JSON string with either a single session object or `{active_sessions, sessions}` list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `pending_filter` is an unknown preset name or an invalid shape.
     pub async fn status(
         &self,
         session_id: Option<&str>,
         pending_filter: Option<serde_json::Value>,
+        include_history: bool,
     ) -> Result<String, String> {
         let filter = self.resolve_pending_filter(pending_filter)?;
-        // include_history: ST3 will wire this from StatusParams.include_history;
-        // for now pass false (existing behaviour, high-frequency polling safe).
-        let snapshots = self.registry.list_snapshots(filter.as_ref(), false).await;
+        let snapshots = self
+            .registry
+            .list_snapshots(filter.as_ref(), include_history)
+            .await;
 
         // If a specific session requested, return just that one
         if let Some(sid) = session_id {

@@ -69,10 +69,15 @@ pub trait EngineApi: Send + Sync {
     /// callers, decoded inside the app layer into either a preset name
     /// (`"meta"` / `"preview"` / `"full"`) or a custom field-filter
     /// object. `None` keeps the legacy count-only snapshot.
+    ///
+    /// `include_history`: when `true`, each session snapshot includes
+    /// `conversation_history` (capped at 10 entries). Default `false`
+    /// preserves the lightweight snapshot contract for high-frequency pollers.
     async fn status(
         &self,
         session_id: Option<&str>,
         pending_filter: Option<serde_json::Value>,
+        include_history: bool,
     ) -> Result<String, String>;
 
     // ─── Evaluation ──────────────────────────────────────────

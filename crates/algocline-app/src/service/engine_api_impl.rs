@@ -60,8 +60,9 @@ impl EngineApi for AppService {
         &self,
         session_id: Option<&str>,
         pending_filter: Option<serde_json::Value>,
+        include_history: bool,
     ) -> Result<String, String> {
-        AppService::status(self, session_id, pending_filter).await
+        AppService::status(self, session_id, pending_filter, include_history).await
     }
 
     // ─── Evaluation ──────────────────────────────────────────

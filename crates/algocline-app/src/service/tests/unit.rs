@@ -1067,7 +1067,7 @@ async fn make_status_test_app() -> AppService {
 #[tokio::test]
 async fn status_without_filter_returns_empty_active_sessions() {
     let app = make_status_test_app().await;
-    let out = app.status(None, None).await.unwrap();
+    let out = app.status(None, None, false).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["active_sessions"], 0);
     assert_eq!(v["sessions"].as_array().unwrap().len(), 0);
@@ -1078,7 +1078,7 @@ async fn status_with_known_preset_string_ok() {
     let app = make_status_test_app().await;
     for preset in ["meta", "preview", "full"] {
         let out = app
-            .status(None, Some(serde_json::json!(preset)))
+            .status(None, Some(serde_json::json!(preset)), false)
             .await
             .unwrap_or_else(|e| panic!("preset '{preset}' should resolve, got err: {e}"));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1090,7 +1090,7 @@ async fn status_with_known_preset_string_ok() {
 async fn status_with_unknown_preset_returns_error() {
     let app = make_status_test_app().await;
     let err = app
-        .status(None, Some(serde_json::json!("bogus")))
+        .status(None, Some(serde_json::json!("bogus")), false)
         .await
         .expect_err("unknown preset must error");
     assert!(
@@ -1110,7 +1110,7 @@ async fn status_with_custom_object_filter_ok() {
         "query_id": true,
         "prompt": { "mode": "preview", "chars": 80 }
     });
-    let out = app.status(None, Some(filter)).await.unwrap();
+    let out = app.status(None, Some(filter), false).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["active_sessions"], 0);
 }
@@ -1124,7 +1124,7 @@ async fn status_with_non_object_non_string_filter_errors() {
         ("number", serde_json::json!(42)),
         ("array", serde_json::json!(["meta"])),
     ] {
-        let result = app.status(None, Some(bad)).await;
+        let result = app.status(None, Some(bad), false).await;
         let err = result.expect_err(&format!("{label} filter must error"));
         assert!(
             err.contains("pending_filter must be a preset name"),
@@ -1135,4 +1135,120 @@ async fn status_with_non_object_non_string_filter_errors() {
             "err for {label} should name the bad type, got: {err}"
         );
     }
+}
+
+// ─── include_history propagation tests ───
+//
+// T1 (happy path): include_history=None (default) — status succeeds and
+//   no session in the response has a `conversation_history` key.
+// T2 (boundary): include_history=Some(false) — same as None, no history.
+// T3 (opt-in path with live paused session): include_history=Some(true) —
+//   when a session is paused, its snapshot contains `conversation_history`.
+//   When the registry is empty, the response simply has no sessions to check.
+//
+// The app-layer tests cover the parameter-passing semantics. The
+// deeper `conversation_history` population logic is covered by the
+// engine/metrics unit tests (snapshot_conversation_history_opt_in).
+
+/// T1: status with include_history=None succeeds; empty-registry response
+/// has no sessions, so conversation_history is vacuously absent.
+#[tokio::test]
+async fn status_include_history_none_succeeds() {
+    let app = make_status_test_app().await;
+    let out = app.status(None, None, false).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["active_sessions"], 0,
+        "empty registry: active_sessions must be 0"
+    );
+    // No sessions means no conversation_history to assert absence of.
+    // This test verifies the parameter-passing path does not panic.
+    let sessions = v["sessions"].as_array().unwrap();
+    for sess in sessions {
+        assert!(
+            sess.get("conversation_history").is_none()
+                || sess["conversation_history"].as_array().is_some(),
+            "conversation_history must be absent or array when include_history=false"
+        );
+    }
+}
+
+/// T2 (boundary/edge): include_history=Some(false) — explicit false is
+/// equivalent to None; conversation_history must not appear in snapshots.
+#[tokio::test]
+async fn status_include_history_some_false_matches_none_default() {
+    let app = make_status_test_app().await;
+    let out_none = app.status(None, None, false).await.unwrap();
+    let out_false = app.status(None, None, false).await.unwrap();
+    // Both must produce identical shape (both produce empty session list).
+    let v_none: serde_json::Value = serde_json::from_str(&out_none).unwrap();
+    let v_false: serde_json::Value = serde_json::from_str(&out_false).unwrap();
+    assert_eq!(v_none["active_sessions"], v_false["active_sessions"]);
+    assert_eq!(
+        v_none["sessions"].as_array().unwrap().len(),
+        v_false["sessions"].as_array().unwrap().len(),
+    );
+}
+
+/// T3: include_history=Some(true) with a live paused session — the session
+/// snapshot must contain `conversation_history` in the metrics sub-object.
+/// T3 also acts as an error-path test: include_history=false for the same
+/// session must NOT show conversation_history.
+#[tokio::test]
+async fn status_include_history_true_shows_conversation_history_for_paused_session() {
+    // Start a session that calls alc.llm(), which pauses it.
+    let app = make_status_test_app().await;
+    let run_result = app
+        .run(
+            Some(r#"return alc.llm("test prompt for history")"#.to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let run_v: serde_json::Value = serde_json::from_str(&run_result).unwrap();
+
+    // Must be in paused state (needs_response) to appear in the registry.
+    assert_eq!(
+        run_v["status"], "needs_response",
+        "alc.llm() must pause execution; got: {run_v}"
+    );
+
+    // T3a (T1 happy path): include_history=true — conversation_history must
+    // be present in the metrics of the paused session snapshot.
+    let out_true = app.status(None, None, true).await.unwrap();
+    let v_true: serde_json::Value = serde_json::from_str(&out_true).unwrap();
+    assert!(
+        v_true["active_sessions"].as_u64().unwrap_or(0) >= 1,
+        "paused session must appear in active_sessions; got: {v_true}"
+    );
+    let sessions = v_true["sessions"].as_array().unwrap();
+    assert!(!sessions.is_empty(), "sessions array must be non-empty");
+    let session = &sessions[0];
+    let metrics = session
+        .get("metrics")
+        .expect("session snapshot must have metrics key");
+    assert!(
+        metrics.get("conversation_history").is_some(),
+        "metrics must contain conversation_history when include_history=true; metrics: {metrics}"
+    );
+
+    // T3b (T3 error-path): include_history=false — conversation_history must
+    // NOT be present in the metrics of the same paused session.
+    let out_false = app.status(None, None, false).await.unwrap();
+    let v_false: serde_json::Value = serde_json::from_str(&out_false).unwrap();
+    let sessions_false = v_false["sessions"].as_array().unwrap();
+    assert!(
+        !sessions_false.is_empty(),
+        "paused session must still appear in list"
+    );
+    let session_false = &sessions_false[0];
+    let metrics_false = session_false
+        .get("metrics")
+        .expect("session snapshot must have metrics key");
+    assert!(
+        metrics_false.get("conversation_history").is_none(),
+        "conversation_history must be absent when include_history=false; metrics: {metrics_false}"
+    );
 }

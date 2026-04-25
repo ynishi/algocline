@@ -441,6 +441,15 @@ pub struct StatusParams {
     /// this field to retain the legacy count-only snapshot.
     #[serde(default)]
     pub pending_filter: Option<serde_json::Value>,
+    /// If true, include `conversation_history` (cap=10) in each session
+    /// snapshot. Default false to keep the response lightweight for
+    /// high-frequency polling (preserves the existing "snapshot without
+    /// transcript" contract from `metrics.rs:189`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "If true, include `conversation_history` (cap=10) in each session snapshot. Default false to keep response lightweight for high-frequency polling (preserves the existing 'snapshot without transcript' contract)."
+    )]
+    pub include_history: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1222,8 +1231,13 @@ impl AlcService {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self, Parameters(params): Parameters<StatusParams>) -> Result<String, String> {
+        let include_history = params.include_history.unwrap_or(false);
         self.app
-            .status(params.session_id.as_deref(), params.pending_filter)
+            .status(
+                params.session_id.as_deref(),
+                params.pending_filter,
+                include_history,
+            )
             .await
     }
 

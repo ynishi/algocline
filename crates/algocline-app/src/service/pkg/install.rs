@@ -88,7 +88,8 @@ impl AppService {
     ) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
         let pkg_dir = packages_dir(&app_dir);
-        let _ = std::fs::create_dir_all(&pkg_dir);
+        std::fs::create_dir_all(&pkg_dir)
+            .map_err(|e| format!("Failed to create packages dir {}: {e}", pkg_dir.display()))?;
 
         let git_url = match source {
             InstallSource::LocalPath(path) => {
@@ -181,9 +182,16 @@ impl AppService {
                 storage_warnings.push(format!("hub register_source: {e}"));
             }
 
-            // Update alc.toml + alc.lock if project root is found
-            self.update_project_files_for_install(std::slice::from_ref(&name))
-                .await;
+            // Update alc.toml + alc.lock if project root is found.
+            // Fatal errors from the update (e.g. alc.toml load failure) are
+            // degraded to warnings — the pkg copy already succeeded.
+            let project_files_warnings = match self
+                .update_project_files_for_install(std::slice::from_ref(&name))
+                .await
+            {
+                Ok(ws) => ws,
+                Err(e) => vec![e],
+            };
 
             let mut response = serde_json::json!({
                 "installed": [name],
@@ -197,6 +205,9 @@ impl AppService {
             }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
+            }
+            if !project_files_warnings.is_empty() {
+                response["project_files_warnings"] = serde_json::json!(project_files_warnings);
             }
             Ok(response.to_string())
         } else {
@@ -328,8 +339,14 @@ impl AppService {
                 storage_warnings.push(format!("hub register_source: {e}"));
             }
 
-            // Update alc.toml + alc.lock if project root is found
-            self.update_project_files_for_install(&installed).await;
+            // Update alc.toml + alc.lock if project root is found.
+            // Fatal errors from the update (e.g. alc.toml load failure) are
+            // degraded to warnings — the pkg copy already succeeded.
+            let project_files_warnings =
+                match self.update_project_files_for_install(&installed).await {
+                    Ok(ws) => ws,
+                    Err(e) => vec![e],
+                };
 
             let mut response = serde_json::json!({
                 "installed": installed,
@@ -348,6 +365,9 @@ impl AppService {
             }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
+            }
+            if !project_files_warnings.is_empty() {
+                response["project_files_warnings"] = serde_json::json!(project_files_warnings);
             }
             Ok(response.to_string())
         }
@@ -432,9 +452,16 @@ impl AppService {
                 storage_warnings.push(format!("hub register_source: {e}"));
             }
 
-            // Update alc.toml + alc.lock if project root is found
-            self.update_project_files_for_install(std::slice::from_ref(&name))
-                .await;
+            // Update alc.toml + alc.lock if project root is found.
+            // Fatal errors from the update (e.g. alc.toml load failure) are
+            // degraded to warnings — the pkg copy already succeeded.
+            let project_files_warnings = match self
+                .update_project_files_for_install(std::slice::from_ref(&name))
+                .await
+            {
+                Ok(ws) => ws,
+                Err(e) => vec![e],
+            };
 
             let mut response = serde_json::json!({
                 "installed": [name],
@@ -448,6 +475,9 @@ impl AppService {
             }
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
+            }
+            if !project_files_warnings.is_empty() {
+                response["project_files_warnings"] = serde_json::json!(project_files_warnings);
             }
             Ok(response.to_string())
         } else {
@@ -538,8 +568,14 @@ impl AppService {
                 storage_warnings.push(format!("hub register_source: {e}"));
             }
 
-            // Update alc.toml + alc.lock for newly installed packages
-            self.update_project_files_for_install(&installed).await;
+            // Update alc.toml + alc.lock for newly installed packages.
+            // Fatal errors from the update (e.g. alc.toml load failure) are
+            // degraded to warnings — the pkg copy already succeeded.
+            let project_files_warnings =
+                match self.update_project_files_for_install(&installed).await {
+                    Ok(ws) => ws,
+                    Err(e) => vec![e],
+                };
 
             let mut response = serde_json::json!({
                 "installed": installed,
@@ -556,17 +592,24 @@ impl AppService {
             if !storage_warnings.is_empty() {
                 response["storage_warnings"] = serde_json::json!(storage_warnings);
             }
+            if !project_files_warnings.is_empty() {
+                response["project_files_warnings"] = serde_json::json!(project_files_warnings);
+            }
             Ok(response.to_string())
         }
     }
 
     /// After a successful cache install, update `alc.toml` and `alc.lock` if a project
-    /// root (containing `alc.toml`) is found.  Failures are logged but not propagated —
-    /// the install itself already succeeded.
-    async fn update_project_files_for_install(&self, names: &[String]) {
+    /// root (containing `alc.toml`) is found.  Load failures are surfaced as `Err`;
+    /// save failures are collected into the returned warnings vec.  Lock acquisition
+    /// failures are degraded to a single warning so the install result stays `Ok`.
+    async fn update_project_files_for_install(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<String>, String> {
         let root = match resolve_project_root(None) {
             Some(r) => r,
-            None => return, // No project root → skip (current-compat)
+            None => return Ok(Vec::new()), // No project root → skip (current-compat)
         };
 
         // Resolve per-package versions *before* taking the lock, so the
@@ -585,54 +628,65 @@ impl AppService {
         // apply their own mutation, and race to save — the later writer
         // silently overwrites the earlier's entry.
         let lock_path = project_files_lock_path(&root);
-        let lock_result = super::super::lock::with_exclusive_lock(&lock_path, move || {
-            // Load alc.toml document (preserving comments/formatting).
-            let mut doc = match load_alc_toml_document(&root) {
-                Ok(Some(d)) => d,
-                Ok(None) => return Ok(()), // alc.toml not found → skip
-                Err(e) => {
-                    tracing::warn!("pkg_install: failed to load alc.toml: {e}");
-                    return Ok(());
+        let lock_result: Result<Vec<String>, String> =
+            super::super::lock::with_exclusive_lock(&lock_path, move || {
+                let mut warnings: Vec<String> = Vec::new();
+
+                // Load alc.toml document (preserving comments/formatting).
+                // file absent (Ok(None)) is a normal skip; corruption (Err) is fatal.
+                let mut doc = match load_alc_toml_document(&root) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => return Ok(Vec::new()), // alc.toml not found → skip
+                    Err(e) => {
+                        return Err(format!("alc.toml load: {e}"));
+                    }
+                };
+
+                // Load or create alc.lock.
+                // file absent (Ok(None)) → start with empty lockfile (normal init path).
+                // corruption (Err) is fatal — same policy as alc.toml.
+                let mut lock = match load_lockfile(&root) {
+                    Ok(Some(l)) => l,
+                    Ok(None) => LockFile {
+                        version: 1,
+                        packages: Vec::new(),
+                    },
+                    Err(e) => {
+                        return Err(format!("alc.lock load: {e}"));
+                    }
+                };
+
+                for (name, version) in &resolved {
+                    // Add to alc.toml (no-op if already present).
+                    add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
+                    // Upsert into alc.lock with the pre-resolved version.
+                    upsert_lock_entry(
+                        &mut lock,
+                        name.clone(),
+                        version.clone(),
+                        PackageSource::Installed,
+                    );
                 }
-            };
 
-            // Load or create alc.lock.
-            let mut lock = match load_lockfile(&root) {
-                Ok(Some(l)) => l,
-                Ok(None) => LockFile {
-                    version: 1,
-                    packages: Vec::new(),
-                },
-                Err(e) => {
-                    tracing::warn!("pkg_install: failed to load alc.lock: {e}");
-                    return Ok(());
+                // Save failures are non-fatal: collect as warnings so the caller
+                // can surface them in the response JSON. Both saves are attempted
+                // independently (one failure does not skip the other).
+                if let Err(e) = save_alc_toml(&root, &doc) {
+                    warnings.push(format!("alc.toml save: {e}"));
                 }
-            };
+                if let Err(e) = save_lockfile(&root, &lock) {
+                    warnings.push(format!("alc.lock save: {e}"));
+                }
+                Ok(warnings)
+            });
 
-            for (name, version) in &resolved {
-                // Add to alc.toml (no-op if already present).
-                add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
-                // Upsert into alc.lock with the pre-resolved version.
-                upsert_lock_entry(
-                    &mut lock,
-                    name.clone(),
-                    version.clone(),
-                    PackageSource::Installed,
-                );
-            }
-
-            if let Err(e) = save_alc_toml(&root, &doc) {
-                tracing::warn!("pkg_install: failed to save alc.toml: {e}");
-            }
-            if let Err(e) = save_lockfile(&root, &lock) {
-                tracing::warn!("pkg_install: failed to save alc.lock: {e}");
-            }
-            Ok(())
-        });
-
-        if let Err(e) = lock_result {
-            tracing::warn!("pkg_install: project files lock failed: {e}");
-        }
+        // Lock acquisition failure or closure fatal err (load failure) is degraded
+        // to a warning so the install result (pkg copy already succeeded) stays Ok.
+        let warnings = match lock_result {
+            Ok(ws) => ws,
+            Err(e) => vec![format!("project files lock: {e}")],
+        };
+        Ok(warnings)
     }
 
     /// Fetch package version via `eval_simple` (best-effort; returns `None` on failure).
@@ -711,5 +765,253 @@ fn upsert_lock_entry(
             version,
             source,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::alc_toml::save_alc_toml;
+    use super::super::super::lock::with_exclusive_lock;
+    use super::super::super::lockfile::save_lockfile;
+    use super::*;
+
+    // ── (b) closure load failure → fatal Err propagated through Result ────────
+
+    /// When `alc.toml` exists but is corrupt (unparseable TOML), the closure
+    /// must return `Err(...)` rather than silently skipping.
+    #[test]
+    fn load_alc_toml_corrupt_yields_fatal_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Write corrupt TOML
+        std::fs::write(root.join("alc.toml"), b"[[not valid toml = {").unwrap();
+
+        let lock_path = root.join(".alc-install.lock");
+        let result: Result<Vec<String>, String> =
+            with_exclusive_lock(&lock_path, move || match load_alc_toml_document(root) {
+                Ok(Some(_d)) => Ok(Vec::new()),
+                Ok(None) => Ok(Vec::new()),
+                Err(e) => Err(format!("alc.toml load: {e}")),
+            });
+
+        assert!(
+            result.is_err(),
+            "Expected Err on corrupt alc.toml, got: {result:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("alc.toml load:"),
+            "Error should contain 'alc.toml load:', got: {msg}"
+        );
+    }
+
+    /// When `alc.lock` exists but is corrupt, the closure must return `Err`.
+    #[test]
+    fn load_alc_lock_corrupt_yields_fatal_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Write a valid alc.toml so it passes the first check
+        std::fs::write(root.join("alc.toml"), b"[packages]\n").unwrap();
+        // Write corrupt alc.lock
+        std::fs::write(root.join("alc.lock"), b"version = 999\n[[package]]\n").unwrap();
+
+        let lock_path = root.join(".alc-install.lock");
+        let result: Result<Vec<String>, String> = with_exclusive_lock(&lock_path, move || {
+            let _doc = match load_alc_toml_document(root) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Ok(Vec::new()),
+                Err(e) => return Err(format!("alc.toml load: {e}")),
+            };
+            match load_lockfile(root) {
+                Ok(Some(_l)) => Ok(Vec::new()),
+                Ok(None) => Ok(Vec::new()),
+                Err(e) => Err(format!("alc.lock load: {e}")),
+            }
+        });
+
+        assert!(
+            result.is_err(),
+            "Expected Err on corrupt alc.lock, got: {result:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("alc.lock load:"),
+            "Error should contain 'alc.lock load:', got: {msg}"
+        );
+    }
+
+    // ── (a) closure save failure → warnings collected (not fatal) ─────────────
+
+    /// When alc.toml exists and is valid but the save path is non-writable,
+    /// the failure should appear in the returned warnings vec (not as Err).
+    #[test]
+    fn save_failure_produces_warning_not_fatal_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Write a minimal valid alc.toml
+        std::fs::write(root.join("alc.toml"), b"[packages]\n").unwrap();
+
+        // Place a regular FILE at bad_root so create_dir_all(bad_root) fails
+        // (cannot create a directory at a path occupied by a non-directory).
+        // Both save_alc_toml and save_lockfile call create_dir_all(parent)
+        // where parent = bad_root, so the file blocker triggers the failure.
+        let bad_root = root.join("blocked_subdir");
+        std::fs::write(&bad_root, b"this is a file, not a dir").unwrap();
+
+        let lock_path = root.join(".alc-install.lock");
+        let root_owned = root.to_path_buf();
+        let bad_root_owned = bad_root.clone();
+        let result: Result<Vec<String>, String> = with_exclusive_lock(&lock_path, move || {
+            let mut warnings: Vec<String> = Vec::new();
+            let doc = match load_alc_toml_document(&root_owned) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Ok(Vec::new()),
+                Err(e) => return Err(format!("alc.toml load: {e}")),
+            };
+            if let Err(e) = save_alc_toml(&bad_root_owned, &doc) {
+                warnings.push(format!("alc.toml save: {e}"));
+            }
+            let lock = LockFile {
+                version: 1,
+                packages: Vec::new(),
+            };
+            if let Err(e) = save_lockfile(&bad_root_owned, &lock) {
+                warnings.push(format!("alc.lock save: {e}"));
+            }
+            Ok(warnings)
+        });
+
+        assert!(
+            result.is_ok(),
+            "Expected Ok even with save failures, got: {result:?}"
+        );
+        let warnings = result.unwrap();
+        assert!(
+            !warnings.is_empty(),
+            "Expected at least one save warning, got empty warnings"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("alc.toml save:")),
+            "Expected 'alc.toml save:' warning, got: {warnings:?}"
+        );
+    }
+
+    // ── (c) caller transforms fatal Err into project_files_warnings ───────────
+
+    /// The caller pattern `match result { Ok(ws) => ws, Err(e) => vec![e] }`
+    /// must convert a fatal Err into a single-element warnings vec so the
+    /// install response remains Ok.
+    #[test]
+    fn caller_degrades_fatal_err_to_project_files_warnings() {
+        // Simulate the update returning a fatal Err (e.g. alc.toml load failure)
+        let update_result: Result<Vec<String>, String> =
+            Err("alc.toml load: TOML parse error at line 1".to_string());
+
+        // This is the exact pattern used in each of the 4 callers.
+        let project_files_warnings = match update_result {
+            Ok(ws) => ws,
+            Err(e) => vec![e],
+        };
+
+        assert_eq!(project_files_warnings.len(), 1);
+        assert!(
+            project_files_warnings[0].contains("alc.toml load:"),
+            "Warning should contain the original error message"
+        );
+    }
+
+    /// When update returns Ok with warnings, they pass through unchanged.
+    #[test]
+    fn caller_passes_through_ok_warnings() {
+        let update_result: Result<Vec<String>, String> = Ok(vec![
+            "alc.toml save: permission denied".to_string(),
+            "alc.lock save: no space left".to_string(),
+        ]);
+
+        let project_files_warnings = match update_result {
+            Ok(ws) => ws,
+            Err(e) => vec![e],
+        };
+
+        assert_eq!(project_files_warnings.len(), 2);
+    }
+
+    /// When update returns Ok with no warnings, the empty vec is gated out
+    /// of the response JSON (mirrors storage_warnings convention).
+    #[test]
+    fn empty_warnings_are_not_added_to_response() {
+        let update_result: Result<Vec<String>, String> = Ok(Vec::new());
+
+        let project_files_warnings = match update_result {
+            Ok(ws) => ws,
+            Err(e) => vec![e],
+        };
+
+        // Gate mirrors the `if !project_files_warnings.is_empty()` check in callers
+        let mut response = serde_json::json!({ "installed": ["mypkg"], "mode": "single" });
+        if !project_files_warnings.is_empty() {
+            response["project_files_warnings"] = serde_json::json!(project_files_warnings);
+        }
+
+        assert!(
+            response.get("project_files_warnings").is_none(),
+            "project_files_warnings should not appear when warnings are empty"
+        );
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_lock_entry_inserts_new_package() {
+        let mut lock = LockFile {
+            version: 1,
+            packages: Vec::new(),
+        };
+        upsert_lock_entry(
+            &mut lock,
+            "mypkg".to_string(),
+            Some("1.0.0".to_string()),
+            PackageSource::Installed,
+        );
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].name, "mypkg");
+        assert_eq!(lock.packages[0].version, Some("1.0.0".to_string()));
+    }
+
+    #[test]
+    fn upsert_lock_entry_updates_existing_package() {
+        let mut lock = LockFile {
+            version: 1,
+            packages: Vec::new(),
+        };
+        upsert_lock_entry(
+            &mut lock,
+            "mypkg".to_string(),
+            Some("1.0.0".to_string()),
+            PackageSource::Installed,
+        );
+        upsert_lock_entry(
+            &mut lock,
+            "mypkg".to_string(),
+            Some("2.0.0".to_string()),
+            PackageSource::Installed,
+        );
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].version, Some("2.0.0".to_string()));
+    }
+
+    #[test]
+    fn is_safe_pkg_name_accepts_valid_names() {
+        assert!(is_safe_pkg_name("my_pkg"));
+        assert!(is_safe_pkg_name("my-pkg"));
+        assert!(is_safe_pkg_name("mypkg123"));
+    }
+
+    #[test]
+    fn is_safe_pkg_name_rejects_invalid_names() {
+        assert!(!is_safe_pkg_name(""));
+        assert!(!is_safe_pkg_name("my pkg"));
+        assert!(!is_safe_pkg_name("../escape"));
+        assert!(!is_safe_pkg_name("pkg;rm -rf /"));
     }
 }

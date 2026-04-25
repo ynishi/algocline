@@ -3478,3 +3478,103 @@ return M"#,
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── state lost-update / Lua print safety ────────────────────────
+
+/// Verify that concurrent `alc.state.set` calls on the same key do not
+/// produce a lost update.
+///
+/// Two `alc_run` requests are issued in parallel via the same MCP
+/// connection.  Each Lua snippet reads the current value of key `"c"`,
+/// adds 1, and writes it back.  Without the per-namespace `Mutex`
+/// introduced in `JsonFileStore`, one of the two writes would be
+/// dropped when both reads observe the same initial value.
+///
+/// After both calls complete the key must equal 2.
+#[tokio::test]
+async fn test_state_no_lost_update_under_concurrent_writes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Use a dedicated namespace via ctx._ns so the test is hermetic.
+    // alc.state.incr is used here because its read-modify-write is fully
+    // serialised by the per-namespace Mutex inside JsonFileStore.  A plain
+    // get/set pair would require the Lua code to also run atomically, which
+    // cannot be guaranteed across two independent MCP sessions — the sessions
+    // themselves run concurrently but the Lua RMW within each is not atomic
+    // unless backed by an atomic backend primitive.
+    //
+    // This test verifies that two concurrent incr(delta=1) calls on the same
+    // key never produce a lost update: the final value must be exactly 2.
+    let ns = "e2e_concurrent_state";
+    let code = r#"return alc.state.incr("c", 1, 0)"#;
+
+    // Fire both requests in parallel, both targeting the same namespace.
+    let (r1, r2) = tokio::join!(
+        call_json(
+            &client,
+            "alc_run",
+            json!({ "code": code, "ctx": { "_ns": ns } })
+        ),
+        call_json(
+            &client,
+            "alc_run",
+            json!({ "code": code, "ctx": { "_ns": ns } })
+        ),
+    );
+    assert_eq!(r1["status"], "completed", "run 1 failed: {r1}");
+    assert_eq!(r2["status"], "completed", "run 2 failed: {r2}");
+
+    // Each call returns the value after its own increment.  The two returned
+    // values must be {1, 2} (in any order) — never {1, 1} which would indicate
+    // a lost update.
+    let v1 = r1["result"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("r1 result not a number: {r1}")) as u64;
+    let v2 = r2["result"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("r2 result not a number: {r2}")) as u64;
+    let mut pair = [v1, v2];
+    pair.sort();
+    assert_eq!(
+        pair,
+        [1, 2],
+        "expected incr results to be {{1, 2}} (no lost update), got {v1} and {v2}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Verify that Lua `print(...)` does not corrupt the rmcp transport.
+///
+/// A user strategy calling `print("dbg")` should emit log output without
+/// touching stdout.  The MCP connection must remain functional after the
+/// call, i.e. a follow-up request to the same client must succeed.
+#[tokio::test]
+async fn test_lua_print_does_not_corrupt_transport() {
+    let client = connect().await;
+
+    // Run Lua that calls print() — this would corrupt the JSON-RPC transport
+    // if print still wrote to stdout.
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": r#"print("dbg: hello from lua"); return 42"# }),
+    )
+    .await;
+    assert_eq!(
+        resp["status"], "completed",
+        "alc_run with print failed: {resp}"
+    );
+    assert_eq!(resp["result"], 42);
+
+    // The transport must still be functional — issue a follow-up request.
+    let resp2 = call_json(&client, "alc_run", json!({ "code": "return 99" })).await;
+    assert_eq!(
+        resp2["status"], "completed",
+        "follow-up call failed: {resp2}"
+    );
+    assert_eq!(resp2["result"], 99);
+
+    client.cancel().await.expect("cancel failed");
+}

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `JsonFileStore`: per-namespace lock to prevent lost updates under concurrent
+  `alc.state.*` calls within the same process. The previous implementation
+  noted "Safe within one process" but assumed single-threaded execution and was
+  vulnerable to lost updates across tokio tasks (non-locking read-modify-write).
+  A `std::sync::Mutex` per namespace now serialises the load → mutate →
+  atomic-rename cycle. Multi-process safety still requires a backend with native
+  `INCR` (Redis) or transactions (SQLite).
+- Lua standard `print` is now redirected to `tracing::info!(target = "alc.lua.print", ...)`.
+  Previously, raw `print(...)` from user strategies wrote directly to process
+  stdout and corrupted the rmcp JSON-RPC transport, manifesting as
+  `serde error expected value at line 1 column 1` in agent-block ↔ algocline
+  sessions with ~50% reproducibility.
+
 ## [0.27.0] - 2026-04-25
 
 ### Added

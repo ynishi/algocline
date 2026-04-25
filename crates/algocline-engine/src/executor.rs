@@ -242,6 +242,50 @@ impl Executor {
                     .exec()
                     .map_err(|e| IsleError::Lua(format!("Prelude load failed: {e}")))?;
 
+                // Override Lua's standard `print` to redirect output to tracing
+                // instead of stdout.  Stdout is used exclusively by the rmcp
+                // JSON-RPC stdio transport; any stray write from user Lua code
+                // would corrupt the transport framing.
+                //
+                // Behaviour mirrors the standard `print`:
+                //   * multiple args are joined with "\t"
+                //   * each arg is coerced via `tostring`
+                //   * the assembled line is emitted as `tracing::info!` so it
+                //     appears in the log file without reaching stdout
+                //
+                // `io.write` is intentionally left unchanged — scripts that
+                // explicitly target stdout/stderr can still use it.
+                let print_fn = lua.create_function(|lua_inner, args: mlua::MultiValue| {
+                    use mlua::prelude::LuaValue;
+                    let parts: Vec<String> = args
+                        .iter()
+                        .map(|v| match v {
+                            LuaValue::Nil => "nil".to_string(),
+                            LuaValue::Boolean(b) => b.to_string(),
+                            LuaValue::Integer(n) => n.to_string(),
+                            LuaValue::Number(n) => {
+                                // Reproduce Lua's default float formatting: no
+                                // trailing zeros for whole-number values.
+                                if n.fract() == 0.0 && n.abs() < 1e15_f64 {
+                                    format!("{n:.1}")
+                                } else {
+                                    format!("{n}")
+                                }
+                            }
+                            other => lua_inner
+                                .coerce_string(other.clone())
+                                .ok()
+                                .flatten()
+                                .and_then(|s| s.to_str().ok().map(|r| r.to_string()))
+                                .unwrap_or_else(|| format!("{other:?}")),
+                        })
+                        .collect();
+                    let line = parts.join("\t");
+                    tracing::info!(target: "alc.lua.print", "{}", line);
+                    Ok(())
+                })?;
+                lua.globals().set("print", print_fn)?;
+
                 // No need to clear package.loaded — fresh VM.
 
                 Ok("ok".to_string())

@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -83,22 +84,23 @@ pub trait StateStore: Send + Sync {
     /// Returns `true` if the value was written, `false` if the key
     /// was already present.
     ///
-    /// **Note:** `JsonFileStore` performs a non-locking load-check-save
-    /// cycle.  This is safe within a single process but **not** across
-    /// concurrent processes.  Backends with native CAS (Redis `SETNX`,
-    /// SQLite transactions) will provide true atomicity.
+    /// **Note:** `JsonFileStore` serialises this operation per namespace
+    /// with an in-process `Mutex`, making it safe across concurrent tokio
+    /// tasks within the same process.  Cross-process atomicity still
+    /// requires a backend with native CAS (Redis `SETNX`, SQLite
+    /// transactions).
     fn set_nx(&self, ns: &str, key: &str, value: Value) -> Result<bool, String>;
 
-    /// Counter increment (single-process atomic).
+    /// Counter increment, serialised per namespace within the same process.
     ///
     /// Adds `delta` to the current numeric value at `key`.  If the key
     /// is missing, initialises it to `default` before adding.  Returns
     /// the new value.
     ///
-    /// **Note:** `JsonFileStore` performs a non-locking
-    /// read-modify-write.  Safe within one process; use a backend with
-    /// native `INCR` (Redis) or transactions (SQLite) for multi-process
-    /// safety.
+    /// `JsonFileStore` acquires a per-namespace `Mutex` for the full
+    /// read-modify-write cycle, preventing lost updates across concurrent
+    /// tokio tasks.  For multi-process safety use a backend with native
+    /// `INCR` (Redis) or transactions (SQLite).
     ///
     /// Uses `f64` internally.  Integer-valued deltas are exact; fractional
     /// deltas may accumulate floating-point rounding errors over many calls.
@@ -120,8 +122,27 @@ pub trait StateStore: Send + Sync {
 /// The root directory is provided at construction time; callers are
 /// expected to resolve it from the service-layer `AppDir` abstraction
 /// (typically `~/.algocline/state/`).
+///
+/// ## Concurrency
+///
+/// Per-namespace locks (`std::sync::Mutex`) prevent lost updates under
+/// concurrent `alc.state.*` calls within the same process.  The lock
+/// is acquired for the full load → mutate → atomic-rename cycle, so
+/// two tokio tasks operating on the **same** namespace are serialised.
+///
+/// Rationale for `std::sync::Mutex` over `tokio::sync::Mutex`:
+/// all I/O inside the lock uses `std::fs` (synchronous, no `.await`),
+/// so a standard mutex is sufficient and avoids holding a tokio mutex
+/// across potential scheduler context switches.
+///
+/// **Multi-process safety is NOT provided.**  If multiple `alc`
+/// processes share the same state directory (uncommon), use a backend
+/// with native `INCR` (Redis) or transactions (SQLite).
 pub struct JsonFileStore {
     root: PathBuf,
+    /// Per-namespace locks.  Keyed by the resolved JSON file path so
+    /// that namespace validation is already applied before lookup.
+    locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl JsonFileStore {
@@ -130,7 +151,27 @@ impl JsonFileStore {
     /// The directory is **not** created eagerly; it is created lazily
     /// on the first `set` / `set_nx` / `incr` call via [`Self::state_path`].
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Acquire (or create) the per-namespace lock and return a guard.
+    ///
+    /// The returned `std::sync::MutexGuard` keeps the namespace lock
+    /// held for the duration of the caller's load → mutate → save cycle.
+    /// The outer `locks` map is released immediately after the inner
+    /// `Arc` is cloned, so contention on unrelated namespaces is zero.
+    fn ns_lock(&self, path: &Path) -> Result<Arc<Mutex<()>>, String> {
+        let mut map = self
+            .locks
+            .lock()
+            .map_err(|_| "state: locks map poisoned".to_string())?;
+        Ok(Arc::clone(
+            map.entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
     }
 
     /// Return the root directory this store writes under.
@@ -185,17 +226,32 @@ impl JsonFileStore {
 
 impl StateStore for JsonFileStore {
     fn get(&self, ns: &str, key: &str) -> Result<Option<Value>, String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let state = self.load(ns)?;
         Ok(state.get(key).cloned())
     }
 
     fn set(&self, ns: &str, key: &str, value: Value) -> Result<(), String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let mut state = self.load(ns)?;
         state.insert(key.to_string(), value);
         self.save(ns, &state)
     }
 
     fn delete(&self, ns: &str, key: &str) -> Result<bool, String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let mut state = self.load(ns)?;
         let existed = state.remove(key).is_some();
         if existed {
@@ -205,16 +261,31 @@ impl StateStore for JsonFileStore {
     }
 
     fn keys(&self, ns: &str) -> Result<Vec<String>, String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let state = self.load(ns)?;
         Ok(state.keys().cloned().collect())
     }
 
     fn has(&self, ns: &str, key: &str) -> Result<bool, String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let state = self.load(ns)?;
         Ok(state.contains_key(key))
     }
 
     fn set_nx(&self, ns: &str, key: &str, value: Value) -> Result<bool, String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let mut state = self.load(ns)?;
         if state.contains_key(key) {
             return Ok(false);
@@ -225,6 +296,11 @@ impl StateStore for JsonFileStore {
     }
 
     fn incr(&self, ns: &str, key: &str, delta: f64, default: f64) -> Result<f64, String> {
+        let path = self.state_path(ns)?;
+        let lock = self.ns_lock(&path)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| format!("state: lock poisoned for ns '{ns}'"))?;
         let mut state = self.load(ns)?;
         let current = match state.get(key) {
             Some(v) => v

@@ -356,20 +356,33 @@ pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) -> R
 // index containing all known packages, including uninstalled ones).
 
 /// Read the `[hub].collection_url` from `~/.algocline/config.toml`.
-fn collection_url_from_config(app_dir: &AppDir) -> Option<String> {
+///
+/// Returns:
+/// - `Ok(Some(url))` — file exists, parses cleanly, `[hub].collection_url` present and non-empty.
+/// - `Ok(None)` — file absent (normal: config is optional) or `[hub].collection_url` not set.
+/// - `Err(msg)` — file exists but TOML parse fails (corruption); caller should surface as warning.
+fn collection_url_from_config(app_dir: &AppDir) -> Result<Option<String>, String> {
     let path = app_dir.config_toml();
-    let content = std::fs::read_to_string(&path).ok()?;
-    let doc: toml_edit::DocumentMut = content.parse().ok()?;
-    let url = doc
-        .get("hub")?
-        .get("collection_url")?
-        .as_str()?
-        .trim()
-        .to_string();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None), // permission errors etc. treated as absent
+    };
+    let doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("config.toml parse: {e}"))?;
+    let url = match doc
+        .get("hub")
+        .and_then(|h| h.get("collection_url"))
+        .and_then(|v| v.as_str())
+    {
+        Some(s) => s.trim().to_string(),
+        None => return Ok(None),
+    };
     if url.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(url)
+        Ok(Some(url))
     }
 }
 
@@ -414,12 +427,23 @@ fn repo_to_index_url(repo_url: &str) -> Option<String> {
 /// failures rather than silently skipping — callers feed these URLs into
 /// hub resolution, and a partial URL set is indistinguishable from a
 /// corrupt manifest without the signal.
-fn discover_index_urls(app_dir: &AppDir) -> Result<Vec<String>, String> {
+///
+/// `warnings` collects non-fatal issues (e.g. config.toml TOML parse failure)
+/// that the caller should surface on the MCP wire response.
+fn discover_index_urls(
+    app_dir: &AppDir,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
     let mut index_urls: Vec<String> = Vec::new();
 
-    // 0. From config.toml [hub].collection_url (Tier 0 — aggregated collection)
-    if let Some(url) = collection_url_from_config(app_dir) {
-        index_urls.push(url);
+    // 0. From config.toml [hub].collection_url (Tier 0 — aggregated collection).
+    // Parse failures (corrupted config) are collected as warnings so the
+    // rest of discovery proceeds — the file is optional, but corruption
+    // is distinguishable from absence and must be surfaced to the caller.
+    match collection_url_from_config(app_dir) {
+        Ok(Some(url)) => index_urls.push(url),
+        Ok(None) => {}
+        Err(e) => warnings.push(format!("config.toml hub.collection_url: {e}")),
     }
 
     let mut repo_urls: HashSet<String> = HashSet::new();
@@ -490,19 +514,38 @@ fn cache_key(url: &str) -> String {
 }
 
 /// Load cached remote index for a specific URL if fresh (within TTL).
-fn load_cached(app_dir: &AppDir, url: &str) -> Option<HubIndex> {
+///
+/// Returns:
+/// - `Ok(Some(index))` — cache hit: file exists, within TTL, parses cleanly.
+/// - `Ok(None)` — cache miss: file absent, expired, or metadata unreadable (treat as miss).
+/// - `Err(msg)` — file exists and is within TTL but JSON parse fails (corruption);
+///   caller should surface as warning and fall back to a network fetch.
+fn load_cached(app_dir: &AppDir, url: &str) -> Result<Option<HubIndex>, String> {
     let dir = cache_dir(app_dir);
     let path = dir.join(format!("{}.json", cache_key(url)));
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    let metadata = std::fs::metadata(&path).ok()?;
-    let age = metadata.modified().ok()?.elapsed().ok()?;
+    // Metadata failure (e.g. race condition) → treat as cache miss, not corruption.
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let age = match metadata.modified().ok().and_then(|t| t.elapsed().ok()) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     if age.as_secs() > CACHE_TTL_SECS {
-        return None;
+        return Ok(None);
     }
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    // File exists and is within TTL — read and parse. A parse failure here
+    // indicates an on-disk corruption (truncated write, etc.) that is
+    // distinguishable from a cache miss and must be surfaced to the caller.
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("hub cache read {}: {e}", path.display()))?;
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|e| format!("hub cache parse {}: {e}", path.display()))
 }
 
 /// Save remote index to per-source cache file.
@@ -526,16 +569,47 @@ fn save_cached(app_dir: &AppDir, url: &str, index: &HubIndex) -> Result<(), Stri
 
 /// Fetch a single remote index by URL, using per-source cache.
 ///
-/// Returns the index plus an optional cache-write warning. The warning
-/// is `Some(_)` only when the network fetch succeeded but persisting
-/// the cache to disk failed — the data flow is unaffected, but the
-/// caller surfaces the warning so the operator can fix the underlying
-/// disk issue.
+/// Returns the index plus an optional cache-related warning. The warning
+/// is non-None when either:
+/// - The network fetch succeeded but persisting the cache to disk failed.
+/// - The cache file was present and within TTL but failed to parse
+///   (corruption); in that case the function falls back to a network
+///   fetch and includes the parse-failure in the warning so the operator
+///   can investigate the on-disk state.
 fn fetch_one(app_dir: &AppDir, url: &str) -> Result<(HubIndex, Option<String>), String> {
-    if let Some(cached) = load_cached(app_dir, url) {
-        return Ok((cached, None));
+    // Distinguish cache corruption (Err) from cache miss (Ok(None)).
+    match load_cached(app_dir, url) {
+        Ok(Some(cached)) => return Ok((cached, None)),
+        Ok(None) => {} // cache miss — proceed to network fetch
+        Err(e) => {
+            // Cache file is corrupt. Fall through to network fetch and
+            // carry the corruption warning so the caller can surface it.
+            // We don't return Err here because the network path may still succeed.
+            let warn = format!("hub cache corrupted for {url}: {e}; falling back to network");
+            // Attempt network fetch; on success, attach the cache-corruption warning.
+            return fetch_one_from_network(app_dir, url)
+                .map(|(idx, save_warn)| {
+                    // Prefer the corruption warning; save_warn is secondary.
+                    let combined = Some(match save_warn {
+                        Some(sw) => format!("{warn}; {sw}"),
+                        None => warn.clone(),
+                    });
+                    (idx, combined)
+                })
+                .map_err(|fetch_err| format!("{warn}; network fetch also failed: {fetch_err}"));
+        }
     }
 
+    fetch_one_from_network(app_dir, url)
+}
+
+/// Network-only path for fetching a remote index (no cache read).
+///
+/// On success returns `(index, Option<cache_write_warning>)`.
+fn fetch_one_from_network(
+    app_dir: &AppDir,
+    url: &str,
+) -> Result<(HubIndex, Option<String>), String> {
     let agent = ureq::Agent::new_with_config(
         ureq::config::Config::builder()
             .timeout_global(Some(HTTP_TIMEOUT))
@@ -561,10 +635,10 @@ fn fetch_one(app_dir: &AppDir, url: &str) -> Result<(HubIndex, Option<String>), 
 /// Fetch all discovered remote indices and merge into one.
 /// Falls back gracefully: failed sources are skipped with warnings.
 fn fetch_remote_indices(app_dir: &AppDir) -> Result<(HubIndex, Vec<String>), String> {
-    let urls = discover_index_urls(app_dir)?;
+    let mut warnings: Vec<String> = Vec::new();
+    let urls = discover_index_urls(app_dir, &mut warnings)?;
     let mut all_packages: Vec<IndexEntry> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
-    let mut warnings: Vec<String> = Vec::new();
 
     for url in &urls {
         match fetch_one(app_dir, url) {
@@ -662,7 +736,13 @@ fn local_card_counts(app_dir: &AppDir) -> HashMap<String, usize> {
 ///
 /// Reads only `.meta.json` files (lightweight) to check the strategy field.
 /// Falls back to reading full eval JSON if meta is missing.
-fn count_evals_for_pkg(app_dir: &AppDir, pkg: &str) -> usize {
+///
+/// `warnings` receives per-file corruption messages (read or parse failures).
+/// I/O errors on the directory itself return 0 silently (evals dir absent is
+/// a legitimate "no evals yet" state). Per-file errors that indicate corruption
+/// (file exists but is unreadable or unparseable) are pushed to `warnings` so
+/// the caller can surface them on the MCP wire response.
+fn count_evals_for_pkg(app_dir: &AppDir, pkg: &str, warnings: &mut Vec<String>) -> usize {
     let evals_dir = app_dir.evals_dir();
     let entries = match std::fs::read_dir(&evals_dir) {
         Ok(e) => e,
@@ -684,13 +764,18 @@ fn count_evals_for_pkg(app_dir: &AppDir, pkg: &str) -> usize {
 
         if name.ends_with(".meta.json") {
             let stem = name.trim_end_matches(".meta.json").to_string();
-            meta_stems.insert(stem);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if val.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
-                        meta_matches += 1;
+            meta_stems.insert(stem.clone());
+            // Distinguish I/O failure from parse failure so corruption is visible.
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(val) => {
+                        if val.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
+                            meta_matches += 1;
+                        }
                     }
-                }
+                    Err(e) => warnings.push(format!("eval meta parse {}: {e}", path.display())),
+                },
+                Err(e) => warnings.push(format!("eval meta read {}: {e}", path.display())),
             }
             continue;
         }
@@ -708,18 +793,25 @@ fn count_evals_for_pkg(app_dir: &AppDir, pkg: &str) -> usize {
         non_meta_paths.push((path, stem));
     }
 
-    // Only read full eval JSON for entries without a .meta.json
-    let fallback_matches = non_meta_paths
-        .iter()
-        .filter(|(_, stem)| !meta_stems.contains(stem))
-        .filter(|(path, _)| {
-            std::fs::read_to_string(path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                .and_then(|v| v.get("strategy")?.as_str().map(|s| s == pkg))
-                .unwrap_or(false)
-        })
-        .count();
+    // Only read full eval JSON for entries without a .meta.json.
+    // Distinguish I/O and parse failures; both are surfaced as warnings.
+    let mut fallback_matches: usize = 0;
+    for (path, stem) in &non_meta_paths {
+        if meta_stems.contains(stem) {
+            continue;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(c) => match serde_json::from_str::<serde_json::Value>(&c) {
+                Ok(v) => {
+                    if v.get("strategy").and_then(|s| s.as_str()) == Some(pkg) {
+                        fallback_matches += 1;
+                    }
+                }
+                Err(e) => warnings.push(format!("eval result parse {}: {e}", path.display())),
+            },
+            Err(e) => warnings.push(format!("eval result read {}: {e}", path.display())),
+        }
+    }
 
     meta_matches + fallback_matches
 }
@@ -1073,10 +1165,11 @@ impl AppService {
             None
         };
 
-        // Eval count from evals directory
-        let eval_count = count_evals_for_pkg(&app_dir, pkg);
+        // Eval count from evals directory; corruption warnings surfaced additively.
+        let mut eval_warnings: Vec<String> = Vec::new();
+        let eval_count = count_evals_for_pkg(&app_dir, pkg, &mut eval_warnings);
 
-        let response = serde_json::json!({
+        let mut response = serde_json::json!({
             "pkg": {
                 "name": pkg,
                 "version": version,
@@ -1093,6 +1186,9 @@ impl AppService {
                 "best_pass_rate": best_pass_rate,
             },
         });
+        if !eval_warnings.is_empty() {
+            response["warnings"] = serde_json::json!(eval_warnings);
+        }
         Ok(response.to_string())
     }
 
@@ -1248,7 +1344,11 @@ impl AppService {
             .collect();
 
         // Collect discovered sources for transparency.
-        let sources = discover_index_urls(&app_dir)?;
+        // Warnings from this call (e.g. config.toml parse failure) are
+        // already present in `warnings` from `fetch_remote_indices` above;
+        // use a throwaway buffer here to avoid duplicating them.
+        let mut _src_warnings: Vec<String> = Vec::new();
+        let sources = discover_index_urls(&app_dir, &mut _src_warnings)?;
 
         let mut json = serde_json::json!({
             "results": projected,
@@ -1765,5 +1865,172 @@ mod tests {
             .map(|v| v.get("name").and_then(|x| x.as_str()).unwrap_or(""))
             .collect();
         assert_eq!(names, vec!["beta", "mu", "alpha", "zeta"]);
+    }
+
+    // ─── Phase 3 MED batch: error-propagation tests ───────────────
+
+    // Site 1: collection_url_from_config
+
+    #[test]
+    fn collection_url_from_config_absent_returns_ok_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        // No config.toml created — absent file must be Ok(None), not Err.
+        let result = collection_url_from_config(&app_dir);
+        assert!(
+            matches!(result, Ok(None)),
+            "absent config.toml must return Ok(None), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn collection_url_from_config_corrupt_toml_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let path = app_dir.config_toml();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"[hub\ncollection_url = broken{{{{").unwrap();
+        let result = collection_url_from_config(&app_dir);
+        assert!(
+            result.is_err(),
+            "corrupt TOML must return Err, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn collection_url_from_config_valid_returns_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let path = app_dir.config_toml();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            b"[hub]\ncollection_url = \"https://example.com/hub_index.json\"\n",
+        )
+        .unwrap();
+        let result = collection_url_from_config(&app_dir);
+        assert_eq!(
+            result.unwrap(),
+            Some("https://example.com/hub_index.json".to_string())
+        );
+    }
+
+    #[test]
+    fn collection_url_from_config_no_hub_section_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let path = app_dir.config_toml();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"[some_other_section]\nfoo = \"bar\"\n").unwrap();
+        let result = collection_url_from_config(&app_dir);
+        assert!(
+            matches!(result, Ok(None)),
+            "config without [hub] must return Ok(None), got {result:?}"
+        );
+    }
+
+    // Site 2: load_cached
+
+    #[test]
+    fn load_cached_absent_returns_ok_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let result = load_cached(&app_dir, "https://example.com/index.json");
+        assert!(
+            matches!(result, Ok(None)),
+            "absent cache file must return Ok(None), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn load_cached_corrupt_json_within_ttl_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let url = "https://example.com/index.json";
+        let dir = cache_dir(&app_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", cache_key(url)));
+        std::fs::write(&path, b"not valid json {{{{").unwrap();
+        // file is freshly written so within TTL
+        let result = load_cached(&app_dir, url);
+        assert!(
+            result.is_err(),
+            "corrupt JSON within TTL must return Err, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn load_cached_valid_json_within_ttl_returns_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let url = "https://example.com/index.json";
+        let dir = cache_dir(&app_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", cache_key(url)));
+        let index_json = r#"{"schema_version":"hub_index/v0","updated_at":"2026-01-01T00:00:00Z","packages":[]}"#;
+        std::fs::write(&path, index_json).unwrap();
+        let result = load_cached(&app_dir, url);
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "valid JSON within TTL must return Ok(Some(_)), got {result:?}"
+        );
+    }
+
+    // Site 3: count_evals_for_pkg
+
+    #[test]
+    fn count_evals_for_pkg_absent_dir_returns_zero_no_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let mut warnings: Vec<String> = Vec::new();
+        let count = count_evals_for_pkg(&app_dir, "cot", &mut warnings);
+        assert_eq!(count, 0, "absent evals dir must return 0");
+        assert!(
+            warnings.is_empty(),
+            "absent evals dir must produce no warnings, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn count_evals_for_pkg_corrupt_meta_surfaces_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let evals_dir = app_dir.evals_dir();
+        std::fs::create_dir_all(&evals_dir).unwrap();
+
+        // Write a result JSON stub so the file is scanned.
+        std::fs::write(evals_dir.join("cot_9999.json"), b"{}").unwrap();
+        // Write a corrupt meta.json for the same stem.
+        std::fs::write(evals_dir.join("cot_9999.meta.json"), b"not json {{{{").unwrap();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let _count = count_evals_for_pkg(&app_dir, "cot", &mut warnings);
+        assert!(
+            !warnings.is_empty(),
+            "corrupt meta.json must produce at least one warning, got {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("parse"),
+            "warning must mention parse: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn count_evals_for_pkg_valid_meta_counts_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let evals_dir = app_dir.evals_dir();
+        std::fs::create_dir_all(&evals_dir).unwrap();
+
+        // Write a result JSON + valid meta for strategy "cot".
+        let meta = r#"{"eval_id":"cot_1","strategy":"cot","timestamp":1}"#;
+        std::fs::write(evals_dir.join("cot_1.json"), b"{}").unwrap();
+        std::fs::write(evals_dir.join("cot_1.meta.json"), meta).unwrap();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let count = count_evals_for_pkg(&app_dir, "cot", &mut warnings);
+        assert_eq!(count, 1, "should count 1 valid eval");
+        assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
     }
 }

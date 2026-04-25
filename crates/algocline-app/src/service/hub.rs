@@ -246,16 +246,30 @@ fn registries_path(app_dir: &AppDir) -> PathBuf {
     app_dir.hub_registries_json()
 }
 
-/// Load registries from disk.  Returns empty list if file is missing.
-fn load_registries(app_dir: &AppDir) -> HubRegistries {
+/// Load registries from disk.
+///
+/// Returns `Ok(HubRegistries::default())` when the file does not yet exist —
+/// the file is created lazily on first `register_source` call. Returns `Err`
+/// when the file exists but cannot be read (I/O error) or parsed (corrupt
+/// JSON), so callers can surface the failure instead of silently degrading hub
+/// discovery.
+fn load_registries(app_dir: &AppDir) -> Result<HubRegistries, String> {
     let path = registries_path(app_dir);
     if !path.exists() {
-        return HubRegistries::default();
+        return Ok(HubRegistries::default());
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "failed to read hub_registries.json at {}: {e}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str::<HubRegistries>(&content).map_err(|e| {
+        format!(
+            "failed to parse hub_registries.json at {}: {e}",
+            path.display()
+        )
+    })
 }
 
 /// Register a source URL.  Deduplicates by normalized URL.
@@ -291,8 +305,10 @@ pub(crate) fn register_source(app_dir: &AppDir, source: &str, origin: &str) -> R
         })?;
     }
 
-    // Re-read from disk right before write to minimize TOCTOU window
-    let mut reg = load_registries(app_dir);
+    // Re-read from disk right before write to minimize TOCTOU window.
+    // Parse failure is propagated — a corrupt registries file means we
+    // cannot safely read-modify-write without risking data loss.
+    let mut reg = load_registries(app_dir).map_err(|e| format!("cannot register source: {e}"))?;
 
     // Already registered?
     if reg
@@ -408,8 +424,10 @@ fn discover_index_urls(app_dir: &AppDir) -> Result<Vec<String>, String> {
 
     let mut repo_urls: HashSet<String> = HashSet::new();
 
-    // 1. From hub registries (primary)
-    let reg = load_registries(app_dir);
+    // 1. From hub registries (primary). Parse failure is propagated so
+    // callers know the registry is degraded — a partial URL set from a
+    // corrupt file is indistinguishable from intentionally empty.
+    let reg = load_registries(app_dir)?;
     for entry in &reg.registries {
         let normalized = entry.source.trim_end_matches('/').to_string();
         if !normalized.is_empty() {
@@ -1677,6 +1695,50 @@ mod tests {
             Some(&serde_json::Value::String("reasoning".to_string()))
         );
         assert_eq!(m.get("installed"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    // ─── load_registries: file-absent vs. corrupt JSON ────────────
+
+    #[test]
+    fn load_registries_missing_file_returns_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        // No hub_registries.json created — must return Ok(empty).
+        let result = load_registries(&app_dir);
+        assert!(result.is_ok(), "missing file should be Ok: {result:?}");
+        assert!(result.unwrap().registries.is_empty());
+    }
+
+    #[test]
+    fn load_registries_corrupt_json_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        // Write corrupt JSON to the registries path.
+        let path = app_dir.hub_registries_json();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not valid json {{{").unwrap();
+        let result = load_registries(&app_dir);
+        assert!(result.is_err(), "corrupt JSON must propagate Err");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("parse"),
+            "error message should mention parse: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_registries_valid_file_deserializes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let path = app_dir.hub_registries_json();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = r#"{"registries":[{"source":"https://github.com/user/repo","origin":"pkg_install","added_at":"2026-01-01T00:00:00Z"}]}"#;
+        std::fs::write(&path, content).unwrap();
+        let result = load_registries(&app_dir);
+        assert!(result.is_ok(), "valid JSON must parse Ok: {result:?}");
+        let reg = result.unwrap();
+        assert_eq!(reg.registries.len(), 1);
+        assert_eq!(reg.registries[0].source, "https://github.com/user/repo");
     }
 
     // ─── default sort verification ────────────────────────────────

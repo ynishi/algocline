@@ -147,7 +147,10 @@ pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), 
 ///
 /// - Relative paths are resolved against `project_root`.
 /// - Absolute paths are used as-is.
-/// - Entries whose resolved path does not exist are skipped with a warning.
+/// - Entries whose resolved path does not exist are skipped; the skip reason is
+///   returned in the second element of the tuple so callers can surface it
+///   (e.g. as a `warnings` field in the MCP wire response) instead of silently
+///   losing the signal.
 ///
 /// **No containment check**: unlike v0.14.0, paths outside `project_root` are
 /// intentionally allowed. The pkg-redesign (Phase 2) moved link management to
@@ -155,8 +158,12 @@ pub(crate) fn save_lockfile(project_root: &Path, lock: &LockFile) -> Result<(), 
 /// exclusively by `alc_update` from `alc.toml` declarations. Hand-editing
 /// `alc.lock` is unsupported; the prior canonicalize + starts_with guard was
 /// removed to simplify resolution and support cross-project path references.
-pub(crate) fn resolve_path_entries(project_root: &Path, lock: &LockFile) -> Vec<PathBuf> {
+pub(crate) fn resolve_path_entries(
+    project_root: &Path,
+    lock: &LockFile,
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut paths = Vec::new();
+    let mut warnings = Vec::new();
 
     for pkg in &lock.packages {
         let PackageSource::Path { path: ref raw } = pkg.source else {
@@ -173,18 +180,18 @@ pub(crate) fn resolve_path_entries(project_root: &Path, lock: &LockFile) -> Vec<
         };
 
         if !resolved.exists() {
-            tracing::warn!(
+            warnings.push(format!(
                 "alc.lock: path entry for '{}' does not exist, skipping: {}",
                 pkg.name,
                 resolved.display()
-            );
+            ));
             continue;
         }
 
         paths.push(resolved);
     }
 
-    paths
+    (paths, warnings)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -292,10 +299,11 @@ path = "packages/foo"
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
         let lock = make_path_lock("packages/my_pkg");
-        let paths = resolve_path_entries(project_root, &lock);
+        let (paths, warnings) = resolve_path_entries(project_root, &lock);
 
         let expected = project_root.join("packages").join("my_pkg");
         assert_eq!(paths, vec![expected]);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -307,9 +315,10 @@ path = "packages/foo"
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
         let lock = make_path_lock(pkg_dir.to_str().unwrap());
-        let paths = resolve_path_entries(project_root, &lock);
+        let (paths, warnings) = resolve_path_entries(project_root, &lock);
 
         assert_eq!(paths, vec![pkg_dir]);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -322,10 +331,11 @@ path = "packages/foo"
         let abs_path = abs_tmp.path().to_path_buf();
 
         let lock = make_path_lock(abs_path.to_str().unwrap());
-        let paths = resolve_path_entries(project_root, &lock);
+        let (paths, warnings) = resolve_path_entries(project_root, &lock);
 
         // 存在するので受け入れる
         assert_eq!(paths, vec![abs_path]);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -339,10 +349,11 @@ path = "packages/foo"
         std::fs::create_dir_all(&sibling).unwrap();
 
         let lock = make_path_lock("../sibling");
-        let paths = resolve_path_entries(&project_root, &lock);
+        let (paths, warnings) = resolve_path_entries(&project_root, &lock);
 
         let expected = project_root.join("../sibling");
         assert_eq!(paths, vec![expected]);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -350,10 +361,37 @@ path = "packages/foo"
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path();
 
-        // Path does not exist — should be skipped silently.
+        // Path does not exist — should be skipped with a warning, not silently.
         let lock = make_path_lock("nonexistent/path");
-        let paths = resolve_path_entries(project_root, &lock);
+        let (paths, warnings) = resolve_path_entries(project_root, &lock);
 
         assert!(paths.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("test_pkg"),
+            "warning should mention the package name: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("nonexistent"),
+            "warning should mention the missing path: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_path_existing_no_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+
+        let pkg_dir = project_root.join("packages").join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        let lock = make_path_lock("packages/my_pkg");
+        let (paths, warnings) = resolve_path_entries(project_root, &lock);
+
+        assert_eq!(paths.len(), 1);
+        assert!(
+            warnings.is_empty(),
+            "existing path should not warn: {warnings:?}"
+        );
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use algocline_core::QueryId;
 use algocline_engine::{FeedResult, VariantPkg};
 
-use super::eval_store::splice_response_string;
+use super::eval_store::{splice_response_string, splice_response_warnings};
 use super::resolve::{is_package_installed, make_require_code, resolve_code, QueryResponse};
 use super::transcript::write_transcript_log;
 use super::AppService;
@@ -42,9 +42,18 @@ impl AppService {
     ) -> Result<String, String> {
         let code = resolve_code(code, code_file)?;
         let ctx = ctx.unwrap_or(serde_json::Value::Null);
-        let extra = self.resolve_extra_lib_paths(project_root.as_deref());
-        let variants = self.resolve_variant_pkgs(project_root.as_deref());
-        self.start_and_tick(code, ctx, None, extra, variants).await
+        let (extra, extra_warnings) = self.resolve_extra_lib_paths(project_root.as_deref());
+        let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
+        let mut warnings: Vec<String> = extra_warnings;
+        warnings.extend(variant_warnings);
+        let json = self
+            .start_and_tick(code, ctx, None, extra, variants)
+            .await?;
+        Ok(splice_response_warnings(
+            &json,
+            "lib_path_warnings",
+            &warnings,
+        ))
     }
 
     /// Apply a built-in strategy to a task.
@@ -84,10 +93,18 @@ impl AppService {
         }
         let ctx = serde_json::Value::Object(ctx_map);
 
-        let extra = self.resolve_extra_lib_paths(project_root.as_deref());
-        let variants = self.resolve_variant_pkgs(project_root.as_deref());
-        self.start_and_tick(code, ctx, Some(strategy), extra, variants)
-            .await
+        let (extra, extra_warnings) = self.resolve_extra_lib_paths(project_root.as_deref());
+        let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
+        let mut warnings: Vec<String> = extra_warnings;
+        warnings.extend(variant_warnings);
+        let json = self
+            .start_and_tick(code, ctx, Some(strategy), extra, variants)
+            .await?;
+        Ok(splice_response_warnings(
+            &json,
+            "lib_path_warnings",
+            &warnings,
+        ))
     }
 
     /// Continue a paused execution — batch feed.

@@ -279,14 +279,9 @@ impl SessionStatus {
 
         if include_history {
             // Emit the last ≤10 transcript entries in chronological order.
-            let history: Vec<serde_json::Value> = self
-                .transcript
+            let start = self.transcript.len().saturating_sub(10);
+            let history: Vec<serde_json::Value> = self.transcript[start..]
                 .iter()
-                .rev()
-                .take(10)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
                 .map(|e| e.to_history_json())
                 .collect();
             json["conversation_history"] = serde_json::Value::Array(history);
@@ -445,7 +440,7 @@ impl MetricsObserver {
 
 impl ExecutionObserver for MetricsObserver {
     fn on_paused(&self, queries: &[LlmQuery]) {
-        // Safety: duration_since fails only if wall clock is before UNIX_EPOCH
+        // Note: duration_since fails only if wall clock is before UNIX_EPOCH
         // (broken system clock). Saturating to zero is harmless for timestamps.
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -483,7 +478,7 @@ impl ExecutionObserver for MetricsObserver {
         response: &str,
         usage: Option<&crate::TokenUsage>,
     ) {
-        // Safety: duration_since fails only if wall clock is before UNIX_EPOCH
+        // Note: duration_since fails only if wall clock is before UNIX_EPOCH
         // (broken system clock). Saturating to zero is harmless for timestamps.
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

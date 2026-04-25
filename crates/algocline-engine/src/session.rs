@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use algocline_core::{
-    ExecutionMetrics, ExecutionObserver, ExecutionState, LlmQuery, LogSink, MetricsObserver,
-    QueryId, TerminalState,
+    ExecutionMetrics, ExecutionObserver, ExecutionState, LlmQuery, MetricsObserver, QueryId,
+    TerminalState,
 };
 use mlua_isle::{AsyncIsleDriver, AsyncTask};
 use serde_json::json;
@@ -304,12 +304,11 @@ impl Session {
     ///
     /// - `llm_rx` — Receiver for LLM requests from the Lua bridge.
     /// - `exec_task` — The coroutine execution task handle.
-    /// - `metrics` — Session metrics (owns the LogSink ring buffer).
+    /// - `metrics` — Session metrics (owns the LogSink ring buffer; the bridge
+    ///   reads its `log_sink_handle()` separately to wire `print()` / `alc.log()`
+    ///   into the same ring buffer that `metrics.snapshot()` exposes via
+    ///   `recent_logs` in `alc_status`).
     /// - `vm_driver` — Keeps the Lua OS thread alive.
-    /// - `log_sink` — Shared log-capture sink, obtained from `metrics.log_sink_handle()`.
-    ///   The `LogSink` is passed so that `bridge::register_print` and `register_log`
-    ///   route Lua output into the per-session ring buffer, which is then exposed
-    ///   via `metrics.snapshot()` → `recent_logs` in `alc_status`.
     ///
     /// # Returns
     ///
@@ -319,10 +318,9 @@ impl Session {
         exec_task: AsyncTask,
         metrics: ExecutionMetrics,
         vm_driver: AsyncIsleDriver,
-        _log_sink: LogSink,
     ) -> Self {
         let observer = metrics.create_observer();
-        // Safety: duration_since can only fail if the wall clock predates UNIX_EPOCH
+        // Note: duration_since can only fail if the wall clock predates UNIX_EPOCH
         // (broken system clock). Saturating to 0 is harmless for observability.
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -412,7 +410,7 @@ impl Session {
     ) -> Result<bool, SessionError> {
         // Update both monotonic and wall-clock activity timestamps on each feed.
         self.last_active = std::time::Instant::now();
-        // Safety: duration_since can only fail if wall clock predates UNIX_EPOCH.
+        // Note: duration_since can only fail if wall clock predates UNIX_EPOCH.
         // Saturating to 0 is harmless for observability.
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

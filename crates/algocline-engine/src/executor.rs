@@ -271,13 +271,7 @@ impl Executor {
         // The driver keeps the channel alive until the session completes.
         drop(session_isle);
 
-        Ok(Session::new(
-            llm_rx,
-            exec_task,
-            metrics,
-            session_driver,
-            log_sink,
-        ))
+        Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
     }
 }
 

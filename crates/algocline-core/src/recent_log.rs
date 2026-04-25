@@ -47,7 +47,7 @@ impl LogEntry {
         source: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
-        // Safety: duration_since can only fail if the wall clock predates
+        // Note: duration_since can only fail if the wall clock predates
         // UNIX_EPOCH (1970-01-01), which indicates a broken system clock.
         // Saturating to zero is harmless for observability purposes.
         let ts = SystemTime::now()
@@ -118,7 +118,13 @@ impl LogSink {
         if let Ok(buf) = self.0.lock() {
             let entries: Vec<serde_json::Value> = buf
                 .iter()
-                .filter_map(|e| serde_json::to_value(e).ok())
+                .map(|e| {
+                    // LogEntry has only i64 / String fields; serde_json::to_value
+                    // cannot fail in practice (only on OOM, which would already
+                    // panic elsewhere). Falling back to Null preserves array
+                    // length without introducing a silent drop.
+                    serde_json::to_value(e).unwrap_or(serde_json::Value::Null)
+                })
                 .collect();
             serde_json::Value::Array(entries)
         } else {

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::super::alc_toml::{self, load_alc_toml};
+use super::super::eval_store::splice_response_warnings;
 use super::super::list_opts::{
     apply_sort_by_value, matches_filter, parse_sort, project_fields, resolve_fields, ListOpts,
     PKG_LIST_FULL, PKG_LIST_SUMMARY,
@@ -242,6 +243,7 @@ impl AppService {
         let mut entries: Vec<PackageListEntry> = Vec::new();
         let mut project_root_str: Option<String> = None;
         let mut lockfile_path_str: Option<String> = None;
+        let mut pkg_list_warnings: Vec<String> = Vec::new();
 
         if let Some(ref root) = resolved_root {
             project_root_str = Some(root.display().to_string());
@@ -250,9 +252,13 @@ impl AppService {
             // Variant pkgs from alc.local.toml (worktree-scoped, gitignored).
             // Highest priority — recorded first so they shadow same-name
             // project / global entries via `variant_names` set.
-            collect_variant_entries(root, &mut variant_names, &mut entries);
+            let variant_warnings = collect_variant_entries(root, &mut variant_names, &mut entries);
+            pkg_list_warnings.extend(variant_warnings);
 
             // Load alc.lock for version/source lookup (may not exist yet).
+            // Corruption (parse errors) surfaces as a warning rather than
+            // silently falling back to an empty map — callers need to know
+            // that lock metadata is unavailable.
             let lock_map: HashMap<String, (Option<String>, PackageSource)> =
                 match load_lockfile(root) {
                     Ok(Some(lock)) => lock
@@ -262,12 +268,14 @@ impl AppService {
                         .collect(),
                     Ok(None) => HashMap::new(),
                     Err(e) => {
-                        tracing::warn!("failed to load alc.lock: {e}");
+                        pkg_list_warnings.push(format!("failed to load alc.lock: {e}"));
                         HashMap::new()
                     }
                 };
 
             // Enumerate project packages from alc.toml declarations.
+            // Corruption surfaces as a warning so the rest of the list
+            // (global packages) is still returned.
             match load_alc_toml(root) {
                 Ok(Some(alc_toml)) => {
                     for (name, dep) in &alc_toml.packages {
@@ -330,7 +338,7 @@ impl AppService {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("failed to load alc.toml: {e}");
+                    pkg_list_warnings.push(format!("failed to load alc.toml: {e}"));
                 }
             }
         }
@@ -633,7 +641,12 @@ return pkg.meta or {{ name = "{name}" }}"#
             result["lockfile_path"] = serde_json::Value::String(lp);
         }
 
-        Ok(result.to_string())
+        let json = result.to_string();
+        Ok(splice_response_warnings(
+            &json,
+            "warnings",
+            &pkg_list_warnings,
+        ))
     }
 }
 
@@ -686,19 +699,22 @@ fn resolve_project_pkg_info(
 /// `algocline_engine::VariantPkg`. They have the highest priority — same-name
 /// project / global entries are demoted to `active: false`.
 ///
-/// Failures (missing / malformed `alc.local.toml`) are logged at `warn` and
-/// degrade to no variant entries (consistent with `resolve_extra_lib_paths`).
+/// Returns a `Vec<String>` of warnings for any corruption encountered. File-
+/// absent (`Ok(None)`) is a normal state and produces no warning. The caller
+/// (`pkg_list`) is responsible for splicing warnings into the MCP wire response.
 fn collect_variant_entries(
     root: &Path,
     variant_names: &mut std::collections::HashSet<String>,
     entries: &mut Vec<PackageListEntry>,
-) {
+) -> Vec<String> {
     let local = match alc_toml::load_alc_local_toml(root) {
         Ok(Some(l)) => l,
-        Ok(None) => return,
+        Ok(None) => return vec![],
         Err(e) => {
-            tracing::warn!("failed to load alc.local.toml at {}: {e}", root.display());
-            return;
+            return vec![format!(
+                "failed to load alc.local.toml at {}: {e}",
+                root.display()
+            )];
         }
     };
 
@@ -728,6 +744,8 @@ fn collect_variant_entries(
             override_paths: None,
         });
     }
+
+    vec![]
 }
 
 /// Create a `PackageListEntry` for a project-scoped package.

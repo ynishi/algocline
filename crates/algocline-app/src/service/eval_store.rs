@@ -27,6 +27,22 @@ pub(super) fn splice_response_string(json_str: &str, key: &str, value: &str) -> 
     json_str.to_string()
 }
 
+/// Insert a top-level string-array field into a JSON object response.
+///
+/// When `values` is empty the helper returns `json_str` unchanged — callers
+/// should only invoke this when there are actual warnings to surface. If
+/// `json_str` is not a JSON object it is returned unchanged.
+pub(super) fn splice_response_warnings(json_str: &str, key: &str, values: &[String]) -> String {
+    if values.is_empty() {
+        return json_str.to_string();
+    }
+    if let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str(json_str) {
+        map.insert(key.to_string(), serde_json::json!(values));
+        return serde_json::Value::Object(map).to_string();
+    }
+    json_str.to_string()
+}
+
 /// Persist eval result to `{app_dir}/evals/{strategy}_{timestamp}.json`.
 ///
 /// Returns `Ok(())` on success, `Err(String)` when the on-disk write
@@ -188,6 +204,36 @@ pub(super) fn escape_for_lua_sq(s: &str) -> String {
 /// Extract strategy name from eval_id (format: "{strategy}_{timestamp}").
 pub(super) fn extract_strategy_from_id(eval_id: &str) -> Option<&str> {
     eval_id.rsplit_once('_').map(|(prefix, _)| prefix)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod splice_warnings_tests {
+    use super::splice_response_warnings;
+
+    #[test]
+    fn empty_warnings_returns_original_unchanged() {
+        let json = r#"{"status":"ok"}"#;
+        assert_eq!(splice_response_warnings(json, "warnings", &[]), json);
+    }
+
+    #[test]
+    fn non_empty_warnings_added_as_array() {
+        let json = r#"{"status":"ok"}"#;
+        let warnings = vec!["alc.lock parse error".to_string()];
+        let out = splice_response_warnings(json, "warnings", &warnings);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v["warnings"].as_array().expect("warnings must be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str(), Some("alc.lock parse error"));
+    }
+
+    #[test]
+    fn non_object_json_returned_unchanged() {
+        let json = r#""just a string""#;
+        let warnings = vec!["something".to_string()];
+        assert_eq!(splice_response_warnings(json, "warnings", &warnings), json);
+    }
 }
 
 /// Persist a comparison result to `{app_dir}/evals/`.

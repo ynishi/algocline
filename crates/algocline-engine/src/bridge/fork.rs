@@ -160,6 +160,8 @@ pub(crate) fn register_fork(
                         state_store: Arc::clone(&state_store),
                         card_store: Arc::clone(&card_store),
                         scenarios_dir: scenarios_dir.clone(),
+                        // Fork child sessions don't expose recent_logs via alc_status.
+                        log_sink: None,
                     };
 
                     child_isle

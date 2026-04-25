@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use algocline_core::{BudgetHandle, CustomMetricsHandle, ProgressHandle};
+use algocline_core::{BudgetHandle, CustomMetricsHandle, LogSink, ProgressHandle};
 use mlua::prelude::*;
 
 mod data;
@@ -53,13 +53,30 @@ pub struct BridgeConfig {
     pub card_store: Arc<FileCardStore>,
     /// Scenarios directory exposed to Lua via `alc._dirs.scenarios`.
     pub scenarios_dir: PathBuf,
+    /// Per-session log-capture ring buffer.
+    ///
+    /// Obtained from `ExecutionMetrics::log_sink_handle()`.  Passed to
+    /// `alc.log` and `print()` overrides so log output is routed into the
+    /// ring buffer for `alc_status` recent_logs.
+    ///
+    /// `None` for `eval_simple` / fork child sessions where observability
+    /// is not needed; in that case log entries are emitted to tracing only.
+    pub log_sink: Option<LogSink>,
 }
 
 /// Register all Layer 0 runtime primitives onto the given table.
 pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaResult<()> {
     data::register_json(lua, alc_table)?;
     fuzzy::register_fuzzy(lua, alc_table)?;
-    data::register_log(lua, alc_table)?;
+    // Register alc.log — pass LogSink when available so entries reach the ring buffer.
+    if let Some(sink) = config.log_sink.clone() {
+        data::register_log(lua, alc_table, sink.clone())?;
+        // Override global print() to also push to the ring buffer.
+        data::register_print(lua, sink)?;
+    } else {
+        // Fallback: tracing-only path for eval_simple / fork children.
+        data::register_log(lua, alc_table, algocline_core::LogSink::new())?;
+    }
     data::register_state(lua, alc_table, config.ns, Arc::clone(&config.state_store))?;
     data::register_card(lua, alc_table, Arc::clone(&config.card_store))?;
     data::register_dirs(
@@ -141,6 +158,7 @@ mod tests {
             state_store: Arc::new(JsonFileStore::new(root.join("state"))),
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
             scenarios_dir: root.join("scenarios"),
+            log_sink: None,
         }
     }
 

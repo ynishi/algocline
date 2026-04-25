@@ -98,6 +98,7 @@ mod tests {
             state_store: Arc::new(JsonFileStore::new(root.join("state"))),
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
             scenarios_dir: root.join("scenarios"),
+            log_sink: None,
         }
     }
 

@@ -196,6 +196,10 @@ impl Executor {
         let mut effective = extra_lib_paths;
         effective.extend(self.lib_paths.iter().cloned());
 
+        // Obtain the log-capture sink before moving `metrics` into BridgeConfig.
+        // The same Arc is shared with Session so snapshot() can read recent_logs.
+        let log_sink = metrics.log_sink_handle();
+
         let bridge_config = bridge::BridgeConfig {
             llm_tx: Some(llm_tx),
             ns: spec.namespace.clone(),
@@ -207,6 +211,7 @@ impl Executor {
             state_store,
             card_store,
             scenarios_dir,
+            log_sink: Some(log_sink.clone()),
         };
         let lua_ctx = spec.ctx.clone();
         let lua_code = spec.code.clone();
@@ -242,49 +247,14 @@ impl Executor {
                     .exec()
                     .map_err(|e| IsleError::Lua(format!("Prelude load failed: {e}")))?;
 
-                // Override Lua's standard `print` to redirect output to tracing
-                // instead of stdout.  Stdout is used exclusively by the rmcp
-                // JSON-RPC stdio transport; any stray write from user Lua code
-                // would corrupt the transport framing.
-                //
-                // Behaviour mirrors the standard `print`:
-                //   * multiple args are joined with "\t"
-                //   * each arg is coerced via `tostring`
-                //   * the assembled line is emitted as `tracing::info!` so it
-                //     appears in the log file without reaching stdout
+                // Note: `print()` redirect is handled by `bridge::register` via
+                // `data::register_print` when `BridgeConfig::log_sink` is Some.
+                // That implementation routes to both tracing (alc.lua.print) and
+                // the per-session LogSink ring buffer, keeping stdout clean for
+                // the rmcp JSON-RPC stdio transport.
                 //
                 // `io.write` is intentionally left unchanged — scripts that
                 // explicitly target stdout/stderr can still use it.
-                let print_fn = lua.create_function(|lua_inner, args: mlua::MultiValue| {
-                    use mlua::prelude::LuaValue;
-                    let parts: Vec<String> = args
-                        .iter()
-                        .map(|v| match v {
-                            LuaValue::Nil => "nil".to_string(),
-                            LuaValue::Boolean(b) => b.to_string(),
-                            LuaValue::Integer(n) => n.to_string(),
-                            LuaValue::Number(n) => {
-                                // Reproduce Lua's default float formatting: no
-                                // trailing zeros for whole-number values.
-                                if n.fract() == 0.0 && n.abs() < 1e15_f64 {
-                                    format!("{n:.1}")
-                                } else {
-                                    format!("{n}")
-                                }
-                            }
-                            other => lua_inner
-                                .coerce_string(other.clone())
-                                .ok()
-                                .flatten()
-                                .and_then(|s| s.to_str().ok().map(|r| r.to_string()))
-                                .unwrap_or_else(|| format!("{other:?}")),
-                        })
-                        .collect();
-                    let line = parts.join("\t");
-                    tracing::info!(target: "alc.lua.print", "{}", line);
-                    Ok(())
-                })?;
-                lua.globals().set("print", print_fn)?;
 
                 // No need to clear package.loaded — fresh VM.
 
@@ -301,7 +271,13 @@ impl Executor {
         // The driver keeps the channel alive until the session completes.
         drop(session_isle);
 
-        Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
+        Ok(Session::new(
+            llm_rx,
+            exec_task,
+            metrics,
+            session_driver,
+            log_sink,
+        ))
     }
 }
 

@@ -28,7 +28,9 @@ impl AppService {
         pending_filter: Option<serde_json::Value>,
     ) -> Result<String, String> {
         let filter = self.resolve_pending_filter(pending_filter)?;
-        let snapshots = self.registry.list_snapshots(filter.as_ref()).await;
+        // include_history: ST3 will wire this from StatusParams.include_history;
+        // for now pass false (existing behaviour, high-frequency polling safe).
+        let snapshots = self.registry.list_snapshots(filter.as_ref(), false).await;
 
         // If a specific session requested, return just that one
         if let Some(sid) = session_id {

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use algocline_core::CustomMetricsHandle;
+use algocline_core::{CustomMetricsHandle, LogEntry, LogSink};
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 
@@ -24,19 +24,91 @@ pub(super) fn register_json(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     Ok(())
 }
 
-pub(super) fn register_log(_lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
-    let log = _lua.create_function(|_, (level, msg): (String, String)| {
+/// Register `alc.log(level, msg)` — routes Lua log calls to tracing and to the
+/// per-session [`LogSink`] ring buffer.
+///
+/// # Arguments
+///
+/// - `lua` — The Lua VM.
+/// - `alc_table` — The `alc` table to register the function on.
+/// - `log_sink` — Shared ring buffer; the entry is pushed in addition to the
+///   existing tracing output so stderr tail is unaffected.
+///
+/// # Errors
+///
+/// Returns `LuaError` only if function or table registration fails (mlua infra).
+pub(super) fn register_log(lua: &Lua, alc_table: &LuaTable, log_sink: LogSink) -> LuaResult<()> {
+    let log = lua.create_function(move |_, (level, msg): (String, String)| {
+        // Existing tracing path — preserves stderr/log-file output.
         match level.as_str() {
-            "error" => tracing::error!("{}", msg),
-            "warn" => tracing::warn!("{}", msg),
-            "info" => tracing::info!("{}", msg),
-            "debug" => tracing::debug!("{}", msg),
-            _ => tracing::info!("{}", msg),
+            "error" => tracing::error!(target: "alc.log", "{}", msg),
+            "warn" => tracing::warn!(target: "alc.log", "{}", msg),
+            "info" => tracing::info!(target: "alc.log", "{}", msg),
+            "debug" => tracing::debug!(target: "alc.log", "{}", msg),
+            _ => tracing::info!(target: "alc.log", "{}", msg),
         }
+        // Push to per-session ring buffer for alc_status recent_logs.
+        log_sink.push(LogEntry::new(level.clone(), "alc.log", msg));
         Ok(())
     })?;
 
     alc_table.set("log", log)?;
+    Ok(())
+}
+
+/// Register a Lua `print()` override that routes output to the per-session
+/// [`LogSink`] ring buffer and to `tracing::info!(target: "alc.lua.print")`.
+///
+/// Behaviour mirrors the standard `print`:
+/// - Multiple arguments are joined with `"\t"`.
+/// - Each argument is coerced to a string.
+/// - Trailing newlines are stripped before storing in the ring buffer.
+///
+/// The existing tracing path is preserved so operator `tail -f` workflows
+/// are unaffected.  `io.write` is intentionally left unchanged.
+///
+/// # Arguments
+///
+/// - `lua` — The Lua VM.
+/// - `log_sink` — Shared ring buffer for this session.
+///
+/// # Errors
+///
+/// Returns `LuaError` only if function or global registration fails (mlua infra).
+pub(super) fn register_print(lua: &Lua, log_sink: LogSink) -> LuaResult<()> {
+    let print_fn = lua.create_function(move |lua_inner, args: mlua::MultiValue| {
+        let parts: Vec<String> = args
+            .iter()
+            .map(|v| match v {
+                LuaValue::Nil => "nil".to_string(),
+                LuaValue::Boolean(b) => b.to_string(),
+                LuaValue::Integer(n) => n.to_string(),
+                LuaValue::Number(n) => {
+                    // Reproduce Lua's default float formatting: no trailing zeros
+                    // for whole-number values.
+                    if n.fract() == 0.0 && n.abs() < 1e15_f64 {
+                        format!("{n:.1}")
+                    } else {
+                        format!("{n}")
+                    }
+                }
+                other => lua_inner
+                    .coerce_string(other.clone())
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.to_str().ok().map(|r| r.to_string()))
+                    .unwrap_or_else(|| format!("{other:?}")),
+            })
+            .collect();
+        let line = parts.join("\t");
+        // Emit to tracing — operator log-file / stderr path preserved.
+        tracing::info!(target: "alc.lua.print", "{}", line);
+        // Push trimmed message to per-session ring buffer.
+        let message = line.trim_end_matches('\n').to_string();
+        log_sink.push(LogEntry::new("info", "alc.lua.print", message));
+        Ok(())
+    })?;
+    lua.globals().set("print", print_fn)?;
     Ok(())
 }
 
@@ -496,6 +568,7 @@ mod tests {
             state_store: Arc::new(JsonFileStore::new(root.join("state"))),
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
             scenarios_dir: root.join("scenarios"),
+            log_sink: None,
         }
     }
 
@@ -699,6 +772,7 @@ mod tests {
                 state_store: Arc::new(JsonFileStore::new(root.join("state"))),
                 card_store: Arc::new(FileCardStore::new(root.join("cards"))),
                 scenarios_dir: root.join("scenarios"),
+                log_sink: None,
             },
         )
         .unwrap();
@@ -718,5 +792,144 @@ mod tests {
             .eval()
             .unwrap();
         assert!(result.is_nil());
+    }
+
+    // ─── register_log tests ───
+
+    // T1: alc.log routes entry to LogSink with correct fields
+    #[test]
+    fn register_log_pushes_to_log_sink() {
+        use algocline_core::LogSink;
+
+        let sink = LogSink::new();
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        // Safety: unwrap is acceptable in test code.
+        register_log(&lua, &t, sink.clone()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        lua.load(r#"alc.log("info", "hello-from-log")"#)
+            .exec()
+            // Safety: unwrap in test code — propagates Lua errors as test failure.
+            .unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "alc.log");
+        assert_eq!(entries[0].level, "info");
+        assert_eq!(entries[0].message, "hello-from-log");
+    }
+
+    // T2: alc.log with unknown level falls back to "info" entry source
+    #[test]
+    fn register_log_unknown_level_still_pushes() {
+        use algocline_core::LogSink;
+
+        let sink = LogSink::new();
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        // Safety: unwrap in test code.
+        register_log(&lua, &t, sink.clone()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        lua.load(r#"alc.log("custom", "edge-case")"#)
+            .exec()
+            // Safety: unwrap in test code.
+            .unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "alc.log");
+        // level is passed through verbatim regardless of tracing fallback path
+        assert_eq!(entries[0].level, "custom");
+        assert_eq!(entries[0].message, "edge-case");
+    }
+
+    // T3: alc.log with empty message — edge case, should still push
+    #[test]
+    fn register_log_empty_message() {
+        use algocline_core::LogSink;
+
+        let sink = LogSink::new();
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        // Safety: unwrap in test code.
+        register_log(&lua, &t, sink.clone()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        lua.load(r#"alc.log("warn", "")"#)
+            .exec()
+            // Safety: unwrap in test code.
+            .unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "");
+    }
+
+    // ─── register_print tests ───
+
+    // T1: print() override pushes to LogSink with source alc.lua.print
+    #[test]
+    fn register_print_pushes_to_log_sink() {
+        use algocline_core::LogSink;
+
+        let sink = LogSink::new();
+        let lua = Lua::new();
+        // Safety: unwrap in test code.
+        register_print(&lua, sink.clone()).unwrap();
+
+        lua.load(r#"print("hello-print")"#)
+            .exec()
+            // Safety: unwrap in test code.
+            .unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "alc.lua.print");
+        assert_eq!(entries[0].level, "info");
+        assert_eq!(entries[0].message, "hello-print");
+    }
+
+    // T2: print() with multiple arguments joins with tab
+    #[test]
+    fn register_print_multiple_args_tab_joined() {
+        use algocline_core::LogSink;
+
+        let sink = LogSink::new();
+        let lua = Lua::new();
+        // Safety: unwrap in test code.
+        register_print(&lua, sink.clone()).unwrap();
+
+        lua.load(r#"print("a", "b", "c")"#)
+            .exec()
+            // Safety: unwrap in test code.
+            .unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "a\tb\tc");
+    }
+
+    // T3: print() with nil/bool/number args — no panic, correct string coercion
+    #[test]
+    fn register_print_mixed_value_types() {
+        use algocline_core::LogSink;
+
+        let sink = LogSink::new();
+        let lua = Lua::new();
+        // Safety: unwrap in test code.
+        register_print(&lua, sink.clone()).unwrap();
+
+        lua.load(r#"print(nil, true, 42, 3.14)"#)
+            .exec()
+            // Safety: unwrap in test code.
+            .unwrap();
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        // nil → "nil", bool → "true", int → "42", float → formatted per Lua convention
+        let msg = &entries[0].message;
+        assert!(msg.starts_with("nil\ttrue\t42\t"), "got: {msg}");
     }
 }

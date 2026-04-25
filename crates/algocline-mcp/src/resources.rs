@@ -647,6 +647,315 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Generates a complete `impl EngineApi for $ty` where every method returns
+    /// `Err($err.into())`. Use for test stubs that need no per-method
+    /// customisation.
+    ///
+    /// Drift safety: adding a new trait method causes a compile error here,
+    /// forcing the macro definition to be updated in one place instead of
+    /// touching every stub individually.
+    ///
+    /// Limitation: stubs that need to override specific methods must remain
+    /// handwritten — Rust does not allow two `impl Trait for T` blocks.
+    macro_rules! engine_default_err {
+        ($ty:ty, $err:expr) => {
+            #[async_trait::async_trait]
+            impl algocline_app::EngineApi for $ty {
+                async fn run(
+                    &self,
+                    _code: Option<String>,
+                    _code_file: Option<String>,
+                    _ctx: Option<serde_json::Value>,
+                    _project_root: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn advice(
+                    &self,
+                    _strategy: &str,
+                    _task: Option<String>,
+                    _opts: Option<serde_json::Value>,
+                    _project_root: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn continue_single(
+                    &self,
+                    _session_id: &str,
+                    _response: String,
+                    _query_id: Option<&str>,
+                    _usage: Option<algocline_core::TokenUsage>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn continue_batch(
+                    &self,
+                    _session_id: &str,
+                    _responses: Vec<algocline_core::QueryResponse>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn status(
+                    &self,
+                    _session_id: Option<&str>,
+                    _pending_filter: Option<serde_json::Value>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn eval(
+                    &self,
+                    _scenario: Option<String>,
+                    _scenario_file: Option<String>,
+                    _scenario_name: Option<String>,
+                    _strategy: &str,
+                    _strategy_opts: Option<serde_json::Value>,
+                    _auto_card: bool,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn eval_history(
+                    &self,
+                    _strategy: Option<&str>,
+                    _limit: usize,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn eval_detail(&self, _eval_id: &str) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn eval_compare(
+                    &self,
+                    _eval_id_a: &str,
+                    _eval_id_b: &str,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn scenario_list(&self) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn scenario_show(&self, _name: &str) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn scenario_install(&self, _url: String) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_link(
+                    &self,
+                    _path: String,
+                    _name: Option<String>,
+                    _force: Option<bool>,
+                    _scope: Option<String>,
+                    _project_root: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                #[allow(clippy::too_many_arguments)]
+                async fn pkg_list(
+                    &self,
+                    _project_root: Option<String>,
+                    _limit: Option<i32>,
+                    _sort: Option<String>,
+                    _filter: Option<serde_json::Value>,
+                    _fields: Option<Vec<String>>,
+                    _verbose: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_install(
+                    &self,
+                    _url: String,
+                    _name: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_unlink(&self, _name: String) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_remove(
+                    &self,
+                    _name: &str,
+                    _project_root: Option<String>,
+                    _version: Option<String>,
+                    _scope: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_repair(
+                    &self,
+                    _name: Option<String>,
+                    _project_root: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_doctor(
+                    &self,
+                    _name: Option<String>,
+                    _project_root: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn add_note(
+                    &self,
+                    _session_id: &str,
+                    _content: &str,
+                    _title: Option<&str>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn log_view(
+                    &self,
+                    _session_id: Option<&str>,
+                    _limit: Option<usize>,
+                    _max_chars: Option<usize>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn stats(
+                    &self,
+                    _strategy_filter: Option<&str>,
+                    _days: Option<u64>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn init(&self, _project_root: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn update(&self, _project_root: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn migrate(&self, _project_root: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_list(&self, _pkg: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_get(&self, _card_id: &str) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_find(
+                    &self,
+                    _pkg: Option<String>,
+                    _where_: Option<serde_json::Value>,
+                    _order_by: Option<serde_json::Value>,
+                    _limit: Option<usize>,
+                    _offset: Option<usize>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_alias_list(&self, _pkg: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_get_by_alias(&self, _name: &str) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_alias_set(
+                    &self,
+                    _name: &str,
+                    _card_id: &str,
+                    _pkg: Option<String>,
+                    _note: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_append(
+                    &self,
+                    _card_id: &str,
+                    _fields: serde_json::Value,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_install(&self, _url: String) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_samples(
+                    &self,
+                    _card_id: &str,
+                    _offset: Option<usize>,
+                    _limit: Option<usize>,
+                    _where_: Option<serde_json::Value>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn card_lineage(
+                    &self,
+                    _card_id: &str,
+                    _direction: Option<String>,
+                    _depth: Option<usize>,
+                    _include_stats: Option<bool>,
+                    _relation_filter: Option<Vec<String>>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn hub_reindex(
+                    &self,
+                    _output_path: Option<String>,
+                    _source_dir: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn hub_gendoc(
+                    &self,
+                    _source_dir: String,
+                    _out_dir: Option<String>,
+                    _projections: Option<Vec<String>>,
+                    _config_path: Option<String>,
+                    _lint_strict: Option<bool>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                #[allow(clippy::too_many_arguments)]
+                async fn hub_dist(
+                    &self,
+                    _source_dir: String,
+                    _output_path: Option<String>,
+                    _out_dir: Option<String>,
+                    _preset: Option<String>,
+                    _project_root: Option<String>,
+                    _projections: Option<Vec<String>>,
+                    _config_path: Option<String>,
+                    _lint_strict: Option<bool>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn hub_info(&self, _pkg: String) -> Result<String, String> {
+                    Err($err.into())
+                }
+                #[allow(clippy::too_many_arguments)]
+                async fn hub_search(
+                    &self,
+                    _query: Option<String>,
+                    _category: Option<String>,
+                    _installed_only: Option<bool>,
+                    _limit: Option<i32>,
+                    _sort: Option<String>,
+                    _filter: Option<serde_json::Value>,
+                    _fields: Option<Vec<String>>,
+                    _verbose: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_scaffold(
+                    &self,
+                    _name: String,
+                    _target_dir: Option<String>,
+                    _category: Option<String>,
+                    _description: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_read_init_lua(&self, _name: &str) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pkg_meta(&self, _name: &str) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn info(&self) -> String {
+                    format!("default-err stub: {}", stringify!($ty))
+                }
+            }
+        };
+    }
+
     // ── URI parser tests ──────────────────────────────────────────────────
 
     #[test]
@@ -726,290 +1035,7 @@ mod tests {
 
     // Minimal no-op EngineApi implementation for unit tests.
     struct NoopEngine;
-
-    #[async_trait::async_trait]
-    impl EngineApi for NoopEngine {
-        async fn run(
-            &self,
-            _code: Option<String>,
-            _code_file: Option<String>,
-            _ctx: Option<serde_json::Value>,
-            _project_root: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn advice(
-            &self,
-            _strategy: &str,
-            _task: Option<String>,
-            _opts: Option<serde_json::Value>,
-            _project_root: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn continue_single(
-            &self,
-            _session_id: &str,
-            _response: String,
-            _query_id: Option<&str>,
-            _usage: Option<algocline_core::TokenUsage>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn continue_batch(
-            &self,
-            _session_id: &str,
-            _responses: Vec<algocline_core::QueryResponse>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn status(
-            &self,
-            _session_id: Option<&str>,
-            _pending_filter: Option<serde_json::Value>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn eval(
-            &self,
-            _scenario: Option<String>,
-            _scenario_file: Option<String>,
-            _scenario_name: Option<String>,
-            _strategy: &str,
-            _strategy_opts: Option<serde_json::Value>,
-            _auto_card: bool,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn eval_history(
-            &self,
-            _strategy: Option<&str>,
-            _limit: usize,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn eval_detail(&self, _eval_id: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn eval_compare(&self, _eval_id_a: &str, _eval_id_b: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn scenario_list(&self) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn scenario_show(&self, _name: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn scenario_install(&self, _url: String) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_link(
-            &self,
-            _path: String,
-            _name: Option<String>,
-            _force: Option<bool>,
-            _scope: Option<String>,
-            _project_root: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_list(
-            &self,
-            _project_root: Option<String>,
-            _limit: Option<i32>,
-            _sort: Option<String>,
-            _filter: Option<serde_json::Value>,
-            _fields: Option<Vec<String>>,
-            _verbose: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_install(&self, _url: String, _name: Option<String>) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_unlink(&self, _name: String) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_remove(
-            &self,
-            _name: &str,
-            _project_root: Option<String>,
-            _version: Option<String>,
-            _scope: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_repair(
-            &self,
-            _name: Option<String>,
-            _project_root: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_doctor(
-            &self,
-            _name: Option<String>,
-            _project_root: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn add_note(
-            &self,
-            _session_id: &str,
-            _content: &str,
-            _title: Option<&str>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn log_view(
-            &self,
-            _session_id: Option<&str>,
-            _limit: Option<usize>,
-            _max_chars: Option<usize>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn stats(
-            &self,
-            _strategy_filter: Option<&str>,
-            _days: Option<u64>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn init(&self, _project_root: Option<String>) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn update(&self, _project_root: Option<String>) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn migrate(&self, _project_root: Option<String>) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_list(&self, _pkg: Option<String>) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_get(&self, _card_id: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_find(
-            &self,
-            _pkg: Option<String>,
-            _where_: Option<serde_json::Value>,
-            _order_by: Option<serde_json::Value>,
-            _limit: Option<usize>,
-            _offset: Option<usize>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_alias_list(&self, _pkg: Option<String>) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_get_by_alias(&self, _name: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_alias_set(
-            &self,
-            _name: &str,
-            _card_id: &str,
-            _pkg: Option<String>,
-            _note: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_append(
-            &self,
-            _card_id: &str,
-            _fields: serde_json::Value,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_install(&self, _url: String) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_samples(
-            &self,
-            _card_id: &str,
-            _offset: Option<usize>,
-            _limit: Option<usize>,
-            _where_: Option<serde_json::Value>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn card_lineage(
-            &self,
-            _card_id: &str,
-            _direction: Option<String>,
-            _depth: Option<usize>,
-            _include_stats: Option<bool>,
-            _relation_filter: Option<Vec<String>>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn hub_reindex(
-            &self,
-            _output_path: Option<String>,
-            _source_dir: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn hub_gendoc(
-            &self,
-            _source_dir: String,
-            _out_dir: Option<String>,
-            _projections: Option<Vec<String>>,
-            _config_path: Option<String>,
-            _lint_strict: Option<bool>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn hub_dist(
-            &self,
-            _source_dir: String,
-            _output_path: Option<String>,
-            _out_dir: Option<String>,
-            _preset: Option<String>,
-            _project_root: Option<String>,
-            _projections: Option<Vec<String>>,
-            _config_path: Option<String>,
-            _lint_strict: Option<bool>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn hub_info(&self, _pkg: String) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn hub_search(
-            &self,
-            _query: Option<String>,
-            _category: Option<String>,
-            _installed_only: Option<bool>,
-            _limit: Option<i32>,
-            _sort: Option<String>,
-            _filter: Option<serde_json::Value>,
-            _fields: Option<Vec<String>>,
-            _verbose: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_scaffold(
-            &self,
-            _name: String,
-            _target_dir: Option<String>,
-            _category: Option<String>,
-            _description: Option<String>,
-        ) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_read_init_lua(&self, _name: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn pkg_meta(&self, _name: &str) -> Result<String, String> {
-            Err("noop".into())
-        }
-        async fn info(&self) -> String {
-            "noop".into()
-        }
-    }
+    engine_default_err!(NoopEngine, "noop");
 
     // ── ResourceCatalog read tests (types — sync-converted to async) ─────
 

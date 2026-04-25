@@ -14,7 +14,7 @@ use super::super::resolve::{
     install_scenarios_from_dir, packages_dir, scenarios_dir, DirEntryFailures, AUTO_INSTALL_SOURCES,
 };
 use super::super::source::PackageSource;
-use super::super::AppService;
+use super::super::{AppService, ProjectFilesError};
 
 /// Explicit install dispatch. Carries exactly the information `pkg_install`
 /// needs after classification so that downstream code does not re-classify
@@ -89,7 +89,11 @@ impl AppService {
         let app_dir = self.log_config.app_dir();
         let pkg_dir = packages_dir(&app_dir);
         std::fs::create_dir_all(&pkg_dir)
-            .map_err(|e| format!("Failed to create packages dir {}: {e}", pkg_dir.display()))?;
+            .map_err(|e| ProjectFilesError::PackagesDir {
+                path: pkg_dir.display().to_string(),
+                source: e,
+            })
+            .map_err(|e| e.to_string())?;
 
         let git_url = match source {
             InstallSource::LocalPath(path) => {
@@ -190,7 +194,7 @@ impl AppService {
                 .await
             {
                 Ok(ws) => ws,
-                Err(e) => vec![e],
+                Err(e) => vec![e.to_string()],
             };
 
             let mut response = serde_json::json!({
@@ -345,7 +349,7 @@ impl AppService {
             let project_files_warnings =
                 match self.update_project_files_for_install(&installed).await {
                     Ok(ws) => ws,
-                    Err(e) => vec![e],
+                    Err(e) => vec![e.to_string()],
                 };
 
             let mut response = serde_json::json!({
@@ -460,7 +464,7 @@ impl AppService {
                 .await
             {
                 Ok(ws) => ws,
-                Err(e) => vec![e],
+                Err(e) => vec![e.to_string()],
             };
 
             let mut response = serde_json::json!({
@@ -574,7 +578,7 @@ impl AppService {
             let project_files_warnings =
                 match self.update_project_files_for_install(&installed).await {
                     Ok(ws) => ws,
-                    Err(e) => vec![e],
+                    Err(e) => vec![e.to_string()],
                 };
 
             let mut response = serde_json::json!({
@@ -606,7 +610,7 @@ impl AppService {
     async fn update_project_files_for_install(
         &self,
         names: &[String],
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, ProjectFilesError> {
         let root = match resolve_project_root(None) {
             Some(r) => r,
             None => return Ok(Vec::new()), // No project root → skip (current-compat)
@@ -638,7 +642,7 @@ impl AppService {
                     Ok(Some(d)) => d,
                     Ok(None) => return Ok(Vec::new()), // alc.toml not found → skip
                     Err(e) => {
-                        return Err(format!("alc.toml load: {e}"));
+                        return Err(ProjectFilesError::AlcTomlLoad(e).to_string());
                     }
                 };
 
@@ -652,7 +656,7 @@ impl AppService {
                         packages: Vec::new(),
                     },
                     Err(e) => {
-                        return Err(format!("alc.lock load: {e}"));
+                        return Err(ProjectFilesError::AlcLockLoad(e).to_string());
                     }
                 };
 
@@ -672,21 +676,20 @@ impl AppService {
                 // can surface them in the response JSON. Both saves are attempted
                 // independently (one failure does not skip the other).
                 if let Err(e) = save_alc_toml(&root, &doc) {
-                    warnings.push(format!("alc.toml save: {e}"));
+                    warnings.push(ProjectFilesError::AlcTomlSave(e).to_string());
                 }
                 if let Err(e) = save_lockfile(&root, &lock) {
-                    warnings.push(format!("alc.lock save: {e}"));
+                    warnings.push(ProjectFilesError::AlcLockSave(e).to_string());
                 }
                 Ok(warnings)
             });
 
-        // Lock acquisition failure or closure fatal err (load failure) is degraded
-        // to a warning so the install result (pkg copy already succeeded) stays Ok.
-        let warnings = match lock_result {
-            Ok(ws) => ws,
-            Err(e) => vec![format!("project files lock: {e}")],
-        };
-        Ok(warnings)
+        // Lock acquisition failure or closure fatal err (load failure) is surfaced
+        // as a typed ProjectFilesError::Lock so callers can inspect it.
+        match lock_result {
+            Ok(ws) => Ok(ws),
+            Err(e) => Err(ProjectFilesError::Lock(e)),
+        }
     }
 
     /// Fetch package version via `eval_simple` (best-effort; returns `None` on failure).

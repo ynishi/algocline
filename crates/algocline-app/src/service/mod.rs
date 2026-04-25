@@ -1,4 +1,6 @@
 pub(crate) mod alc_toml;
+mod error;
+pub(crate) use error::{ProjectFilesError, TranscriptError};
 mod card;
 mod config;
 mod dist;

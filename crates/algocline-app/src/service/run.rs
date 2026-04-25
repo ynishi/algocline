@@ -164,6 +164,7 @@ impl AppService {
                 strategy.as_deref(),
             )
             .err()
+            .map(|e| e.to_string())
         } else {
             None
         }
@@ -300,8 +301,8 @@ mod tests {
         assert!(warning.is_some(), "expected Some warning on write failure");
         let msg = warning.unwrap();
         assert!(
-            msg.contains("transcript log"),
-            "warning should mention 'transcript log', got: {msg}"
+            msg.contains("transcript"),
+            "warning should mention 'transcript', got: {msg}"
         );
     }
 

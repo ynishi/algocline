@@ -4,6 +4,7 @@ use algocline_core::ExecutionMetrics;
 
 use super::config::AppConfig;
 use super::path::ContainedPath;
+use super::TranscriptError;
 
 /// Write transcript log to `{dir}/{session_id}.json`.
 ///
@@ -17,7 +18,7 @@ pub(super) fn write_transcript_log(
     session_id: &str,
     metrics: &ExecutionMetrics,
     strategy: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), TranscriptError> {
     let log_dir = match (&config.log_dir, config.log_enabled) {
         (Some(dir), true) => dir,
         _ => return Ok(()),
@@ -58,15 +59,20 @@ pub(super) fn write_transcript_log(
         "transcript": transcript,
     });
 
-    std::fs::create_dir_all(log_dir)
-        .map_err(|e| format!("transcript log: failed to create log dir: {e}"))?;
+    std::fs::create_dir_all(log_dir).map_err(|e| TranscriptError::LogDir {
+        path: log_dir.display().to_string(),
+        source: e,
+    })?;
 
     let path = ContainedPath::child(log_dir, &format!("{session_id}.json"))
-        .map_err(|e| format!("transcript log: invalid path: {e}"))?;
+        .map_err(TranscriptError::Path)?;
     let content = serde_json::to_string_pretty(&log_entry)
-        .map_err(|e| format!("transcript log: failed to serialize: {e}"))?;
+        .map_err(|e| TranscriptError::Serialize(e.to_string()))?;
 
-    std::fs::write(&path, content).map_err(|e| format!("transcript log: failed to write: {e}"))?;
+    std::fs::write(&path, content).map_err(|e| TranscriptError::Write {
+        path: path.as_ref().display().to_string(),
+        source: e,
+    })?;
 
     // Write lightweight meta file for log_list (avoids reading full transcript)
     let meta = serde_json::json!({
@@ -167,10 +173,10 @@ mod tests {
             result.is_err(),
             "expected Err when write target is a directory"
         );
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("transcript log"),
-            "error message should mention 'transcript log', got: {msg}"
+            msg.contains("transcript"),
+            "error message should mention 'transcript', got: {msg}"
         );
     }
 }

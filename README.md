@@ -244,7 +244,7 @@ algocline exposes structured data via [MCP Resources](https://spec.modelcontextp
 | `alc://types/alc.d.lua` | Fixed | LuaCats type definitions for `alc.*` StdLib (editor completion) |
 | `alc://types/alc_shapes.d.lua` | Fixed | LuaCats definitions for `alc_shapes` shape library |
 | `alc://hub/index` | Fixed | Aggregated hub package catalog (`application/json`) — merges all cached `hub_index.json` files across registered sources |
-| `alc://packages/{name}` | Template | Package `init.lua` source |
+| `alc://packages/{name}/init.lua` | Template | Package `init.lua` source |
 | `alc://packages/{name}/meta` | Template | Package metadata JSON |
 | `alc://cards/{card_id}` | Template | Eval card JSON |
 | `alc://scenarios/{name}` | Template | Scenario Lua source |
@@ -256,9 +256,9 @@ algocline exposes structured data via [MCP Resources](https://spec.modelcontextp
 When algocline is configured as an MCP server, Claude Code exposes all resources via `@alc:` mention syntax. Type `@alc:` in the input field to browse or tab-complete resource URIs:
 
 ```
-@alc:alc://hub/index                    # read the full package catalog
-@alc:alc://packages/reflect             # read the reflect package source
-@alc:alc://types/alc.d.lua              # read StdLib type definitions
+@alc:alc://hub/index                         # read the full package catalog
+@alc:alc://packages/reflect/init.lua         # read the reflect package source
+@alc:alc://types/alc.d.lua                   # read StdLib type definitions
 ```
 
 Tab-completion for template arguments is supported (`completion/complete`). Typing `@alc:alc://packages/` and pressing `<TAB>` returns installed package names filtered by prefix.

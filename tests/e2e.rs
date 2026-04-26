@@ -3824,6 +3824,165 @@ async fn test_mcp_resources_complete_packages_prefix_filter() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// E2E: `alc://hub/index` with a corrupt cache file emits a `warnings` array.
+///
+/// Sets up an isolated `ALC_HOME` with:
+/// - A `hub_registries.json` pointing to two source URLs.
+/// - A valid `hub_cache/{key}.json` for the first URL (contains "good_pkg").
+/// - An invalid JSON `hub_cache/{key}.json` for the second URL (corrupt).
+///
+/// Reading `alc://hub/index` must:
+/// - Return valid JSON with `packages` containing entries from the valid source.
+/// - Include a `warnings` array mentioning the corrupt source URL.
+#[tokio::test]
+async fn test_alc_hub_index_aggregate_warnings_emitted_on_corrupt_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let alc_home = tmp.path();
+
+    let url_good = "https://good.example.com/index.json";
+    let url_bad = "https://bad-corrupt.example.com/index.json";
+
+    // FNV-1a cache key (matches hub.rs::cache_key)
+    fn fnv1a_hex(url: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325u64;
+        for b in url.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3u64);
+        }
+        format!("{h:016x}")
+    }
+
+    let hub_cache_dir = alc_home.join("hub_cache");
+    std::fs::create_dir_all(&hub_cache_dir).expect("mkdir hub_cache");
+
+    // Write a valid cache for the good URL.
+    // IndexEntry uses #[serde(flatten)] on entity, so pkg fields are top-level.
+    let good_index = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "packages": [{
+            "name": "good_pkg",
+            "version": "0.1.0",
+            "source": { "type": "unknown" },
+            "card_count": 0
+        }]
+    });
+    std::fs::write(
+        hub_cache_dir.join(format!("{}.json", fnv1a_hex(url_good))),
+        serde_json::to_string(&good_index).expect("serialize"),
+    )
+    .expect("write good cache");
+
+    // Write corrupt JSON for the bad URL.
+    std::fs::write(
+        hub_cache_dir.join(format!("{}.json", fnv1a_hex(url_bad))),
+        b"{{{{ definitely not valid json",
+    )
+    .expect("write corrupt cache");
+
+    // Register both URLs in hub_registries.json.
+    let reg_json = serde_json::json!({
+        "registries": [
+            { "source": url_good, "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z" },
+            { "source": url_bad,  "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z" }
+        ]
+    });
+    std::fs::write(
+        alc_home.join("hub_registries.json"),
+        serde_json::to_string(&reg_json).expect("serialize"),
+    )
+    .expect("write hub_registries");
+
+    let client = connect_with_alc_home(alc_home).await;
+    let result = read_resource(&client, "alc://hub/index")
+        .await
+        .expect("read alc://hub/index failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (uri, text) = resource_text(&result.contents[0]);
+    assert_eq!(uri, "alc://hub/index");
+
+    let body: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("hub/index JSON parse failed: {e}\nraw: {text}"));
+
+    // packages must contain entries from the valid source.
+    // IndexEntry uses #[serde(flatten)] so package fields are at top level.
+    let packages = body["packages"].as_array().expect("packages must be array");
+    let has_good_pkg = packages
+        .iter()
+        .any(|p| p["name"].as_str() == Some("good_pkg"));
+    assert!(
+        has_good_pkg,
+        "expected good_pkg from valid source, got packages: {packages:?}"
+    );
+
+    // warnings must be non-empty and mention the corrupt URL.
+    let warnings = body["warnings"].as_array().expect("warnings must be array");
+    assert!(
+        !warnings.is_empty(),
+        "expected non-empty warnings array, got: {body}"
+    );
+    let bad_url_mentioned = warnings.iter().any(|w| {
+        w.as_str()
+            .map(|s| s.contains("bad-corrupt.example.com"))
+            .unwrap_or(false)
+    });
+    assert!(
+        bad_url_mentioned,
+        "expected warning to mention the corrupt URL, got warnings: {warnings:?}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// E2E: `completion/complete` for a resource template arg name that the server
+/// does not provide candidates for must return a non-error response with
+/// `values: []`, `total: 0`, and `has_more: false`.
+///
+/// Uses `alc://logs/{session_id}` with arg `session_id` — the handler
+/// explicitly returns empty for the `logs` domain (no session-list API).
+#[tokio::test]
+async fn test_mcp_resources_complete_returns_empty_for_unsupported_arg_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = CompleteRequestParams {
+        meta: None,
+        r#ref: Reference::Resource(ResourceReference {
+            uri: "alc://logs/{session_id}".to_string(),
+        }),
+        argument: ArgumentInfo {
+            name: "session_id".to_string(),
+            value: "".to_string(),
+        },
+        context: None,
+    };
+
+    let result = client
+        .complete(params)
+        .await
+        .expect("completion/complete for logs domain must not error");
+
+    assert!(
+        result.completion.values.is_empty(),
+        "expected empty values for logs domain (no session-list API), got: {:?}",
+        result.completion.values
+    );
+    assert_eq!(
+        result.completion.total,
+        Some(0),
+        "expected total=0 for empty completion, got: {:?}",
+        result.completion.total
+    );
+    assert_ne!(
+        result.completion.has_more,
+        Some(true),
+        "has_more must not be true when values is empty"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// `ref/prompt` reference must return an empty completion result without error.
 ///
 /// The handler's `Reference::Prompt` branch returns `CompletionInfo::default()`

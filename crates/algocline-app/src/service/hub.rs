@@ -516,6 +516,57 @@ fn cache_key(url: &str) -> String {
     format!("{h:016x}")
 }
 
+/// Result of a cache lookup distinguishing absent, stale, fresh, and corrupt.
+///
+/// Used by `load_cached_full` (called from `aggregate_index`) to allow
+/// stale data to be merged into the aggregate while a warning is emitted.
+/// `load_cached` (used by `fetch_one`) maps both `NotPresent` and `Stale`
+/// to `Ok(None)` for backward compat.
+enum CacheLookup {
+    /// File absent.
+    NotPresent,
+    /// File present but older than `CACHE_TTL_SECS`; contains the stale data.
+    Stale(HubIndex),
+    /// File present, within TTL, parsed cleanly.
+    Fresh(HubIndex),
+    /// File present (within TTL) but JSON parse failed.
+    Corrupt(String),
+}
+
+/// Full cache lookup that distinguishes stale from absent.
+///
+/// Used by `aggregate_index` so stale data can still be merged with a
+/// warning, rather than being silently discarded.
+fn load_cached_full(app_dir: &AppDir, url: &str) -> CacheLookup {
+    let dir = cache_dir(app_dir);
+    let path = dir.join(format!("{}.json", cache_key(url)));
+    if !path.exists() {
+        return CacheLookup::NotPresent;
+    }
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(_) => return CacheLookup::NotPresent,
+    };
+    let age = match metadata.modified().ok().and_then(|t| t.elapsed().ok()) {
+        Some(a) => a,
+        None => return CacheLookup::NotPresent,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return CacheLookup::Corrupt(format!("hub cache read {}: {e}", path.display())),
+    };
+    match serde_json::from_str::<HubIndex>(&content) {
+        Ok(index) => {
+            if age.as_secs() > CACHE_TTL_SECS {
+                CacheLookup::Stale(index)
+            } else {
+                CacheLookup::Fresh(index)
+            }
+        }
+        Err(e) => CacheLookup::Corrupt(format!("hub cache parse {}: {e}", path.display())),
+    }
+}
+
 /// Load cached remote index for a specific URL if fresh (within TTL).
 ///
 /// Returns:
@@ -524,31 +575,11 @@ fn cache_key(url: &str) -> String {
 /// - `Err(msg)` — file exists and is within TTL but JSON parse fails (corruption);
 ///   caller should surface as warning and fall back to a network fetch.
 fn load_cached(app_dir: &AppDir, url: &str) -> Result<Option<HubIndex>, String> {
-    let dir = cache_dir(app_dir);
-    let path = dir.join(format!("{}.json", cache_key(url)));
-    if !path.exists() {
-        return Ok(None);
+    match load_cached_full(app_dir, url) {
+        CacheLookup::Fresh(index) => Ok(Some(index)),
+        CacheLookup::NotPresent | CacheLookup::Stale(_) => Ok(None),
+        CacheLookup::Corrupt(msg) => Err(msg),
     }
-    // Metadata failure (e.g. race condition) → treat as cache miss, not corruption.
-    let metadata = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-    let age = match metadata.modified().ok().and_then(|t| t.elapsed().ok()) {
-        Some(a) => a,
-        None => return Ok(None),
-    };
-    if age.as_secs() > CACHE_TTL_SECS {
-        return Ok(None);
-    }
-    // File exists and is within TTL — read and parse. A parse failure here
-    // indicates an on-disk corruption (truncated write, etc.) that is
-    // distinguishable from a cache miss and must be surfaced to the caller.
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("hub cache read {}: {e}", path.display()))?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|e| format!("hub cache parse {}: {e}", path.display()))
 }
 
 /// Save remote index to per-source cache file.
@@ -1388,11 +1419,14 @@ impl AppService {
     /// or whose cache file is corrupt are skipped and a warning is collected;
     /// the aggregate still succeeds with the remaining sources.
     ///
+    /// Registry-load failures (corrupt `hub_registries.json`) are also
+    /// demoted to warnings rather than hard errors. Any warnings accumulated
+    /// before the failure are preserved in the returned `warnings` vec so
+    /// they reach the MCP wire response.
+    ///
     /// # Returns
-    /// - `Ok((merged_index, warnings))` — merged index across available
-    ///   sources; `warnings` contains per-source failure messages.
-    /// - `Err(ServiceError)` — when the hub registries file is corrupt,
-    ///   making URL discovery impossible.
+    /// `Ok((merged_index, warnings))` — always Ok; `warnings` contains any
+    /// per-source failure messages including registry-load failures.
     pub(crate) fn aggregate_index(
         &self,
     ) -> Result<(HubIndex, Vec<String>), super::error::ServiceError> {
@@ -1400,11 +1434,23 @@ impl AppService {
         let mut warnings: Vec<String> = Vec::new();
 
         // Discover source URLs (registries + manifest + seeds).
-        // Propagate registry read failure rather than silently degrading —
-        // a corrupt registries file would produce an empty URL set
-        // indistinguishable from the legitimate "no sources registered" state.
-        let urls = discover_index_urls(&app_dir, &mut warnings)
-            .map_err(super::error::ServiceError::InvalidInput)?;
+        // On failure, demote the error to a warning and return a degraded
+        // (empty) response. Preserves any warnings already collected
+        // (e.g. config.toml parse warning) before the failure.
+        let urls = match discover_index_urls(&app_dir, &mut warnings) {
+            Ok(u) => u,
+            Err(e) => {
+                warnings.push(format!("hub registry discovery failed: {e}"));
+                return Ok((
+                    HubIndex {
+                        schema_version: "hub_index/v0".into(),
+                        updated_at: String::new(),
+                        packages: Vec::new(),
+                    },
+                    warnings,
+                ));
+            }
+        };
 
         // Empty URL list: return empty index (not an error — fresh install).
         if urls.is_empty() {
@@ -1428,19 +1474,32 @@ impl AppService {
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for url in &urls {
-            match load_cached(&app_dir, url) {
-                Ok(Some(index)) => {
-                    // Merge packages; dedup by name (first source wins).
-                    for entry in index.packages {
-                        if seen_names.insert(entry.entity.name.clone()) {
-                            all_packages.push(entry);
+            let merge_packages =
+                |packages: Vec<IndexEntry>,
+                 all: &mut Vec<IndexEntry>,
+                 seen: &mut std::collections::HashSet<String>| {
+                    for entry in packages {
+                        if seen.insert(entry.entity.name.clone()) {
+                            all.push(entry);
                         }
                     }
+                };
+            match load_cached_full(&app_dir, url) {
+                CacheLookup::Fresh(index) => {
+                    merge_packages(index.packages, &mut all_packages, &mut seen_names);
                 }
-                Ok(None) => {
-                    // Cache miss for this URL — not an error, just skip.
+                CacheLookup::Stale(index) => {
+                    // Stale but not absent: merge the data and emit a warning so
+                    // the caller knows the catalog may be outdated.
+                    warnings.push(format!(
+                        "hub cache stale (>{CACHE_TTL_SECS}s) for {url}; run alc_hub_search to refresh"
+                    ));
+                    merge_packages(index.packages, &mut all_packages, &mut seen_names);
                 }
-                Err(e) => {
+                CacheLookup::NotPresent => {
+                    // Cache file absent — not an error, just skip.
+                }
+                CacheLookup::Corrupt(e) => {
                     // Cache corruption: surface as warning, continue aggregate.
                     warnings.push(format!("hub cache read failed for {url}: {e}"));
                 }
@@ -2072,6 +2131,81 @@ mod tests {
         );
     }
 
+    /// Helper: backdate a file's mtime by `secs` seconds so it appears stale.
+    fn backdate_file(path: &std::path::Path, secs: u64) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(past)
+            .set_modified(past);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for backdate");
+        f.set_times(times).expect("set_times");
+    }
+
+    // L-1: load_cached_full returns Stale (not NotPresent) for outdated cache.
+    #[test]
+    fn load_cached_full_stale_file_returns_stale_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let url = "https://stale.example.com/index.json";
+        // Write a valid cache entry using the helper to get correct serialization.
+        write_cache_for_url(&app_dir, url, &make_index(vec![("stale_pkg", "0.1.0")]));
+        // Backdate by 2× TTL to ensure it's stale.
+        let path = cache_dir(&app_dir).join(format!("{}.json", cache_key(url)));
+        backdate_file(&path, CACHE_TTL_SECS * 2);
+        let result = load_cached_full(&app_dir, url);
+        assert!(
+            matches!(result, CacheLookup::Stale(_)),
+            "backdated cache must return Stale variant"
+        );
+    }
+
+    // L-1: aggregate_index with stale cache returns data AND emits warning.
+    #[tokio::test]
+    async fn aggregate_index_stale_cache_returns_data_and_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir_root = tmp.path().to_path_buf();
+        let app_dir = AppDir::new(app_dir_root.clone());
+        let url = "https://stale-agg.example.com/index.json";
+
+        // Write a valid cache file with one package.
+        write_cache_for_url(&app_dir, url, &make_index(vec![("stale_pkg", "0.1.0")]));
+        // Backdate the cache file so it's stale.
+        let cache_path = cache_dir(&app_dir).join(format!("{}.json", cache_key(url)));
+        backdate_file(&cache_path, CACHE_TTL_SECS * 2);
+
+        // Register the URL in hub_registries.
+        let reg_path = app_dir.hub_registries_json();
+        std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
+        let reg_json = serde_json::json!({
+            "registries": [{"source": url, "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z"}]
+        });
+        std::fs::write(&reg_path, reg_json.to_string()).unwrap();
+
+        let svc = super::super::test_support::make_app_service_at(app_dir_root).await;
+        let (index, warnings) = AppService::aggregate_index(&svc).unwrap();
+
+        // Data from stale cache must still be present.
+        assert!(
+            index.packages.iter().any(|p| p.entity.name == "stale_pkg"),
+            "stale package must be included in aggregate, got: {:?}",
+            index
+                .packages
+                .iter()
+                .map(|p| &p.entity.name)
+                .collect::<Vec<_>>()
+        );
+        // A stale warning must be emitted.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("stale") && w.contains(url)),
+            "stale cache must emit a warning mentioning the URL, got: {warnings:?}"
+        );
+    }
+
     // Site 3: count_evals_for_pkg
 
     #[test]
@@ -2343,5 +2477,45 @@ mod tests {
             extra_warnings[0]
         );
         assert!(packages.is_empty(), "no packages from corrupt source");
+    }
+
+    // M-2: registry-load failure is demoted to a warning; accumulated
+    // warnings before the failure are preserved in the returned vec.
+    #[tokio::test]
+    async fn aggregate_index_registry_failure_returns_ok_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir_root = tmp.path().to_path_buf();
+
+        // Write corrupt hub_registries.json so load_registries fails.
+        let reg_path = AppDir::new(app_dir_root.clone()).hub_registries_json();
+        std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
+        std::fs::write(&reg_path, b"{{{{ not valid json").unwrap();
+
+        // Also write a corrupt config.toml to generate a pre-registry warning.
+        // (config.toml hub.collection_url parse warns before the registry step.)
+        // We skip this to keep the test minimal — just verify registry failure
+        // demotes to warning and result is Ok.
+
+        let svc = super::super::test_support::make_app_service_at(app_dir_root).await;
+        let result = AppService::aggregate_index(&svc);
+        assert!(
+            result.is_ok(),
+            "aggregate_index must return Ok even on registry-load failure, got: {result:?}"
+        );
+        let (index, warnings) = result.unwrap();
+        assert!(
+            index.packages.is_empty(),
+            "degraded response must have empty packages"
+        );
+        assert!(
+            !warnings.is_empty(),
+            "registry-load failure must produce a warning"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("hub registry discovery failed")),
+            "warning must mention registry discovery failure, got: {warnings:?}"
+        );
     }
 }

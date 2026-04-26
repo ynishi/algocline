@@ -10,13 +10,11 @@ use std::sync::Arc;
 
 use algocline_app::EngineApi;
 use algocline_core::AppDir;
-use chrono::{DateTime, Utc};
 use rmcp::model::{
-    Annotated, Annotations, ListResourceTemplatesResult, ListResourcesResult, RawResource,
-    RawResourceTemplate, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    Annotated, ListResourceTemplatesResult, ListResourcesResult, RawResource, RawResourceTemplate,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
 };
 use rmcp::ErrorData as McpError;
-use tracing;
 
 // ─── Known services ──────────────────────────────────────────────────────────
 
@@ -177,14 +175,6 @@ impl ResourceCatalog {
     /// to be absent at list-time; a subsequent `read` for a missing file will
     /// return `McpError::invalid_params`. This matches MCP spec semantics.
     pub fn list_fixed(&self) -> Vec<Resource> {
-        // Build timestamp from VERGEN_BUILD_TIMESTAMP if available; otherwise None.
-        // This is a best-effort field: absent at most build environments is fine.
-        let build_ts: Option<DateTime<Utc>> = option_env!("VERGEN_BUILD_TIMESTAMP").and_then(|s| {
-            DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        });
-
         vec![
             make_resource(
                 "alc://types/alc.d.lua",
@@ -193,7 +183,6 @@ impl ResourceCatalog {
                 "Lua type stubs for alc.* StdLib",
                 "text/x-lua",
                 None,
-                build_ts,
             ),
             make_resource(
                 "alc://types/alc_shapes.d.lua",
@@ -202,7 +191,6 @@ impl ResourceCatalog {
                 "Lua type stubs for alc shapes",
                 "text/x-lua",
                 None,
-                build_ts,
             ),
             make_resource(
                 "alc://hub/index",
@@ -210,7 +198,6 @@ impl ResourceCatalog {
                 Some("Hub Aggregate Index"),
                 "Aggregated package catalog merged across all installed hub sources.",
                 "application/json",
-                None,
                 None,
             ),
         ]
@@ -685,7 +672,6 @@ fn make_resource(
     description: &str,
     mime_type: &str,
     size: Option<u32>,
-    last_modified: Option<DateTime<Utc>>,
 ) -> Resource {
     let raw = RawResource {
         uri: uri.to_string(),
@@ -697,15 +683,7 @@ fn make_resource(
         icons: None,
         meta: None,
     };
-    let annotations = if last_modified.is_some() {
-        Some(Annotations {
-            last_modified,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
-    Annotated::new(raw, annotations)
+    Annotated::new(raw, None)
 }
 
 fn make_template(
@@ -938,11 +916,13 @@ impl ResourceCatalog {
 
     /// List eval result IDs, prefix-filtered.
     ///
-    /// Fetches 101 entries (one over cap) to detect `has_more` without a
-    /// separate count query.
+    /// Fetches all entries (unbounded), applies prefix filter, then caps at
+    /// `COMPLETION_CAP`. Fetching before filtering ensures older matches
+    /// beyond the cap are not silently dropped.
     async fn list_eval_ids(&self, prefix: &str) -> Vec<String> {
-        // Request cap + 1 so we can detect truncation from the source side.
-        let json_str = match self.app.eval_history(None, COMPLETION_CAP + 1).await {
+        // usize::MAX acts as "no limit" — eval_store truncates to limit, so
+        // passing the maximum ensures we get every entry before filtering.
+        let json_str = match self.app.eval_history(None, usize::MAX).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "completion: eval_history failed, returning empty candidates");
@@ -2512,13 +2492,9 @@ mod tests {
             "Lua type stubs",
             "text/x-lua",
             None,
-            None,
         );
         assert_eq!(r.raw.title.as_deref(), Some("My Title"));
-        assert!(
-            r.annotations.is_none(),
-            "annotations should be None when lastModified is None"
-        );
+        assert!(r.annotations.is_none());
     }
 
     #[test]
@@ -2530,26 +2506,8 @@ mod tests {
             "desc",
             "text/x-lua",
             Some(1234),
-            None,
         );
         assert_eq!(r.raw.size, Some(1234));
-    }
-
-    #[test]
-    fn make_resource_with_last_modified_sets_annotations() {
-        use chrono::TimeZone;
-        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
-        let r = make_resource(
-            "alc://types/alc.d.lua",
-            "alc.d.lua",
-            None,
-            "desc",
-            "text/x-lua",
-            None,
-            Some(ts),
-        );
-        let ann = r.annotations.as_ref().expect("annotations should be Some");
-        assert_eq!(ann.last_modified, Some(ts));
     }
 
     #[test]
@@ -2560,7 +2518,6 @@ mod tests {
             None,
             "desc",
             "text/x-lua",
-            None,
             None,
         );
         assert!(r.annotations.is_none());
@@ -2872,5 +2829,56 @@ mod tests {
             .complete_resource_arg("https://other/{name}", "name", "")
             .await;
         assert!(result.values.is_empty());
+    }
+
+    // E2E parity note: seeding 100+ eval results via the MCP test harness
+    // (which relies on the real binary + on-disk evals dir) is impractical —
+    // each eval result requires a full alc_eval invocation with an LLM mock.
+    // The invariant is therefore verified here at the unit level.
+    //
+    // L-5 regression: prefix filter must happen BEFORE cap truncation.
+    // Build 105 eval IDs matching prefix "strat-a" plus 5 matching "strat-b".
+    // With prefix="strat-a", result must be capped at 100 with has_more=true
+    // and total=105 (not 101 from a pre-cap fetch).
+    #[tokio::test]
+    async fn list_eval_ids_prefix_filter_before_cap() {
+        // Build the eval_history JSON response with 110 entries (105 "strat-a", 5 "strat-b").
+        let mut evals: Vec<serde_json::Value> = (0..105)
+            .map(|i| {
+                serde_json::json!({
+                    "eval_id": format!("strat-a_{}", 1_000_000_u64 + i),
+                    "strategy": "strat-a",
+                    "timestamp": 1_000_000_u64 + i,
+                })
+            })
+            .collect();
+        evals.extend((0..5).map(|i| {
+            serde_json::json!({
+                "eval_id": format!("strat-b_{}", 2_000_000_u64 + i),
+                "strategy": "strat-b",
+                "timestamp": 2_000_000_u64 + i,
+            })
+        }));
+        let history_json = serde_json::json!({ "evals": evals }).to_string();
+
+        let engine = FakeEngine {
+            eval_history: Some(Ok(history_json)),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://eval/{result_id}", "result_id", "strat-a")
+            .await;
+
+        assert_eq!(
+            result.total, 105,
+            "total must reflect all prefix-matching entries before cap"
+        );
+        assert_eq!(
+            result.values.len(),
+            100,
+            "values must be capped at COMPLETION_CAP=100"
+        );
+        assert!(result.has_more, "has_more must be true when total > cap");
     }
 }

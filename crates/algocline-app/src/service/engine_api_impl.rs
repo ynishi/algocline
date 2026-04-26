@@ -518,12 +518,10 @@ impl EngineApi for AppService {
     /// Aggregate hub index across all registered cache sources.
     ///
     /// Delegates to `AppService::aggregate_index`, then serializes the
-    /// result to a JSON string. Individual source failures are embedded
-    /// in the response JSON under a `"warnings"` field so the MCP caller
-    /// can observe partial failures without losing the aggregate result.
-    ///
-    /// Returns `Err(message)` only when the hub registries file is corrupt
-    /// (making URL discovery impossible).
+    /// result to a JSON string. Individual source failures and registry-load
+    /// failures are embedded in the response JSON under a `"warnings"` field
+    /// so the MCP caller can observe partial failures without losing the
+    /// aggregate result.
     async fn hub_index_aggregate(&self) -> Result<String, String> {
         let svc = self.clone();
         let (index, warnings) = tokio::task::spawn_blocking(move || {

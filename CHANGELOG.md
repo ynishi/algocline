@@ -5,17 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-
-- **Bump `rmcp` 0.16.0 → 1.5.0**. rmcp 1.x makes most model structs
-  `#[non_exhaustive]`, so direct struct expressions (`ReadResourceResult { contents }`,
-  `CompleteResult { completion }`, `ServerInfo { instructions, .. }`,
-  `ReadResourceRequestParams { uri, meta }`, `CallToolRequestParams { ... }`,
-  `CompleteRequestParams { ... }`) were migrated to constructor / `Default` +
-  field-mutation patterns. Wire shape unchanged; breaking only for direct
-  rmcp consumers reading internal types in this workspace.
+## [0.30.0] - 2026-04-26
 
 ### Added
 
@@ -23,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aggregated hub package catalog as a single `application/json` read. Merges
   cached `hub_index.json` data across all registered hub sources; individual
   source failures are surfaced in a `"warnings"` array field in the response
-  JSON rather than failing the whole read (best-effort aggregate). On a clean
-  install with no cached sources the response is
+  JSON rather than failing the whole read (best-effort aggregate). Stale
+  cache entries (>1h) and registry-load failures also surface as warnings,
+  preserving partial diagnostic information across the MCP wire boundary.
+  On a clean install with no cached sources the response is
   `{"schema_version":"hub_index/v0","packages":[]}`. Backed by the new
   `EngineApi::hub_index_aggregate` trait method and
   `AppService::aggregate_index` service method.
@@ -51,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP wire shape is additive). External crates implementing `EngineApi` must add this
   method. The default return type is `Result<String, String>` (JSON string), consistent
   with all other hub trait methods.
+- **Bump `rmcp` 0.16.0 → 1.5.0**. rmcp 1.x marks most model structs
+  `#[non_exhaustive]`, so direct struct expressions (`ReadResourceResult`,
+  `CompleteResult`, `ServerInfo`, `ReadResourceRequestParams`,
+  `CallToolRequestParams`, `CompleteRequestParams`) were migrated to
+  constructor / `Default` + field-mutation patterns. MCP wire shape unchanged;
+  breaking only for direct rmcp consumers reading internal types in this
+  workspace.
 
 ### Fixed
 
@@ -60,6 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `read_packages/meta`, and wildcard arms in `read_packages`, `read_cards`,
   `read_scenarios`, `read_eval`, and `read_logs`. URI parse errors / unknown service /
   malformed query still correctly return `-32602 invalid_params`.
+- **README**: corrected `alc://packages/{name}` template URI rows — the actual
+  templates served are `alc://packages/{name}/init.lua` and
+  `alc://packages/{name}/meta` (the bare `alc://packages/{name}` form returns
+  `resource not found`).
+- **`alc://hub/index` registry-load failure**: previously the registry-load
+  step's `?` early-return discarded already-accumulated `warnings` entries
+  (e.g. `config.toml hub.collection_url:` parse warnings). Now degrades to
+  `Ok` with the failure surfaced as a warning, symmetric with per-source
+  cache-corrupt handling.
+- **`alc://hub/index` stale cache no longer silently empty**: `load_cached`
+  now distinguishes `NotPresent` / `Stale(HubIndex)` / `Fresh(HubIndex)` /
+  `Corrupt(String)`. Stale entries (>1h) still merge their data and emit a
+  `hub cache stale (>3600s)` warning instead of being indistinguishable from
+  a fresh-install empty result.
+- **`completion/complete` for `eval_id`**: prefix filter now applied to the
+  full eval history rather than after the source-side limit. Matches outside
+  the newest 100 entries are now visible and `has_more` accurately reflects
+  truncation.
 
 ### Improved
 
@@ -67,8 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via extended `make_resource` / `make_template` helpers. Fixed resources
   (`alc://types/alc.d.lua`, `alc://types/alc_shapes.d.lua`) now carry human-readable
   titles visible in MCP client UIs. All 7 resource templates similarly include titles.
-  `annotations.lastModified` is populated from `VERGEN_BUILD_TIMESTAMP` when present
-  at build time; absent in standard builds (no vergen dep added).
+
+### Removed
+
+- **Dead `chrono` direct dep + `option_env!("VERGEN_BUILD_TIMESTAMP")` path**
+  in `algocline-mcp`. The `annotations.lastModified` Some-branch was
+  unreachable in standard builds (no vergen wired), and an earlier note about
+  populating `lastModified` from a build-time timestamp did not actually
+  apply on shipped binaries. The shape always emitted `annotations: None`,
+  which is preserved.
 
 ## [0.29.1] - 2026-04-26
 

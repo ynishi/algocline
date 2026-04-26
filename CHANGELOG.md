@@ -31,8 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   All results are prefix-filtered by the typed value, capped at 100 entries
   (`has_more: true` + `total` when truncated). `ref/prompt` references return an
   empty result without error. `ServerCapabilities` now declares `completions`.
-  New public helpers: `extract_template_vars` (RFC 6570 Level-1 parser) and
-  `complete_resource_arg` on `ResourceCatalog`.
+  New public API surface: `extract_template_vars` (RFC 6570 Level-1 variable
+  parser) and `complete_resource_arg` on `ResourceCatalog` (for external crates
+  that build on the MCP resource layer).
 
 ### Changed
 

@@ -233,6 +233,52 @@ alc_continue({ session_id, response })
 | `alc_scenario_show` | Show an installed scenario's content |
 | `alc_scenario_install` | Install scenarios from Git URL or local path |
 
+## MCP Resources
+
+algocline exposes structured data via [MCP Resources](https://spec.modelcontextprotocol.io/specification/server/resources/) — a standard capability that lets MCP clients read named files and catalog data without calling tools.
+
+### Resource URIs
+
+| URI | Type | Description |
+|---|---|---|
+| `alc://types/alc.d.lua` | Fixed | LuaCats type definitions for `alc.*` StdLib (editor completion) |
+| `alc://types/alc_shapes.d.lua` | Fixed | LuaCats definitions for `alc_shapes` shape library |
+| `alc://hub/index` | Fixed | Aggregated hub package catalog (`application/json`) — merges all cached `hub_index.json` files across registered sources |
+| `alc://packages/{name}` | Template | Package `init.lua` source |
+| `alc://packages/{name}/meta` | Template | Package metadata JSON |
+| `alc://cards/{card_id}` | Template | Eval card JSON |
+| `alc://scenarios/{name}` | Template | Scenario Lua source |
+| `alc://eval/{result_id}` | Template | Eval result JSON |
+| `alc://logs/{session_id}` | Template | Session transcript log |
+
+### Claude Code `@`-mention
+
+When algocline is configured as an MCP server, Claude Code exposes all resources via `@alc:` mention syntax. Type `@alc:` in the input field to browse or tab-complete resource URIs:
+
+```
+@alc:alc://hub/index                    # read the full package catalog
+@alc:alc://packages/reflect             # read the reflect package source
+@alc:alc://types/alc.d.lua              # read StdLib type definitions
+```
+
+Tab-completion for template arguments is supported (`completion/complete`). Typing `@alc:alc://packages/` and pressing `<TAB>` returns installed package names filtered by prefix.
+
+> **Caveat**: Claude Code subagents launched with `subagent_type` may not inherit the parent session's MCP resource access. Read resources from the main agent context, not from within a delegated subagent.
+
+### `alc://hub/index` — aggregated package catalog
+
+Reading `alc://hub/index` returns a JSON object with the union of all registered hub sources:
+
+```json
+{
+  "schema_version": "hub_index/v0",
+  "packages": [ ... ],
+  "warnings": []
+}
+```
+
+Individual source read failures are surfaced in `"warnings"` rather than failing the whole request (best-effort aggregate). On a clean install with no cached sources the response is `{"schema_version":"hub_index/v0","packages":[]}`.
+
 ## Host integration patterns
 
 algocline's `alc.llm()` is a cooperative yield — it pauses the Lua VM and returns a prompt to the host. How the host handles this determines performance and quality.

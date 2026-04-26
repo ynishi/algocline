@@ -109,10 +109,13 @@ pub(crate) enum InstalledManifestStoreError {
         source: std::io::Error,
     },
     /// The advisory lock subsystem (`service::lock::with_exclusive_lock`)
-    /// returned an error. We carry its message verbatim until the lock
-    /// subsystem is also typed.
-    #[error("installed manifest lock failed at {path}: {message}")]
-    Lock { path: PathBuf, message: String },
+    /// returned a typed [`crate::service::lock::LockError`].
+    #[error("installed manifest lock failed at {path}: {source}")]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: crate::service::lock::LockError,
+    },
 }
 
 /// Bridge for callers still on `Result<_, String>`. Each service-layer
@@ -125,6 +128,25 @@ pub(crate) enum InstalledManifestStoreError {
 impl From<InstalledManifestStoreError> for String {
     fn from(e: InstalledManifestStoreError) -> Self {
         e.to_string()
+    }
+}
+
+/// Absorb a typed [`LockError`] into the `Lock` variant.
+///
+/// This `From` impl is what makes `with_exclusive_lock` generic over `E`:
+/// `E: From<LockError>` is satisfied, so lock acquisition errors are
+/// injected directly into the typed error channel without an intermediate
+/// `String` conversion.
+impl From<crate::service::lock::LockError> for InstalledManifestStoreError {
+    fn from(e: crate::service::lock::LockError) -> Self {
+        // Path is embedded in the LockError variants themselves; we extract
+        // a representative path for the `Lock { path }` field from the error.
+        let path = match &e {
+            crate::service::lock::LockError::CreateDir { path, .. }
+            | crate::service::lock::LockError::Open { path, .. }
+            | crate::service::lock::LockError::Acquire { path, .. } => path.clone(),
+        };
+        InstalledManifestStoreError::Lock { path, source: e }
     }
 }
 
@@ -213,24 +235,17 @@ impl FsInstalledManifestStore {
     }
 
     /// Run `f` under an exclusive advisory file lock on the companion
-    /// `.lock` path. Wraps the lock subsystem's stringly-typed errors
-    /// into the typed `Lock` variant; `f`'s own errors (already typed)
-    /// are passed through.
+    /// `.lock` path. Lock acquisition failures are absorbed into the typed
+    /// `Lock` variant via `From<LockError>`; `f`'s own errors pass through.
     fn with_lock<F, R>(&self, f: F) -> Result<R, InstalledManifestStoreError>
     where
         F: FnOnce() -> Result<R, InstalledManifestStoreError>,
     {
         let lock_path = self.manifest_lock_path();
-        // `with_exclusive_lock` encodes both its own acquisition errors
-        // and the inner closure's error as `String`. We cannot tell
-        // them apart after the fact, so we return the whole string
-        // under the `Lock` variant. Once the lock subsystem is typed,
-        // this merging can be replaced with `#[from]` absorption.
-        crate::service::lock::with_exclusive_lock(&lock_path, || f().map_err(|e| e.to_string()))
-            .map_err(|message| InstalledManifestStoreError::Lock {
-                path: lock_path.clone(),
-                message,
-            })
+        // `From<LockError> for InstalledManifestStoreError` is implemented
+        // below, so lock acquisition errors are injected as `Lock` variants
+        // and the closure's typed errors pass through unchanged.
+        crate::service::lock::with_exclusive_lock(&lock_path, f)
     }
 
     fn save(&self, manifest: &Manifest) -> Result<(), InstalledManifestStoreError> {

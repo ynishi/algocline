@@ -1,4 +1,8 @@
 pub(crate) mod alc_toml;
+mod error;
+pub(crate) use error::{
+    HubRegistriesError, PkgListError, ProjectFilesError, ServiceError, TranscriptError,
+};
 mod card;
 mod config;
 mod dist;
@@ -128,16 +132,20 @@ impl AppService {
     ///    (git-ignored, not persisted to alc.lock, loaded every call).
     /// 2. `alc.lock` path entries — alc.toml-derived, git-managed.
     ///
-    /// Returns an empty `Vec` if no project root is found. Partial
-    /// failures (e.g. malformed `alc.local.toml`) are logged at `warn`
-    /// and degraded to the empty layer without failing the whole call.
+    /// Returns `(paths, warnings)`. An empty `paths` is returned when no project
+    /// root is found. Corruption errors (parse failures) are returned as warning
+    /// strings in the second element rather than dropped silently — callers are
+    /// responsible for surfacing them on the MCP wire response. File-absent is
+    /// `Ok(None)` in the underlying loaders and produces no warning.
     pub(crate) fn resolve_extra_lib_paths(
         &self,
         project_root: Option<&str>,
-    ) -> Vec<std::path::PathBuf> {
+    ) -> (Vec<std::path::PathBuf>, Vec<String>) {
         let Some(root) = project::resolve_project_root(project_root) else {
-            return vec![];
+            return (vec![], vec![]);
         };
+
+        let mut warnings: Vec<String> = Vec::new();
 
         // Local override layer (highest priority) — merged every call,
         // never persisted to alc.lock (decisions.md FsResolver priority).
@@ -145,7 +153,10 @@ impl AppService {
             Ok(Some(local)) => alc_toml::resolve_local_path_entries(&root, &local),
             Ok(None) => Vec::new(),
             Err(e) => {
-                tracing::warn!("failed to load alc.local.toml at {}: {e}", root.display());
+                warnings.push(format!(
+                    "failed to load alc.local.toml at {}: {e}",
+                    root.display()
+                ));
                 Vec::new()
             }
         };
@@ -154,38 +165,47 @@ impl AppService {
         let lock_paths: Vec<std::path::PathBuf> = match lockfile::load_lockfile(&root) {
             Ok(Some(lock)) => {
                 self.warn_toml_lock_mismatch(&root, &lock);
-                lockfile::resolve_path_entries(&root, &lock)
+                let (paths, path_warnings) = lockfile::resolve_path_entries(&root, &lock);
+                warnings.extend(path_warnings);
+                paths
             }
             Ok(None) => Vec::new(),
             Err(e) => {
-                tracing::warn!("failed to load alc.lock at {}: {e}", root.display());
+                warnings.push(format!(
+                    "failed to load alc.lock at {}: {e}",
+                    root.display()
+                ));
                 Vec::new()
             }
         };
 
         let mut merged = local_paths;
         merged.extend(lock_paths);
-        merged
+        (merged, warnings)
     }
 
     /// Resolve variant pkg overrides for a request.
     ///
     /// Reads `alc.local.toml` (worktree-scoped, gitignored) and emits one
     /// [`VariantPkg`] per `[packages.{name}] path = "..."` entry, preserving
-    /// the explicit `(name, pkg_dir)` mapping. Returns an empty `Vec` if no
-    /// project root is found or `alc.local.toml` is missing/malformed
-    /// (failures are logged at `warn`).
-    pub(crate) fn resolve_variant_pkgs(&self, project_root: Option<&str>) -> Vec<VariantPkg> {
+    /// the explicit `(name, pkg_dir)` mapping. Returns `(pkgs, warnings)` —
+    /// an empty `pkgs` when no project root is found or `alc.local.toml` is
+    /// absent. Corruption (parse failures) is returned as a warning string so
+    /// callers can surface it on the MCP wire response.
+    pub(crate) fn resolve_variant_pkgs(
+        &self,
+        project_root: Option<&str>,
+    ) -> (Vec<VariantPkg>, Vec<String>) {
         let Some(root) = project::resolve_project_root(project_root) else {
-            return vec![];
+            return (vec![], vec![]);
         };
 
         match alc_toml::load_alc_local_toml(&root) {
-            Ok(Some(local)) => alc_toml::resolve_local_variant_pkgs(&root, &local),
-            Ok(None) => Vec::new(),
+            Ok(Some(local)) => (alc_toml::resolve_local_variant_pkgs(&root, &local), vec![]),
+            Ok(None) => (Vec::new(), vec![]),
             Err(e) => {
-                tracing::warn!("failed to load alc.local.toml at {}: {e}", root.display());
-                Vec::new()
+                let msg = format!("failed to load alc.local.toml at {}: {e}", root.display());
+                (Vec::new(), vec![msg])
             }
         }
     }

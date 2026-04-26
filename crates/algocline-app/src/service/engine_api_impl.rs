@@ -169,7 +169,9 @@ impl EngineApi for AppService {
             verbose,
         };
 
-        AppService::pkg_list(self, project_root, opts).await
+        AppService::pkg_list(self, project_root, opts)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {
@@ -461,7 +463,7 @@ impl EngineApi for AppService {
     // ─── Package read ─────────────────────────────────────────
 
     async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String> {
-        AppService::pkg_read_init_lua(self, name)
+        AppService::pkg_read_init_lua(self, name, None)
     }
 
     async fn pkg_meta(&self, name: &str) -> Result<String, String> {

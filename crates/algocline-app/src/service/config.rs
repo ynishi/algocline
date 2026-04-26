@@ -223,18 +223,15 @@ impl Default for AppConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::with_env_var;
     use super::*;
 
     #[test]
     fn app_dir_env_overrides_home() {
-        let prev = std::env::var("ALC_HOME").ok();
-        std::env::set_var("ALC_HOME", "/tmp/alc-home-override");
-        let dir = AppConfig::resolve_app_dir();
-        assert_eq!(dir.root(), Path::new("/tmp/alc-home-override"));
-        match prev {
-            Some(v) => std::env::set_var("ALC_HOME", v),
-            None => std::env::remove_var("ALC_HOME"),
-        }
+        with_env_var("ALC_HOME", "/tmp/alc-home-override", || {
+            let dir = AppConfig::resolve_app_dir();
+            assert_eq!(dir.root(), Path::new("/tmp/alc-home-override"));
+        });
     }
 
     #[test]

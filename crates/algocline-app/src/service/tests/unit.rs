@@ -249,7 +249,8 @@ fn write_transcript_log_creates_meta_file() {
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
-    write_transcript_log(&config, "s-meta-test", &metrics, Some("ucb"));
+    write_transcript_log(&config, "s-meta-test", &metrics, Some("ucb"))
+        .expect("write_transcript_log");
 
     // Main log should exist
     assert!(dir.path().join("s-meta-test.json").exists());
@@ -302,7 +303,7 @@ fn write_transcript_log_strategy_none() {
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
-    write_transcript_log(&config, "s-no-strat", &metrics, None);
+    write_transcript_log(&config, "s-no-strat", &metrics, None).expect("write_transcript_log");
 
     let meta_path = dir.path().join("s-no-strat.meta.json");
     let raw = std::fs::read_to_string(&meta_path).unwrap();
@@ -394,7 +395,7 @@ fn write_transcript_log_disabled_is_noop() {
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
-    write_transcript_log(&config, "s-disabled", &metrics, None);
+    write_transcript_log(&config, "s-disabled", &metrics, None).expect("write_transcript_log");
 
     // No file should be created
     assert!(!dir.path().join("s-disabled.json").exists());
@@ -413,7 +414,7 @@ fn write_transcript_log_empty_transcript_is_noop() {
     };
     // Metrics with no observer events → empty transcript
     let metrics = algocline_core::ExecutionMetrics::new();
-    write_transcript_log(&config, "s-empty", &metrics, None);
+    write_transcript_log(&config, "s-empty", &metrics, None).expect("write_transcript_log");
     assert!(!dir.path().join("s-empty.json").exists());
 }
 
@@ -478,7 +479,7 @@ fn write_transcript_log_truncates_long_prompt() {
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
-    write_transcript_log(&config, "s-long", &metrics, None);
+    write_transcript_log(&config, "s-long", &metrics, None).expect("write_transcript_log");
 
     let raw = std::fs::read_to_string(dir.path().join("s-long.json")).unwrap();
     let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -952,7 +953,7 @@ fn write_transcript_log_noop_when_log_dir_none() {
     observer.on_resumed();
     observer.on_completed(&serde_json::json!(null));
 
-    write_transcript_log(&config, "s-none-dir", &metrics, None);
+    write_transcript_log(&config, "s-none-dir", &metrics, None).expect("write_transcript_log");
 
     // No file anywhere — dir is unused, just verifying no panic
     assert!(!dir.path().join("s-none-dir.json").exists());

@@ -8,7 +8,10 @@ use std::borrow::Cow;
 use std::io::Write;
 
 use rmcp::{
-    model::{CallToolRequestParams, ReadResourceRequestParams},
+    model::{
+        ArgumentInfo, CallToolRequestParams, CompleteRequestParams, ReadResourceRequestParams,
+        Reference, ResourceReference,
+    },
     transport::TokioChildProcess,
     ServiceExt,
 };
@@ -2906,7 +2909,7 @@ async fn test_alc_hub_dist_compat_undeclared_warns() {
 
 // ─── MCP Resources E2E ──────────────────────────────────────────
 
-/// `resources/list` must return exactly 2 fixed resources.
+/// `resources/list` must return exactly 3 fixed resources.
 #[tokio::test]
 async fn test_mcp_resources_list_returns_two_fixed() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2919,8 +2922,8 @@ async fn test_mcp_resources_list_returns_two_fixed() {
 
     assert_eq!(
         result.resources.len(),
-        2,
-        "expected 2 fixed resources, got: {:?}",
+        3,
+        "expected 3 fixed resources (types x2 + hub/index), got: {:?}",
         result
             .resources
             .iter()
@@ -2940,6 +2943,16 @@ async fn test_mcp_resources_list_returns_two_fixed() {
     assert!(
         uris.contains(&"alc://types/alc_shapes.d.lua"),
         "expected alc://types/alc_shapes.d.lua in fixed list"
+    );
+    assert!(
+        uris.contains(&"alc://hub/index"),
+        "expected alc://hub/index in fixed list"
+    );
+
+    // Verify that at least one fixed resource has title populated (ST-1 field extension).
+    assert!(
+        result.resources.iter().any(|r| r.raw.title.is_some()),
+        "expected at least one fixed resource to have a title field"
     );
 
     client.cancel().await.expect("cancel failed");
@@ -2965,6 +2978,60 @@ async fn test_mcp_resource_templates_list_returns_seven() {
             .iter()
             .map(|t| t.raw.uri_template.as_str())
             .collect::<Vec<_>>()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://hub/index` on a clean install (no sources registered) returns
+/// an empty packages array.
+#[tokio::test]
+async fn test_mcp_resource_read_hub_index_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Fresh tempdir with no hub_registries.json and no cache files → packages empty.
+    let result = read_resource(&client, "alc://hub/index")
+        .await
+        .expect("read alc://hub/index failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (uri, text) = resource_text(&result.contents[0]);
+    assert_eq!(uri, "alc://hub/index");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("hub/index response must be valid JSON");
+    assert_eq!(
+        parsed.get("schema_version").and_then(|v| v.as_str()),
+        Some("hub_index/v0"),
+        "schema_version must be hub_index/v0"
+    );
+    let packages = parsed
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .expect("packages must be an array");
+    assert!(
+        packages.is_empty(),
+        "clean install must return empty packages, got: {packages:?}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://hub/unknown` returns an error (invalid path).
+#[tokio::test]
+async fn test_mcp_resource_read_hub_unknown_path_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = ReadResourceRequestParams {
+        uri: "alc://hub/unknown".to_string(),
+        meta: None,
+    };
+    let result = client.read_resource(params).await;
+    assert!(
+        result.is_err(),
+        "alc://hub/unknown must return an error, got: {result:?}"
     );
 
     client.cancel().await.expect("cancel failed");
@@ -3575,6 +3642,218 @@ async fn test_lua_print_does_not_corrupt_transport() {
         "follow-up call failed: {resp2}"
     );
     assert_eq!(resp2["result"], 99);
+
+    client.cancel().await.expect("cancel failed");
+}
+
+// ─── MCP completion/complete E2E ────────────────────────────────
+
+/// Happy-path: `completion/complete` for `alc://packages/{name}/init.lua`
+/// with an empty prefix and no packages installed returns a structurally
+/// valid `CompleteResult` with `completion.values` as an array.
+///
+/// This test exercises the full MCP wire path:
+///   client → `completion/complete` request → `ServerHandler::complete` →
+///   `ResourceCatalog::complete_resource_arg` → `EngineApi::pkg_list` →
+///   JSON → `CompleteResult { completion: CompletionInfo }`.
+///
+/// When the `packages/` directory is empty (isolated `ALC_HOME`), the
+/// result must be `values: []` — not an error.  That confirms the handler
+/// is wired and the wire shape is correct.
+#[tokio::test]
+async fn test_mcp_resources_complete_packages_empty_home() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Ensure packages dir exists so the server does not error on scan.
+    std::fs::create_dir_all(tmp.path().join("packages")).expect("mkdir packages");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = CompleteRequestParams {
+        meta: None,
+        r#ref: Reference::Resource(ResourceReference {
+            uri: "alc://packages/{name}/init.lua".to_string(),
+        }),
+        argument: ArgumentInfo {
+            name: "name".to_string(),
+            value: "".to_string(),
+        },
+        context: None,
+    };
+
+    let result = client
+        .complete(params)
+        .await
+        .expect("completion/complete failed");
+
+    // Wire shape: completion.values must be a Vec (possibly empty).
+    assert!(
+        result.completion.values.len() <= 100,
+        "values length must not exceed cap=100, got {}",
+        result.completion.values.len()
+    );
+    // All values must be non-empty strings.
+    for v in &result.completion.values {
+        assert!(!v.is_empty(), "completion value must not be empty string");
+    }
+    // When values is empty, has_more must not be true.
+    if result.completion.values.is_empty() {
+        assert_ne!(
+            result.completion.has_more,
+            Some(true),
+            "has_more must not be true when values is empty"
+        );
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// When a package is pre-installed in `ALC_HOME/packages/`, the completion
+/// result for `alc://packages/{name}/init.lua` must include it in `values`.
+///
+/// This confirms the EngineApi → JSON → completion dispatch chain returns
+/// real data end-to-end across the MCP wire.
+#[tokio::test]
+async fn test_mcp_resources_complete_packages_returns_installed_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Pre-install a package so pkg_list returns it.
+    let pkg_dir = tmp.path().join("packages").join("e2e_complete_test_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'e2e_complete_test_pkg', version = '0.1.0' }\n",
+            "return M\n",
+        ),
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = CompleteRequestParams {
+        meta: None,
+        r#ref: Reference::Resource(ResourceReference {
+            uri: "alc://packages/{name}/init.lua".to_string(),
+        }),
+        argument: ArgumentInfo {
+            name: "name".to_string(),
+            value: "".to_string(),
+        },
+        context: None,
+    };
+
+    let result = client
+        .complete(params)
+        .await
+        .expect("completion/complete failed");
+
+    assert!(
+        result
+            .completion
+            .values
+            .iter()
+            .any(|v| v == "e2e_complete_test_pkg"),
+        "expected 'e2e_complete_test_pkg' in completion values, got: {:?}",
+        result.completion.values
+    );
+    // total must be Some and ≥ 1 when values are present.
+    assert!(
+        result.completion.total.unwrap_or(0) >= 1,
+        "expected total >= 1 when at least one package is installed"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Prefix filtering: when the prefix `"e2e_c"` is provided, only packages
+/// whose names start with that prefix must appear in the completion values.
+///
+/// This verifies that `complete_resource_arg` passes the prefix down and
+/// filters correctly.
+#[tokio::test]
+async fn test_mcp_resources_complete_packages_prefix_filter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Install two packages: one matching the prefix, one not.
+    for name in &["e2e_c_alpha", "other_pkg"] {
+        let dir = tmp.path().join("packages").join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("init.lua"),
+            format!(
+                "local M = {{}}\nM.meta = {{ name = '{}', version = '0.1.0' }}\nreturn M\n",
+                name
+            ),
+        )
+        .expect("write init.lua");
+    }
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = CompleteRequestParams {
+        meta: None,
+        r#ref: Reference::Resource(ResourceReference {
+            uri: "alc://packages/{name}/init.lua".to_string(),
+        }),
+        argument: ArgumentInfo {
+            name: "name".to_string(),
+            value: "e2e_c".to_string(),
+        },
+        context: None,
+    };
+
+    let result = client
+        .complete(params)
+        .await
+        .expect("completion/complete failed");
+
+    // e2e_c_alpha starts with "e2e_c" → must appear.
+    assert!(
+        result.completion.values.iter().any(|v| v == "e2e_c_alpha"),
+        "expected 'e2e_c_alpha' in completion values for prefix 'e2e_c', got: {:?}",
+        result.completion.values
+    );
+    // other_pkg does NOT start with "e2e_c" → must not appear.
+    assert!(
+        !result.completion.values.iter().any(|v| v == "other_pkg"),
+        "unexpected 'other_pkg' in filtered completion values: {:?}",
+        result.completion.values
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `ref/prompt` reference must return an empty completion result without error.
+///
+/// The handler's `Reference::Prompt` branch returns `CompletionInfo::default()`
+/// (empty values, no total/has_more).  This confirms the branch is reachable
+/// end-to-end without panic or MCP error.
+#[tokio::test]
+async fn test_mcp_resources_complete_prompt_ref_returns_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = CompleteRequestParams {
+        meta: None,
+        r#ref: Reference::for_prompt("nonexistent_prompt"),
+        argument: ArgumentInfo {
+            name: "arg".to_string(),
+            value: "".to_string(),
+        },
+        context: None,
+    };
+
+    let result = client
+        .complete(params)
+        .await
+        .expect("completion/complete for prompt ref must not error");
+
+    assert!(
+        result.completion.values.is_empty(),
+        "expected empty values for prompt ref, got: {:?}",
+        result.completion.values
+    );
 
     client.cancel().await.expect("cancel failed");
 }

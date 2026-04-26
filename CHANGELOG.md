@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP Resource `alc://hub/index`**: new fixed resource that exposes the
+  aggregated hub package catalog as a single `application/json` read. Merges
+  cached `hub_index.json` data across all registered hub sources; individual
+  source failures are surfaced in a `"warnings"` array field in the response
+  JSON rather than failing the whole read (best-effort aggregate). On a clean
+  install with no cached sources the response is
+  `{"schema_version":"hub_index/v0","packages":[]}`. Backed by the new
+  `EngineApi::hub_index_aggregate` trait method and
+  `AppService::aggregate_index` service method.
+
+- **MCP `completion/complete` for resource template arguments**: `ServerHandler::complete`
+  is now implemented in `algocline-mcp`, enabling IDE-style tab-completion of resource
+  template variables (e.g. `@alc:alc://packages/<TAB>` auto-completes with installed
+  package names in Claude Code). Supported argument slots:
+  - `alc://packages/{name}/…` → installed package names (from `pkg_list`)
+  - `alc://cards/{card_id}` → eval card IDs (from `card_list`)
+  - `alc://scenarios/{name}` → scenario names (from `scenario_list`)
+  - `alc://eval/{result_id}` → eval result IDs (from `eval_history`)
+  - `alc://logs/{…}` → empty (no session-list API)
+  All results are prefix-filtered by the typed value, capped at 100 entries
+  (`has_more: true` + `total` when truncated). `ref/prompt` references return an
+  empty result without error. `ServerCapabilities` now declares `completions`.
+  New public API surface: `extract_template_vars` (RFC 6570 Level-1 variable
+  parser) and `complete_resource_arg` on `ResourceCatalog` (for external crates
+  that build on the MCP resource layer).
+
+### Changed
+
+- **`EngineApi::hub_index_aggregate` added** (breaking for trait implementors only;
+  MCP wire shape is additive). External crates implementing `EngineApi` must add this
+  method. The default return type is `Result<String, String>` (JSON string), consistent
+  with all other hub trait methods.
+
+### Fixed
+
+- **MCP Resources: error code for resource-not-found cases now returns `-32002`** (was
+  `-32602 invalid_params` at 8 sites in `resources.rs`). Affected paths: segment
+  mismatch in `read_types`, file-not-found in `read_types`, `pkg not found` in
+  `read_packages/meta`, and wildcard arms in `read_packages`, `read_cards`,
+  `read_scenarios`, `read_eval`, and `read_logs`. URI parse errors / unknown service /
+  malformed query still correctly return `-32602 invalid_params`.
+
+### Improved
+
+- **MCP Resources: `title` field populated for all fixed resources and resource templates**
+  via extended `make_resource` / `make_template` helpers. Fixed resources
+  (`alc://types/alc.d.lua`, `alc://types/alc_shapes.d.lua`) now carry human-readable
+  titles visible in MCP client UIs. All 7 resource templates similarly include titles.
+  `annotations.lastModified` is populated from `VERGEN_BUILD_TIMESTAMP` when present
+  at build time; absent in standard builds (no vergen dep added).
+
 ## [0.29.1] - 2026-04-26
 
 ### Fixed

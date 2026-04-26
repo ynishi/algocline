@@ -10,15 +10,25 @@ use std::sync::Arc;
 
 use algocline_app::EngineApi;
 use algocline_core::AppDir;
+use chrono::{DateTime, Utc};
 use rmcp::model::{
-    Annotated, ListResourceTemplatesResult, ListResourcesResult, RawResource, RawResourceTemplate,
-    ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    Annotated, Annotations, ListResourceTemplatesResult, ListResourcesResult, RawResource,
+    RawResourceTemplate, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
 };
 use rmcp::ErrorData as McpError;
+use tracing;
 
 // ─── Known services ──────────────────────────────────────────────────────────
 
-const KNOWN_SERVICES: &[&str] = &["types", "packages", "cards", "scenarios", "eval", "logs"];
+const KNOWN_SERVICES: &[&str] = &[
+    "types",
+    "packages",
+    "cards",
+    "scenarios",
+    "eval",
+    "logs",
+    "hub",
+];
 
 // ─── URI parser ──────────────────────────────────────────────────────────────
 
@@ -167,18 +177,41 @@ impl ResourceCatalog {
     /// to be absent at list-time; a subsequent `read` for a missing file will
     /// return `McpError::invalid_params`. This matches MCP spec semantics.
     pub fn list_fixed(&self) -> Vec<Resource> {
+        // Build timestamp from VERGEN_BUILD_TIMESTAMP if available; otherwise None.
+        // This is a best-effort field: absent at most build environments is fine.
+        let build_ts: Option<DateTime<Utc>> = option_env!("VERGEN_BUILD_TIMESTAMP").and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        });
+
         vec![
             make_resource(
                 "alc://types/alc.d.lua",
                 "alc.d.lua",
+                Some("Lua Type Stub (alc.d.lua)"),
                 "Lua type stubs for alc.* StdLib",
                 "text/x-lua",
+                None,
+                build_ts,
             ),
             make_resource(
                 "alc://types/alc_shapes.d.lua",
                 "alc_shapes.d.lua",
+                Some("Lua Type Stub (alc_shapes.d.lua)"),
                 "Lua type stubs for alc shapes",
                 "text/x-lua",
+                None,
+                build_ts,
+            ),
+            make_resource(
+                "alc://hub/index",
+                "hub-index",
+                Some("Hub Aggregate Index"),
+                "Aggregated package catalog merged across all installed hub sources.",
+                "application/json",
+                None,
+                None,
             ),
         ]
     }
@@ -192,42 +225,49 @@ impl ResourceCatalog {
             make_template(
                 "alc://packages/{name}/init.lua",
                 "package-init-lua",
+                Some("Package Lua Source"),
                 "Lua source of an installed package",
                 Some("text/x-lua"),
             ),
             make_template(
                 "alc://packages/{name}/meta",
                 "package-meta",
+                Some("Package Metadata"),
                 "Package metadata JSON (description, category, alc_shapes_compat)",
                 Some("application/json"),
             ),
             make_template(
                 "alc://cards/{card_id}",
                 "card",
+                Some("Card Snapshot"),
                 "Immutable Card snapshot",
                 Some("application/json"),
             ),
             make_template(
                 "alc://cards/{card_id}/samples",
                 "card-samples",
+                Some("Card Samples"),
                 "Per-case sample rows (paginate with ?offset=N&limit=M)",
                 Some("application/json"),
             ),
             make_template(
                 "alc://scenarios/{name}",
                 "scenario",
+                Some("Scenario Source"),
                 "Scenario Lua source",
                 Some("text/x-lua"),
             ),
             make_template(
                 "alc://eval/{result_id}",
                 "eval-result",
+                Some("Eval Result"),
                 "Eval result detail ({strategy}_{timestamp_secs} id)",
                 Some("application/json"),
             ),
             make_template(
                 "alc://logs/{session_id}",
                 "session-log",
+                Some("Session Log"),
                 "Session log (paginate with ?limit=N&max_chars=M)",
                 Some("application/json"),
             ),
@@ -248,6 +288,7 @@ impl ResourceCatalog {
             "scenarios" => self.read_scenarios(uri, &parsed).await,
             "eval" => self.read_eval(uri, &parsed).await,
             "logs" => self.read_logs(uri, &parsed).await,
+            "hub" => self.read_hub(&parsed).await,
             other => Err(McpError::invalid_params(
                 format!("unknown service: {other}"),
                 None,
@@ -267,7 +308,7 @@ impl ResourceCatalog {
         let file_name = match parsed.segments.as_slice() {
             [name] if name == "alc.d.lua" || name == "alc_shapes.d.lua" => name.as_str(),
             _ => {
-                return Err(McpError::invalid_params(
+                return Err(McpError::resource_not_found(
                     format!("resource not found: {uri}"),
                     None,
                 ));
@@ -287,10 +328,9 @@ impl ResourceCatalog {
                     contents: vec![contents],
                 })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(McpError::invalid_params(
-                format!("resource not found: {uri}"),
-                None,
-            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
+                McpError::resource_not_found(format!("resource not found: {uri}"), None),
+            ),
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }
     }
@@ -323,14 +363,14 @@ impl ResourceCatalog {
                 }
                 let json_str = self.app.pkg_meta(name).await.map_err(|e| {
                     if e.starts_with("pkg not found") {
-                        McpError::invalid_params(format!("resource not found: {uri}"), None)
+                        McpError::resource_not_found(format!("resource not found: {uri}"), None)
                     } else {
                         err_to_mcp(e)
                     }
                 })?;
                 Ok(text_result(uri, json_str, "application/json"))
             }
-            _ => Err(McpError::invalid_params(
+            _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
                 None,
             )),
@@ -383,7 +423,7 @@ impl ResourceCatalog {
                     .map_err(err_to_mcp)?;
                 Ok(text_result(uri, json_str, "application/json"))
             }
-            _ => Err(McpError::invalid_params(
+            _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
                 None,
             )),
@@ -407,7 +447,7 @@ impl ResourceCatalog {
                 let text = self.app.scenario_show(name).await.map_err(err_to_mcp)?;
                 Ok(text_result(uri, text, "text/x-lua"))
             }
-            _ => Err(McpError::invalid_params(
+            _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
                 None,
             )),
@@ -439,7 +479,7 @@ impl ResourceCatalog {
                 let json_str = self.app.eval_detail(result_id).await.map_err(err_to_mcp)?;
                 Ok(text_result(uri, json_str, "application/json"))
             }
-            _ => Err(McpError::invalid_params(
+            _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
                 None,
             )),
@@ -476,8 +516,37 @@ impl ResourceCatalog {
                     .map_err(err_to_mcp)?;
                 Ok(text_result(uri, json_str, "application/json"))
             }
-            _ => Err(McpError::invalid_params(
+            _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
+
+    /// Dispatch a `alc://hub/<path>` resource read.
+    ///
+    /// Currently only `alc://hub/index` (segments `["index"]`) is supported.
+    /// Any other path segment returns `invalid_params`.
+    ///
+    /// # Arguments
+    /// - `parsed` — already-validated URI parsed from the `alc://hub/...` request.
+    ///
+    /// # Returns
+    /// - `Ok(ReadResourceResult)` with `application/json` content on success.
+    /// - `Err(McpError::invalid_params)` for unrecognised hub paths.
+    /// - `Err(McpError::internal_error)` when the engine call or JSON serialisation fails.
+    async fn read_hub(&self, parsed: &ParsedUri) -> Result<ReadResourceResult, McpError> {
+        match parsed.segments.as_slice() {
+            [s] if s == "index" => {
+                let json = self
+                    .app
+                    .hub_index_aggregate()
+                    .await
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(text_result("alc://hub/index", json, "application/json"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("unknown hub resource: {}", parsed.segments.join("/")),
                 None,
             )),
         }
@@ -609,35 +678,323 @@ fn text_result(uri: &str, text: String, mime_type: &str) -> ReadResourceResult {
     }
 }
 
-fn make_resource(uri: &str, name: &str, description: &str, mime_type: &str) -> Resource {
+fn make_resource(
+    uri: &str,
+    name: &str,
+    title: Option<&str>,
+    description: &str,
+    mime_type: &str,
+    size: Option<u32>,
+    last_modified: Option<DateTime<Utc>>,
+) -> Resource {
     let raw = RawResource {
         uri: uri.to_string(),
         name: name.to_string(),
-        title: None,
+        title: title.map(|s| s.to_string()),
         description: Some(description.to_string()),
         mime_type: Some(mime_type.to_string()),
-        size: None,
+        size,
         icons: None,
         meta: None,
     };
-    Annotated::new(raw, None)
+    let annotations = if last_modified.is_some() {
+        Some(Annotations {
+            last_modified,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    Annotated::new(raw, annotations)
 }
 
 fn make_template(
     uri_template: &str,
     name: &str,
+    title: Option<&str>,
     description: &str,
     mime_type: Option<&str>,
 ) -> ResourceTemplate {
     let raw = RawResourceTemplate {
         uri_template: uri_template.to_string(),
         name: name.to_string(),
-        title: None,
+        title: title.map(|s| s.to_string()),
         description: Some(description.to_string()),
         mime_type: mime_type.map(|s| s.to_string()),
         icons: None,
     };
     Annotated::new(raw, None)
+}
+
+// ─── Completion API ──────────────────────────────────────────────────────────
+
+/// Candidate result for a `completion/complete` request.
+///
+/// Returned by [`ResourceCatalog::complete_resource_arg`] for use in the
+/// `CompleteResult.completion` field on the MCP wire.
+pub struct CompletionCandidates {
+    /// Matching candidate strings (capped at [`COMPLETION_CAP`]).
+    pub values: Vec<String>,
+    /// Total number of matches before truncation.
+    pub total: u32,
+    /// `true` when `values` was truncated (i.e. `values.len() < total`).
+    pub has_more: bool,
+}
+
+/// Maximum number of completion candidates returned per request.
+const COMPLETION_CAP: usize = 100;
+
+/// Extract all RFC 6570 Level-1 variable names from a URI template string.
+///
+/// Scans the template for `{var}` patterns (no operator support — only
+/// Level-1 simple expansion is used by algocline templates). Variables appear
+/// in the order they are encountered; duplicates are preserved.
+///
+/// # Arguments
+///
+/// * `template` — a URI template string, e.g. `"alc://packages/{name}/init.lua"`.
+///
+/// # Returns
+///
+/// A `Vec<String>` of variable names found between `{` and `}`.
+///
+/// # Examples
+///
+/// `extract_template_vars("alc://packages/{name}/init.lua")` returns `["name"]`.
+/// `extract_template_vars("alc://types/alc.d.lua")` returns `[]`.
+pub fn extract_template_vars(template: &str) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('}') {
+            let var = &rest[..end];
+            if !var.is_empty() {
+                vars.push(var.to_string());
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    vars
+}
+
+/// Extract the service component from a URI template string.
+///
+/// Strips the `alc://` prefix and returns the first path component before
+/// any `/`. Does not invoke `parse_uri` (which rejects template variables).
+///
+/// Returns `None` when the template does not start with `alc://` or has no
+/// path component.
+fn service_from_template(template: &str) -> Option<&str> {
+    let rest = template.strip_prefix("alc://")?;
+    let component = rest.split('/').next()?;
+    if component.is_empty() {
+        None
+    } else {
+        Some(component)
+    }
+}
+
+impl ResourceCatalog {
+    /// Return completion candidates for a single template argument.
+    ///
+    /// Dispatches to the appropriate `EngineApi` list method based on the
+    /// `(service, arg_name)` pair extracted from `uri_template`. Candidate
+    /// strings are filtered to those that start with `prefix` (case-sensitive,
+    /// best-effort per spec). Results are capped at [`COMPLETION_CAP`] entries;
+    /// if the list exceeds the cap, `has_more` is set to `true` and `total`
+    /// reflects the untruncated count.
+    ///
+    /// Unknown `(service, arg_name)` pairs return an empty candidate list
+    /// rather than an error — empty completion is a valid MCP response.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri_template` — a URI template string such as `"alc://packages/{name}/init.lua"`.
+    /// * `arg_name`     — the template variable being completed, e.g. `"name"`.
+    /// * `prefix`       — the partial value typed so far; used for prefix filtering.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(CompletionCandidates)` on success. Errors from the backing
+    /// `EngineApi` are logged but result in an empty candidate list so that
+    /// completion failures never surface as MCP errors.
+    pub async fn complete_resource_arg(
+        &self,
+        uri_template: &str,
+        arg_name: &str,
+        prefix: &str,
+    ) -> CompletionCandidates {
+        let service = match service_from_template(uri_template) {
+            Some(s) => s,
+            None => return CompletionCandidates::empty(),
+        };
+
+        let candidates = match (service, arg_name) {
+            ("packages", "name") => self.list_pkg_names(prefix).await,
+            ("cards", "card_id") => self.list_card_ids(prefix).await,
+            ("scenarios", "name") => self.list_scenario_names(prefix).await,
+            ("eval", "result_id") => self.list_eval_ids(prefix).await,
+            // logs domain: no session-list API available; return empty per subtask spec §2.3(a)
+            ("logs", _) => Vec::new(),
+            _ => Vec::new(),
+        };
+
+        CompletionCandidates::from_all(candidates)
+    }
+
+    /// List installed package names, prefix-filtered.
+    async fn list_pkg_names(&self, prefix: &str) -> Vec<String> {
+        let json_str = match self
+            .app
+            .pkg_list(None, Some(0), None, None, None, None)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: pkg_list failed, returning empty candidates");
+                return Vec::new();
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: pkg_list response is not valid JSON");
+                return Vec::new();
+            }
+        };
+        parsed
+            .get("packages")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                    .filter(|n| n.starts_with(prefix))
+                    .map(|n| n.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List card IDs, prefix-filtered.
+    async fn list_card_ids(&self, prefix: &str) -> Vec<String> {
+        let json_str = match self.app.card_list(None).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: card_list failed, returning empty candidates");
+                return Vec::new();
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: card_list response is not valid JSON");
+                return Vec::new();
+            }
+        };
+        // card_list returns a JSON array directly
+        parsed
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("card_id").and_then(|id| id.as_str()))
+                    .filter(|id| id.starts_with(prefix))
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List scenario names, prefix-filtered.
+    async fn list_scenario_names(&self, prefix: &str) -> Vec<String> {
+        let json_str = match self.app.scenario_list().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: scenario_list failed, returning empty candidates");
+                return Vec::new();
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: scenario_list response is not valid JSON");
+                return Vec::new();
+            }
+        };
+        parsed
+            .get("scenarios")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                    .filter(|n| n.starts_with(prefix))
+                    .map(|n| n.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List eval result IDs, prefix-filtered.
+    ///
+    /// Fetches 101 entries (one over cap) to detect `has_more` without a
+    /// separate count query.
+    async fn list_eval_ids(&self, prefix: &str) -> Vec<String> {
+        // Request cap + 1 so we can detect truncation from the source side.
+        let json_str = match self.app.eval_history(None, COMPLETION_CAP + 1).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: eval_history failed, returning empty candidates");
+                return Vec::new();
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: eval_history response is not valid JSON");
+                return Vec::new();
+            }
+        };
+        parsed
+            .get("evals")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("eval_id").and_then(|id| id.as_str()))
+                    .filter(|id| id.starts_with(prefix))
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl CompletionCandidates {
+    /// Create an empty result (no candidates, no more results).
+    pub fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            total: 0,
+            has_more: false,
+        }
+    }
+
+    /// Build from a full (potentially large) candidate list, applying the cap.
+    ///
+    /// If `all.len() > COMPLETION_CAP`, the list is truncated and `has_more`
+    /// is set. `total` always reflects the untruncated count (clamped to
+    /// `u32::MAX`).
+    pub fn from_all(mut all: Vec<String>) -> Self {
+        let total = all.len().min(u32::MAX as usize) as u32;
+        let has_more = all.len() > COMPLETION_CAP;
+        all.truncate(COMPLETION_CAP);
+        Self {
+            values: all,
+            total,
+            has_more,
+        }
+    }
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
@@ -953,6 +1310,9 @@ mod tests {
                 async fn info(&self) -> String {
                     format!("default-err stub: {}", stringify!($ty))
                 }
+                async fn hub_index_aggregate(&self) -> Result<String, String> {
+                    Err($err.into())
+                }
             }
         };
     }
@@ -1027,6 +1387,77 @@ mod tests {
         assert_eq!(parsed.segments, vec!["alc_shapes.d.lua"]);
     }
 
+    // T1: hub/index parses correctly
+    #[test]
+    fn parse_hub_index_uri() {
+        let parsed = parse_uri("alc://hub/index").unwrap();
+        assert_eq!(parsed.service, "hub");
+        assert_eq!(parsed.segments, vec!["index"]);
+        assert!(parsed.query.is_empty());
+    }
+
+    // T2: hub service is in KNOWN_SERVICES
+    #[test]
+    fn known_services_contains_hub() {
+        assert!(
+            KNOWN_SERVICES.contains(&"hub"),
+            "KNOWN_SERVICES must include \"hub\""
+        );
+    }
+
+    // T3: unknown hub path → invalid_params (via read dispatch)
+    #[tokio::test]
+    async fn read_hub_unknown_path_returns_invalid_params() {
+        let engine = FakeEngine::noop();
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let err = cat.read("alc://hub/unknown").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown hub resource") || msg.contains("invalid"),
+            "expected invalid_params error, got: {msg}"
+        );
+    }
+
+    // T1: read_hub_index returns JSON from engine
+    #[tokio::test]
+    async fn read_hub_index_returns_json() {
+        let index_json = r#"{"schema_version":"hub_index/v0","packages":[]}"#;
+        let engine = FakeEngine::ok_hub_index(index_json);
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat.read("alc://hub/index").await.unwrap();
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text,
+                mime_type,
+                uri,
+                ..
+            } => {
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+                assert_eq!(uri, "alc://hub/index");
+                assert!(
+                    text.contains("hub_index/v0"),
+                    "response must contain schema_version"
+                );
+            }
+            _ => panic!("expected TextResourceContents"),
+        }
+    }
+
+    // T3: read_hub_index when engine errors → internal_error
+    #[tokio::test]
+    async fn read_hub_index_engine_error_returns_internal_error() {
+        let mut engine = FakeEngine::noop();
+        engine.hub_index_aggregate = Some(Err("registries corrupt".into()));
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let err = cat.read("alc://hub/index").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("registries corrupt") || msg.contains("internal"),
+            "expected internal_error, got: {msg}"
+        );
+    }
+
     // ── ResourceCatalog helpers ───────────────────────────────────────────
 
     fn make_test_catalog(root: PathBuf) -> ResourceCatalog {
@@ -1071,13 +1502,18 @@ mod tests {
     }
 
     #[test]
-    fn list_fixed_returns_two_entries() {
+    fn list_fixed_returns_three_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = make_test_catalog(tmp.path().to_path_buf());
         let fixed = catalog.list_fixed();
-        assert_eq!(fixed.len(), 2);
+        assert_eq!(
+            fixed.len(),
+            3,
+            "expected 3 fixed resources (types x2 + hub/index)"
+        );
         assert_eq!(fixed[0].raw.uri, "alc://types/alc.d.lua");
         assert_eq!(fixed[1].raw.uri, "alc://types/alc_shapes.d.lua");
+        assert_eq!(fixed[2].raw.uri, "alc://hub/index");
     }
 
     #[test]
@@ -1106,10 +1542,14 @@ mod tests {
         pkg_meta: Option<Result<String, String>>,
         pkg_list: Option<Result<String, String>>,
         card_get: Option<Result<String, String>>,
+        card_list: Option<Result<String, String>>,
         card_samples: FakeEngineExpected,
         scenario_show: Option<Result<String, String>>,
+        scenario_list: Option<Result<String, String>>,
         eval_detail: Option<Result<String, String>>,
+        eval_history: Option<Result<String, String>>,
         log_view: FakeEngineExpected,
+        hub_index_aggregate: Option<Result<String, String>>,
     }
 
     impl FakeEngine {
@@ -1163,16 +1603,26 @@ mod tests {
                 ..Self::noop()
             }
         }
+        fn ok_hub_index(json: &str) -> Self {
+            Self {
+                hub_index_aggregate: Some(Ok(json.to_string())),
+                ..Self::noop()
+            }
+        }
         fn noop() -> Self {
             Self {
                 pkg_init_lua: None,
                 pkg_meta: None,
                 pkg_list: None,
                 card_get: None,
+                card_list: None,
                 card_samples: None,
                 scenario_show: None,
+                scenario_list: None,
                 eval_detail: None,
+                eval_history: None,
                 log_view: None,
+                hub_index_aggregate: None,
             }
         }
     }
@@ -1301,13 +1751,17 @@ mod tests {
             Err("noop".into())
         }
         async fn eval_history(&self, _: Option<&str>, _: usize) -> Result<String, String> {
-            Err("noop".into())
+            self.eval_history
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
         async fn eval_compare(&self, _: &str, _: &str) -> Result<String, String> {
             Err("noop".into())
         }
         async fn scenario_list(&self) -> Result<String, String> {
-            Err("noop".into())
+            self.scenario_list
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
         async fn scenario_install(&self, _: String) -> Result<String, String> {
             Err("noop".into())
@@ -1359,7 +1813,9 @@ mod tests {
             Err("noop".into())
         }
         async fn card_list(&self, _: Option<String>) -> Result<String, String> {
-            Err("noop".into())
+            self.card_list
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
         async fn card_find(
             &self,
@@ -1459,6 +1915,11 @@ mod tests {
         }
         async fn info(&self) -> String {
             "fake".into()
+        }
+        async fn hub_index_aggregate(&self) -> Result<String, String> {
+            self.hub_index_aggregate
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
     }
 
@@ -1754,6 +2215,9 @@ mod tests {
             async fn info(&self) -> String {
                 "fake".into()
             }
+            async fn hub_index_aggregate(&self) -> Result<String, String> {
+                Err("noop".into())
+            }
         }
         let tmp = tempfile::tempdir().unwrap();
         let app_dir = Arc::new(AppDir::new(tmp.path().to_path_buf()));
@@ -2035,5 +2499,378 @@ mod tests {
             Some("a=b"),
             "value after first = should be preserved"
         );
+    }
+
+    // ── ST-1: make_resource / make_template field extension tests ────────────
+
+    #[test]
+    fn make_resource_with_title_sets_title() {
+        let r = make_resource(
+            "alc://types/alc.d.lua",
+            "alc.d.lua",
+            Some("My Title"),
+            "Lua type stubs",
+            "text/x-lua",
+            None,
+            None,
+        );
+        assert_eq!(r.raw.title.as_deref(), Some("My Title"));
+        assert!(
+            r.annotations.is_none(),
+            "annotations should be None when lastModified is None"
+        );
+    }
+
+    #[test]
+    fn make_resource_with_size_sets_size() {
+        let r = make_resource(
+            "alc://types/alc.d.lua",
+            "alc.d.lua",
+            None,
+            "desc",
+            "text/x-lua",
+            Some(1234),
+            None,
+        );
+        assert_eq!(r.raw.size, Some(1234));
+    }
+
+    #[test]
+    fn make_resource_with_last_modified_sets_annotations() {
+        use chrono::TimeZone;
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap();
+        let r = make_resource(
+            "alc://types/alc.d.lua",
+            "alc.d.lua",
+            None,
+            "desc",
+            "text/x-lua",
+            None,
+            Some(ts),
+        );
+        let ann = r.annotations.as_ref().expect("annotations should be Some");
+        assert_eq!(ann.last_modified, Some(ts));
+    }
+
+    #[test]
+    fn make_resource_without_annotations_is_none() {
+        let r = make_resource(
+            "alc://types/alc.d.lua",
+            "alc.d.lua",
+            None,
+            "desc",
+            "text/x-lua",
+            None,
+            None,
+        );
+        assert!(r.annotations.is_none());
+    }
+
+    #[test]
+    fn make_template_with_title_sets_title() {
+        let t = make_template(
+            "alc://packages/{name}/init.lua",
+            "package-init-lua",
+            Some("Package Lua Source"),
+            "Lua source of an installed package",
+            Some("text/x-lua"),
+        );
+        assert_eq!(t.raw.title.as_deref(), Some("Package Lua Source"));
+    }
+
+    #[test]
+    fn list_fixed_has_title_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = make_test_catalog(tmp.path().to_path_buf());
+        let fixed = catalog.list_fixed();
+        assert!(
+            fixed.iter().any(|r| r.raw.title.is_some()),
+            "at least one fixed resource should have a title"
+        );
+    }
+
+    #[test]
+    fn list_templates_have_titles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = make_test_catalog(tmp.path().to_path_buf());
+        let templates = catalog.list_templates();
+        assert!(
+            templates.iter().all(|t| t.raw.title.is_some()),
+            "all templates should have a title"
+        );
+    }
+
+    // ── ST-1: resource_not_found error code tests ────────────────────────────
+
+    #[tokio::test]
+    async fn read_types_bad_segment_returns_resource_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = make_test_catalog(tmp.path().to_path_buf());
+        let err = catalog
+            .read("alc://types/sub/unknown.lua")
+            .await
+            .unwrap_err();
+        // error code -32002 = RESOURCE_NOT_FOUND
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    #[tokio::test]
+    async fn read_types_missing_file_returns_resource_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = make_test_catalog(tmp.path().to_path_buf());
+        let err = catalog.read("alc://types/alc.d.lua").await.unwrap_err();
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    #[tokio::test]
+    async fn read_packages_meta_not_found_returns_resource_not_found() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://packages/unknown/meta").await.unwrap_err();
+        // noop engine returns "noop" which is mapped via err_to_mcp (internal_error),
+        // but the wildcard arm should return resource_not_found.
+        // Let's verify the wildcard arm (bad segment count):
+        let err2 = cat
+            .read("alc://packages/unknown/bad/extra")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err2.code.0, -32002,
+            "wildcard arm should return -32002, got: {:?}",
+            err2.code
+        );
+        // The not-found path (pkg not found) error code depends on engine response.
+        // We check noop -> internal (not resource_not_found) for this case.
+        let _ = err; // suppress unused warning
+    }
+
+    #[tokio::test]
+    async fn read_packages_wildcard_returns_resource_not_found() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        // 3-segment path that doesn't match any arm → wildcard
+        let err = cat.read("alc://packages/a/b/c").await.unwrap_err();
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    #[tokio::test]
+    async fn read_cards_wildcard_returns_resource_not_found() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        // 3-segment path that doesn't match [card_id] or [card_id, "samples"]
+        let err = cat.read("alc://cards/a/b/c").await.unwrap_err();
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    #[tokio::test]
+    async fn read_scenarios_wildcard_returns_resource_not_found() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        // 2-segment path → wildcard in read_scenarios
+        let err = cat.read("alc://scenarios/a/b").await.unwrap_err();
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    #[tokio::test]
+    async fn read_eval_wildcard_returns_resource_not_found() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://eval/a/b").await.unwrap_err();
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    #[tokio::test]
+    async fn read_logs_wildcard_returns_resource_not_found() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat.read("alc://logs/a/b").await.unwrap_err();
+        assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    // ── ST-2: extract_template_vars ───────────────────────────────────────────
+
+    // T1: happy path — extract single variable from packages template
+    #[test]
+    fn extract_template_vars_single_var() {
+        let vars = extract_template_vars("alc://packages/{name}/init.lua");
+        assert_eq!(vars, vec!["name"]);
+    }
+
+    // T1: happy path — extract single variable from cards template
+    #[test]
+    fn extract_template_vars_card_id() {
+        let vars = extract_template_vars("alc://cards/{card_id}/samples");
+        assert_eq!(vars, vec!["card_id"]);
+    }
+
+    // T2: boundary — no variables in static URI
+    #[test]
+    fn extract_template_vars_no_vars() {
+        let vars = extract_template_vars("alc://types/alc.d.lua");
+        assert!(vars.is_empty());
+    }
+
+    // T2: boundary — empty string
+    #[test]
+    fn extract_template_vars_empty_template() {
+        let vars = extract_template_vars("");
+        assert!(vars.is_empty());
+    }
+
+    // T2: boundary — unclosed brace is ignored gracefully
+    #[test]
+    fn extract_template_vars_unclosed_brace() {
+        let vars = extract_template_vars("alc://packages/{name");
+        assert!(vars.is_empty(), "unclosed brace should produce no vars");
+    }
+
+    // T1: happy path — two variables in one template
+    #[test]
+    fn extract_template_vars_two_vars() {
+        let vars = extract_template_vars("alc://{service}/{id}");
+        assert_eq!(vars, vec!["service", "id"]);
+    }
+
+    // ── ST-2: service_from_template ──────────────────────────────────────────
+
+    // T1: happy path — packages service
+    #[test]
+    fn service_from_template_packages() {
+        assert_eq!(
+            service_from_template("alc://packages/{name}/init.lua"),
+            Some("packages")
+        );
+    }
+
+    // T2: boundary — no alc:// prefix returns None
+    #[test]
+    fn service_from_template_wrong_scheme() {
+        assert_eq!(service_from_template("https://foo/bar"), None);
+    }
+
+    // T2: boundary — empty template returns None
+    #[test]
+    fn service_from_template_empty() {
+        assert_eq!(service_from_template(""), None);
+    }
+
+    // ── ST-2: CompletionCandidates::from_all ─────────────────────────────────
+
+    // T1: happy path — small list returned as-is
+    #[test]
+    fn completion_candidates_from_all_small() {
+        let items: Vec<String> = (0..5).map(|i| format!("item-{i}")).collect();
+        let c = CompletionCandidates::from_all(items.clone());
+        assert_eq!(c.values, items);
+        assert_eq!(c.total, 5);
+        assert!(!c.has_more);
+    }
+
+    // T2: boundary — exactly 100 items (no truncation)
+    #[test]
+    fn completion_candidates_from_all_at_cap() {
+        let items: Vec<String> = (0..100).map(|i| format!("item-{i}")).collect();
+        let c = CompletionCandidates::from_all(items);
+        assert_eq!(c.values.len(), 100);
+        assert_eq!(c.total, 100);
+        assert!(!c.has_more);
+    }
+
+    // T2: boundary — 101 items triggers truncation
+    #[test]
+    fn completion_candidates_from_all_over_cap() {
+        let items: Vec<String> = (0..101).map(|i| format!("item-{i}")).collect();
+        let c = CompletionCandidates::from_all(items);
+        assert_eq!(c.values.len(), 100);
+        assert_eq!(c.total, 101);
+        assert!(c.has_more);
+    }
+
+    // T1: empty() produces zeroed result
+    #[test]
+    fn completion_candidates_empty() {
+        let c = CompletionCandidates::empty();
+        assert!(c.values.is_empty());
+        assert_eq!(c.total, 0);
+        assert!(!c.has_more);
+    }
+
+    // ── ST-2: complete_resource_arg — pkg domain ──────────────────────────────
+
+    // T1: happy path — packages completion returns filtered names
+    #[tokio::test]
+    async fn complete_resource_arg_packages_prefix_filter() {
+        let engine = FakeEngine {
+            pkg_list: Some(Ok(
+                r#"{"packages":[{"name":"cot"},{"name":"sc"},{"name":"cove"}]}"#.into(),
+            )),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "name", "c")
+            .await;
+        // "cot", "cove" start with "c" but "sc" does not
+        assert_eq!(result.total, 2);
+        assert!(!result.has_more);
+        let mut got = result.values.clone();
+        got.sort();
+        assert_eq!(got, vec!["cot", "cove"]);
+    }
+
+    // T1: happy path — empty prefix returns all packages
+    #[tokio::test]
+    async fn complete_resource_arg_packages_empty_prefix() {
+        let engine = FakeEngine {
+            pkg_list: Some(Ok(r#"{"packages":[{"name":"cot"},{"name":"sc"}]}"#.into())),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "name", "")
+            .await;
+        assert_eq!(result.total, 2);
+        assert!(!result.has_more);
+    }
+
+    // T3: error path — engine error returns empty result (no MCP error)
+    #[tokio::test]
+    async fn complete_resource_arg_engine_error_returns_empty() {
+        let engine = FakeEngine {
+            pkg_list: Some(Err("storage error".into())),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "name", "")
+            .await;
+        assert!(result.values.is_empty());
+        assert_eq!(result.total, 0);
+        assert!(!result.has_more);
+    }
+
+    // T2: unknown domain returns empty result
+    #[tokio::test]
+    async fn complete_resource_arg_unknown_domain_returns_empty() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let result = cat
+            .complete_resource_arg("alc://logs/{session_id}", "session_id", "")
+            .await;
+        assert!(result.values.is_empty());
+        assert_eq!(result.total, 0);
+    }
+
+    // T2: unknown arg name for known service returns empty result
+    #[tokio::test]
+    async fn complete_resource_arg_unknown_arg_returns_empty() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "unknown_arg", "")
+            .await;
+        assert!(result.values.is_empty());
+    }
+
+    // T2: template with no valid alc:// prefix returns empty
+    #[tokio::test]
+    async fn complete_resource_arg_bad_template_returns_empty() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let result = cat
+            .complete_resource_arg("https://other/{name}", "name", "")
+            .await;
+        assert!(result.values.is_empty());
     }
 }

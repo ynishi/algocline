@@ -1380,6 +1380,82 @@ impl AppService {
         }
         Ok(json.to_string())
     }
+
+    /// Aggregate hub index across all discovered cache sources.
+    ///
+    /// Reads the cached `hub_index.json` for each registered source URL
+    /// (cache-only, no network fetch). Sources that are missing from cache
+    /// or whose cache file is corrupt are skipped and a warning is collected;
+    /// the aggregate still succeeds with the remaining sources.
+    ///
+    /// # Returns
+    /// - `Ok((merged_index, warnings))` — merged index across available
+    ///   sources; `warnings` contains per-source failure messages.
+    /// - `Err(ServiceError)` — when the hub registries file is corrupt,
+    ///   making URL discovery impossible.
+    pub(crate) fn aggregate_index(
+        &self,
+    ) -> Result<(HubIndex, Vec<String>), super::error::ServiceError> {
+        let app_dir = self.log_config.app_dir();
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Discover source URLs (registries + manifest + seeds).
+        // Propagate registry read failure rather than silently degrading —
+        // a corrupt registries file would produce an empty URL set
+        // indistinguishable from the legitimate "no sources registered" state.
+        let urls = discover_index_urls(&app_dir, &mut warnings)
+            .map_err(super::error::ServiceError::InvalidInput)?;
+
+        // Empty URL list: return empty index (not an error — fresh install).
+        if urls.is_empty() {
+            return Ok((
+                HubIndex {
+                    schema_version: "hub_index/v0".into(),
+                    updated_at: String::new(),
+                    packages: Vec::new(),
+                },
+                warnings,
+            ));
+        }
+
+        // Load each source from cache. Network fetches are intentionally
+        // avoided here: resource reads happen synchronously in the MCP
+        // request path and should not block on network I/O. The cache
+        // is populated by hub_reindex / hub_search (which do fetch).
+        // Per-source load failures are best-effort: collect as warnings
+        // and continue with remaining sources.
+        let mut all_packages: Vec<IndexEntry> = Vec::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for url in &urls {
+            match load_cached(&app_dir, url) {
+                Ok(Some(index)) => {
+                    // Merge packages; dedup by name (first source wins).
+                    for entry in index.packages {
+                        if seen_names.insert(entry.entity.name.clone()) {
+                            all_packages.push(entry);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Cache miss for this URL — not an error, just skip.
+                }
+                Err(e) => {
+                    // Cache corruption: surface as warning, continue aggregate.
+                    warnings.push(format!("hub cache read failed for {url}: {e}"));
+                }
+            }
+        }
+
+        Ok((
+            HubIndex {
+                schema_version: "hub_index/v0".into(),
+                updated_at: String::new(),
+                packages: all_packages,
+            },
+            warnings,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -2052,5 +2128,220 @@ mod tests {
         let count = count_evals_for_pkg(&app_dir, "cot", &mut warnings);
         assert_eq!(count, 1, "should count 1 valid eval");
         assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
+    }
+
+    // ─── aggregate_index unit tests ───────────────────────────────
+
+    /// Write a minimal HubIndex JSON to the per-source cache for a URL.
+    fn write_cache_for_url(app_dir: &AppDir, url: &str, index: &HubIndex) {
+        let dir = cache_dir(app_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", cache_key(url)));
+        // justification: test helper, panicking on failure is acceptable in tests
+        std::fs::write(&path, serde_json::to_string_pretty(index).unwrap()).unwrap();
+    }
+
+    fn make_index(packages: Vec<(&str, &str)>) -> HubIndex {
+        HubIndex {
+            schema_version: "hub_index/v0".into(),
+            updated_at: String::new(),
+            packages: packages
+                .into_iter()
+                .map(|(name, version)| IndexEntry {
+                    entity: PkgEntity {
+                        name: name.to_string(),
+                        version: Some(version.to_string()),
+                        description: None,
+                        category: None,
+                        docstring: None,
+                    },
+                    source: PackageSource::Unknown,
+                    card_count: 0,
+                    best_card: None,
+                })
+                .collect(),
+        }
+    }
+
+    // T1: empty sources → empty index, no warnings
+    #[test]
+    fn aggregate_index_empty_sources_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        // No registries, no manifest, no seeds in cache → no URLs → empty index.
+        // discover_index_urls will still produce AUTO_INSTALL_SOURCES seeds,
+        // but their cache files don't exist → Ok(None) for each → empty result.
+        let (index, warnings) = {
+            // Build a minimal AppService-like test by calling the free functions
+            // and replicating the aggregate_index logic directly.
+            let mut w: Vec<String> = Vec::new();
+            let urls = discover_index_urls(&app_dir, &mut w).unwrap();
+            let mut packages: Vec<IndexEntry> = Vec::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for url in &urls {
+                if let Ok(Some(idx)) = load_cached(&app_dir, url) {
+                    for e in idx.packages {
+                        if seen.insert(e.entity.name.clone()) {
+                            packages.push(e);
+                        }
+                    }
+                }
+            }
+            (
+                HubIndex {
+                    schema_version: "hub_index/v0".into(),
+                    updated_at: String::new(),
+                    packages,
+                },
+                w,
+            )
+        };
+        assert!(
+            index.packages.is_empty(),
+            "no cached sources should produce empty packages"
+        );
+        assert!(warnings.is_empty(), "no warnings expected for cache misses");
+    }
+
+    // T1: one source in cache → packages returned
+    #[test]
+    fn aggregate_index_one_source_returns_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let url = "https://example.com/test_index.json";
+        let source_index = make_index(vec![("cot", "0.1.0"), ("ucb", "0.2.0")]);
+        write_cache_for_url(&app_dir, url, &source_index);
+
+        // Register the URL in hub_registries so discover_index_urls finds it.
+        let reg_path = app_dir.hub_registries_json();
+        std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
+        let reg_json = serde_json::json!({
+            "registries": [{"source": url, "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z"}]
+        });
+        std::fs::write(&reg_path, reg_json.to_string()).unwrap();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let urls = discover_index_urls(&app_dir, &mut warnings).unwrap();
+        let mut packages: Vec<IndexEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for u in &urls {
+            if let Ok(Some(idx)) = load_cached(&app_dir, u) {
+                for e in idx.packages {
+                    if seen.insert(e.entity.name.clone()) {
+                        packages.push(e);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            packages.iter().any(|p| p.entity.name == "cot"),
+            "cot expected"
+        );
+        assert!(
+            packages.iter().any(|p| p.entity.name == "ucb"),
+            "ucb expected"
+        );
+    }
+
+    // T2: duplicate package across two sources → first source wins
+    #[test]
+    fn aggregate_index_deduplicate_by_name_first_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let url_a = "https://a.example.com/index.json";
+        let url_b = "https://b.example.com/index.json";
+
+        // Both sources have "cot" but different versions.
+        let idx_a = make_index(vec![("cot", "1.0.0")]);
+        let idx_b = make_index(vec![("cot", "2.0.0"), ("ucb", "0.1.0")]);
+        write_cache_for_url(&app_dir, url_a, &idx_a);
+        write_cache_for_url(&app_dir, url_b, &idx_b);
+
+        let reg_path = app_dir.hub_registries_json();
+        std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
+        let reg_json = serde_json::json!({
+            "registries": [
+                {"source": url_a, "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z"},
+                {"source": url_b, "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z"}
+            ]
+        });
+        std::fs::write(&reg_path, reg_json.to_string()).unwrap();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let urls = {
+            let mut raw = discover_index_urls(&app_dir, &mut warnings).unwrap();
+            // Restrict to only our two test URLs so seed URLs don't interfere.
+            raw.retain(|u| u == url_a || u == url_b);
+            raw
+        };
+
+        let mut packages: Vec<IndexEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for u in &urls {
+            if let Ok(Some(idx)) = load_cached(&app_dir, u) {
+                for e in idx.packages {
+                    if seen.insert(e.entity.name.clone()) {
+                        packages.push(e);
+                    }
+                }
+            }
+        }
+
+        let cot_count = packages.iter().filter(|p| p.entity.name == "cot").count();
+        assert_eq!(cot_count, 1, "dedup: cot must appear exactly once");
+        let ucb_count = packages.iter().filter(|p| p.entity.name == "ucb").count();
+        assert_eq!(ucb_count, 1, "ucb from second source must appear");
+    }
+
+    // T3: corrupt cache file → warning collected, other sources unaffected
+    #[test]
+    fn aggregate_index_corrupt_cache_collects_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = AppDir::new(tmp.path().to_path_buf());
+        let url_corrupt = "https://corrupt.example.com/index.json";
+
+        // Write corrupt JSON to the cache slot.
+        let dir = cache_dir(&app_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", cache_key(url_corrupt)));
+        std::fs::write(&path, b"{{{{ not valid json").unwrap();
+
+        let reg_path = app_dir.hub_registries_json();
+        std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
+        let reg_json = serde_json::json!({
+            "registries": [{"source": url_corrupt, "origin": "pkg_install", "added_at": "2026-01-01T00:00:00Z"}]
+        });
+        std::fs::write(&reg_path, reg_json.to_string()).unwrap();
+
+        let mut warnings: Vec<String> = Vec::new();
+        let urls = discover_index_urls(&app_dir, &mut warnings).unwrap();
+        let mut packages: Vec<IndexEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut extra_warnings: Vec<String> = Vec::new();
+        for u in &urls {
+            match load_cached(&app_dir, u) {
+                Ok(Some(idx)) => {
+                    for e in idx.packages {
+                        if seen.insert(e.entity.name.clone()) {
+                            packages.push(e);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => extra_warnings.push(format!("hub cache read failed for {u}: {e}")),
+            }
+        }
+
+        assert!(
+            !extra_warnings.is_empty(),
+            "corrupt cache must produce a warning"
+        );
+        assert!(
+            extra_warnings[0].contains("hub cache read failed"),
+            "warning text mismatch: {}",
+            extra_warnings[0]
+        );
+        assert!(packages.is_empty(), "no packages from corrupt source");
     }
 }

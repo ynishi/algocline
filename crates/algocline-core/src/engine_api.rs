@@ -525,4 +525,21 @@ pub trait EngineApi: Send + Sync {
 
     /// Show server configuration and diagnostic info.
     async fn info(&self) -> String;
+
+    // ─── Hub resources ───────────────────────────────────────
+
+    /// Return the aggregated hub index across all registered sources as a JSON string.
+    ///
+    /// Merges the cached `hub_index.json` from every discovered source URL.
+    /// Sources that fail to load produce warnings that are embedded in the
+    /// returned JSON under a `"warnings"` field so the MCP caller can observe
+    /// partial failures.
+    ///
+    /// Returns `Ok(json_string)` where the JSON has shape:
+    /// ```json
+    /// { "schema_version": "hub_index/v0", "packages": [...], "warnings": [...] }
+    /// ```
+    /// Returns `Err(message)` only when the hub registries file itself is
+    /// corrupt (hard I/O failure), making further index discovery impossible.
+    async fn hub_index_aggregate(&self) -> Result<String, String>;
 }

@@ -2909,7 +2909,7 @@ async fn test_alc_hub_dist_compat_undeclared_warns() {
 
 // ─── MCP Resources E2E ──────────────────────────────────────────
 
-/// `resources/list` must return exactly 2 fixed resources.
+/// `resources/list` must return exactly 3 fixed resources.
 #[tokio::test]
 async fn test_mcp_resources_list_returns_two_fixed() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2922,8 +2922,8 @@ async fn test_mcp_resources_list_returns_two_fixed() {
 
     assert_eq!(
         result.resources.len(),
-        2,
-        "expected 2 fixed resources, got: {:?}",
+        3,
+        "expected 3 fixed resources (types x2 + hub/index), got: {:?}",
         result
             .resources
             .iter()
@@ -2943,6 +2943,10 @@ async fn test_mcp_resources_list_returns_two_fixed() {
     assert!(
         uris.contains(&"alc://types/alc_shapes.d.lua"),
         "expected alc://types/alc_shapes.d.lua in fixed list"
+    );
+    assert!(
+        uris.contains(&"alc://hub/index"),
+        "expected alc://hub/index in fixed list"
     );
 
     // Verify that at least one fixed resource has title populated (ST-1 field extension).
@@ -2974,6 +2978,60 @@ async fn test_mcp_resource_templates_list_returns_seven() {
             .iter()
             .map(|t| t.raw.uri_template.as_str())
             .collect::<Vec<_>>()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://hub/index` on a clean install (no sources registered) returns
+/// an empty packages array.
+#[tokio::test]
+async fn test_mcp_resource_read_hub_index_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Fresh tempdir with no hub_registries.json and no cache files → packages empty.
+    let result = read_resource(&client, "alc://hub/index")
+        .await
+        .expect("read alc://hub/index failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (uri, text) = resource_text(&result.contents[0]);
+    assert_eq!(uri, "alc://hub/index");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("hub/index response must be valid JSON");
+    assert_eq!(
+        parsed.get("schema_version").and_then(|v| v.as_str()),
+        Some("hub_index/v0"),
+        "schema_version must be hub_index/v0"
+    );
+    let packages = parsed
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .expect("packages must be an array");
+    assert!(
+        packages.is_empty(),
+        "clean install must return empty packages, got: {packages:?}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://hub/unknown` returns an error (invalid path).
+#[tokio::test]
+async fn test_mcp_resource_read_hub_unknown_path_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let params = ReadResourceRequestParams {
+        uri: "alc://hub/unknown".to_string(),
+        meta: None,
+    };
+    let result = client.read_resource(params).await;
+    assert!(
+        result.is_err(),
+        "alc://hub/unknown must return an error, got: {result:?}"
     );
 
     client.cancel().await.expect("cancel failed");

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP Resource `alc://hub/index`**: new fixed resource that exposes the
+  aggregated hub package catalog as a single `application/json` read. Merges
+  cached `hub_index.json` data across all registered hub sources; individual
+  source failures are surfaced in a `"warnings"` array field in the response
+  JSON rather than failing the whole read (best-effort aggregate). On a clean
+  install with no cached sources the response is
+  `{"schema_version":"hub_index/v0","packages":[]}`. Backed by the new
+  `EngineApi::hub_index_aggregate` trait method and
+  `AppService::aggregate_index` service method.
+
 - **MCP `completion/complete` for resource template arguments**: `ServerHandler::complete`
   is now implemented in `algocline-mcp`, enabling IDE-style tab-completion of resource
   template variables (e.g. `@alc:alc://packages/<TAB>` auto-completes with installed
@@ -23,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty result without error. `ServerCapabilities` now declares `completions`.
   New public helpers: `extract_template_vars` (RFC 6570 Level-1 parser) and
   `complete_resource_arg` on `ResourceCatalog`.
+
+### Changed
+
+- **`EngineApi::hub_index_aggregate` added** (breaking for trait implementors only;
+  MCP wire shape is additive). External crates implementing `EngineApi` must add this
+  method. The default return type is `Result<String, String>` (JSON string), consistent
+  with all other hub trait methods.
 
 ### Fixed
 

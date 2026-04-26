@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-04-26
+
+### Added
+
+- **`alc_status` v2 — long-running session observability**: session detail
+  JSON now includes 5 additive fields for diagnosing in-flight execution
+  without external instrumentation:
+  - `phase` (string enum: `starting` / `running` / `llm_pending` /
+    `continuing` / `completed` / `failed` / `aborted`)
+  - `started_at` / `last_activity_at` / `elapsed_ms` (unix ms;
+    `last_activity_at` is the primary stuck-detection signal)
+  - `tokens` (cumulative `prompt_total` / `response_total` / `total`
+    plus optional `current_query` snapshot during paused LLM calls)
+  - `recent_logs` (per-session ring buffer, cap=20; captures both
+    `alc.lua.print` and `alc.log` channels)
+  - `conversation_history` (LLM query records, cap=10; opt-in via
+    `StatusParams.include_history` to preserve high-frequency polling
+    cost). Existing `alc_status` callers keep working — all new fields
+    are additive Option types.
+- New `algocline-core::recent_log` module (`LogEntry` / `LogSink`,
+  `Arc<Mutex<VecDeque>>` ring buffer) and `ExecutionObserver::on_log`
+  trait method. `MetricsObserver` routes log entries to the per-session
+  `LogSink`; `Session` exposes the sink to the Lua bridge via
+  `BridgeConfig`. (breaking for crate-internal `ExecutionMetrics::snapshot`
+  callers — `include_history: bool` parameter added; MCP wire shape is
+  additive.)
+
 ## [0.28.0] - 2026-04-26
 
 ### Changed

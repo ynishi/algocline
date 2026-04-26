@@ -462,7 +462,7 @@ impl EngineApi for AppService {
     // ─── Package read ─────────────────────────────────────────
 
     async fn pkg_read_init_lua(&self, name: &str) -> Result<String, String> {
-        AppService::pkg_read_init_lua(self, name)
+        AppService::pkg_read_init_lua(self, name, None)
     }
 
     async fn pkg_meta(&self, name: &str) -> Result<String, String> {

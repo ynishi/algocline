@@ -1146,14 +1146,32 @@ impl AppService {
             }
         };
 
+        // Collect warnings additively; surfaced in response JSON so MCP callers
+        // (Claude Code UI) observe degraded data instead of silent loss.
+        // See CLAUDE.md §Service 層の Error 伝播規律 — tracing alone is not enough.
+        let mut warnings: Vec<String> = Vec::new();
+
         // Cards for this package (single call, reused for stats)
-        let card_rows = self.card_store.list(Some(pkg)).unwrap_or_default();
+        let card_rows = match self.card_store.list(Some(pkg)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                let msg = format!("card store list for '{pkg}': {e}");
+                tracing::warn!("{}", msg);
+                warnings.push(msg);
+                vec![]
+            }
+        };
         let cards_json = card::summaries_to_json(&card_rows);
 
         // Aliases for this package
         let aliases_json = match self.card_store.alias_list(Some(pkg)) {
             Ok(rows) => card::aliases_to_json(&rows),
-            Err(_) => serde_json::json!([]),
+            Err(e) => {
+                let msg = format!("card store alias_list for '{pkg}': {e}");
+                tracing::warn!("{}", msg);
+                warnings.push(msg);
+                serde_json::json!([])
+            }
         };
 
         // Stats: card count, best pass_rate, eval count
@@ -1169,8 +1187,7 @@ impl AppService {
         };
 
         // Eval count from evals directory; corruption warnings surfaced additively.
-        let mut eval_warnings: Vec<String> = Vec::new();
-        let eval_count = count_evals_for_pkg(&app_dir, pkg, &mut eval_warnings);
+        let eval_count = count_evals_for_pkg(&app_dir, pkg, &mut warnings);
 
         let mut response = serde_json::json!({
             "pkg": {
@@ -1189,8 +1206,8 @@ impl AppService {
                 "best_pass_rate": best_pass_rate,
             },
         });
-        if !eval_warnings.is_empty() {
-            response["warnings"] = serde_json::json!(eval_warnings);
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
         }
         Ok(response.to_string())
     }

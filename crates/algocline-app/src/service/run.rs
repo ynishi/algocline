@@ -169,19 +169,37 @@ impl AppService {
         session_id: &str,
     ) -> Option<String> {
         if let FeedResult::Finished(exec_result) = result {
-            let strategy = self
-                .session_strategies
-                .lock()
-                .ok()
-                .and_then(|mut map| map.remove(session_id));
-            write_transcript_log(
+            // Mutex poison means a previous thread panicked while holding the lock.
+            // Strategy name is non-critical for correctness, but the failure must be
+            // surfaced to MCP callers so it is observable, not silently dropped.
+            // See CLAUDE.md §Service 層の Error 伝播規律.
+            let strategy = match self.session_strategies.lock() {
+                Ok(mut map) => map.remove(session_id),
+                Err(e) => {
+                    tracing::warn!(
+                        "session_strategies mutex poisoned for '{}': {}",
+                        session_id,
+                        e
+                    );
+                    // Return warning immediately; transcript cannot be written
+                    // without strategy context being reliably recoverable.
+                    return Some(format!(
+                        "session_strategies mutex poisoned for '{session_id}': {e}"
+                    ));
+                }
+            };
+            // write_transcript_log returns Ok(Some(warning)) when meta write
+            // failed but the main log succeeded, so both Err and meta warning
+            // are surfaced as transcript_warning on the wire response.
+            match write_transcript_log(
                 &self.log_config,
                 session_id,
                 &exec_result.metrics,
                 strategy.as_deref(),
-            )
-            .err()
-            .map(|e| e.to_string())
+            ) {
+                Err(e) => Some(e.to_string()),
+                Ok(meta_warning) => meta_warning,
+            }
         } else {
             None
         }

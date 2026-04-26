@@ -8,25 +8,30 @@ use super::TranscriptError;
 
 /// Write transcript log to `{dir}/{session_id}.json`.
 ///
-/// Returns `Err` on main log write failure; the meta file
-/// (`{session_id}.meta.json`) is best-effort — its failure is silent
-/// because the main log holds the authoritative data and meta is only
-/// a lightweight projection used by log_list to avoid reading full
-/// transcripts.
+/// Returns `Err` on main log write failure.
+///
+/// Returns `Ok(Some(warning))` when the main log succeeded but the
+/// lightweight meta file (`{session_id}.meta.json`) could not be written.
+/// The meta file is a projection used by `log_list` to skip reading full
+/// transcripts; its failure must be surfaced to MCP callers because
+/// a missing meta row causes `log_list` to omit the session silently.
+/// See CLAUDE.md §Service 層の Error 伝播規律 — tracing alone is not enough.
+///
+/// Returns `Ok(None)` on full success.
 pub(super) fn write_transcript_log(
     config: &AppConfig,
     session_id: &str,
     metrics: &ExecutionMetrics,
     strategy: Option<&str>,
-) -> Result<(), TranscriptError> {
+) -> Result<Option<String>, TranscriptError> {
     let log_dir = match (&config.log_dir, config.log_enabled) {
         (Some(dir), true) => dir,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
 
     let transcript = metrics.transcript_to_json();
     if transcript.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let stats = metrics.to_json();
@@ -74,7 +79,9 @@ pub(super) fn write_transcript_log(
         source: e,
     })?;
 
-    // Write lightweight meta file for log_list (avoids reading full transcript)
+    // Write lightweight meta file for log_list (avoids reading full transcript).
+    // Failure is surfaced as Ok(Some(warning)) so MCP callers observe the
+    // degraded state; a missing meta row causes log_list to omit the session.
     let meta = serde_json::json!({
         "session_id": session_id,
         "strategy": strategy,
@@ -89,11 +96,32 @@ pub(super) fn write_transcript_log(
         "total_tokens": auto_stats.get("total_tokens"),
         "notes_count": 0,
     });
-    if let Ok(meta_path) = ContainedPath::child(log_dir, &format!("{session_id}.meta.json")) {
-        let _ = serde_json::to_string(&meta).map(|s| std::fs::write(&meta_path, s));
-    }
-
-    Ok(())
+    let meta_warning = match ContainedPath::child(log_dir, &format!("{session_id}.meta.json")) {
+        Err(e) => {
+            let msg = format!("transcript meta path error for '{session_id}': {e}");
+            tracing::warn!("{}", msg);
+            Some(msg)
+        }
+        Ok(meta_path) => match serde_json::to_string(&meta) {
+            Err(e) => {
+                let msg = format!("transcript meta serialize error for '{session_id}': {e}");
+                tracing::warn!("{}", msg);
+                Some(msg)
+            }
+            Ok(s) => match std::fs::write(&meta_path, s) {
+                Ok(()) => None,
+                Err(e) => {
+                    let msg = format!(
+                        "transcript meta write failed for '{session_id}' at '{}': {e}",
+                        meta_path.as_ref().display()
+                    );
+                    tracing::warn!("{}", msg);
+                    Some(msg)
+                }
+            },
+        },
+    };
+    Ok(meta_warning)
 }
 
 #[cfg(test)]

@@ -3066,202 +3066,128 @@ fn percent_decode(src: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Test-only shared [`FileCardStore`] rooted at a process-wide tempdir.
-    ///
-    /// The legacy module-level free-fn tests (originally backed by
-    /// `~/.algocline/cards/`) now target this store so no test reads
-    /// the real HOME directory. Each test still uses `unique_pkg()`
-    /// for cross-test isolation under a single root, mirroring the
-    /// legacy pkg-namespaced layout.
-    fn shared_store() -> &'static FileCardStore {
-        static STORE: OnceLock<FileCardStore> = OnceLock::new();
-        STORE.get_or_init(|| {
-            let tmp = tempfile::tempdir().expect("test tempdir");
-            // Leak the guard: the dir survives for the whole test
-            // binary lifetime which matches the OnceLock lifetime.
-            let root = tmp.path().to_path_buf();
-            std::mem::forget(tmp);
-            FileCardStore::new(root)
-        })
-    }
-
-    // ─── Back-compat free-fn shims over `shared_store()` ──────────
-    //
-    // These wrap the same `*_with_store` free fns that the production
-    // `Arc<FileCardStore>` path calls, but through a tempdir-rooted
-    // store so tests never touch HOME. Kept private to the test module.
-
-    fn create(input: Json) -> Result<(String, PathBuf), String> {
-        create_with_store(shared_store(), input)
-    }
-
-    fn get(card_id: &str) -> Result<Option<Json>, String> {
-        get_with_store(shared_store(), card_id)
-    }
-
-    fn list(pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
-        list_with_store(shared_store(), pkg_filter)
-    }
-
-    fn append(card_id: &str, fields: Json) -> Result<Json, String> {
-        append_with_store(shared_store(), card_id, fields)
-    }
-
-    fn alias_set(
-        name: &str,
-        card_id: &str,
-        pkg: Option<&str>,
-        note: Option<&str>,
-    ) -> Result<Alias, String> {
-        alias_set_with_store(shared_store(), name, card_id, pkg, note)
-    }
-
-    fn alias_list(pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
-        alias_list_with_store(shared_store(), pkg_filter)
-    }
-
-    fn get_by_alias(name: &str) -> Result<Option<Json>, String> {
-        get_by_alias_with_store(shared_store(), name)
-    }
-
-    fn find(q: FindQuery) -> Result<Vec<Summary>, String> {
-        find_with_store(shared_store(), q)
-    }
-
-    // Shim names used only by a subset of tests; remaining back-compat
-    // wrappers for functions exercised directly here. Tests for paths
-    // not covered by a shim call the `_with_store` variants against
-    // their own tempdir stores.
-
-    fn lineage(q: LineageQuery) -> Result<Option<LineageResult>, String> {
-        lineage_with_store(shared_store(), q)
-    }
-
-    fn import_from_dir(
-        source_dir: &std::path::Path,
-        pkg: &str,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        import_from_dir_with_store(shared_store(), source_dir, pkg)
-    }
-
-    fn unique_pkg() -> String {
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("_test_card_{ns}")
-    }
-
-    fn cleanup(pkg: &str) {
-        if let Ok(d) = shared_store().pkg_dir(pkg) {
-            let _ = fs::remove_dir_all(&d);
-        }
-    }
-
     #[test]
     fn minimum_valid_card() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "minimum_valid_pkg";
         let input = json!({ "pkg": { "name": pkg } });
-        let (id, path) = create(input).unwrap();
+        let (id, path) = create_with_store(&store, input).unwrap();
         assert!(path.exists());
-        assert!(id.starts_with(&pkg));
+        assert!(id.starts_with(pkg));
 
-        let got = get(&id).unwrap().unwrap();
+        let got = get_with_store(&store, &id).unwrap().unwrap();
         assert_eq!(got["schema_version"], json!(SCHEMA_VERSION));
         assert_eq!(got["card_id"], json!(id));
         assert_eq!(got["pkg"]["name"], json!(pkg));
         assert!(got.get("created_at").is_some());
         assert!(got.get("created_by").is_some());
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn create_rejects_missing_pkg_name() {
-        let err = create(json!({})).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let err = create_with_store(&store, json!({})).unwrap_err();
         assert!(err.contains("pkg.name"));
     }
 
     #[test]
     fn create_is_immutable() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "immutable_pkg";
         let input = json!({
             "card_id": "fixed_id_001",
             "pkg": { "name": pkg }
         });
-        create(input.clone()).unwrap();
-        let err = create(input).unwrap_err();
+        create_with_store(&store, input.clone()).unwrap();
+        let err = create_with_store(&store, input).unwrap_err();
         assert!(err.contains("already exists"));
-        cleanup(&pkg);
     }
 
     #[test]
     fn create_injects_param_fingerprint() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "fingerprint_pkg";
         let input = json!({
             "pkg": { "name": pkg },
             "params": { "depth": 3, "temperature": 0.0 }
         });
-        let (id, _) = create(input).unwrap();
-        let got = get(&id).unwrap().unwrap();
+        let (id, _) = create_with_store(&store, input).unwrap();
+        let got = get_with_store(&store, &id).unwrap().unwrap();
         assert!(got["param_fingerprint"].is_string());
-        cleanup(&pkg);
     }
 
     #[test]
     fn list_returns_newest_first() {
-        let pkg = unique_pkg();
-        // First card
-        let (id1, _) = create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-            "created_at": "2025-01-01T00:00:00Z"
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "list_newest_pkg";
+        let (id1, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+                "created_at": "2025-01-01T00:00:00Z"
+            }),
+        )
         .unwrap();
-        let (id2, _) = create(json!({
-            "card_id": format!("{pkg}_b"),
-            "pkg": { "name": pkg },
-            "created_at": "2026-01-01T00:00:00Z"
-        }))
+        let (id2, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_b"),
+                "pkg": { "name": pkg },
+                "created_at": "2026-01-01T00:00:00Z"
+            }),
+        )
         .unwrap();
 
-        let rows = list(Some(&pkg)).unwrap();
+        let rows = list_with_store(&store, Some(pkg)).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].card_id, id2); // newer first
         assert_eq!(rows[1].card_id, id1);
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn list_extracts_summary_fields() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-opus-4-6" },
-            "scenario": { "name": "gsm8k_sample100" },
-            "stats": { "pass_rate": 0.82 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "list_summary_pkg";
+        let (id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-opus-4-6" },
+                "scenario": { "name": "gsm8k_sample100" },
+                "stats": { "pass_rate": 0.82 }
+            }),
+        )
         .unwrap();
 
-        let rows = list(Some(&pkg)).unwrap();
+        let rows = list_with_store(&store, Some(pkg)).unwrap();
         let row = rows.iter().find(|r| r.card_id == id).unwrap();
         assert_eq!(row.model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(row.scenario.as_deref(), Some("gsm8k_sample100"));
         assert_eq!(row.pass_rate, Some(0.82));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn get_missing_returns_none() {
-        assert!(get("does_not_exist_xyz").unwrap().is_none());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        assert!(get_with_store(&store, "does_not_exist_xyz")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn card_id_embeds_compact_timestamp() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "ts_embed_pkg";
+        let (id, _) = create_with_store(&store, json!({ "pkg": { "name": pkg } })).unwrap();
         // Expect: {pkg}_{model}_{YYYYMMDDTHHMMSS}_{hash6}
         // After removing the pkg prefix, there should be a segment
         // containing 'T' separating date and time.
@@ -3272,7 +3198,6 @@ mod tests {
         let ts = parts[1];
         assert_eq!(ts.len(), 15, "timestamp segment wrong length: {ts}");
         assert!(ts.chars().nth(8) == Some('T'), "missing T separator: {ts}");
-        cleanup(&pkg);
     }
 
     #[test]
@@ -3297,7 +3222,9 @@ mod tests {
 
     #[test]
     fn two_cards_same_second_different_stats_get_distinct_ids() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "distinct_ids_pkg";
         let input1 = json!({
             "pkg": { "name": pkg },
             "scenario": { "name": "gsm8k" },
@@ -3308,24 +3235,29 @@ mod tests {
             "scenario": { "name": "gsm8k" },
             "stats": { "pass_rate": 0.9 }
         });
-        let (id1, _) = create(input1).unwrap();
-        let (id2, _) = create(input2).unwrap();
+        let (id1, _) = create_with_store(&store, input1).unwrap();
+        let (id2, _) = create_with_store(&store, input2).unwrap();
         assert_ne!(id1, id2, "distinct stats must yield distinct card_ids");
-        cleanup(&pkg);
     }
 
     // ─── P1: append ────────────────────────────────────────────
 
     #[test]
     fn append_adds_new_fields() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.5 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "append_new_fields_pkg";
+        let (id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.5 }
+            }),
+        )
         .unwrap();
 
-        let merged = append(
+        let merged = append_with_store(
+            &store,
             &id,
             json!({
                 "caveats": { "notes": "rescored after fix" },
@@ -3337,35 +3269,39 @@ mod tests {
         assert_eq!(merged["metadata"]["reviewer"], json!("yn"));
 
         // Persisted
-        let got = get(&id).unwrap().unwrap();
+        let got = get_with_store(&store, &id).unwrap().unwrap();
         assert_eq!(got["caveats"]["notes"], json!("rescored after fix"));
         // Existing field untouched
         assert_eq!(got["stats"]["pass_rate"], json!(0.5));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn append_rejects_existing_key() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.5 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "append_reject_key_pkg";
+        let (id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.5 }
+            }),
+        )
         .unwrap();
 
-        let err = append(&id, json!({ "stats": { "pass_rate": 0.9 } })).unwrap_err();
+        let err =
+            append_with_store(&store, &id, json!({ "stats": { "pass_rate": 0.9 } })).unwrap_err();
         assert!(err.contains("already set"), "got: {err}");
         // Verify original value still there
-        let got = get(&id).unwrap().unwrap();
+        let got = get_with_store(&store, &id).unwrap().unwrap();
         assert_eq!(got["stats"]["pass_rate"], json!(0.5));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn append_errors_on_missing_card() {
-        let err = append("does_not_exist_xyz", json!({ "x": 1 })).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let err = append_with_store(&store, "does_not_exist_xyz", json!({ "x": 1 })).unwrap_err();
         assert!(err.contains("not found"));
     }
 
@@ -3373,46 +3309,42 @@ mod tests {
 
     #[test]
     fn alias_set_and_list_roundtrip() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({ "pkg": { "name": pkg } })).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "alias_roundtrip_pkg";
+        let (id, _) = create_with_store(&store, json!({ "pkg": { "name": pkg } })).unwrap();
 
-        let alias_name = format!("test_alias_{}", &pkg);
-        alias_set(&alias_name, &id, Some(&pkg), Some("smoke")).unwrap();
+        let alias_name = "test_alias_roundtrip";
+        alias_set_with_store(&store, alias_name, &id, Some(pkg), Some("smoke")).unwrap();
 
-        let rows = alias_list(Some(&pkg)).unwrap();
+        let rows = alias_list_with_store(&store, Some(pkg)).unwrap();
         let a = rows.iter().find(|a| a.name == alias_name).unwrap();
         assert_eq!(a.card_id, id);
-        assert_eq!(a.pkg.as_deref(), Some(pkg.as_str()));
+        assert_eq!(a.pkg.as_deref(), Some(pkg));
         assert_eq!(a.note.as_deref(), Some("smoke"));
         assert!(!a.set_at.is_empty());
 
         // Rebind to a new card
-        let (id2, _) = create(json!({
-            "card_id": format!("{pkg}_b"),
-            "pkg": { "name": pkg }
-        }))
+        let (id2, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_b"),
+                "pkg": { "name": pkg }
+            }),
+        )
         .unwrap();
-        alias_set(&alias_name, &id2, Some(&pkg), None).unwrap();
-        let rows = alias_list(Some(&pkg)).unwrap();
+        alias_set_with_store(&store, alias_name, &id2, Some(pkg), None).unwrap();
+        let rows = alias_list_with_store(&store, Some(pkg)).unwrap();
         let matching: Vec<&Alias> = rows.iter().filter(|a| a.name == alias_name).collect();
         assert_eq!(matching.len(), 1, "alias should be unique by name");
         assert_eq!(matching[0].card_id, id2);
-
-        // Cleanup: remove our alias from the file
-        let store = shared_store();
-        let remaining: Vec<Alias> = store
-            .read_aliases()
-            .unwrap()
-            .into_iter()
-            .filter(|a| a.name != alias_name)
-            .collect();
-        store.write_aliases(&remaining).unwrap();
-        cleanup(&pkg);
     }
 
     #[test]
     fn alias_set_rejects_unknown_card() {
-        let err = alias_set("x", "does_not_exist_xyz", None, None).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let err = alias_set_with_store(&store, "x", "does_not_exist_xyz", None, None).unwrap_err();
         assert!(err.contains("not found"));
     }
 
@@ -3428,187 +3360,243 @@ mod tests {
 
     #[test]
     fn find_where_nested_eq_and_gte() {
-        let pkg = unique_pkg();
-        create(json!({
-            "card_id": format!("{pkg}_low"),
-            "pkg": { "name": pkg },
-            "scenario": { "name": "gsm8k" },
-            "stats": { "pass_rate": 0.4 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "find_nested_eq_pkg";
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_low"),
+                "pkg": { "name": pkg },
+                "scenario": { "name": "gsm8k" },
+                "stats": { "pass_rate": 0.4 }
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_high"),
-            "pkg": { "name": pkg },
-            "scenario": { "name": "gsm8k" },
-            "stats": { "pass_rate": 0.9 }
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_high"),
+                "pkg": { "name": pkg },
+                "scenario": { "name": "gsm8k" },
+                "stats": { "pass_rate": 0.9 }
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_other"),
-            "pkg": { "name": pkg },
-            "scenario": { "name": "other" },
-            "stats": { "pass_rate": 1.0 }
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_other"),
+                "pkg": { "name": pkg },
+                "scenario": { "name": "other" },
+                "stats": { "pass_rate": 1.0 }
+            }),
+        )
         .unwrap();
 
         // scenario eq via nested object
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "scenario": { "name": "gsm8k" },
-            }))),
-            order_by: order_from(json!("-stats.pass_rate")),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "scenario": { "name": "gsm8k" },
+                }))),
+                order_by: order_from(json!("-stats.pass_rate")),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].pass_rate, Some(0.9));
         assert_eq!(rows[1].pass_rate, Some(0.4));
 
         // gte operator
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "stats": { "pass_rate": { "gte": 0.8 } },
-            }))),
-            order_by: order_from(json!("-stats.pass_rate")),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "stats": { "pass_rate": { "gte": 0.8 } },
+                }))),
+                order_by: order_from(json!("-stats.pass_rate")),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.pass_rate.unwrap() >= 0.8));
 
         // limit
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            order_by: order_from(json!("-stats.pass_rate")),
-            limit: Some(1),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                order_by: order_from(json!("-stats.pass_rate")),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pass_rate, Some(1.0));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn find_where_implicit_eq_and_logical() {
-        let pkg = unique_pkg();
-        create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-opus-4-6" },
-            "stats": { "equilibrium_position": "dead", "survival_rate": 0.0 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "find_implicit_eq_pkg";
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-opus-4-6" },
+                "stats": { "equilibrium_position": "dead", "survival_rate": 0.0 }
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_b"),
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-opus-4-6" },
-            "stats": { "equilibrium_position": "niche_leader", "survival_rate": 1.0 }
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_b"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-opus-4-6" },
+                "stats": { "equilibrium_position": "niche_leader", "survival_rate": 1.0 }
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_c"),
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-haiku-4-5-20251001" },
-            "stats": { "equilibrium_position": "fragile", "survival_rate": 0.2 }
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_c"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-haiku-4-5-20251001" },
+                "stats": { "equilibrium_position": "fragile", "survival_rate": 0.2 }
+            }),
+        )
         .unwrap();
 
         // implicit eq on sparse stats field
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "stats": { "equilibrium_position": "dead" },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "stats": { "equilibrium_position": "dead" },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].card_id.ends_with("_a"));
 
         // _or
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "_or": [
-                    { "stats": { "equilibrium_position": "dead" } },
-                    { "stats": { "survival_rate": { "gte": 0.9 } } },
-                ],
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "_or": [
+                        { "stats": { "equilibrium_position": "dead" } },
+                        { "stats": { "survival_rate": { "gte": 0.9 } } },
+                    ],
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
 
         // _not
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "_not": { "model": { "id": "claude-haiku-4-5-20251001" } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "_not": { "model": { "id": "claude-haiku-4-5-20251001" } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
 
         // in operator
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "stats": {
-                    "equilibrium_position": { "in": ["dead", "fragile"] },
-                },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "stats": {
+                        "equilibrium_position": { "in": ["dead", "fragile"] },
+                    },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
 
         // exists false (sparse field missing on haiku card? all have it, so test on
         // a field that only some have)
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "strategy_params": { "temperature": { "exists": false } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "strategy_params": { "temperature": { "exists": false } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 3, "none of the cards have strategy_params");
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn find_order_by_multi_key() {
-        let pkg = unique_pkg();
-        create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.5 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "find_order_multi_pkg";
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.5 }
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_b"),
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.9 }
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_b"),
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.9 }
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_c"),
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.9 }
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_c"),
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.9 }
+            }),
+        )
         .unwrap();
 
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            order_by: order_from(json!(["-stats.pass_rate", "card_id"])),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                order_by: order_from(json!(["-stats.pass_rate", "card_id"])),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].pass_rate, Some(0.9));
@@ -3616,29 +3604,35 @@ mod tests {
         assert_eq!(rows[2].pass_rate, Some(0.5));
         // Tiebreak by card_id ascending
         assert!(rows[0].card_id < rows[1].card_id);
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn find_offset_and_limit() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "find_offset_limit_pkg";
         for i in 0..5 {
-            create(json!({
-                "card_id": format!("{pkg}_{i}"),
-                "pkg": { "name": pkg },
-                "stats": { "pass_rate": 0.1 * (i + 1) as f64 }
-            }))
+            create_with_store(
+                &store,
+                json!({
+                    "card_id": format!("{pkg}_{i}"),
+                    "pkg": { "name": pkg },
+                    "stats": { "pass_rate": 0.1 * (i + 1) as f64 }
+                }),
+            )
             .unwrap();
         }
 
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            order_by: order_from(json!("-stats.pass_rate")),
-            offset: Some(1),
-            limit: Some(2),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                order_by: order_from(json!("-stats.pass_rate")),
+                offset: Some(1),
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
         // Best is 0.5, after offset=1 we start at 0.4 then 0.3.
@@ -3646,8 +3640,6 @@ mod tests {
         let pr1 = rows[1].pass_rate.unwrap();
         assert!((pr0 - 0.4).abs() < 1e-9, "got {pr0}");
         assert!((pr1 - 0.3).abs() < 1e-9, "got {pr1}");
-
-        cleanup(&pkg);
     }
 
     #[test]
@@ -3671,135 +3663,179 @@ mod tests {
 
     #[test]
     fn find_where_string_ops_contains_and_starts_with() {
-        let pkg = unique_pkg();
-        create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-opus-4-6" },
-            "metadata": { "tag": "experiment_alpha" },
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "find_string_ops_pkg";
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-opus-4-6" },
+                "metadata": { "tag": "experiment_alpha" },
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_b"),
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-haiku-4-5-20251001" },
-            "metadata": { "tag": "experiment_beta" },
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_b"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-haiku-4-5-20251001" },
+                "metadata": { "tag": "experiment_beta" },
+            }),
+        )
         .unwrap();
-        create(json!({
-            "card_id": format!("{pkg}_c"),
-            "pkg": { "name": pkg },
-            "model": { "id": "claude-sonnet-4-5" },
-            "metadata": { "tag": "baseline" },
-        }))
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_c"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-sonnet-4-5" },
+                "metadata": { "tag": "baseline" },
+            }),
+        )
         .unwrap();
 
         // contains: matches substring anywhere
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "metadata": { "tag": { "contains": "experiment" } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "metadata": { "tag": { "contains": "experiment" } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 2);
 
         // starts_with: matches only the prefix
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "model": { "id": { "starts_with": "claude-opus" } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "model": { "id": { "starts_with": "claude-opus" } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].card_id.ends_with("_a"));
 
         // string ops on missing field → false
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "metadata": { "missing_field": { "contains": "x" } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "metadata": { "missing_field": { "contains": "x" } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 0);
 
         // string ops on non-string field → false
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "metadata": { "tag": { "starts_with": 42 } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "metadata": { "tag": { "starts_with": 42 } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 0);
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn where_missing_field_ne_is_true() {
-        let pkg = unique_pkg();
-        create(json!({
-            "card_id": format!("{pkg}_x"),
-            "pkg": { "name": pkg },
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "where_missing_ne_pkg";
+        create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_x"),
+                "pkg": { "name": pkg },
+            }),
+        )
         .unwrap();
 
-        let rows = find(FindQuery {
-            pkg: Some(pkg.clone()),
-            where_: Some(where_from(json!({
-                "strategy_params": { "temperature": { "ne": 0.5 } },
-            }))),
-            ..Default::default()
-        })
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({
+                    "strategy_params": { "temperature": { "ne": 0.5 } },
+                }))),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(rows.len(), 1, "missing field is ne to anything");
-
-        cleanup(&pkg);
     }
 
     // ─── lineage ───────────────────────────────────────────────
 
     /// Helper: create a child Card pointing at a parent with a relation.
-    fn create_child(pkg: &str, suffix: &str, parent_id: &str, relation: &str) -> String {
-        let (id, _) = create(json!({
-            "card_id": format!("{pkg}_{suffix}"),
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.5 },
-            "metadata": {
-                "prior_card_id": parent_id,
-                "prior_relation": relation,
-            },
-        }))
+    fn create_child(
+        store: &FileCardStore,
+        pkg: &str,
+        suffix: &str,
+        parent_id: &str,
+        relation: &str,
+    ) -> String {
+        let (id, _) = create_with_store(
+            store,
+            json!({
+                "card_id": format!("{pkg}_{suffix}"),
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.5 },
+                "metadata": {
+                    "prior_card_id": parent_id,
+                    "prior_relation": relation,
+                },
+            }),
+        )
         .unwrap();
         id
     }
 
     #[test]
     fn lineage_up_walks_prior_card_id_chain() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "lineage_up_pkg";
         // a → b → c (c is newest; b points at a; c points at b)
-        let (a, _) = create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-        }))
+        let (a, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+            }),
+        )
         .unwrap();
-        let b = create_child(&pkg, "b", &a, "rerun_of");
-        let c = create_child(&pkg, "c", &b, "rerun_of");
+        let b = create_child(&store, pkg, "b", &a, "rerun_of");
+        let c = create_child(&store, pkg, "c", &b, "rerun_of");
 
-        let res = lineage(LineageQuery {
-            card_id: c.clone(),
-            direction: LineageDirection::Up,
-            depth: None,
-            include_stats: false,
-            relation_filter: None,
-        })
+        let res = lineage_with_store(
+            &store,
+            LineageQuery {
+                card_id: c.clone(),
+                direction: LineageDirection::Up,
+                depth: None,
+                include_stats: false,
+                relation_filter: None,
+            },
+        )
         .unwrap()
         .expect("lineage result");
 
@@ -3813,30 +3849,36 @@ mod tests {
         assert_eq!(res.nodes[2].depth, -2);
         assert_eq!(res.edges.len(), 2);
         assert!(!res.truncated);
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn lineage_down_walks_descendants_breadth_first() {
-        let pkg = unique_pkg();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "lineage_down_pkg";
         // a has two children b, c; c has one child d.
-        let (a, _) = create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-        }))
+        let (a, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+            }),
+        )
         .unwrap();
-        let _b = create_child(&pkg, "b", &a, "sweep_variant");
-        let c = create_child(&pkg, "c", &a, "sweep_variant");
-        let _d = create_child(&pkg, "d", &c, "rerun_of");
+        let _b = create_child(&store, pkg, "b", &a, "sweep_variant");
+        let c = create_child(&store, pkg, "c", &a, "sweep_variant");
+        let _d = create_child(&store, pkg, "d", &c, "rerun_of");
 
-        let res = lineage(LineageQuery {
-            card_id: a.clone(),
-            direction: LineageDirection::Down,
-            depth: None,
-            include_stats: false,
-            relation_filter: None,
-        })
+        let res = lineage_with_store(
+            &store,
+            LineageQuery {
+                card_id: a.clone(),
+                direction: LineageDirection::Down,
+                depth: None,
+                include_stats: false,
+                relation_filter: None,
+            },
+        )
         .unwrap()
         .expect("lineage result");
 
@@ -3844,71 +3886,86 @@ mod tests {
         assert_eq!(res.nodes.len(), 4);
         assert_eq!(res.edges.len(), 3);
         assert!(!res.truncated);
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn lineage_depth_truncation_sets_flag() {
-        let pkg = unique_pkg();
-        let (a, _) = create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "lineage_depth_pkg";
+        let (a, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+            }),
+        )
         .unwrap();
-        let b = create_child(&pkg, "b", &a, "rerun_of");
-        let _c = create_child(&pkg, "c", &b, "rerun_of");
+        let b = create_child(&store, pkg, "b", &a, "rerun_of");
+        let _c = create_child(&store, pkg, "c", &b, "rerun_of");
 
-        let res = lineage(LineageQuery {
-            card_id: a,
-            direction: LineageDirection::Down,
-            depth: Some(1),
-            include_stats: false,
-            relation_filter: None,
-        })
+        let res = lineage_with_store(
+            &store,
+            LineageQuery {
+                card_id: a,
+                direction: LineageDirection::Down,
+                depth: Some(1),
+                include_stats: false,
+                relation_filter: None,
+            },
+        )
         .unwrap()
         .unwrap();
         assert_eq!(res.nodes.len(), 2, "root + 1 level");
         assert!(res.truncated, "should be truncated at depth=1");
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn lineage_relation_filter_skips_unlisted() {
-        let pkg = unique_pkg();
-        let (a, _) = create(json!({
-            "card_id": format!("{pkg}_a"),
-            "pkg": { "name": pkg },
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "lineage_filter_pkg";
+        let (a, _) = create_with_store(
+            &store,
+            json!({
+                "card_id": format!("{pkg}_a"),
+                "pkg": { "name": pkg },
+            }),
+        )
         .unwrap();
-        let _b = create_child(&pkg, "b", &a, "sweep_variant");
-        let _c = create_child(&pkg, "c", &a, "rerun_of");
+        let _b = create_child(&store, pkg, "b", &a, "sweep_variant");
+        let _c = create_child(&store, pkg, "c", &a, "rerun_of");
 
-        let res = lineage(LineageQuery {
-            card_id: a,
-            direction: LineageDirection::Down,
-            depth: None,
-            include_stats: false,
-            relation_filter: Some(vec!["sweep_variant".to_string()]),
-        })
+        let res = lineage_with_store(
+            &store,
+            LineageQuery {
+                card_id: a,
+                direction: LineageDirection::Down,
+                depth: None,
+                include_stats: false,
+                relation_filter: Some(vec!["sweep_variant".to_string()]),
+            },
+        )
         .unwrap()
         .unwrap();
         assert_eq!(res.nodes.len(), 2, "root + only sweep_variant child");
         assert_eq!(res.edges[0].relation.as_deref(), Some("sweep_variant"));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn lineage_missing_card_returns_none() {
-        let res = lineage(LineageQuery {
-            card_id: "nonexistent_card_id_xyz".into(),
-            direction: LineageDirection::Up,
-            depth: None,
-            include_stats: false,
-            relation_filter: None,
-        })
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let res = lineage_with_store(
+            &store,
+            LineageQuery {
+                card_id: "nonexistent_card_id_xyz".into(),
+                direction: LineageDirection::Up,
+                depth: None,
+                include_stats: false,
+                relation_filter: None,
+            },
+        )
         .unwrap();
         assert!(res.is_none());
     }
@@ -4066,23 +4123,30 @@ mod tests {
 
     #[test]
     fn get_by_alias_roundtrip() {
-        let pkg = unique_pkg();
-        let (id, _) = create(json!({
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.85 }
-        }))
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "get_by_alias_pkg";
+        let (id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.85 }
+            }),
+        )
         .unwrap();
 
-        let alias_name = format!("best_{pkg}");
-        alias_set(&alias_name, &id, Some(&pkg), None).unwrap();
+        let alias_name = "best_by_alias";
+        alias_set_with_store(&store, alias_name, &id, Some(pkg), None).unwrap();
 
-        let card = get_by_alias(&alias_name).unwrap().unwrap();
+        let card = get_by_alias_with_store(&store, alias_name)
+            .unwrap()
+            .unwrap();
         assert_eq!(card["card_id"], json!(id));
         assert_eq!(card["stats"]["pass_rate"], json!(0.85));
 
-        assert!(get_by_alias("nonexistent_alias_xyz").unwrap().is_none());
-
-        cleanup(&pkg);
+        assert!(get_by_alias_with_store(&store, "nonexistent_alias_xyz")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -4136,49 +4200,56 @@ mod tests {
 
     #[test]
     fn import_from_dir_skips_existing() {
-        let pkg = unique_pkg();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(store_tmp.path().to_path_buf());
+        let pkg = "import_skips_existing_pkg";
         // Create a card in the store first
-        let (existing_id, _) = create(json!({
-            "pkg": { "name": pkg },
-            "stats": { "pass_rate": 0.5 }
-        }))
+        let (existing_id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": pkg },
+                "stats": { "pass_rate": 0.5 }
+            }),
+        )
         .unwrap();
 
         // Try to import a card with the same id
-        let tmp = tempfile::tempdir().unwrap();
+        let src_tmp = tempfile::tempdir().unwrap();
         let card_content = format!(
             "schema_version = \"{SCHEMA_VERSION}\"\ncard_id = \"{existing_id}\"\npkg = \"{pkg}\"\n"
         );
         fs::write(
-            tmp.path().join(format!("{existing_id}.toml")),
+            src_tmp.path().join(format!("{existing_id}.toml")),
             &card_content,
         )
         .unwrap();
 
-        let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
+        let (imported, skipped) = import_from_dir_with_store(&store, src_tmp.path(), pkg).unwrap();
         assert!(imported.is_empty());
         assert_eq!(skipped, vec![existing_id.clone()]);
 
         // Original card untouched
-        let got = get(&existing_id).unwrap().unwrap();
+        let got = get_with_store(&store, &existing_id).unwrap().unwrap();
         assert_eq!(got["stats"]["pass_rate"], json!(0.5));
-
-        cleanup(&pkg);
     }
 
     #[test]
     fn import_from_dir_skips_non_card_toml() {
-        let pkg = unique_pkg();
-        let tmp = tempfile::tempdir().unwrap();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(store_tmp.path().to_path_buf());
+        let pkg = "import_skips_non_card_pkg";
+        let src_tmp = tempfile::tempdir().unwrap();
 
         // A TOML file without schema_version = "card/v0" should be skipped
-        fs::write(tmp.path().join("not_a_card.toml"), "title = \"hello\"\n").unwrap();
+        fs::write(
+            src_tmp.path().join("not_a_card.toml"),
+            "title = \"hello\"\n",
+        )
+        .unwrap();
 
-        let (imported, skipped) = import_from_dir(tmp.path(), &pkg).unwrap();
+        let (imported, skipped) = import_from_dir_with_store(&store, src_tmp.path(), pkg).unwrap();
         assert!(imported.is_empty());
         assert!(skipped.is_empty());
-
-        cleanup(&pkg);
     }
 
     // ─── PathCardStore (FileCardStore rooted at a custom path) ──────
@@ -4214,8 +4285,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].card_id, id);
 
-        // Ensure the default store is not polluted.
-        let default_rows = list(Some(pkg)).unwrap();
+        // Ensure a distinct store does not see the card (isolation check).
+        let other_tmp = tempfile::tempdir().unwrap();
+        let other_store = FileCardStore::new(other_tmp.path().to_path_buf());
+        let default_rows = list_with_store(&other_store, Some(pkg)).unwrap();
         assert!(default_rows.iter().all(|r| r.card_id != id));
 
         // alias + lookup scoped to the custom store

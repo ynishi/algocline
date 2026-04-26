@@ -64,6 +64,32 @@ pub(super) fn test_app_dir(root: &std::path::Path) -> AppDir {
     AppDir::new(root.to_path_buf())
 }
 
+/// Set `key` to `val` for the duration of `f`, then restore the previous
+/// value (or remove if absent). A crate-wide `Mutex` serialises all callers
+/// so parallel tests do not race on the environment.
+///
+/// # Safety
+/// Test-only, serialised via `LOCK`. Rust 2024 will make `set_var`/
+/// `remove_var` `unsafe`; the `unsafe` blocks are already written here so
+/// the later edition bump is a no-op.
+pub(crate) fn with_env_var<F: FnOnce()>(key: &str, val: &str, f: F) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prev = std::env::var(key).ok();
+    // SAFETY: no other threads read/write the env var while LOCK is held.
+    unsafe {
+        std::env::set_var(key, val);
+    }
+    f();
+    // SAFETY: same as above.
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+}
+
 // `AppConfig::with_log_disabled` lives in the production module
 // (`config.rs`) — tests reuse it via the builder chain above so
 // log-related fields stay private to that module.

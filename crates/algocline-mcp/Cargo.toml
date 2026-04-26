@@ -16,7 +16,7 @@ readme = "../../README.md"
 algocline-app = { workspace = true }
 algocline-core = { workspace = true }
 
-rmcp = { version = "0.16", features = ["server", "transport-io"] }
+rmcp = { version = "1.5", features = ["server", "transport-io"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

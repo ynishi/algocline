@@ -27,22 +27,18 @@ fn call_params(name: &str, args: Value) -> CallToolRequestParams {
         Value::Object(map) => Some(map),
         _ => None,
     };
-    CallToolRequestParams {
-        name: Cow::Owned(name.to_string()),
-        arguments,
-        meta: None,
-        task: None,
-    }
+    let mut p = CallToolRequestParams::default();
+    p.name = Cow::Owned(name.to_string());
+    p.arguments = arguments;
+    p
 }
 
 /// Build `CallToolRequestParams` with no arguments.
 fn call_params_empty(name: &str) -> CallToolRequestParams {
-    CallToolRequestParams {
-        name: Cow::Owned(name.to_string()),
-        arguments: Some(Map::new()),
-        meta: None,
-        task: None,
-    }
+    let mut p = CallToolRequestParams::default();
+    p.name = Cow::Owned(name.to_string());
+    p.arguments = Some(Map::new());
+    p
 }
 
 /// Connect to the `alc` binary as an MCP client.
@@ -113,10 +109,7 @@ async fn read_resource(
     uri: &str,
 ) -> Result<rmcp::model::ReadResourceResult, rmcp::service::ServiceError> {
     client
-        .read_resource(ReadResourceRequestParams {
-            uri: uri.to_string(),
-            meta: None,
-        })
+        .read_resource(ReadResourceRequestParams::new(uri.to_string()))
         .await
 }
 
@@ -3024,10 +3017,7 @@ async fn test_mcp_resource_read_hub_unknown_path_errors() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let params = ReadResourceRequestParams {
-        uri: "alc://hub/unknown".to_string(),
-        meta: None,
-    };
+    let params = ReadResourceRequestParams::new("alc://hub/unknown".to_string());
     let result = client.read_resource(params).await;
     assert!(
         result.is_err(),
@@ -3668,17 +3658,15 @@ async fn test_mcp_resources_complete_packages_empty_home() {
 
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let params = CompleteRequestParams {
-        meta: None,
-        r#ref: Reference::Resource(ResourceReference {
+    let params = CompleteRequestParams::new(
+        Reference::Resource(ResourceReference {
             uri: "alc://packages/{name}/init.lua".to_string(),
         }),
-        argument: ArgumentInfo {
+        ArgumentInfo {
             name: "name".to_string(),
             value: "".to_string(),
         },
-        context: None,
-    };
+    );
 
     let result = client
         .complete(params)
@@ -3731,17 +3719,15 @@ async fn test_mcp_resources_complete_packages_returns_installed_name() {
 
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let params = CompleteRequestParams {
-        meta: None,
-        r#ref: Reference::Resource(ResourceReference {
+    let params = CompleteRequestParams::new(
+        Reference::Resource(ResourceReference {
             uri: "alc://packages/{name}/init.lua".to_string(),
         }),
-        argument: ArgumentInfo {
+        ArgumentInfo {
             name: "name".to_string(),
             value: "".to_string(),
         },
-        context: None,
-    };
+    );
 
     let result = client
         .complete(params)
@@ -3791,17 +3777,15 @@ async fn test_mcp_resources_complete_packages_prefix_filter() {
 
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let params = CompleteRequestParams {
-        meta: None,
-        r#ref: Reference::Resource(ResourceReference {
+    let params = CompleteRequestParams::new(
+        Reference::Resource(ResourceReference {
             uri: "alc://packages/{name}/init.lua".to_string(),
         }),
-        argument: ArgumentInfo {
+        ArgumentInfo {
             name: "name".to_string(),
             value: "e2e_c".to_string(),
         },
-        context: None,
-    };
+    );
 
     let result = client
         .complete(params)
@@ -3946,17 +3930,15 @@ async fn test_mcp_resources_complete_returns_empty_for_unsupported_arg_name() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let params = CompleteRequestParams {
-        meta: None,
-        r#ref: Reference::Resource(ResourceReference {
+    let params = CompleteRequestParams::new(
+        Reference::Resource(ResourceReference {
             uri: "alc://logs/{session_id}".to_string(),
         }),
-        argument: ArgumentInfo {
+        ArgumentInfo {
             name: "session_id".to_string(),
             value: "".to_string(),
         },
-        context: None,
-    };
+    );
 
     let result = client
         .complete(params)
@@ -3993,15 +3975,13 @@ async fn test_mcp_resources_complete_prompt_ref_returns_empty() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let params = CompleteRequestParams {
-        meta: None,
-        r#ref: Reference::for_prompt("nonexistent_prompt"),
-        argument: ArgumentInfo {
+    let params = CompleteRequestParams::new(
+        Reference::for_prompt("nonexistent_prompt"),
+        ArgumentInfo {
             name: "arg".to_string(),
             value: "".to_string(),
         },
-        context: None,
-    };
+    );
 
     let result = client
         .complete(params)

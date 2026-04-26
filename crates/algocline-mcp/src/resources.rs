@@ -311,9 +311,7 @@ impl ResourceCatalog {
                     text,
                     meta: None,
                 };
-                Ok(ReadResourceResult {
-                    contents: vec![contents],
-                })
+                Ok(ReadResourceResult::new(vec![contents]))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
                 McpError::resource_not_found(format!("resource not found: {uri}"), None),
@@ -655,14 +653,12 @@ fn is_valid_eval_id(s: &str) -> bool {
 
 /// Produce a single-content `ReadResourceResult` with text content.
 fn text_result(uri: &str, text: String, mime_type: &str) -> ReadResourceResult {
-    ReadResourceResult {
-        contents: vec![ResourceContents::TextResourceContents {
-            uri: uri.to_string(),
-            mime_type: Some(mime_type.to_string()),
-            text,
-            meta: None,
-        }],
-    }
+    ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+        uri: uri.to_string(),
+        mime_type: Some(mime_type.to_string()),
+        text,
+        meta: None,
+    }])
 }
 
 fn make_resource(

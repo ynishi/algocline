@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Bump `rmcp` 0.16.0 → 1.5.0**. rmcp 1.x makes most model structs
+  `#[non_exhaustive]`, so direct struct expressions (`ReadResourceResult { contents }`,
+  `CompleteResult { completion }`, `ServerInfo { instructions, .. }`,
+  `ReadResourceRequestParams { uri, meta }`, `CallToolRequestParams { ... }`,
+  `CompleteRequestParams { ... }`) were migrated to constructor / `Default` +
+  field-mutation patterns. Wire shape unchanged; breaking only for direct
+  rmcp consumers reading internal types in this workspace.
+
 ### Added
 
 - **MCP Resource `alc://hub/index`**: new fixed resource that exposes the

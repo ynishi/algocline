@@ -762,6 +762,7 @@ pub struct HubSearchParams {
 
 #[derive(Clone)]
 pub struct AlcService {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     app: Arc<dyn EngineApi>,
     resource_catalog: Arc<ResourceCatalog>,
@@ -1655,9 +1656,14 @@ impl AlcService {
 #[tool_handler]
 impl ServerHandler for AlcService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "algocline — LLM amplification engine. Execute Lua strategies that structurally \
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_completions()
+            .build();
+        info.instructions = Some(
+            "algocline — LLM amplification engine. Execute Lua strategies that structurally \
                  enhance LLM reasoning via alc.run(). Strategies are Pure Lua modules with \
                  access to alc.* StdLib (json, log, state, llm).\n\n\
                  Tools:\n\
@@ -1715,15 +1721,9 @@ impl ServerHandler for AlcService {
                  - alc_hub_dist: Facade that runs alc_hub_reindex followed by alc_hub_gendoc and returns a composed `{ reindex, gendoc, preset_catalog_version, preset? }` response (optional `preset` expands into primitive gendoc args; `preset_catalog_version` is always included for observability). Fails fast on reindex error; surfaces reindex result in the error text on gendoc failure.\n\n\
                  Diagnostics:\n\
                  - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .enable_completions()
-                .build(),
-            ..Default::default()
-        }
+                .into(),
+        );
+        info
     }
 
     async fn list_resources(
@@ -1779,9 +1779,7 @@ impl ServerHandler for AlcService {
             ),
             // ref/prompt: algocline has no Prompts capability — return empty
             Reference::Prompt(_) => {
-                return Ok(CompleteResult {
-                    completion: CompletionInfo::default(),
-                });
+                return Ok(CompleteResult::new(CompletionInfo::default()));
             }
         };
 
@@ -1793,13 +1791,11 @@ impl ServerHandler for AlcService {
         // CompletionInfo::new validates the 100-item cap; from_all already enforced
         // it, so we construct directly. The `total` / `has_more` fields are always
         // set for observability.
-        Ok(CompleteResult {
-            completion: CompletionInfo {
-                values: candidates.values,
-                total: Some(candidates.total),
-                has_more: Some(candidates.has_more),
-            },
-        })
+        Ok(CompleteResult::new(CompletionInfo {
+            values: candidates.values,
+            total: Some(candidates.total),
+            has_more: Some(candidates.has_more),
+        }))
     }
 }
 

@@ -2942,6 +2942,12 @@ async fn test_mcp_resources_list_returns_two_fixed() {
         "expected alc://types/alc_shapes.d.lua in fixed list"
     );
 
+    // Verify that at least one fixed resource has title populated (ST-1 field extension).
+    assert!(
+        result.resources.iter().any(|r| r.raw.title.is_some()),
+        "expected at least one fixed resource to have a title field"
+    );
+
     client.cancel().await.expect("cancel failed");
 }
 

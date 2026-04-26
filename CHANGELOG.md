@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP Resources: error code for resource-not-found cases now returns `-32002`** (was
+  `-32602 invalid_params` at 8 sites in `resources.rs`). Affected paths: segment
+  mismatch in `read_types`, file-not-found in `read_types`, `pkg not found` in
+  `read_packages/meta`, and wildcard arms in `read_packages`, `read_cards`,
+  `read_scenarios`, `read_eval`, and `read_logs`. URI parse errors / unknown service /
+  malformed query still correctly return `-32602 invalid_params`.
+
+### Improved
+
+- **MCP Resources: `title` field populated for all fixed resources and resource templates**
+  via extended `make_resource` / `make_template` helpers. Fixed resources
+  (`alc://types/alc.d.lua`, `alc://types/alc_shapes.d.lua`) now carry human-readable
+  titles visible in MCP client UIs. All 7 resource templates similarly include titles.
+  `annotations.lastModified` is populated from `VERGEN_BUILD_TIMESTAMP` when present
+  at build time; absent in standard builds (no vergen dep added).
+
 ## [0.29.1] - 2026-04-26
 
 ### Fixed

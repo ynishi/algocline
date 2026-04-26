@@ -513,6 +513,36 @@ impl EngineApi for AppService {
         .map_err(|e| format!("pkg_scaffold task panicked: {e}"))?
     }
 
+    // ─── Hub resources ───────────────────────────────────────
+
+    /// Aggregate hub index across all registered cache sources.
+    ///
+    /// Delegates to `AppService::aggregate_index`, then serializes the
+    /// result to a JSON string. Individual source failures are embedded
+    /// in the response JSON under a `"warnings"` field so the MCP caller
+    /// can observe partial failures without losing the aggregate result.
+    ///
+    /// Returns `Err(message)` only when the hub registries file is corrupt
+    /// (making URL discovery impossible).
+    async fn hub_index_aggregate(&self) -> Result<String, String> {
+        let svc = self.clone();
+        let (index, warnings) = tokio::task::spawn_blocking(move || {
+            AppService::aggregate_index(&svc).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("hub_index_aggregate task panicked: {e}"))??;
+
+        let mut json = serde_json::to_value(&index)
+            .map_err(|e| format!("hub_index_aggregate: serialize index: {e}"))?;
+        if !warnings.is_empty() {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert("warnings".to_string(), serde_json::json!(warnings));
+            }
+        }
+        serde_json::to_string(&json)
+            .map_err(|e| format!("hub_index_aggregate: serialize final: {e}"))
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

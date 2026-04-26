@@ -16,10 +16,19 @@ use rmcp::model::{
     RawResourceTemplate, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
 };
 use rmcp::ErrorData as McpError;
+use tracing;
 
 // ─── Known services ──────────────────────────────────────────────────────────
 
-const KNOWN_SERVICES: &[&str] = &["types", "packages", "cards", "scenarios", "eval", "logs"];
+const KNOWN_SERVICES: &[&str] = &[
+    "types",
+    "packages",
+    "cards",
+    "scenarios",
+    "eval",
+    "logs",
+    "hub",
+];
 
 // ─── URI parser ──────────────────────────────────────────────────────────────
 
@@ -195,6 +204,15 @@ impl ResourceCatalog {
                 None,
                 build_ts,
             ),
+            make_resource(
+                "alc://hub/index",
+                "hub-index",
+                Some("Hub Aggregate Index"),
+                "Aggregated package catalog merged across all installed hub sources.",
+                "application/json",
+                None,
+                None,
+            ),
         ]
     }
 
@@ -270,6 +288,7 @@ impl ResourceCatalog {
             "scenarios" => self.read_scenarios(uri, &parsed).await,
             "eval" => self.read_eval(uri, &parsed).await,
             "logs" => self.read_logs(uri, &parsed).await,
+            "hub" => self.read_hub(&parsed).await,
             other => Err(McpError::invalid_params(
                 format!("unknown service: {other}"),
                 None,
@@ -499,6 +518,35 @@ impl ResourceCatalog {
             }
             _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
+                None,
+            )),
+        }
+    }
+
+    /// Dispatch a `alc://hub/<path>` resource read.
+    ///
+    /// Currently only `alc://hub/index` (segments `["index"]`) is supported.
+    /// Any other path segment returns `invalid_params`.
+    ///
+    /// # Arguments
+    /// - `parsed` — already-validated URI parsed from the `alc://hub/...` request.
+    ///
+    /// # Returns
+    /// - `Ok(ReadResourceResult)` with `application/json` content on success.
+    /// - `Err(McpError::invalid_params)` for unrecognised hub paths.
+    /// - `Err(McpError::internal_error)` when the engine call or JSON serialisation fails.
+    async fn read_hub(&self, parsed: &ParsedUri) -> Result<ReadResourceResult, McpError> {
+        match parsed.segments.as_slice() {
+            [s] if s == "index" => {
+                let json = self
+                    .app
+                    .hub_index_aggregate()
+                    .await
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                Ok(text_result("alc://hub/index", json, "application/json"))
+            }
+            _ => Err(McpError::invalid_params(
+                format!("unknown hub resource: {}", parsed.segments.join("/")),
                 None,
             )),
         }
@@ -805,11 +853,17 @@ impl ResourceCatalog {
             .await
         {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: pkg_list failed, returning empty candidates");
+                return Vec::new();
+            }
         };
         let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: pkg_list response is not valid JSON");
+                return Vec::new();
+            }
         };
         parsed
             .get("packages")
@@ -828,11 +882,17 @@ impl ResourceCatalog {
     async fn list_card_ids(&self, prefix: &str) -> Vec<String> {
         let json_str = match self.app.card_list(None).await {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: card_list failed, returning empty candidates");
+                return Vec::new();
+            }
         };
         let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: card_list response is not valid JSON");
+                return Vec::new();
+            }
         };
         // card_list returns a JSON array directly
         parsed
@@ -851,11 +911,17 @@ impl ResourceCatalog {
     async fn list_scenario_names(&self, prefix: &str) -> Vec<String> {
         let json_str = match self.app.scenario_list().await {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: scenario_list failed, returning empty candidates");
+                return Vec::new();
+            }
         };
         let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: scenario_list response is not valid JSON");
+                return Vec::new();
+            }
         };
         parsed
             .get("scenarios")
@@ -878,11 +944,17 @@ impl ResourceCatalog {
         // Request cap + 1 so we can detect truncation from the source side.
         let json_str = match self.app.eval_history(None, COMPLETION_CAP + 1).await {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: eval_history failed, returning empty candidates");
+                return Vec::new();
+            }
         };
         let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "completion: eval_history response is not valid JSON");
+                return Vec::new();
+            }
         };
         parsed
             .get("evals")
@@ -1238,6 +1310,9 @@ mod tests {
                 async fn info(&self) -> String {
                     format!("default-err stub: {}", stringify!($ty))
                 }
+                async fn hub_index_aggregate(&self) -> Result<String, String> {
+                    Err($err.into())
+                }
             }
         };
     }
@@ -1312,6 +1387,77 @@ mod tests {
         assert_eq!(parsed.segments, vec!["alc_shapes.d.lua"]);
     }
 
+    // T1: hub/index parses correctly
+    #[test]
+    fn parse_hub_index_uri() {
+        let parsed = parse_uri("alc://hub/index").unwrap();
+        assert_eq!(parsed.service, "hub");
+        assert_eq!(parsed.segments, vec!["index"]);
+        assert!(parsed.query.is_empty());
+    }
+
+    // T2: hub service is in KNOWN_SERVICES
+    #[test]
+    fn known_services_contains_hub() {
+        assert!(
+            KNOWN_SERVICES.contains(&"hub"),
+            "KNOWN_SERVICES must include \"hub\""
+        );
+    }
+
+    // T3: unknown hub path → invalid_params (via read dispatch)
+    #[tokio::test]
+    async fn read_hub_unknown_path_returns_invalid_params() {
+        let engine = FakeEngine::noop();
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let err = cat.read("alc://hub/unknown").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown hub resource") || msg.contains("invalid"),
+            "expected invalid_params error, got: {msg}"
+        );
+    }
+
+    // T1: read_hub_index returns JSON from engine
+    #[tokio::test]
+    async fn read_hub_index_returns_json() {
+        let index_json = r#"{"schema_version":"hub_index/v0","packages":[]}"#;
+        let engine = FakeEngine::ok_hub_index(index_json);
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat.read("alc://hub/index").await.unwrap();
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text,
+                mime_type,
+                uri,
+                ..
+            } => {
+                assert_eq!(mime_type.as_deref(), Some("application/json"));
+                assert_eq!(uri, "alc://hub/index");
+                assert!(
+                    text.contains("hub_index/v0"),
+                    "response must contain schema_version"
+                );
+            }
+            _ => panic!("expected TextResourceContents"),
+        }
+    }
+
+    // T3: read_hub_index when engine errors → internal_error
+    #[tokio::test]
+    async fn read_hub_index_engine_error_returns_internal_error() {
+        let mut engine = FakeEngine::noop();
+        engine.hub_index_aggregate = Some(Err("registries corrupt".into()));
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let err = cat.read("alc://hub/index").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("registries corrupt") || msg.contains("internal"),
+            "expected internal_error, got: {msg}"
+        );
+    }
+
     // ── ResourceCatalog helpers ───────────────────────────────────────────
 
     fn make_test_catalog(root: PathBuf) -> ResourceCatalog {
@@ -1356,13 +1502,18 @@ mod tests {
     }
 
     #[test]
-    fn list_fixed_returns_two_entries() {
+    fn list_fixed_returns_three_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = make_test_catalog(tmp.path().to_path_buf());
         let fixed = catalog.list_fixed();
-        assert_eq!(fixed.len(), 2);
+        assert_eq!(
+            fixed.len(),
+            3,
+            "expected 3 fixed resources (types x2 + hub/index)"
+        );
         assert_eq!(fixed[0].raw.uri, "alc://types/alc.d.lua");
         assert_eq!(fixed[1].raw.uri, "alc://types/alc_shapes.d.lua");
+        assert_eq!(fixed[2].raw.uri, "alc://hub/index");
     }
 
     #[test]
@@ -1398,6 +1549,7 @@ mod tests {
         eval_detail: Option<Result<String, String>>,
         eval_history: Option<Result<String, String>>,
         log_view: FakeEngineExpected,
+        hub_index_aggregate: Option<Result<String, String>>,
     }
 
     impl FakeEngine {
@@ -1451,6 +1603,12 @@ mod tests {
                 ..Self::noop()
             }
         }
+        fn ok_hub_index(json: &str) -> Self {
+            Self {
+                hub_index_aggregate: Some(Ok(json.to_string())),
+                ..Self::noop()
+            }
+        }
         fn noop() -> Self {
             Self {
                 pkg_init_lua: None,
@@ -1464,6 +1622,7 @@ mod tests {
                 eval_detail: None,
                 eval_history: None,
                 log_view: None,
+                hub_index_aggregate: None,
             }
         }
     }
@@ -1756,6 +1915,11 @@ mod tests {
         }
         async fn info(&self) -> String {
             "fake".into()
+        }
+        async fn hub_index_aggregate(&self) -> Result<String, String> {
+            self.hub_index_aggregate
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
     }
 
@@ -2050,6 +2214,9 @@ mod tests {
             }
             async fn info(&self) -> String {
                 "fake".into()
+            }
+            async fn hub_index_aggregate(&self) -> Result<String, String> {
+                Err("noop".into())
             }
         }
         let tmp = tempfile::tempdir().unwrap();

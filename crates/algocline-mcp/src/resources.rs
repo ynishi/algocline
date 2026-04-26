@@ -678,6 +678,253 @@ fn make_template(
     Annotated::new(raw, None)
 }
 
+// ─── Completion API ──────────────────────────────────────────────────────────
+
+/// Candidate result for a `completion/complete` request.
+///
+/// Returned by [`ResourceCatalog::complete_resource_arg`] for use in the
+/// `CompleteResult.completion` field on the MCP wire.
+pub struct CompletionCandidates {
+    /// Matching candidate strings (capped at [`COMPLETION_CAP`]).
+    pub values: Vec<String>,
+    /// Total number of matches before truncation.
+    pub total: u32,
+    /// `true` when `values` was truncated (i.e. `values.len() < total`).
+    pub has_more: bool,
+}
+
+/// Maximum number of completion candidates returned per request.
+const COMPLETION_CAP: usize = 100;
+
+/// Extract all RFC 6570 Level-1 variable names from a URI template string.
+///
+/// Scans the template for `{var}` patterns (no operator support — only
+/// Level-1 simple expansion is used by algocline templates). Variables appear
+/// in the order they are encountered; duplicates are preserved.
+///
+/// # Arguments
+///
+/// * `template` — a URI template string, e.g. `"alc://packages/{name}/init.lua"`.
+///
+/// # Returns
+///
+/// A `Vec<String>` of variable names found between `{` and `}`.
+///
+/// # Examples
+///
+/// `extract_template_vars("alc://packages/{name}/init.lua")` returns `["name"]`.
+/// `extract_template_vars("alc://types/alc.d.lua")` returns `[]`.
+pub fn extract_template_vars(template: &str) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('}') {
+            let var = &rest[..end];
+            if !var.is_empty() {
+                vars.push(var.to_string());
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    vars
+}
+
+/// Extract the service component from a URI template string.
+///
+/// Strips the `alc://` prefix and returns the first path component before
+/// any `/`. Does not invoke `parse_uri` (which rejects template variables).
+///
+/// Returns `None` when the template does not start with `alc://` or has no
+/// path component.
+fn service_from_template(template: &str) -> Option<&str> {
+    let rest = template.strip_prefix("alc://")?;
+    let component = rest.split('/').next()?;
+    if component.is_empty() {
+        None
+    } else {
+        Some(component)
+    }
+}
+
+impl ResourceCatalog {
+    /// Return completion candidates for a single template argument.
+    ///
+    /// Dispatches to the appropriate `EngineApi` list method based on the
+    /// `(service, arg_name)` pair extracted from `uri_template`. Candidate
+    /// strings are filtered to those that start with `prefix` (case-sensitive,
+    /// best-effort per spec). Results are capped at [`COMPLETION_CAP`] entries;
+    /// if the list exceeds the cap, `has_more` is set to `true` and `total`
+    /// reflects the untruncated count.
+    ///
+    /// Unknown `(service, arg_name)` pairs return an empty candidate list
+    /// rather than an error — empty completion is a valid MCP response.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri_template` — a URI template string such as `"alc://packages/{name}/init.lua"`.
+    /// * `arg_name`     — the template variable being completed, e.g. `"name"`.
+    /// * `prefix`       — the partial value typed so far; used for prefix filtering.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(CompletionCandidates)` on success. Errors from the backing
+    /// `EngineApi` are logged but result in an empty candidate list so that
+    /// completion failures never surface as MCP errors.
+    pub async fn complete_resource_arg(
+        &self,
+        uri_template: &str,
+        arg_name: &str,
+        prefix: &str,
+    ) -> CompletionCandidates {
+        let service = match service_from_template(uri_template) {
+            Some(s) => s,
+            None => return CompletionCandidates::empty(),
+        };
+
+        let candidates = match (service, arg_name) {
+            ("packages", "name") => self.list_pkg_names(prefix).await,
+            ("cards", "card_id") => self.list_card_ids(prefix).await,
+            ("scenarios", "name") => self.list_scenario_names(prefix).await,
+            ("eval", "result_id") => self.list_eval_ids(prefix).await,
+            // logs domain: no session-list API available; return empty per subtask spec §2.3(a)
+            ("logs", _) => Vec::new(),
+            _ => Vec::new(),
+        };
+
+        CompletionCandidates::from_all(candidates)
+    }
+
+    /// List installed package names, prefix-filtered.
+    async fn list_pkg_names(&self, prefix: &str) -> Vec<String> {
+        let json_str = match self
+            .app
+            .pkg_list(None, Some(0), None, None, None, None)
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        parsed
+            .get("packages")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                    .filter(|n| n.starts_with(prefix))
+                    .map(|n| n.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List card IDs, prefix-filtered.
+    async fn list_card_ids(&self, prefix: &str) -> Vec<String> {
+        let json_str = match self.app.card_list(None).await {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        // card_list returns a JSON array directly
+        parsed
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("card_id").and_then(|id| id.as_str()))
+                    .filter(|id| id.starts_with(prefix))
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List scenario names, prefix-filtered.
+    async fn list_scenario_names(&self, prefix: &str) -> Vec<String> {
+        let json_str = match self.app.scenario_list().await {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        parsed
+            .get("scenarios")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                    .filter(|n| n.starts_with(prefix))
+                    .map(|n| n.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List eval result IDs, prefix-filtered.
+    ///
+    /// Fetches 101 entries (one over cap) to detect `has_more` without a
+    /// separate count query.
+    async fn list_eval_ids(&self, prefix: &str) -> Vec<String> {
+        // Request cap + 1 so we can detect truncation from the source side.
+        let json_str = match self.app.eval_history(None, COMPLETION_CAP + 1).await {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        parsed
+            .get("evals")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("eval_id").and_then(|id| id.as_str()))
+                    .filter(|id| id.starts_with(prefix))
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl CompletionCandidates {
+    /// Create an empty result (no candidates, no more results).
+    pub fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            total: 0,
+            has_more: false,
+        }
+    }
+
+    /// Build from a full (potentially large) candidate list, applying the cap.
+    ///
+    /// If `all.len() > COMPLETION_CAP`, the list is truncated and `has_more`
+    /// is set. `total` always reflects the untruncated count (clamped to
+    /// `u32::MAX`).
+    pub fn from_all(mut all: Vec<String>) -> Self {
+        let total = all.len().min(u32::MAX as usize) as u32;
+        let has_more = all.len() > COMPLETION_CAP;
+        all.truncate(COMPLETION_CAP);
+        Self {
+            values: all,
+            total,
+            has_more,
+        }
+    }
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1144,9 +1391,12 @@ mod tests {
         pkg_meta: Option<Result<String, String>>,
         pkg_list: Option<Result<String, String>>,
         card_get: Option<Result<String, String>>,
+        card_list: Option<Result<String, String>>,
         card_samples: FakeEngineExpected,
         scenario_show: Option<Result<String, String>>,
+        scenario_list: Option<Result<String, String>>,
         eval_detail: Option<Result<String, String>>,
+        eval_history: Option<Result<String, String>>,
         log_view: FakeEngineExpected,
     }
 
@@ -1207,9 +1457,12 @@ mod tests {
                 pkg_meta: None,
                 pkg_list: None,
                 card_get: None,
+                card_list: None,
                 card_samples: None,
                 scenario_show: None,
+                scenario_list: None,
                 eval_detail: None,
+                eval_history: None,
                 log_view: None,
             }
         }
@@ -1339,13 +1592,17 @@ mod tests {
             Err("noop".into())
         }
         async fn eval_history(&self, _: Option<&str>, _: usize) -> Result<String, String> {
-            Err("noop".into())
+            self.eval_history
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
         async fn eval_compare(&self, _: &str, _: &str) -> Result<String, String> {
             Err("noop".into())
         }
         async fn scenario_list(&self) -> Result<String, String> {
-            Err("noop".into())
+            self.scenario_list
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
         async fn scenario_install(&self, _: String) -> Result<String, String> {
             Err("noop".into())
@@ -1397,7 +1654,9 @@ mod tests {
             Err("noop".into())
         }
         async fn card_list(&self, _: Option<String>) -> Result<String, String> {
-            Err("noop".into())
+            self.card_list
+                .clone()
+                .unwrap_or(Err("not configured".into()))
         }
         async fn card_find(
             &self,
@@ -2253,5 +2512,198 @@ mod tests {
         let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
         let err = cat.read("alc://logs/a/b").await.unwrap_err();
         assert_eq!(err.code.0, -32002, "expected -32002, got: {:?}", err.code);
+    }
+
+    // ── ST-2: extract_template_vars ───────────────────────────────────────────
+
+    // T1: happy path — extract single variable from packages template
+    #[test]
+    fn extract_template_vars_single_var() {
+        let vars = extract_template_vars("alc://packages/{name}/init.lua");
+        assert_eq!(vars, vec!["name"]);
+    }
+
+    // T1: happy path — extract single variable from cards template
+    #[test]
+    fn extract_template_vars_card_id() {
+        let vars = extract_template_vars("alc://cards/{card_id}/samples");
+        assert_eq!(vars, vec!["card_id"]);
+    }
+
+    // T2: boundary — no variables in static URI
+    #[test]
+    fn extract_template_vars_no_vars() {
+        let vars = extract_template_vars("alc://types/alc.d.lua");
+        assert!(vars.is_empty());
+    }
+
+    // T2: boundary — empty string
+    #[test]
+    fn extract_template_vars_empty_template() {
+        let vars = extract_template_vars("");
+        assert!(vars.is_empty());
+    }
+
+    // T2: boundary — unclosed brace is ignored gracefully
+    #[test]
+    fn extract_template_vars_unclosed_brace() {
+        let vars = extract_template_vars("alc://packages/{name");
+        assert!(vars.is_empty(), "unclosed brace should produce no vars");
+    }
+
+    // T1: happy path — two variables in one template
+    #[test]
+    fn extract_template_vars_two_vars() {
+        let vars = extract_template_vars("alc://{service}/{id}");
+        assert_eq!(vars, vec!["service", "id"]);
+    }
+
+    // ── ST-2: service_from_template ──────────────────────────────────────────
+
+    // T1: happy path — packages service
+    #[test]
+    fn service_from_template_packages() {
+        assert_eq!(
+            service_from_template("alc://packages/{name}/init.lua"),
+            Some("packages")
+        );
+    }
+
+    // T2: boundary — no alc:// prefix returns None
+    #[test]
+    fn service_from_template_wrong_scheme() {
+        assert_eq!(service_from_template("https://foo/bar"), None);
+    }
+
+    // T2: boundary — empty template returns None
+    #[test]
+    fn service_from_template_empty() {
+        assert_eq!(service_from_template(""), None);
+    }
+
+    // ── ST-2: CompletionCandidates::from_all ─────────────────────────────────
+
+    // T1: happy path — small list returned as-is
+    #[test]
+    fn completion_candidates_from_all_small() {
+        let items: Vec<String> = (0..5).map(|i| format!("item-{i}")).collect();
+        let c = CompletionCandidates::from_all(items.clone());
+        assert_eq!(c.values, items);
+        assert_eq!(c.total, 5);
+        assert!(!c.has_more);
+    }
+
+    // T2: boundary — exactly 100 items (no truncation)
+    #[test]
+    fn completion_candidates_from_all_at_cap() {
+        let items: Vec<String> = (0..100).map(|i| format!("item-{i}")).collect();
+        let c = CompletionCandidates::from_all(items);
+        assert_eq!(c.values.len(), 100);
+        assert_eq!(c.total, 100);
+        assert!(!c.has_more);
+    }
+
+    // T2: boundary — 101 items triggers truncation
+    #[test]
+    fn completion_candidates_from_all_over_cap() {
+        let items: Vec<String> = (0..101).map(|i| format!("item-{i}")).collect();
+        let c = CompletionCandidates::from_all(items);
+        assert_eq!(c.values.len(), 100);
+        assert_eq!(c.total, 101);
+        assert!(c.has_more);
+    }
+
+    // T1: empty() produces zeroed result
+    #[test]
+    fn completion_candidates_empty() {
+        let c = CompletionCandidates::empty();
+        assert!(c.values.is_empty());
+        assert_eq!(c.total, 0);
+        assert!(!c.has_more);
+    }
+
+    // ── ST-2: complete_resource_arg — pkg domain ──────────────────────────────
+
+    // T1: happy path — packages completion returns filtered names
+    #[tokio::test]
+    async fn complete_resource_arg_packages_prefix_filter() {
+        let engine = FakeEngine {
+            pkg_list: Some(Ok(
+                r#"{"packages":[{"name":"cot"},{"name":"sc"},{"name":"cove"}]}"#.into(),
+            )),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "name", "c")
+            .await;
+        // "cot", "cove" start with "c" but "sc" does not
+        assert_eq!(result.total, 2);
+        assert!(!result.has_more);
+        let mut got = result.values.clone();
+        got.sort();
+        assert_eq!(got, vec!["cot", "cove"]);
+    }
+
+    // T1: happy path — empty prefix returns all packages
+    #[tokio::test]
+    async fn complete_resource_arg_packages_empty_prefix() {
+        let engine = FakeEngine {
+            pkg_list: Some(Ok(r#"{"packages":[{"name":"cot"},{"name":"sc"}]}"#.into())),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "name", "")
+            .await;
+        assert_eq!(result.total, 2);
+        assert!(!result.has_more);
+    }
+
+    // T3: error path — engine error returns empty result (no MCP error)
+    #[tokio::test]
+    async fn complete_resource_arg_engine_error_returns_empty() {
+        let engine = FakeEngine {
+            pkg_list: Some(Err("storage error".into())),
+            ..FakeEngine::noop()
+        };
+        let (cat, _tmp) = make_fake_catalog(engine);
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "name", "")
+            .await;
+        assert!(result.values.is_empty());
+        assert_eq!(result.total, 0);
+        assert!(!result.has_more);
+    }
+
+    // T2: unknown domain returns empty result
+    #[tokio::test]
+    async fn complete_resource_arg_unknown_domain_returns_empty() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let result = cat
+            .complete_resource_arg("alc://logs/{session_id}", "session_id", "")
+            .await;
+        assert!(result.values.is_empty());
+        assert_eq!(result.total, 0);
+    }
+
+    // T2: unknown arg name for known service returns empty result
+    #[tokio::test]
+    async fn complete_resource_arg_unknown_arg_returns_empty() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let result = cat
+            .complete_resource_arg("alc://packages/{name}/init.lua", "unknown_arg", "")
+            .await;
+        assert!(result.values.is_empty());
+    }
+
+    // T2: template with no valid alc:// prefix returns empty
+    #[tokio::test]
+    async fn complete_resource_arg_bad_template_returns_empty() {
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let result = cat
+            .complete_resource_arg("https://other/{name}", "name", "")
+            .await;
+        assert!(result.values.is_empty());
     }
 }

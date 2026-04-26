@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP `completion/complete` for resource template arguments**: `ServerHandler::complete`
+  is now implemented in `algocline-mcp`, enabling IDE-style tab-completion of resource
+  template variables (e.g. `@alc:alc://packages/<TAB>` auto-completes with installed
+  package names in Claude Code). Supported argument slots:
+  - `alc://packages/{name}/…` → installed package names (from `pkg_list`)
+  - `alc://cards/{card_id}` → eval card IDs (from `card_list`)
+  - `alc://scenarios/{name}` → scenario names (from `scenario_list`)
+  - `alc://eval/{result_id}` → eval result IDs (from `eval_history`)
+  - `alc://logs/{…}` → empty (no session-list API)
+  All results are prefix-filtered by the typed value, capped at 100 entries
+  (`has_more: true` + `total` when truncated). `ref/prompt` references return an
+  empty result without error. `ServerCapabilities` now declares `completions`.
+  New public helpers: `extract_template_vars` (RFC 6570 Level-1 parser) and
+  `complete_resource_arg` on `ResourceCatalog`.
+
 ### Fixed
 
 - **MCP Resources: error code for resource-not-found cases now returns `-32002`** (was

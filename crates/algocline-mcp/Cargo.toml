@@ -18,6 +18,7 @@ algocline-core = { workspace = true }
 
 rmcp = { version = "0.16", features = ["server", "transport-io"] }
 
+chrono = { version = "0.4", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

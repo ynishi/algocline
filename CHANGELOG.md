@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [0.29.1] - 2026-04-26
+
+### Fixed
 
 - **Log directory now honors `ALC_HOME`**: `AppConfig::resolve_log_dir`
   branch 2 (`{app_dir}/logs`) is derived from the resolved `AppDir`

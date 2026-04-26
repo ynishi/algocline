@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-04-26
+
+### Changed
+
+- **Service-layer error propagation**: typed `ServiceError` / `ProjectFilesError` /
+  `LockError` / `TranscriptError` / `PkgListError` / `HubRegistriesError` /
+  `InstalledManifestStoreError` hierarchy is now used end-to-end inside
+  `crates/algocline-app/src/service/`. `String` as `E` is confined to the MCP
+  wire boundary (`engine_api_impl.rs`), where typed errors are flattened via
+  `.map_err(|e| e.to_string())`. `with_exclusive_lock` is now generic over
+  `E: From<LockError>`, eliminating the prior `String` round-trip that fused
+  Lock-acquisition failures with `alc.toml` corruption into a single variant.
+  (breaking for direct `service::*` consumers; MCP wire shape is unchanged.)
+- **Silent-drop sites surfaced**: best-effort enrichment / projection writes
+  that previously used `let _ = ...` or `tracing::warn!`-and-drop now surface
+  warnings to the caller through additive `warnings` / `transcript_warning`
+  fields in MCP response JSON. Affected: `hub_info` card-store reads,
+  transcript meta projection writes, `run` session-strategy mutex poison.
+  CLI / library context lacks a server-framework exception catcher, so
+  `tracing::warn!` alone is insufficient — both the log and the user-facing
+  response now carry the diagnostic.
+
+### Fixed
+
+- **`pkg_read_init_lua` honours explicit `project_root`**: previously called
+  `resolve_project_root(None)` unconditionally, ignoring the AppService
+  context. Tests worked around this by setting `ALC_PROJECT_ROOT` env, which
+  raced across parallel tests because env names are process-global. Signature
+  now takes `Option<&Path>` (matching `pkg_list` / `resolve_extra_lib_paths`),
+  and tests pass `tmp.path()` directly. (breaking for direct callers;
+  MCP wire boundary passes `None` for backwards-compatible behaviour.)
+- **Card-store test isolation**: `crates/algocline-engine/src/card.rs` test
+  module previously shared a process-wide `OnceLock<FileCardStore>` keyed
+  by nanosecond-timestamp `unique_pkg()`. Nanosecond collisions caused
+  flaky failures in `find_where_*`, `get_by_alias_*`, etc. All 29 tests now
+  use per-test `FileCardStore::new(tempdir)`.
+- **Crate-wide env-var test serialisation**: `with_env_var(key, val, f)`
+  helper consolidated in `crates/algocline-app/src/service/test_support.rs`
+  with a single static `Mutex`. `config.rs::app_dir_env_overrides_home`
+  (which races against any test calling `AppConfig::default()`) now routes
+  through this shared lock instead of bare `std::env::set_var`.
+
 ## [0.27.1] - 2026-04-25
 
 ### Fixed

@@ -1,8 +1,9 @@
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ServerCapabilities, ServerInfo,
+        CompleteRequestParams, CompleteResult, CompletionInfo, ListResourceTemplatesResult,
+        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, Reference,
+        ServerCapabilities, ServerInfo,
     },
     schemars,
     service::RequestContext,
@@ -1719,6 +1720,7 @@ impl ServerHandler for AlcService {
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_completions()
                 .build(),
             ..Default::default()
         }
@@ -1746,6 +1748,58 @@ impl ServerHandler for AlcService {
         _cx: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResult, rmcp::ErrorData> {
         self.resource_catalog.read(&req.uri).await
+    }
+
+    /// Handle `completion/complete` for `ref/resource` template arguments.
+    ///
+    /// Dispatches to `ResourceCatalog::complete_resource_arg` when the reference
+    /// is `ref/resource`. For `ref/prompt` (algocline has no Prompts capability)
+    /// and any future reference types, an empty completion result is returned —
+    /// empty completion is a valid MCP response and never causes a client error.
+    ///
+    /// # Arguments
+    ///
+    /// * `req` — contains the resource URI template reference and the argument
+    ///   name + partial value being completed.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(CompleteResult)` always. Engine errors during candidate lookup are
+    /// absorbed and result in an empty candidate list rather than an MCP error.
+    async fn complete(
+        &self,
+        req: CompleteRequestParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, rmcp::ErrorData> {
+        let (uri_template, arg_name, prefix) = match &req.r#ref {
+            Reference::Resource(resource_ref) => (
+                resource_ref.uri.as_str(),
+                req.argument.name.as_str(),
+                req.argument.value.as_str(),
+            ),
+            // ref/prompt: algocline has no Prompts capability — return empty
+            Reference::Prompt(_) => {
+                return Ok(CompleteResult {
+                    completion: CompletionInfo::default(),
+                });
+            }
+        };
+
+        let candidates = self
+            .resource_catalog
+            .complete_resource_arg(uri_template, arg_name, prefix)
+            .await;
+
+        // CompletionInfo::new validates the 100-item cap; from_all already enforced
+        // it, so we construct directly. The `total` / `has_more` fields are always
+        // set for observability.
+        Ok(CompleteResult {
+            completion: CompletionInfo {
+                values: candidates.values,
+                total: Some(candidates.total),
+                has_more: Some(candidates.has_more),
+            },
+        })
     }
 }
 

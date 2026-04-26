@@ -75,7 +75,8 @@ pub struct AppConfig {
 impl AppConfig {
     /// Build from environment variables (single resolution point).
     pub fn from_env() -> Self {
-        let (log_dir, log_dir_source) = Self::resolve_log_dir();
+        let app_dir = Arc::new(Self::resolve_app_dir());
+        let (log_dir, log_dir_source) = Self::resolve_log_dir(&app_dir);
 
         let log_enabled = std::env::var("ALC_LOG_LEVEL")
             .map(|v| v.to_lowercase() != "off")
@@ -85,8 +86,6 @@ impl AppConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS);
-
-        let app_dir = Arc::new(Self::resolve_app_dir());
 
         Self {
             log_dir,
@@ -149,7 +148,9 @@ impl AppConfig {
     /// ## Fallback order
     ///
     /// 1. `ALC_LOG_DIR` env var — explicit user/operator override.
-    /// 2. `~/.algocline/logs` — home-based default (most common).
+    /// 2. `{app_dir}/logs` — derived from the resolved [`AppDir`] so it
+    ///    honors `ALC_HOME` when set; defaults to `~/.algocline/logs`
+    ///    when no override is in effect.
     /// 3. `$XDG_STATE_HOME/algocline/logs` (or `~/.local/state/…`).
     /// 4. `<cwd>/algocline-logs` — **sandbox fallback**.
     ///    In containerised / sandbox environments (Docker, CI runners,
@@ -159,7 +160,7 @@ impl AppConfig {
     ///    to it to preserve file logging in those environments.
     /// 5. `None` — no writable directory found; file logging is disabled
     ///    and the server operates in stderr-only tracing mode.
-    fn resolve_log_dir() -> (Option<PathBuf>, LogDirSource) {
+    fn resolve_log_dir(app_dir: &AppDir) -> (Option<PathBuf>, LogDirSource) {
         // 1. ALC_LOG_DIR env (explicit override — highest priority)
         if let Ok(dir) = std::env::var("ALC_LOG_DIR") {
             let path = PathBuf::from(dir);
@@ -168,12 +169,10 @@ impl AppConfig {
             }
         }
 
-        // 2. ~/.algocline/logs (home-based default)
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join(".algocline").join("logs");
-            if Self::ensure_dir(&path) {
-                return (Some(path), LogDirSource::Home);
-            }
+        // 2. {app_dir}/logs — honors ALC_HOME via AppDir
+        let path = app_dir.logs_dir();
+        if Self::ensure_dir(&path) {
+            return (Some(path), LogDirSource::Home);
         }
 
         // 3. state_dir (XDG_STATE_HOME or ~/.local/state)

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Log directory now honors `ALC_HOME`**: `AppConfig::resolve_log_dir`
+  branch 2 (`{app_dir}/logs`) is derived from the resolved `AppDir`
+  instead of hard-coding `dirs::home_dir().join(".algocline").join("logs")`.
+  Setting `ALC_HOME=/custom` now resolves logs under `/custom/logs`,
+  matching every other Service-layer path (packages / cards / state /
+  evals). Previous behavior left logs at `~/.algocline/logs` even when
+  `ALC_HOME` was set — a latent inconsistency. `LogDirSource::Home`
+  Display label is unchanged (`~/.algocline/logs`) since it documents
+  the unset-default semantics, not the resolved path.
+- This also eliminates the last `dirs::home_dir()` direct read in the
+  Service layer; the only remaining HOME / `ALC_HOME` reads under
+  `crates/algocline-app/src/service/` are inside `AppConfig::resolve_app_dir`
+  (the documented single resolution point).
+
 ## [0.29.0] - 2026-04-26
 
 ### Added

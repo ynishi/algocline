@@ -1098,15 +1098,17 @@ mod tests {
     // For these tests we use a custom `FakeEngine` that returns controlled
     // responses for the specific methods under test.
 
+    type FakeEngineExpected = Option<(Option<usize>, Option<usize>, Result<String, String>)>;
+
     struct FakeEngine {
         pkg_init_lua: Option<Result<String, String>>,
         pkg_meta: Option<Result<String, String>>,
         pkg_list: Option<Result<String, String>>,
         card_get: Option<Result<String, String>>,
-        card_samples: Option<(Option<usize>, Option<usize>, Result<String, String>)>,
+        card_samples: FakeEngineExpected,
         scenario_show: Option<Result<String, String>>,
         eval_detail: Option<Result<String, String>>,
-        log_view: Option<(Option<usize>, Option<usize>, Result<String, String>)>,
+        log_view: FakeEngineExpected,
     }
 
     impl FakeEngine {
@@ -1119,12 +1121,6 @@ mod tests {
         fn ok_meta(json: &str) -> Self {
             Self {
                 pkg_meta: Some(Ok(json.to_string())),
-                ..Self::noop()
-            }
-        }
-        fn ok_pkg_list(json: &str) -> Self {
-            Self {
-                pkg_list: Some(Ok(json.to_string())),
                 ..Self::noop()
             }
         }

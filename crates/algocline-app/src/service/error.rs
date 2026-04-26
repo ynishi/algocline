@@ -1,13 +1,6 @@
-// Phase 2 adds PkgList, HubRegistries sub-enums.
-// Phase 3 will add EvalStore, Status sub-enums.
-// See issue 1777125405-1441.
-
 use thiserror::Error;
 
-/// Top-level service-layer error type. Variants are added as `String`->`Result`
-/// migration progresses (Phase 1 seeds `ProjectFiles` + `Transcript`; Phase 2
-/// adds `PkgList` and `HubRegistries`).
-#[allow(dead_code)]
+/// Top-level service-layer error type.
 #[derive(Debug, Error)]
 pub(crate) enum ServiceError {
     #[error(transparent)]
@@ -18,6 +11,16 @@ pub(crate) enum ServiceError {
     PkgList(#[from] PkgListError),
     #[error(transparent)]
     HubRegistries(#[from] HubRegistriesError),
+    /// User-supplied parameter was invalid (sort key, field name, etc.).
+    /// This is a client error (bad input), not a server-side failure.
+    #[error("{0}")]
+    InvalidInput(String),
+}
+
+impl From<ServiceError> for String {
+    fn from(e: ServiceError) -> Self {
+        e.to_string()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -27,8 +30,9 @@ pub enum ProjectFilesError {
         path: String,
         source: std::io::Error,
     },
+    /// Advisory lock acquisition failed.
     #[error("project files lock: {0}")]
-    Lock(String),
+    Lock(#[from] crate::service::lock::LockError),
     #[error("alc.toml load: {0}")]
     AlcTomlLoad(String),
     #[error("alc.toml save: {0}")]
@@ -44,10 +48,7 @@ pub enum ProjectFilesError {
 /// Corruption (parse error / version mismatch) is distinguished from file-absent
 /// (`load_lockfile` / `load_alc_toml` return `Ok(None)` for absent files) so
 /// callers can surface the former as a `warnings` field in the MCP wire response.
-///
-/// Variants are seeded for Phase 2; direct construction happens when a higher-level
-/// caller is wired to propagate via `ServiceError::PkgList`.
-#[allow(dead_code, clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Error)]
 pub(crate) enum PkgListError {
     #[error("alc.lock parse: {0}")]
@@ -63,10 +64,6 @@ pub(crate) enum PkgListError {
 /// File-absent is `Ok(HubRegistries::default())` — the file is created lazily.
 /// Parse failures (corrupt JSON) are `Err` so callers can surface them in the
 /// MCP wire `warnings` field instead of silently degrading hub discovery.
-///
-/// Variant is seeded for Phase 2; direct construction happens when a higher-level
-/// caller is wired to propagate via `ServiceError::HubRegistries`.
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum HubRegistriesError {
     #[error("hub_registries.json parse: {0}")]

@@ -631,65 +631,58 @@ impl AppService {
         // advisory lock two concurrent installs can each load the old state,
         // apply their own mutation, and race to save — the later writer
         // silently overwrites the earlier's entry.
+        //
+        // `From<LockError> for ProjectFilesError` is implemented via `#[from]` on
+        // the `Lock` variant in `service/error.rs`, so lock acquisition errors
+        // are injected as typed `ProjectFilesError::Lock` values — no `.to_string()`
+        // flattening at this call site.
         let lock_path = project_files_lock_path(&root);
-        let lock_result: Result<Vec<String>, String> =
-            super::super::lock::with_exclusive_lock(&lock_path, move || {
-                let mut warnings: Vec<String> = Vec::new();
+        super::super::lock::with_exclusive_lock(&lock_path, move || {
+            let mut warnings: Vec<String> = Vec::new();
 
-                // Load alc.toml document (preserving comments/formatting).
-                // file absent (Ok(None)) is a normal skip; corruption (Err) is fatal.
-                let mut doc = match load_alc_toml_document(&root) {
-                    Ok(Some(d)) => d,
-                    Ok(None) => return Ok(Vec::new()), // alc.toml not found → skip
-                    Err(e) => {
-                        return Err(ProjectFilesError::AlcTomlLoad(e).to_string());
-                    }
-                };
+            // Load alc.toml document (preserving comments/formatting).
+            // file absent (Ok(None)) is a normal skip; corruption (Err) is fatal.
+            let mut doc = match load_alc_toml_document(&root) {
+                Ok(Some(d)) => d,
+                Ok(None) => return Ok(Vec::new()), // alc.toml not found → skip
+                Err(e) => return Err(ProjectFilesError::AlcTomlLoad(e)),
+            };
 
-                // Load or create alc.lock.
-                // file absent (Ok(None)) → start with empty lockfile (normal init path).
-                // corruption (Err) is fatal — same policy as alc.toml.
-                let mut lock = match load_lockfile(&root) {
-                    Ok(Some(l)) => l,
-                    Ok(None) => LockFile {
-                        version: 1,
-                        packages: Vec::new(),
-                    },
-                    Err(e) => {
-                        return Err(ProjectFilesError::AlcLockLoad(e).to_string());
-                    }
-                };
+            // Load or create alc.lock.
+            // file absent (Ok(None)) → start with empty lockfile (normal init path).
+            // corruption (Err) is fatal — same policy as alc.toml.
+            let mut lock = match load_lockfile(&root) {
+                Ok(Some(l)) => l,
+                Ok(None) => LockFile {
+                    version: 1,
+                    packages: Vec::new(),
+                },
+                Err(e) => return Err(ProjectFilesError::AlcLockLoad(e)),
+            };
 
-                for (name, version) in &resolved {
-                    // Add to alc.toml (no-op if already present).
-                    add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
-                    // Upsert into alc.lock with the pre-resolved version.
-                    upsert_lock_entry(
-                        &mut lock,
-                        name.clone(),
-                        version.clone(),
-                        PackageSource::Installed,
-                    );
-                }
+            for (name, version) in &resolved {
+                // Add to alc.toml (no-op if already present).
+                add_package_entry(&mut doc, name, &PackageDep::Version("*".to_string()));
+                // Upsert into alc.lock with the pre-resolved version.
+                upsert_lock_entry(
+                    &mut lock,
+                    name.clone(),
+                    version.clone(),
+                    PackageSource::Installed,
+                );
+            }
 
-                // Save failures are non-fatal: collect as warnings so the caller
-                // can surface them in the response JSON. Both saves are attempted
-                // independently (one failure does not skip the other).
-                if let Err(e) = save_alc_toml(&root, &doc) {
-                    warnings.push(ProjectFilesError::AlcTomlSave(e).to_string());
-                }
-                if let Err(e) = save_lockfile(&root, &lock) {
-                    warnings.push(ProjectFilesError::AlcLockSave(e).to_string());
-                }
-                Ok(warnings)
-            });
-
-        // Lock acquisition failure or closure fatal err (load failure) is surfaced
-        // as a typed ProjectFilesError::Lock so callers can inspect it.
-        match lock_result {
-            Ok(ws) => Ok(ws),
-            Err(e) => Err(ProjectFilesError::Lock(e)),
-        }
+            // Save failures are non-fatal: collect as warnings so the caller
+            // can surface them in the response JSON. Both saves are attempted
+            // independently (one failure does not skip the other).
+            if let Err(e) = save_alc_toml(&root, &doc) {
+                warnings.push(ProjectFilesError::AlcTomlSave(e).to_string());
+            }
+            if let Err(e) = save_lockfile(&root, &lock) {
+                warnings.push(ProjectFilesError::AlcLockSave(e).to_string());
+            }
+            Ok(warnings)
+        })
     }
 
     /// Fetch package version via `eval_simple` (best-effort; returns `None` on failure).

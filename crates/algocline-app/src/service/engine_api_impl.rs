@@ -168,7 +168,9 @@ impl EngineApi for AppService {
             verbose,
         };
 
-        AppService::pkg_list(self, project_root, opts).await
+        AppService::pkg_list(self, project_root, opts)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {

@@ -88,6 +88,7 @@ use super::manifest;
 use super::resolve::AUTO_INSTALL_SOURCES;
 use super::source::PackageSource;
 use super::AppService;
+use super::HubRegistriesError;
 
 // ─── Constants ─────────────────────────────────────────────────
 
@@ -253,22 +254,22 @@ fn registries_path(app_dir: &AppDir) -> PathBuf {
 /// when the file exists but cannot be read (I/O error) or parsed (corrupt
 /// JSON), so callers can surface the failure instead of silently degrading hub
 /// discovery.
-fn load_registries(app_dir: &AppDir) -> Result<HubRegistries, String> {
+fn load_registries(app_dir: &AppDir) -> Result<HubRegistries, HubRegistriesError> {
     let path = registries_path(app_dir);
     if !path.exists() {
         return Ok(HubRegistries::default());
     }
     let content = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
+        HubRegistriesError::Parse(format!(
             "failed to read hub_registries.json at {}: {e}",
             path.display()
-        )
+        ))
     })?;
     serde_json::from_str::<HubRegistries>(&content).map_err(|e| {
-        format!(
+        HubRegistriesError::Parse(format!(
             "failed to parse hub_registries.json at {}: {e}",
             path.display()
-        )
+        ))
     })
 }
 
@@ -451,7 +452,9 @@ fn discover_index_urls(
     // 1. From hub registries (primary). Parse failure is propagated so
     // callers know the registry is degraded — a partial URL set from a
     // corrupt file is indistinguishable from intentionally empty.
-    let reg = load_registries(app_dir)?;
+    // `HubRegistriesError` is converted to `String` at the wire boundary
+    // (`discover_index_urls` still returns `Result<_, String>`).
+    let reg = load_registries(app_dir).map_err(|e| e.to_string())?;
     for entry in &reg.registries {
         let normalized = entry.source.trim_end_matches('/').to_string();
         if !normalized.is_empty() {
@@ -1819,7 +1822,7 @@ mod tests {
         std::fs::write(&path, b"not valid json {{{").unwrap();
         let result = load_registries(&app_dir);
         assert!(result.is_err(), "corrupt JSON must propagate Err");
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("parse"),
             "error message should mention parse: {msg}"

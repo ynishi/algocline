@@ -15,6 +15,7 @@ use super::super::project::resolve_project_root;
 use super::super::resolve::{is_system_package, packages_dir};
 use super::super::source::PackageSource;
 use super::super::AppService;
+use super::super::{PkgListError, ServiceError};
 
 // ─── Intermediate DTO for pkg_list ───────────────────────────────
 
@@ -206,7 +207,7 @@ impl AppService {
         &self,
         project_root: Option<String>,
         opts: ListOpts,
-    ) -> Result<String, String> {
+    ) -> Result<String, ServiceError> {
         // ── Resolve list-tool knobs up-front ─────────────────────────────
         // Validate sort / verbose strings before doing any filesystem IO
         // so user-input errors short-circuit fast.
@@ -219,13 +220,14 @@ impl AppService {
         // (DESC) is the only way to satisfy that with the bool ordering
         // contract — see context-st2.md Pitfall #3.
         let sort_str = opts.sort.as_deref().unwrap_or("-active,-installed_at");
-        let sort_keys = parse_sort(sort_str)?;
+        let sort_keys = parse_sort(sort_str).map_err(ServiceError::InvalidInput)?;
         let fields = resolve_fields(
             opts.verbose.as_deref(),
             opts.fields.as_deref(),
             PKG_LIST_SUMMARY,
             PKG_LIST_FULL,
-        )?;
+        )
+        .map_err(ServiceError::InvalidInput)?;
 
         // ── Load manifest once upfront ─────────────────────────────────────
         // Errors here (I/O, JSON corruption, permission denied) are
@@ -233,7 +235,8 @@ impl AppService {
         // shows "0 packages" for a corrupted `installed.json` is worse
         // than a structured error the operator can act on.
         let app_dir = self.log_config.app_dir();
-        let manifest_data = manifest::load_manifest(&app_dir)?;
+        let manifest_data = manifest::load_manifest(&app_dir)
+            .map_err(|e| ServiceError::InvalidInput(e.to_string()))?;
 
         // ── Project-local packages (from alc.toml + alc.lock) ─────────────
         let resolved_root = resolve_project_root(project_root.as_deref());
@@ -243,7 +246,7 @@ impl AppService {
         let mut entries: Vec<PackageListEntry> = Vec::new();
         let mut project_root_str: Option<String> = None;
         let mut lockfile_path_str: Option<String> = None;
-        let mut pkg_list_warnings: Vec<String> = Vec::new();
+        let mut pkg_list_warnings: Vec<PkgListError> = Vec::new();
 
         if let Some(ref root) = resolved_root {
             project_root_str = Some(root.display().to_string());
@@ -268,7 +271,7 @@ impl AppService {
                         .collect(),
                     Ok(None) => HashMap::new(),
                     Err(e) => {
-                        pkg_list_warnings.push(format!("failed to load alc.lock: {e}"));
+                        pkg_list_warnings.push(PkgListError::LockfileParse(e));
                         HashMap::new()
                     }
                 };
@@ -338,7 +341,7 @@ impl AppService {
                     );
                 }
                 Err(e) => {
-                    pkg_list_warnings.push(format!("failed to load alc.toml: {e}"));
+                    pkg_list_warnings.push(PkgListError::AlcTomlParse(e));
                 }
             }
         }
@@ -642,11 +645,11 @@ return pkg.meta or {{ name = "{name}" }}"#
         }
 
         let json = result.to_string();
-        Ok(splice_response_warnings(
-            &json,
-            "warnings",
-            &pkg_list_warnings,
-        ))
+        // Wire boundary: flatten typed PkgListError warnings to strings for
+        // the MCP wire response. The Display impl on each variant produces the
+        // human-readable message that operators see in the `warnings` array.
+        let wire_warnings: Vec<String> = pkg_list_warnings.iter().map(|e| e.to_string()).collect();
+        Ok(splice_response_warnings(&json, "warnings", &wire_warnings))
     }
 }
 
@@ -699,22 +702,23 @@ fn resolve_project_pkg_info(
 /// `algocline_engine::VariantPkg`. They have the highest priority — same-name
 /// project / global entries are demoted to `active: false`.
 ///
-/// Returns a `Vec<String>` of warnings for any corruption encountered. File-
-/// absent (`Ok(None)`) is a normal state and produces no warning. The caller
-/// (`pkg_list`) is responsible for splicing warnings into the MCP wire response.
+/// Returns a `Vec<PkgListError>` of warnings for any corruption encountered.
+/// File-absent (`Ok(None)`) is a normal state and produces no warning. The
+/// caller (`pkg_list`) is responsible for converting to `Vec<String>` before
+/// splicing into the MCP wire response.
 fn collect_variant_entries(
     root: &Path,
     variant_names: &mut std::collections::HashSet<String>,
     entries: &mut Vec<PackageListEntry>,
-) -> Vec<String> {
+) -> Vec<PkgListError> {
     let local = match alc_toml::load_alc_local_toml(root) {
         Ok(Some(l)) => l,
         Ok(None) => return vec![],
         Err(e) => {
-            return vec![format!(
+            return vec![PkgListError::AlcLocalTomlParse(format!(
                 "failed to load alc.local.toml at {}: {e}",
                 root.display()
-            )];
+            ))];
         }
     };
 

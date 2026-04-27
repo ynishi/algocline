@@ -19,6 +19,7 @@ algocline-engine = { path = "crates/algocline-engine", version = "0.30.0" }
 algocline-app = { path = "crates/algocline-app", version = "0.30.0" }
 algocline-mcp = { path = "crates/algocline-mcp", version = "0.30.0" }
 
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = { version = "0.8", features = ["preserve_order"] }
@@ -51,6 +52,7 @@ path = "src/main.rs"
 algocline-app = { workspace = true }
 algocline-engine = { workspace = true }
 algocline-mcp = { workspace = true }
+clap = { workspace = true }
 
 rmcp = { version = "1.5", features = ["server", "transport-io"] }
 

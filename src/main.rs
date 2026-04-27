@@ -52,7 +52,39 @@ use std::sync::Arc;
 use algocline_app::{AppConfig, AppService, EngineApi};
 use algocline_engine::Executor;
 use algocline_mcp::AlcService;
+use clap::{Parser, Subcommand};
 use rmcp::{transport::stdio, ServiceExt};
+
+#[derive(Parser)]
+#[command(
+    name = "alc",
+    version,
+    about = "algocline — LLM amplification engine (MCP server)"
+)]
+#[command(
+    long_about = "By default `alc` runs as an MCP stdio server, intended to be launched \
+by an MCP client such as Claude Code. Use subcommands for one-shot maintenance tasks. \
+For ad-hoc shell access to MCP tools, run `alc` from an agent-block harness that calls the \
+MCP server directly."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Install bundled packages into ~/.algocline/packages/
+    Init {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    /// Re-install bundled packages with --force (alias for `init --force`)
+    Update {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+}
 
 fn setup_tracing(log_dir: Option<&std::path::Path>) -> anyhow::Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -106,16 +138,12 @@ fn resolve_lib_paths() -> Vec<algocline_app::SearchPath> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    // `alc init` — install bundled packages (skip existing)
-    if args.get(1).is_some_and(|a| a == "init") {
-        return init::run(&args[2..], false).await;
-    }
-
-    // `alc update` — update all bundled packages (alias for init --force)
-    if args.get(1).is_some_and(|a| a == "update") {
-        return init::run(&args[2..], true).await;
+    match cli.command {
+        Some(Commands::Init { rest }) => return init::run(&rest, false).await,
+        Some(Commands::Update { rest }) => return init::run(&rest, true).await,
+        None => {} // fall through to MCP server mode
     }
 
     // Default: MCP server mode

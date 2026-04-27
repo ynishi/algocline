@@ -3996,3 +3996,82 @@ async fn test_mcp_resources_complete_prompt_ref_returns_empty() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── CLI dry-run tests (no MCP harness) ──────────────────────────────────────
+
+/// Resolve the path to the `alc` binary, mirroring the logic in `connect()`.
+fn alc_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_alc")
+        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")))
+}
+
+#[test]
+fn test_cli_help_short() {
+    let output = std::process::Command::new(alc_bin())
+        .arg("-h")
+        .output()
+        .expect("failed to run alc -h");
+
+    assert!(
+        output.status.success(),
+        "alc -h exited with non-zero status: {}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Usage:"),
+        "alc -h stdout missing 'Usage:': {stdout}"
+    );
+}
+
+#[test]
+fn test_cli_help_long() {
+    let output = std::process::Command::new(alc_bin())
+        .arg("--help")
+        .output()
+        .expect("failed to run alc --help");
+
+    assert!(
+        output.status.success(),
+        "alc --help exited with non-zero status: {}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("init"),
+        "alc --help stdout missing 'init': {stdout}"
+    );
+    assert!(
+        stdout.contains("update"),
+        "alc --help stdout missing 'update': {stdout}"
+    );
+}
+
+#[test]
+fn test_cli_version() {
+    let output = std::process::Command::new(alc_bin())
+        .arg("-V")
+        .output()
+        .expect("failed to run alc -V");
+
+    assert!(
+        output.status.success(),
+        "alc -V exited with non-zero status: {}",
+        output.status
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // clap uses the binary name from #[command(name = "alc", ...)], so the
+    // version line is "alc X.Y.Z"
+    assert!(
+        stdout.contains("alc"),
+        "alc -V stdout missing binary name 'alc': {stdout}"
+    );
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "alc -V stdout missing version '{}': {stdout}",
+        env!("CARGO_PKG_VERSION")
+    );
+}

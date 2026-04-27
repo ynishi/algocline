@@ -60,6 +60,13 @@ It also distributes `alc.d.lua` — LuaCats type definitions for all `alc.*` Std
 
 ### 3. Add to your MCP config
 
+By default, `alc` runs as an MCP stdio server — it is designed to be launched by an MCP client
+such as Claude Code, not invoked directly from a shell. For one-shot maintenance tasks, use the
+`alc init` and `alc update` subcommands. For ad-hoc shell access to algocline MCP tools, set up
+an agent-block harness that starts `alc` as a child process and calls the MCP server directly;
+running plain `alc` from a terminal will start the server in the foreground waiting for an MCP
+client connection. Run `alc --help` for a summary of available subcommands.
+
 Add algocline as an MCP server in your host's configuration (e.g. Claude Code's `~/.claude.json`, Cursor's MCP settings, etc.):
 
 ```json

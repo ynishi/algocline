@@ -1000,6 +1000,7 @@ mod tests {
                     _code_file: Option<String>,
                     _ctx: Option<serde_json::Value>,
                     _project_root: Option<String>,
+                    _host_mode: Option<bool>,
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1679,6 +1680,7 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
             _: Option<String>,
+            _: Option<bool>,
         ) -> Result<String, String> {
             Err("noop".into())
         }
@@ -1939,6 +1941,7 @@ mod tests {
                 _: Option<String>,
                 _: Option<serde_json::Value>,
                 _: Option<String>,
+                _: Option<bool>,
             ) -> Result<String, String> {
                 Err("noop".into())
             }

@@ -238,12 +238,27 @@ impl PoolRegistry {
 
         #[cfg(unix)]
         self.sessions.retain(|entry| {
+            // Guard u32 → i32 (pid_t) conversion: pids above i32::MAX would
+            // produce a negative value and send the signal to an unintended
+            // process group (K-52).  Treat overflow as "dead" and prune.
+            let pid_t = match i32::try_from(entry.pid) {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        pid = entry.pid,
+                        sid = %entry.sid,
+                        "pid exceeds i32::MAX, treating as dead (K-52)"
+                    );
+                    return false;
+                }
+            };
             // SAFETY: libc::kill(pid, sig) is a thin syscall wrapper.
             // pid > 0 sends to the specific process (never to a group).
             // sig == 0 performs an existence check without delivering a signal.
+            // pid fits in i32, verified by try_from above.
             // Return 0 → process exists (live).
             // Return -1 with errno ESRCH → no such process (dead / orphan).
-            let result = unsafe { libc::kill(entry.pid as libc::pid_t, 0) };
+            let result = unsafe { libc::kill(pid_t, 0) };
             result == 0
         });
 

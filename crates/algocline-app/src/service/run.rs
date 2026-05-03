@@ -31,15 +31,30 @@ fn splice_transcript_warning(result_json: &str, warning: Option<String>) -> Stri
 impl AppService {
     /// Execute Lua code with optional JSON context.
     ///
-    /// `project_root` — optional absolute path to the project root containing
-    /// `alc.lock`. Falls back to `ALC_PROJECT_ROOT` env or ancestor walk.
+    /// When `host_mode: Some(true)` is passed, the call is proxied via
+    /// `PoolClient` to a long-lived worker subprocess over a Unix domain socket.
+    /// When `host_mode` is `None` or `Some(false)` the existing in-process
+    /// `Executor::start_session` path is used unchanged.
+    ///
+    /// **NOTE (ST5 scope)**: this subtask only adds the parameter to the signature.
+    /// The actual host_mode dispatch (worker spawn / PoolClient routing) is
+    /// implemented in ST6. In ST5, `host_mode=Some(true)` is silently treated as
+    /// `None` (existing path) for now.
+    ///
+    /// # Concurrency
+    ///
+    /// **host_mode=false (default)**: No additional locking beyond `SessionRegistry`
+    /// lock C. `AppService` itself holds no long-lived lock during this call.
     pub async fn run(
         &self,
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
         project_root: Option<String>,
+        host_mode: Option<bool>,
     ) -> Result<String, String> {
+        tracing::trace!("host_mode received but dispatch deferred to ST6");
+        let _ = host_mode;
         let code = resolve_code(code, code_file)?;
         let ctx = ctx.unwrap_or(serde_json::Value::Null);
         let (extra, extra_warnings) = self.resolve_extra_lib_paths(project_root.as_deref());

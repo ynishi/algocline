@@ -22,8 +22,9 @@ impl EngineApi for AppService {
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
         project_root: Option<String>,
+        host_mode: Option<bool>,
     ) -> Result<String, String> {
-        AppService::run(self, code, code_file, ctx, project_root).await
+        AppService::run(self, code, code_file, ctx, project_root, host_mode).await
     }
 
     async fn advice(

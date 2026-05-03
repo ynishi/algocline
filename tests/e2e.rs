@@ -2026,6 +2026,86 @@ return M
     client.cancel().await.expect("cancel failed");
 }
 
+/// Pool session survives MCP restart and can be resumed via registry.json reconnect.
+///
+/// Acceptance criterion 3 from subtask-6.md: a `host_mode=true` session paused by
+/// `alc.llm(...)` must remain continuable after the originating MCP process
+/// (AppService) dies and a brand-new AppService starts against the same ALC_HOME.
+///
+/// Verifies Crux constraint: Registry reconnect — registry.json persists atomically
+/// and survives MCP process death.
+#[tokio::test]
+async fn host_mode_paused_session_survives_appservice_restart() {
+    // Use an isolated ALC_HOME so the pool registry is clean.
+    // Use /tmp directly to avoid exceeding SUN_LEN (104/108 bytes on macOS/Linux).
+    // tempfile::tempdir() on macOS expands to /var/folders/.../ which can be
+    // > 90 chars before the socket filename, leaving < 14 chars for the name.
+    // /tmp is short (4 chars) leaving ~100 chars for the socket path.
+    let tmp = tempfile::Builder::new()
+        .prefix("alc-e2e-")
+        .tempdir_in("/tmp")
+        .expect("tempdir in /tmp");
+    let alc_home = tmp.path();
+
+    // ── Step 1: First MCP session — run with host_mode=true, pauses on alc.llm. ──
+    let client1 = connect_with_alc_home(alc_home).await;
+    let resp1 = call_json(
+        &client1,
+        "alc_run",
+        json!({
+            "code": "return alc.llm('What is 1+1?')",
+            "host_mode": true,
+        }),
+    )
+    .await;
+
+    // The pool worker pauses execution at alc.llm; the MCP layer returns needs_response.
+    assert_eq!(
+        resp1.get("status").and_then(|v| v.as_str()),
+        Some("needs_response"),
+        "host_mode=true alc_run must pause on alc.llm; got: {resp1}"
+    );
+    let session_id = resp1
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("session_id missing from alc_run response: {resp1}"))
+        .to_string();
+
+    // ── Step 2: Simulate MCP restart — cancel (kill) the first client. ──
+    client1.cancel().await.expect("cancel client1");
+
+    // ── Step 3: Second MCP session — new AppService, same ALC_HOME. ──
+    let client2 = connect_with_alc_home(alc_home).await;
+    let resp2 = call_json(
+        &client2,
+        "alc_continue",
+        json!({
+            "session_id": session_id,
+            "response": "2",
+        }),
+    )
+    .await;
+
+    // ── Step 4: Verify the worker was resumed, not "session not found". ──
+    // The worker process is still alive (setsid makes it independent of the MCP
+    // parent).  registry.json carries the UDS socket path needed for reconnect.
+    let err_text = resp2.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !err_text.contains("session not found in pool") && !err_text.contains("not found"),
+        "worker must survive MCP restart and be resumable via registry.json; \
+         got error: {err_text:?}, full response: {resp2}"
+    );
+
+    let status = resp2.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        status == "completed" || status == "needs_response",
+        "continue after restart must succeed (status=completed or needs_response), \
+         got status={status:?}, full response: {resp2}"
+    );
+
+    client2.cancel().await.expect("cancel client2");
+}
+
 #[tokio::test]
 async fn test_alc_hub_dist_with_toml_config_context7() {
     let client = connect().await;

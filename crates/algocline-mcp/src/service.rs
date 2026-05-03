@@ -32,6 +32,10 @@ pub struct RunParams {
     /// Optional absolute path to the project root containing `alc.lock`.
     /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
     pub project_root: Option<String>,
+    /// Whether to route this execution through the persistent host-mode pool.
+    /// `None` (default) and `false` use the existing in-process path unchanged.
+    #[serde(default)]
+    pub host_mode: Option<bool>,
 }
 
 /// Host-reported token usage for an LLM call (MCP schema).
@@ -791,6 +795,7 @@ impl AlcService {
                 params.code_file,
                 params.ctx,
                 params.project_root,
+                params.host_mode,
             )
             .await
     }

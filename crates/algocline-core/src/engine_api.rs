@@ -28,12 +28,18 @@ pub trait EngineApi: Send + Sync {
     // ─── Core execution ──────────────────────────────────────
 
     /// Execute Lua code with optional JSON context.
+    ///
+    /// When `host_mode: Some(true)` is passed, the call is proxied via
+    /// `PoolClient` to a long-lived worker subprocess over a Unix domain socket.
+    /// When `host_mode` is `None` or `Some(false)` the existing in-process
+    /// `Executor::start_session` path is used unchanged.
     async fn run(
         &self,
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
         project_root: Option<String>,
+        host_mode: Option<bool>,
     ) -> Result<String, String>;
 
     /// Apply an installed strategy package. Task is optional.

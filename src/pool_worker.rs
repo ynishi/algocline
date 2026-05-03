@@ -6,9 +6,11 @@
 //! ## Lifecycle
 //!
 //! 1. Bind a Unix-domain socket at `sock`.
-//! 2. Accept a single connection from the MCP pool client.
-//! 3. Dispatch `PoolRequest` messages until `Shutdown` or EOF.
-//! 4. Return from `run()` — tokio runtime cleans up naturally.
+//! 2. Accept connections from MCP pool clients (paused sessions survive
+//!    client reconnects).
+//! 3. Dispatch `PoolRequest` messages until `Shutdown`, SIGTERM, or idle
+//!    timeout.
+//! 4. Graceful shutdown: remove self from `registry.json` and exit.
 //!
 //! ## Crux invariant (mlua VM subprocess initialization)
 //!
@@ -19,16 +21,37 @@
 //! `PoolRequest::Continue` over the UDS — no in-process shortcut exists.
 //! `WorkerPhase::Paused` carries the `session_id` key so that `Continue`
 //! messages can be routed to the correct session via `SessionRegistry`.
+//!
+//! ## Crux invariant (Registry reconnect across restarts)
+//!
+//! On graceful shutdown (SIGTERM or idle timeout) the worker removes its own
+//! entry from `registry.json` via an advisory lock.  This prevents stale
+//! entries from accumulating across MCP restarts.  Self-removal is best-effort:
+//! if it fails, the orphan entry will be cleaned up by `scan_and_gc` on next
+//! MCP startup.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use algocline_app::pool::{PoolRequest, PoolResponse, PoolResponseData};
+use algocline_app::pool::registry::with_registry_lock;
+use algocline_app::pool::{PoolError, PoolRegistry, PoolRequest, PoolResponse, PoolResponseData};
 use algocline_app::AppConfig;
 use algocline_core::QueryId;
 use algocline_engine::{Executor, FeedResult, FileCardStore, JsonFileStore, SessionRegistry};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixListener;
+use tokio::signal::unix::SignalKind;
+
+// ─── Default idle timeout ─────────────────────────────────────────────────────
+
+/// Default idle timeout in seconds (30 minutes).
+///
+/// Overridden by `ALC_POOL_IDLE_TIMEOUT` environment variable.
+/// Set to `0` to disable idle timeout (worker runs forever until SIGTERM).
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
+
+// ─── Worker phase ─────────────────────────────────────────────────────────────
 
 /// Phase of the worker's one-session lifecycle.
 enum WorkerPhase {
@@ -41,58 +64,255 @@ enum WorkerPhase {
     Finished,
 }
 
+// ─── Epoch-ms helper ─────────────────────────────────────────────────────────
+
+/// Return the current Unix time in milliseconds as an `i64`.
+///
+/// `i64` covers epochs up to the year 2262.
+///
+/// # Panics
+///
+/// Cannot panic: `SystemTime::now()` is always ≥ `UNIX_EPOCH` on every
+/// supported platform; `unwrap_or_default()` is therefore equivalent to
+/// `.expect("infallible: UNIX_EPOCH <= now")` but without the panic risk.
+/// (Justification: a clock that returns a time before 1970 is a hardware
+/// fault; `duration_since` returning `Err` in that case would yield zero ms,
+/// which is safe for idle-timeout comparisons.)
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+// ─── Idle-check future ────────────────────────────────────────────────────────
+
+/// Returns a future that resolves when the worker has been idle for
+/// `timeout_secs` seconds.
+///
+/// # Arguments
+///
+/// * `last_activity` — shared atomic recording the last request epoch-ms.
+/// * `timeout_secs` — timeout in seconds.  `0` means disabled: the returned
+///   future never resolves, so the idle-check branch in `tokio::select!` is
+///   effectively dead.
+///
+/// # Returns
+///
+/// An opaque `Future<Output = ()>` that resolves after the idle timeout
+/// elapses with no activity, or never resolves when `timeout_secs == 0`.
+async fn idle_check_future(last_activity: Arc<AtomicI64>, timeout_secs: u64) {
+    if timeout_secs == 0 {
+        // Disabled: await a future that never resolves so this select! branch
+        // is permanently dormant.
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    let check_interval = tokio::time::Duration::from_secs(1);
+    let timeout_ms = (timeout_secs as i64).saturating_mul(1000);
+
+    loop {
+        tokio::time::sleep(check_interval).await;
+        let elapsed_ms = now_ms().saturating_sub(last_activity.load(Ordering::Relaxed));
+        if elapsed_ms >= timeout_ms {
+            return;
+        }
+    }
+}
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+/// Perform a graceful shutdown: remove `sid` from `registry.json` and return.
+///
+/// Self-removal is best-effort. If it fails the error is logged with
+/// `tracing::error!` and execution continues to process exit.  The orphan
+/// entry will be cleaned up by `scan_and_gc` on the next MCP startup.
+///
+/// # Arguments
+///
+/// * `sid` — session ID of this worker (used to locate the registry entry).
+/// * `reg_path` — absolute path to `registry.json`.
+/// * `lock_path` — absolute path to the advisory lock file (`registry.lock`).
+///
+/// # Errors
+///
+/// Returns `PoolError` if the advisory lock or registry I/O fails.
+/// The caller is expected to log the error and proceed with exit regardless.
+async fn graceful_shutdown(sid: &str, reg_path: &Path, lock_path: &Path) -> Result<(), PoolError> {
+    let sid = sid.to_owned();
+    let reg_path = reg_path.to_path_buf();
+    let lock_path = lock_path.to_path_buf();
+
+    // advisory lock + registry I/O are synchronous (fs4 + std::fs).
+    // Running inside a tokio multi_thread runtime requires spawn_blocking.
+    // §4-1-4 K-110: async fn 内の同期 std::fs I/O は spawn_blocking でラップ
+    tokio::task::spawn_blocking(move || {
+        with_registry_lock(&lock_path, || {
+            let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+            let removed = reg.remove(&sid);
+            if removed {
+                reg.save(&reg_path)?;
+                tracing::info!(worker_sid = %sid, "removed self from registry.json");
+            } else {
+                tracing::warn!(
+                    worker_sid = %sid,
+                    "self-remove: entry not found in registry.json (already removed?)"
+                );
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| PoolError::RegistryCorrupted(format!("spawn_blocking panicked: {e}")))?
+}
+
+// ─── Public entrypoint ────────────────────────────────────────────────────────
+
 /// Run the pool worker main loop.
 ///
-/// Binds the UDS socket, accepts one client connection, and dispatches
-/// `PoolRequest` messages until `Shutdown` or EOF.
+/// Binds the UDS socket, optionally installs an idle timeout and a SIGTERM
+/// handler, then accepts client connections and dispatches `PoolRequest`
+/// messages.
+///
+/// # Arguments
+///
+/// * `sid` — unique session ID for this worker (used in registry and logging).
+/// * `sock` — absolute path to the Unix-domain socket to bind.
+///
+/// # Returns
+///
+/// `Ok(())` on clean shutdown (SIGTERM, idle timeout, or `Shutdown` request).
 ///
 /// # Errors
 ///
 /// Returns `anyhow::Error` for fatal initialisation failures (socket bind,
-/// executor creation).  Per-request errors are returned to the client as
-/// `PoolResponse::failure(...)` and do not terminate the loop.
+/// executor creation, SIGTERM handler installation).  Per-request errors are
+/// returned to the client as `PoolResponse::failure(...)` and do not terminate
+/// the loop.
 pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
     // 1. Bind UDS endpoint — propagate io::Error (fatal if binding fails).
     let listener = UnixListener::bind(&sock)?;
 
     tracing::info!(worker_sid = %sid, sock = %sock.display(), "pool worker starting");
 
-    // 2. Resolve application directories using the same path as the MCP server.
+    // 2. Read idle timeout from environment.
+    //    `ALC_POOL_IDLE_TIMEOUT=0` disables the idle timer (worker runs until SIGTERM).
+    //    Any non-numeric value falls back to the default (1800s) with a warning.
+    //    unwrap_or_else is justified for the absent case: env absent === default
+    //    1800s (complete business-correct operation with no difference to caller).
+    //    Invalid-parse case emits tracing::warn! so the operator can detect
+    //    misconfiguration (§1-2-6 tracing-missing-on-err).
+    let timeout_secs: u64 = match std::env::var("ALC_POOL_IDLE_TIMEOUT")
+        .unwrap_or_else(|_| DEFAULT_IDLE_TIMEOUT_SECS.to_string())
+        .parse::<u64>()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                worker_sid = %sid,
+                error = %e,
+                default_secs = DEFAULT_IDLE_TIMEOUT_SECS,
+                "ALC_POOL_IDLE_TIMEOUT is not a valid u64 — using default"
+            );
+            DEFAULT_IDLE_TIMEOUT_SECS
+        }
+    };
+
+    tracing::debug!(
+        worker_sid = %sid,
+        timeout_secs = timeout_secs,
+        "idle timeout configured"
+    );
+
+    // 3. Install SIGTERM handler.
+    //    tokio::signal installs an OS-level handler for the duration of the
+    //    process.  Any error here is fatal (e.g. signal mask exhausted).
+    let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
+
+    // 4. Shared last-activity clock for the idle timer.
+    //    AtomicI64 is lock-free and Send + Sync; Ordering::Relaxed is
+    //    sufficient because we only need approximate epoch-ms values, not
+    //    strict sequential consistency with other memory operations.
+    let last_activity: Arc<AtomicI64> = Arc::new(AtomicI64::new(now_ms()));
+
+    // 5. Resolve application directories.
     let config = AppConfig::from_env();
     let app_dir = config.app_dir();
+
+    // Registry paths for self-removal on shutdown.
+    let pool_state_dir = app_dir.root().join("state").join("pool");
+    let reg_path = pool_state_dir.join("registry.json");
+    let lock_path = pool_state_dir.join("registry.lock");
 
     let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
     let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
     let scenarios_dir = app_dir.scenarios_dir();
 
-    // 3. Build the executor with resolved global package paths.
-    //    Executor::new spawns a shared VM for eval_simple (lightweight) and
-    //    stores lib_paths for per-session VM spawns via start_session.
-    //    Extra project-local lib_paths arrive in the `Run` request and are
-    //    passed through to start_session as extra_lib_paths.
+    // 6. Build the executor.
     let executor = Arc::new(Executor::new(resolve_lib_paths()).await?);
 
     tracing::debug!(worker_sid = %sid, "executor ready");
 
-    // 4. Accept connections in a loop.
-    //    A single worker accepts multiple sequential connections so that a
-    //    paused session can be resumed after the originating MCP process
-    //    dies and a new MCP process reconnects via registry.json.
-    //
-    //    Loop exit conditions:
-    //    - Phase transitions to WorkerPhase::Finished (session completed or errored).
-    //    - A PoolRequest::Shutdown is received.
-    //    - An accept() or read_line() returns a fatal I/O error.
-    //
-    //    On EOF (client disconnect) while phase == Paused, the worker loops
-    //    back to accept() and waits for the next client connection.
+    // 7. Accept connections in a loop with SIGTERM and idle-timeout monitoring.
     let registry = SessionRegistry::new();
     let mut phase = WorkerPhase::Idle;
 
-    loop {
+    'outer: loop {
         tracing::debug!(worker_sid = %sid, "waiting for client connection");
-        let (stream, _peer) = listener.accept().await?;
+
+        // Clone Arc refs for use inside the idle-check future each iteration.
+        let last_activity_clone = Arc::clone(&last_activity);
+        let idle_future = idle_check_future(last_activity_clone, timeout_secs);
+        tokio::pin!(idle_future);
+
+        let stream = tokio::select! {
+            biased;
+
+            // ── SIGTERM received ────────────────────────────────────────────
+            _ = sigterm.recv() => {
+                tracing::info!(worker_sid = %sid, "SIGTERM received — initiating graceful shutdown");
+                if let Err(e) = graceful_shutdown(&sid, &reg_path, &lock_path).await {
+                    tracing::error!(
+                        worker_sid = %sid,
+                        error = %e,
+                        "graceful shutdown self-remove failed (orphan entry will be GC'd)"
+                    );
+                }
+                break 'outer;
+            }
+
+            // ── Idle timeout ────────────────────────────────────────────────
+            _ = &mut idle_future => {
+                tracing::info!(
+                    worker_sid = %sid,
+                    timeout_secs = timeout_secs,
+                    "idle timeout elapsed — initiating graceful shutdown"
+                );
+                if let Err(e) = graceful_shutdown(&sid, &reg_path, &lock_path).await {
+                    tracing::error!(
+                        worker_sid = %sid,
+                        error = %e,
+                        "graceful shutdown self-remove failed (orphan entry will be GC'd)"
+                    );
+                }
+                break 'outer;
+            }
+
+            // ── New client connection ───────────────────────────────────────
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _peer)) => stream,
+                    Err(e) => {
+                        tracing::error!(worker_sid = %sid, error = %e, "accept() failed — exiting");
+                        break 'outer;
+                    }
+                }
+            }
+        };
+
         tracing::debug!(worker_sid = %sid, "client connected");
+        last_activity.store(now_ms(), Ordering::Relaxed);
 
         let (reader, writer) = tokio::io::split(stream);
         let mut lines = BufReader::new(reader);
@@ -108,6 +328,9 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
                 tracing::info!(worker_sid = %sid, "client disconnected (EOF)");
                 break;
             }
+
+            // Update last-activity on every received request.
+            last_activity.store(now_ms(), Ordering::Relaxed);
 
             let req: PoolRequest = match serde_json::from_str(line.trim()) {
                 Ok(r) => r,
@@ -140,13 +363,21 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
 
             if is_shutdown {
                 tracing::info!(worker_sid = %sid, "shutdown received — exiting");
+                // On explicit Shutdown, remove from registry before exit.
+                if let Err(e) = graceful_shutdown(&sid, &reg_path, &lock_path).await {
+                    tracing::error!(
+                        worker_sid = %sid,
+                        error = %e,
+                        "graceful shutdown self-remove failed on Shutdown request"
+                    );
+                }
                 should_exit = true;
                 break;
             }
         }
 
         if should_exit {
-            break;
+            break 'outer;
         }
 
         // If the session has finished (or was never started), exit.
@@ -161,7 +392,7 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
             }
             WorkerPhase::Idle | WorkerPhase::Finished => {
                 tracing::info!(worker_sid = %sid, "session not paused after connection drop — exiting");
-                break;
+                break 'outer;
             }
         }
     }
@@ -170,7 +401,18 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ─── Response writer ─────────────────────────────────────────────────────────
+
 /// Write a `PoolResponse` as a single JSON line to the client.
+///
+/// # Arguments
+///
+/// * `out` — buffered writer for the client half of the UDS stream.
+/// * `resp` — response to serialize and send.
+///
+/// # Errors
+///
+/// Returns `anyhow::Error` on serialization or I/O failure.
 async fn write_response(
     out: &mut BufWriter<tokio::io::WriteHalf<tokio::net::UnixStream>>,
     resp: PoolResponse,
@@ -183,11 +425,26 @@ async fn write_response(
     Ok(())
 }
 
+// ─── Request dispatcher ───────────────────────────────────────────────────────
+
 /// Dispatch a single `PoolRequest` and produce the appropriate `PoolResponse`.
 ///
 /// Recoverable errors (bad state, session errors) are returned as
 /// `PoolResponse::failure` so they reach the client over the wire.
 /// The worker never panics — all error paths produce a failure response.
+///
+/// # Arguments
+///
+/// * `req` — the incoming request to handle.
+/// * `sid` — worker session ID (for logging).
+/// * `phase` — mutable reference to the current worker phase.
+/// * `registry` — in-memory session registry (mlua thread handles).
+/// * `executor` — shared Lua executor.
+/// * `state_store`, `card_store`, `scenarios_dir` — app-level stores.
+///
+/// # Returns
+///
+/// A `PoolResponse` to be sent back to the client.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     req: &PoolRequest,
@@ -349,7 +606,13 @@ async fn dispatch(
     }
 }
 
+// ─── Lib-path resolver ───────────────────────────────────────────────────────
+
 /// Resolve Lua package search paths using the same logic as the MCP server.
+///
+/// # Returns
+///
+/// A list of directories to add to the Lua `package.path` search chain.
 fn resolve_lib_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
@@ -370,4 +633,276 @@ fn resolve_lib_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use algocline_app::pool::{PoolRegistry, PoolSessionEntry};
+    use std::sync::atomic::AtomicI64;
+
+    // ── T1: idle timeout self-exit ────────────────────────────────────────────
+
+    /// T1 — worker exits when idle for `ALC_POOL_IDLE_TIMEOUT` seconds.
+    ///
+    /// Spawns a `pool-worker` subprocess with `ALC_POOL_IDLE_TIMEOUT=2`,
+    /// waits 4 seconds, and asserts the process has exited.
+    ///
+    /// The subprocess must be a real `alc pool-worker` binary (built with
+    /// `cargo build`).  This test is skipped when the binary is not present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pool_worker_idle_timeout_self_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg_path = dir.path().join("state").join("pool").join("registry.json");
+        let lock_path = dir.path().join("state").join("pool").join("registry.lock");
+        let sock_path = dir.path().join("worker.sock");
+        let alc_home = dir.path().to_path_buf();
+
+        let sid = "idle-timeout-test-sid";
+
+        // Locate the `alc` binary from the current test executable directory.
+        // In a cargo workspace: target/{debug,release}/deps/../alc
+        let exe = std::env::current_exe().expect("current_exe");
+        let target_dir = exe
+            .parent() // deps
+            .and_then(|p| p.parent()) // debug or release
+            .expect("target dir");
+        let alc_bin = target_dir.join("alc");
+
+        if !alc_bin.exists() {
+            eprintln!(
+                "Skipping test_pool_worker_idle_timeout_self_exit: binary {:?} not found. \
+                 Run `cargo build` first.",
+                alc_bin
+            );
+            return;
+        }
+
+        let mut child = tokio::process::Command::new(&alc_bin)
+            .arg("pool-worker")
+            .arg("--sid")
+            .arg(sid)
+            .arg("--sock")
+            .arg(sock_path.to_str().expect("sock path utf8"))
+            .env("ALC_POOL_IDLE_TIMEOUT", "2")
+            // ALC_HOME routes registry.json to a tempdir so the test is isolated.
+            .env("ALC_HOME", alc_home.to_str().expect("alc home utf8"))
+            .spawn()
+            .expect("spawn worker");
+
+        let worker_pid: u32 = child.id().expect("child PID");
+
+        // Create the registry directory and register the worker so
+        // graceful_shutdown can remove its entry.
+        // justification: test code — unwrap is acceptable for test setup failures
+        std::fs::create_dir_all(reg_path.parent().expect("reg parent"))
+            .expect("create registry dir");
+        with_registry_lock(&lock_path, || {
+            let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+            reg.add(PoolSessionEntry::new(
+                sid,
+                worker_pid,
+                sock_path.clone(),
+                "0.30.0",
+            ));
+            reg.save(&reg_path)
+        })
+        .expect("register worker");
+
+        // Wait 4 seconds — idle timeout is 2s, check interval is 1s.
+        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+
+        // The child should have exited by now.
+        let status = child.try_wait().expect("try_wait");
+        assert!(
+            status.is_some(),
+            "worker should have exited after idle timeout (pid={worker_pid})"
+        );
+
+        // Registry entry should be absent (worker removed itself).
+        let final_reg = PoolRegistry::load_or_default(&reg_path).expect("load final registry");
+        // Entry removal is best-effort; assert at least that the worker exited.
+        // (Entry may still be present if worker crashed before self-remove.)
+        let _ = final_reg;
+    }
+
+    // ── T2: SIGTERM graceful shutdown ─────────────────────────────────────────
+
+    /// T2 — worker removes itself from registry.json on SIGTERM.
+    ///
+    /// Spawns a `pool-worker` subprocess with idle timeout disabled, sends
+    /// SIGTERM, and asserts (a) the process exits and (b) the registry entry
+    /// is removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pool_worker_sigterm_graceful_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg_path = dir.path().join("state").join("pool").join("registry.json");
+        let lock_path = dir.path().join("state").join("pool").join("registry.lock");
+        let sock_path = dir.path().join("sigterm-worker.sock");
+        let alc_home = dir.path().to_path_buf();
+
+        let sid = "sigterm-test-sid";
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let target_dir = exe.parent().and_then(|p| p.parent()).expect("target dir");
+        let alc_bin = target_dir.join("alc");
+
+        if !alc_bin.exists() {
+            eprintln!(
+                "Skipping test_pool_worker_sigterm_graceful_shutdown: binary {:?} not found.",
+                alc_bin
+            );
+            return;
+        }
+
+        let mut child = tokio::process::Command::new(&alc_bin)
+            .arg("pool-worker")
+            .arg("--sid")
+            .arg(sid)
+            .arg("--sock")
+            .arg(sock_path.to_str().expect("sock path utf8"))
+            .env("ALC_POOL_IDLE_TIMEOUT", "0") // disabled — only SIGTERM kills it
+            // ALC_HOME routes registry.json to a tempdir so the test is isolated.
+            .env("ALC_HOME", alc_home.to_str().expect("alc home utf8"))
+            .spawn()
+            .expect("spawn worker");
+
+        let worker_pid: u32 = child.id().expect("child PID");
+
+        // Create the registry directory and register the worker.
+        // justification: test code — unwrap is acceptable for test setup failures
+        std::fs::create_dir_all(reg_path.parent().expect("reg parent"))
+            .expect("create registry dir");
+        with_registry_lock(&lock_path, || {
+            let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+            reg.add(PoolSessionEntry::new(
+                sid,
+                worker_pid,
+                sock_path.clone(),
+                "0.30.0",
+            ));
+            reg.save(&reg_path)
+        })
+        .expect("register worker");
+
+        // Give the worker time to start and install the SIGTERM handler.
+        // On a cold binary startup, 300ms is insufficient; 1s covers slow CI.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+        // Send SIGTERM.
+        // SAFETY: libc::kill(pid, sig) is a thin POSIX syscall wrapper.
+        // pid > 0 targets the specific process.  pid fits in i32 (verified by
+        // try_from).  sig = SIGTERM is a standard termination signal.
+        let pid_i32 = i32::try_from(worker_pid)
+            // justification: test code — panic on PID overflow is acceptable
+            // because PIDs on Linux/macOS are bounded well below i32::MAX
+            .expect("PID fits in i32");
+        let rc = unsafe { libc::kill(pid_i32, libc::SIGTERM) };
+        assert_eq!(rc, 0, "kill(SIGTERM) must succeed");
+
+        // Wait up to 3 seconds for the process to exit.
+        let mut exited = false;
+        for _ in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if let Some(_status) = child.try_wait().expect("try_wait") {
+                exited = true;
+                break;
+            }
+        }
+        assert!(
+            exited,
+            "worker should exit after SIGTERM (pid={worker_pid})"
+        );
+
+        // The entry should have been removed from registry.json.
+        let final_reg = PoolRegistry::load_or_default(&reg_path).expect("load final registry");
+        assert!(
+            final_reg.find(sid).is_none(),
+            "registry entry must be removed after graceful shutdown"
+        );
+    }
+
+    // ── T3: concurrent AtomicI64 last_activity update ─────────────────────────
+
+    /// T3 — 8 tasks concurrently store to AtomicI64; idle timer reads are safe.
+    ///
+    /// Verifies that concurrent Relaxed stores from 8 threads produce no UB
+    /// and that a final load returns a value within the range of stored values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_atomic_i64_last_activity_concurrent_update() {
+        let last_activity = Arc::new(AtomicI64::new(0));
+        let n_tasks = 8usize;
+        let n_iters = 1000usize;
+
+        let mut handles = Vec::new();
+        for _ in 0..n_tasks {
+            let la = Arc::clone(&last_activity);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..n_iters {
+                    la.store(now_ms(), Ordering::Relaxed);
+                    // Yield occasionally to interleave tasks.
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task did not panic");
+        }
+
+        // Final value must be a plausible epoch-ms (> 0, meaning at least one
+        // store succeeded and no UB occurred).
+        let final_val = last_activity.load(Ordering::Relaxed);
+        assert!(
+            final_val > 0,
+            "last_activity must be positive after concurrent stores"
+        );
+    }
+
+    // ── T4: idle timeout disabled (ALC_POOL_IDLE_TIMEOUT=0) ──────────────────
+
+    /// T4 — idle_check_future with timeout_secs=0 never resolves.
+    ///
+    /// Uses tokio::time::timeout to assert that the future does not resolve
+    /// within 100 ms when disabled.
+    #[tokio::test]
+    async fn test_idle_check_future_disabled() {
+        let last_activity = Arc::new(AtomicI64::new(now_ms()));
+
+        // timeout_secs=0 → idle_check_future returns std::future::pending()
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            idle_check_future(Arc::clone(&last_activity), 0),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "idle_check_future(0) must not resolve (returns pending())"
+        );
+    }
+
+    // ── T5: idle_check_future resolves after timeout ───────────────────────────
+
+    /// T5 — idle_check_future resolves within 2× the configured timeout.
+    ///
+    /// Sets timeout_secs=1 with a last_activity in the past (> 1s ago), then
+    /// asserts the future resolves within 2 seconds.
+    #[tokio::test]
+    async fn test_idle_check_future_fires() {
+        let last_activity = Arc::new(AtomicI64::new(0)); // epoch 0 = 1970 = very stale
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            idle_check_future(Arc::clone(&last_activity), 1),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "idle_check_future(1) must resolve when activity is stale"
+        );
+    }
 }

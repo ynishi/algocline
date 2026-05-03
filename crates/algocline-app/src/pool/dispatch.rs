@@ -206,10 +206,11 @@ pub async fn run_via_pool(
     // Write failures are non-fatal: the session was already started.
     // Callers surface the error as `pool_save_error` on the wire response.
     let pool_save_error = persist_entry(
-        reg_path,
-        lock_path,
+        reg_path.to_path_buf(),
+        lock_path.to_path_buf(),
         PoolSessionEntry::new(&worker_sid, pid, sock, env!("CARGO_PKG_VERSION")),
-    );
+    )
+    .await;
 
     Ok((worker_sid, mcp_json.to_string(), pool_save_error))
 }
@@ -408,21 +409,27 @@ fn extract_feed_response(resp: PoolResponse) -> Result<(String, serde_json::Valu
 /// This never returns `Err` — registry write failures are surfaced as
 /// additive `pool_save_error` fields on the MCP response, not as hard errors,
 /// because the session was already started successfully.
-fn persist_entry(reg_path: &Path, lock_path: &Path, entry: PoolSessionEntry) -> Option<String> {
-    // Registry I/O is synchronous; called from async context but we do NOT
-    // use spawn_blocking here because:
-    // (a) this is a brief lock + read + write cycle (~1ms on SSD),
-    // (b) the lock is advisory so no OS-level blocking occurs unless another
-    //     MCP process is simultaneously writing, which is rare,
-    // (c) adding spawn_blocking would require cloning paths and returning a
-    //     JoinHandle, complicating the caller without meaningful latency benefit.
-    match with_registry_lock(lock_path, || {
-        let mut reg = PoolRegistry::load_or_default(reg_path)?;
-        reg.add(entry);
-        reg.save(reg_path)
-    }) {
-        Ok(()) => None,
-        Err(e) => Some(e.to_string()),
+///
+/// Registry I/O is synchronous and held under an advisory flock; the locked
+/// region is wrapped in `spawn_blocking` to avoid stalling a tokio runtime
+/// worker when another MCP process holds the lock.
+async fn persist_entry(
+    reg_path: PathBuf,
+    lock_path: PathBuf,
+    entry: PoolSessionEntry,
+) -> Option<String> {
+    match tokio::task::spawn_blocking(move || {
+        with_registry_lock(&lock_path, || {
+            let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+            reg.add(entry);
+            reg.save(&reg_path)
+        })
+    })
+    .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(format!("spawn_blocking join error: {e}")),
     }
 }
 

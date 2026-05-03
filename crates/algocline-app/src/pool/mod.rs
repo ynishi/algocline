@@ -4,12 +4,14 @@
 //!
 //! - [`error`] — [`PoolError`] enum (thiserror-derived)
 //! - [`protocol`] — [`PoolRequest`] / [`PoolResponse`] wire types (serde JSON line)
+//! - [`client`] — [`PoolClient`] UDS client (connect + handshake + send_request)
 //!
-//! The `client` module (pool client / UDS connection handling) is added in Subtask 2.
 //! The `registry` module (registry.json persistence + GC) is added in Subtask 4.
 
+pub mod client;
 pub mod error;
 pub mod protocol;
 
+pub use client::PoolClient;
 pub use error::PoolError;
 pub use protocol::{PoolRequest, PoolResponse, PoolResponseData};

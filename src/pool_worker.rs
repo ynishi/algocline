@@ -74,62 +74,95 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
 
     tracing::debug!(worker_sid = %sid, "executor ready");
 
-    // 4. Accept exactly one connection.
-    //    The worker never reads stdin — if the parent MCP process dies and
-    //    stdin closes, the UDS accept loop continues uninterrupted.
-    let (stream, _peer) = listener.accept().await?;
-
-    tracing::debug!(worker_sid = %sid, "client connected");
-
-    let (reader, writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader);
-    let mut out = BufWriter::new(writer);
-
-    // 5. Dispatch loop.
+    // 4. Accept connections in a loop.
+    //    A single worker accepts multiple sequential connections so that a
+    //    paused session can be resumed after the originating MCP process
+    //    dies and a new MCP process reconnects via registry.json.
+    //
+    //    Loop exit conditions:
+    //    - Phase transitions to WorkerPhase::Finished (session completed or errored).
+    //    - A PoolRequest::Shutdown is received.
+    //    - An accept() or read_line() returns a fatal I/O error.
+    //
+    //    On EOF (client disconnect) while phase == Paused, the worker loops
+    //    back to accept() and waits for the next client connection.
     let registry = SessionRegistry::new();
     let mut phase = WorkerPhase::Idle;
 
     loop {
-        let mut line = String::new();
-        let n = lines.read_line(&mut line).await?;
-        if n == 0 {
-            // EOF — client disconnected. Exit cleanly.
-            tracing::info!(worker_sid = %sid, "client disconnected (EOF)");
+        tracing::debug!(worker_sid = %sid, "waiting for client connection");
+        let (stream, _peer) = listener.accept().await?;
+        tracing::debug!(worker_sid = %sid, "client connected");
+
+        let (reader, writer) = tokio::io::split(stream);
+        let mut lines = BufReader::new(reader);
+        let mut out = BufWriter::new(writer);
+
+        let mut should_exit = false;
+
+        loop {
+            let mut line = String::new();
+            let n = lines.read_line(&mut line).await?;
+            if n == 0 {
+                // EOF — client disconnected.
+                tracing::info!(worker_sid = %sid, "client disconnected (EOF)");
+                break;
+            }
+
+            let req: PoolRequest = match serde_json::from_str(line.trim()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(worker_sid = %sid, error = %e, "malformed request");
+                    write_response(
+                        &mut out,
+                        PoolResponse::failure(format!("malformed request: {e}")),
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+
+            let is_shutdown = matches!(req, PoolRequest::Shutdown);
+
+            let resp = dispatch(
+                &req,
+                &sid,
+                &mut phase,
+                &registry,
+                &executor,
+                &state_store,
+                &card_store,
+                &scenarios_dir,
+            )
+            .await;
+
+            write_response(&mut out, resp).await?;
+
+            if is_shutdown {
+                tracing::info!(worker_sid = %sid, "shutdown received — exiting");
+                should_exit = true;
+                break;
+            }
+        }
+
+        if should_exit {
             break;
         }
 
-        let req: PoolRequest = match serde_json::from_str(line.trim()) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(worker_sid = %sid, error = %e, "malformed request");
-                write_response(
-                    &mut out,
-                    PoolResponse::failure(format!("malformed request: {e}")),
-                )
-                .await?;
-                continue;
+        // If the session has finished (or was never started), exit.
+        // Only continue the outer accept-loop when still Paused.
+        match &phase {
+            WorkerPhase::Paused { .. } => {
+                tracing::info!(
+                    worker_sid = %sid,
+                    "connection dropped but session still paused — waiting for reconnect"
+                );
+                // continue outer loop → accept next connection
             }
-        };
-
-        let is_shutdown = matches!(req, PoolRequest::Shutdown);
-
-        let resp = dispatch(
-            &req,
-            &sid,
-            &mut phase,
-            &registry,
-            &executor,
-            &state_store,
-            &card_store,
-            &scenarios_dir,
-        )
-        .await;
-
-        write_response(&mut out, resp).await?;
-
-        if is_shutdown {
-            tracing::info!(worker_sid = %sid, "shutdown received — exiting");
-            break;
+            WorkerPhase::Idle | WorkerPhase::Finished => {
+                tracing::info!(worker_sid = %sid, "session not paused after connection drop — exiting");
+                break;
+            }
         }
     }
 

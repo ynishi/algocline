@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`alc` CLI: `clap` derive + `-h` / `--help` / `-V` / `--version` support**.
+  Replaces the previous hand-rolled `args.get(1) == "..."` dispatch in
+  `src/main.rs` with a `#[derive(Parser)]` `Cli` struct and a `Commands` enum
+  (`Init`, `Update`). Default behaviour (no subcommand) still falls through to
+  MCP stdio server mode, so `alc` invoked by an MCP client (e.g. Claude Code)
+  is unchanged. Existing `alc init` / `alc update` flags (`--force`, `--dev`,
+  …) are forwarded verbatim via `trailing_var_arg = true` + `allow_hyphen_values
+  = true`, preserving full backward compatibility. `alc -h` / `alc --help`
+  now print the subcommand list and a one-paragraph note that the default
+  mode is MCP server (intended to be launched by an MCP client) and that
+  ad-hoc shell access to MCP tools is best done through an `agent-block`
+  harness that calls the MCP server directly. `alc -V` / `alc --version`
+  print `alc <version>`. Three new e2e tests
+  (`test_cli_help_short`, `test_cli_help_long`, `test_cli_version`) exercise
+  these dry-run code paths without spawning the stdio MCP server.
+
 ## [0.30.0] - 2026-04-26
 
 ### Added

@@ -46,6 +46,7 @@
 //! in the Rust ecosystem.
 
 mod init;
+mod pool_worker;
 
 use std::sync::Arc;
 
@@ -83,6 +84,16 @@ enum Commands {
     Update {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
+    },
+    /// (Internal) Pool worker subprocess entrypoint — not for direct use.
+    #[command(hide = true)]
+    PoolWorker {
+        /// Session ID assigned to this worker.
+        #[arg(long)]
+        sid: String,
+        /// Unix-domain socket path to listen on.
+        #[arg(long)]
+        sock: std::path::PathBuf,
     },
 }
 
@@ -143,6 +154,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Init { rest }) => return init::run(&rest, false).await,
         Some(Commands::Update { rest }) => return init::run(&rest, true).await,
+        Some(Commands::PoolWorker { sid, sock }) => {
+            return pool_worker::run(sid, sock).await;
+        }
         None => {} // fall through to MCP server mode
     }
 

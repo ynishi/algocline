@@ -135,19 +135,32 @@ impl PoolClient {
 
 /// Write a JSON-line for `req` and flush.
 async fn send_line(inner: &mut Inner, req: &PoolRequest) -> Result<(), PoolError> {
-    let mut line = serde_json::to_string(req).map_err(|e| PoolError::Handshake(e.to_string()))?;
+    let mut line =
+        serde_json::to_string(req).map_err(|e| PoolError::ResponseParse(e.to_string()))?;
     line.push('\n');
-    inner.writer.write_all(line.as_bytes()).await?;
-    inner.writer.flush().await?;
+    inner
+        .writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| PoolError::Io(e.to_string()))?;
+    inner
+        .writer
+        .flush()
+        .await
+        .map_err(|e| PoolError::Io(e.to_string()))?;
     Ok(())
 }
 
 /// Read one JSON line and deserialise it as [`PoolResponse`].
 async fn recv_line(inner: &mut Inner) -> Result<PoolResponse, PoolError> {
     let mut buf = String::new();
-    inner.reader.read_line(&mut buf).await?;
+    inner
+        .reader
+        .read_line(&mut buf)
+        .await
+        .map_err(|e| PoolError::Io(e.to_string()))?;
     serde_json::from_str(buf.trim_end_matches('\n'))
-        .map_err(|e| PoolError::Handshake(format!("response parse error: {e}")))
+        .map_err(|e| PoolError::ResponseParse(e.to_string()))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

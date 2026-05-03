@@ -49,6 +49,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "fs4",
+ "libc",
  "mlua",
  "proptest",
  "semver",

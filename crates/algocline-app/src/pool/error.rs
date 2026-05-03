@@ -6,8 +6,16 @@
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     /// Unix-domain socket connection failed.
-    #[error("UDS connect failed: {0}")]
+    #[error("failed to connect to UDS socket: {0}")]
     Connect(#[from] std::io::Error),
+
+    /// Socket read or write failed after connection was established.
+    #[error("failed to read/write UDS socket: {0}")]
+    Io(String),
+
+    /// A response line from the worker could not be parsed as valid JSON.
+    #[error("failed to parse worker response: {0}")]
+    ResponseParse(String),
 
     /// `registry.json` could not be parsed (corrupt or schema mismatch).
     ///

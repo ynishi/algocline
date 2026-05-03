@@ -11,7 +11,9 @@
 pub mod client;
 pub mod error;
 pub mod protocol;
+pub mod registry;
 
 pub use client::PoolClient;
 pub use error::PoolError;
 pub use protocol::{PoolRequest, PoolResponse, PoolResponseData};
+pub use registry::{PoolRegistry, PoolSessionEntry};

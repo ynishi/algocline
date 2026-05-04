@@ -155,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Init { rest }) => return init::run(&rest, false).await,
         Some(Commands::Update { rest }) => return init::run(&rest, true).await,
         Some(Commands::PoolWorker { sid, sock }) => {
+            let config = AppConfig::from_env();
+            setup_tracing(config.log_dir.as_deref())?;
             return pool_worker::run(sid, sock).await;
         }
         None => {} // fall through to MCP server mode

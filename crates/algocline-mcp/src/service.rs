@@ -803,6 +803,8 @@ impl AlcService {
     /// Returns the Lua return value as JSON.
     /// Lua code can call `alc.llm(prompt, opts)` to invoke the Host LLM
     /// via MCP Sampling.
+    /// Pass `host_mode: true` to route through the persistent worker pool
+    /// (subprocess-isolated, survives MCP restart).
     #[tool(name = "alc_run", annotations(open_world_hint = false))]
     async fn run(&self, Parameters(params): Parameters<RunParams>) -> Result<String, String> {
         self.app
@@ -1684,7 +1686,11 @@ impl AlcService {
     /// Returns `{"sessions": [{"sid","pid","sock","version","created_at","status"},...], "pool_version":"..."}`.
     #[tool(
         name = "alc_pool_status",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn pool_status(
         &self,

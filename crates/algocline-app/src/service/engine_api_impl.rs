@@ -835,4 +835,3 @@ mod tests {
         // reaching this line without being killed by SIGTERM.
     }
 }
-

@@ -86,8 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `alc_pool_ensure` (`idempotent_hint=true`): ensures a pool worker is
       running for a session, spawning one if absent. Returns `{sid, sock,
       pid, status}`.
-    - `alc_pool_status` (`read_only_hint=true`): queries live registry entries;
-      returns the list of active pool sessions with PID / socket path / version.
+    - `alc_pool_status` (`read_only_hint=false, idempotent_hint=true`): queries
+      live registry entries; returns the list of active pool sessions with PID /
+      socket path / version. (`read_only_hint` corrected from `true` — the
+      implementation runs GC + `registry.json` write on every call; see Fixed.)
     - `alc_pool_stop` (`destructive_hint=true`): sends SIGTERM to a named
       session's worker and removes the registry entry. Guards against
       `pid == 0` to prevent accidental process-group signals.
@@ -95,6 +97,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Registry corruption is propagated as `PoolError::RegistryCorrupted` (not
   silently defaulted) in accordance with the project's Result propagation
   policy.
+
+### Fixed
+
+- **Pool worker tracing initialisation** (`src/main.rs`): the
+  `Commands::PoolWorker` arm now calls `setup_tracing(config.log_dir.as_deref())?`
+  before entering `pool_worker::run`. Previously the 14 `tracing::warn!` /
+  `info!` / `error!` calls inside `src/pool_worker.rs` were dead because the
+  subscriber was never registered in the worker subprocess. Worker stderr now
+  emits structured log lines under `RUST_LOG`.
+
+- **`alc_run` `#[tool]` description** (`crates/algocline-mcp/src/service.rs`):
+  added a sentence documenting the `host_mode` parameter — "Pass
+  `host_mode: true` to route the session through the persistent worker pool
+  (`1 session = 1 process`); the worker survives MCP server restarts and can
+  be resumed via `alc_continue`." Previously the tool description was silent
+  about `host_mode`, violating K-49 (new option must be reflected in `#[tool]`
+  doc).
+
+- **`alc_run` cache-reload failure now surfaced to MCP caller**
+  (`crates/algocline-app/src/service/run.rs`): when `PoolRegistry::load_or_default`
+  fails after a `run_via_pool` call, the error is now propagated as
+  `pool_cache_reload_warning` in the wire response JSON (additive field, never
+  omitted when a reload error occurs). Previously the `Err(e)` arm only emitted
+  `tracing::warn!`, which reaches the MCP server's stderr log but is invisible
+  to the MCP caller UI — a silent data loss in violation of the project's Result
+  propagation policy.
+
+- **`alc_pool_status` annotation corrected** (`crates/algocline-mcp/src/service.rs`):
+  `read_only_hint` changed from `true` to `false`. The implementation calls
+  `scan_and_gc` and writes `registry.json` on every invocation, making
+  `read_only_hint = true` a K-111 annotation mismatch. `idempotent_hint = true`
+  and `open_world_hint = false` are unchanged.
+
+- **Pool state directory permissions tightened to 0700 / 0600**
+  (`crates/algocline-app/src/pool/registry.rs`, `crates/algocline-app/src/pool/dispatch.rs`,
+  `src/pool_worker.rs`): the pool state directory (`~/.algocline/state/pool/`),
+  `registry.json`, `registry.lock`, and worker UDS socket files are now created
+  with mode `0700` / `0600` (owner-only) instead of the umask-default `0755` /
+  `0644`. This eliminates a multi-user RCE attack surface on shared hosts.
+  Permission setting uses `std::os::unix::fs::PermissionsExt::set_mode` under
+  `#[cfg(unix)]`; Windows builds are unaffected.
+
+- **Worker process zombie reaping** (`crates/algocline-app/src/pool/dispatch.rs`):
+  `spawn_worker` is migrated from `std::process::Command` to
+  `tokio::process::Command`. The returned `tokio::process::Child` handle is
+  immediately handed to `tokio::spawn(async move { let _ = child.wait().await; })`
+  so that the kernel zombie entry is reaped after the worker exits. Previously
+  the `Child` handle was dropped without calling `wait`, leading to zombie
+  accumulation across idle-timeout / SIGTERM cycles.
+
+- **`PoolClient::connect` handshake recv bounded to 10 s**
+  (`crates/algocline-app/src/pool/client.rs`): the handshake `recv_line` call
+  is now wrapped in `tokio::time::timeout(Duration::from_secs(10), …)`. A
+  timeout is returned as `PoolError::Handshake("handshake recv timeout (10s)")`.
+  Previously a worker that never sent its handshake response caused
+  `RunningService::cancel` to hang indefinitely. The four `tests/e2e_pool.rs`
+  integration tests that were `#[ignore]`d for this reason are now enabled and
+  run by default.
 
 ### Changed
 

@@ -242,7 +242,7 @@ alc_continue({ session_id, response })
 | `alc_scenario_show` | Show an installed scenario's content |
 | `alc_scenario_install` | Install scenarios from Git URL or local path |
 | `alc_pool_ensure` | Ensure a pool worker subprocess is running for a session; spawns one if absent. Returns `{sid, sock, pid, status}` |
-| `alc_pool_status` | List active pool sessions with PID, socket path, and version (read-only) |
+| `alc_pool_status` | List active pool sessions with PID, socket path, and version. Also runs GC to evict stale entries and persists the updated registry |
 | `alc_pool_stop` | Send SIGTERM to a named session's pool worker and remove its registry entry |
 
 ## MCP Resources

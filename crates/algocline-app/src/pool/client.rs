@@ -142,12 +142,12 @@ async fn send_line(inner: &mut Inner, req: &PoolRequest) -> Result<(), PoolError
         .writer
         .write_all(line.as_bytes())
         .await
-        .map_err(|e| PoolError::Io(e.to_string()))?;
+        .map_err(|e| PoolError::IoWrite(e.to_string()))?;
     inner
         .writer
         .flush()
         .await
-        .map_err(|e| PoolError::Io(e.to_string()))?;
+        .map_err(|e| PoolError::IoWrite(e.to_string()))?;
     Ok(())
 }
 
@@ -158,7 +158,7 @@ async fn recv_line(inner: &mut Inner) -> Result<PoolResponse, PoolError> {
         .reader
         .read_line(&mut buf)
         .await
-        .map_err(|e| PoolError::Io(e.to_string()))?;
+        .map_err(|e| PoolError::IoRead(e.to_string()))?;
     serde_json::from_str(buf.trim_end_matches('\n'))
         .map_err(|e| PoolError::ResponseParse(e.to_string()))
 }

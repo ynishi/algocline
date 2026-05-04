@@ -548,4 +548,22 @@ pub trait EngineApi: Send + Sync {
     /// Returns `Err(message)` only when the hub registries file itself is
     /// corrupt (hard I/O failure), making further index discovery impossible.
     async fn hub_index_aggregate(&self) -> Result<String, String>;
+
+    // ─── Pool management ─────────────────────────────────────────
+
+    /// Ensure pool workers are alive; GC stale entries. Idempotent.
+    ///
+    /// Returns JSON `{"sessions": [...], "pool_version": "..."}`.
+    async fn pool_ensure(&self) -> Result<String, String>;
+
+    /// Return pool worker status (registry.json + live state).
+    ///
+    /// When `sid` is provided, restricts to a single worker.
+    /// Returns JSON `{"sessions": [...], "pool_version": "..."}`.
+    async fn pool_status(&self, sid: Option<String>) -> Result<String, String>;
+
+    /// Send SIGTERM to all workers (`sid=None`) or a single worker.
+    ///
+    /// Returns JSON `{"stopped": [...], "errors": [...]}`.
+    async fn pool_stop(&self, sid: Option<String>) -> Result<String, String>;
 }

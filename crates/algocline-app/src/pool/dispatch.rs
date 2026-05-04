@@ -30,25 +30,47 @@ use crate::pool::{
 /// # Arguments
 ///
 /// * `pool_dir` — directory for UDS sockets and the registry lock file.
-/// * `reg_path` — path to `registry.json`.
-/// * `lock_path` — path to the advisory lock sentinel file.
 /// * `sid` — session ID string (UUID).
 ///
 /// # Returns
 ///
-/// `Ok((pid, sock_path))` once the worker socket file is visible.
+/// `Ok((pid, sock_path))` on success. The returned `pid` is the OS-assigned
+/// process identifier captured immediately after `spawn()`; it is valid at
+/// the time of return but may be reused by the OS after the worker exits.
+///
+/// # Concurrency
+///
+/// **Reaping**: a `tokio::spawn` task is started to call `child.wait().await`
+/// (cancel safe per tokio docs). The spawned task runs independently; dropping
+/// its `JoinHandle` does not cancel it. The runtime reaps the OS process entry
+/// when `wait()` returns, preventing zombie accumulation.
+///
+/// **Cancel safety of the reap task**: `tokio::process::Child::wait` is cancel
+/// safe. If the MCP server runtime shuts down before the worker exits, the
+/// reap task is dropped; the worker process (setsid session leader) is
+/// reparented to init (PID 1) by the OS and reaped there — no zombie results.
+///
+/// **`child.id()` Option**: `tokio::process::Child::id()` returns `Option<u32>`.
+/// A `None` result (process already exited before id() was called) is
+/// propagated as `Err(PoolError::Spawn)`.
 ///
 /// # Errors
 ///
-/// - `PoolError::Spawn` — `current_exe()` failed or `Command::spawn()` failed.
-/// - `PoolError::Handshake` — the socket file did not appear within 5 seconds.
-fn spawn_worker(pool_dir: &Path, sid: &str) -> Result<(u32, PathBuf), PoolError> {
+/// - `PoolError::Spawn` — `current_exe()` failed, `Command::spawn()` failed,
+///   or `child.id()` returned `None` (process exited immediately after spawn).
+///
+/// # Panics
+///
+/// Does not panic. `tokio::spawn` panics if called outside a tokio runtime,
+/// but `spawn_worker` is only called from `run_via_pool` which runs on the
+/// MCP server's runtime.
+async fn spawn_worker(pool_dir: &Path, sid: &str) -> Result<(u32, PathBuf), PoolError> {
     let sock = pool_dir.join(format!("{sid}.sock"));
 
     let exe = std::env::current_exe()
         .map_err(|e| PoolError::Spawn(format!("current_exe failed: {e}")))?;
 
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = tokio::process::Command::new(&exe);
     // "pool-worker" is a clap subcommand (kebab-case of PoolWorker enum variant).
     // The worker binary must be invoked as `alc pool-worker --sid <sid> --sock <path>`.
     cmd.args([
@@ -64,7 +86,6 @@ fn spawn_worker(pool_dir: &Path, sid: &str) -> Result<(u32, PathBuf), PoolError>
     // mutex, or tokio runtime is used inside the closure.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
                 // Detach the child from the parent's session so that
@@ -76,16 +97,29 @@ fn spawn_worker(pool_dir: &Path, sid: &str) -> Result<(u32, PathBuf), PoolError>
         }
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| PoolError::Spawn(format!("worker spawn failed: {e}")))?;
 
-    // Record the PID immediately, before any wait() can reap the child.
-    let pid = child.id();
-    // Drop the Child handle — the worker continues running independently
-    // (std::process::Child drop does not send any signal; the process
-    // continues as a detached session leader after setsid()).
-    drop(child);
+    // tokio::process::Child::id() returns Option<u32>: None if the process
+    // already exited before id() was called.
+    let pid = child.id().ok_or_else(|| {
+        PoolError::Spawn("child.id() returned None — process already exited".to_string())
+    })?;
+
+    // Fire-and-forget reap: start a background task that calls child.wait().await.
+    // Without this spawn, the Child handle drop would trigger a non-blocking
+    // orphan reap, but explicit wait() makes the reaping path observable and
+    // zombie-free even on slow exits.
+    // Dropping the JoinHandle does NOT cancel the task; the runtime continues
+    // running it until wait() completes.
+    let sid_owned = sid.to_string();
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => tracing::debug!(sid = %sid_owned, ?status, "pool worker reaped"),
+            Err(e) => tracing::warn!(sid = %sid_owned, error = %e, "pool worker wait error"),
+        }
+    });
 
     Ok((pid, sock))
 }
@@ -125,28 +159,34 @@ fn gen_pool_sid() -> String {
 /// On success, returns `(session_id, json_response, Option<pool_save_error>)`.
 /// The optional `pool_save_error` is `Some(msg)` when the registry write
 /// failed — callers must surface this as an additive field on the MCP wire
-/// response (CLAUDE.md §Service 層の Error 伝播規律: write failures must not
-/// be silently dropped).
+/// response.
 ///
-/// # Arguments
+/// # Concurrency
 ///
-/// * `pool_dir` — directory containing the socket files and registry files.
-/// * `reg_path` — path to `registry.json`.
-/// * `lock_path` — path to the advisory lock sentinel.
-/// * `extra_lib_paths` — additional Lua library search paths.
-/// * `code` — Lua source code to run.
-/// * `ctx` — JSON context passed as `alc.ctx`.
+/// **Cancel safety**: this function is **not** cancel safe. If dropped during
+/// `PoolClient::connect` or `send_request`, the `PoolClient` is dropped and
+/// the UDS connection is closed. The worker subprocess continues running; the
+/// session can be resumed via `continue_via_pool` using the registry entry.
+///
+/// **Locks**: acquires an advisory `fs4` flock (inside `spawn_blocking`) for
+/// the registry add/save. The lock is held only for the duration of the
+/// synchronous I/O in `persist_entry` and is released before this function
+/// returns. No `std::sync::Mutex` or `tokio::sync::Mutex` is held across
+/// `.await` points in this function.
+///
+/// **Zombie reaping**: `spawn_worker` starts a background `tokio::spawn` reap
+/// task. If this function returns `Err`, the spawned reap task continues in the
+/// background and the OS process entry is reaped when the worker exits.
+///
+/// **Socket wait timeout**: polls for socket file appearance with a 5 s
+/// `tokio::time::timeout`. If the socket does not appear in 5 s,
+/// `Err(PoolError::Handshake)` is returned.
 ///
 /// # Errors
 ///
 /// Returns `Err(PoolError)` if worker spawn, socket wait, or UDS run
-/// round-trip fails.  Registry persistence failure is returned in the
-/// `pool_save_error` field, not as an `Err`.
-///
-/// # Concurrency
-///
-/// Acquires `RwLock<PoolRegistry>` (write) + advisory `fs4` file lock for
-/// the registry add/save.  These locks are released before returning.
+/// round-trip fails. Registry persistence failure is returned in the
+/// `pool_save_error` field, not as `Err`.
 pub async fn run_via_pool(
     pool_dir: &Path,
     reg_path: &Path,
@@ -158,8 +198,8 @@ pub async fn run_via_pool(
     // 1. Generate session ID and socket path.
     let sid = gen_pool_sid();
 
-    // 2. Spawn worker subprocess (synchronous — Command::spawn is not async).
-    let (pid, sock) = spawn_worker(pool_dir, &sid)?;
+    // 2. Spawn worker subprocess (async — uses tokio::process::Command).
+    let (pid, sock) = spawn_worker(pool_dir, &sid).await?;
 
     // 3. Poll for socket file appearance (timeout 5s).
     {
@@ -601,6 +641,74 @@ mod tests {
             mcp["error"].as_str().unwrap_or("").contains("unrecognised"),
             "error message must mention 'unrecognised', got: {}",
             mcp["error"]
+        );
+    }
+
+    // ── G1/G2: concurrency — zombie reaping ───────────────────────────────────
+
+    /// G1 — spawn_worker uses tokio::process::Command and the reap task
+    ///      prevents zombie accumulation.  Verified by spawning /bin/true
+    ///      (instant exit), waiting for the reap task to complete, then
+    ///      confirming the OS has cleaned up the PID entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_worker_reaps_child_no_zombie() {
+        // Directly exercise the tokio::process machinery (not spawn_worker itself,
+        // which requires a valid worker binary path).  We reproduce the exact
+        // reaping pattern used inside spawn_worker.
+        let mut cmd = tokio::process::Command::new("/bin/true");
+        let mut child = cmd.spawn().expect("spawn /bin/true");
+        let pid = child.id().expect("child.id() must be Some before wait");
+        // Start the fire-and-forget reap task — mirrors spawn_worker behaviour.
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        // Give the reap task enough time to call wait() and the OS to remove the entry.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Confirm the PID is no longer present in the OS process table.
+        // kill(pid, 0) returns -1 / ESRCH when the process is fully reaped.
+        let pid_i32 = i32::try_from(pid).expect("pid fits i32");
+        // SAFETY: kill(pid, 0) is a signal existence check; it does not deliver
+        // a signal and is safe to call with an arbitrary PID.
+        let rc = unsafe { libc::kill(pid_i32, 0) };
+        assert_eq!(
+            rc, -1,
+            "process should be gone (kill(pid,0) must return -1)"
+        );
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // ESRCH (3) = no such process — the expected errno when fully reaped.
+        assert_eq!(
+            errno,
+            libc::ESRCH,
+            "errno must be ESRCH (no such process), got {errno}"
+        );
+    }
+
+    /// G2 — `tokio::process::Child::id()` returns `None` after `wait()` completes,
+    ///      and `ok_or_else` correctly maps that to `PoolError::Spawn`.
+    ///      This validates the exact error propagation path used inside spawn_worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_worker_child_id_none_returns_pool_error() {
+        let mut child = tokio::process::Command::new("/bin/false")
+            .spawn()
+            .expect("spawn /bin/false");
+        // After wait() completes the child is consumed; id() returns None.
+        let _status = child.wait().await.expect("wait");
+        let id = child.id();
+        assert!(
+            id.is_none(),
+            "child.id() must be None after wait(): got {:?}",
+            id
+        );
+        // Reproduce the ok_or_else path from spawn_worker.
+        let result: Result<u32, crate::pool::PoolError> = id.ok_or_else(|| {
+            crate::pool::PoolError::Spawn(
+                "child.id() returned None — process already exited".to_string(),
+            )
+        });
+        assert!(
+            matches!(result, Err(crate::pool::PoolError::Spawn(_))),
+            "expected Err(PoolError::Spawn), got {:?}",
+            result
         );
     }
 }

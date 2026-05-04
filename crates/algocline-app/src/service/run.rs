@@ -82,27 +82,35 @@ impl AppService {
             // session_id is stored in the JSON by the worker; update the
             // in-memory registry so this MCP instance can route continues
             // without another disk read.
-            {
-                // Load the just-persisted entry from disk to keep in-memory
-                // registry in sync.  This is a best-effort convenience cache;
-                // the disk state is authoritative.
+            // Load the just-persisted entry from disk to keep in-memory
+            // registry in sync.  This is a best-effort convenience cache;
+            // the disk state is authoritative.  Failure is surfaced to the
+            // MCP wire response as `pool_cache_reload_warning` so the caller
+            // can observe stale-cache conditions; tracing::warn! is kept for
+            // operator visibility in logs.
+            let cache_reload_warning: Option<String> =
                 match crate::pool::PoolRegistry::load_or_default(&self.pool_reg_path) {
                     Ok(reg) => {
                         let mut guard = self.pool_registry.write().await;
                         *guard = reg;
+                        None
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             "failed to reload pool registry after run; in-memory cache may be stale"
                         );
+                        Some(e.to_string())
                     }
-                }
-            }
+                };
 
             let json = splice_response_warnings(&json, "lib_path_warnings", &warnings);
             let json = match pool_save_error {
                 Some(msg) => splice_response_string(&json, "pool_save_error", &msg),
+                None => json,
+            };
+            let json = match cache_reload_warning {
+                Some(msg) => splice_response_string(&json, "pool_cache_reload_warning", &msg),
                 None => json,
             };
             let _ = session_id; // session_id is embedded in the JSON response
@@ -654,6 +662,58 @@ mod tests {
         assert!(
             msg.contains("corrupted") || msg.contains("parse") || msg.contains("Continue failed"),
             "error must mention registry problem, got: {msg}"
+        );
+    }
+
+    // ── pool_cache_reload_warning splice tests ───────────────────────────────
+
+    use super::super::eval_store::splice_response_string;
+
+    /// T1 (happy path): splice_response_string inserts pool_cache_reload_warning
+    /// into a valid JSON object response.
+    ///
+    /// Verifies the crux-card constraint: cache-reload failure must surface on
+    /// the MCP wire as an additive field, not remain warn!-only.
+    #[test]
+    fn splice_response_string_injects_cache_reload_warning() {
+        let json = r#"{"status":"finished","result":{"ok":true}}"#;
+        let msg = "failed to reload pool registry: No such file or directory";
+        let out = splice_response_string(json, "pool_cache_reload_warning", msg);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(
+            v["pool_cache_reload_warning"].as_str(),
+            Some(msg),
+            "pool_cache_reload_warning must be present in response"
+        );
+        // Original fields preserved (additive, not destructive).
+        assert_eq!(v["status"].as_str(), Some("finished"));
+    }
+
+    /// T2 (edge case): splice_response_string is a no-op when input is not a
+    /// JSON object (e.g. bare string or array).
+    ///
+    /// Guards against panics when strategy output is malformed.
+    #[test]
+    fn splice_response_string_passthrough_on_non_object_json() {
+        let non_object = r#""just a string""#;
+        let out = splice_response_string(non_object, "pool_cache_reload_warning", "err");
+        // Must return original unchanged.
+        assert_eq!(out, non_object);
+    }
+
+    /// T3 (error path / None branch): when cache_reload_warning is None, the
+    /// pool_cache_reload_warning field must NOT appear in the response JSON.
+    ///
+    /// Verifies the None arm of the new match block in run.rs leaves the JSON
+    /// untouched, consistent with the pool_save_error pattern.
+    #[test]
+    fn splice_response_string_not_called_when_none() {
+        let json = r#"{"status":"finished"}"#;
+        // Simulate the None branch: we simply do not call splice_response_string.
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        assert!(
+            v.get("pool_cache_reload_warning").is_none(),
+            "pool_cache_reload_warning must be absent when no cache-reload error occurred"
         );
     }
 

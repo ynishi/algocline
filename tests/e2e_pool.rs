@@ -103,7 +103,6 @@ async fn call_json(
 ///
 /// Issue verification goal 1: pool session lifecycle (create → pause → visible).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "integration: requires pool worker infrastructure (run with --include-ignored)"]
 async fn test_pool_paused_session_visible_in_status() {
     let tmp = short_tempdir();
     let client = connect_with_home(tmp.path()).await;
@@ -165,7 +164,6 @@ async fn test_pool_paused_session_visible_in_status() {
 ///   - (Kill session A's MCP process.)
 ///   - Session B: new MCP server reads registry.json, sees the live worker.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "integration: requires pool worker infrastructure (run with --include-ignored)"]
 async fn test_pool_registry_reconnect_after_mcp_restart() {
     let tmp = short_tempdir();
 
@@ -235,7 +233,6 @@ async fn test_pool_registry_reconnect_after_mcp_restart() {
 ///
 /// Issue verification goal 3 / Crux: mlua VM subprocess initialization.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "integration: requires pool worker infrastructure (run with --include-ignored)"]
 async fn test_pool_continue_after_reconnect() {
     let tmp = short_tempdir();
 
@@ -287,7 +284,6 @@ async fn test_pool_continue_after_reconnect() {
 ///
 /// Issue verification goal 4.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "integration: requires pool worker infrastructure (run with --include-ignored)"]
 async fn test_pool_stop_empties_sessions() {
     let tmp = short_tempdir();
     let client = connect_with_home(tmp.path()).await;

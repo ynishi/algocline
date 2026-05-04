@@ -194,6 +194,18 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
     // 1. Bind UDS endpoint — propagate io::Error (fatal if binding fails).
     let listener = UnixListener::bind(&sock)?;
 
+    // Restrict the socket file to the owning user only (0600 = -rw-------).
+    // UnixListener::bind leaves the socket at the umask-derived mode (typically
+    // 0666).  Tightening to 0600 prevents other local users from connecting to
+    // the pool worker.  Failure here is fatal — we cannot safely serve requests
+    // on an unrestricted socket.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("failed to set permissions on {}: {e}", sock.display()))?;
+    }
+
     tracing::info!(worker_sid = %sid, sock = %sock.display(), "pool worker starting");
 
     // 2. Read idle timeout from environment.

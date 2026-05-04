@@ -177,6 +177,23 @@ impl PoolRegistry {
             ))
         })?;
 
+        // Restrict the pool directory to the owning user only (0700 = drwx------).
+        // This prevents other local users from listing or accessing pool sockets and
+        // the registry file.  set_permissions failure is fatal — propagate as
+        // RegistryCorrupted per CLAUDE.md §Service 層の Error 伝播規律.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    PoolError::RegistryCorrupted(format!(
+                        "failed to set permissions on {}: {e}",
+                        parent.display()
+                    ))
+                },
+            )?;
+        }
+
         let content = serde_json::to_string_pretty(self).map_err(|e| {
             PoolError::RegistryCorrupted(format!("failed to serialize registry: {e}"))
         })?;
@@ -204,6 +221,21 @@ impl PoolRegistry {
                 path.display()
             ))
         })?;
+
+        // Restrict the registry file to the owning user only (0600 = -rw-------).
+        // Applied after persist so we operate on the final path, not the temp file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    PoolError::RegistryCorrupted(format!(
+                        "failed to set permissions on {}: {e}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
 
         Ok(())
     }
@@ -494,6 +526,72 @@ mod tests {
             final_reg.sessions.len(),
             expected,
             "all {expected} entries must be present (no last-writer-wins loss)"
+        );
+    }
+
+    // ── T5: permissions (Unix only) ───────────────────────────────────────────
+
+    /// T5 — save() restricts pool dir to 0700 and registry.json to 0600.
+    ///
+    /// Verifies that the secure-permissions requirement introduced in ST2
+    /// (item 6) is met on Unix targets.  The pool directory must be accessible
+    /// only by its owner (`drwx------`) and the registry file must be
+    /// readable/writable only by its owner (`-rw-------`).
+    #[test]
+    #[cfg(unix)]
+    fn save_sets_secure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Use a nested path so save() has to create the "pool" subdirectory.
+        let path = dir.path().join("pool/registry.json");
+        let reg = PoolRegistry::default();
+        reg.save(&path).expect("save");
+
+        // (T1) pool directory must be 0700
+        let parent_meta = std::fs::metadata(path.parent().expect("parent")).expect("dir metadata");
+        assert_eq!(
+            parent_meta.permissions().mode() & 0o777,
+            0o700,
+            "pool dir must be 0700 (drwx------)"
+        );
+
+        // (T2) registry.json must be 0600
+        let file_meta = std::fs::metadata(&path).expect("file metadata");
+        assert_eq!(
+            file_meta.permissions().mode() & 0o777,
+            0o600,
+            "registry.json must be 0600 (-rw-------)"
+        );
+    }
+
+    // ── T6: lock file permissions (Unix only) ─────────────────────────────────
+
+    /// T6 — with_registry_lock() restricts the lock file to 0600.
+    ///
+    /// Verifies that the advisory lock sentinel file (`registry.lock`) is
+    /// restricted to owner-only access on Unix targets.
+    #[test]
+    #[cfg(unix)]
+    fn lock_file_sets_secure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_path = dir.path().join("registry.lock");
+        let reg_path = dir.path().join("registry.json");
+
+        // Run a no-op closure so the lock file is created and chmod'd.
+        with_registry_lock(&lock_path, || {
+            let reg = PoolRegistry::default();
+            reg.save(&reg_path)
+        })
+        .expect("with_registry_lock");
+
+        let lock_meta = std::fs::metadata(&lock_path).expect("lock metadata");
+        assert_eq!(
+            lock_meta.permissions().mode() & 0o777,
+            0o600,
+            "registry.lock must be 0600 (-rw-------)"
         );
     }
 }

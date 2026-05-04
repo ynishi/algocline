@@ -64,6 +64,20 @@ where
         })
         .map_err(E::from)?;
 
+    // Restrict the lock file to the owning user only (0600 = -rw-------).
+    // Applied once per open — the file owner is the only user who should
+    // be able to acquire or observe the advisory lock.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| LockError::Chmod {
+                path: lock_path.to_path_buf(),
+                source: e,
+            })
+            .map_err(E::from)?;
+    }
+
     let result = f();
     // Ordering insurance for the success path — the drop impl would run
     // regardless when the function returns or unwinds, but making it
@@ -96,6 +110,13 @@ pub(crate) enum LockError {
     /// Failed to acquire the exclusive lock.
     #[error("failed to acquire lock on {}: {source}", path.display())]
     Acquire {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Failed to set permissions (0600) on the lock file.
+    #[error("failed to set permissions on lock file {}: {source}", path.display())]
+    Chmod {
         path: std::path::PathBuf,
         #[source]
         source: std::io::Error,

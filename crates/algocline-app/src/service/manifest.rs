@@ -144,7 +144,8 @@ impl From<crate::service::lock::LockError> for InstalledManifestStoreError {
         let path = match &e {
             crate::service::lock::LockError::CreateDir { path, .. }
             | crate::service::lock::LockError::Open { path, .. }
-            | crate::service::lock::LockError::Acquire { path, .. } => path.clone(),
+            | crate::service::lock::LockError::Acquire { path, .. }
+            | crate::service::lock::LockError::Chmod { path, .. } => path.clone(),
         };
         InstalledManifestStoreError::Lock { path, source: e }
     }

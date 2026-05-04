@@ -20,6 +20,14 @@ use crate::pool::{
 /// Version string embedded in every handshake to prevent client/server skew.
 pub const POOL_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Maximum time to wait for the worker's handshake response.
+///
+/// If the worker does not respond within this window, `PoolClient::connect`
+/// returns `Err(PoolError::Handshake("handshake recv timeout (10s)"))` and the
+/// connection is dropped.  This prevents `RunningService::cancel` from hanging
+/// indefinitely when a worker fails to send the handshake reply.
+pub(crate) const HANDSHAKE_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ─── Internal state ───────────────────────────────────────────────────────────
 
 struct Inner {
@@ -52,10 +60,27 @@ impl PoolClient {
     /// If the worker reports a different version, `Err(PoolError::VersionMismatch)`
     /// is returned and no `PoolClient` is constructed.
     ///
+    /// # Concurrency
+    ///
+    /// **Cancel safety**: this function is **not** cancel safe. If dropped before
+    /// `recv_line` completes, the internal `BufReader` may hold a partial line;
+    /// the partial connection is dropped and must not be reused.
+    ///
+    /// **Timeout**: the handshake recv is bounded by `HANDSHAKE_RECV_TIMEOUT`
+    /// (10 s). If the worker does not respond within this window, the function
+    /// returns `Err(PoolError::Handshake("handshake recv timeout (10s)"))` and the
+    /// connection is dropped. This prevents `RunningService::cancel` from hanging
+    /// when a worker fails to send the handshake.
+    ///
+    /// **Send + Sync**: `PoolClient` is `Send` (all fields are `Send`). It is
+    /// **not** `Sync` — callers sharing across tasks must wrap in
+    /// `Arc<tokio::sync::Mutex<PoolClient>>`.
+    ///
     /// # Errors
     ///
     /// - `PoolError::Connect` — socket connect failed (wraps `std::io::Error`).
-    /// - `PoolError::Handshake` — response could not be parsed as valid JSON.
+    /// - `PoolError::Handshake` — response could not be parsed as valid JSON, or
+    ///   the handshake recv timed out after 10 s.
     /// - `PoolError::VersionMismatch` — worker version differs from client version.
     pub async fn connect(sock_path: &Path) -> Result<Self, PoolError> {
         let stream = UnixStream::connect(sock_path).await?;
@@ -71,7 +96,16 @@ impl PoolClient {
             version: POOL_PROTOCOL_VERSION.to_string(),
         };
         send_line(&mut inner, &handshake_req).await?;
-        let resp = recv_line(&mut inner).await?;
+
+        let resp = match tokio::time::timeout(HANDSHAKE_RECV_TIMEOUT, recv_line(&mut inner)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                return Err(PoolError::Handshake(
+                    "handshake recv timeout (10s)".to_string(),
+                ));
+            }
+        };
 
         match &resp.data {
             Some(PoolResponseData::Handshake { version }) => {
@@ -102,24 +136,22 @@ impl PoolClient {
     ///
     /// # Concurrency
     ///
-    /// A `tokio::sync::Mutex` guards the `BufWriter`/`BufReader` pair so that
-    /// concurrent calls from multiple tasks are serialised. Only one request can
-    /// be in-flight per `PoolClient` instance at a time.
+    /// **Cancel safety**: this function is **not** cancel safe.
+    /// `AsyncBufReadExt::read_line` is not cancel safe per tokio documentation:
+    /// if this future is dropped before `read_line` completes, the internal buffer
+    /// may hold a partial line. After cancellation the connection is no longer
+    /// usable; callers must drop this `PoolClient` and reconnect.
     ///
-    /// **Cancel safety of `read_line`**: `AsyncBufReadExt::read_line` is **not**
-    /// cancel safe. If this future is dropped before `read_line` completes, the
-    /// internal buffer may hold a partial line. After cancellation the connection
-    /// is no longer usable; callers must drop this `PoolClient` and reconnect.
+    /// **Mutex serialisation**: the internal `tokio::sync::Mutex<Inner>` serialises
+    /// concurrent callers. Cancelling a `lock().await` call loses queue position
+    /// (tokio docs: "Cancelling a call to `lock` makes you lose your place in the
+    /// queue"). Only one request can be in-flight per `PoolClient` instance at a
+    /// time. Holding the guard across `.await` (write + flush + read_line) is
+    /// intentional and correct with `tokio::sync::Mutex`.
     ///
     /// **Send + Sync**: `PoolClient` is `Send` (all fields are `Send`). It is
-    /// **not** `Sync` by default — callers should wrap in `Arc<Mutex<PoolClient>>`
-    /// if shared across tasks.
-    ///
-    /// # Errors
-    ///
-    /// Returns `PoolError::Connect` on I/O failure, `PoolError::Handshake` if the
-    /// response cannot be parsed as valid JSON, `PoolError::VersionMismatch` if
-    /// the server reports an incompatible version.
+    /// **not** `Sync` — callers sharing across tasks must wrap in
+    /// `Arc<tokio::sync::Mutex<PoolClient>>`.
     ///
     /// # Panics
     ///
@@ -375,6 +407,186 @@ mod tests {
                 } if client == POOL_PROTOCOL_VERSION && server == "999.0.0"
             ),
             "unexpected error: {err:?}"
+        );
+
+        server_handle.await.expect("server task");
+    }
+
+    // ── test G3: handshake timeout finite ────────────────────────────────────
+
+    /// Verify that `PoolClient::connect` returns `Err(PoolError::Handshake(_))`
+    /// within a finite wall-clock bound when the worker never sends the handshake
+    /// response.
+    ///
+    /// The mock server accepts the connection but does not send anything (sleeps
+    /// for 30 s).  The client must time out within `HANDSHAKE_RECV_TIMEOUT` and
+    /// return an error rather than blocking indefinitely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connect_handshake_timeout_finite() {
+        let (_dir, sock_path) = temp_sock();
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind");
+
+        // Fake server: accept then do nothing (sleep longer than the timeout).
+        let _server = spawn_server(listener, |_inner| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        })
+        .await;
+
+        let start = tokio::time::Instant::now();
+        let err = PoolClient::connect(&sock_path)
+            .await
+            .expect_err("should time out and return an error");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, PoolError::Handshake(_)),
+            "expected PoolError::Handshake, got {err:?}"
+        );
+        assert!(
+            elapsed.as_secs() < HANDSHAKE_RECV_TIMEOUT.as_secs() + 1,
+            "connect must complete within {}s, took {:?}",
+            HANDSHAKE_RECV_TIMEOUT.as_secs() + 1,
+            elapsed
+        );
+    }
+
+    // ── test G4: concurrent two clients serialised via Mutex ─────────────────
+
+    /// Verify that two tasks sharing a single `Arc<tokio::sync::Mutex<PoolClient>>`
+    /// can concurrently call `send_request` without deadlocking or mixing up
+    /// responses.
+    ///
+    /// The mock server handles one connection and echoes back a unique
+    /// `session_id` for each request (incrementing counter).  Two tasks each
+    /// send 10 requests; we assert that all 20 responses are received with no
+    /// duplicates and no gaps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_connect_handshake_concurrent_two_clients() {
+        use std::sync::Arc;
+
+        let (_dir, sock_path) = temp_sock();
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind");
+
+        // Fake server: handshake then serve N Run requests with unique session_ids.
+        let server_handle = spawn_server(listener, |mut inner| async move {
+            // Handshake
+            let _ = server_recv(&mut inner).await;
+            server_send(
+                &mut inner,
+                &PoolResponse::success(PoolResponseData::Handshake {
+                    version: POOL_PROTOCOL_VERSION.to_string(),
+                }),
+            )
+            .await;
+
+            // Serve requests sequentially (client Mutex ensures serial delivery).
+            let mut counter: u32 = 0;
+            loop {
+                let req = server_recv(&mut inner).await;
+                match req {
+                    PoolRequest::Shutdown => {
+                        server_send(
+                            &mut inner,
+                            &PoolResponse::success(PoolResponseData::Shutdown),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {
+                        let sid = format!("sid-{counter}");
+                        counter += 1;
+                        let feed_result = serde_json::json!({
+                            "type": "finished",
+                            "session_id": sid,
+                        });
+                        server_send(
+                            &mut inner,
+                            &PoolResponse::success(PoolResponseData::Feed {
+                                session_id: sid,
+                                feed_result,
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("spawn_server");
+
+        let client = Arc::new(tokio::sync::Mutex::new(
+            PoolClient::connect(&sock_path).await.expect("connect"),
+        ));
+
+        const REQS_PER_TASK: usize = 10;
+
+        let client_a = Arc::clone(&client);
+        let task_a = tokio::spawn(async move {
+            let mut results = Vec::with_capacity(REQS_PER_TASK);
+            for _ in 0..REQS_PER_TASK {
+                let mut guard = client_a.lock().await;
+                let resp = guard
+                    .send_request(PoolRequest::Run {
+                        code: String::new(),
+                        ctx: None,
+                        lib_paths: vec![],
+                    })
+                    .await
+                    .expect("send_request failed");
+                if let Some(PoolResponseData::Feed { session_id, .. }) = resp.data {
+                    results.push(session_id);
+                }
+            }
+            results
+        });
+
+        let client_b = Arc::clone(&client);
+        let task_b = tokio::spawn(async move {
+            let mut results = Vec::with_capacity(REQS_PER_TASK);
+            for _ in 0..REQS_PER_TASK {
+                let mut guard = client_b.lock().await;
+                let resp = guard
+                    .send_request(PoolRequest::Run {
+                        code: String::new(),
+                        ctx: None,
+                        lib_paths: vec![],
+                    })
+                    .await
+                    .expect("send_request failed");
+                if let Some(PoolResponseData::Feed { session_id, .. }) = resp.data {
+                    results.push(session_id);
+                }
+            }
+            results
+        });
+
+        let mut results_a = task_a.await.expect("task_a panicked");
+        let results_b = task_b.await.expect("task_b panicked");
+        results_a.extend(results_b);
+
+        // Shutdown cleanly.
+        {
+            let mut guard = client.lock().await;
+            let _ = guard.send_request(PoolRequest::Shutdown).await;
+        }
+
+        // All 20 session_ids must be present with no duplicates.
+        assert_eq!(
+            results_a.len(),
+            REQS_PER_TASK * 2,
+            "expected {} responses, got {}",
+            REQS_PER_TASK * 2,
+            results_a.len()
+        );
+        let mut sorted = results_a.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            results_a.len(),
+            "duplicate session_ids detected: {results_a:?}"
         );
 
         server_handle.await.expect("server task");

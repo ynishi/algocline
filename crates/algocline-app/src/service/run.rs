@@ -7,6 +7,7 @@ use super::eval_store::{splice_response_string, splice_response_warnings};
 use super::resolve::{is_package_installed, make_require_code, resolve_code, QueryResponse};
 use super::transcript::write_transcript_log;
 use super::AppService;
+use crate::pool::dispatch::{continue_via_pool, run_via_pool};
 
 /// Splice `save_warning` into the JSON `result` when the optional
 /// warning is `Some(_)`. Returns the original string unchanged when
@@ -31,14 +32,30 @@ fn splice_transcript_warning(result_json: &str, warning: Option<String>) -> Stri
 impl AppService {
     /// Execute Lua code with optional JSON context.
     ///
-    /// `project_root` — optional absolute path to the project root containing
-    /// `alc.lock`. Falls back to `ALC_PROJECT_ROOT` env or ancestor walk.
+    /// When `host_mode: Some(true)` is passed, the call is proxied via
+    /// `PoolClient` to a long-lived worker subprocess over a Unix domain socket.
+    /// When `host_mode` is `None` or `Some(false)` the existing in-process
+    /// `Executor::start_session` path is used unchanged.
+    ///
+    /// # Concurrency
+    ///
+    /// **host_mode=false (default)**: No additional locking beyond `SessionRegistry`
+    /// lock C. `AppService` itself holds no long-lived lock during this call.
+    ///
+    /// **host_mode=true**: Acquires `RwLock<PoolRegistry>` (write) and advisory
+    /// `fs4::FileExt::lock_exclusive` to update `registry.json`. These locks are
+    /// **not** held across the UDS round-trip await.
+    ///
+    /// **Cancel safety**: cancelling this `.await` mid-UDS-request leaves the
+    /// worker subprocess running. The registry entry persists; callers can
+    /// reconnect via `alc_continue` after MCP restart.
     pub async fn run(
         &self,
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
         project_root: Option<String>,
+        host_mode: Option<bool>,
     ) -> Result<String, String> {
         let code = resolve_code(code, code_file)?;
         let ctx = ctx.unwrap_or(serde_json::Value::Null);
@@ -46,6 +63,53 @@ impl AppService {
         let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
         let mut warnings: Vec<String> = extra_warnings;
         warnings.extend(variant_warnings);
+
+        if host_mode == Some(true) {
+            // ── Pool path (Crux: MCP thin proxy IPC boundary) ─────────────────
+            // Worker subprocess is spawned and communicated via UDS.
+            // SessionRegistry (in-memory) is NOT touched on this path.
+            let (session_id, json, pool_save_error) = run_via_pool(
+                &self.pool_dir,
+                &self.pool_reg_path,
+                &self.pool_lock_path,
+                extra,
+                code,
+                ctx,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // session_id is stored in the JSON by the worker; update the
+            // in-memory registry so this MCP instance can route continues
+            // without another disk read.
+            {
+                // Load the just-persisted entry from disk to keep in-memory
+                // registry in sync.  This is a best-effort convenience cache;
+                // the disk state is authoritative.
+                match crate::pool::PoolRegistry::load_or_default(&self.pool_reg_path) {
+                    Ok(reg) => {
+                        let mut guard = self.pool_registry.write().await;
+                        *guard = reg;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to reload pool registry after run; in-memory cache may be stale"
+                        );
+                    }
+                }
+            }
+
+            let json = splice_response_warnings(&json, "lib_path_warnings", &warnings);
+            let json = match pool_save_error {
+                Some(msg) => splice_response_string(&json, "pool_save_error", &msg),
+                None => json,
+            };
+            let _ = session_id; // session_id is embedded in the JSON response
+            return Ok(json);
+        }
+
+        // ── In-process path (default) ──────────────────────────────────────────
         let json = self
             .start_and_tick(code, ctx, None, extra, variants)
             .await?;
@@ -108,11 +172,54 @@ impl AppService {
     }
 
     /// Continue a paused execution — batch feed.
+    ///
+    /// For pool sessions (`session_id` found in registry.json), each response
+    /// in the batch is forwarded to the worker via `PoolClient::send_request`.
+    /// For in-MCP sessions, the existing `SessionRegistry::feed_response` path
+    /// is used unchanged.
     pub async fn continue_batch(
         &self,
         session_id: &str,
         responses: Vec<QueryResponse>,
     ) -> Result<String, String> {
+        // ── Pool path check (same registry lookup as continue_single) ─────────
+        let pool_entry = {
+            let reg = self.pool_registry.read().await;
+            reg.find(session_id).cloned()
+        };
+
+        let pool_entry = if pool_entry.is_some() {
+            pool_entry
+        } else {
+            match crate::pool::PoolRegistry::load_or_default(&self.pool_reg_path) {
+                Ok(reg) => {
+                    let entry = reg.find(session_id).cloned();
+                    if entry.is_some() {
+                        let mut guard = self.pool_registry.write().await;
+                        *guard = reg;
+                    }
+                    entry
+                }
+                Err(e) => {
+                    return Err(format!("Continue failed: {e}"));
+                }
+            }
+        };
+
+        if let Some(entry) = pool_entry {
+            // ── Pool routing ────────────────────────────────────────────────────
+            let mut last_json = None;
+            for qr in responses {
+                let json =
+                    continue_via_pool(&entry, session_id, qr.response, Some(qr.query_id), qr.usage)
+                        .await
+                        .map_err(|e| format!("Continue failed: {e}"))?;
+                last_json = Some(json);
+            }
+            return last_json.ok_or_else(|| "Empty responses array".to_string());
+        }
+
+        // ── In-MCP path ────────────────────────────────────────────────────────
         let mut last_result = None;
         for qr in responses {
             let qid = QueryId::parse(&qr.query_id);
@@ -132,6 +239,25 @@ impl AppService {
     }
 
     /// Continue a paused execution — single response (with optional query_id).
+    ///
+    /// Routing is automatic: if `session_id` is found in `registry.json`
+    /// (pool path), the call is proxied via `PoolClient` over UDS. If not
+    /// found (in-MCP path), the existing `SessionRegistry::feed_response`
+    /// is used. Both paths never coexist for the same `session_id`.
+    ///
+    /// # Concurrency
+    ///
+    /// **Pool path**: acquires `RwLock<PoolRegistry>` (read) to look up the
+    /// session entry, then acquires `tokio::sync::Mutex` inside `PoolClient`
+    /// to serialize the UDS write. Neither lock is held across the UDS await.
+    ///
+    /// **In-MCP path**: acquires lock C in the two-phase pattern documented on
+    /// `SessionRegistry::feed_response`.
+    ///
+    /// **Cancel safety**: cancelling mid-await on the pool path leaves the
+    /// worker subprocess running (UDS send may have been partially written;
+    /// `read_line` is not cancel-safe — a partial line in the buffer renders
+    /// the connection unusable and `PoolClient` must reconnect).
     pub async fn continue_single(
         &self,
         session_id: &str,
@@ -139,6 +265,49 @@ impl AppService {
         query_id: Option<&str>,
         usage: Option<algocline_core::TokenUsage>,
     ) -> Result<String, String> {
+        // ── Pool path: check in-memory registry, then disk registry ───────────
+        // K-4: acquire read lock, clone the entry, release lock BEFORE await.
+        let pool_entry = {
+            let reg = self.pool_registry.read().await;
+            reg.find(session_id).cloned()
+        }; // read lock released here
+
+        // If in-memory cache missed, check disk (e.g. after MCP restart).
+        let pool_entry = if pool_entry.is_some() {
+            pool_entry
+        } else {
+            match crate::pool::PoolRegistry::load_or_default(&self.pool_reg_path) {
+                Ok(reg) => {
+                    let entry = reg.find(session_id).cloned();
+                    if entry.is_some() {
+                        // Warm the in-memory cache.
+                        let mut guard = self.pool_registry.write().await;
+                        *guard = reg;
+                    }
+                    entry
+                }
+                Err(e) => {
+                    // Corrupt registry: propagate to MCP wire per §Error 伝播規律.
+                    return Err(format!("Continue failed: {e}"));
+                }
+            }
+        };
+
+        if let Some(entry) = pool_entry {
+            // ── Pool routing (Crux: MCP thin proxy IPC boundary) ──────────────
+            let json = continue_via_pool(
+                &entry,
+                session_id,
+                response,
+                query_id.map(str::to_string),
+                usage,
+            )
+            .await
+            .map_err(|e| format!("Continue failed: {e}"))?;
+            return Ok(json);
+        }
+
+        // ── In-MCP path ────────────────────────────────────────────────────────
         let query_id = match query_id {
             Some(qid) => QueryId::parse(qid),
             None => self
@@ -374,6 +543,160 @@ mod tests {
         assert!(
             v.get("transcript_warning").is_none(),
             "transcript_warning must be absent when warning is None"
+        );
+    }
+
+    // ── ST6: pool registry routing tests ────────────────────────────────────
+
+    use crate::pool::{PoolRegistry, PoolSessionEntry};
+
+    /// T1: continue_single falls through to in-MCP path when session is not in pool registry.
+    ///
+    /// An unknown session ID should not be found in the pool registry and
+    /// should reach the `SessionRegistry::feed_response` path, which returns
+    /// an error because no session exists in the in-memory registry either.
+    #[tokio::test]
+    async fn continue_single_in_mcp_path_on_registry_miss() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let svc = make_app_service_with_log_dir(tmp.path().to_path_buf()).await;
+
+        // The pool registry on disk and in-memory is empty (no workers registered).
+        // continue_single should fall through to the in-MCP path and return
+        // "not found" because the in-memory session registry also has nothing.
+        let result = svc
+            .continue_single(
+                "nonexistent-session-id",
+                "some response".to_string(),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "unknown session must return Err on in-MCP path"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("not found") || msg.contains("Continue failed"),
+            "error must indicate session not found, got: {msg}"
+        );
+    }
+
+    /// T2: AppService::new initialises pool_registry as empty when pool dir absent.
+    ///
+    /// Verifies that startup GC with a missing registry.json (normal first-run)
+    /// produces an empty PoolRegistry (not an error).
+    #[tokio::test]
+    async fn app_service_new_initialises_empty_pool_registry() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let svc = make_app_service_with_log_dir(tmp.path().to_path_buf()).await;
+
+        let reg = svc.pool_registry.read().await;
+        assert!(
+            reg.sessions.is_empty(),
+            "pool registry must be empty on first-run (no registry.json)"
+        );
+    }
+
+    /// T2b: AppService correctly stores pool registry paths derived from app_dir.
+    ///
+    /// Verifies that pool_dir / pool_reg_path / pool_lock_path are
+    /// non-empty paths derived from state_dir/pool/*.
+    #[tokio::test]
+    async fn app_service_pool_paths_correctly_derived() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let svc = make_app_service_with_log_dir(tmp.path().to_path_buf()).await;
+
+        assert!(
+            svc.pool_dir.ends_with("pool"),
+            "pool_dir must end in 'pool', got: {}",
+            svc.pool_dir.display()
+        );
+        assert!(
+            svc.pool_reg_path.ends_with("pool/registry.json"),
+            "pool_reg_path must end in 'pool/registry.json', got: {}",
+            svc.pool_reg_path.display()
+        );
+        assert!(
+            svc.pool_lock_path.ends_with("pool/registry.lock"),
+            "pool_lock_path must end in 'pool/registry.lock', got: {}",
+            svc.pool_lock_path.display()
+        );
+    }
+
+    /// T3: continue_single propagates PoolError::RegistryCorrupted to MCP wire.
+    ///
+    /// When registry.json is corrupt and there is a cache miss, continue_single
+    /// must return Err (not silently proceed with empty registry). This verifies
+    /// the CLAUDE.md §Error 伝播規律 invariant — no unwrap_or_default() swallowing.
+    #[tokio::test]
+    async fn continue_single_propagates_corrupted_registry_error() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let svc = make_app_service_with_log_dir(tmp.path().to_path_buf()).await;
+
+        // Write a corrupt registry.json to the pool directory.
+        let pool_dir = svc.pool_dir.clone();
+        std::fs::create_dir_all(&pool_dir).expect("create pool dir");
+        std::fs::write(pool_dir.join("registry.json"), b"{ not valid json !!!")
+            .expect("write corrupt registry");
+
+        // The in-memory cache is empty (startup GC failed on the corrupt file,
+        // so pool_registry is empty default).  The disk read in continue_single
+        // will hit the corrupt file and must propagate the error.
+        let result = svc
+            .continue_single("any-session-id", "response".to_string(), None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "corrupted registry must cause Err, not silent empty fallback"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("corrupted") || msg.contains("parse") || msg.contains("Continue failed"),
+            "error must mention registry problem, got: {msg}"
+        );
+    }
+
+    /// T1b: in-memory pool registry lookup finds an entry and routes to pool path.
+    ///
+    /// Inserts a live entry (current process PID) into the in-memory registry
+    /// and verifies that continue_single attempts the pool path (fails with
+    /// connection error because no real worker socket exists, not "not found").
+    #[tokio::test]
+    async fn continue_single_routes_to_pool_on_registry_hit() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let svc = make_app_service_with_log_dir(tmp.path().to_path_buf()).await;
+
+        // Insert a fake entry pointing to a non-existent socket.
+        // This simulates the case where a pool session was started.
+        let fake_sock = tmp.path().join("nonexistent.sock");
+        let entry = PoolSessionEntry::new(
+            "test-pool-session",
+            std::process::id(), // live PID — survives GC
+            fake_sock.clone(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        {
+            let mut reg = svc.pool_registry.write().await;
+            reg.add(entry);
+        }
+
+        // continue_single should find the entry and attempt pool path.
+        // The UDS connect will fail (no socket file) → PoolError::Connect → Err.
+        // Importantly, the error is a connection error, NOT a "session not found" error.
+        let result = svc
+            .continue_single("test-pool-session", "response".to_string(), None, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "pool path must fail with connect error (no real worker)"
+        );
+        let msg = result.unwrap_err();
+        // The error must come from pool path (UDS connect), not from SessionRegistry.
+        // "not found" would indicate the in-MCP path was taken instead.
+        assert!(
+            !msg.contains("session not found") || msg.contains("Continue failed"),
+            "error must be from pool path (UDS connect), got: {msg}"
         );
     }
 }

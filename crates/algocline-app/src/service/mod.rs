@@ -41,6 +41,7 @@ mod tests;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::pool::{registry::with_registry_lock, PoolError, PoolRegistry};
 use algocline_engine::{Executor, FileCardStore, JsonFileStore, SessionRegistry, VariantPkg};
 
 pub use algocline_core::{EngineApi, TokenUsage};
@@ -88,6 +89,19 @@ pub struct AppService {
     eval_sessions: Arc<EvalSessions>,
     /// session_id → strategy name for log/stats tracking (cleared on session completion).
     session_strategies: Arc<SessionStrategies>,
+    /// Pool worker registry (persistent, backed by registry.json).
+    ///
+    /// `RwLock` because multiple concurrent callers may check for pool sessions
+    /// while a single writer spawns a new worker.  The lock is never held across
+    /// an `.await` boundary (K-4: clone-then-release pattern).
+    pub(crate) pool_registry: Arc<tokio::sync::RwLock<PoolRegistry>>,
+    /// Filesystem paths for pool registry management.
+    ///
+    /// Stored here so `run.rs` / `engine_api_impl.rs` can reach them without
+    /// re-computing from `AppConfig` on every call.
+    pub(crate) pool_reg_path: std::path::PathBuf,
+    pub(crate) pool_lock_path: std::path::PathBuf,
+    pub(crate) pool_dir: std::path::PathBuf,
 }
 
 impl AppService {
@@ -103,6 +117,42 @@ impl AppService {
         let app_dir = log_config.app_dir();
         let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
         let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
+
+        // ─── Pool registry setup ───────────────────────────────────────────────
+        // Paths: ~/.algocline/state/pool/{registry.json, registry.lock}
+        // No pool_dir() helper in AppDir (not in scope); derive manually.
+        let pool_dir = app_dir.state_dir().join("pool");
+        let pool_reg_path = pool_dir.join("registry.json");
+        let pool_lock_path = pool_dir.join("registry.lock");
+
+        // Startup GC: remove dead worker entries accumulated from previous
+        // MCP sessions.  Runs synchronously in new() (called before any
+        // tokio tasks spawn) so spawn_blocking is not needed (K-110).
+        //
+        // If GC fails (corrupt registry, lock I/O error), we start with an
+        // empty registry and emit a tracing::warn.  This is justified for
+        // startup housekeeping only: the worker processes themselves remain
+        // alive — they accumulate as orphans until the next restart, which
+        // is acceptable for a POC.  A corrupt registry.json on startup is
+        // surfaced via the tracing warn so operators can investigate.
+        //
+        // NOTE: this is the ONLY place in AppService that uses
+        // tracing::warn without propagating to MCP wire.  It is defensible
+        // because new() has no return type capable of carrying the error, and
+        // GC failure has no correctness impact on the current session.
+        let pool_registry = match with_registry_lock(&pool_lock_path, || {
+            let mut reg = PoolRegistry::load_or_default(&pool_reg_path)?;
+            let _ = reg.scan_and_gc()?;
+            reg.save(&pool_reg_path)?;
+            Ok::<_, PoolError>(reg)
+        }) {
+            Ok(reg) => reg,
+            Err(e) => {
+                tracing::warn!("pool registry startup GC failed (workers may accumulate): {e}");
+                PoolRegistry::default()
+            }
+        };
+
         Self {
             executor,
             registry,
@@ -112,6 +162,10 @@ impl AppService {
             card_store,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pool_registry: Arc::new(tokio::sync::RwLock::new(pool_registry)),
+            pool_reg_path,
+            pool_lock_path,
+            pool_dir,
         }
     }
 

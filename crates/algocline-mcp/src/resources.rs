@@ -1000,6 +1000,7 @@ mod tests {
                     _code_file: Option<String>,
                     _ctx: Option<serde_json::Value>,
                     _project_root: Option<String>,
+                    _host_mode: Option<bool>,
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1287,6 +1288,15 @@ mod tests {
                     format!("default-err stub: {}", stringify!($ty))
                 }
                 async fn hub_index_aggregate(&self) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pool_ensure(&self) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pool_status(&self, _sid: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn pool_stop(&self, _sid: Option<String>) -> Result<String, String> {
                     Err($err.into())
                 }
             }
@@ -1679,6 +1689,7 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
             _: Option<String>,
+            _: Option<bool>,
         ) -> Result<String, String> {
             Err("noop".into())
         }
@@ -1897,6 +1908,15 @@ mod tests {
                 .clone()
                 .unwrap_or(Err("not configured".into()))
         }
+        async fn pool_ensure(&self) -> Result<String, String> {
+            Err("not configured".into())
+        }
+        async fn pool_status(&self, _sid: Option<String>) -> Result<String, String> {
+            Err("not configured".into())
+        }
+        async fn pool_stop(&self, _sid: Option<String>) -> Result<String, String> {
+            Err("not configured".into())
+        }
     }
 
     fn make_fake_catalog(engine: FakeEngine) -> (ResourceCatalog, tempfile::TempDir) {
@@ -1939,6 +1959,7 @@ mod tests {
                 _: Option<String>,
                 _: Option<serde_json::Value>,
                 _: Option<String>,
+                _: Option<bool>,
             ) -> Result<String, String> {
                 Err("noop".into())
             }
@@ -2193,6 +2214,15 @@ mod tests {
             }
             async fn hub_index_aggregate(&self) -> Result<String, String> {
                 Err("noop".into())
+            }
+            async fn pool_ensure(&self) -> Result<String, String> {
+                Err("not found".into())
+            }
+            async fn pool_status(&self, _sid: Option<String>) -> Result<String, String> {
+                Err("not found".into())
+            }
+            async fn pool_stop(&self, _sid: Option<String>) -> Result<String, String> {
+                Err("not found".into())
             }
         }
         let tmp = tempfile::tempdir().unwrap();

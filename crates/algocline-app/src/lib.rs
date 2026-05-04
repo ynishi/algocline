@@ -1,3 +1,4 @@
+pub mod pool;
 mod service;
 
 pub use service::hub_dist_preset::load_hub_projection_config;

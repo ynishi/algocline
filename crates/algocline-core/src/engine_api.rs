@@ -28,12 +28,18 @@ pub trait EngineApi: Send + Sync {
     // ─── Core execution ──────────────────────────────────────
 
     /// Execute Lua code with optional JSON context.
+    ///
+    /// When `host_mode: Some(true)` is passed, the call is proxied via
+    /// `PoolClient` to a long-lived worker subprocess over a Unix domain socket.
+    /// When `host_mode` is `None` or `Some(false)` the existing in-process
+    /// `Executor::start_session` path is used unchanged.
     async fn run(
         &self,
         code: Option<String>,
         code_file: Option<String>,
         ctx: Option<serde_json::Value>,
         project_root: Option<String>,
+        host_mode: Option<bool>,
     ) -> Result<String, String>;
 
     /// Apply an installed strategy package. Task is optional.
@@ -542,4 +548,22 @@ pub trait EngineApi: Send + Sync {
     /// Returns `Err(message)` only when the hub registries file itself is
     /// corrupt (hard I/O failure), making further index discovery impossible.
     async fn hub_index_aggregate(&self) -> Result<String, String>;
+
+    // ─── Pool management ─────────────────────────────────────────
+
+    /// Ensure pool workers are alive; GC stale entries. Idempotent.
+    ///
+    /// Returns JSON `{"sessions": [...], "pool_version": "..."}`.
+    async fn pool_ensure(&self) -> Result<String, String>;
+
+    /// Return pool worker status (registry.json + live state).
+    ///
+    /// When `sid` is provided, restricts to a single worker.
+    /// Returns JSON `{"sessions": [...], "pool_version": "..."}`.
+    async fn pool_status(&self, sid: Option<String>) -> Result<String, String>;
+
+    /// Send SIGTERM to all workers (`sid=None`) or a single worker.
+    ///
+    /// Returns JSON `{"stopped": [...], "errors": [...]}`.
+    async fn pool_stop(&self, sid: Option<String>) -> Result<String, String>;
 }

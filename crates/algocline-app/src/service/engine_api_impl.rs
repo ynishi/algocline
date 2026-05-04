@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use algocline_core::{EngineApi, QueryResponse};
 use async_trait::async_trait;
 
+use crate::pool::{registry::with_registry_lock, PoolError, PoolRegistry};
+
 use super::list_opts::ListOpts;
 use super::AppService;
 
@@ -546,5 +548,204 @@ impl EngineApi for AppService {
 
     async fn info(&self) -> String {
         AppService::info(self)
+    }
+
+    // ─── Pool management ─────────────────────────────────────
+
+    async fn pool_ensure(&self) -> Result<String, String> {
+        AppService::pool_ensure_impl(self).await
+    }
+
+    async fn pool_status(&self, sid: Option<String>) -> Result<String, String> {
+        AppService::pool_status_impl(self, sid).await
+    }
+
+    async fn pool_stop(&self, sid: Option<String>) -> Result<String, String> {
+        AppService::pool_stop_impl(self, sid).await
+    }
+}
+
+// ─── Pool inherent helpers ────────────────────────────────────────────────────
+
+impl AppService {
+    /// Scan registry.json, GC dead workers, and return live sessions.
+    ///
+    /// Idempotent: calling twice produces the same result when no workers change
+    /// state between calls.  Does NOT spawn new workers.
+    pub(crate) async fn pool_ensure_impl(&self) -> Result<String, String> {
+        let reg_path = self.pool_reg_path.clone();
+        let lock_path = self.pool_lock_path.clone();
+
+        let sessions =
+            tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, PoolError> {
+                with_registry_lock(&lock_path, || {
+                    let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+                    let survivors = reg.scan_and_gc()?;
+                    // Persist GC result back to disk.
+                    reg.save(&reg_path)?;
+                    let entries = survivors
+                        .iter()
+                        .map(|e| {
+                            serde_json::json!({
+                                "sid": e.sid,
+                                "pid": e.pid,
+                                "sock": e.sock.to_string_lossy(),
+                                "version": e.version,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(entries)
+                })
+            })
+            .await
+            .map_err(|e| format!("pool_ensure: task panicked: {e}"))?
+            .map_err(|e| e.to_string())?;
+
+        let pool_version = env!("CARGO_PKG_VERSION");
+        serde_json::to_string(&serde_json::json!({
+            "sessions": sessions,
+            "pool_version": pool_version,
+        }))
+        .map_err(|e| format!("pool_ensure: serialize: {e}"))
+    }
+
+    /// Return pool worker status from registry.json.
+    ///
+    /// When `sid` is `Some`, restricts output to that single worker.
+    /// Uses kill -0 liveness check for each returned entry.
+    pub(crate) async fn pool_status_impl(&self, sid: Option<String>) -> Result<String, String> {
+        let reg_path = self.pool_reg_path.clone();
+        let lock_path = self.pool_lock_path.clone();
+
+        let sessions =
+            tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, PoolError> {
+                with_registry_lock(&lock_path, || {
+                    let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+                    // GC dead entries in-place so status reflects reality.
+                    let _ = reg.scan_and_gc()?;
+                    reg.save(&reg_path)?;
+
+                    let entries: Vec<serde_json::Value> = reg
+                        .sessions
+                        .iter()
+                        .filter(|e| sid.as_deref().map(|s| e.sid == s).unwrap_or(true))
+                        .map(|e| {
+                            serde_json::json!({
+                                "sid": e.sid,
+                                "pid": e.pid,
+                                "sock": e.sock.to_string_lossy(),
+                                "version": e.version,
+                                "created_at": e.created_at,
+                                // Status is "running" for all live entries (UDS ping not required in POC).
+                                "status": "running",
+                            })
+                        })
+                        .collect();
+                    Ok(entries)
+                })
+            })
+            .await
+            .map_err(|e| format!("pool_status: task panicked: {e}"))?
+            .map_err(|e| e.to_string())?;
+
+        let pool_version = env!("CARGO_PKG_VERSION");
+        serde_json::to_string(&serde_json::json!({
+            "sessions": sessions,
+            "pool_version": pool_version,
+        }))
+        .map_err(|e| format!("pool_status: serialize: {e}"))
+    }
+
+    /// Send SIGTERM to all workers or a single worker identified by `sid`.
+    ///
+    /// After SIGTERM, removes the entry from registry.json.
+    /// Returns `{"stopped": [...], "errors": [...]}`.
+    /// SIGTERM send failures are surfaced in the `errors` array (not dropped silently).
+    pub(crate) async fn pool_stop_impl(&self, sid: Option<String>) -> Result<String, String> {
+        let reg_path = self.pool_reg_path.clone();
+        let lock_path = self.pool_lock_path.clone();
+
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<String>, Vec<String>), PoolError> {
+                with_registry_lock(&lock_path, || {
+                    let mut reg = PoolRegistry::load_or_default(&reg_path)?;
+
+                    // Determine targets.
+                    let targets: Vec<_> = reg
+                        .sessions
+                        .iter()
+                        .filter(|e| sid.as_deref().map(|s| e.sid == s).unwrap_or(true))
+                        .cloned()
+                        .collect();
+
+                    let mut stopped: Vec<String> = Vec::new();
+                    let mut errors: Vec<String> = Vec::new();
+
+                    for entry in &targets {
+                        #[cfg(unix)]
+                        {
+                            // K-52: guard u32 → i32 (pid_t) overflow.
+                            let pid_t = match i32::try_from(entry.pid) {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    errors.push(format!(
+                                        "sid={}: pid={} exceeds i32::MAX, cannot send SIGTERM (K-52)",
+                                        entry.sid, entry.pid
+                                    ));
+                                    // Remove the entry anyway (PID is invalid, worker is unreachable).
+                                    reg.remove(&entry.sid);
+                                    continue;
+                                }
+                            };
+
+                            // SAFETY: libc::kill(pid, SIGTERM) is a thin syscall wrapper.
+                            // pid > 0 sends to the specific process.
+                            // pid fits in i32 (verified above).
+                            let ret = unsafe { libc::kill(pid_t, libc::SIGTERM) };
+                            if ret == 0 {
+                                stopped.push(entry.sid.clone());
+                            } else {
+                                let os_err = std::io::Error::last_os_error();
+                                if os_err.raw_os_error() == Some(libc::ESRCH) {
+                                    // Process already dead — treat as stopped (idempotent).
+                                    stopped.push(entry.sid.clone());
+                                } else {
+                                    errors.push(format!(
+                                        "sid={}: SIGTERM failed: {}",
+                                        entry.sid, os_err
+                                    ));
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            // Non-Unix: cannot send SIGTERM; report as unsupported.
+                            errors.push(format!(
+                                "sid={}: SIGTERM not supported on this platform",
+                                entry.sid
+                            ));
+                        }
+                        // Remove from registry regardless of SIGTERM result
+                        // (dead or dying, we no longer track it).
+                        reg.remove(&entry.sid);
+                    }
+
+                    // Persist updated registry (entries removed).
+                    reg.save(&reg_path)?;
+
+                    Ok((stopped, errors))
+                })
+            },
+        )
+        .await
+        .map_err(|e| format!("pool_stop: task panicked: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+        let (stopped, errors) = result;
+        serde_json::to_string(&serde_json::json!({
+            "stopped": stopped,
+            "errors": errors,
+        }))
+        .map_err(|e| format!("pool_stop: serialize: {e}"))
     }
 }

@@ -9,9 +9,13 @@ pub enum PoolError {
     #[error("failed to connect to UDS socket: {0}")]
     Connect(#[from] std::io::Error),
 
-    /// Socket read or write failed after connection was established.
-    #[error("failed to read/write UDS socket: {0}")]
-    Io(String),
+    /// Socket write (or flush) failed after connection was established.
+    #[error("failed to write UDS socket: {0}")]
+    IoWrite(String),
+
+    /// Socket read failed after connection was established.
+    #[error("failed to read UDS socket: {0}")]
+    IoRead(String),
 
     /// A response line from the worker could not be parsed as valid JSON.
     #[error("failed to parse worker response: {0}")]

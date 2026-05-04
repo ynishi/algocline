@@ -38,6 +38,22 @@ pub struct RunParams {
     pub host_mode: Option<bool>,
 }
 
+/// Parameters for `alc_pool_status`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PoolStatusParams {
+    /// Optional session ID to restrict status to a single worker.
+    /// Omit to return status for all registered workers.
+    pub sid: Option<String>,
+}
+
+/// Parameters for `alc_pool_stop`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PoolStopParams {
+    /// Optional session ID. When provided, sends SIGTERM to that single worker.
+    /// Omit to stop all registered workers.
+    pub sid: Option<String>,
+}
+
 /// Host-reported token usage for an LLM call (MCP schema).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpTokenUsage {
@@ -1641,6 +1657,61 @@ impl AlcService {
                 params.verbose,
             )
             .await
+    }
+
+    // ─── Pool management ────────────────────────────────────────
+
+    /// Scan the pool registry, GC dead workers, and return live sessions.
+    ///
+    /// Idempotent: calling twice produces the same result when no workers change
+    /// state between calls. Does NOT spawn new workers — new workers are spawned
+    /// on demand by `alc_run` with `host_mode=true`.
+    ///
+    /// Returns `{"sessions": [...], "pool_version": "..."}`.
+    #[tool(
+        name = "alc_pool_ensure",
+        annotations(idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn pool_ensure(&self) -> Result<String, String> {
+        self.app.pool_ensure().await
+    }
+
+    /// Return pool worker status (registry.json + liveness).
+    ///
+    /// Uses kill -0 to check each registered worker. When `sid` is provided,
+    /// restricts output to that single worker.
+    ///
+    /// Returns `{"sessions": [{"sid","pid","sock","version","created_at","status"},...], "pool_version":"..."}`.
+    #[tool(
+        name = "alc_pool_status",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn pool_status(
+        &self,
+        Parameters(params): Parameters<PoolStatusParams>,
+    ) -> Result<String, String> {
+        self.app.pool_status(params.sid).await
+    }
+
+    /// Send SIGTERM to all pool workers (`sid` omitted) or a single worker.
+    ///
+    /// Removes stopped entries from registry.json. SIGTERM failures are
+    /// returned in the `errors` array rather than dropped silently.
+    ///
+    /// Returns `{"stopped": [...], "errors": [...]}`.
+    #[tool(
+        name = "alc_pool_stop",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pool_stop(
+        &self,
+        Parameters(params): Parameters<PoolStopParams>,
+    ) -> Result<String, String> {
+        self.app.pool_stop(params.sid).await
     }
 
     // ─── Diagnostics ────────────────────────────────────────────

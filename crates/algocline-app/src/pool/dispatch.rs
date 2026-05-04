@@ -117,7 +117,7 @@ async fn spawn_worker(pool_dir: &Path, sid: &str) -> Result<(u32, PathBuf), Pool
     tokio::spawn(async move {
         match child.wait().await {
             Ok(status) => tracing::debug!(sid = %sid_owned, ?status, "pool worker reaped"),
-            Err(e) => tracing::debug!(sid = %sid_owned, error = %e, "pool worker wait error"),
+            Err(e) => tracing::warn!(sid = %sid_owned, error = %e, "pool worker wait error"),
         }
     });
 

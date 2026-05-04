@@ -684,9 +684,19 @@ impl AppService {
                     for entry in &targets {
                         #[cfg(unix)]
                         {
-                            // K-52: guard u32 → i32 (pid_t) overflow.
+                            // K-52: guard u32 → i32 (pid_t) overflow; also reject pid == 0
+                            // (POSIX kill(2): pid=0 signals every process in the calling process
+                            // group, pid<0 signals a process group — both are unsafe here).
                             let pid_t = match i32::try_from(entry.pid) {
-                                Ok(p) => p,
+                                Ok(p) if p > 0 => p,
+                                Ok(_) => {
+                                    errors.push(format!(
+                                        "sid={}: pid={} is not a valid POSIX target pid (must be > 0); skipping SIGTERM",
+                                        entry.sid, entry.pid
+                                    ));
+                                    reg.remove(&entry.sid);
+                                    continue;
+                                }
                                 Err(_) => {
                                     errors.push(format!(
                                         "sid={}: pid={} exceeds i32::MAX, cannot send SIGTERM (K-52)",
@@ -699,7 +709,7 @@ impl AppService {
                             };
 
                             // SAFETY: libc::kill(pid, SIGTERM) is a thin syscall wrapper.
-                            // pid > 0 sends to the specific process.
+                            // pid_t > 0, verified by the match arm above.
                             // pid fits in i32 (verified above).
                             let ret = unsafe { libc::kill(pid_t, libc::SIGTERM) };
                             if ret == 0 {
@@ -749,3 +759,80 @@ impl AppService {
         .map_err(|e| format!("pool_stop: serialize: {e}"))
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::make_app_service_at;
+
+    /// pool_stop_impl rejects pid=0 without delivering SIGTERM.
+    ///
+    /// A registry.json containing `"pid": 0` must be handled as an invalid
+    /// POSIX target: the error is surfaced in the `errors` array, the entry is
+    /// removed from the on-disk registry, and the test process itself survives
+    /// (proving no SIGTERM was sent to the process group).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pool_stop_pid_zero_is_rejected() {
+        // Arrange: build an AppService rooted at a tempdir so no real $HOME is
+        // touched, then seed registry.json with a single pid=0 entry.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let svc = make_app_service_at(root.clone()).await;
+
+        // The pool registry lives at {app_dir}/state/pool/registry.json.
+        // AppDir::state_dir() resolves to {root}/state.
+        let pool_reg_path = root.join("state").join("pool").join("registry.json");
+        std::fs::create_dir_all(pool_reg_path.parent().unwrap()).expect("create pool dir");
+
+        let seeded = serde_json::json!({
+            "sessions": [{
+                "sid": "zero-pid-session",
+                "pid": 0u32,
+                "sock": "/tmp/alc-pool/zero.sock",
+                "version": "0.30.0",
+                "created_at": "2026-01-01T00:00:00Z"
+            }]
+        });
+        std::fs::write(&pool_reg_path, seeded.to_string()).expect("seed registry.json");
+
+        // Act: stop all sessions.
+        let json_str = svc.pool_stop_impl(None).await.expect("pool_stop_impl");
+        let result: serde_json::Value =
+            serde_json::from_str(&json_str).expect("response is valid JSON");
+
+        // Assert (1): the error message contains "not a valid POSIX target pid".
+        let errors = result["errors"].as_array().expect("errors array");
+        assert!(
+            !errors.is_empty(),
+            "expected at least one error for pid=0 entry"
+        );
+        let err_msg = errors[0].as_str().unwrap_or("");
+        assert!(
+            err_msg.contains("not a valid POSIX target pid"),
+            "unexpected error message: {err_msg}"
+        );
+
+        // Assert (2): stopped array is empty (no process was stopped).
+        let stopped = result["stopped"].as_array().expect("stopped array");
+        assert!(
+            stopped.is_empty(),
+            "pid=0 entry must not appear in stopped list"
+        );
+
+        // Assert (3): the entry is removed from the on-disk registry.
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pool_reg_path).expect("read registry"))
+                .expect("parse registry");
+        let sessions = on_disk["sessions"].as_array().expect("sessions array");
+        assert!(
+            sessions.is_empty(),
+            "pid=0 entry must be removed from on-disk registry"
+        );
+
+        // Assert (4): test process is still alive — trivially confirmed by
+        // reaching this line without being killed by SIGTERM.
+    }
+}
+

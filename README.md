@@ -90,6 +90,8 @@ After adding the config, restart your MCP host session so it picks up the new se
 | `ALC_LOG_LEVEL` | `full` (enable logging) or `off` (disable) | `full` |
 | `ALC_PACKAGES_PATH` | Additional package search paths (colon-separated). Takes priority over `~/.algocline/packages/` | (none) |
 | `ALC_PROJECT_ROOT` | Project root directory for project-local package resolution. When omitted, auto-detected by walking up from cwd to find `alc.toml` | (auto-detect) |
+| `ALC_POOL_STATE_DIR` | Directory for pool registry state (`registry.json`). Overrides the default `~/.algocline/state/pool/` | `~/.algocline/state/pool` |
+| `ALC_POOL_IDLE_TIMEOUT` | Idle timeout in seconds for pool worker subprocesses. Set to `0` to disable. Only relevant when using `host_mode: true` | `1800` |
 
 Example: writing logs to a custom directory:
 
@@ -210,8 +212,8 @@ alc_continue({ session_id, response })
 
 | Tool | Description |
 |---|---|
-| `alc_run` | Execute Lua code with optional JSON context |
-| `alc_continue` | Resume a paused execution with the host LLM's response |
+| `alc_run` | Execute Lua code with optional JSON context. Pass `host_mode: true` to run the session in a long-lived pool worker subprocess that survives MCP server restarts |
+| `alc_continue` | Resume a paused execution with the host LLM's response. Automatically routes to a pool worker when the session was started with `host_mode: true` |
 | `alc_advice` | Apply an installed package by name |
 | `alc_pkg_link` | Link a local directory as a project-local package via symlink. Records path in `alc.lock` |
 | `alc_pkg_unlink` | Remove a symlink created by `alc_pkg_link` (rejects real directories) |
@@ -239,6 +241,9 @@ alc_continue({ session_id, response })
 | `alc_scenario_list` | List installed eval scenarios |
 | `alc_scenario_show` | Show an installed scenario's content |
 | `alc_scenario_install` | Install scenarios from Git URL or local path |
+| `alc_pool_ensure` | Ensure a pool worker subprocess is running for a session; spawns one if absent. Returns `{sid, sock, pid, status}` |
+| `alc_pool_status` | List active pool sessions with PID, socket path, and version (read-only) |
+| `alc_pool_stop` | Send SIGTERM to a named session's pool worker and remove its registry entry |
 
 ## MCP Resources
 

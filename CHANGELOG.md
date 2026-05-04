@@ -25,6 +25,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`test_cli_help_short`, `test_cli_help_long`, `test_cli_version`) exercise
   these dry-run code paths without spawning the stdio MCP server.
 
+- **Pool worker POC: long-lived `alc_run` sessions that survive MCP server
+  restarts** (`host_mode=true`). When `alc_run` is called with
+  `host_mode: true`, the session runs inside a dedicated worker subprocess
+  (`1 session = 1 process`, each with its own mlua VM) rather than inside the
+  MCP server process. The worker persists independently of the MCP server
+  lifecycle so that a `paused` session survives a Claude Code (MCP client)
+  restart and can be resumed via `alc_continue` after reconnection. The
+  default (`host_mode` absent or `false`) is fully unchanged — all existing
+  `alc_run` / `alc_continue` calls continue to run in-MCP with no behaviour
+  difference.
+
+  Key components added:
+
+  - **`PoolError` + pool wire protocol** (`crates/algocline-app/src/pool/`):
+    `PoolError` (`thiserror` enum covering `Connect`, `RegistryCorrupted`,
+    `Spawn`, `Handshake`, `SessionNotFound`, `VersionMismatch`),
+    `PoolRequest` / `PoolResponse` serde enums (JSON line IPC), and a
+    version-handshake type.
+
+  - **`PoolClient`** (`crates/algocline-app/src/pool/client.rs`): Unix domain
+    socket client. Connects to a worker's UDS path, sends length-prefixed JSON
+    lines, and receives responses. Cancel-safe design: on cancellation the
+    connection is dropped and re-established to avoid partial-line buffer
+    corruption.
+
+  - **`--pool-worker` hidden subcommand** (`src/pool_worker.rs` +
+    `src/main.rs`): the binary can be spawned as a worker subprocess with
+    `alc --pool-worker --sid <sid> --sock <path>`. The worker starts its own
+    `tokio` runtime, accepts exactly one IPC client, initialises one mlua VM
+    via `AsyncIsle::spawn`, and dispatches `run` / `continue` / `stop` IPC
+    messages in a loop. 1 session = 1 worker process; sessions are fully
+    isolated.
+
+  - **`PoolRegistry`** (`crates/algocline-app/src/pool/registry.rs`):
+    persistent session registry at `~/.algocline/state/pool/registry.json`
+    (path overridable via `ALC_POOL_STATE_DIR`). Entries are written atomically
+    via `tempfile::NamedTempFile::persist` (`rename(2)`). On `AppService::new`,
+    `scan_and_gc` evicts orphaned entries using `libc::kill(pid, 0)` (ESRCH
+    detection). An advisory lock (`fs2::FileExt::lock_exclusive`) on
+    `~/.algocline/pool/registry.lock` serialises concurrent writers.
+
+  - **`AppService` host_mode dispatch** (`crates/algocline-app/src/service/`):
+    when `host_mode=true`, `AppService::run` spawns a worker subprocess via
+    `tokio::process::Command::new(current_exe())` with `pre_exec(setsid)` and
+    registers the session in `PoolRegistry`. `alc_continue` / `alc_continue_batch`
+    auto-detect the routing (pool vs in-MCP) from `PoolRegistry::lookup`.
+    Registry I/O is wrapped in `spawn_blocking` to avoid blocking the async
+    executor.
+
+  - **Worker idle timeout + SIGTERM graceful shutdown**: workers respect
+    `ALC_POOL_IDLE_TIMEOUT` (default `1800` s; `0` = no timeout). After the
+    timeout elapses with no IPC activity the worker removes itself from
+    `registry.json` and exits. SIGTERM is caught via
+    `tokio::signal::unix::signal(SignalKind::terminate())` and triggers the
+    same cleanup path.
+
+  - **MCP tools `alc_pool_ensure` / `alc_pool_status` / `alc_pool_stop`**:
+    three new MCP tools for pool lifecycle management.
+    - `alc_pool_ensure` (`idempotent_hint=true`): ensures a pool worker is
+      running for a session, spawning one if absent. Returns `{sid, sock,
+      pid, status}`.
+    - `alc_pool_status` (`read_only_hint=true`): queries live registry entries;
+      returns the list of active pool sessions with PID / socket path / version.
+    - `alc_pool_stop` (`destructive_hint=true`): sends SIGTERM to a named
+      session's worker and removes the registry entry. Guards against
+      `pid == 0` to prevent accidental process-group signals.
+
+  Registry corruption is propagated as `PoolError::RegistryCorrupted` (not
+  silently defaulted) in accordance with the project's Result propagation
+  policy.
+
+### Changed
+
+- **`EngineApi::run` gains `host_mode: Option<bool>` parameter** (breaking for
+  trait implementors only; MCP wire shape is additive). External crates
+  implementing `EngineApi` must add this parameter. All in-repo implementations
+  (`AppService`, `engine_default_err!` macro, `FakeEngine`, `NotFoundEngine`)
+  are updated in the same commit.
+
+- **`RunParams` gains `host_mode: Option<bool>` field** (MCP wire shape is
+  additive; existing callers that omit the field receive `host_mode=false`
+  default behaviour, which is the unchanged in-MCP path).
+
 ## [0.30.0] - 2026-04-26
 
 ### Added

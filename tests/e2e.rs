@@ -3616,6 +3616,206 @@ return M"#,
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── alc_pkg_install force parameter ─────────────────────────────
+
+/// Verify that `force=true` is accepted over MCP wire and the Collection install
+/// succeeds when the package already exists at dest.
+///
+/// Uses the git-clone Collection path via a local git repo so that the
+/// GitUrl Collection branch (where force skip/overwrite logic lives) is
+/// exercised end-to-end.
+#[tokio::test]
+async fn test_pkg_install_force_overwrites_collection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Build a bare git repo acting as a Collection source.
+    // One subdir `e2e_force_col` with init.lua.
+    let repo_root = tempfile::tempdir().expect("repo root");
+    let pkg_subdir = repo_root.path().join("e2e_force_col");
+    std::fs::create_dir_all(&pkg_subdir).expect("mkdir pkg_subdir");
+    std::fs::write(
+        pkg_subdir.join("init.lua"),
+        "local M = {}\nM.meta = { name = \"e2e_force_col\", version = \"1.0.0\" }\nreturn M",
+    )
+    .expect("write init.lua v1");
+
+    // Init git repo and commit.
+    let git_init = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root.path())
+        .output()
+        .expect("git init");
+    assert!(git_init.status.success(), "git init failed");
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo_root.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo_root.path())
+        .output();
+    let git_add = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo_root.path())
+        .output()
+        .expect("git add");
+    assert!(git_add.status.success(), "git add failed");
+    let git_commit = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(repo_root.path())
+        .output()
+        .expect("git commit");
+    assert!(git_commit.status.success(), "git commit failed");
+
+    // First install via file:// URL — goes through git clone Collection path.
+    let repo_url = format!("file://{}", repo_root.path().to_string_lossy());
+    let resp1 = call_json(&client, "alc_pkg_install", json!({ "url": repo_url })).await;
+    let installed1 = resp1["installed"].as_array().expect("installed array");
+    assert!(
+        installed1.iter().any(|v| v == "e2e_force_col"),
+        "e2e_force_col should be installed on first call: {resp1}"
+    );
+
+    // Modify the installed package to simulate drift.
+    let installed_init = tmp
+        .path()
+        .join("packages")
+        .join("e2e_force_col")
+        .join("init.lua");
+    std::fs::write(&installed_init, "-- stale").expect("write stale");
+
+    // Second install with force=true — GitUrl Collection branch: removes existing → copies fresh.
+    let resp2 = call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": repo_url, "force": true }),
+    )
+    .await;
+    // force=true: existing package is overwritten → lands in `installed` (not `skipped`).
+    let installed2 = resp2["installed"]
+        .as_array()
+        .expect("installed array (force)");
+    assert!(
+        installed2.iter().any(|v| v == "e2e_force_col"),
+        "e2e_force_col should be in installed (not skipped) after force=true: {resp2}"
+    );
+
+    // The stale content must be gone.
+    let content = std::fs::read_to_string(&installed_init).expect("read after force install");
+    assert!(
+        content.contains("1.0.0"),
+        "installed init.lua should be restored from git after force overwrite, got: {content}"
+    );
+    assert!(
+        !content.contains("stale"),
+        "stale content must be removed after force overwrite"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Verify that omitting `force` (default false) causes an existing Collection
+/// package to be skipped via the git-clone Collection path.
+#[tokio::test]
+async fn test_pkg_install_force_default_is_skip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Build a bare git repo acting as a Collection source.
+    let repo_root = tempfile::tempdir().expect("repo root");
+    let pkg_subdir = repo_root.path().join("e2e_skip_col");
+    std::fs::create_dir_all(&pkg_subdir).expect("mkdir pkg_subdir");
+    std::fs::write(
+        pkg_subdir.join("init.lua"),
+        "local M = {}\nM.meta = { name = \"e2e_skip_col\", version = \"1.0.0\" }\nreturn M",
+    )
+    .expect("write init.lua");
+
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo_root.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo_root.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo_root.path())
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(repo_root.path())
+        .output();
+
+    // First install via file:// URL.
+    let repo_url = format!("file://{}", repo_root.path().to_string_lossy());
+    call_json(&client, "alc_pkg_install", json!({ "url": repo_url })).await;
+
+    // Second install without force — existing package must be skipped.
+    let resp2 = call_json(&client, "alc_pkg_install", json!({ "url": repo_url })).await;
+    let skipped = resp2["skipped"].as_array().expect("skipped array");
+    assert!(
+        skipped.iter().any(|v| v == "e2e_skip_col"),
+        "e2e_skip_col should be in skipped when force is omitted: {resp2}"
+    );
+    let installed = resp2["installed"].as_array().expect("installed array");
+    assert!(
+        !installed.iter().any(|v| v == "e2e_skip_col"),
+        "e2e_skip_col must not be in installed when force is omitted: {resp2}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Verify that passing a non-bool value for `force` results in a deserialization
+/// error returned by the MCP layer (protocol-level error, not a tool-level error).
+///
+/// Uses the default `connect()` to match the pattern of `test_pkg_doctor_shape_error`
+/// which tests the same schema-violation path.
+#[tokio::test]
+async fn test_pkg_install_invalid_force_type() {
+    let client = connect().await;
+
+    // The MCP layer rejects invalid parameter types before reaching the tool handler.
+    // This surfaces as an Err from call_tool (McpError), not as is_error=true.
+    // Pattern mirrors `test_pkg_doctor_shape_error`.
+    let outcome = client
+        .call_tool(call_params(
+            "alc_pkg_install",
+            json!({ "url": "github.com/user/pkg", "force": "notbool" }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            let has_type_error = text.contains("invalid type")
+                || text.contains("expected a boolean")
+                || text.contains("expected bool");
+            assert!(
+                is_error || has_type_error,
+                "expected shape error (is_error=true or type-mismatch text), got is_error={is_error:?}, text: {text}"
+            );
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("invalid type") || msg.contains("expected a boolean"),
+                "expected invalid-type error from param deserialization, got: {msg}"
+            );
+        }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── state lost-update / Lua print safety ────────────────────────
 
 /// Verify that concurrent `alc.state.set` calls on the same key do not

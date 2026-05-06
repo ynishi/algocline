@@ -177,8 +177,13 @@ impl EngineApi for AppService {
             .map_err(|e| e.to_string())
     }
 
-    async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {
-        AppService::pkg_install(self, url, name).await
+    async fn pkg_install(
+        &self,
+        url: String,
+        name: Option<String>,
+        force: Option<bool>,
+    ) -> Result<String, String> {
+        AppService::pkg_install(self, url, name, force).await
     }
 
     async fn pkg_remove(

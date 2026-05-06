@@ -564,6 +564,12 @@ fn log_list_prefers_meta_file() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.log_list(50).unwrap();
@@ -616,6 +622,12 @@ fn stats_empty_dir() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.stats(None, None).unwrap();
@@ -682,6 +694,12 @@ fn stats_aggregates_by_strategy() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     // All strategies
@@ -752,6 +770,12 @@ fn stats_legacy_logs_without_strategy() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.stats(None, None).unwrap();
@@ -795,6 +819,12 @@ fn info_returns_valid_json_with_expected_keys() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.info();
@@ -842,6 +872,12 @@ fn info_stderr_only_when_no_log_dir() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.info();
@@ -887,6 +923,12 @@ fn require_log_dir_returns_path_when_present() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     assert_eq!(app.require_log_dir().unwrap(), Path::new("/tmp/test-logs"));
@@ -924,6 +966,12 @@ fn require_log_dir_returns_err_when_none() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     assert!(app.require_log_dir().is_err());
@@ -1000,6 +1048,12 @@ fn log_list_returns_empty_when_no_log_dir() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.log_list(50).unwrap();
@@ -1039,6 +1093,12 @@ fn stats_returns_zero_when_no_log_dir() {
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
+        pool_registry: Arc::new(tokio::sync::RwLock::new(
+            crate::pool::registry::PoolRegistry::default(),
+        )),
+        pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
+        pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
+        pool_dir: std::path::PathBuf::from("/tmp/pool"),
     };
 
     let result = app.stats(None, None).unwrap();
@@ -1202,6 +1262,7 @@ async fn status_include_history_true_shows_conversation_history_for_paused_sessi
     let run_result = app
         .run(
             Some(r#"return alc.llm("test prompt for history")"#.to_string()),
+            None,
             None,
             None,
             None,

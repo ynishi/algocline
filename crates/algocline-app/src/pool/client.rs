@@ -30,6 +30,7 @@ pub(crate) const HANDSHAKE_RECV_TIMEOUT: std::time::Duration = std::time::Durati
 
 // ─── Internal state ───────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct Inner {
     writer: BufWriter<tokio::net::unix::OwnedWriteHalf>,
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -49,6 +50,7 @@ struct Inner {
 ///    and an error is returned; no `PoolClient` instance is produced.
 /// 2. Call [`PoolClient::send_request`] for each message.
 /// 3. Drop the `PoolClient` when done; the underlying socket is closed.
+#[derive(Debug)]
 pub struct PoolClient {
     inner: Mutex<Inner>,
 }
@@ -325,8 +327,7 @@ mod tests {
             )
             .await;
         })
-        .await
-        .expect("spawn_server");
+        .await;
 
         // --- Client side ---
         let mut client = PoolClient::connect(&sock_path).await.expect("connect");
@@ -391,8 +392,7 @@ mod tests {
             )
             .await;
         })
-        .await
-        .expect("spawn_server");
+        .await;
 
         let err = PoolClient::connect(&sock_path)
             .await
@@ -513,8 +513,7 @@ mod tests {
                 }
             }
         })
-        .await
-        .expect("spawn_server");
+        .await;
 
         let client = Arc::new(tokio::sync::Mutex::new(
             PoolClient::connect(&sock_path).await.expect("connect"),

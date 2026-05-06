@@ -549,8 +549,8 @@ mod tests {
     /// T3c — persist_entry returns Some(error) when the lock path parent
     ///        directory cannot be created (permission denied simulation via
     ///        using a path under a file, not a directory).
-    #[test]
-    fn persist_entry_returns_some_on_io_error() {
+    #[tokio::test]
+    async fn persist_entry_returns_some_on_io_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Place a regular file where the parent directory is expected.
         let blocker = dir.path().join("blocker");
@@ -565,7 +565,7 @@ mod tests {
             "0.30.0",
         );
 
-        let result = persist_entry(&reg_path, &lock_path, entry);
+        let result = persist_entry(reg_path, lock_path, entry).await;
         assert!(
             result.is_some(),
             "persist_entry must return Some(error) on I/O failure"

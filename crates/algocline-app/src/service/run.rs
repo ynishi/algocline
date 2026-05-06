@@ -556,7 +556,7 @@ mod tests {
 
     // ── ST6: pool registry routing tests ────────────────────────────────────
 
-    use crate::pool::{PoolRegistry, PoolSessionEntry};
+    use crate::pool::PoolSessionEntry;
 
     /// T1: continue_single falls through to in-MCP path when session is not in pool registry.
     ///

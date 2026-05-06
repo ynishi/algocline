@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`alc init` — Collection packages now install all sub-files** (`src/init.rs`
+  `copy_package`). Previously only `init.lua` was copied for Collection-layout
+  packages, leaving sibling files (`mc.lua`, `stats.lua`, `sweep.lua`,
+  `eval.lua`, `search.lua`, `stop.lua`, etc.) behind and causing `alc_pkg_doctor`
+  to report `incomplete_pkg` for every multi-file bundled package (e.g.
+  `abm/optimize`). The fix replaces the single-file copy with a full directory
+  tree copy (`copy_dir`) matching the pattern already used by the MCP
+  `alc_pkg_install` path.
+
+- **`alc_pkg_install` — `force` parameter now propagates end-to-end**
+  (`crates/algocline-mcp/src/service.rs`, `crates/algocline-core/src/engine_api.rs`,
+  `crates/algocline-app/src/service/pkg/install.rs`). Previously `PkgInstallParams`
+  had no `force` field; the MCP wire boundary silently dropped any caller-supplied
+  value. `PkgInstallParams.force: Option<bool>` is now an additive field
+  (`#[serde(default)]`), wired through `EngineApi::pkg_install` and
+  `AppService::pkg_install_typed` to the install path. Passing `force: true` via
+  the MCP tool now overwrites an already-installed Collection package instead of
+  skipping it. (breaking for trait implementors only; MCP wire shape is additive)
+
 ## [0.31.1] - 2026-05-06
 
 ### Changed

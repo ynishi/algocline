@@ -218,7 +218,7 @@ alc_continue({ session_id, response })
 | `alc_pkg_link` | Link a local directory as a project-local package via symlink. Records path in `alc.lock` |
 | `alc_pkg_unlink` | Remove a symlink created by `alc_pkg_link` (rejects real directories) |
 | `alc_pkg_list` | List installed packages with metadata. Pass `project_root` to include project-local packages |
-| `alc_pkg_install` | Install a package or collection from Git URL or local path. Response includes `types_path` (absolute path to `alc.d.lua`) |
+| `alc_pkg_install` | Install a package or collection from Git URL or local path. Pass `force: true` to overwrite an already-installed package. Response includes `types_path` (absolute path to `alc.d.lua`) |
 | `alc_pkg_remove` | Remove an installed package from `alc.toml` + `alc.lock`. Pass `project_root` to target project scope |
 | `alc_init` | Initialize a project — creates `alc.toml` in the project root if absent |
 | `alc_update` | Update packages declared in `alc.toml` by re-installing from their recorded sources |
@@ -470,6 +470,7 @@ To install or update via MCP:
 
 ```
 alc_pkg_install({ url: "github.com/ynishi/algocline-bundled-packages" })
+alc_pkg_install({ url: "github.com/ynishi/algocline-bundled-packages", force: true })  # overwrite existing
 ```
 
 For local development (installs from a local checkout, supports uncommitted changes):
@@ -501,10 +502,11 @@ Supported URL formats:
 | Local path (file://) | `file:///path/to/my-strategy` |
 | Local path (absolute) | `/path/to/my-strategy` |
 
-Optional name override (single package mode only):
+Optional parameters:
 
 ```
-alc_pkg_install({ url: "/path/to/repo", name: "custom-name" })
+alc_pkg_install({ url: "/path/to/repo", name: "custom-name" })  # name override (single package mode only)
+alc_pkg_install({ url: "/path/to/repo", force: true })          # overwrite if already installed
 ```
 
 ### Managing packages

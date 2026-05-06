@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-05-06
+
+### Changed
+
+- **BUNDLED_VERSION: `algocline-bundled-packages` v0.20.0 → v0.21.0**.
+  `src/init.rs` `BUNDLED_SOURCES` tag bumped. New packages picked up by
+  `alc init` / `alc update`:
+  - `slm_mux` (Selection, Pure Computation) — SLM-MUX confidence-based
+    per-model selection + complementarity-driven K-subset selection
+    (arXiv:2510.05077, ICLR 2026 Poster).
+  - `solve_verify_split` (Orchestration, Pure Computation) — compute
+    allocator splitting test-time budget between solver and verifier
+    (arXiv:2504.01005, COLM 2025).
+  - `particle_infer`, `isp_aggregate` — additional inference/aggregation
+    primitives.
+  - `alc_shapes.M.slm_muxed` result shape registered.
+  evalframe stays at v0.3.0. MCP-side `AUTO_INSTALL_SOURCES`
+  (`crates/algocline-app/src/service/resolve.rs`) is unchanged (main-branch
+  pinning, separate channel from CLI bundled tag).
+
 ## [0.31.0] - 2026-05-06
 
 ### Added

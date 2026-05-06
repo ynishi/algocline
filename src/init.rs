@@ -196,53 +196,80 @@ fn find_local_source(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Copy a single package directory to dest.
+/// Copy a package directory tree to dest.
 ///
-/// Uses atomic write (copy to temp → rename) to prevent truncated zombie files.
-/// Detects existing zombie files via size mismatch and repairs them on force.
+/// Copies the entire directory tree (all files, not just `init.lua`) so that
+/// multi-file Collection packages install completely into `dest_root/{name}/`.
+///
+/// Zombie detection: compares the top-level entry names of the source and dest
+/// trees. If all source entries are present in dest (src ⊆ dest), the install
+/// is considered healthy and skipped. A missing entry triggers repair.
+///
+/// # Arguments
+/// * `name` - Package name used as the destination directory basename.
+/// * `pkg_source` - Path to the source package directory (must exist).
+/// * `dest_root` - Parent directory under which `{name}/` will be created.
+/// * `force` - When true, unconditionally replaces any existing dest tree.
+///
+/// # Returns
+/// * `Ok(true)` — Package was installed or updated.
+/// * `Ok(false)` — Package already exists and is healthy; skipped.
+///
+/// # Errors
+/// Returns an error if `pkg_source` does not exist, or if any I/O operation fails.
 fn copy_package(
     name: &str,
     pkg_source: &Path,
     dest_root: &Path,
     force: bool,
 ) -> anyhow::Result<bool> {
-    let src = pkg_source.join("init.lua");
-    if !src.exists() {
-        anyhow::bail!("Source not found: {}", src.display());
+    if !pkg_source.exists() {
+        anyhow::bail!("Source not found: {}", pkg_source.display());
     }
 
     let dest_dir = dest_root.join(name);
-    let dest_file = dest_dir.join("init.lua");
 
-    if dest_file.exists() && !force {
-        // Zombie detection: if dest exists but size mismatches source,
-        // it's likely a truncated leftover from a previous failed copy.
-        let src_len = std::fs::metadata(&src)?.len();
-        let dest_len = std::fs::metadata(&dest_file)?.len();
-        if src_len == dest_len {
-            return Ok(false); // Healthy file, skip
+    if dest_dir.exists() && !force {
+        // Zombie detection: collect top-level entry names from src and dest.
+        // If all src entries are present in dest (src ⊆ dest), the tree is
+        // healthy and we skip. Any missing src entry triggers repair.
+        let src_names = top_level_entry_names(pkg_source)?;
+        let dest_names = top_level_entry_names(&dest_dir)?;
+        let all_present = src_names.iter().all(|n| dest_names.contains(n));
+        if all_present {
+            return Ok(false); // Healthy tree, skip
         }
-        // Size mismatch → zombie. Fall through to overwrite.
-        eprintln!("    (repairing truncated file for {name})");
+        // Missing entries → zombie. Fall through to overwrite.
+        eprintln!("    (repairing incomplete package for {name})");
     }
 
-    std::fs::create_dir_all(&dest_dir)?;
-
-    // Atomic write: copy to temp file in same directory, then rename.
-    // rename() on the same filesystem is atomic on POSIX.
-    let tmp_file = dest_dir.join("init.lua.tmp");
-    match std::fs::copy(&src, &tmp_file) {
-        Ok(_) => {
-            std::fs::rename(&tmp_file, &dest_file)?;
-        }
-        Err(e) => {
-            // Clean up partial temp file
-            let _ = std::fs::remove_file(&tmp_file);
-            return Err(e.into());
-        }
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(&dest_dir)?;
     }
+    copy_dir(pkg_source, &dest_dir)?;
+    // Remove .git if present (best-effort, not an error if absent)
+    let _ = std::fs::remove_dir_all(dest_dir.join(".git"));
 
     Ok(true)
+}
+
+/// Collect the top-level entry names of a directory.
+///
+/// # Arguments
+/// * `dir` - Directory to read.
+///
+/// # Returns
+/// A set of file/directory name strings (OsString lossy-converted).
+///
+/// # Errors
+/// Returns an error if the directory cannot be read.
+fn top_level_entry_names(dir: &Path) -> std::io::Result<std::collections::HashSet<String>> {
+    let mut names = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        names.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
 }
 
 /// Recursively copy a directory tree.
@@ -572,21 +599,51 @@ mod tests {
     }
 
     #[test]
-    fn copy_package_skips_existing_same_size() {
+    fn copy_package_copies_subfiles() {
+        // T1 (happy path): multi-file source dir installs all sub-files to dest.
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
 
-        // Same size content — should skip (not detected as zombie)
+        let src_pkg = source.path().join("mypkg");
+        std::fs::create_dir(&src_pkg).unwrap();
+        std::fs::write(src_pkg.join("init.lua"), "return {}").unwrap();
+        std::fs::write(src_pkg.join("mc.lua"), "return {}").unwrap();
+        std::fs::write(src_pkg.join("stats.lua"), "return {}").unwrap();
+
+        let installed = copy_package("mypkg", &src_pkg, dest.path(), false).unwrap();
+        assert!(installed, "fresh install should return Ok(true)");
+        assert!(
+            dest.path().join("mypkg/init.lua").exists(),
+            "init.lua must be installed"
+        );
+        assert!(
+            dest.path().join("mypkg/mc.lua").exists(),
+            "mc.lua must be installed"
+        );
+        assert!(
+            dest.path().join("mypkg/stats.lua").exists(),
+            "stats.lua must be installed"
+        );
+    }
+
+    #[test]
+    fn copy_package_skips_existing_same_size() {
+        // Healthy tree: src top-level entries ⊆ dest top-level entries → skip.
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
         let src_pkg = source.path().join("mypkg");
         std::fs::create_dir(&src_pkg).unwrap();
         std::fs::write(src_pkg.join("init.lua"), "return {v=2}").unwrap();
 
+        // Dest has the same top-level entry (init.lua) → healthy, skip
         let dst_pkg = dest.path().join("mypkg");
         std::fs::create_dir(&dst_pkg).unwrap();
         std::fs::write(dst_pkg.join("init.lua"), "return {v=1}").unwrap();
 
         let installed = copy_package("mypkg", &src_pkg, dest.path(), false).unwrap();
-        assert!(!installed, "same-size file should be skipped");
+        assert!(!installed, "healthy tree should be skipped");
+        // Original dest content must be preserved (not overwritten)
         assert_eq!(
             std::fs::read_to_string(dest.path().join("mypkg/init.lua")).unwrap(),
             "return {v=1}"
@@ -595,40 +652,50 @@ mod tests {
 
     #[test]
     fn copy_package_repairs_zombie_file() {
+        // Zombie: dest is missing one or more src top-level entries.
+        // Setup: src has init.lua + mc.lua, dest has only init.lua.
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
 
         let src_pkg = source.path().join("mypkg");
         std::fs::create_dir(&src_pkg).unwrap();
         std::fs::write(src_pkg.join("init.lua"), "return {complete=true}").unwrap();
+        std::fs::write(src_pkg.join("mc.lua"), "return {}").unwrap();
 
-        // Create a zombie (truncated) dest file — size mismatch
+        // Dest is missing mc.lua — incomplete (zombie) tree
         let dst_pkg = dest.path().join("mypkg");
         std::fs::create_dir(&dst_pkg).unwrap();
-        std::fs::write(dst_pkg.join("init.lua"), "ret").unwrap(); // truncated
+        std::fs::write(dst_pkg.join("init.lua"), "return {old=true}").unwrap();
 
-        // Without force: zombie is detected and repaired via size mismatch
+        // Without force: missing entry triggers repair
         let installed = copy_package("mypkg", &src_pkg, dest.path(), false).unwrap();
         assert!(installed, "zombie should be repaired even without --force");
+        // After repair both files must be present with src content
         assert_eq!(
             std::fs::read_to_string(dest.path().join("mypkg/init.lua")).unwrap(),
             "return {complete=true}"
         );
+        assert!(dest.path().join("mypkg/mc.lua").exists());
     }
 
     #[test]
     fn copy_package_no_tmp_file_on_success() {
+        // Tree copy leaves no stale .tmp files and installs all expected files.
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
 
         let src_pkg = source.path().join("mypkg");
         std::fs::create_dir(&src_pkg).unwrap();
         std::fs::write(src_pkg.join("init.lua"), "return {}").unwrap();
+        std::fs::write(src_pkg.join("helper.lua"), "return {}").unwrap();
 
         copy_package("mypkg", &src_pkg, dest.path(), false).unwrap();
 
-        // Temp file should not remain after successful install
+        // No stale temp files
         assert!(!dest.path().join("mypkg/init.lua.tmp").exists());
+        // Tree was written correctly
+        assert!(dest.path().join("mypkg/init.lua").exists());
+        assert!(dest.path().join("mypkg/helper.lua").exists());
     }
 
     #[test]

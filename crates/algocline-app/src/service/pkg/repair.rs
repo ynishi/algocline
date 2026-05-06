@@ -306,7 +306,7 @@ impl AppService {
         }
 
         match self
-            .pkg_install_typed(install_source, Some(name.to_string()))
+            .pkg_install_typed(install_source, Some(name.to_string()), None)
             .await
         {
             Ok(_) => RepairOutcome::Repaired {

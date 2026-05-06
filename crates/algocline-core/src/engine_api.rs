@@ -181,7 +181,15 @@ pub trait EngineApi: Send + Sync {
     ) -> Result<String, String>;
 
     /// Install a package from a Git URL or local path.
-    async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String>;
+    ///
+    /// `force` (optional, default `false`): Collection mode only — overwrite existing
+    /// packages at dest. Single mode rejects pre-existing dest with an error regardless.
+    async fn pkg_install(
+        &self,
+        url: String,
+        name: Option<String>,
+        force: Option<bool>,
+    ) -> Result<String, String>;
 
     /// Remove a symlinked package from `~/.algocline/packages/`.
     ///

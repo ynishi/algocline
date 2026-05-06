@@ -1623,7 +1623,7 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
     let svc = make_app_service_at(home.to_path_buf()).await;
 
     // Initial install — populates installed.json and creates dest dir.
-    svc.pkg_install(source.display().to_string(), None)
+    svc.pkg_install(source.display().to_string(), None, None)
         .await
         .expect("initial install");
 
@@ -1657,7 +1657,7 @@ async fn pkg_repair_skips_healthy_pkg() {
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
     let svc = make_app_service_at(home.to_path_buf()).await;
-    svc.pkg_install(source.display().to_string(), None)
+    svc.pkg_install(source.display().to_string(), None, None)
         .await
         .unwrap();
 
@@ -1810,7 +1810,7 @@ async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
     let svc = make_app_service_at(home.to_path_buf()).await;
-    svc.pkg_install(source.display().to_string(), None)
+    svc.pkg_install(source.display().to_string(), None, None)
         .await
         .expect("initial install");
 
@@ -1858,7 +1858,7 @@ async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
     let svc = make_app_service_at(home.to_path_buf()).await;
-    svc.pkg_install(source.display().to_string(), None)
+    svc.pkg_install(source.display().to_string(), None, None)
         .await
         .expect("initial install");
 
@@ -1904,7 +1904,7 @@ async fn pkg_install_rejects_missing_local_source_with_clear_error() {
     let svc = make_app_service_at(home.to_path_buf()).await;
     let missing = "/tmp/alc-nonexistent-source-for-test-2e8f3a";
     let err = svc
-        .pkg_install(missing.to_string(), Some("anything".to_string()))
+        .pkg_install(missing.to_string(), Some("anything".to_string()), None)
         .await
         .unwrap_err();
     assert!(

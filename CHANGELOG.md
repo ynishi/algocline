@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`alc_status` — pool sessions are now visible when queried by `session_id`**
+  (`crates/algocline-app/src/service/status.rs`). Previously `alc_status`
+  consulted only the in-memory `SessionRegistry`; sessions started with
+  `alc_run host_mode=true` live exclusively in `pool_registry` (registry.json)
+  and were reported as `session 'sid' not found (may have completed)`. The MCP
+  wire returned this plain-text error and `e2e_pool::test_pool_paused_session_visible_in_status`
+  panicked on JSON parse. `AppService::status()` now falls back to
+  `pool_registry` on `SessionRegistry` miss and returns `{status: "needs_response",
+  session_id, pool: true, pid, sock, version, created_at}` for live pool entries.
+  `include_history` is ignored on the pool path (worker-side IPC fetch is
+  out of scope for this fix).
+
 - **`alc init` — Collection packages now install all sub-files** (`src/init.rs`
   `copy_package`). Previously only `init.lua` was copied for Collection-layout
   packages, leaving sibling files (`mc.lua`, `stats.lua`, `sweep.lua`,

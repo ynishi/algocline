@@ -33,20 +33,36 @@ impl AppService {
 
         // If a specific session requested, return just that one
         if let Some(sid) = session_id {
-            return match snapshots.get(sid) {
-                Some(snapshot) => {
-                    let mut result = snapshot.clone();
-                    // Enrich with strategy name
-                    if let Ok(strategies) = self.session_strategies.lock() {
-                        if let Some(name) = strategies.get(sid) {
-                            result["strategy"] = serde_json::json!(name);
-                        }
+            if let Some(snapshot) = snapshots.get(sid) {
+                let mut result = snapshot.clone();
+                // Enrich with strategy name
+                if let Ok(strategies) = self.session_strategies.lock() {
+                    if let Some(name) = strategies.get(sid) {
+                        result["strategy"] = serde_json::json!(name);
                     }
-                    result["session_id"] = serde_json::json!(sid);
-                    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
                 }
-                None => Err(format!("session '{sid}' not found (may have completed)")),
-            };
+                result["session_id"] = serde_json::json!(sid);
+                return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
+            }
+            // Pool fallback: host_mode=true sessions live in pool_registry,
+            // not SessionRegistry. Surface them as needs_response with a
+            // `pool: true` marker so callers can distinguish backends.
+            // include_history is ignored on this path — pool worker history
+            // requires a separate IPC round-trip and is out of scope here.
+            let pool_reg = self.pool_registry.read().await;
+            if let Some(entry) = pool_reg.find(sid) {
+                let result = serde_json::json!({
+                    "status": "needs_response",
+                    "session_id": sid,
+                    "pool": true,
+                    "pid": entry.pid,
+                    "sock": entry.sock.to_string_lossy(),
+                    "version": entry.version,
+                    "created_at": entry.created_at,
+                });
+                return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
+            }
+            return Err(format!("session '{sid}' not found (may have completed)"));
         }
 
         // List all active sessions

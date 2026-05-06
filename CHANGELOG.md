@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-05-07
+
 ### Fixed
 
 - **Test isolation: `AppConfig::default()` no longer pollutes `cwd/.algocline/`**

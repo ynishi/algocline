@@ -74,9 +74,14 @@ impl AppService {
     /// [`AppService::pkg_install_typed`]. Callers that already hold a
     /// classified [`InstallSource`] (e.g. `pkg_repair`) should call the
     /// typed API directly to avoid re-classifying a stale string.
-    pub async fn pkg_install(&self, url: String, name: Option<String>) -> Result<String, String> {
+    pub async fn pkg_install(
+        &self,
+        url: String,
+        name: Option<String>,
+        force: Option<bool>,
+    ) -> Result<String, String> {
         let source = classify_install_url(&url);
-        self.pkg_install_typed(source, name).await
+        self.pkg_install_typed(source, name, force).await
     }
 
     /// Typed install dispatch. Does no string re-classification; branches
@@ -85,6 +90,7 @@ impl AppService {
         &self,
         source: InstallSource,
         name: Option<String>,
+        force: Option<bool>,
     ) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
         let pkg_dir = packages_dir(&app_dir);
@@ -225,6 +231,7 @@ impl AppService {
                 );
             }
 
+            let force = force.unwrap_or(false);
             let mut installed = Vec::new();
             let mut skipped = Vec::new();
             // Dev symlinks (pkg_link scope=global) previously blocked collection
@@ -273,8 +280,14 @@ impl AppService {
                 // dir is untrusted input in the general case.
                 let dest = ContainedPath::child(&pkg_dir, &pkg_name)?;
                 if dest.as_ref().exists() {
-                    skipped.push(pkg_name);
-                    continue;
+                    if !force {
+                        skipped.push(pkg_name);
+                        continue;
+                    }
+                    // force=true: remove existing tree before overwriting
+                    std::fs::remove_dir_all(dest.as_ref()).map_err(|e| {
+                        format!("Failed to remove existing package '{pkg_name}': {e}")
+                    })?;
                 }
                 copy_dir(&path, dest.as_ref())
                     .map_err(|e| format!("Failed to copy package '{pkg_name}': {e}"))?;
@@ -706,7 +719,7 @@ return (pkg.meta or {{}}).version"#
         let mut errors: Vec<String> = Vec::new();
         for url in AUTO_INSTALL_SOURCES {
             tracing::info!("auto-installing from {url}");
-            if let Err(e) = self.pkg_install(url.to_string(), None).await {
+            if let Err(e) = self.pkg_install(url.to_string(), None, None).await {
                 tracing::warn!("failed to auto-install from {url}: {e}");
                 errors.push(format!("{url}: {e}"));
             }

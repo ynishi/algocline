@@ -109,6 +109,10 @@ pub struct PkgInstallParams {
     /// Optional package name override (single package mode only).
     /// Defaults to the last segment of the URL. Ignored for collections.
     pub name: Option<String>,
+    /// Collection mode only: overwrite existing packages at dest (default `false`).
+    /// Single mode rejects pre-existing dest with an error regardless of this flag.
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 /// Scope selector for `alc_pkg_link`.
@@ -1061,6 +1065,7 @@ impl AlcService {
     /// Supports: `github.com/user/pkg`, `https://...`, `git@...`,
     /// `file:///absolute/path`, or bare `/absolute/path`.
     /// The package must have an init.lua at its root.
+    /// `force` (optional, default false): Collection mode only — overwrite existing packages at dest.
     #[tool(
         name = "alc_pkg_install",
         annotations(destructive_hint = true, open_world_hint = true)
@@ -1069,7 +1074,9 @@ impl AlcService {
         &self,
         Parameters(params): Parameters<PkgInstallParams>,
     ) -> Result<String, String> {
-        self.app.pkg_install(params.url, params.name).await
+        self.app
+            .pkg_install(params.url, params.name, params.force)
+            .await
     }
 
     /// Remove a package entry, scoped by `scope`:

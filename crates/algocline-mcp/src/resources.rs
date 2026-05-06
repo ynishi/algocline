@@ -1100,6 +1100,7 @@ mod tests {
                     &self,
                     _url: String,
                     _name: Option<String>,
+                    _force: Option<bool>,
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1763,7 +1764,12 @@ mod tests {
         ) -> Result<String, String> {
             Err("noop".into())
         }
-        async fn pkg_install(&self, _: String, _: Option<String>) -> Result<String, String> {
+        async fn pkg_install(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: Option<bool>,
+        ) -> Result<String, String> {
             Err("noop".into())
         }
         async fn pkg_unlink(&self, _: String) -> Result<String, String> {
@@ -2046,7 +2052,12 @@ mod tests {
             ) -> Result<String, String> {
                 Err("noop".into())
             }
-            async fn pkg_install(&self, _: String, _: Option<String>) -> Result<String, String> {
+            async fn pkg_install(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<bool>,
+            ) -> Result<String, String> {
                 Err("noop".into())
             }
             async fn pkg_unlink(&self, _: String) -> Result<String, String> {

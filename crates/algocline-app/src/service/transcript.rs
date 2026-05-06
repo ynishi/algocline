@@ -128,9 +128,8 @@ pub(super) fn write_transcript_log(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::Arc;
 
-    use algocline_core::{AppDir, ExecutionMetrics, ExecutionObserver, LlmQuery, QueryId};
+    use algocline_core::{ExecutionMetrics, ExecutionObserver, LlmQuery, QueryId};
 
     use super::super::config::{AppConfig, LogDirSource};
     use super::write_transcript_log;
@@ -155,7 +154,9 @@ mod tests {
             log_dir_source: LogDirSource::EnvVar,
             log_enabled: true,
             prompt_preview_chars: 200,
-            app_dir: Arc::new(AppDir::new(PathBuf::from(".algocline"))),
+            // app_dir comes from AppConfig::default() (test-only impl that
+            // roots at a leaked tempdir), avoiding cwd pollution.
+            ..AppConfig::default()
         }
     }
 

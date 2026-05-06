@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Test isolation: `AppConfig::default()` no longer pollutes `cwd/.algocline/`**
+  (`crates/algocline-app/src/service/config.rs`,
+  `crates/algocline-app/src/service/transcript.rs`). The `#[cfg(test)]`
+  `Default` impl previously returned a relative `app_dir = ".algocline"`,
+  which caused `AppService::new()` startup GC to write
+  `crates/algocline-app/.algocline/state/pool/registry.json` whenever
+  `cargo test -p algocline-app --lib` was run from the crate dir. The
+  default now leaks a fresh `tempfile::tempdir()` per call, so every
+  `..Default::default()` callsite (22+ in unit/transcript tests) is
+  automatically rooted at an isolated tempdir. `transcript::tests::config_with_log_dir`
+  also dropped its hand-rolled `AppDir::new(PathBuf::from(".algocline"))`
+  in favour of `..AppConfig::default()`.
+
 - **`alc_status` — pool sessions are now visible when queried by `session_id`**
   (`crates/algocline-app/src/service/status.rs`). Previously `alc_status`
   consulted only the in-memory `SessionRegistry`; sessions started with

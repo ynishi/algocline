@@ -203,19 +203,28 @@ impl AppConfig {
 
 #[cfg(test)]
 impl Default for AppConfig {
-    /// Test-only default. `app_dir` points to a relative `./.algocline/`
-    /// — do not rely on this in production code; it would clobber
-    /// whatever the cwd happens to be. Production code constructs
-    /// [`AppConfig`] via [`AppConfig::from_env`] which resolves
-    /// `ALC_HOME` / `~/.algocline/` properly. The trait impl is
-    /// `#[cfg(test)]`-gated so a misuse in production won't compile.
+    /// Test-only default. `app_dir` is rooted at a freshly created tempdir
+    /// whose handle is leaked (`mem::forget`); the OS reclaims the directory
+    /// when the test binary exits. This keeps every test isolated from cwd
+    /// and from other tests without requiring callers to remember to chain
+    /// `with_app_dir(tempdir)` after `AppConfig::default()` /
+    /// `..Default::default()`.
+    ///
+    /// The trait impl is `#[cfg(test)]`-gated so a misuse in production
+    /// code won't compile. Production code constructs [`AppConfig`] via
+    /// [`AppConfig::from_env`] which resolves `ALC_HOME` / `~/.algocline/`
+    /// properly.
     fn default() -> Self {
+        let tmp = tempfile::tempdir().expect("AppConfig::default tempdir");
+        let root = tmp.path().to_path_buf();
+        // Leak the handle so the dir survives for the test duration.
+        std::mem::forget(tmp);
         Self {
             log_dir: None,
             log_dir_source: LogDirSource::None,
             log_enabled: false,
             prompt_preview_chars: algocline_engine::DEFAULT_PROMPT_PREVIEW_CHARS,
-            app_dir: Arc::new(AppDir::new(PathBuf::from(".algocline"))),
+            app_dir: Arc::new(AppDir::new(root)),
         }
     }
 }

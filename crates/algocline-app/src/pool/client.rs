@@ -428,7 +428,13 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).expect("bind");
 
         // Fake server: accept then do nothing (sleep longer than the timeout).
-        let _server = spawn_server(listener, |_inner| async move {
+        // Hold `inner` across the sleep so the server-side socket stays open;
+        // otherwise async-move would not capture the unused param and the writer
+        // would drop immediately, causing the client to read EOF instead of timing
+        // out and producing a `ResponseParse` error rather than the expected
+        // `Handshake` timeout error.
+        let _server = spawn_server(listener, |inner| async move {
+            let _hold = inner;
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         })
         .await;

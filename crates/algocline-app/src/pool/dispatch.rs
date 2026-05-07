@@ -655,8 +655,8 @@ mod tests {
         // Directly exercise the tokio::process machinery (not spawn_worker itself,
         // which requires a valid worker binary path).  We reproduce the exact
         // reaping pattern used inside spawn_worker.
-        let mut cmd = tokio::process::Command::new("/bin/true");
-        let mut child = cmd.spawn().expect("spawn /bin/true");
+        let mut cmd = tokio::process::Command::new("true");
+        let mut child = cmd.spawn().expect("spawn true");
         let pid = child.id().expect("child.id() must be Some before wait");
         // Start the fire-and-forget reap task — mirrors spawn_worker behaviour.
         tokio::spawn(async move {
@@ -688,9 +688,9 @@ mod tests {
     ///      This validates the exact error propagation path used inside spawn_worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_spawn_worker_child_id_none_returns_pool_error() {
-        let mut child = tokio::process::Command::new("/bin/false")
+        let mut child = tokio::process::Command::new("false")
             .spawn()
-            .expect("spawn /bin/false");
+            .expect("spawn false");
         // After wait() completes the child is consumed; id() returns None.
         let _status = child.wait().await.expect("wait");
         let id = child.id();

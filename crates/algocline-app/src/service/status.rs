@@ -169,7 +169,9 @@ impl AppService {
             .await
             .map_err(|e| format!("pool status request failed: {e}"))?;
         if !resp.ok {
-            return Err(resp.error.unwrap_or_else(|| "pool status error".to_string()));
+            return Err(resp
+                .error
+                .unwrap_or_else(|| "pool status error".to_string()));
         }
         match resp.data {
             Some(PoolResponseData::Status {

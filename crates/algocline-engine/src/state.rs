@@ -312,9 +312,9 @@ impl StateStore for JsonFileStore {
         // remain readable without migration.
         if let Some(dpath) = self.dispatch_path(key)? {
             let lock = self.ns_lock(&dpath)?;
-            let _guard = lock.lock().map_err(|_| {
-                format!("state: dispatch lock poisoned for key '{key}'")
-            })?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| format!("state: dispatch lock poisoned for key '{key}'"))?;
             if let Some(v) = self.load_dispatched(&dpath)? {
                 return Ok(Some(v));
             }
@@ -333,9 +333,9 @@ impl StateStore for JsonFileStore {
     fn set(&self, ns: &str, key: &str, value: Value) -> Result<(), String> {
         if let Some(dpath) = self.dispatch_path(key)? {
             let lock = self.ns_lock(&dpath)?;
-            let _guard = lock.lock().map_err(|_| {
-                format!("state: dispatch lock poisoned for key '{key}'")
-            })?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| format!("state: dispatch lock poisoned for key '{key}'"))?;
             return self.save_dispatched(&dpath, &value);
         }
         let path = self.state_path(ns)?;
@@ -351,9 +351,9 @@ impl StateStore for JsonFileStore {
     fn delete(&self, ns: &str, key: &str) -> Result<bool, String> {
         if let Some(dpath) = self.dispatch_path(key)? {
             let lock = self.ns_lock(&dpath)?;
-            let _guard = lock.lock().map_err(|_| {
-                format!("state: dispatch lock poisoned for key '{key}'")
-            })?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| format!("state: dispatch lock poisoned for key '{key}'"))?;
             if dpath.exists() {
                 fs::remove_file(&dpath).map_err(|e| {
                     format!(
@@ -392,9 +392,9 @@ impl StateStore for JsonFileStore {
     fn has(&self, ns: &str, key: &str) -> Result<bool, String> {
         if let Some(dpath) = self.dispatch_path(key)? {
             let lock = self.ns_lock(&dpath)?;
-            let _guard = lock.lock().map_err(|_| {
-                format!("state: dispatch lock poisoned for key '{key}'")
-            })?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| format!("state: dispatch lock poisoned for key '{key}'"))?;
             if dpath.exists() {
                 return Ok(true);
             }
@@ -412,9 +412,9 @@ impl StateStore for JsonFileStore {
     fn set_nx(&self, ns: &str, key: &str, value: Value) -> Result<bool, String> {
         if let Some(dpath) = self.dispatch_path(key)? {
             let lock = self.ns_lock(&dpath)?;
-            let _guard = lock.lock().map_err(|_| {
-                format!("state: dispatch lock poisoned for key '{key}'")
-            })?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| format!("state: dispatch lock poisoned for key '{key}'"))?;
             if dpath.exists() {
                 return Ok(false);
             }
@@ -447,9 +447,9 @@ impl StateStore for JsonFileStore {
     fn incr(&self, ns: &str, key: &str, delta: f64, default: f64) -> Result<f64, String> {
         if let Some(dpath) = self.dispatch_path(key)? {
             let lock = self.ns_lock(&dpath)?;
-            let _guard = lock.lock().map_err(|_| {
-                format!("state: dispatch lock poisoned for key '{key}'")
-            })?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| format!("state: dispatch lock poisoned for key '{key}'"))?;
             let current = if let Some(v) = self.load_dispatched(&dpath)? {
                 v.as_f64()
                     .ok_or_else(|| format!("incr: value at '{key}' is not a number"))?
@@ -460,9 +460,9 @@ impl StateStore for JsonFileStore {
                 if path.exists() {
                     let state = self.load(ns)?;
                     match state.get(key) {
-                        Some(v) => v.as_f64().ok_or_else(|| {
-                            format!("incr: value at '{key}' is not a number")
-                        })?,
+                        Some(v) => v
+                            .as_f64()
+                            .ok_or_else(|| format!("incr: value at '{key}' is not a number"))?,
                         None => default,
                     }
                 } else {
@@ -651,7 +651,11 @@ mod tests {
     fn dispatch_writes_to_per_key_file_for_prefix_id_keys() {
         let (store, tmp) = new_store();
         store
-            .set("default", "flow_orch:abc-123", serde_json::json!({"step": 1}))
+            .set(
+                "default",
+                "flow_orch:abc-123",
+                serde_json::json!({"step": 1}),
+            )
             .unwrap();
         let dispatched = tmp.path().join("flow_orch").join("abc-123.json");
         assert!(
@@ -754,11 +758,12 @@ mod tests {
     #[test]
     fn dispatch_delete_removes_per_key_file() {
         let (store, tmp) = new_store();
-        store
-            .set("default", "p:q", serde_json::json!("v"))
-            .unwrap();
+        store.set("default", "p:q", serde_json::json!("v")).unwrap();
         let dispatched = tmp.path().join("p").join("q.json");
-        assert!(dispatched.exists(), "dispatched file should exist before delete");
+        assert!(
+            dispatched.exists(),
+            "dispatched file should exist before delete"
+        );
         assert!(store.delete("default", "p:q").unwrap());
         assert!(
             !dispatched.exists(),
@@ -773,9 +778,7 @@ mod tests {
     fn dispatch_has_reports_dispatched_file_existence() {
         let (store, _tmp) = new_store();
         assert!(!store.has("default", "p:q").unwrap());
-        store
-            .set("default", "p:q", serde_json::json!("v"))
-            .unwrap();
+        store.set("default", "p:q", serde_json::json!("v")).unwrap();
         assert!(store.has("default", "p:q").unwrap());
     }
 
@@ -798,14 +801,20 @@ mod tests {
         )
         .unwrap();
         // set_nx must refuse because the legacy entry exists.
-        assert!(!store.set_nx("default", "p:q", serde_json::json!("new")).unwrap());
+        assert!(!store
+            .set_nx("default", "p:q", serde_json::json!("new"))
+            .unwrap());
 
         // For a fresh dispatched-shaped key with no legacy entry, set_nx
         // creates the dispatched file and returns true; second call
         // returns false because the dispatched file now exists.
-        assert!(store.set_nx("default", "p:r", serde_json::json!("first")).unwrap());
+        assert!(store
+            .set_nx("default", "p:r", serde_json::json!("first"))
+            .unwrap());
         assert!(tmp.path().join("p").join("r.json").exists());
-        assert!(!store.set_nx("default", "p:r", serde_json::json!("second")).unwrap());
+        assert!(!store
+            .set_nx("default", "p:r", serde_json::json!("second"))
+            .unwrap());
     }
 
     /// `incr` operates on the dispatched file when the key matches the
@@ -815,9 +824,7 @@ mod tests {
     fn dispatch_incr_promotes_legacy_value_on_first_call() {
         let (store, tmp) = new_store();
         // Pre-populate a legacy numeric value under a dispatched-shaped key.
-        store
-            .set("default", "seed", serde_json::json!(0))
-            .unwrap();
+        store.set("default", "seed", serde_json::json!(0)).unwrap();
         let legacy_path = tmp.path().join("default.json");
         let mut existing: HashMap<String, Value> =
             serde_json::from_str(&std::fs::read_to_string(&legacy_path).unwrap()).unwrap();

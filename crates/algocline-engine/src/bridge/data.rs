@@ -850,10 +850,7 @@ mod tests {
         lua.globals().set("alc", t).unwrap();
 
         // Initial value: 0
-        let initial: u64 = lua
-            .load(r#"return alc.stats.llm_calls()"#)
-            .eval()
-            .unwrap();
+        let initial: u64 = lua.load(r#"return alc.stats.llm_calls()"#).eval().unwrap();
         assert_eq!(initial, 0, "fresh session must report llm_calls() == 0");
 
         // Drive the observer to simulate a paused-cycle (one LLM call).
@@ -867,11 +864,11 @@ mod tests {
         }]);
 
         // Lua side now sees the increment.
-        let after_one: u64 = lua
-            .load(r#"return alc.stats.llm_calls()"#)
-            .eval()
-            .unwrap();
-        assert_eq!(after_one, 1, "one paused query must increment llm_calls() to 1");
+        let after_one: u64 = lua.load(r#"return alc.stats.llm_calls()"#).eval().unwrap();
+        assert_eq!(
+            after_one, 1,
+            "one paused query must increment llm_calls() to 1"
+        );
 
         // Two more queries in a single paused-cycle.
         observer.on_paused(&[
@@ -893,10 +890,7 @@ mod tests {
             },
         ]);
 
-        let after_three: u64 = lua
-            .load(r#"return alc.stats.llm_calls()"#)
-            .eval()
-            .unwrap();
+        let after_three: u64 = lua.load(r#"return alc.stats.llm_calls()"#).eval().unwrap();
         assert_eq!(
             after_three, 3,
             "two further paused queries (multi-query batch) must bring llm_calls() to 3"

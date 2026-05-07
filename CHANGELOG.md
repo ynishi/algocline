@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-05-07
+
+### Fixed
+
+- **Pool dispatch / client lib tests pass on systems lacking `/bin/true`
+  and `/bin/false`** (`crates/algocline-app/src/pool/dispatch.rs`,
+  `crates/algocline-app/src/pool/client.rs`, #1778084517). The two
+  spawn-tests now invoke `Command::new("true"|"false")` so tokio's PATH
+  lookup resolves to `/usr/bin/...` on the macOS sandbox layouts where
+  `/bin/{true,false}` is absent. The handshake-timeout test held its
+  server-side `Inner` across the sleep so async-move actually captures
+  the writer/reader; previously the server socket dropped immediately
+  and the client received `ResponseParse(EOF)` rather than the expected
+  `Handshake` timeout.
+
+### Added
+
+- **`alc_status` list path now merges pool sessions**
+  (`crates/algocline-app/src/service/status.rs`,
+  `tests/e2e_pool.rs`, #1778084339). Calling `alc_status` without a
+  `session_id` previously enumerated only `SessionRegistry` snapshots;
+  `host_mode=true` sessions (which live in `pool_registry`) were
+  invisible. The list path now fetches `pool_registry.read().await`
+  live entries and merges them into the returned `sessions` array
+  with the same shape used by the single-session fallback (marked
+  `pool: true`). `SessionRegistry` takes precedence on sid collision
+  (defensive — host_mode design avoids collisions). The compact
+  `{"active_sessions":0,"sessions":[]}` wire format is preserved when
+  both registries are empty (snapshot regression guard).
+
+- **`alc_status include_history=true` fetches pool conversation_history
+  via IPC** (`crates/algocline-app/src/pool/protocol.rs`,
+  `src/pool_worker.rs`, `crates/algocline-app/src/service/status.rs`,
+  #1778084344). The pool wire protocol's `Status` request was extended
+  from a unit variant to a struct with `include_history: bool` (with
+  `#[serde(default)]` for legacy `{"op":"status"}` wire compatibility);
+  the response carries an optional `conversation_history` field
+  (`#[serde(default, skip_serializing_if = "Option::is_none")]`). When a
+  caller queries `alc_status` for a paused pool session with
+  `include_history: true`, the service performs a one-shot UDS
+  round-trip to the worker and injects the active session's
+  `conversation_history` into the response. IPC failures surface as an
+  additive `history_warning` field per the Service-layer
+  Error-propagation rule rather than dropping the status reply itself.
+  The list path is intentionally not extended (would require N IPC
+  round-trips); that is tracked separately if needed.
+
 ### Changed
 
 - **`alc.state` per-key file dispatch — `default.json` SSoT relief**

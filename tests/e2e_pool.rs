@@ -183,9 +183,9 @@ async fn test_pool_paused_session_appears_in_status_list() {
     let sessions = list_resp["sessions"]
         .as_array()
         .expect("sessions must be an array");
-    let found = sessions.iter().find(|s| {
-        s["session_id"].as_str() == Some(&session_id) && s["pool"] == json!(true)
-    });
+    let found = sessions
+        .iter()
+        .find(|s| s["session_id"].as_str() == Some(&session_id) && s["pool"] == json!(true));
     assert!(
         found.is_some(),
         "pool session must appear in alc_status list with pool=true marker"
@@ -240,12 +240,8 @@ async fn test_pool_status_include_history_fetches_via_ipc() {
     );
 
     // include_history=false (default) → conversation_history must be absent
-    let status_no_history = call_json(
-        &client,
-        "alc_status",
-        json!({ "session_id": session_id }),
-    )
-    .await;
+    let status_no_history =
+        call_json(&client, "alc_status", json!({ "session_id": session_id })).await;
     assert!(
         status_no_history.get("conversation_history").is_none(),
         "conversation_history must be absent when include_history is unset"

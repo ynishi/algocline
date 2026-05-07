@@ -46,9 +46,15 @@ impl AppService {
         config_path: Option<&str>,
         lint_strict: Option<bool>,
     ) -> Result<String, String> {
+        // Honour the activated session pin (P > S > E > W) before
+        // delegating to the free helper, which only knows the legacy
+        // 3-layer chain.
+        let resolved_root = self
+            .resolve_root(project_root)
+            .map(|p| p.to_string_lossy().to_string());
         let preset_resolution = resolve_hub_dist_preset(
             preset,
-            project_root,
+            resolved_root.as_deref(),
             source_dir,
             projections,
             config_path,

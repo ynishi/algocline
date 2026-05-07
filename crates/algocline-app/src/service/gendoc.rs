@@ -51,7 +51,6 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::hub_dist_preset::load_hub_projection_config;
-use super::project::resolve_project_root;
 use super::AppService;
 
 pub mod alc_shapes_codegen;
@@ -453,7 +452,7 @@ impl AppService {
             }
             None if projection_flags.context7 || projection_flags.devin => {
                 // New path: auto-explore alc.toml and merge with core defaults.
-                let project_root = resolve_project_root(Some(source_dir));
+                let project_root = self.resolve_root(Some(source_dir));
                 let merged = load_hub_projection_config(project_root.as_deref())?;
                 inject_config_subtable(
                     &lua,

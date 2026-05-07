@@ -46,6 +46,7 @@ expression: names
   "alc_scenario_install",
   "alc_scenario_list",
   "alc_scenario_show",
+  "alc_session_new",
   "alc_stats",
   "alc_status",
   "alc_update"

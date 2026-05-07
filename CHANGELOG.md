@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc_session_new` — optional MCP-connection session pin**
+  (`crates/algocline-app/src/service/session.rs` (new),
+  `crates/algocline-app/src/service/mod.rs`,
+  `crates/algocline-app/src/service/project.rs`,
+  `crates/algocline-mcp/src/service.rs`,
+  `crates/algocline-core/src/engine_api.rs`,
+  #1776627475). New MCP tool that pins a `project_root` (and
+  optional `mode` ∈ `"default"` | `"test"`) for the current MCP
+  connection. Subsequent tool calls without an explicit
+  `project_root` resolve via P > **S** > E > W (per-call > session
+  pin > `ALC_PROJECT_ROOT` > cwd ancestor walk). Activation is
+  optional — when no session is activated, behaviour matches
+  the legacy 3-layer chain (P > E > W) exactly.
+
+  **Why**: AI agents working across multiple worktrees were
+  forgetting per-call `project_root` arguments, causing variant-
+  scope `pkg_install` calls to leak into the global manifest. The
+  pin makes the project context implicit at the connection level
+  while preserving per-call override semantics for debug / probe
+  flows.
+
+  **Lifetime**: per-MCP-connection. For stdio MCP transport (the
+  only transport algocline currently supports), one process serves
+  one connection, so the pin lives on `AppService` and drops with
+  the process. No explicit `alc_session_end` — closing the MCP
+  connection (or activating again) replaces the pin.
+
+  **Modes**: `"default"` matches legacy resolution. `"test"` is a
+  hint for downstream tools to apply stricter isolation; the
+  current release records the mode but does not yet branch on it
+  (consumers like scenario test runners can opt in incrementally).
+
+  Backward compatible — every existing tool continues to accept an
+  explicit `project_root` argument, and the env var / cwd walk
+  fallbacks are preserved.
+
+
+
 ## [0.32.0] - 2026-05-07
 
 ### Fixed

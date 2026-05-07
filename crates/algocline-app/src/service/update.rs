@@ -3,14 +3,14 @@
 use super::alc_toml::{load_alc_toml, PackageDep};
 use super::lockfile::{lockfile_path, save_lockfile, LockFile, LockPackage};
 use super::path::copy_dir;
-use super::project::resolve_project_root;
 use super::resolve::packages_dir;
 use super::source::PackageSource;
 use super::AppService;
 
 impl AppService {
     pub async fn update(&self, project_root: Option<String>) -> Result<String, String> {
-        let root = resolve_project_root(project_root.as_deref())
+        let root = self
+            .resolve_root(project_root.as_deref())
             .ok_or_else(|| "No alc.toml found. Run alc_init first.".to_string())?;
 
         let toml = load_alc_toml(&root)?

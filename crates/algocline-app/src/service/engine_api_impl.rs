@@ -254,6 +254,25 @@ impl EngineApi for AppService {
         AppService::migrate(self, project_root).await
     }
 
+    // ─── Session activation (issue #1776627475) ──────────────
+
+    async fn session_new(
+        &self,
+        project_root: Option<String>,
+        mode: Option<String>,
+    ) -> Result<String, String> {
+        let session = self.activate_session(project_root.as_deref(), mode.as_deref())?;
+        let result = serde_json::json!({
+            "session_id": session.session_id,
+            "project_root": session
+                .project_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            "mode": session.mode.as_str(),
+        });
+        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    }
+
     // ─── Cards ───────────────────────────────────────────────
 
     async fn card_list(&self, pkg: Option<String>) -> Result<String, String> {

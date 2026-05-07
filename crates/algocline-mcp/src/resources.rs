@@ -1162,6 +1162,13 @@ mod tests {
                 async fn migrate(&self, _project_root: Option<String>) -> Result<String, String> {
                     Err($err.into())
                 }
+                async fn session_new(
+                    &self,
+                    _project_root: Option<String>,
+                    _mode: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
                 async fn card_list(&self, _pkg: Option<String>) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1805,6 +1812,13 @@ mod tests {
         async fn migrate(&self, _: Option<String>) -> Result<String, String> {
             Err("noop".into())
         }
+        async fn session_new(
+            &self,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
         async fn card_list(&self, _: Option<String>) -> Result<String, String> {
             self.card_list
                 .clone()
@@ -2107,6 +2121,13 @@ mod tests {
                 Err("noop".into())
             }
             async fn migrate(&self, _: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn session_new(
+                &self,
+                _: Option<String>,
+                _: Option<String>,
+            ) -> Result<String, String> {
                 Err("noop".into())
             }
             async fn card_list(&self, _: Option<String>) -> Result<String, String> {

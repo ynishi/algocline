@@ -4277,6 +4277,145 @@ async fn test_mcp_resources_complete_prompt_ref_returns_empty() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── alc_session_new (issue #1776627475) ─────────────────────────────────────
+
+/// `alc_session_new` activates a session pin: subsequent calls without
+/// an explicit `project_root` resolve through the pin (S layer in the
+/// P > S > E > W chain).
+#[tokio::test]
+async fn test_alc_session_new_activates_pin_for_subsequent_pkg_list() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Build a project root with alc.toml so pkg_list returns project rows.
+    let project_dir = tmp.path().join("proj-A");
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    std::fs::write(project_dir.join("alc.toml"), "[packages]\n").expect("write alc.toml");
+
+    // Activate session with this project root.
+    let resp = call_json(
+        &client,
+        "alc_session_new",
+        json!({ "project_root": project_dir.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(resp["mode"], "default");
+    assert_eq!(
+        resp["project_root"],
+        json!(project_dir.to_string_lossy().to_string())
+    );
+    assert!(
+        resp["session_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("alc-sess-"),
+        "session_id must use alc-sess- prefix, got {:?}",
+        resp["session_id"]
+    );
+
+    // alc_pkg_list without explicit project_root must pick up the pin
+    // (alc.toml at project_dir → empty `[packages]`).
+    let listing = call_json(&client, "alc_pkg_list", json!({})).await;
+    let project_root = listing["project_root"].as_str().unwrap_or("");
+    assert_eq!(
+        project_root,
+        project_dir.to_string_lossy().as_ref(),
+        "pkg_list project_root must reflect the activated session pin, got {project_root}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `mode = "test"` round-trips through the activation response.
+#[tokio::test]
+async fn test_alc_session_new_test_mode_records_in_response() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(&client, "alc_session_new", json!({ "mode": "test" })).await;
+    assert_eq!(resp["mode"], "test");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Without `alc_session_new`, the legacy fallback chain (env / cwd
+/// walk) is preserved unchanged. After activating, the pin replaces
+/// what cwd-walk would have produced.
+#[tokio::test]
+async fn test_legacy_fallback_unchanged_when_session_not_activated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // No alc_session_new call → legacy resolution. pkg_list must
+    // succeed without panic / MCP error and return a JSON object.
+    // (Specific project_root value depends on cwd ancestor walk and
+    // is not asserted here — the contract is "doesn't break".)
+    let listing_no_session = call_json(&client, "alc_pkg_list", json!({})).await;
+    assert!(
+        listing_no_session.is_object(),
+        "pkg_list legacy path must return a JSON object, got: {listing_no_session}"
+    );
+
+    // After activation, the pin takes effect — fixture project root
+    // appears as the resolved root for subsequent calls.
+    let project_dir = tmp.path().join("legacy-flip");
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    std::fs::write(project_dir.join("alc.toml"), "[packages]\n").expect("write alc.toml");
+
+    let _ = call_json(
+        &client,
+        "alc_session_new",
+        json!({ "project_root": project_dir.to_string_lossy() }),
+    )
+    .await;
+    let listing_with_session = call_json(&client, "alc_pkg_list", json!({})).await;
+    assert_eq!(
+        listing_with_session["project_root"].as_str().unwrap_or(""),
+        project_dir.to_string_lossy().as_ref(),
+        "after activation, pkg_list must reflect the session pin"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Per-call `project_root` overrides the activated session pin
+/// (P > S in the §6 priority order).
+#[tokio::test]
+async fn test_per_call_project_root_overrides_session_pin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let pinned = tmp.path().join("pinned");
+    let override_dir = tmp.path().join("override");
+    std::fs::create_dir_all(&pinned).expect("create pinned");
+    std::fs::create_dir_all(&override_dir).expect("create override");
+    std::fs::write(pinned.join("alc.toml"), "[packages]\n").expect("write pinned alc.toml");
+    std::fs::write(override_dir.join("alc.toml"), "[packages]\n").expect("write override alc.toml");
+
+    // Pin to `pinned`.
+    let _ = call_json(
+        &client,
+        "alc_session_new",
+        json!({ "project_root": pinned.to_string_lossy() }),
+    )
+    .await;
+
+    // pkg_list with explicit project_root = override_dir must win.
+    let listing = call_json(
+        &client,
+        "alc_pkg_list",
+        json!({ "project_root": override_dir.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(
+        listing["project_root"].as_str().unwrap_or(""),
+        override_dir.to_string_lossy().as_ref(),
+        "explicit per-call project_root must override session pin"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── CLI dry-run tests (no MCP harness) ──────────────────────────────────────
 
 /// Resolve the path to the `alc` binary, mirroring the logic in `connect()`.

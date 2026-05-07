@@ -40,7 +40,6 @@ use std::path::Path;
 use tracing::warn;
 
 use super::super::manifest::{load_manifest, Manifest, ManifestEntry};
-use super::super::project::resolve_project_root;
 use super::super::resolve::packages_dir;
 use super::super::source::PackageSource;
 use super::super::AppService;
@@ -435,7 +434,7 @@ impl AppService {
         let app_dir = self.log_config.app_dir();
         let manifest = load_manifest(&app_dir)?;
         let pkg_dir = packages_dir(&app_dir);
-        let resolved_root = resolve_project_root(project_root.as_deref());
+        let resolved_root = self.resolve_root(project_root.as_deref());
         let target_filter = name.as_deref();
 
         let mut buckets = DoctorBuckets::default();

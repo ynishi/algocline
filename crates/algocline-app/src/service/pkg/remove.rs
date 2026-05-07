@@ -12,7 +12,6 @@ use algocline_core::AppDir;
 use super::super::alc_toml::{load_alc_toml_document, remove_package_entry, save_alc_toml};
 use super::super::lockfile::{load_lockfile, lockfile_path, save_lockfile};
 use super::super::manifest::{load_manifest, record_remove};
-use super::super::project::resolve_project_root;
 use super::super::AppService;
 
 impl AppService {
@@ -35,10 +34,13 @@ impl AppService {
     ) -> Result<String, String> {
         let scope = scope.as_deref().unwrap_or("project");
         let app_dir = self.log_config.app_dir();
+        // Pre-resolve via session-aware chain (P > S > E > W) so the
+        // underlying free helpers do not need the AppService.
+        let resolved_root = self.resolve_root(project_root.as_deref());
         match scope {
-            "project" => remove_from_project(name, project_root, version),
+            "project" => remove_from_project(name, resolved_root, version),
             "global" => remove_from_global(&app_dir, name),
-            "all" => remove_from_all(&app_dir, name, project_root, version),
+            "all" => remove_from_all(&app_dir, name, resolved_root, version),
             other => Err(format!(
                 "invalid scope '{other}': expected one of project, global, all"
             )),
@@ -49,13 +51,13 @@ impl AppService {
 /// Remove from `alc.toml` + `alc.lock`. Existing 0.15.0+ behavior.
 fn remove_from_project(
     name: &str,
-    project_root: Option<String>,
+    project_root: Option<std::path::PathBuf>,
     version: Option<String>,
 ) -> Result<String, String> {
-    let root = resolve_project_root(project_root.as_deref()).ok_or_else(|| {
+    let root = project_root.ok_or_else(|| {
         format!(
             "alc.toml not found: cannot remove '{name}' without a project root. \
-             Provide project_root or run from a project directory."
+             Provide project_root, activate via alc_session_new, or run from a project directory."
         )
     })?;
 
@@ -138,7 +140,7 @@ fn remove_from_global(app_dir: &AppDir, name: &str) -> Result<String, String> {
 fn remove_from_all(
     app_dir: &AppDir,
     name: &str,
-    project_root: Option<String>,
+    project_root: Option<std::path::PathBuf>,
     version: Option<String>,
 ) -> Result<String, String> {
     let project_res = remove_from_project(name, project_root, version);

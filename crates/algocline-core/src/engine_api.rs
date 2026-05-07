@@ -284,6 +284,29 @@ pub trait EngineApi: Send + Sync {
     /// Backs up the old lock file as `alc.lock.bak`.
     async fn migrate(&self, project_root: Option<String>) -> Result<String, String>;
 
+    // ─── Session activation (issue #1776627475) ──────────────
+
+    /// Activate a session pin for the current MCP connection.
+    ///
+    /// `project_root` is resolved at activation time using the
+    /// existing fallback chain (P > E > W) and cached on the
+    /// `AppService`. Subsequent tool calls without an explicit
+    /// `project_root` argument resolve via P > **S** > E > W,
+    /// where S is this pin (issue #1776627475 §6).
+    ///
+    /// `mode` accepts `"default"` (or `None`) and `"test"`. Unknown
+    /// values return a typed error rather than silent fallback.
+    /// Mode is exposed back to callers so downstream tools can
+    /// adapt behaviour (e.g. scenario test isolation).
+    ///
+    /// Returns a JSON string with `session_id`, `project_root`
+    /// (resolved or `null`), and `mode`.
+    async fn session_new(
+        &self,
+        project_root: Option<String>,
+        mode: Option<String>,
+    ) -> Result<String, String>;
+
     // ─── Cards ───────────────────────────────────────────────
 
     /// List Card summaries, optionally filtered by pkg.

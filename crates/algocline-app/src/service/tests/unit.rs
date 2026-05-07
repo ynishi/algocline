@@ -570,6 +570,7 @@ fn log_list_prefers_meta_file() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.log_list(50).unwrap();
@@ -628,6 +629,7 @@ fn stats_empty_dir() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.stats(None, None).unwrap();
@@ -700,6 +702,7 @@ fn stats_aggregates_by_strategy() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     // All strategies
@@ -776,6 +779,7 @@ fn stats_legacy_logs_without_strategy() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.stats(None, None).unwrap();
@@ -825,6 +829,7 @@ fn info_returns_valid_json_with_expected_keys() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.info();
@@ -878,6 +883,7 @@ fn info_stderr_only_when_no_log_dir() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.info();
@@ -929,6 +935,7 @@ fn require_log_dir_returns_path_when_present() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     assert_eq!(app.require_log_dir().unwrap(), Path::new("/tmp/test-logs"));
@@ -972,6 +979,7 @@ fn require_log_dir_returns_err_when_none() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     assert!(app.require_log_dir().is_err());
@@ -1054,6 +1062,7 @@ fn log_list_returns_empty_when_no_log_dir() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.log_list(50).unwrap();
@@ -1099,6 +1108,7 @@ fn stats_returns_zero_when_no_log_dir() {
         pool_reg_path: std::path::PathBuf::from("/tmp/pool/registry.json"),
         pool_lock_path: std::path::PathBuf::from("/tmp/pool/registry.lock"),
         pool_dir: std::path::PathBuf::from("/tmp/pool"),
+        session: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let result = app.stats(None, None).unwrap();

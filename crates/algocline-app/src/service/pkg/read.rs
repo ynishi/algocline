@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use super::super::alc_toml;
-use super::super::project::resolve_project_root;
 use super::super::AppService;
 
 impl AppService {
@@ -30,13 +29,13 @@ impl AppService {
         // ── 1. Variant scope: alc.local.toml ──────────────────────────────
         //
         // Use the caller-supplied project_root when available; fall back to
-        // resolve_project_root(None) for MCP callers that do not pass one.
-        // A missing file is non-fatal (fall through to global scope).
+        // self.resolve_root(None) (P > S > E > W) for MCP callers that do not
+        // pass one. A missing file is non-fatal (fall through to global scope).
         // A malformed file is a hard error — corruption must reach the caller,
         // not be silently swallowed.
         let resolved_root = project_root
             .map(|p| p.to_path_buf())
-            .or_else(|| resolve_project_root(None));
+            .or_else(|| self.resolve_root(None));
         if let Some(root) = resolved_root {
             match alc_toml::load_alc_local_toml(&root) {
                 Ok(Some(local)) => {

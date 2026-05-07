@@ -28,6 +28,7 @@ pub(crate) mod project;
 pub mod resolve;
 mod run;
 mod scenario;
+pub(crate) mod session;
 pub(crate) mod source;
 mod status;
 mod transcript;
@@ -102,6 +103,18 @@ pub struct AppService {
     pub(crate) pool_reg_path: std::path::PathBuf,
     pub(crate) pool_lock_path: std::path::PathBuf,
     pub(crate) pool_dir: std::path::PathBuf,
+    /// Activated session pin for `alc_session_new` (#1776627475). For
+    /// stdio MCP transport this is functionally a per-connection
+    /// pin (one process = one connection). `None` when no session
+    /// has been activated; callers fall back to the existing
+    /// `resolve_project_root` chain (P > E > W).
+    ///
+    /// `std::sync::Mutex` because all access is a single
+    /// load/store completing in microseconds, with no `.await` held
+    /// across the lock. Poison maps to "no session pin" so a
+    /// poisoned lock degrades to legacy behaviour rather than
+    /// breaking every subsequent tool call.
+    pub(crate) session: Arc<std::sync::Mutex<Option<session::AlcSession>>>,
 }
 
 impl AppService {
@@ -166,7 +179,54 @@ impl AppService {
             pool_reg_path,
             pool_lock_path,
             pool_dir,
+            session: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Activate (or replace) the session pin. Returns the new
+    /// `AlcSession`. See `session::AlcSession` for lifecycle
+    /// semantics. Wired through `EngineApi::session_new` to the
+    /// MCP `alc_session_new` tool.
+    pub(crate) fn activate_session(
+        &self,
+        project_root: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<session::AlcSession, String> {
+        let pinned = project::resolve_project_root(project_root);
+        let mode = session::SessionMode::parse(mode)?;
+        let new = session::AlcSession::new(pinned, mode);
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| "alc_session_new: session lock poisoned".to_string())?;
+        *guard = Some(new.clone());
+        Ok(new)
+    }
+
+    /// Snapshot the currently activated session, if any.
+    ///
+    /// Returns `None` when no session has been activated or when
+    /// the session lock is poisoned (degrades to legacy
+    /// `resolve_project_root` behaviour rather than failing every
+    /// subsequent tool call).
+    pub(crate) fn current_session(&self) -> Option<session::AlcSession> {
+        self.session.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Resolve the project root for a tool call, consulting the
+    /// activated session pin between the explicit per-call argument
+    /// and the `ALC_PROJECT_ROOT` env var (issue #1776627475 §6:
+    /// P > S > E > W).
+    ///
+    /// MCP tool entry points should use this instead of
+    /// `project::resolve_project_root` so the activated session
+    /// pin is honoured uniformly. Lower-level free functions
+    /// (hub_dist_preset, etc.) continue to use the legacy free
+    /// helper because their callers have already routed through
+    /// this method when invoked from the AppService layer.
+    pub(crate) fn resolve_root(&self, explicit: Option<&str>) -> Option<std::path::PathBuf> {
+        let session_pin = self.current_session().and_then(|s| s.project_root);
+        project::resolve_project_root_with_session(explicit, session_pin.as_deref())
     }
 
     /// Returns the log directory, or an error if file logging is unavailable.
@@ -195,7 +255,7 @@ impl AppService {
         &self,
         project_root: Option<&str>,
     ) -> (Vec<std::path::PathBuf>, Vec<String>) {
-        let Some(root) = project::resolve_project_root(project_root) else {
+        let Some(root) = self.resolve_root(project_root) else {
             return (vec![], vec![]);
         };
 
@@ -250,7 +310,7 @@ impl AppService {
         &self,
         project_root: Option<&str>,
     ) -> (Vec<VariantPkg>, Vec<String>) {
-        let Some(root) = project::resolve_project_root(project_root) else {
+        let Some(root) = self.resolve_root(project_root) else {
             return (vec![], vec![]);
         };
 

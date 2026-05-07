@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use super::alc_toml::{alc_toml_path, save_alc_toml};
-use super::project::resolve_project_root;
 use super::AppService;
 
 /// Entries to ensure are present in `.gitignore` after `alc_init`.
@@ -21,8 +20,8 @@ const GITIGNORE_ENTRIES: &[&str] = &["alc.local.toml", ".alc-install.lock"];
 
 impl AppService {
     pub async fn init(&self, project_root: Option<String>) -> Result<String, String> {
-        // resolve: explicit → ALC_PROJECT_ROOT → walk_up (None if alc.toml absent) → cwd
-        let root = match resolve_project_root(project_root.as_deref()) {
+        // resolve: explicit → session pin → ALC_PROJECT_ROOT → walk_up (None if alc.toml absent) → cwd
+        let root = match self.resolve_root(project_root.as_deref()) {
             Some(r) => r,
             None => std::env::current_dir().map_err(|e| format!("Cannot determine cwd: {e}"))?,
         };

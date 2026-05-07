@@ -496,6 +496,21 @@ pub struct MigrateParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionNewParams {
+    /// Optional absolute path to the project root to pin for this MCP
+    /// connection. Resolved at activation time using the existing
+    /// `project_root` fallback chain (P > E > W). When omitted, the
+    /// pin is recorded with `None` and tool calls fall back to the
+    /// usual chain.
+    pub project_root: Option<String>,
+    /// Activation mode. Accepts `"default"` (or omitted) and `"test"`.
+    /// `"test"` is a hint for downstream tools to apply stricter
+    /// isolation (scenario test runners may scope state under a
+    /// per-session subdir). Unknown values return a typed error.
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardListParams {
     /// Optional pkg filter — restrict listing to `~/.algocline/cards/{pkg}/`.
     pub pkg: Option<String>,
@@ -1317,6 +1332,30 @@ impl AlcService {
         Parameters(params): Parameters<MigrateParams>,
     ) -> Result<String, String> {
         self.app.migrate(params.project_root).await
+    }
+
+    /// Pin a project_root + mode for the current MCP connection (issue #1776627475).
+    ///
+    /// Optional activation. Without calling this, every tool falls
+    /// back to the existing `project_root` chain (P > E > W). After
+    /// activation, the chain becomes P > **S** > E > W where S is
+    /// the pinned root from this call — solving the
+    /// "AI forgets project_root and pollutes global manifest" class
+    /// of accident in multi-worktree workflows.
+    ///
+    /// Mode `"default"` matches legacy resolution. Mode `"test"`
+    /// signals that downstream scenario tools should apply stricter
+    /// isolation (specific behaviour deferred to those tools).
+    ///
+    /// Lifetime: pinned for the duration of the MCP connection. No
+    /// explicit `alc_session_end` — closing the MCP connection (or
+    /// activating again) drops the previous pin.
+    #[tool(name = "alc_session_new", annotations(open_world_hint = false))]
+    async fn session_new(
+        &self,
+        Parameters(params): Parameters<SessionNewParams>,
+    ) -> Result<String, String> {
+        self.app.session_new(params.project_root, params.mode).await
     }
 
     // ─── Cards ──────────────────────────────────────────────────

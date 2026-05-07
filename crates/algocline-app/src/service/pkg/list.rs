@@ -11,7 +11,6 @@ use super::super::list_opts::{
 };
 use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
-use super::super::project::resolve_project_root;
 use super::super::resolve::{is_system_package, packages_dir};
 use super::super::source::PackageSource;
 use super::super::AppService;
@@ -239,7 +238,7 @@ impl AppService {
             .map_err(|e| ServiceError::InvalidInput(e.to_string()))?;
 
         // ── Project-local packages (from alc.toml + alc.lock) ─────────────
-        let resolved_root = resolve_project_root(project_root.as_deref());
+        let resolved_root = self.resolve_root(project_root.as_deref());
 
         let mut project_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut variant_names: std::collections::HashSet<String> = std::collections::HashSet::new();

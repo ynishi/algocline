@@ -13,7 +13,6 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use super::alc_toml::{self, add_package_entry, validate_package_name, PackageDep};
-use super::project::resolve_project_root;
 #[cfg(unix)]
 use super::resolve::packages_dir;
 use super::AppService;
@@ -204,9 +203,9 @@ impl AppService {
         // 2. Detect mode.
         let mode = detect_mode(&source)?;
 
-        // 3. Resolve project root.
-        let root = resolve_project_root(project_root.as_deref()).ok_or_else(|| {
-            "No project root found. Pass project_root or set ALC_PROJECT_ROOT, or run from within a project containing alc.toml.".to_string()
+        // 3. Resolve project root (P > S > E > W).
+        let root = self.resolve_root(project_root.as_deref()).ok_or_else(|| {
+            "No project root found. Pass project_root or activate via alc_session_new, set ALC_PROJECT_ROOT, or run from within a project containing alc.toml.".to_string()
         })?;
 
         // 4. Load or create alc.local.toml document.

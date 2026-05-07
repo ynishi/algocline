@@ -9,7 +9,6 @@ use super::super::hub;
 use super::super::lockfile::{load_lockfile, save_lockfile, LockFile, LockPackage};
 use super::super::manifest;
 use super::super::path::{copy_dir, ContainedPath};
-use super::super::project::resolve_project_root;
 use super::super::resolve::{
     install_scenarios_from_dir, packages_dir, scenarios_dir, DirEntryFailures, AUTO_INSTALL_SOURCES,
 };
@@ -624,7 +623,7 @@ impl AppService {
         &self,
         names: &[String],
     ) -> Result<Vec<String>, ProjectFilesError> {
-        let root = match resolve_project_root(None) {
+        let root = match self.resolve_root(None) {
             Some(r) => r,
             None => return Ok(Vec::new()), // No project root → skip (current-compat)
         };

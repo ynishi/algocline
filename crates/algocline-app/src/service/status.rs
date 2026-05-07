@@ -1,6 +1,12 @@
+use std::path::Path;
+
 use algocline_engine::PendingFilter;
 
 use super::AppService;
+use crate::pool::{
+    client::PoolClient,
+    protocol::{PoolRequest, PoolResponseData},
+};
 
 impl AppService {
     /// Snapshot of all active sessions (or one by ID) for external observation.
@@ -47,11 +53,16 @@ impl AppService {
             // Pool fallback: host_mode=true sessions live in pool_registry,
             // not SessionRegistry. Surface them as needs_response with a
             // `pool: true` marker so callers can distinguish backends.
-            // include_history is ignored on this path — pool worker history
-            // requires a separate IPC round-trip and is out of scope here.
+            //
+            // When include_history=true, perform an IPC round-trip to the
+            // worker via PoolClient::Status{include_history:true} and inject
+            // the returned conversation_history. IPC failures surface as a
+            // `history_warning` field on the response (additive — see
+            // CLAUDE.md §Service 層 Error 伝播 規律) rather than dropping the
+            // status reply itself.
             let pool_reg = self.pool_registry.read().await;
             if let Some(entry) = pool_reg.find(sid) {
-                let result = serde_json::json!({
+                let mut result = serde_json::json!({
                     "status": "needs_response",
                     "session_id": sid,
                     "pool": true,
@@ -60,6 +71,19 @@ impl AppService {
                     "version": entry.version,
                     "created_at": entry.created_at,
                 });
+                let sock_path = entry.sock.clone();
+                drop(pool_reg);
+                if include_history {
+                    match Self::fetch_pool_history(&sock_path).await {
+                        Ok(Some(history)) => {
+                            result["conversation_history"] = history;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            result["history_warning"] = serde_json::json!(e);
+                        }
+                    }
+                }
                 return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
             }
             return Err(format!("session '{sid}' not found (may have completed)"));
@@ -120,6 +144,40 @@ impl AppService {
         });
 
         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    }
+
+    /// Open a one-shot UDS connection to the pool worker at `sock` and ask
+    /// it for the active session's conversation_history.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(history))` — worker has an active session and returned a
+    ///   non-empty conversation_history JSON value.
+    /// - `Ok(None)` — worker is reachable but has no active session, or the
+    ///   session has no conversation_history yet.
+    /// - `Err(reason)` — IPC failure (connect / handshake / send / parse).
+    ///   Caller surfaces this as an additive `history_warning` field rather
+    ///   than dropping the status response (§Service 層 Error 伝播 規律).
+    async fn fetch_pool_history(sock: &Path) -> Result<Option<serde_json::Value>, String> {
+        let mut client = PoolClient::connect(sock)
+            .await
+            .map_err(|e| format!("pool connect failed: {e}"))?;
+        let resp = client
+            .send_request(PoolRequest::Status {
+                include_history: true,
+            })
+            .await
+            .map_err(|e| format!("pool status request failed: {e}"))?;
+        if !resp.ok {
+            return Err(resp.error.unwrap_or_else(|| "pool status error".to_string()));
+        }
+        match resp.data {
+            Some(PoolResponseData::Status {
+                conversation_history,
+                ..
+            }) => Ok(conversation_history),
+            other => Err(format!("unexpected pool status response: {other:?}")),
+        }
     }
 
     /// Decode the incoming `pending_filter` JSON value into an optional

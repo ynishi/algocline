@@ -601,15 +601,37 @@ async fn dispatch(
         }
 
         // ── Status ─────────────────────────────────────────────────────────
-        PoolRequest::Status => {
+        PoolRequest::Status { include_history } => {
             let (has_session, session_id) = match phase {
                 WorkerPhase::Idle => (false, None),
                 WorkerPhase::Paused { session_id } => (true, Some(session_id.clone())),
                 WorkerPhase::Finished => (false, None),
             };
+            let conversation_history = if *include_history {
+                if let Some(ref active_sid) = session_id {
+                    let snaps = registry.list_snapshots(None, true).await;
+                    // conversation_history is nested under `metrics` in the
+                    // snapshot shape produced by the engine. Engine may
+                    // return an empty array (or absent) until the first LLM
+                    // round completes — surface either as present-and-empty
+                    // so callers can distinguish "no history yet" from
+                    // "feature disabled".
+                    snaps.get(active_sid).map(|s| {
+                        s.get("metrics")
+                            .and_then(|m| m.get("conversation_history"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]))
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             PoolResponse::success(PoolResponseData::Status {
                 has_session,
                 session_id,
+                conversation_history,
             })
         }
 

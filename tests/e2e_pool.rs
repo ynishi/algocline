@@ -201,6 +201,66 @@ async fn test_pool_paused_session_appears_in_status_list() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── Test 1c: alc_status include_history=true fetches pool history ─
+
+/// Regression for issue 1778084344: when `alc_status` is called with
+/// `session_id` for a pool session and `include_history: true`, the service
+/// must perform an IPC round-trip to the worker and inject the active
+/// session's `conversation_history` into the response.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pool_status_include_history_fetches_via_ipc() {
+    let tmp = short_tempdir();
+    let client = connect_with_home(tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": "return alc.llm('What is 2+2?')", "host_mode": true }),
+    )
+    .await;
+    let session_id = resp["session_id"]
+        .as_str()
+        .expect("session_id must be present")
+        .to_string();
+
+    // include_history=true → conversation_history field must be present
+    // (may be empty array if no transcript yet, but must not be missing).
+    let status_resp = call_json(
+        &client,
+        "alc_status",
+        json!({ "session_id": session_id, "include_history": true }),
+    )
+    .await;
+    assert_eq!(status_resp["status"], "needs_response");
+    assert_eq!(status_resp["pool"], json!(true));
+    assert!(
+        status_resp.get("conversation_history").is_some()
+            || status_resp.get("history_warning").is_some(),
+        "conversation_history (or history_warning fallback) must be present when include_history=true"
+    );
+
+    // include_history=false (default) → conversation_history must be absent
+    let status_no_history = call_json(
+        &client,
+        "alc_status",
+        json!({ "session_id": session_id }),
+    )
+    .await;
+    assert!(
+        status_no_history.get("conversation_history").is_none(),
+        "conversation_history must be absent when include_history is unset"
+    );
+
+    let _ = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "4" }),
+    )
+    .await;
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── Test 2: MCP restart reconnect ───────────────────────────────
 
 /// Verify that after killing the MCP server process and starting a new one,

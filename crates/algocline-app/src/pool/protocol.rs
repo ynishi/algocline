@@ -48,7 +48,16 @@ pub enum PoolRequest {
     },
 
     /// Query the worker's current health/state (read-only).
-    Status,
+    ///
+    /// When `include_history` is `true`, the worker enriches the response with
+    /// the `conversation_history` of the active session (≤10 entries). Old
+    /// clients that send `{"op":"status"}` without the field deserialise as
+    /// `include_history: false` (`#[serde(default)]`), preserving wire
+    /// backward compatibility.
+    Status {
+        #[serde(default)]
+        include_history: bool,
+    },
 
     /// Ask the worker to finish gracefully and exit.
     Shutdown,
@@ -85,6 +94,11 @@ pub enum PoolResponseData {
         has_session: bool,
         /// Session ID of the active session, if any.
         session_id: Option<String>,
+        /// `conversation_history` for the active session when the request set
+        /// `include_history: true`. Capped at 10 entries by the engine.
+        /// Absent when `include_history` was false or no active session exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_history: Option<serde_json::Value>,
     },
 
     /// Reply to a `Shutdown` request (worker will exit after sending this).
@@ -183,6 +197,90 @@ mod tests {
                 assert_eq!(version, "0.31.0");
             }
             other => panic!("unexpected data: {other:?}"),
+        }
+    }
+
+    /// Backward compat: legacy clients send `{"op":"status"}` without the
+    /// `include_history` field. `#[serde(default)]` must accept that and
+    /// deserialise as `include_history: false`.
+    #[test]
+    fn status_request_legacy_wire_default_false() {
+        let legacy_json = r#"{"op":"status"}"#;
+        let decoded: PoolRequest = serde_json::from_str(legacy_json).expect("deserialize legacy");
+        match decoded {
+            PoolRequest::Status { include_history } => {
+                assert!(
+                    !include_history,
+                    "legacy {{op:status}} must default include_history=false"
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Status request with `include_history: true` round-trips correctly.
+    #[test]
+    fn status_request_with_history_roundtrip() {
+        let req = PoolRequest::Status {
+            include_history: true,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"op\":\"status\""), "op missing");
+        assert!(
+            json.contains("\"include_history\":true"),
+            "include_history missing"
+        );
+        let decoded: PoolRequest = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            PoolRequest::Status { include_history } => {
+                assert!(include_history, "round-trip must preserve true");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Status response with `conversation_history` round-trips and
+    /// `skip_serializing_if = "Option::is_none"` omits the field when absent.
+    #[test]
+    fn status_response_history_roundtrip_and_skip() {
+        // Present case
+        let with_history = PoolResponse::success(PoolResponseData::Status {
+            has_session: true,
+            session_id: Some("sid-1".to_string()),
+            conversation_history: Some(serde_json::json!([{"role":"user","content":"hi"}])),
+        });
+        let json = serde_json::to_string(&with_history).expect("serialize");
+        assert!(
+            json.contains("\"conversation_history\""),
+            "conversation_history must be present when Some"
+        );
+        let decoded: PoolResponse = serde_json::from_str(&json).expect("deserialize");
+        match decoded.data {
+            Some(PoolResponseData::Status {
+                conversation_history: Some(_),
+                ..
+            }) => {}
+            other => panic!("expected Status with history, got {other:?}"),
+        }
+
+        // Absent case: skip_serializing_if must omit the field on the wire
+        let without_history = PoolResponse::success(PoolResponseData::Status {
+            has_session: false,
+            session_id: None,
+            conversation_history: None,
+        });
+        let json = serde_json::to_string(&without_history).expect("serialize");
+        assert!(
+            !json.contains("\"conversation_history\""),
+            "conversation_history must be omitted when None"
+        );
+        let decoded: PoolResponse = serde_json::from_str(&json).expect("deserialize");
+        match decoded.data {
+            Some(PoolResponseData::Status {
+                conversation_history: None,
+                ..
+            }) => {}
+            other => panic!("expected Status with no history, got {other:?}"),
         }
     }
 

@@ -161,7 +161,9 @@ async fn worker_status_idle_before_run() {
     let mut client = connect_with_retry(&sock_path, Duration::from_secs(5)).await;
 
     let status_resp = client
-        .send_request(PoolRequest::Status)
+        .send_request(PoolRequest::Status {
+            include_history: false,
+        })
         .await
         .expect("Status request");
 
@@ -170,9 +172,14 @@ async fn worker_status_idle_before_run() {
         Some(PoolResponseData::Status {
             has_session,
             session_id,
+            conversation_history,
         }) => {
             assert!(!has_session, "worker should have no session before Run");
             assert!(session_id.is_none(), "session_id should be None before Run");
+            assert!(
+                conversation_history.is_none(),
+                "conversation_history must be None when include_history=false"
+            );
         }
         other => panic!("expected Status response, got: {other:?}"),
     }

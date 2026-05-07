@@ -65,8 +65,15 @@ impl AppService {
             return Err(format!("session '{sid}' not found (may have completed)"));
         }
 
-        // List all active sessions
-        if snapshots.is_empty() {
+        // List all active sessions — merge SessionRegistry snapshots with
+        // pool_registry live entries. Pool entries are surfaced in the same
+        // shape used by the single-session fallback (see above), with a
+        // `pool: true` marker. SessionRegistry takes precedence on sid
+        // collision (defensive — host_mode design avoids collisions).
+        // include_history is ignored on the pool path; per-session
+        // conversation_history fetch over IPC is out of scope here.
+        let pool_reg = self.pool_registry.read().await;
+        if snapshots.is_empty() && pool_reg.sessions.is_empty() {
             return Ok(serde_json::json!({
                 "active_sessions": 0,
                 "sessions": [],
@@ -74,19 +81,38 @@ impl AppService {
             .to_string());
         }
 
-        let strategies = self.session_strategies.lock().ok();
-        let sessions: Vec<serde_json::Value> = snapshots
-            .into_iter()
-            .map(|(id, mut snapshot)| {
-                if let Some(ref strats) = strategies {
-                    if let Some(name) = strats.get(&id) {
-                        snapshot["strategy"] = serde_json::json!(name);
+        let mut sessions: Vec<serde_json::Value> = {
+            let strategies = self.session_strategies.lock().ok();
+            snapshots
+                .iter()
+                .map(|(id, snapshot)| {
+                    let mut snap = snapshot.clone();
+                    if let Some(ref strats) = strategies {
+                        if let Some(name) = strats.get(id) {
+                            snap["strategy"] = serde_json::json!(name);
+                        }
                     }
-                }
-                snapshot["session_id"] = serde_json::json!(id);
-                snapshot
-            })
-            .collect();
+                    snap["session_id"] = serde_json::json!(id);
+                    snap
+                })
+                .collect()
+        };
+
+        for entry in pool_reg.sessions.iter() {
+            if snapshots.contains_key(&entry.sid) {
+                continue;
+            }
+            sessions.push(serde_json::json!({
+                "status": "needs_response",
+                "session_id": entry.sid,
+                "pool": true,
+                "pid": entry.pid,
+                "sock": entry.sock.to_string_lossy(),
+                "version": entry.version,
+                "created_at": entry.created_at,
+            }));
+        }
+        drop(pool_reg);
 
         let result = serde_json::json!({
             "active_sessions": sessions.len(),

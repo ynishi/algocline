@@ -151,6 +151,56 @@ async fn test_pool_paused_session_visible_in_status() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── Test 1b: paused pool session merged into alc_status list path ──
+
+/// Regression for issue 1778084339: when `alc_status` is called without a
+/// `session_id`, pool_registry entries must be merged into the returned
+/// `sessions` array alongside SessionRegistry snapshots, with a `pool: true`
+/// marker so callers can distinguish backends.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pool_paused_session_appears_in_status_list() {
+    let tmp = short_tempdir();
+    let client = connect_with_home(tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": "return alc.llm('hi')", "host_mode": true }),
+    )
+    .await;
+    let session_id = resp["session_id"]
+        .as_str()
+        .expect("session_id must be present")
+        .to_string();
+
+    // Query alc_status with no session_id → list path. The pool session must
+    // appear in the merged sessions array with pool=true.
+    let list_resp = call_json(&client, "alc_status", json!({})).await;
+    assert!(
+        list_resp["active_sessions"].as_u64().unwrap_or(0) >= 1,
+        "active_sessions must include the pool session"
+    );
+    let sessions = list_resp["sessions"]
+        .as_array()
+        .expect("sessions must be an array");
+    let found = sessions.iter().find(|s| {
+        s["session_id"].as_str() == Some(&session_id) && s["pool"] == json!(true)
+    });
+    assert!(
+        found.is_some(),
+        "pool session must appear in alc_status list with pool=true marker"
+    );
+
+    let _ = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "4" }),
+    )
+    .await;
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── Test 2: MCP restart reconnect ───────────────────────────────
 
 /// Verify that after killing the MCP server process and starting a new one,

@@ -204,6 +204,7 @@ impl Executor {
             llm_tx: Some(llm_tx),
             ns: spec.namespace.clone(),
             custom_metrics: metrics.custom_metrics_handle(),
+            stats: metrics.stats_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: effective.clone(), // fork child VMs inherit project paths

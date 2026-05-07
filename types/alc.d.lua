@@ -169,6 +169,17 @@ function alc.stats.record(key, value) end
 ---@return any|nil value Metric value or nil
 function alc.stats.get(key) end
 
+--- Total LLM calls observed in the current session so far.
+---
+--- Auto-counted by the engine on every paused-cycle complete; recipes
+--- and ingredients can compute scoped deltas via:
+---   local before = alc.stats.llm_calls()
+---   -- ... do work ...
+---   local count = alc.stats.llm_calls() - before
+---
+---@return integer count Cumulative LLM call count for this session
+function alc.stats.llm_calls() end
+
 -- Time ---
 
 --- Wall-clock time in fractional seconds since Unix epoch.

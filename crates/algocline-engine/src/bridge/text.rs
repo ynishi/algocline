@@ -91,6 +91,7 @@ mod tests {
             llm_tx: None,
             ns: "default".into(),
             custom_metrics: metrics.custom_metrics_handle(),
+            stats: metrics.stats_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: vec![],

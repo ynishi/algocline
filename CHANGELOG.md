@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc.stats.llm_calls()` — Lua-side access to the auto-counted session
+  LLM call total** (`crates/algocline-engine/src/bridge/data.rs`,
+  `crates/algocline-core/src/metrics.rs`). The `SessionStatus.llm_calls`
+  counter has been incremented automatically on every paused-cycle
+  complete since 0.29.0 (alc_status v2), but Lua scripts could only
+  observe it via an external `alc_status` MCP round-trip. Recipes /
+  ingredients can now read it directly:
+
+  ```lua
+  local before = alc.stats.llm_calls()
+  -- ... do work that may invoke alc.llm() on multiple branches ...
+  local count = alc.stats.llm_calls() - before
+  ```
+
+  This obviates the `total_llm_calls = total_llm_calls + 1` pattern
+  manually maintained across recipe/ingredient packages (52 occurrences
+  across 7 files in algocline-bundled-packages at the time of this
+  change). New `StatsHandle` (`pub use algocline_core::StatsHandle`)
+  exposes a read-only handle on `Arc<Mutex<SessionStatus>>`; mirrors the
+  `BudgetHandle` pattern.
+
+  Migration of bundled recipes (`sc`, `recipe_safe_panel`,
+  `recipe_deep_panel`, `orch_adaptive`, `orch_gatephase`, `orch_escalate`,
+  `particle_infer`) to the new API is tracked in a separate issue and
+  ships in algocline-bundled-packages.
+
 ## [0.31.2] - 2026-05-07
 
 ### Fixed

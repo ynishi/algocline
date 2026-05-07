@@ -304,6 +304,24 @@ Retrieve a recorded metric. Returns nil if not recorded.
 local v = alc.stats.get("accuracy")  -- 0.95
 ```
 
+#### `alc.stats.llm_calls() -> integer`
+
+Total LLM calls observed in the current session so far. Auto-counted by
+the engine on every paused-cycle complete (one call per query in
+`alc.llm_batch()` / one per `alc.llm()` invocation). Recipes and
+ingredients can compute scoped deltas without tracking calls manually:
+
+```lua
+local before = alc.stats.llm_calls()
+-- ... do work that may call alc.llm(...) on multiple branches ...
+local count = alc.stats.llm_calls() - before
+```
+
+This avoids the `total_llm_calls = total_llm_calls + 1` pattern required
+when only the per-session count was readable via the `alc_status` MCP
+tool — Lua scripts can now read it directly without an external
+round-trip.
+
 ### Time
 
 #### `alc.time() -> number`

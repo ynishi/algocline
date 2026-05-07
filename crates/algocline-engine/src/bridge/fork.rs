@@ -153,6 +153,7 @@ pub(crate) fn register_fork(
                         llm_tx: Some(child_llm_tx),
                         ns: format!("fork-{vm_idx}"),
                         custom_metrics: child_metrics.custom_metrics_handle(),
+                        stats: child_metrics.stats_handle(),
                         budget: bh.clone(),
                         progress: child_metrics.progress_handle(),
                         lib_paths: vec![],    // Children don't need to fork further

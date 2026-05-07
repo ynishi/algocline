@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use algocline_core::{BudgetHandle, CustomMetricsHandle, LogSink, ProgressHandle};
+use algocline_core::{BudgetHandle, CustomMetricsHandle, LogSink, ProgressHandle, StatsHandle};
 use mlua::prelude::*;
 
 mod data;
@@ -39,6 +39,8 @@ pub struct BridgeConfig {
     pub ns: String,
     /// Custom metrics handle for alc.stats.record/get.
     pub custom_metrics: CustomMetricsHandle,
+    /// Stats handle for `alc.stats.llm_calls()` (auto-counted session metrics).
+    pub stats: StatsHandle,
     /// Budget checker for LLM call limits.
     pub budget: BudgetHandle,
     /// Progress reporter for alc.progress().
@@ -87,7 +89,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
         &config.scenarios_dir,
     )?;
     text::register_chunk(lua, alc_table)?;
-    data::register_stats(lua, alc_table, config.custom_metrics)?;
+    data::register_stats(lua, alc_table, config.custom_metrics, config.stats)?;
     register_time(lua, alc_table)?;
     register_math(lua, alc_table)?;
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
@@ -151,6 +153,7 @@ mod tests {
             llm_tx: None,
             ns: "default".into(),
             custom_metrics: metrics.custom_metrics_handle(),
+            stats: metrics.stats_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: vec![],

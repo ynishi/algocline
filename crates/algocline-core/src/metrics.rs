@@ -412,6 +412,46 @@ impl ExecutionMetrics {
     pub fn log_sink_handle(&self) -> LogSink {
         self.log_sink.clone()
     }
+
+    /// Create a stats handle for the Lua bridge to read auto-counted
+    /// session metrics (e.g. `alc.stats.llm_calls()`).
+    pub fn stats_handle(&self) -> StatsHandle {
+        StatsHandle::new(Arc::clone(&self.auto))
+    }
+}
+
+/// Read-only handle exposing auto-counted [`SessionStatus`] metrics to
+/// the Lua bridge (e.g. `alc.stats.llm_calls()`).
+///
+/// Cloned per session and per fork-child VM. Each holds an
+/// `Arc<Mutex<SessionStatus>>` shared with the observer that writes to
+/// `llm_calls` on every paused-cycle complete.
+///
+/// # Poison policy
+///
+/// Read methods return `0` (or sensible defaults) on mutex poison —
+/// they are observational and non-fatal, mirroring `BudgetHandle::remaining`.
+/// Reads do **not** mutate `SessionStatus`.
+#[derive(Clone)]
+pub struct StatsHandle {
+    auto: Arc<Mutex<SessionStatus>>,
+}
+
+impl StatsHandle {
+    pub(crate) fn new(auto: Arc<Mutex<SessionStatus>>) -> Self {
+        Self { auto }
+    }
+
+    /// Total LLM calls observed in the current session so far.
+    ///
+    /// Returns `0` on mutex poison (observational; matches the
+    /// `Null` fallback used by `BudgetHandle::remaining`). Within a
+    /// single session the Lua thread is the only writer path, so
+    /// poison only occurs when an observer callback panicked under
+    /// the lock — an unrecoverable state where `0` is acceptable.
+    pub fn llm_calls(&self) -> u64 {
+        self.auto.lock().map(|m| m.llm_calls).unwrap_or(0)
+    }
 }
 
 impl Default for ExecutionMetrics {

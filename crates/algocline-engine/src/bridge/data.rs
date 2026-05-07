@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use algocline_core::{CustomMetricsHandle, LogEntry, LogSink};
+use algocline_core::{CustomMetricsHandle, LogEntry, LogSink, StatsHandle};
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 
@@ -510,15 +510,23 @@ pub(super) fn register_card(
     Ok(())
 }
 
-/// Register `alc.stats` table with record/get.
+/// Register `alc.stats` table with record/get + auto-counted llm_calls.
 ///
 /// Lua usage:
 ///   alc.stats.record("accuracy", 0.95)
 ///   local v = alc.stats.get("accuracy")  -- 0.95
+///   local n = alc.stats.llm_calls()      -- session-level cumulative count
+///
+/// `llm_calls()` reads the engine-maintained `SessionStatus.llm_calls`
+/// counter (incremented on every paused-cycle complete in
+/// `MetricsObserver`). Recipes / ingredients can compute scoped deltas
+/// via `local before = alc.stats.llm_calls(); ... ; local n = alc.stats.llm_calls() - before`
+/// without manually tracking calls per branch.
 pub(super) fn register_stats(
     lua: &Lua,
     alc_table: &LuaTable,
     custom_metrics: CustomMetricsHandle,
+    stats: StatsHandle,
 ) -> LuaResult<()> {
     let stats_table = lua.create_table()?;
 
@@ -537,8 +545,13 @@ pub(super) fn register_stats(
         None => Ok(LuaValue::Nil),
     })?;
 
+    // alc.stats.llm_calls() — auto-counted session-level LLM call total
+    let stats_handle = stats;
+    let llm_calls = lua.create_function(move |_, ()| Ok(stats_handle.llm_calls()))?;
+
     stats_table.set("record", record)?;
     stats_table.set("get", get)?;
+    stats_table.set("llm_calls", llm_calls)?;
 
     alc_table.set("stats", stats_table)?;
     Ok(())
@@ -561,6 +574,7 @@ mod tests {
             llm_tx: None,
             ns: ns.into(),
             custom_metrics: metrics.custom_metrics_handle(),
+            stats: metrics.stats_handle(),
             budget: metrics.budget_handle(),
             progress: metrics.progress_handle(),
             lib_paths: vec![],
@@ -765,6 +779,7 @@ mod tests {
                 llm_tx: None,
                 ns: "default".into(),
                 custom_metrics: custom_handle.clone(),
+                stats: metrics.stats_handle(),
                 budget: metrics.budget_handle(),
                 progress: metrics.progress_handle(),
                 lib_paths: vec![],
@@ -792,6 +807,100 @@ mod tests {
             .eval()
             .unwrap();
         assert!(result.is_nil());
+    }
+
+    /// `alc.stats.llm_calls()` reads the engine-maintained
+    /// `SessionStatus.llm_calls` counter and returns 0 for a fresh session.
+    /// After driving the counter via `MetricsObserver::on_paused`, the
+    /// Lua-side function reflects the new value.
+    #[test]
+    fn stats_llm_calls_reads_session_status() {
+        use crate::card::FileCardStore;
+        use crate::state::JsonFileStore;
+        use algocline_core::{ExecutionObserver, LlmQuery, QueryId};
+        use std::sync::Arc;
+
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        crate::bridge::register(
+            &lua,
+            &t,
+            crate::bridge::BridgeConfig {
+                llm_tx: None,
+                ns: "default".into(),
+                custom_metrics: metrics.custom_metrics_handle(),
+                stats: metrics.stats_handle(),
+                budget: metrics.budget_handle(),
+                progress: metrics.progress_handle(),
+                lib_paths: vec![],
+                variant_pkgs: vec![],
+                state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+                card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+                scenarios_dir: root.join("scenarios"),
+                log_sink: None,
+            },
+        )
+        .unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Initial value: 0
+        let initial: u64 = lua
+            .load(r#"return alc.stats.llm_calls()"#)
+            .eval()
+            .unwrap();
+        assert_eq!(initial, 0, "fresh session must report llm_calls() == 0");
+
+        // Drive the observer to simulate a paused-cycle (one LLM call).
+        observer.on_paused(&[LlmQuery {
+            id: QueryId::parse("q-0"),
+            prompt: "hi".to_string(),
+            system: None,
+            max_tokens: 0,
+            grounded: false,
+            underspecified: false,
+        }]);
+
+        // Lua side now sees the increment.
+        let after_one: u64 = lua
+            .load(r#"return alc.stats.llm_calls()"#)
+            .eval()
+            .unwrap();
+        assert_eq!(after_one, 1, "one paused query must increment llm_calls() to 1");
+
+        // Two more queries in a single paused-cycle.
+        observer.on_paused(&[
+            LlmQuery {
+                id: QueryId::parse("q-1"),
+                prompt: "a".to_string(),
+                system: None,
+                max_tokens: 0,
+                grounded: false,
+                underspecified: false,
+            },
+            LlmQuery {
+                id: QueryId::parse("q-2"),
+                prompt: "b".to_string(),
+                system: None,
+                max_tokens: 0,
+                grounded: false,
+                underspecified: false,
+            },
+        ]);
+
+        let after_three: u64 = lua
+            .load(r#"return alc.stats.llm_calls()"#)
+            .eval()
+            .unwrap();
+        assert_eq!(
+            after_three, 3,
+            "two further paused queries (multi-query batch) must bring llm_calls() to 3"
+        );
     }
 
     // ─── register_log tests ───

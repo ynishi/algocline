@@ -17,7 +17,7 @@ pub use app_dir::AppDir;
 pub use budget::{Budget, BudgetHandle};
 pub use custom::{CustomMetrics, CustomMetricsHandle};
 pub use engine_api::{EngineApi, QueryResponse};
-pub use metrics::{ExecutionMetrics, MetricsObserver};
+pub use metrics::{ExecutionMetrics, MetricsObserver, StatsHandle};
 pub use observer::ExecutionObserver;
 pub use pkg::PkgEntity;
 pub use progress::{ProgressHandle, ProgressInfo};

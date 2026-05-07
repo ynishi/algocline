@@ -52,6 +52,24 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+/// Whether a string is a safe path segment for `dispatch_path`.
+///
+/// Accepts ASCII alphanumerics, `_`, `-`, and `.` (single dots only —
+/// path traversal `..` and reserved names `.` are rejected). Empty
+/// strings and any other character (slash, backslash, NUL, control
+/// chars, whitespace) cause dispatch to fall back to legacy single-file
+/// storage.
+fn is_safe_segment(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    if s.contains("..") {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Trait
 // ═══════════════════════════════════════════════════════════════
@@ -203,6 +221,68 @@ impl JsonFileStore {
         Ok(dir.join(format!("{ns}.json")))
     }
 
+    /// Resolve the per-key dispatched file path for a `{prefix}:{id}`
+    /// shaped key, returning `None` when the key does not match the
+    /// dispatch contract (no `:`, multiple `:`, or unsafe characters
+    /// in either segment).
+    ///
+    /// Dispatched layout (issue #1776868812):
+    ///   `{root}/{prefix}/{id}.json` — file contents = the value as
+    ///   raw JSON (no wrapper map). Each `flow.state_save(state)` call
+    ///   becomes a single per-task file rather than another entry
+    ///   crammed into `default.json`.
+    ///
+    /// Legacy layout: keys without `:` (or with unsafe characters)
+    /// continue writing into `{ns}.json` so existing behaviour is
+    /// preserved without migration.
+    fn dispatch_path(&self, key: &str) -> Result<Option<PathBuf>, String> {
+        let (prefix, id) = match key.split_once(':') {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+        if !is_safe_segment(prefix) || !is_safe_segment(id) {
+            return Ok(None);
+        }
+        let dir = self.ensure_root()?;
+        Ok(Some(dir.join(prefix).join(format!("{id}.json"))))
+    }
+
+    /// Read a dispatched value file and deserialize it as JSON.
+    /// Returns `Ok(None)` when the file does not exist.
+    fn load_dispatched(&self, path: &Path) -> Result<Option<Value>, String> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read dispatched state '{}': {e}", path.display()))?;
+        let v: Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse dispatched state '{}': {e}", path.display()))?;
+        Ok(Some(v))
+    }
+
+    /// Atomically write a value to a dispatched file (tmp + rename).
+    /// Creates the prefix subdirectory if missing.
+    fn save_dispatched(&self, path: &Path, value: &Value) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create dispatched state dir '{}': {e}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        let content = serde_json::to_string_pretty(value)
+            .map_err(|e| format!("Failed to serialize dispatched state: {e}"))?;
+        fs::write(&tmp, &content)
+            .map_err(|e| format!("Failed to write dispatched state tmp: {e}"))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| format!("Failed to rename dispatched state file: {e}"))?;
+        Ok(())
+    }
+
     fn load(&self, ns: &str) -> Result<HashMap<String, Value>, String> {
         let path = self.state_path(ns)?;
         if !path.exists() {
@@ -226,6 +306,21 @@ impl JsonFileStore {
 
 impl StateStore for JsonFileStore {
     fn get(&self, ns: &str, key: &str) -> Result<Option<Value>, String> {
+        // Dispatched path takes precedence — when present, that file is
+        // the canonical source. Falls back to the legacy `{ns}.json`
+        // store so existing entries written before dispatch was enabled
+        // remain readable without migration.
+        if let Some(dpath) = self.dispatch_path(key)? {
+            let lock = self.ns_lock(&dpath)?;
+            let _guard = lock.lock().map_err(|_| {
+                format!("state: dispatch lock poisoned for key '{key}'")
+            })?;
+            if let Some(v) = self.load_dispatched(&dpath)? {
+                return Ok(Some(v));
+            }
+            // Fall through to legacy lookup so pre-dispatch values remain
+            // visible until the next set() promotes them.
+        }
         let path = self.state_path(ns)?;
         let lock = self.ns_lock(&path)?;
         let _guard = lock
@@ -236,6 +331,13 @@ impl StateStore for JsonFileStore {
     }
 
     fn set(&self, ns: &str, key: &str, value: Value) -> Result<(), String> {
+        if let Some(dpath) = self.dispatch_path(key)? {
+            let lock = self.ns_lock(&dpath)?;
+            let _guard = lock.lock().map_err(|_| {
+                format!("state: dispatch lock poisoned for key '{key}'")
+            })?;
+            return self.save_dispatched(&dpath, &value);
+        }
         let path = self.state_path(ns)?;
         let lock = self.ns_lock(&path)?;
         let _guard = lock
@@ -247,6 +349,23 @@ impl StateStore for JsonFileStore {
     }
 
     fn delete(&self, ns: &str, key: &str) -> Result<bool, String> {
+        if let Some(dpath) = self.dispatch_path(key)? {
+            let lock = self.ns_lock(&dpath)?;
+            let _guard = lock.lock().map_err(|_| {
+                format!("state: dispatch lock poisoned for key '{key}'")
+            })?;
+            if dpath.exists() {
+                fs::remove_file(&dpath).map_err(|e| {
+                    format!(
+                        "Failed to delete dispatched state '{}': {e}",
+                        dpath.display()
+                    )
+                })?;
+                return Ok(true);
+            }
+            // Fall through to legacy delete in case the entry only exists
+            // in the legacy single-file store.
+        }
         let path = self.state_path(ns)?;
         let lock = self.ns_lock(&path)?;
         let _guard = lock
@@ -271,6 +390,16 @@ impl StateStore for JsonFileStore {
     }
 
     fn has(&self, ns: &str, key: &str) -> Result<bool, String> {
+        if let Some(dpath) = self.dispatch_path(key)? {
+            let lock = self.ns_lock(&dpath)?;
+            let _guard = lock.lock().map_err(|_| {
+                format!("state: dispatch lock poisoned for key '{key}'")
+            })?;
+            if dpath.exists() {
+                return Ok(true);
+            }
+            // Fall through to legacy check.
+        }
         let path = self.state_path(ns)?;
         let lock = self.ns_lock(&path)?;
         let _guard = lock
@@ -281,6 +410,26 @@ impl StateStore for JsonFileStore {
     }
 
     fn set_nx(&self, ns: &str, key: &str, value: Value) -> Result<bool, String> {
+        if let Some(dpath) = self.dispatch_path(key)? {
+            let lock = self.ns_lock(&dpath)?;
+            let _guard = lock.lock().map_err(|_| {
+                format!("state: dispatch lock poisoned for key '{key}'")
+            })?;
+            if dpath.exists() {
+                return Ok(false);
+            }
+            // Also honour any legacy entry to preserve set_nx semantics
+            // across the migration boundary.
+            let path = self.state_path(ns)?;
+            if path.exists() {
+                let state = self.load(ns)?;
+                if state.contains_key(key) {
+                    return Ok(false);
+                }
+            }
+            self.save_dispatched(&dpath, &value)?;
+            return Ok(true);
+        }
         let path = self.state_path(ns)?;
         let lock = self.ns_lock(&path)?;
         let _guard = lock
@@ -296,6 +445,34 @@ impl StateStore for JsonFileStore {
     }
 
     fn incr(&self, ns: &str, key: &str, delta: f64, default: f64) -> Result<f64, String> {
+        if let Some(dpath) = self.dispatch_path(key)? {
+            let lock = self.ns_lock(&dpath)?;
+            let _guard = lock.lock().map_err(|_| {
+                format!("state: dispatch lock poisoned for key '{key}'")
+            })?;
+            let current = if let Some(v) = self.load_dispatched(&dpath)? {
+                v.as_f64()
+                    .ok_or_else(|| format!("incr: value at '{key}' is not a number"))?
+            } else {
+                // Fall back to any legacy value so incr stays monotonic
+                // across the dispatch transition.
+                let path = self.state_path(ns)?;
+                if path.exists() {
+                    let state = self.load(ns)?;
+                    match state.get(key) {
+                        Some(v) => v.as_f64().ok_or_else(|| {
+                            format!("incr: value at '{key}' is not a number")
+                        })?,
+                        None => default,
+                    }
+                } else {
+                    default
+                }
+            };
+            let new_val = current + delta;
+            self.save_dispatched(&dpath, &serde_json::json!(new_val))?;
+            return Ok(new_val);
+        }
         let path = self.state_path(ns)?;
         let lock = self.ns_lock(&path)?;
         let _guard = lock
@@ -463,6 +640,221 @@ mod tests {
 
         let v = store.incr(ns, "score", 10.0, 100.0).unwrap();
         assert!((v - 110.0).abs() < f64::EPSILON, "100 + 10 = 110");
+    }
+
+    // ─── Per-key dispatch (issue #1776868812) ─────────────────────────
+
+    /// Keys shaped `{prefix}:{id}` with safe segments are written to
+    /// `{root}/{prefix}/{id}.json` rather than crammed into the legacy
+    /// `{ns}.json` SSoT.
+    #[test]
+    fn dispatch_writes_to_per_key_file_for_prefix_id_keys() {
+        let (store, tmp) = new_store();
+        store
+            .set("default", "flow_orch:abc-123", serde_json::json!({"step": 1}))
+            .unwrap();
+        let dispatched = tmp.path().join("flow_orch").join("abc-123.json");
+        assert!(
+            dispatched.exists(),
+            "dispatched file must exist at {}",
+            dispatched.display()
+        );
+        // Legacy file must NOT have been touched for this key.
+        let legacy = tmp.path().join("default.json");
+        assert!(
+            !legacy.exists(),
+            "legacy default.json must not be created for dispatched keys"
+        );
+    }
+
+    /// Read path: dispatched file takes precedence; legacy `{ns}.json`
+    /// is consulted only when the dispatched file is absent (so
+    /// pre-dispatch entries remain readable without migration).
+    #[test]
+    fn dispatch_read_falls_back_to_legacy_for_unmigrated_entries() {
+        let (store, tmp) = new_store();
+        // Pre-populate the legacy default.json by writing a key without
+        // a `:` (forces the legacy path) then manually inject the
+        // dispatched-shaped key into the same file to simulate a state
+        // produced before dispatch was enabled.
+        store
+            .set("default", "boot_marker", serde_json::json!(true))
+            .unwrap();
+        let legacy_path = tmp.path().join("default.json");
+        let mut existing: HashMap<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&legacy_path).unwrap()).unwrap();
+        existing.insert(
+            "flow_legacy:xyz".to_string(),
+            serde_json::json!({"old": "value"}),
+        );
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Read returns the legacy value because no dispatched file exists.
+        assert_eq!(
+            store.get("default", "flow_legacy:xyz").unwrap(),
+            Some(serde_json::json!({"old": "value"})),
+            "must fall back to legacy default.json when dispatched file absent"
+        );
+
+        // Once we set a new value, it lands in the dispatched file and
+        // future reads see the new value (legacy entry is shadowed).
+        store
+            .set(
+                "default",
+                "flow_legacy:xyz",
+                serde_json::json!({"new": "promoted"}),
+            )
+            .unwrap();
+        assert!(
+            tmp.path().join("flow_legacy").join("xyz.json").exists(),
+            "set() must promote dispatched-shaped keys to per-key file"
+        );
+        assert_eq!(
+            store.get("default", "flow_legacy:xyz").unwrap(),
+            Some(serde_json::json!({"new": "promoted"})),
+            "dispatched file must shadow legacy entry on subsequent reads"
+        );
+    }
+
+    /// Keys without a `:` separator (or with unsafe characters in either
+    /// segment) bypass dispatch and use the legacy single-file store.
+    #[test]
+    fn dispatch_skips_keys_without_colon_or_with_unsafe_segments() {
+        let (store, tmp) = new_store();
+        store
+            .set("default", "no_colon", serde_json::json!(1))
+            .unwrap();
+        store
+            .set("default", "bad/prefix:id", serde_json::json!(2))
+            .unwrap();
+        store
+            .set("default", "prefix:bad/id", serde_json::json!(3))
+            .unwrap();
+        store
+            .set("default", "prefix:..", serde_json::json!(4))
+            .unwrap();
+        // All four go to legacy default.json.
+        let legacy = tmp.path().join("default.json");
+        let raw: HashMap<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(raw.get("no_colon"), Some(&serde_json::json!(1)));
+        assert_eq!(raw.get("bad/prefix:id"), Some(&serde_json::json!(2)));
+        assert_eq!(raw.get("prefix:bad/id"), Some(&serde_json::json!(3)));
+        assert_eq!(raw.get("prefix:.."), Some(&serde_json::json!(4)));
+        // No subdirectories were created.
+        assert!(!tmp.path().join("bad").exists());
+        assert!(!tmp.path().join("prefix").exists());
+    }
+
+    /// `delete` removes the dispatched file and returns `true`.
+    #[test]
+    fn dispatch_delete_removes_per_key_file() {
+        let (store, tmp) = new_store();
+        store
+            .set("default", "p:q", serde_json::json!("v"))
+            .unwrap();
+        let dispatched = tmp.path().join("p").join("q.json");
+        assert!(dispatched.exists(), "dispatched file should exist before delete");
+        assert!(store.delete("default", "p:q").unwrap());
+        assert!(
+            !dispatched.exists(),
+            "dispatched file should be removed after delete"
+        );
+        // Re-deleting returns false.
+        assert!(!store.delete("default", "p:q").unwrap());
+    }
+
+    /// `has` reflects dispatched file existence.
+    #[test]
+    fn dispatch_has_reports_dispatched_file_existence() {
+        let (store, _tmp) = new_store();
+        assert!(!store.has("default", "p:q").unwrap());
+        store
+            .set("default", "p:q", serde_json::json!("v"))
+            .unwrap();
+        assert!(store.has("default", "p:q").unwrap());
+    }
+
+    /// `set_nx` honours both the dispatched file and any legacy entry
+    /// to keep set-if-not-exists semantics consistent across migration.
+    #[test]
+    fn dispatch_set_nx_blocks_when_legacy_or_dispatched_entry_exists() {
+        let (store, tmp) = new_store();
+        // Inject a legacy entry under the dispatched-shaped key.
+        store
+            .set("default", "boot", serde_json::json!(true))
+            .unwrap();
+        let legacy_path = tmp.path().join("default.json");
+        let mut existing: HashMap<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&legacy_path).unwrap()).unwrap();
+        existing.insert("p:q".to_string(), serde_json::json!("legacy_only"));
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+        // set_nx must refuse because the legacy entry exists.
+        assert!(!store.set_nx("default", "p:q", serde_json::json!("new")).unwrap());
+
+        // For a fresh dispatched-shaped key with no legacy entry, set_nx
+        // creates the dispatched file and returns true; second call
+        // returns false because the dispatched file now exists.
+        assert!(store.set_nx("default", "p:r", serde_json::json!("first")).unwrap());
+        assert!(tmp.path().join("p").join("r.json").exists());
+        assert!(!store.set_nx("default", "p:r", serde_json::json!("second")).unwrap());
+    }
+
+    /// `incr` operates on the dispatched file when the key matches the
+    /// dispatch pattern; legacy values are migrated forward on the
+    /// first call.
+    #[test]
+    fn dispatch_incr_promotes_legacy_value_on_first_call() {
+        let (store, tmp) = new_store();
+        // Pre-populate a legacy numeric value under a dispatched-shaped key.
+        store
+            .set("default", "seed", serde_json::json!(0))
+            .unwrap();
+        let legacy_path = tmp.path().join("default.json");
+        let mut existing: HashMap<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(&legacy_path).unwrap()).unwrap();
+        existing.insert("counter:cnt".to_string(), serde_json::json!(7));
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // First incr: reads legacy value (7), writes new value (10) to
+        // the dispatched file.
+        let result = store.incr("default", "counter:cnt", 3.0, 0.0).unwrap();
+        assert_eq!(result, 10.0);
+        let dispatched = tmp.path().join("counter").join("cnt.json");
+        assert!(dispatched.exists(), "dispatched file must be created");
+
+        // Second incr: reads dispatched (10), writes 12.
+        let result2 = store.incr("default", "counter:cnt", 2.0, 0.0).unwrap();
+        assert_eq!(result2, 12.0);
+    }
+
+    /// `is_safe_segment` accepts alphanumerics + `_-.` and rejects
+    /// path traversal sequences and reserved names.
+    #[test]
+    fn is_safe_segment_validates_path_safety() {
+        assert!(is_safe_segment("flow_orch"));
+        assert!(is_safe_segment("abc-123"));
+        assert!(is_safe_segment("v1.2.3"));
+        assert!(!is_safe_segment(""));
+        assert!(!is_safe_segment("."));
+        assert!(!is_safe_segment(".."));
+        assert!(!is_safe_segment("a..b"));
+        assert!(!is_safe_segment("a/b"));
+        assert!(!is_safe_segment("a\\b"));
+        assert!(!is_safe_segment("a b"));
+        assert!(!is_safe_segment("a\0b"));
     }
 }
 

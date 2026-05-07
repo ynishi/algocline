@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`alc.state` per-key file dispatch — `default.json` SSoT relief**
+  (`crates/algocline-engine/src/state.rs`, #1776868812). The Rust
+  `JsonFileStore` backend now writes keys shaped `{prefix}:{id}` (with
+  safe segments — ASCII alphanumerics + `_-.`) to per-key files at
+  `{root}/{prefix}/{id}.json` instead of bundling them into the legacy
+  single `{ns}.json` (typically `default.json`). The shape matches what
+  `flow.state.lua` (algocline-bundled-packages) already produces — keys
+  like `flow_orch:abc-123` — so no Lua-side change is required.
+
+  Read-side falls back to the legacy `{ns}.json` for entries written
+  before this change, and `incr` / `set_nx` honour both files so
+  semantics stay consistent across the dispatch boundary. Existing
+  `default.json` is **not migrated** — it remains a legacy reader
+  fallback that gradually shadows out as keys are re-set into
+  dispatched files (per-task new sessions get the per-file layout
+  from the first write).
+
+  Keys without `:` (or with unsafe characters in either segment)
+  bypass dispatch and continue using the legacy single-file path.
+
 ### Added
 
 - **`alc_hub_dist projections=["luacats"]` — per-pkg IF types projection

@@ -197,6 +197,92 @@ function M.class_for(class_name, schema, class_prefix)
     return table.concat(lines, "\n") .. "\n"
 end
 
+--- Render an `---@alias` line for a single ref schema.
+---
+--- Used by `gen_pkgs` to project per-pkg `T.ref(name)` shapes into a
+--- stable `AlcPkgInput_<pkg>` / `AlcPkgResult_<pkg>` alias surface so
+--- pkg consumers see consistent class names regardless of whether the
+--- pkg's run.input/result is an inline shape or a ref into the
+--- alc_shapes registry.
+---
+--- `class_prefix` controls the resolution of the ref target name and
+--- defaults to "AlcResult" to match `gen()` / `class_for()`.
+function M.alias_for(class_name, ref_schema, class_prefix)
+    if type(class_name) ~= "string" or class_name == "" then
+        error("alc_shapes.luacats.alias_for: class_name must be non-empty string", 2)
+    end
+    if type(ref_schema) ~= "table" or rawget(ref_schema, "kind") ~= "ref" then
+        error("alc_shapes.luacats.alias_for: schema must be kind='ref'", 2)
+    end
+    class_prefix = class_prefix or "AlcResult"
+    local target = class_prefix .. pascal_case(rawget(ref_schema, "name"))
+    return "---@alias " .. class_name .. " " .. target .. "\n"
+end
+
+--- Generate the full contents of types/alc_pkgs.d.lua from a list of
+--- per-pkg shape specs.
+---
+--- `pkg_specs` must be an array of `{ name = <pkg_name>, input = <schema?>, result = <schema?> }`
+--- entries (matching the `PkgInfo.shape` format produced by
+--- `tools.docs.extract.build_pkg_info`).
+---
+--- For each spec, produces (in pkg name asc order):
+---   * `AlcPkgInput_<pkg>`  ←  spec.input  (omitted when nil)
+---   * `AlcPkgResult_<pkg>` ←  spec.result (omitted when nil)
+---
+--- Inline shape schemas (kind="shape") become `---@class` blocks via
+--- `class_for`. Ref schemas (kind="ref") become `---@alias` lines via
+--- `alias_for`. Other top-level kinds are silently skipped (would
+--- otherwise require an artificial wrapper class — out of scope here).
+---
+--- Output always ends with a newline. Returns just `"---@meta\n"` when
+--- no spec carries any shape (caller can still write the file as a
+--- placeholder so downstream `workspace.library` references resolve).
+function M.gen_pkgs(pkg_specs)
+    if pkg_specs ~= nil and type(pkg_specs) ~= "table" then
+        error("alc_shapes.luacats.gen_pkgs: pkg_specs must be table or nil", 2)
+    end
+
+    -- Sort by pkg name for deterministic output (drift-check friendly).
+    local sorted = {}
+    if pkg_specs ~= nil then
+        for i = 1, #pkg_specs do
+            sorted[i] = pkg_specs[i]
+        end
+        table.sort(sorted, function(a, b)
+            return tostring(a.name) < tostring(b.name)
+        end)
+    end
+
+    local out = { "---@meta" }
+
+    local function emit(class_name, schema)
+        if type(schema) ~= "table" then return end
+        local kind = rawget(schema, "kind")
+        if kind == "shape" then
+            out[#out + 1] = ""
+            out[#out + 1] = M.class_for(class_name, schema, "AlcResult"):gsub("\n$", "")
+        elseif kind == "ref" then
+            out[#out + 1] = ""
+            out[#out + 1] = M.alias_for(class_name, schema, "AlcResult"):gsub("\n$", "")
+        end
+        -- Other kinds (string/number/list/etc. as a top-level pkg shape) are
+        -- structurally unusual and skipped silently — pkgs should wrap them
+        -- in a shape if they want a typed surface.
+    end
+
+    for i = 1, #sorted do
+        local spec = sorted[i]
+        local pkg_name = spec.name
+        if type(pkg_name) == "string" and pkg_name ~= "" then
+            emit("AlcPkgInput_" .. pkg_name, spec.input)
+            emit("AlcPkgResult_" .. pkg_name, spec.result)
+        end
+    end
+
+    return table.concat(out, "\n") .. "\n"
+end
+
 --- Generate the full contents of types/alc_shapes.d.lua from a
 --- table of `{ [name] = shape_schema, ... }`. Output always ends
 --- with a newline (drift check compatibility).

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc_hub_dist projections=["luacats"]` — per-pkg IF types projection
+  (`types/alc_pkgs.d.lua`)** (#1777032565). The existing luacats branch
+  emitted only `alc_shapes` *registered* shapes
+  (`types/alc_shapes.d.lua`); each pkg's `M.spec.entries.run.{input, result}`
+  was invisible to LuaLS / LuaCATS consumers, so `alc.run("cot", ctx)`
+  did not get ctx / return-value completion. The projection now also
+  emits `types/alc_pkgs.d.lua` containing one entry per pkg shape:
+
+  - inline shapes (`T.shape({...})`) become `---@class AlcPkgInput_<pkg>`
+    / `---@class AlcPkgResult_<pkg>` blocks with one `---@field` per
+    schema entry.
+  - ref shapes (`T.ref("voted")`) become `---@alias AlcPkgResult_<pkg>
+    AlcResultVoted` (resolves into the existing alc_shapes class).
+
+  `gen_docs.lua` writes both `types/alc_shapes.d.lua` and
+  `types/alc_pkgs.d.lua` in a single `--luacats` pass. Output is
+  deterministic (pkgs sorted by name) and Issue A
+  (`#1777032506`, embed + distribute alc_shapes.d.lua) remains the
+  prerequisite — no schema or distribution change to alc_shapes.d.lua.
+
+  New helpers in `alc_shapes.luacats`:
+  `M.gen_pkgs(pkg_specs)` (top-level driver) and `M.alias_for(class_name,
+  ref_schema, class_prefix)` (per-ref alias renderer).
+
 - **`alc.stats.llm_calls()` — Lua-side access to the auto-counted session
   LLM call total** (`crates/algocline-engine/src/bridge/data.rs`,
   `crates/algocline-core/src/metrics.rs`). The `SessionStatus.llm_calls`

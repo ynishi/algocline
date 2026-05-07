@@ -221,6 +221,28 @@ local function main(argv)
             write_file(repo_root .. "/types/alc_shapes.d.lua",
                        S.LuaCats.gen(shapes, "AlcResult"))
             io.stdout:write("  [ok]   types/alc_shapes.d.lua (repo root)\n")
+
+            -- Per-pkg IF projection (Issue #1777032565):
+            -- Each pkg's M.spec.entries.run.{input, result} (already
+            -- extracted into PkgInfo.shape during build_pkg_info) is
+            -- projected into types/alc_pkgs.d.lua so pkg consumers get
+            -- AlcPkgInput_<name> / AlcPkgResult_<name> classes (or
+            -- aliases for ref shapes that point into alc_shapes). This
+            -- complements alc_shapes.d.lua, which only carries
+            -- *registered* shapes — pkg-local IF types were previously
+            -- invisible to LuaLS / LuaCATS consumers.
+            local pkg_specs = {}
+            for i = 1, #infos do
+                local info = infos[i]
+                pkg_specs[#pkg_specs + 1] = {
+                    name   = info.identity.name,
+                    input  = info.shape.input,
+                    result = info.shape.result,
+                }
+            end
+            write_file(repo_root .. "/types/alc_pkgs.d.lua",
+                       S.LuaCats.gen_pkgs(pkg_specs))
+            io.stdout:write("  [ok]   types/alc_pkgs.d.lua (repo root)\n")
         end
     end
 

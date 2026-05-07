@@ -3033,7 +3033,10 @@ async fn test_mcp_resources_list_returns_two_fixed() {
 
 /// `resources/templates/list` must return exactly 7 templates.
 #[tokio::test]
-async fn test_mcp_resource_templates_list_returns_seven() {
+async fn test_mcp_resource_templates_list_returns_eight() {
+    // V1 = 7 templates; V2 added `packages/{name}/narrative` (#1777052474),
+    // bringing the total to 8. The companion `list_changed` notification
+    // template (#1777052497) was closed without adding a template.
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = connect_with_alc_home(tmp.path()).await;
 
@@ -3044,8 +3047,8 @@ async fn test_mcp_resource_templates_list_returns_seven() {
 
     assert_eq!(
         result.resource_templates.len(),
-        7,
-        "expected 7 resource templates, got: {:?}",
+        8,
+        "expected 8 resource templates, got: {:?}",
         result
             .resource_templates
             .iter()
@@ -3223,6 +3226,89 @@ async fn test_mcp_resource_read_pkg_meta() {
     let meta: Value = serde_json::from_str(text)
         .unwrap_or_else(|e| panic!("meta JSON parse failed: {e}\nraw: {text}"));
     assert_eq!(meta["name"], "my_e2e_meta_pkg");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Read `alc://packages/{name}/narrative` when bundled-side install copied
+/// `narrative.md` into the pkg dir (#1777052474).
+#[tokio::test]
+async fn test_mcp_resource_read_pkg_narrative_ok() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("narrative_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
+    std::fs::write(
+        pkg_dir.join("narrative.md"),
+        "# narrative_pkg\n\nStdpkg reference smoke test.\n",
+    )
+    .expect("write narrative.md");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://packages/narrative_pkg/narrative")
+        .await
+        .expect("read_resource pkg narrative failed");
+
+    assert_eq!(result.contents.len(), 1);
+    let (uri, text) = resource_text(&result.contents[0]);
+    assert_eq!(uri, "alc://packages/narrative_pkg/narrative");
+    assert!(
+        text.contains("Stdpkg reference"),
+        "unexpected narrative content: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `alc://packages/{name}/narrative` for a pkg without `narrative.md`
+/// returns -32002 ResourceNotFound (#1777052474).
+#[tokio::test]
+async fn test_mcp_resource_read_pkg_narrative_missing_returns_not_found() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("no_narrative_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
+    // intentionally no narrative.md
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let err = read_resource(&client, "alc://packages/no_narrative_pkg/narrative")
+        .await
+        .expect_err("read_resource must error when narrative.md absent");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not found") || msg.contains("32002"),
+        "expected NotFound error, got: {msg}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `list_resource_templates` exposes `alc://packages/{name}/narrative`
+/// (#1777052474, V2 cluster). Sanity check that template enumeration
+/// keeps the new entry visible.
+#[tokio::test]
+async fn test_mcp_list_resource_templates_includes_narrative() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .list_resource_templates(None)
+        .await
+        .expect("list_resource_templates failed");
+
+    let uris: Vec<String> = result
+        .resource_templates
+        .iter()
+        .map(|t| t.uri_template.to_string())
+        .collect();
+    assert!(
+        uris.iter().any(|u| u == "alc://packages/{name}/narrative"),
+        "narrative template missing, got: {uris:?}"
+    );
 
     client.cancel().await.expect("cancel failed");
 }

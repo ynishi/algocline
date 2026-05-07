@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc://packages/{name}/narrative` MCP resource — bundled-pkg
+  Stdpkg reference** (`src/init.rs`,
+  `crates/algocline-mcp/src/resources.rs`,
+  #1777052474). New resource template that exposes per-pkg narrative
+  Markdown for bundled packages. `alc init` /
+  `pkg_install AUTO_INSTALL_SOURCES` now copies
+  `<source>/docs/narrative/{name}.md` to
+  `~/.algocline/packages/{name}/narrative.md` (silent skip when the
+  source has no narrative for that pkg). `ResourceCatalog` reads
+  the file directly as `text/markdown`; missing narrative returns
+  -32002 ResourceNotFound.
+
+  **Scope (re-framed from V2 cluster)**: bundled-only Stdpkg
+  reference. Personal-package gendoc-output narrative is
+  intentionally not surfaced via Resources — schema completion is
+  already covered by `alc_pkgs.d.lua` (#1777032565), and external
+  narrative indexing belongs to services like Context7. The
+  companion `list_changed` notification issue (#1777052497) was
+  closed at the same time because the dynamic-pkg mutation surface
+  it depended on is now out of Resource scope.
+
 - **`alc_session_new` — optional MCP-connection session pin**
   (`crates/algocline-app/src/service/session.rs` (new),
   `crates/algocline-app/src/service/mod.rs`,

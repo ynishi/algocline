@@ -205,8 +205,12 @@ impl ResourceCatalog {
 
     /// Return the list of resource templates (URI template notation, RFC 6570 level 1).
     ///
-    /// Returns the 7 approved V1 templates. `packages/{name}/narrative` is out
-    /// of scope for V1.
+    /// Returns the V1 templates plus the V2-bundled-narrative template
+    /// (`packages/{name}/narrative`, #1777052474). Personal-package
+    /// gendoc-output narrative is intentionally not included here —
+    /// per-pkg type completion is provided by `alc_pkgs.d.lua`
+    /// (#1777032565), and external narrative indexing belongs to
+    /// services like Context7 rather than the algocline Resource scope.
     pub fn list_templates(&self) -> Vec<ResourceTemplate> {
         vec![
             make_template(
@@ -222,6 +226,13 @@ impl ResourceCatalog {
                 Some("Package Metadata"),
                 "Package metadata JSON (description, category, alc_shapes_compat)",
                 Some("application/json"),
+            ),
+            make_template(
+                "alc://packages/{name}/narrative",
+                "package-narrative",
+                Some("Package Narrative"),
+                "Markdown narrative for a bundled package (Stdpkg reference)",
+                Some("text/markdown"),
             ),
             make_template(
                 "alc://cards/{card_id}",
@@ -354,6 +365,35 @@ impl ResourceCatalog {
                     }
                 })?;
                 Ok(text_result(uri, json_str, "application/json"))
+            }
+            [name, sub] if sub == "narrative" => {
+                // Stdpkg reference: bundled-packages narrative
+                // (#1777052474). Read from
+                // `{packages_dir}/{name}/narrative.md` written at
+                // install time by `init.rs::install_narrative_for`.
+                // Personal pkg gendoc output is intentionally not
+                // surfaced here — see list_templates() doc.
+                validate_id("package name", name, uri)?;
+                if !parsed.query.is_empty() {
+                    return Err(McpError::invalid_params(
+                        format!("query params not supported on {uri}"),
+                        None,
+                    ));
+                }
+                let path = self.app_dir.packages_dir().join(name).join("narrative.md");
+                if !path.is_file() {
+                    return Err(McpError::resource_not_found(
+                        format!("resource not found: {uri}"),
+                        None,
+                    ));
+                }
+                let text = std::fs::read_to_string(&path).map_err(|e| {
+                    err_to_mcp(format!(
+                        "narrative read failed for {name}: {e} (path={})",
+                        path.display()
+                    ))
+                })?;
+                Ok(text_result(uri, text, "text/markdown"))
             }
             _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
@@ -1511,17 +1551,24 @@ mod tests {
     }
 
     #[test]
-    fn list_templates_returns_7() {
+    fn list_templates_returns_8() {
+        // V1 = 7 templates; V2 added `packages/{name}/narrative`
+        // (#1777052474, Stdpkg reference for bundled packages),
+        // bringing the total to 8.
         let tmp = tempfile::tempdir().unwrap();
         let catalog = make_test_catalog(tmp.path().to_path_buf());
         let templates = catalog.list_templates();
-        assert_eq!(templates.len(), 7, "expected exactly 7 templates");
+        assert_eq!(templates.len(), 8, "expected exactly 8 templates");
         // Spot-check uri_template and name fields.
         assert_eq!(
             templates[0].raw.uri_template,
             "alc://packages/{name}/init.lua"
         );
-        assert_eq!(templates[6].raw.uri_template, "alc://logs/{session_id}");
+        assert_eq!(
+            templates[2].raw.uri_template,
+            "alc://packages/{name}/narrative"
+        );
+        assert_eq!(templates[7].raw.uri_template, "alc://logs/{session_id}");
     }
 
     // ── Template dispatch tests ───────────────────────────────────────────

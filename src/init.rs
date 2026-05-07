@@ -20,6 +20,7 @@
 //!   alc init --dev       — Force local source (development)
 //!   alc update           — Alias for `alc init --force`
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 /// Source kind: collection of packages or a single package.
@@ -396,6 +397,42 @@ async fn install_from_git(dest: &Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Copy `<source>/docs/narrative/{name}.md` to `<dest>/{name}/narrative.md`
+/// when present. Used by `install_from_local` to surface bundled-packages
+/// narrative docs as the `alc://packages/{name}/narrative` MCP resource
+/// (#1777052474). Always overwrites the destination so a `--force` install
+/// or a tag bump propagates updated narrative without manual cleanup.
+///
+/// Returns `Ok(())` when the source narrative does not exist (silent skip)
+/// or when the copy succeeds. Returns `Err` only on filesystem failure
+/// while the source file *does* exist — so non-bundled installs (which do
+/// not follow the `docs/narrative/` convention) never raise.
+fn install_narrative_for(source: &Path, dest: &Path, name: &str) -> anyhow::Result<()> {
+    let src = source
+        .join("docs")
+        .join("narrative")
+        .join(format!("{name}.md"));
+    if !src.is_file() {
+        return Ok(());
+    }
+    let dest_pkg = dest.join(name);
+    if !dest_pkg.is_dir() {
+        // copy_package failed earlier — skip narrative copy rather than
+        // creating an orphan dir. The earlier error has already been
+        // reported by the caller.
+        return Ok(());
+    }
+    let dest_file = dest_pkg.join("narrative.md");
+    std::fs::copy(&src, &dest_file).with_context(|| {
+        format!(
+            "copy narrative from {} to {}",
+            src.display(),
+            dest_file.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Install from local packages directory.
 ///
 /// Dynamically discovers all subdirectories with `init.lua` and installs them.
@@ -436,6 +473,17 @@ fn install_from_local(source: &Path, dest: &Path, force: bool) -> anyhow::Result
                 eprintln!("  ! {name}: {e}");
                 failures.push(format!("{name}: {e}"));
             }
+        }
+        // Stdpkg reference (#1777052474): bundled-packages stores per-pkg
+        // narrative under `<source>/docs/narrative/{name}.md` outside the
+        // pkg subdir, so `copy_package` (which only copies the pkg subdir)
+        // does not pick it up. Copy the narrative file (when present) into
+        // `<dest>/{name}/narrative.md` so the `alc://packages/{name}/narrative`
+        // MCP resource can serve it from a stable path. Silent skip when the
+        // source has no narrative for this pkg — non-bundled local sources
+        // simply do not have the docs/narrative/ convention.
+        if let Err(e) = install_narrative_for(source, dest, name) {
+            eprintln!("  ! {name}: narrative copy failed: {e}");
         }
     }
 

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`docs/pkg-author-conventions.md` upgraded to V1** —
+  single-source-of-truth expansion. New §0 (SSoT / Projection global
+  rule) and §1 (Publish patterns and lint scope) introduce the
+  Source-vs-Projection discipline and the Bundled / Community /
+  Private publish-mode taxonomy, together with the
+  `Required` / `Recommended` / `Optional` field status legend. The
+  existing top-level pkg shape, docstring narrative, and docstring
+  style sections are renumbered (§2-§4); §5 Lint rules table is
+  expanded to all 11 active codes plus 2 planned V1 codes
+  (`E_META_MISSING_INPUT_SHAPE`, `E_PARAM_MISSING_DESCRIBE`); §6
+  Migration is split into §6.1 (legacy `M.docs.narrative` removal,
+  retained from V0) and §6.2 (V1 conventions adoption). Parameter
+  SSoT location is corrected from the stale `M.meta.input_shape`
+  phrasing to the canonical `M.spec.entries.{entry}.input` (matches
+  `extract.lua` and the `cot/init.lua` reference). All
+  cross-references to `algocline-bundled-packages/docs/docstring-convention.md`
+  removed; this convention doc is now the canonical specification
+  (the bundled-side doc is scheduled for removal in a separate
+  change). Internal issue IDs dropped from public-facing prose. The
+  2 planned V1 lint rules are spec-only at this revision; their
+  implementation is a follow-up change. No code changes — pure spec
+  document update.
+
 ### Added
 
 - **Bundled-packages adoption guide for the M.docs SSOT migration**

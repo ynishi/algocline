@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc_pkg_doctor` narrative_issues bucket — M.docs SSOT lint (L-1)**
+  (`crates/algocline-app/src/service/pkg/doctor.rs`,
+  `tests/e2e.rs`, #1778197805 L-1). New `narrative_issues` top-level
+  bucket on the `alc_pkg_doctor` JSON output. Two `kind`/`severity`
+  classifications:
+
+  - `declared_missing` (severity `warn`): the pkg declares
+    `M.docs.narrative = "<path>"` but the file is absent. Surfaces
+    typos and forgot-to-install-narrative cases.
+  - `unmigrated` (severity `info`): the pkg has no `M.docs`
+    declaration but a convention `narrative.md` exists — the
+    bundled adoption signal for #1778197753 (machine-readable
+    progress tracking of the SSOT migration).
+
+  Pkgs whose `M.docs.narrative` resolves to an existing file, and
+  pkgs with neither declaration nor convention narrative, stay
+  silent (clean state). The pass piggy-backs on
+  `EngineApi::pkg_resolve_narrative_path` (introduced in #1778112139)
+  so the resolution semantics are identical to the
+  `alc://packages/{name}/narrative` resource consumer.
+
+  L-2 (Diátaxis section heading lint) and L-3 (docstring 1-line
+  summary lint) remain out of this release; they require markdown
+  and LuaCATS parser dependencies respectively and will be
+  evaluated after bundled adoption (#1778197753) signals demand.
+
 - **`M.docs` spec key — narrative SSOT mechanism for pkg authors**
   (`crates/algocline-app/src/service/lua/gendoc/docs/{entity_schemas,pkg_info,extract}.lua`,
   `crates/algocline-app/src/service/pkg/read.rs`,

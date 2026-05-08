@@ -3834,6 +3834,173 @@ return M"#,
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── alc_pkg_doctor — narrative_issues bucket (#1778197805 L-1) ────
+
+/// Pre-install a pkg into ALC_HOME (filesystem + installed.json) BEFORE
+/// the MCP server connects, so the Lua executor's `package.path`
+/// includes the pkg dir from startup. Required because the shared VM's
+/// `lib_paths` does not refresh after `pkg_install` calls during the
+/// same session — narrative pass needs `require(pkg)` to succeed.
+fn pre_install_pkg(alc_home: &std::path::Path, name: &str, files: &[(&str, &str)]) {
+    let pkg_dir = alc_home.join("packages").join(name);
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    for (filename, content) in files {
+        std::fs::write(pkg_dir.join(filename), content).expect("write pkg file");
+    }
+    let manifest_path = alc_home.join("installed.json");
+    let mut manifest: serde_json::Value = if manifest_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read installed.json"))
+            .expect("parse installed.json")
+    } else {
+        json!({ "packages": {} })
+    };
+    manifest["packages"][name] = json!({
+        "version": "0.1.0",
+        "source": { "type": "path", "path": pkg_dir.to_string_lossy() },
+        "installed_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write installed.json");
+}
+
+/// `M.docs.narrative` declared but the file is absent → `declared_missing`
+/// with severity `warn`.
+#[tokio::test]
+async fn test_pkg_doctor_narrative_declared_missing_warns() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pre_install_pkg(
+        tmp.path(),
+        "e2e_narr_declared",
+        &[(
+            "init.lua",
+            concat!(
+                "local M = {}\n",
+                "M.meta = { name = 'e2e_narr_declared', version = '0.1.0' }\n",
+                "M.docs = { narrative = 'overview.md', schema_version = 1 }\n",
+                "function M.run(ctx) return ctx end\n",
+                "return M\n",
+            ),
+        )],
+    );
+    // Intentionally no overview.md file.
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_narr_declared" }),
+    )
+    .await;
+
+    let narr = resp["narrative_issues"]
+        .as_array()
+        .expect("narrative_issues bucket missing");
+    let entry = narr
+        .iter()
+        .find(|e| e["name"] == "e2e_narr_declared")
+        .unwrap_or_else(|| panic!("e2e_narr_declared not in narrative_issues, got: {resp}"));
+    assert_eq!(entry["kind"], "declared_missing");
+    assert_eq!(entry["severity"], "warn");
+    assert_eq!(entry["declared_path"], "overview.md");
+    assert!(entry["message"].as_str().unwrap_or("").contains("absent"));
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `M.docs` not declared but `narrative.md` exists by convention →
+/// `unmigrated` with severity `info` (adoption candidate for #1778197753).
+#[tokio::test]
+async fn test_pkg_doctor_narrative_unmigrated_info() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pre_install_pkg(
+        tmp.path(),
+        "e2e_narr_unmigrated",
+        &[
+            (
+                "init.lua",
+                concat!(
+                    "local M = {}\n",
+                    "M.meta = { name = 'e2e_narr_unmigrated', version = '0.1.0' }\n",
+                    // intentionally no M.docs
+                    "function M.run(ctx) return ctx end\n",
+                    "return M\n",
+                ),
+            ),
+            (
+                "narrative.md",
+                "# e2e_narr_unmigrated\n\nAdoption candidate.\n",
+            ),
+        ],
+    );
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_narr_unmigrated" }),
+    )
+    .await;
+
+    let narr = resp["narrative_issues"]
+        .as_array()
+        .expect("narrative_issues bucket missing");
+    let entry = narr
+        .iter()
+        .find(|e| e["name"] == "e2e_narr_unmigrated")
+        .unwrap_or_else(|| panic!("e2e_narr_unmigrated not in narrative_issues, got: {resp}"));
+    assert_eq!(entry["kind"], "unmigrated");
+    assert_eq!(entry["severity"], "info");
+    assert!(entry["message"].as_str().unwrap_or("").contains("adoption"));
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `M.docs.narrative` declared and the file exists → narrative_issues
+/// must NOT include this pkg (clean state, success case).
+#[tokio::test]
+async fn test_pkg_doctor_narrative_clean_state_silent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    pre_install_pkg(
+        tmp.path(),
+        "e2e_narr_clean",
+        &[
+            (
+                "init.lua",
+                concat!(
+                    "local M = {}\n",
+                    "M.meta = { name = 'e2e_narr_clean', version = '0.1.0' }\n",
+                    "M.docs = { narrative = 'narrative.md', schema_version = 1 }\n",
+                    "function M.run(ctx) return ctx end\n",
+                    "return M\n",
+                ),
+            ),
+            ("narrative.md", "# clean\n"),
+        ],
+    );
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_narr_clean" }),
+    )
+    .await;
+
+    let narr = resp["narrative_issues"]
+        .as_array()
+        .expect("narrative_issues bucket missing");
+    assert!(
+        !narr.iter().any(|e| e["name"] == "e2e_narr_clean"),
+        "clean pkg must not appear in narrative_issues, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── alc_pkg_install force parameter ─────────────────────────────
 
 /// Verify that `force=true` is accepted over MCP wire and the Collection install

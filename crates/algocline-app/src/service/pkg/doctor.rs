@@ -65,7 +65,11 @@ enum DoctorOutcome {
     },
 }
 
-/// Accumulator for the five JSON output buckets.
+/// Accumulator for the JSON output buckets.
+///
+/// `narrative_issues` (added in #1778197805) is structurally analogous to the
+/// five status buckets but tagged per-entry with `kind` and `severity` so the
+/// downstream consumer (lint UI, CI gate) can route based on those.
 #[derive(Default)]
 struct DoctorBuckets {
     healthy: Vec<serde_json::Value>,
@@ -73,6 +77,7 @@ struct DoctorBuckets {
     symlink_dangling: Vec<serde_json::Value>,
     path_missing: Vec<serde_json::Value>,
     incomplete_pkg: Vec<serde_json::Value>,
+    narrative_issues: Vec<serde_json::Value>,
 }
 
 impl DoctorBuckets {
@@ -82,16 +87,18 @@ impl DoctorBuckets {
             || !self.symlink_dangling.is_empty()
             || !self.path_missing.is_empty()
             || !self.incomplete_pkg.is_empty()
+            || !self.narrative_issues.is_empty()
     }
 
     fn into_json(self) -> String {
-        // All five buckets are always emitted (empty arrays when no entries).
+        // All buckets are always emitted (empty arrays when no entries).
         // `serde_json::json!` serializes keys alphabetically without the
         // `preserve_order` feature — consumers parse as a Map, not by order.
         serde_json::json!({
             "healthy": self.healthy,
             "incomplete_pkg": self.incomplete_pkg,
             "installed_missing": self.installed_missing,
+            "narrative_issues": self.narrative_issues,
             "symlink_dangling": self.symlink_dangling,
             "path_missing": self.path_missing,
         })
@@ -441,6 +448,8 @@ impl AppService {
         run_manifest_pass(&manifest, target_filter, &pkg_dir, &mut buckets);
         run_unattached_symlink_pass(&pkg_dir, target_filter, &manifest, &mut buckets);
         run_path_missing_pass(resolved_root.as_deref(), target_filter, &mut buckets);
+        self.run_narrative_pass(&pkg_dir, target_filter, &manifest, &mut buckets)
+            .await;
 
         if let Some(target) = target_filter {
             if !buckets.any_matched() {
@@ -451,6 +460,95 @@ impl AppService {
         }
 
         Ok(buckets.into_json())
+    }
+
+    /// Narrative SSOT lint pass (#1778197805 L-1).
+    ///
+    /// For each manifest-tracked pkg with a present pkg dir, evaluate
+    /// `M.docs.narrative` declaration vs the actual narrative.md file:
+    ///
+    /// - `declared_missing` (severity `warn`): the pkg declares
+    ///   `M.docs.narrative = "<path>"` but the file is absent. The
+    ///   author either typo'd the path or forgot to install the
+    ///   narrative file alongside `init.lua`.
+    /// - `unmigrated` (severity `info`): the pkg has no `M.docs`
+    ///   declaration but the convention path
+    ///   `<pkg>/narrative.md` does exist. This is the bundled
+    ///   adoption signal — a candidate for the
+    ///   `M.docs = { narrative = "narrative.md" }` migration tracked
+    ///   in #1778197753.
+    ///
+    /// Pkgs without `M.docs` and without a convention narrative.md
+    /// are silently fine — narrative is optional. Pkgs whose
+    /// `M.docs.narrative` resolves to an existing file are silently
+    /// fine — that's the success case.
+    async fn run_narrative_pass(
+        &self,
+        pkg_dir: &Path,
+        target_filter: Option<&str>,
+        manifest: &Manifest,
+        buckets: &mut DoctorBuckets,
+    ) {
+        for (name, _entry) in manifest.packages.iter() {
+            if let Some(target) = target_filter {
+                if target != name.as_str() {
+                    continue;
+                }
+            }
+            let pkg_path = pkg_dir.join(name);
+            if !pkg_path.is_dir() {
+                // Pkg dir absent — covered by other passes; narrative
+                // pass has nothing to say about it.
+                continue;
+            }
+            let declared = match self.pkg_resolve_narrative_path(name).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    // Lua load failure for this pkg — log and skip.
+                    // The pkg load problem itself surfaces via
+                    // `pkg_list` / other tools; doctor stays narrative-
+                    // focused.
+                    warn!("pkg_doctor narrative pass: pkg '{name}' load failed: {e}");
+                    continue;
+                }
+            };
+            match declared {
+                Some(rel) => {
+                    let narr_path = pkg_path.join(&rel);
+                    if !narr_path.is_file() {
+                        buckets.narrative_issues.push(serde_json::json!({
+                            "name": name,
+                            "kind": "declared_missing",
+                            "severity": "warn",
+                            "declared_path": rel,
+                            "resolved_path": narr_path.to_string_lossy(),
+                            "message": format!(
+                                "M.docs.narrative declares '{rel}' but the file is absent at {}",
+                                narr_path.display()
+                            ),
+                            "suggestion": format!(
+                                "Create the narrative file or update M.docs.narrative to point at an existing file."
+                            ),
+                        }));
+                    }
+                }
+                None => {
+                    let convention = pkg_path.join("narrative.md");
+                    if convention.is_file() {
+                        buckets.narrative_issues.push(serde_json::json!({
+                            "name": name,
+                            "kind": "unmigrated",
+                            "severity": "info",
+                            "resolved_path": convention.to_string_lossy(),
+                            "message": format!(
+                                "convention narrative.md exists but M.docs is not declared (#1778197753 adoption candidate)"
+                            ),
+                            "suggestion": "Add M.docs = { narrative = \"narrative.md\", schema_version = 1 } to init.lua to make the SSOT explicit.".to_string(),
+                        }));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -571,13 +669,18 @@ mod tests {
         assert!(obj.contains_key("symlink_dangling"));
         assert!(obj.contains_key("path_missing"));
         assert!(obj.contains_key("incomplete_pkg"));
-        assert_eq!(obj.len(), 5, "exactly five top-level buckets: {out}");
+        assert!(obj.contains_key("narrative_issues"));
+        // 6 buckets after #1778197805 (added narrative_issues alongside the
+        // original 5 status buckets).
+        assert_eq!(obj.len(), 6, "exactly six top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
         assert_eq!(obj["symlink_dangling"][0]["name"], "s");
         assert_eq!(obj["path_missing"][0]["name"], "p");
         assert_eq!(obj["incomplete_pkg"][0]["name"], "c");
+        // narrative_issues defaults to empty array (no entry pushed in this test).
+        assert_eq!(obj["narrative_issues"], serde_json::json!([]));
     }
 
     #[test]

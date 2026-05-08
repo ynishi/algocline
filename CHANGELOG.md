@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Bundled-packages adoption guide for the M.docs SSOT migration**
+  (`docs/bundled-packages-adoption-guide.md`). Operator-facing
+  playbook for migrating an entire bundled-packages repo (currently
+  117 pkgs at tag v0.21.0) onto the `M.docs` spec key shipped in
+  v0.33.0. Complements `docs/pkg-author-conventions.md` (the
+  per-pkg authoring spec): the convention doc tells you *what* to
+  write, this guide tells you *how to migrate an existing fleet*.
+  Covers field-by-field reference for `M.docs.{narrative,
+  schema_version}`, the B-1 / B-2 / B-3 sub-step strategy
+  (mechanical declaration insert / Diátaxis section restructuring
+  / docstring discipline), the `alc_pkg_doctor narrative_issues`
+  bucket as an adoption progress meter, edge cases (custom
+  narrative paths, partial adoption, `alc init --force` overwrite
+  caveat, future schema_version expansion), and a 9-row
+  cross-reference table back into algocline-core / algocline-app /
+  algocline-mcp source paths so bundled maintainers do not need to
+  trace the impl themselves. Backs the off-repo follow-up issue
+  #1778197753.
+
 ## [0.33.0] - 2026-05-08
 
 ### Added

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`M.docs` spec key — narrative SSOT mechanism for pkg authors**
+  (`crates/algocline-app/src/service/lua/gendoc/docs/{entity_schemas,pkg_info,extract}.lua`,
+  `crates/algocline-app/src/service/pkg/read.rs`,
+  `crates/algocline-mcp/src/resources.rs`,
+  `crates/algocline-core/src/engine_api.rs`,
+  `docs/pkg-author-conventions.md`,
+  #1778112139). Pkg authors can now declare narrative location and
+  metadata via a top-level `M.docs` table:
+
+  ```lua
+  M.docs = {
+      narrative      = "narrative.md",  -- pkg-dir-relative path
+      schema_version = 1,
+  }
+  ```
+
+  - `EngineApi::pkg_resolve_narrative_path(name)` returns the
+    declared path (or `None` for convention fallback). `..` and
+    leading `/` are rejected as a path-traversal guard.
+  - `alc://packages/{name}/narrative` (#1777052474) consults
+    `M.docs.narrative` first; falls back to the convention path
+    `<pkg>/narrative.md` for pkgs without `M.docs`.
+  - gendoc `extract.lua` populates `PkgInfo.docs` from `M.docs`,
+    making the SSOT visible to downstream lint / projection paths.
+  - `docs/pkg-author-conventions.md` codifies the full author
+    surface: `M.meta` / `M.spec` / `M.docs` / `M.run` layering,
+    Diátaxis section structure for `narrative.md`, and rustdoc-flavoured
+    docstring 1-line summary discipline (arXiv 2510.26130 evidence).
+
+  Backward compatible — `M.docs` is optional, all existing pkgs
+  continue to work via convention fallback. bundled-packages
+  117-pkg adoption is tracked in a separate issue (#1778197753),
+  and lint enforcement in `alc_pkg_doctor` is tracked in
+  #1778197805.
+
 - **`alc://packages/{name}/narrative` MCP resource — bundled-pkg
   Stdpkg reference** (`src/init.rs`,
   `crates/algocline-mcp/src/resources.rs`,

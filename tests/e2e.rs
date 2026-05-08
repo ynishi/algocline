@@ -3313,6 +3313,138 @@ async fn test_mcp_list_resource_templates_includes_narrative() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// `alc://packages/{name}/narrative` honours `M.docs.narrative`
+/// SSOT spec key (#1778112139): when the pkg declares
+/// `M.docs.narrative = "<rel_path>"`, the resource resolves to
+/// `<pkg dir>/<rel_path>` rather than the convention `narrative.md`.
+#[tokio::test]
+async fn test_mcp_resource_narrative_resolves_via_m_docs_when_declared() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("docs_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    // Declare M.docs.narrative pointing at a non-default file name
+    // so the test fails distinguishably if the resource resolver
+    // ignores M.docs and falls back to convention.
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'docs_pkg', version = '0.1.0' }\n",
+            "M.docs = { narrative = 'overview.md', schema_version = 1 }\n",
+            "function M.run(ctx) return ctx end\n",
+            "return M\n",
+        ),
+    )
+    .expect("write init.lua");
+    std::fs::write(
+        pkg_dir.join("overview.md"),
+        "# docs_pkg\n\nDeclared narrative path resolution.\n",
+    )
+    .expect("write overview.md");
+    // Convention path also exists with different content — the
+    // resolver must NOT pick this up when M.docs.narrative is
+    // declared.
+    std::fs::write(
+        pkg_dir.join("narrative.md"),
+        "# docs_pkg\n\nConvention fallback (should NOT be returned).\n",
+    )
+    .expect("write narrative.md");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://packages/docs_pkg/narrative")
+        .await
+        .expect("read_resource pkg narrative failed");
+    let (_, text) = resource_text(&result.contents[0]);
+    assert!(
+        text.contains("Declared narrative path resolution"),
+        "expected declared path content, got: {text}"
+    );
+    assert!(
+        !text.contains("Convention fallback"),
+        "must NOT return convention path content when M.docs.narrative declared, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `alc://packages/{name}/narrative` falls back to the convention
+/// path `narrative.md` when the pkg has no `M.docs.narrative`
+/// declaration (#1778112139, preserves pre-spec behaviour for
+/// unmigrated pkgs).
+#[tokio::test]
+async fn test_mcp_resource_narrative_falls_back_to_convention_without_m_docs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("legacy_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    // No M.docs declaration → convention `narrative.md` must resolve.
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'legacy_pkg', version = '0.1.0' }\n",
+            "function M.run(ctx) return ctx end\n",
+            "return M\n",
+        ),
+    )
+    .expect("write init.lua");
+    std::fs::write(
+        pkg_dir.join("narrative.md"),
+        "# legacy_pkg\n\nConvention path resolved without M.docs.\n",
+    )
+    .expect("write narrative.md");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = read_resource(&client, "alc://packages/legacy_pkg/narrative")
+        .await
+        .expect("read_resource pkg narrative failed");
+    let (_, text) = resource_text(&result.contents[0]);
+    assert!(
+        text.contains("Convention path resolved"),
+        "expected convention fallback content, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `M.docs.narrative` containing `..` is rejected by the path-traversal
+/// guard (#1778112139); the resource read surfaces a typed error rather
+/// than silently traversing.
+#[tokio::test]
+async fn test_mcp_resource_narrative_rejects_path_traversal_in_m_docs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("evil_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'evil_pkg', version = '0.1.0' }\n",
+            "M.docs = { narrative = '../../etc/passwd' }\n",
+            "function M.run(ctx) return ctx end\n",
+            "return M\n",
+        ),
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let err = read_resource(&client, "alc://packages/evil_pkg/narrative")
+        .await
+        .expect_err("path traversal in M.docs.narrative must error");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("..") || msg.contains("traversal") || msg.contains("relative"),
+        "expected path-traversal error, got: {msg}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Read an unknown service → `McpError` returned to the client.
 #[tokio::test]
 async fn test_mcp_resource_read_unknown_uri_returns_error() {

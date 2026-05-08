@@ -85,6 +85,70 @@ impl AppService {
             )),
         }
     }
+
+    /// Resolve the per-pkg narrative file path declared via the
+    /// `M.docs.narrative` SSOT spec key (#1778112139).
+    ///
+    /// Returns `Ok(Some(rel_path))` when the pkg declares
+    /// `M.docs.narrative = "<path>"`. Returns `Ok(None)` when the
+    /// declaration is absent, signalling the caller should fall
+    /// back to the convention path (`narrative.md`). Returns `Err`
+    /// only when the pkg cannot be loaded at all.
+    ///
+    /// `..` and leading `/` are rejected here as a path-traversal
+    /// guard so callers can join the result against the pkg dir
+    /// without re-validating.
+    pub(crate) async fn pkg_resolve_narrative_path(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        if !is_safe_pkg_name(name) {
+            return Err(format!(
+                "pkg_resolve_narrative_path: invalid package name '{name}'"
+            ));
+        }
+        let code = format!(
+            r#"package.loaded["{name}"] = nil
+local pkg = require("{name}")
+if type(pkg.docs) == "table" and type(pkg.docs.narrative) == "string" then
+    return pkg.docs.narrative
+else
+    return nil
+end"#
+        );
+        let value =
+            self.executor.eval_simple(code).await.map_err(|e| {
+                format!("pkg_resolve_narrative_path: pkg '{name}' load failed: {e}")
+            })?;
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) => {
+                if s.contains("..") || s.starts_with('/') {
+                    Err(format!(
+                        "pkg_resolve_narrative_path: pkg '{name}' M.docs.narrative \
+                         must be a pkg-dir-relative path without '..' or leading '/' (got '{s}')"
+                    ))
+                } else if s.is_empty() {
+                    // Empty string is treated as "no declaration" rather than
+                    // a valid path, so the convention fallback kicks in.
+                    Ok(None)
+                } else {
+                    Ok(Some(s))
+                }
+            }
+            other => Err(format!(
+                "pkg_resolve_narrative_path: pkg '{name}' M.docs.narrative must be a string \
+                 (got {other:?})"
+            )),
+        }
+    }
+}
+
+/// Validate a Lua module identifier — alphanumeric + underscore only.
+/// Mirrors `pkg/list.rs::is_safe_pkg_name` but kept module-local to
+/// avoid creating a cross-module dependency just for this guard.
+fn is_safe_pkg_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────

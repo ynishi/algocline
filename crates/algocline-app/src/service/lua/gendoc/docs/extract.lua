@@ -326,7 +326,45 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
         end
     end
 
-    local pi = PI.make_pkg_info(identity, narrative, shape)
+    -- M.docs extraction (#1778112139, narrative SSOT spec key).
+    -- Optional. When the pkg author declares `M.docs = { narrative = ... }`,
+    -- the value is captured here and passed through to PkgInfo for
+    -- downstream consumers (Resource path resolver, lint, gendoc).
+    -- Pkgs without `M.docs` produce `{ narrative = nil, schema_version = nil }`,
+    -- which is the convention-fallback signal for the resource resolver.
+    local docs = { narrative = nil, schema_version = nil }
+    local mod_docs = mod.docs
+    if type(mod_docs) == "table" then
+        if mod_docs.narrative ~= nil then
+            if type(mod_docs.narrative) ~= "string" then
+                error(string.format(
+                    "tools.docs.extract: pkg '%s' M.docs.narrative " ..
+                    "must be a string (got type '%s')",
+                    pkg_name, type(mod_docs.narrative)), 2)
+            end
+            -- Reject path traversal / absolute paths early so downstream
+            -- resolvers can trust the value without re-validation.
+            if mod_docs.narrative:find("%.%.") or mod_docs.narrative:sub(1, 1) == "/" then
+                error(string.format(
+                    "tools.docs.extract: pkg '%s' M.docs.narrative " ..
+                    "must be a pkg-dir-relative path without '..' or " ..
+                    "leading '/' (got '%s')",
+                    pkg_name, mod_docs.narrative), 2)
+            end
+            docs.narrative = mod_docs.narrative
+        end
+        if mod_docs.schema_version ~= nil then
+            if type(mod_docs.schema_version) ~= "number" then
+                error(string.format(
+                    "tools.docs.extract: pkg '%s' M.docs.schema_version " ..
+                    "must be a number (got type '%s')",
+                    pkg_name, type(mod_docs.schema_version)), 2)
+            end
+            docs.schema_version = mod_docs.schema_version
+        end
+    end
+
+    local pi = PI.make_pkg_info(identity, narrative, shape, docs)
     -- Dev-mode conformance check. Gated by ALC_SHAPE_CHECK=1 so production
     -- extract loops pay nothing. On fail raises with pkg_name as ctx hint.
     S.assert_dev(pi, "PkgInfo", pkg_name, { registry = EntitySchemas })

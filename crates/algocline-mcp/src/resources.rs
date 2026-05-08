@@ -368,11 +368,19 @@ impl ResourceCatalog {
             }
             [name, sub] if sub == "narrative" => {
                 // Stdpkg reference: bundled-packages narrative
-                // (#1777052474). Read from
-                // `{packages_dir}/{name}/narrative.md` written at
-                // install time by `init.rs::install_narrative_for`.
-                // Personal pkg gendoc output is intentionally not
-                // surfaced here — see list_templates() doc.
+                // (#1777052474, V2 cluster). Personal pkg gendoc
+                // output is intentionally not surfaced here — see
+                // list_templates() doc.
+                //
+                // Path resolution (#1778112139):
+                // 1. Consult `M.docs.narrative` SSOT spec key
+                //    via `pkg_resolve_narrative_path`. When
+                //    declared, resolve `<pkg dir>/<declared path>`.
+                // 2. Fall back to convention `<pkg dir>/narrative.md`
+                //    when no declaration (preserves the
+                //    pre-#1778112139 behaviour for unmigrated
+                //    bundled pkgs).
+                // 3. Missing file in either path → -32002.
                 validate_id("package name", name, uri)?;
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
@@ -380,7 +388,19 @@ impl ResourceCatalog {
                         None,
                     ));
                 }
-                let path = self.app_dir.packages_dir().join(name).join("narrative.md");
+                let pkg_dir = self.app_dir.packages_dir().join(name);
+                let declared = match self.app.pkg_resolve_narrative_path(name).await {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        return Err(err_to_mcp(format!(
+                            "narrative path resolve failed for {name}: {e}"
+                        )));
+                    }
+                };
+                let path = match declared {
+                    Some(rel) => pkg_dir.join(rel),
+                    None => pkg_dir.join("narrative.md"),
+                };
                 if !path.is_file() {
                     return Err(McpError::resource_not_found(
                         format!("resource not found: {uri}"),
@@ -1209,6 +1229,12 @@ mod tests {
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
+                async fn pkg_resolve_narrative_path(
+                    &self,
+                    _name: &str,
+                ) -> Result<Option<String>, String> {
+                    Err($err.into())
+                }
                 async fn card_list(&self, _pkg: Option<String>) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1866,6 +1892,11 @@ mod tests {
         ) -> Result<String, String> {
             Err("noop".into())
         }
+        async fn pkg_resolve_narrative_path(&self, _: &str) -> Result<Option<String>, String> {
+            // FakeEngine default: pretend M.docs.narrative absent so the
+            // resource handler exercises the convention fallback path.
+            Ok(None)
+        }
         async fn card_list(&self, _: Option<String>) -> Result<String, String> {
             self.card_list
                 .clone()
@@ -2176,6 +2207,9 @@ mod tests {
                 _: Option<String>,
             ) -> Result<String, String> {
                 Err("noop".into())
+            }
+            async fn pkg_resolve_narrative_path(&self, _: &str) -> Result<Option<String>, String> {
+                Ok(None)
             }
             async fn card_list(&self, _: Option<String>) -> Result<String, String> {
                 Err("noop".into())

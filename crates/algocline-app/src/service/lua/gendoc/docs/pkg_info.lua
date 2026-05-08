@@ -22,6 +22,10 @@
 ---       input  = <alc_shapes schema>|nil,   -- typically T.shape(...)
 ---       result = <alc_shapes schema>|nil,   -- T.shape / T.ref / ...
 ---     },
+---     docs = {
+---       narrative      = <string>|nil,   -- pkg-dir-relative path, e.g. "narrative.md"
+---       schema_version = <number>|nil,   -- M.docs field-set version, default 1
+---     },
 ---   }
 ---
 ---   Section = { level = 2|3, heading = <string>,
@@ -38,11 +42,12 @@ function M.make_section(level, heading, anchor, body_md)
     }
 end
 
-function M.make_pkg_info(identity, narrative, shape)
+function M.make_pkg_info(identity, narrative, shape, docs)
     return {
         identity  = identity,
         narrative = narrative,
         shape     = shape,
+        docs      = docs or { narrative = nil, schema_version = nil },
     }
 end
 

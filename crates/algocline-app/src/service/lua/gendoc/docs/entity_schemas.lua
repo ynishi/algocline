@@ -67,10 +67,25 @@ M.Shape = T.shape({
     result = AlcSchema:is_optional(),
 }, { open = false })
 
+-- Docs entity (#1778112139): narrative SSOT spec key.
+--
+-- Mirrors M.docs author surface. `narrative` is the per-pkg dir
+-- relative path to the narrative markdown file (typically
+-- "narrative.md"). `schema_version` is the M.docs field-set version
+-- (currently 1). Both fields are optional — pkgs without M.docs
+-- entirely surface here as `{ narrative = nil, schema_version = nil }`
+-- and the downstream consumer (Resource path resolver / lint /
+-- gendoc) falls back to the convention path or warns as appropriate.
+M.Docs = T.shape({
+    narrative      = T.string:is_optional(),
+    schema_version = T.number:is_optional(),
+}, { open = false })
+
 M.PkgInfo = T.shape({
     identity  = T.ref("Identity"),
     narrative = T.ref("Narrative"),
     shape     = T.ref("Shape"),
+    docs      = T.ref("Docs"),
 }, { open = false })
 
 return M

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`docs/pkg-author-conventions.md` §4.1 — 1-line summary casing
+  convention added**. PkgName-only form
+  (`{PkgName} — {verb phrase}`) is retained when the pkg directory
+  name is the canonical form; new PkgName + StyledName form
+  (`{PkgName}({StyledName}) — {verb phrase}`) covers pkgs with a
+  paper-cited abbreviation (CoT, UCB, MCTS, etc.). Provides a reading
+  aid without breaking directory / SSoT consistency. The §4.5 LuaCATS
+  example is updated to `cot(CoT) — ...` to demonstrate the form.
+
 - **`docs/pkg-author-conventions.md` upgraded to V1** —
   single-source-of-truth expansion. New §0 (SSoT / Projection global
   rule) and §1 (Publish patterns and lint scope) introduce the

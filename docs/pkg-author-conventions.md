@@ -279,7 +279,14 @@ Every docstring opens with a 1-line summary, followed by a 1–3 sentence abstra
 
 **1-line summary** (line 1):
 
-- One clause, ≤ 80 characters, of the form `{PkgName} — {verb phrase}`
+- One clause, ≤ 80 characters, of the form
+  `{PkgName}({StyledName}) — {verb phrase}` when the pkg has a stylized
+  name (typically a paper-cited abbreviation such as `CoT`, `UCB`,
+  `MCTS`), or `{PkgName} — {verb phrase}` when the pkg directory name
+  is already the canonical form
+- `PkgName` is always the pkg directory name (lowercase, matches
+  `M.meta.name`). `StyledName` is the conventional reading-aid form
+  used in the literature; omit it when no such form exists.
 - `—` is the em dash (UTF-8 `U+2014`)
 - Becomes the H1 title in the rendered narrative and the entry in `llms.txt`
 - `M.meta.description` (§2.1) carries the same (or slightly expanded) wording for JSON consumers
@@ -288,6 +295,8 @@ Good:
 
 ```lua
 --- conformal_vote — split conformal prediction gate for multi-agent deliberation
+--- cot(CoT) — iterative chain-of-thought reasoning
+--- ucb(UCB) — upper confidence bound multi-armed bandit
 ```
 
 Too vague:
@@ -430,7 +439,7 @@ Inline citations in body text reference the bullet by surname or arXiv ID — no
 LuaCATS annotations (`---@type`, `---@param`, `---@return`, etc.) appear **after** the narrative docstring body. The generator stops narrative extraction at the first `---@` line.
 
 ```lua
---- cot — iterative chain-of-thought reasoning
+--- cot(CoT) — iterative chain-of-thought reasoning
 ---
 --- Builds a reasoning chain step by step, then synthesizes the chain
 --- into a single coherent conclusion.

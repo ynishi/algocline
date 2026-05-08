@@ -23,9 +23,11 @@
 ---       result = <alc_shapes schema>|nil,   -- T.shape / T.ref / ...
 ---     },
 ---     docs = {
----       narrative      = <string>|nil,   -- pkg-dir-relative path, e.g. "narrative.md"
 ---       schema_version = <number>|nil,   -- M.docs field-set version, default 1
 ---     },
+---     -- Note: M.docs.narrative removed in #1778221491-39903.
+---     -- Narrative content is now served on-the-fly from the init.lua
+---     -- docstring H2 sections via the gendoc pipeline.
 ---   }
 ---
 ---   Section = { level = 2|3, heading = <string>,
@@ -47,7 +49,7 @@ function M.make_pkg_info(identity, narrative, shape, docs)
         identity  = identity,
         narrative = narrative,
         shape     = shape,
-        docs      = docs or { narrative = nil, schema_version = nil },
+        docs      = docs or { schema_version = nil },
     }
 end
 

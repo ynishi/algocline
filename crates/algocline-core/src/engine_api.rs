@@ -284,24 +284,19 @@ pub trait EngineApi: Send + Sync {
     /// Backs up the old lock file as `alc.lock.bak`.
     async fn migrate(&self, project_root: Option<String>) -> Result<String, String>;
 
-    // ─── Package narrative SSOT (issue #1778112139) ──────────
+    // ─── Package narrative (issue #1778221491-39903) ─────────
 
-    /// Resolve the per-pkg narrative file path declared via the
-    /// `M.docs.narrative` SSOT spec key. Returns the pkg-dir-relative
-    /// path string when declared, or `None` to indicate the caller
-    /// should fall back to the convention path (`narrative.md`).
+    /// Render the narrative markdown for a package on-the-fly.
     ///
-    /// Implementations must:
-    /// - reject `..` / leading `/` in the declared value (path
-    ///   traversal guard); fail with a typed error rather than
-    ///   silently returning the unsafe string.
-    /// - return `Ok(None)` when the pkg has no `M.docs` table or no
-    ///   `narrative` field within it (so callers preserve the
-    ///   pre-#1778112139 convention behaviour without raising).
-    /// - return `Err(...)` only when the pkg cannot be loaded at all
-    ///   (e.g. invalid Lua, missing pkg) so callers can surface a
-    ///   distinct error from "narrative simply absent".
-    async fn pkg_resolve_narrative_path(&self, name: &str) -> Result<Option<String>, String>;
+    /// Extracts the init.lua docstring H2/H3 sections via the embedded
+    /// gendoc pipeline (`extract.split_sections` + `projections.narrative_md`)
+    /// and returns the rendered markdown string.
+    ///
+    /// Returns `Ok(Some(markdown))` when the pkg is found and its init.lua
+    /// is loadable. Returns `Ok(None)` when the pkg is not installed.
+    /// Returns `Err(...)` when the pkg is found but the gendoc pipeline fails
+    /// (e.g. malformed init.lua).
+    async fn pkg_get_narrative_md(&self, name: &str) -> Result<Option<String>, String>;
 
     // ─── Session activation (issue #1776627475) ──────────────
 

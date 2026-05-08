@@ -608,6 +608,15 @@ impl ProjectionFlags {
 /// `include_str!` — no disk fallback. `tools/docs/*` pipeline sources
 /// are registered in the same pass.
 fn register_preloads(lua: &Lua) -> Result<(), String> {
+    register_preloads_pub(lua)
+}
+
+/// Crate-visible version of `register_preloads`.
+///
+/// Registers all embedded gendoc tool modules (`tools.docs.*`, `alc_shapes*`)
+/// on `package.preload` of the given Lua VM. Called by the full `hub_gendoc`
+/// pipeline and by the lightweight `pkg_get_narrative_md` path.
+pub(crate) fn register_preloads_pub(lua: &Lua) -> Result<(), String> {
     let preload = preload_table(lua)?;
     for (mod_name, src) in EMBEDDED_TOOL_PRELOADS.iter().copied() {
         register_single_preload(lua, &preload, mod_name, src)?;

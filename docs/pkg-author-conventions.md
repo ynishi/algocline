@@ -1,25 +1,19 @@
-# Package author conventions
+# pkg-author-conventions: docstring-driven narrative
 
-This document codifies the conventions algocline expects from package
-authors targeting the `~/.algocline/packages/` distribution surface.
+**Updated**: issue `#1778221491-39903` — `M.docs.narrative` and separate `narrative.md` files are removed.
+**Applies to**: all bundled packages in `algocline-bundled-packages` and personal packages served via `alc://packages/{name}/narrative`.
+
 The conventions are split into three sections:
 
-1. **Top-level pkg shape** (`M.meta` / `M.spec` / `M.docs` / `M.run`)
-2. **Narrative content** (`narrative.md` Diátaxis sections)
-3. **docstring style** (rustdoc-flavoured 1-line summary + body)
-
-The conventions are advisory by default — algocline ships with
-convention fallbacks so packages without explicit `M.docs` keep
-working — but the per-pkg `alc_pkg_doctor` lint (issue
-[#1778197805](https://github.com/ynishi/algocline/issues/1778197805))
-will surface gaps once enabled.
+1. **Top-level pkg shape** (`M.meta` / `M.spec` / `M.docs`)
+2. **Docstring-driven narrative** (replaces `narrative.md` and `M.docs.narrative`)
+3. **Docstring style** (rustdoc-flavoured 1-line summary + H2 body sections)
 
 ---
 
 ## 1. Top-level pkg shape
 
-Every algocline pkg is a Lua module that returns a table `M`. The
-canonical layering is:
+Every algocline pkg is a Lua module that returns a table `M`. The canonical layout:
 
 ```lua
 local M = {}
@@ -29,7 +23,6 @@ M.meta = {
     version     = "1.2.0",
     description = "Chain-of-thought reasoning",
     category    = "reasoning",
-    -- alc_shapes_compat = "^0.25.0",  -- optional
 }
 
 M.spec = {
@@ -41,8 +34,9 @@ M.spec = {
     },
 }
 
+-- M.docs is optional; set schema_version for future compat if needed.
+-- Do NOT set M.docs.narrative — that field is removed (#1778221491-39903).
 M.docs = {
-    narrative      = "narrative.md",  -- pkg-dir-relative path
     schema_version = 1,
 }
 
@@ -53,188 +47,188 @@ end
 return M
 ```
 
-### 1.1 `M.meta` — identity (existing)
+### 1.1 `M.meta` — identity
 
-Identity / discovery information. Required: `name`. Recommended:
-`version` (SemVer), `description` (≤ 80 char tagline), `category`.
+Required: `name`. Recommended: `version` (SemVer), `description` (≤ 80 char tagline), `category`.
 
-### 1.2 `M.spec` — runtime contract (existing)
+### 1.2 `M.spec` — runtime contract
 
-Schema for `entries.run.{input, result}` written in alc_shapes T DSL.
-Used by `alc_hub_dist projections=["luacats"]` to generate
-`types/alc_pkgs.d.lua` (#1777032565), and by `alc.run(<pkg>, ctx)`
-runtime validation.
+Schema for entries written in the `alc_shapes` T DSL. Used by `alc_hub_dist projections=["luacats"]` to generate `types/alc_pkgs.d.lua`, and by `alc.run(<pkg>, ctx)` runtime validation.
 
-### 1.3 `M.docs` — narrative SSOT (#1778112139)
+### 1.3 `M.docs` — optional container
 
-Optional but **recommended** for pkgs that ship narrative
-documentation. Declaring `M.docs.narrative` makes the path explicit
-so the `alc://packages/{name}/narrative` MCP resource and any future
-lint can resolve the file without convention guessing.
-
-Field reference:
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `narrative` | string | no | pkg-dir-relative path to the narrative markdown file. Typically `"narrative.md"`. `..` and absolute paths are rejected. |
-| `schema_version` | number | no (default 1) | M.docs field-set version, future-compat marker. |
-
-When `M.docs` is omitted entirely the resource resolver falls back to
-the convention path `<pkg>/narrative.md` so existing pkgs continue to
-work unchanged.
-
-### 1.4 `M.run` — primary entry function (existing)
-
-```lua
-function M.run(ctx)
-    -- pkg's main work
-    return result_table
-end
-```
-
-`ctx` shape is constrained by `M.spec.entries.run.input` when
-declared. Return value should match `M.spec.entries.run.result`.
+`M.docs` is preserved as a container for future schema markers. The only recognised field is `schema_version`. **`M.docs.narrative` is removed** — do not set it. The linter will warn on unknown `M.docs` fields in a future release.
 
 ---
 
-## 2. Narrative content (`narrative.md`)
+## 2. Docstring-driven narrative
 
-`narrative.md` is the prose reference for the pkg. The Markdown is
-served verbatim as `text/markdown` via the
-`alc://packages/{name}/narrative` MCP resource.
+`init.lua` is the single source of truth for narrative content. The gendoc pipeline (`extract.lua split_sections` + `projections.lua narrative_md`) renders the docstring H2 sections into Markdown on demand.
 
-### 2.1 File header
+**Removed conventions** (do not use):
 
-The file begins with a top-level heading containing the pkg name:
+- `M.docs.narrative = "narrative.md"` — field is gone
+- Separate `narrative.md` files — not recognised; will be ignored
 
-```markdown
-# cot
-```
+### 2.1 How the resource is served
 
-Followed by a 1–3 sentence overview paragraph (genre-agnostic short
-summary). This paragraph is **required** so that consumers reading
-just the file head (LLM truncation, IDE preview) get a usable
-synopsis.
+When a client requests `alc://packages/{name}/narrative`:
 
-### 2.2 Diátaxis sections (recommended)
+1. The engine locates the pkg's `init.lua` (variant scope first, then global scope).
+2. A fresh mlua VM runs `extract.build_pkg_info` + `projections.narrative_md`.
+3. The rendered Markdown is returned as `text/markdown`.
 
-Use Markdown H2 headings to mark Diátaxis genres. Include only the
-sections that apply to your pkg — small utility pkgs may need only
-`## Reference`; complex orch pkgs may want all four.
+No cache — every request re-renders from the current `init.lua`.
 
-| Heading | Purpose | When to include |
+### 2.2 Recommended H2 sections
+
+From `algocline-bundled-packages/docs/docstring-convention.md §1.2`. Mapping to the four Diátaxis documentation classes:
+
+| Section | Diátaxis class | When to write |
 |---|---|---|
-| `## Tutorial` | Learning-by-doing walkthrough for first-time users | Pkgs with non-trivial getting-started flow |
-| `## How-to` | Recipes for specific problems users want to solve | Pkgs with multiple parameterised modes |
-| `## Reference` | Authoritative description of every input / output / option | Always recommended |
-| `## Explanation` | Conceptual background, design rationale | Pkgs whose behaviour is non-obvious |
+| `## Usage` | How-to | Minimum working example. Write for almost every pkg. |
+| `## When to use` | How-to | When the pkg overlaps with siblings and the choice is non-obvious. |
+| `## Algorithm` | Explanation | When the algorithm has 3+ named steps or a non-trivial invariant. |
+| `## Theoretical foundations` | Explanation | When correctness follows from a theorem or paper. State the theorem. |
+| `## Entry contract` | Reference | When the pkg exposes multiple named entries. |
+| `## Caveats` | Reference | Known limitations, parameter sensitivity, edge cases. |
+| `## Empirical validation` | Reference | Bench data, sweep results, coverage observations. |
+| `## Comparison with related packages` | Reference | When a sibling pkg does something similar. One bullet per peer. |
+| `## References` | Reference | Papers, arXiv IDs, books. Bullet list — see docstring-convention §5. |
 
-### 2.3 Example layout
+Write only the sections relevant to the pkg. A simple wrapper may need only `## Usage`. A paper implementation typically needs Algorithm + Theoretical foundations + References.
 
-```markdown
-# cot
+### 2.3 Canonical example: `conformal_vote`
 
-Chain-of-thought reasoning for LLM-based problem solving. Generates
-an explicit reasoning trace before extracting the final answer.
-
-## Tutorial
-
-Solve a math problem with cot:
-
-```lua
-local result = alc.run("cot", { task = "What is 24 * 17?" })
-print(result.answer)  -- "408"
-```
-
-## Reference
-
-### Input
-
-- `task` (string, required) — the problem statement
-
-### Result
-
-- `reasoning` (string) — full chain-of-thought trace
-- `answer` (string) — extracted final answer
-
-## Explanation
-
-cot follows the original chain-of-thought prompting paper (Wei et
-al., 2022). The reasoning trace is generated by a single LLM call;
-no self-consistency vote is taken — see the `sc` pkg for that.
-```
-
-### 2.4 Section ordering
-
-Recommended order: Tutorial → How-to → Reference → Explanation.
-Linters MAY warn on out-of-order headings but the ordering itself is
-not a hard requirement (a pkg with only Reference is fine).
-
-### 2.5 Examples
-
-`## Examples` is a permitted additional H2 heading; it is reserved
-for the `examples/*.lua` 1st-class target work tracked in issue
-[#1778112133](https://github.com/ynishi/algocline/issues/1778112133).
-
----
-
-## 3. docstring style
-
-Lua docstrings (`---` comments above functions and fields) follow a
-rustdoc-flavoured convention: **1-line summary, blank line, body**.
-
-### 3.1 Form
+`conformal_vote/init.lua` in `algocline-bundled-packages` is the reference implementation. Its docstring demonstrates all required elements:
 
 ```lua
---- Compute the consensus answer from N sampled paths.
+--- conformal_vote — split conformal prediction gate for multi-agent deliberation
 ---
---- Generates `n_paths` independent reasoning chains via `alc.llm`,
---- extracts the answer from each, and returns the majority vote.
+--- Linear opinion pool + split conformal prediction post-hoc decision layer.
+--- Emits a three-way decision (commit / escalate / anomaly) with a finite-sample
+--- coverage guarantee `Pr[Y ∈ C(X)] ≥ 1-α` (Theorem 2). Calibration and online
+--- rounds share aggregation weights so exchangeability is preserved.
 ---
----@param task string The problem to solve
----@param n_paths integer? Number of independent samples (default: 5)
----@return string answer The consensus answer
-function M.run(ctx) ... end
+--- ## Algorithm
+---
+--- Given N agents that each emit a verbalized probability distribution
+--- π_i(y|x) over a fixed option set, the pkg performs:
+---
+--- ```math
+--- P_social(y|x) = Σ_i w_i · π_i(y|x)        (linear opinion pool)
+--- s_nc(x, y)    = 1 - P_social(y|x)          (nonconformity score)
+--- q̂            = sorted[⌈(n+1)(1-α)⌉]        (finite-sample quantile, §4.3)
+--- C(x)          = { y : P_social(y|x) ≥ 1 - q̂ }   (prediction set)
+--- ```
+---
+--- ## Theoretical foundations
+---
+--- Theorem 2 guarantees `Pr[Y ∈ C(X)] ≥ 1-α` in finite samples whenever
+--- calibration and online rounds share the same aggregation weights and
+--- the data is exchangeable.
+---
+--- ## Entry contract
+---
+--- - `calibrate`   — pure, direct-args. returns `{ q_hat, tau, alpha, n, weights }`
+--- - `aggregate`   — pure, direct-args. returns `{ [label] = p_social }`
+--- - `predict_set` — pure, direct-args. returns `{ labels, top1, top1_prob, ... }`
+--- - `decide`      — pure, direct-args. returns `{ action, selected }`
+--- - `run`         — Strategy, ctx-threading. queries N agents via `alc.llm`
+---
+--- ## Comparison with related packages
+---
+--- Category: `validation` (alongside `sprt`, `eval_guard`, `inverse_u`).
+---
+--- ## References
+---
+--- Wang, Xie, Wang, Gao, Yang, Li, Qiu, Han, Qiu, Huang, Zhu, Woo (2026).
+--- "From Debate to Decision: Conformal Social Choice for Safe Multi-Agent
+--- Deliberation". arXiv:2604.07667.
 ```
 
-### 3.2 1-line summary rules
+---
 
-- **One imperative sentence** describing what the function does
-- **≤ 80 characters** (column-friendly)
-- **Ends with a period**
-- **No leading "Returns ..." or "This function ...".** Just say what
-  it does: "Compute X" / "Apply Y" / "Resolve Z"
+## 3. Docstring style
 
-### 3.3 Body (optional)
+Lua docstrings (`---` comments) follow a rustdoc-flavoured convention: **1-line summary, blank line, H2 body sections**.
 
-Separated from the summary by a blank `---` line. Contains:
+### 3.1 1-line summary
 
-- Operational details, edge cases, side effects
-- Cross-references to related functions or pkgs
-- Worked examples (small, in-line)
+The first docstring line is the pkg's identity line:
 
-### 3.4 LuaCATS annotations
+```
+{PkgName} — {verb phrase}
+```
 
-`---@param`, `---@return`, `---@class`, `---@field`, etc. follow the
-docstring body. Place them last so the prose reads as a single block
-when stripped of annotations.
+- One clause, ≤ 80 characters
+- Becomes the H1 title in the rendered narrative and the `llms.txt` entry
+- `M.meta.description` carries the same (or slightly expanded) content for JSON consumers
 
-### 3.5 Why this matters
+Good:
 
-Empirical evidence (arXiv 2510.26130) shows docstring quality has a
-significant effect on LLM code-generation pass rate. Following this
-convention improves both human readability and LLM utilisation of
-the pkg API surface.
+```lua
+--- conformal_vote — split conformal prediction gate for multi-agent deliberation
+```
+
+Too vague:
+
+```lua
+--- conformal_vote — a useful voting package
+```
+
+### 3.2 Abstract
+
+One to three sentences after the 1-line summary (separated by a blank `---` line). Runs until the first `## ` heading. Explains the core capability at a glance.
+
+### 3.3 H2 body sections
+
+- H1 (`#`) must not appear — the generator synthesises it from line 1
+- H2 (`##`) is the highest permitted section level
+- H3 (`###`) for subsections within H2 blocks
+- Each heading must be followed by a blank `---` line before body text
+
+### 3.4 Parameters — do not write by hand
+
+Parameters are declared in `M.meta.input_shape` using the `alc_shapes` DSL. The generator synthesises a `## Parameters` table automatically. Manually writing `## Parameters` alongside `input_shape` triggers lint error `E_PARAMETERS_CONFLICT`.
+
+### 3.5 LuaCATS annotations
+
+`---@param`, `---@return`, `---@type`, etc. follow the narrative docstring body. Place them last so the prose reads as a single block when stripped of annotations. The generator stops narrative extraction at the first `---@` line.
 
 ---
 
-## 4. Migration / adoption
+## 4. Lint rules
 
-For bundled-packages adoption status see issue
-[#1778197753](https://github.com/ynishi/algocline/issues/1778197753).
-For lint enforcement status see issue
-[#1778197805](https://github.com/ynishi/algocline/issues/1778197805).
+Run `alc_hub_gendoc` with `lint_strict=true` before committing. Key codes (full list in `docstring-convention.md §13`):
 
-Existing pkgs without `M.docs` continue to work via convention
-fallback; no breaking change is introduced by adopting this
-convention document.
+| Code | Meaning |
+|---|---|
+| `E_H1_IN_DOCSTRING` | `#` heading in docstring — remove it |
+| `E_PARAMETERS_CONFLICT` | `input_shape` + hand-written `## Parameters` both present |
+| `W_EMPTY_NARRATIVE` | No abstract and no H2 sections |
+| `E_META_MISSING_DESCRIPTION` | `M.meta.description` missing — required for llms.txt |
+| `E_NAME_MISMATCH` | `meta.name` does not match the pkg directory name |
+
+---
+
+## 5. Migration from `M.docs.narrative` / `narrative.md`
+
+If an existing pkg uses the old convention:
+
+1. Move narrative content into the `---` docstring block as H2 sections.
+2. Remove `M.docs.narrative` from the `M.docs` table (or drop `M.docs` entirely if `schema_version` is also absent).
+3. Delete the standalone `narrative.md` file.
+4. Run `alc_hub_dist` with `projections=["narrative"]` to regenerate `docs/narrative/{name}.md`.
+5. Verify `alc://packages/{name}/narrative` returns the expected Markdown.
+
+Bundled-packages adoption is tracked in issue `#1778197753-34288`.
+
+---
+
+## 6. Related documents
+
+- `algocline-bundled-packages/docs/docstring-convention.md` — full syntax specification (V0 canonical)
+- `algocline-bundled-packages/conformal_vote/init.lua` — canonical reference implementation
+- `crates/algocline-app/src/service/lua/gendoc/docs/extract.lua` — narrative extraction engine
+- `crates/algocline-app/src/service/lua/gendoc/docs/projections.lua` — `narrative_md` projection

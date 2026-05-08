@@ -493,8 +493,8 @@ impl EngineApi for AppService {
         AppService::pkg_read_init_lua(self, name, None)
     }
 
-    async fn pkg_resolve_narrative_path(&self, name: &str) -> Result<Option<String>, String> {
-        AppService::pkg_resolve_narrative_path(self, name).await
+    async fn pkg_get_narrative_md(&self, name: &str) -> Result<Option<String>, String> {
+        AppService::pkg_get_narrative_md(self, name).await
     }
 
     async fn pkg_meta(&self, name: &str) -> Result<String, String> {

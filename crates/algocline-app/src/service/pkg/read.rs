@@ -1,4 +1,5 @@
-//! `pkg_read_init_lua` — read the `init.lua` source of an installed package.
+//! `pkg_read_init_lua` / `pkg_get_narrative_md` — read init.lua source and
+//! render narrative markdown for an installed package.
 //!
 //! Searches variant (`alc.local.toml` path entries, project-root-scoped) and
 //! then global (`~/.algocline/packages/<name>/init.lua`) scope in priority
@@ -6,8 +7,45 @@
 
 use std::path::{Path, PathBuf};
 
+use mlua::Lua;
+
 use super::super::alc_toml;
+use super::super::gendoc::register_preloads_pub;
 use super::super::AppService;
+
+/// Validate a Lua module identifier — alphanumeric + underscore only.
+///
+/// Used as a path-traversal / injection guard before interpolating a
+/// package name into Lua code or file paths.
+fn is_safe_pkg_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Inline Lua snippet used by `pkg_get_narrative_md`.
+///
+/// Requires `tools.docs.extract`, `tools.docs.projections`, and a
+/// `package.preload` entry for `_alc_pkg_name` to be set before execution.
+/// The `_alc_pkg_name` and `_alc_init_path` globals are injected
+/// by the Rust caller.
+const NARRATIVE_RENDER_LUA: &str = r#"
+local extract     = require("tools.docs.extract")
+local projections = require("tools.docs.projections")
+local pi = extract.build_pkg_info(_alc_pkg_name, _alc_init_path, _alc_pkg_name .. "/init.lua")
+return projections.narrative_md(pi)
+"#;
+
+/// Lua snippet that registers a pkg's init.lua content as a `package.preload`
+/// entry. Used to inject a pkg's Lua source before `extract.build_pkg_info`
+/// calls `require(pkg_name)`.
+///
+/// Variables consumed: `_alc_pkg_name` (string), `_alc_init_src` (string).
+const INJECT_PKG_PRELOAD_LUA: &str = r#"
+local src = _alc_init_src
+local name = _alc_pkg_name
+package.preload[name] = function()
+    return load(src, "@" .. name .. "/init.lua")()
+end
+"#;
 
 impl AppService {
     /// Return the raw Lua source of `<name>/init.lua`.
@@ -86,69 +124,132 @@ impl AppService {
         }
     }
 
-    /// Resolve the per-pkg narrative file path declared via the
-    /// `M.docs.narrative` SSOT spec key (#1778112139).
+    /// Resolve the `init.lua` path for a package.
     ///
-    /// Returns `Ok(Some(rel_path))` when the pkg declares
-    /// `M.docs.narrative = "<path>"`. Returns `Ok(None)` when the
-    /// declaration is absent, signalling the caller should fall
-    /// back to the convention path (`narrative.md`). Returns `Err`
-    /// only when the pkg cannot be loaded at all.
-    ///
-    /// `..` and leading `/` are rejected here as a path-traversal
-    /// guard so callers can join the result against the pkg dir
-    /// without re-validating.
-    pub(crate) async fn pkg_resolve_narrative_path(
-        &self,
-        name: &str,
-    ) -> Result<Option<String>, String> {
-        if !is_safe_pkg_name(name) {
-            return Err(format!(
-                "pkg_resolve_narrative_path: invalid package name '{name}'"
-            ));
-        }
-        let code = format!(
-            r#"package.loaded["{name}"] = nil
-local pkg = require("{name}")
-if type(pkg.docs) == "table" and type(pkg.docs.narrative) == "string" then
-    return pkg.docs.narrative
-else
-    return nil
-end"#
-        );
-        let value =
-            self.executor.eval_simple(code).await.map_err(|e| {
-                format!("pkg_resolve_narrative_path: pkg '{name}' load failed: {e}")
-            })?;
-        match value {
-            serde_json::Value::Null => Ok(None),
-            serde_json::Value::String(s) => {
-                if s.contains("..") || s.starts_with('/') {
-                    Err(format!(
-                        "pkg_resolve_narrative_path: pkg '{name}' M.docs.narrative \
-                         must be a pkg-dir-relative path without '..' or leading '/' (got '{s}')"
-                    ))
-                } else if s.is_empty() {
-                    // Empty string is treated as "no declaration" rather than
-                    // a valid path, so the convention fallback kicks in.
-                    Ok(None)
-                } else {
-                    Ok(Some(s))
+    /// Returns `Ok(Some(init_lua_path))` when found.
+    /// Returns `Ok(None)` when the package is not installed.
+    /// Returns `Err` only for I/O errors or malformed `alc.local.toml`.
+    fn pkg_resolve_init_path(&self, name: &str) -> Result<Option<PathBuf>, String> {
+        // ── 1. Variant scope: alc.local.toml ──────────────────────────────
+        let resolved_root = self.resolve_root(None);
+        if let Some(root) = resolved_root {
+            match alc_toml::load_alc_local_toml(&root) {
+                Ok(Some(local)) => {
+                    for vp in alc_toml::resolve_local_variant_pkgs(&root, &local) {
+                        if vp.name == name {
+                            return Ok(Some(vp.pkg_dir.join("init.lua")));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "pkg_resolve_init_path: malformed alc.local.toml: {e}"
+                    ));
                 }
             }
-            other => Err(format!(
-                "pkg_resolve_narrative_path: pkg '{name}' M.docs.narrative must be a string \
-                 (got {other:?})"
+        }
+
+        // ── 2. Global scope: ~/.algocline/packages/<name>/init.lua ─────────
+        let global_init_lua: PathBuf = self
+            .log_config
+            .app_dir()
+            .packages_dir()
+            .join(name)
+            .join("init.lua");
+
+        match std::fs::metadata(&global_init_lua) {
+            Ok(_) => Ok(Some(global_init_lua)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!(
+                "pkg_resolve_init_path: I/O error for {}: {e}",
+                global_init_lua.display()
             )),
         }
     }
-}
 
-/// Validate a Lua module identifier — alphanumeric + underscore only.
-/// Mirrors `pkg/list.rs::is_safe_pkg_name` but kept module-local to
-/// avoid creating a cross-module dependency just for this guard.
-fn is_safe_pkg_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    /// Render the narrative markdown for a package on-the-fly.
+    ///
+    /// Extracts the init.lua docstring H2/H3 sections via the embedded
+    /// gendoc pipeline (`extract.build_pkg_info` + `projections.narrative_md`)
+    /// and returns the rendered markdown string.
+    ///
+    /// Returns `Ok(Some(markdown))` when the pkg is found and loadable.
+    /// Returns `Ok(None)` when the pkg is not installed.
+    /// Returns `Err(...)` when the gendoc pipeline fails (e.g. malformed Lua).
+    pub(crate) async fn pkg_get_narrative_md(&self, name: &str) -> Result<Option<String>, String> {
+        if !is_safe_pkg_name(name) {
+            return Err(format!(
+                "pkg_get_narrative_md: invalid package name '{name}'"
+            ));
+        }
+
+        let init_lua_path = match self.pkg_resolve_init_path(name)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Read the init.lua source up-front in async context.
+        let init_src = std::fs::read_to_string(&init_lua_path).map_err(|e| {
+            format!(
+                "pkg_get_narrative_md: failed to read {}: {e}",
+                init_lua_path.display()
+            )
+        })?;
+
+        let init_path_str = init_lua_path.to_string_lossy().into_owned();
+        let name_owned = name.to_string();
+
+        // Run the Lua pipeline synchronously on a blocking thread.
+        // mlua::Lua is not Send, so it must be constructed inside the task.
+        tokio::task::spawn_blocking(move || {
+            let lua = Lua::new();
+
+            // Register gendoc preloads (tools.docs.*, alc_shapes*).
+            register_preloads_pub(&lua)?;
+
+            // Inject the pkg's init.lua as a package.preload entry so that
+            // `require(pkg_name)` resolves it without filesystem access.
+            // This handles variant pkgs where the on-disk directory name may
+            // differ from the Lua module name.
+            lua.globals()
+                .set("_alc_pkg_name", name_owned.clone())
+                .map_err(|e| {
+                    format!("pkg_get_narrative_md: globals set _alc_pkg_name failed: {e}")
+                })?;
+            lua.globals().set("_alc_init_src", init_src).map_err(|e| {
+                format!("pkg_get_narrative_md: globals set _alc_init_src failed: {e}")
+            })?;
+            lua.load(INJECT_PKG_PRELOAD_LUA)
+                .set_name("@embedded:pkg_get_narrative_md/preload")
+                .exec()
+                .map_err(|e| {
+                    format!(
+                        "pkg_get_narrative_md: pkg preload inject failed for '{name_owned}': {e}"
+                    )
+                })?;
+
+            // Inject globals consumed by NARRATIVE_RENDER_LUA.
+            lua.globals()
+                .set("_alc_init_path", init_path_str.clone())
+                .map_err(|e| {
+                    format!("pkg_get_narrative_md: globals set _alc_init_path failed: {e}")
+                })?;
+
+            // Execute the render snippet.
+            let markdown: String = lua
+                .load(NARRATIVE_RENDER_LUA)
+                .set_name("@embedded:pkg_get_narrative_md/render")
+                .eval()
+                .map_err(|e| {
+                    format!("pkg_get_narrative_md: gendoc pipeline failed for '{name_owned}': {e}")
+                })?;
+
+            Ok(Some(markdown))
+        })
+        .await
+        .map_err(|e| format!("pkg_get_narrative_md: blocking task panicked: {e}"))?
+    }
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
@@ -193,5 +294,74 @@ mod tests {
 
         let err = svc.pkg_read_init_lua("nonexistent", None).unwrap_err();
         assert!(err.contains("pkg not found"), "got: {err}");
+    }
+
+    // ── pkg_get_narrative_md ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn narrative_md_missing_pkg_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_app_service_at(tmp.path().to_path_buf()).await;
+
+        let result = svc.pkg_get_narrative_md("nonexistent").await.unwrap();
+        assert!(
+            result.is_none(),
+            "expected None for missing pkg, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narrative_md_invalid_name_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_app_service_at(tmp.path().to_path_buf()).await;
+
+        let err = svc.pkg_get_narrative_md("bad-name!").await.unwrap_err();
+        assert!(
+            err.contains("invalid package name"),
+            "expected invalid name error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narrative_md_renders_docstring_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_app_service_at(tmp.path().to_path_buf()).await;
+
+        // Minimal pkg with H2 sections in the docstring.
+        let pkg_dir = tmp.path().join("packages").join("mypkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("init.lua"),
+            r#"--- mypkg — a test package.
+---
+--- A short summary.
+---
+--- ## Algorithm
+---
+--- This is the algorithm section.
+---
+--- ## References
+---
+--- No references.
+
+local M = {}
+M.meta = { name = "mypkg", version = "0.1.0", category = "test", description = "A test pkg" }
+return M
+"#,
+        )
+        .unwrap();
+
+        let result = svc.pkg_get_narrative_md("mypkg").await.unwrap();
+        let markdown = result.expect("expected Some(markdown) for installed pkg");
+
+        assert!(markdown.contains("mypkg"), "title missing: {markdown}");
+        assert!(
+            markdown.contains("Algorithm"),
+            "Algorithm section missing: {markdown}"
+        );
+        assert!(
+            markdown.contains("References"),
+            "References section missing: {markdown}"
+        );
     }
 }

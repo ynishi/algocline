@@ -372,15 +372,11 @@ impl ResourceCatalog {
                 // output is intentionally not surfaced here — see
                 // list_templates() doc.
                 //
-                // Path resolution (#1778112139):
-                // 1. Consult `M.docs.narrative` SSOT spec key
-                //    via `pkg_resolve_narrative_path`. When
-                //    declared, resolve `<pkg dir>/<declared path>`.
-                // 2. Fall back to convention `<pkg dir>/narrative.md`
-                //    when no declaration (preserves the
-                //    pre-#1778112139 behaviour for unmigrated
-                //    bundled pkgs).
-                // 3. Missing file in either path → -32002.
+                // Serving strategy (#1778221491-39903):
+                // Extract narrative content on-the-fly from the pkg's
+                // init.lua docstring H2 sections via the embedded gendoc
+                // pipeline (extract.build_pkg_info + projections.narrative_md).
+                // The M.docs.narrative file-based SSOT path has been removed.
                 validate_id("package name", name, uri)?;
                 if !parsed.query.is_empty() {
                     return Err(McpError::invalid_params(
@@ -388,32 +384,16 @@ impl ResourceCatalog {
                         None,
                     ));
                 }
-                let pkg_dir = self.app_dir.packages_dir().join(name);
-                let declared = match self.app.pkg_resolve_narrative_path(name).await {
-                    Ok(opt) => opt,
-                    Err(e) => {
-                        return Err(err_to_mcp(format!(
-                            "narrative path resolve failed for {name}: {e}"
-                        )));
-                    }
-                };
-                let path = match declared {
-                    Some(rel) => pkg_dir.join(rel),
-                    None => pkg_dir.join("narrative.md"),
-                };
-                if !path.is_file() {
-                    return Err(McpError::resource_not_found(
+                match self.app.pkg_get_narrative_md(name).await {
+                    Ok(Some(text)) => Ok(text_result(uri, text, "text/markdown")),
+                    Ok(None) => Err(McpError::resource_not_found(
                         format!("resource not found: {uri}"),
                         None,
-                    ));
+                    )),
+                    Err(e) => Err(err_to_mcp(format!(
+                        "narrative render failed for {name}: {e}"
+                    ))),
                 }
-                let text = std::fs::read_to_string(&path).map_err(|e| {
-                    err_to_mcp(format!(
-                        "narrative read failed for {name}: {e} (path={})",
-                        path.display()
-                    ))
-                })?;
-                Ok(text_result(uri, text, "text/markdown"))
             }
             _ => Err(McpError::resource_not_found(
                 format!("resource not found: {uri}"),
@@ -1229,7 +1209,7 @@ mod tests {
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
-                async fn pkg_resolve_narrative_path(
+                async fn pkg_get_narrative_md(
                     &self,
                     _name: &str,
                 ) -> Result<Option<String>, String> {
@@ -1606,6 +1586,7 @@ mod tests {
 
     struct FakeEngine {
         pkg_init_lua: Option<Result<String, String>>,
+        pkg_narrative_md: Option<Result<Option<String>, String>>,
         pkg_meta: Option<Result<String, String>>,
         pkg_list: Option<Result<String, String>>,
         card_get: Option<Result<String, String>>,
@@ -1623,6 +1604,12 @@ mod tests {
         fn ok_init_lua(src: &str) -> Self {
             Self {
                 pkg_init_lua: Some(Ok(src.to_string())),
+                ..Self::noop()
+            }
+        }
+        fn ok_narrative_md(md: &str) -> Self {
+            Self {
+                pkg_narrative_md: Some(Ok(Some(md.to_string()))),
                 ..Self::noop()
             }
         }
@@ -1679,6 +1666,7 @@ mod tests {
         fn noop() -> Self {
             Self {
                 pkg_init_lua: None,
+                pkg_narrative_md: None,
                 pkg_meta: None,
                 pkg_list: None,
                 card_get: None,
@@ -1892,10 +1880,8 @@ mod tests {
         ) -> Result<String, String> {
             Err("noop".into())
         }
-        async fn pkg_resolve_narrative_path(&self, _: &str) -> Result<Option<String>, String> {
-            // FakeEngine default: pretend M.docs.narrative absent so the
-            // resource handler exercises the convention fallback path.
-            Ok(None)
+        async fn pkg_get_narrative_md(&self, _: &str) -> Result<Option<String>, String> {
+            self.pkg_narrative_md.clone().unwrap_or(Ok(None))
         }
         async fn card_list(&self, _: Option<String>) -> Result<String, String> {
             self.card_list
@@ -2208,7 +2194,7 @@ mod tests {
             ) -> Result<String, String> {
                 Err("noop".into())
             }
-            async fn pkg_resolve_narrative_path(&self, _: &str) -> Result<Option<String>, String> {
+            async fn pkg_get_narrative_md(&self, _: &str) -> Result<Option<String>, String> {
                 Ok(None)
             }
             async fn card_list(&self, _: Option<String>) -> Result<String, String> {
@@ -2378,6 +2364,43 @@ mod tests {
         assert!(
             msg.contains("resource not found") || !msg.is_empty(),
             "got: {msg}"
+        );
+    }
+
+    // 4b. read_narrative_ok
+    #[tokio::test]
+    async fn read_narrative_ok() {
+        let md = "# mypkg\n\n## Overview\n\nsome content\n";
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::ok_narrative_md(md));
+        let result = cat.read("alc://packages/mypkg/narrative").await.unwrap();
+        assert_eq!(result.contents.len(), 1);
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            } => {
+                assert!(
+                    text.contains("mypkg"),
+                    "expected pkg name in narrative, got: {text}"
+                );
+                assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+            }
+            _ => panic!("expected text resource contents"),
+        }
+    }
+
+    // 4c. read_narrative_not_found
+    #[tokio::test]
+    async fn read_narrative_not_found() {
+        // FakeEngine::noop() returns Ok(None) for pkg_get_narrative_md
+        let (cat, _tmp) = make_fake_catalog(FakeEngine::noop());
+        let err = cat
+            .read("alc://packages/unknown_pkg/narrative")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code.0, -32002,
+            "expected resource_not_found (-32002), got: {:?}",
+            err.code
         );
     }
 

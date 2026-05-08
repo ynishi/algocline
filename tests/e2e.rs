@@ -3230,20 +3230,35 @@ async fn test_mcp_resource_read_pkg_meta() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// Read `alc://packages/{name}/narrative` when bundled-side install copied
-/// `narrative.md` into the pkg dir (#1777052474).
+/// Read `alc://packages/{name}/narrative` — narrative is served on-the-fly
+/// from the pkg's init.lua docstring H2 sections (#1778221491-39903).
 #[tokio::test]
 async fn test_mcp_resource_read_pkg_narrative_ok() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let pkg_dir = tmp.path().join("packages").join("narrative_pkg");
     std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
-    std::fs::write(pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
+    // Pkg with a proper M.meta and a docstring narrative section.
+    // The old narrative.md file is intentionally absent — the new serving
+    // strategy extracts narrative from the init.lua docstring (#1778221491-39903).
     std::fs::write(
-        pkg_dir.join("narrative.md"),
-        "# narrative_pkg\n\nStdpkg reference smoke test.\n",
+        pkg_dir.join("init.lua"),
+        concat!(
+            "--- narrative_pkg — Stdpkg reference smoke test.\n",
+            "---\n",
+            "--- A short summary paragraph.\n",
+            "---\n",
+            "--- ## Overview\n",
+            "---\n",
+            "--- Stdpkg reference content served from docstring.\n",
+            "local M = {}\n",
+            "M.meta = { name = 'narrative_pkg', version = '0.1.0',\n",
+            "           category = 'test',\n",
+            "           description = 'Stdpkg reference smoke test' }\n",
+            "return M\n",
+        ),
     )
-    .expect("write narrative.md");
+    .expect("write init.lua");
 
     let client = connect_with_alc_home(tmp.path()).await;
 
@@ -3255,29 +3270,27 @@ async fn test_mcp_resource_read_pkg_narrative_ok() {
     let (uri, text) = resource_text(&result.contents[0]);
     assert_eq!(uri, "alc://packages/narrative_pkg/narrative");
     assert!(
-        text.contains("Stdpkg reference"),
-        "unexpected narrative content: {text}"
+        text.contains("narrative_pkg"),
+        "pkg name missing in narrative: {text}"
     );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// `alc://packages/{name}/narrative` for a pkg without `narrative.md`
-/// returns -32002 ResourceNotFound (#1777052474).
+/// `alc://packages/{name}/narrative` for a pkg that is NOT installed
+/// (no init.lua on disk) returns -32002 ResourceNotFound (#1778221491-39903).
+/// The new serving strategy uses `pkg_get_narrative_md` which returns
+/// `Ok(None)` when the pkg is not found, mapped to resource_not_found.
 #[tokio::test]
 async fn test_mcp_resource_read_pkg_narrative_missing_returns_not_found() {
     let tmp = tempfile::tempdir().expect("tempdir");
-
-    let pkg_dir = tmp.path().join("packages").join("no_narrative_pkg");
-    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
-    std::fs::write(pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
-    // intentionally no narrative.md
+    // Intentionally do NOT create any pkg directory — the pkg is not installed.
 
     let client = connect_with_alc_home(tmp.path()).await;
 
     let err = read_resource(&client, "alc://packages/no_narrative_pkg/narrative")
         .await
-        .expect_err("read_resource must error when narrative.md absent");
+        .expect_err("read_resource must error when pkg is not installed");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("not found") || msg.contains("32002"),
@@ -3313,43 +3326,40 @@ async fn test_mcp_list_resource_templates_includes_narrative() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// `alc://packages/{name}/narrative` honours `M.docs.narrative`
-/// SSOT spec key (#1778112139): when the pkg declares
-/// `M.docs.narrative = "<rel_path>"`, the resource resolves to
-/// `<pkg dir>/<rel_path>` rather than the convention `narrative.md`.
+/// `alc://packages/{name}/narrative` renders narrative from the init.lua
+/// docstring H2 sections (#1778221491-39903). `M.docs.narrative` is removed
+/// as SSOT — the docstring is now the only source. A pkg declaring
+/// `M.docs.narrative` pointing at an external file must NOT serve the
+/// external file; instead the docstring is rendered.
 #[tokio::test]
 async fn test_mcp_resource_narrative_resolves_via_m_docs_when_declared() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let pkg_dir = tmp.path().join("packages").join("docs_pkg");
     std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
-    // Declare M.docs.narrative pointing at a non-default file name
-    // so the test fails distinguishably if the resource resolver
-    // ignores M.docs and falls back to convention.
+    // Pkg has M.docs.narrative pointing at overview.md. After #1778221491-39903,
+    // this field is ignored — the narrative is extracted from the docstring.
     std::fs::write(
         pkg_dir.join("init.lua"),
         concat!(
+            "--- docs_pkg — docstring-driven narrative test.\n",
+            "---\n",
+            "--- Narrative from docstring, not from external file.\n",
             "local M = {}\n",
-            "M.meta = { name = 'docs_pkg', version = '0.1.0' }\n",
+            "M.meta = { name = 'docs_pkg', version = '0.1.0',\n",
+            "           category = 'test',\n",
+            "           description = 'docstring-driven narrative test' }\n",
             "M.docs = { narrative = 'overview.md', schema_version = 1 }\n",
-            "function M.run(ctx) return ctx end\n",
             "return M\n",
         ),
     )
     .expect("write init.lua");
+    // overview.md exists but must NOT be served.
     std::fs::write(
         pkg_dir.join("overview.md"),
-        "# docs_pkg\n\nDeclared narrative path resolution.\n",
+        "# docs_pkg\n\nExternal file — must NOT be returned (#1778221491-39903).\n",
     )
     .expect("write overview.md");
-    // Convention path also exists with different content — the
-    // resolver must NOT pick this up when M.docs.narrative is
-    // declared.
-    std::fs::write(
-        pkg_dir.join("narrative.md"),
-        "# docs_pkg\n\nConvention fallback (should NOT be returned).\n",
-    )
-    .expect("write narrative.md");
 
     let client = connect_with_alc_home(tmp.path()).await;
 
@@ -3357,42 +3367,49 @@ async fn test_mcp_resource_narrative_resolves_via_m_docs_when_declared() {
         .await
         .expect("read_resource pkg narrative failed");
     let (_, text) = resource_text(&result.contents[0]);
+    // Docstring content must be present.
     assert!(
-        text.contains("Declared narrative path resolution"),
-        "expected declared path content, got: {text}"
+        text.contains("docs_pkg"),
+        "pkg name missing in narrative, got: {text}"
     );
+    // External file content must NOT be served.
     assert!(
-        !text.contains("Convention fallback"),
-        "must NOT return convention path content when M.docs.narrative declared, got: {text}"
+        !text.contains("External file"),
+        "external file must not be served, got: {text}"
     );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// `alc://packages/{name}/narrative` falls back to the convention
-/// path `narrative.md` when the pkg has no `M.docs.narrative`
-/// declaration (#1778112139, preserves pre-spec behaviour for
-/// unmigrated pkgs).
+/// `alc://packages/{name}/narrative` renders the docstring narrative
+/// regardless of whether `M.docs` is declared (#1778221491-39903).
+/// The convention `narrative.md` file-based fallback is removed.
 #[tokio::test]
 async fn test_mcp_resource_narrative_falls_back_to_convention_without_m_docs() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let pkg_dir = tmp.path().join("packages").join("legacy_pkg");
     std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
-    // No M.docs declaration → convention `narrative.md` must resolve.
+    // No M.docs declaration. After #1778221491-39903, narrative.md is ignored
+    // and the docstring is the source.
     std::fs::write(
         pkg_dir.join("init.lua"),
         concat!(
+            "--- legacy_pkg — docstring narrative without M.docs.\n",
+            "---\n",
+            "--- Narrative from docstring only.\n",
             "local M = {}\n",
-            "M.meta = { name = 'legacy_pkg', version = '0.1.0' }\n",
-            "function M.run(ctx) return ctx end\n",
+            "M.meta = { name = 'legacy_pkg', version = '0.1.0',\n",
+            "           category = 'test',\n",
+            "           description = 'docstring narrative without M.docs' }\n",
             "return M\n",
         ),
     )
     .expect("write init.lua");
+    // narrative.md exists but must NOT be served after the decommission.
     std::fs::write(
         pkg_dir.join("narrative.md"),
-        "# legacy_pkg\n\nConvention path resolved without M.docs.\n",
+        "# legacy_pkg\n\nConvention path — must NOT be returned (#1778221491-39903).\n",
     )
     .expect("write narrative.md");
 
@@ -3402,17 +3419,25 @@ async fn test_mcp_resource_narrative_falls_back_to_convention_without_m_docs() {
         .await
         .expect("read_resource pkg narrative failed");
     let (_, text) = resource_text(&result.contents[0]);
+    // Docstring content must be present.
     assert!(
-        text.contains("Convention path resolved"),
-        "expected convention fallback content, got: {text}"
+        text.contains("legacy_pkg"),
+        "pkg name missing in narrative, got: {text}"
+    );
+    // Convention file content must NOT be served.
+    assert!(
+        !text.contains("Convention path — must NOT be returned"),
+        "convention file must not be served, got: {text}"
     );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// `M.docs.narrative` containing `..` is rejected by the path-traversal
-/// guard (#1778112139); the resource read surfaces a typed error rather
-/// than silently traversing.
+/// After #1778221491-39903, `M.docs.narrative` is removed. A pkg declaring
+/// `M.docs.narrative = '../../etc/passwd'` must NOT serve that file — the
+/// new serving strategy reads only the init.lua docstring, so path traversal
+/// via `M.docs` is no longer possible. The resource must succeed and return
+/// docstring content (not filesystem contents of the traversal target).
 #[tokio::test]
 async fn test_mcp_resource_narrative_rejects_path_traversal_in_m_docs() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3422,10 +3447,14 @@ async fn test_mcp_resource_narrative_rejects_path_traversal_in_m_docs() {
     std::fs::write(
         pkg_dir.join("init.lua"),
         concat!(
+            "--- evil_pkg — path traversal guard test.\n",
+            "---\n",
+            "--- M.docs.narrative path traversal is inert after #1778221491-39903.\n",
             "local M = {}\n",
-            "M.meta = { name = 'evil_pkg', version = '0.1.0' }\n",
+            "M.meta = { name = 'evil_pkg', version = '0.1.0',\n",
+            "           category = 'test',\n",
+            "           description = 'path traversal guard test' }\n",
             "M.docs = { narrative = '../../etc/passwd' }\n",
-            "function M.run(ctx) return ctx end\n",
             "return M\n",
         ),
     )
@@ -3433,13 +3462,20 @@ async fn test_mcp_resource_narrative_rejects_path_traversal_in_m_docs() {
 
     let client = connect_with_alc_home(tmp.path()).await;
 
-    let err = read_resource(&client, "alc://packages/evil_pkg/narrative")
+    // The resource must succeed — M.docs.narrative is ignored.
+    // The docstring narrative (not /etc/passwd content) is returned.
+    let result = read_resource(&client, "alc://packages/evil_pkg/narrative")
         .await
-        .expect_err("path traversal in M.docs.narrative must error");
-    let msg = format!("{err:?}");
+        .expect("read_resource must succeed — M.docs.narrative path traversal is inert");
+    let (_, text) = resource_text(&result.contents[0]);
+    // Docstring content must be present; /etc/passwd content must not appear.
     assert!(
-        msg.contains("..") || msg.contains("traversal") || msg.contains("relative"),
-        "expected path-traversal error, got: {msg}"
+        text.contains("evil_pkg"),
+        "pkg name missing in narrative, got: {text}"
+    );
+    assert!(
+        !text.contains("root:") && !text.contains("/bin/"),
+        "/etc/passwd content must not appear in narrative, got: {text}"
     );
 
     client.cancel().await.expect("cancel failed");
@@ -3867,8 +3903,10 @@ fn pre_install_pkg(alc_home: &std::path::Path, name: &str, files: &[(&str, &str)
     .expect("write installed.json");
 }
 
-/// `M.docs.narrative` declared but the file is absent → `declared_missing`
-/// with severity `warn`.
+/// After #1778221491-39903, `narrative_issues` bucket is removed from
+/// `alc_pkg_doctor` output. Pkgs declaring `M.docs.narrative` are no longer
+/// linted for narrative file presence — the docstring is the SSoT.
+/// Verify the bucket is absent and the tool call succeeds.
 #[tokio::test]
 async fn test_pkg_doctor_narrative_declared_missing_warns() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3886,7 +3924,6 @@ async fn test_pkg_doctor_narrative_declared_missing_warns() {
             ),
         )],
     );
-    // Intentionally no overview.md file.
     let client = connect_with_alc_home(tmp.path()).await;
 
     let resp = call_json(
@@ -3896,23 +3933,19 @@ async fn test_pkg_doctor_narrative_declared_missing_warns() {
     )
     .await;
 
-    let narr = resp["narrative_issues"]
-        .as_array()
-        .expect("narrative_issues bucket missing");
-    let entry = narr
-        .iter()
-        .find(|e| e["name"] == "e2e_narr_declared")
-        .unwrap_or_else(|| panic!("e2e_narr_declared not in narrative_issues, got: {resp}"));
-    assert_eq!(entry["kind"], "declared_missing");
-    assert_eq!(entry["severity"], "warn");
-    assert_eq!(entry["declared_path"], "overview.md");
-    assert!(entry["message"].as_str().unwrap_or("").contains("absent"));
+    // narrative_issues bucket is removed (#1778221491-39903).
+    assert!(
+        resp["narrative_issues"].is_null(),
+        "narrative_issues must be absent after decommission, got: {resp}"
+    );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// `M.docs` not declared but `narrative.md` exists by convention →
-/// `unmigrated` with severity `info` (adoption candidate for #1778197753).
+/// After #1778221491-39903, `narrative_issues` bucket is removed from
+/// `alc_pkg_doctor` output. Pkgs with a `narrative.md` but no `M.docs`
+/// are no longer flagged as `unmigrated` — the docstring is the SSoT.
+/// Verify the bucket is absent and the tool call succeeds.
 #[tokio::test]
 async fn test_pkg_doctor_narrative_unmigrated_info() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3925,7 +3958,6 @@ async fn test_pkg_doctor_narrative_unmigrated_info() {
                 concat!(
                     "local M = {}\n",
                     "M.meta = { name = 'e2e_narr_unmigrated', version = '0.1.0' }\n",
-                    // intentionally no M.docs
                     "function M.run(ctx) return ctx end\n",
                     "return M\n",
                 ),
@@ -3945,22 +3977,18 @@ async fn test_pkg_doctor_narrative_unmigrated_info() {
     )
     .await;
 
-    let narr = resp["narrative_issues"]
-        .as_array()
-        .expect("narrative_issues bucket missing");
-    let entry = narr
-        .iter()
-        .find(|e| e["name"] == "e2e_narr_unmigrated")
-        .unwrap_or_else(|| panic!("e2e_narr_unmigrated not in narrative_issues, got: {resp}"));
-    assert_eq!(entry["kind"], "unmigrated");
-    assert_eq!(entry["severity"], "info");
-    assert!(entry["message"].as_str().unwrap_or("").contains("adoption"));
+    // narrative_issues bucket is removed (#1778221491-39903).
+    assert!(
+        resp["narrative_issues"].is_null(),
+        "narrative_issues must be absent after decommission, got: {resp}"
+    );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// `M.docs.narrative` declared and the file exists → narrative_issues
-/// must NOT include this pkg (clean state, success case).
+/// After #1778221491-39903, `narrative_issues` bucket is removed from
+/// `alc_pkg_doctor` output. Verify the doctor call succeeds and the
+/// bucket is absent for a pkg that previously had a clean narrative state.
 #[tokio::test]
 async fn test_pkg_doctor_narrative_clean_state_silent() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3990,12 +4018,10 @@ async fn test_pkg_doctor_narrative_clean_state_silent() {
     )
     .await;
 
-    let narr = resp["narrative_issues"]
-        .as_array()
-        .expect("narrative_issues bucket missing");
+    // narrative_issues bucket is removed (#1778221491-39903).
     assert!(
-        !narr.iter().any(|e| e["name"] == "e2e_narr_clean"),
-        "clean pkg must not appear in narrative_issues, got: {resp}"
+        resp["narrative_issues"].is_null(),
+        "narrative_issues must be absent after decommission, got: {resp}"
     );
 
     client.cancel().await.expect("cancel failed");

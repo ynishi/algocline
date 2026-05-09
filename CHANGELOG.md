@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-05-09
+
 ### Changed
+
+- **BUNDLED_VERSION bump: `algocline-bundled-packages` v0.21.0 → v0.22.1**
+  (`src/init.rs` `BUNDLED_SOURCES`). Picks up the bundled-packages
+  doc-convention work (V1 SSoT / Projection rule, §4.1 PkgName +
+  StyledName 1-line summary form, narrative SSoT decommission of
+  `M.docs.narrative`, bundled adoption guide). `evalframe` source
+  remains pinned at v0.3.0.
 
 - **`docs/pkg-author-conventions.md` §4.1 — 1-line summary casing
   convention added**. PkgName-only form

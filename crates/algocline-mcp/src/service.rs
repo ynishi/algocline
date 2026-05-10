@@ -1501,21 +1501,40 @@ impl AlcService {
 
     /// Run a Card analyzer package over a single Card.
     ///
-    /// Loads the Card body + samples sidecar host-side and dispatches
-    /// them to a Lua analyzer pkg via `require(pkg).run(ctx)`. The pkg
-    /// builds a prompt from the failure samples, calls `alc.llm`, and
-    /// returns improvement hints. Default pkg name is `"card_analysis"`
-    /// (overridable via the `pkg` arg) — an IF promise, not a hard
-    /// dependency on bundled-packages.
+    /// The host loads the Card body + samples sidecar and dispatches them
+    /// to a Lua analyzer pkg via `require(pkg).run(ctx)`. The pkg builds a
+    /// prompt from the failure samples, calls `alc.llm`, and returns
+    /// improvement hints. Default pkg name is `"card_analysis"` (overridable
+    /// via the `pkg` arg) — an IF promise, not a hard dependency on
+    /// bundled-packages.
+    ///
+    /// ctx (host → pkg, passed to `M.run(ctx)`):
+    /// ```jsonc
+    /// {
+    ///   "card_id": "<string id>",
+    ///   "card":    <Card body, same shape as alc_card_get>,
+    ///   "samples": [<sidecar rows, same shape as alc_card_samples>]
+    /// }
+    /// ```
+    ///
+    /// Result (pkg → host, validated host-side as `CardAnalyzeResult`):
+    /// ```jsonc
+    /// {
+    ///   "pattern":          "<one-line failure pattern summary>",
+    ///   "suggested_change": "<concrete prompt or Lua-level change>",
+    ///   "confidence":       0.0..=1.0,
+    ///   "failure_count":    <int, optional>,
+    ///   "sample_count":     <int, optional>
+    /// }
+    /// ```
+    /// Output that fails to deserialize as the typed contract returns a
+    /// typed error rather than passing freeform JSON to the caller.
     ///
     /// Sister tool to `alc_advice`: `alc_advice` runs a generic strategy
     /// over a free-form task; `alc_card_analyze` runs an analyzer over a
     /// Card. The Card schema is owned by the host so the pkg only deals
     /// with prompt + `alc.llm` + hint formatting.
-    #[tool(
-        name = "alc_card_analyze",
-        annotations(open_world_hint = false)
-    )]
+    #[tool(name = "alc_card_analyze", annotations(open_world_hint = false))]
     async fn card_analyze(
         &self,
         Parameters(params): Parameters<CardAnalyzeParams>,

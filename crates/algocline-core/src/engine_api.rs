@@ -406,18 +406,16 @@ pub trait EngineApi: Send + Sync {
     /// The host loads the Card body + samples sidecar, builds a Lua ctx
     /// (`{ card, samples, card_id }`), and dispatches to the named pkg
     /// via `require(pkg).run(ctx)`. The default pkg name is
-    /// `"card_analysis"` — an IF promise, not a bundled hard dependency.
+    /// `"card_analysis"` — backed by the constant
+    /// `DEFAULT_CARD_ANALYZE_PKG` defined in `algocline_app::service::card`.
+    /// This is an IF promise, not a bundled hard dependency.
     /// If the pkg is missing the call returns an error.
     ///
     /// Sister tool to `advice`: `advice` runs a generic strategy over
     /// a free-form task, while `card_analyze` runs an analyzer over a
     /// Card and its samples. The Card domain is owned by the host
     /// (Card schema parsing + samples sidecar load), not the pkg.
-    async fn card_analyze(
-        &self,
-        _card_id: &str,
-        _pkg: Option<String>,
-    ) -> Result<String, String> {
+    async fn card_analyze(&self, _card_id: &str, _pkg: Option<String>) -> Result<String, String> {
         Err("card_analyze: not implemented by this EngineApi impl".into())
     }
 

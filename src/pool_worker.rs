@@ -745,13 +745,18 @@ mod tests {
         })
         .expect("register worker");
 
-        // Wait 4 seconds — idle timeout is 2s, check interval is 1s.
-        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-        // The child should have exited by now.
-        let status = child.try_wait().expect("try_wait");
+        // Idle timeout is 2s, check interval is 1s — exit expected ~3s.
+        // Poll up to 6s to absorb cold-spawn latency on slow / loaded hosts.
+        let mut exited = false;
+        for _ in 0..60 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if child.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+        }
         assert!(
-            status.is_some(),
+            exited,
             "worker should have exited after idle timeout (pid={worker_pid})"
         );
 
@@ -850,10 +855,20 @@ mod tests {
             "worker should exit after SIGTERM (pid={worker_pid})"
         );
 
-        // The entry should have been removed from registry.json.
-        let final_reg = PoolRegistry::load_or_default(&reg_path).expect("load final registry");
+        // Entry removal happens inside spawn_blocking and is not strictly
+        // ordered before process exit observation, so poll up to 2s for the
+        // registry entry to disappear.
+        let mut removed = false;
+        for _ in 0..40 {
+            let reg = PoolRegistry::load_or_default(&reg_path).expect("load final registry");
+            if reg.find(sid).is_none() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
         assert!(
-            final_reg.find(sid).is_none(),
+            removed,
             "registry entry must be removed after graceful shutdown"
         );
     }

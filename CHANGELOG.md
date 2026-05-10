@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-05-10
+
+### Changed
+
+- **BUNDLED_VERSION bump: `algocline-bundled-packages` v0.22.1 → v0.23.0**
+  (`src/init.rs` `BUNDLED_SOURCES`). Picks up the bundled
+  `card_analysis` package release — the analyzer pkg dispatched by
+  default from the new `alc_card_analyze` MCP tool. Bundled v0.23.0
+  promotes the POC analyzer (previously available only at
+  `~/.algocline/packages/card_analysis/`) into the bundled fleet
+  with `M.spec` (input + result shapes locked to the host
+  `CardAnalyzeResult` typed contract), `S.instrument(M, "run")`
+  wrapper for runtime shape validation, and `tests/test_card_analysis.lua`
+  (5 cases / 6 tests covering happy path / input validation / empty
+  samples sentinel / 4 failure heuristic paths + no-signal fallback /
+  LLM unparseable fallback). `evalframe` source remains pinned at
+  v0.3.0. Bundled release notes: `algocline-bundled-packages` v0.23.0
+  CHANGELOG / README.
+
 ### Added
 
 - **`alc_card_analyze` MCP tool — Card auto-analyzer**.

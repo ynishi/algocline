@@ -215,6 +215,7 @@ alc_continue({ session_id, response })
 | `alc_run` | Execute Lua code with optional JSON context. Pass `host_mode: true` to run the session in a long-lived pool worker subprocess that survives MCP server restarts |
 | `alc_continue` | Resume a paused execution with the host LLM's response. Automatically routes to a pool worker when the session was started with `host_mode: true` |
 | `alc_advice` | Apply an installed package by name |
+| `alc_card_analyze` | Run a Card analyzer pkg over a single Card. Loads the Card body and its `samples.jsonl` sidecar host-side and dispatches them to `require(pkg).run(ctx)` (default `pkg = "card_analysis"`). Returns a typed result `{ pattern, suggested_change, confidence }` validated by the host before the MCP response is constructed — freeform pkg output is rejected with a typed error |
 | `alc_pkg_link` | Link a local directory as a project-local package via symlink. Records path in `alc.lock` |
 | `alc_pkg_unlink` | Remove a symlink created by `alc_pkg_link` (rejects real directories) |
 | `alc_pkg_list` | List installed packages with metadata. Pass `project_root` to include project-local packages |

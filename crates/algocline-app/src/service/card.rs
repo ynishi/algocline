@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use algocline_engine::card;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::hub;
 use super::AppService;
@@ -22,6 +22,33 @@ pub struct SinkBackfillParams {
     pub sink: String,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// Typed contract for the output produced by a Card analyzer package.
+///
+/// Host-side validation: after `advice()` returns `status == "completed"`,
+/// the `result.result` nested value is deserialized into this struct before
+/// being placed at the top level of the MCP response.  Any package that
+/// cannot produce all required fields (`pattern`, `suggested_change`,
+/// `confidence`) will cause `card_analyze` to return a typed error rather
+/// than passing freeform JSON to the caller.
+///
+/// `failure_count` and `sample_count` are optional so that future analyzer
+/// packages may omit them without breaking the typed contract.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CardAnalyzeResult {
+    /// One-line summary of the dominant failure pattern.
+    pub pattern: String,
+    /// Concrete improvement suggestion (prompt wording, Lua change, etc.).
+    pub suggested_change: String,
+    /// Analyzer confidence in the finding, clamped to `0.0..=1.0`.
+    pub confidence: f64,
+    /// Number of failure samples detected (optional).
+    #[serde(default)]
+    pub failure_count: Option<u64>,
+    /// Total number of samples evaluated (optional).
+    #[serde(default)]
+    pub sample_count: Option<u64>,
 }
 
 /// Default analyzer package name dispatched from
@@ -332,11 +359,7 @@ impl AppService {
     /// ```
     /// The pkg is responsible for filtering failures, building prompts,
     /// and shaping the result.
-    pub async fn card_analyze(
-        &self,
-        card_id: &str,
-        pkg: Option<String>,
-    ) -> Result<String, String> {
+    pub async fn card_analyze(&self, card_id: &str, pkg: Option<String>) -> Result<String, String> {
         // Tier 1: Card body
         let card_value = match self.card_store.get(card_id)? {
             Some(v) => v,
@@ -357,12 +380,39 @@ impl AppService {
         opts.insert("samples".into(), serde_json::Value::Array(samples));
 
         let pkg_name = pkg.as_deref().unwrap_or(DEFAULT_CARD_ANALYZE_PKG);
-        self.advice(
-            pkg_name,
-            None,
-            Some(serde_json::Value::Object(opts)),
-            None,
-        )
-        .await
+        let raw = self
+            .advice(pkg_name, None, Some(serde_json::Value::Object(opts)), None)
+            .await?;
+
+        // Post-process only the final `completed` envelope.  All other
+        // statuses (`needs_response`, `error`, `cancelled`) pass through
+        // unchanged so that the `alc_continue` round-trip is not broken.
+        let mut envelope: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("card_analyze: response is not valid JSON: {e}"))?;
+
+        if envelope.get("status").and_then(serde_json::Value::as_str) == Some("completed") {
+            // Extract `result.result` (the pkg-set ctx field) and validate it
+            // against the typed contract before promoting it to top-level.
+            let inner = envelope
+                .get_mut("result")
+                .ok_or_else(|| {
+                    "card_analyze: completed response missing top-level 'result' field".to_string()
+                })?
+                .get_mut("result")
+                .ok_or_else(|| {
+                    "card_analyze: pkg response missing 'result.result' field".to_string()
+                })?
+                .take();
+
+            let typed: CardAnalyzeResult = serde_json::from_value(inner)
+                .map_err(|e| format!("card_analyze: pkg returned invalid result shape: {e}"))?;
+
+            envelope["result"] = serde_json::to_value(&typed).map_err(|e| {
+                format!("card_analyze: failed to re-serialize CardAnalyzeResult: {e}")
+            })?;
+        }
+
+        serde_json::to_string(&envelope)
+            .map_err(|e| format!("card_analyze: failed to serialize response: {e}"))
     }
 }

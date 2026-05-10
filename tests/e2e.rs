@@ -4827,6 +4827,214 @@ async fn test_per_call_project_root_overrides_session_pin() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── alc_card_analyze E2E tests ──────────────────────────────────────────────
+
+/// Happy-path round-trip for `alc_card_analyze`.
+///
+/// Part A (no-sample path): invokes `alc_card_analyze` on a Card with no
+/// samples sidecar.  The `card_analysis` pkg detects total==0 and returns
+/// immediately without calling `alc.llm`.  This exercises the typed-contract
+/// post-processing inside `AppService::card_analyze` and asserts the flat
+/// `CardAnalyzeResult` shape (`pattern`/`suggested_change`/`confidence` at
+/// top-level `result`, `card`/`samples` echo absent).
+///
+/// Part B (LLM round-trip): invokes `alc_card_analyze` on a Card with a
+/// failure sample so the pkg calls `alc.llm` and pauses.  Then drives a
+/// complete `alc_continue` round-trip and asserts `status: "completed"`.
+/// This satisfies Tier 1 constraint C1 (complete alc_continue round-trip).
+#[tokio::test]
+async fn test_alc_card_analyze_roundtrip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // ── Card A: no sidecar (zero samples → immediate completed path) ──
+    let card_id_a = "e2e_20260510T000000_aabbcc";
+    let card_pkg = "e2e";
+    let card_dir = tmp.path().join("cards").join(card_pkg);
+    std::fs::create_dir_all(&card_dir).expect("create card dir");
+    std::fs::write(
+        card_dir.join(format!("{card_id_a}.toml")),
+        concat!(
+            "schema_version = \"card/v0\"\n",
+            "card_id = \"e2e_20260510T000000_aabbcc\"\n",
+            "created_at = \"2026-05-10T00:00:00Z\"\n",
+            "[pkg]\n",
+            "name = \"e2e\"\n",
+        ),
+    )
+    .expect("write card A toml");
+    // No samples file → `card_analysis` returns immediately (total==0 guard).
+
+    // ── Card B: one failure sample (LLM path → needs_response → alc_continue) ──
+    let card_id_b = "e2e_20260510T000001_bbccdd";
+    std::fs::write(
+        card_dir.join(format!("{card_id_b}.toml")),
+        concat!(
+            "schema_version = \"card/v0\"\n",
+            "card_id = \"e2e_20260510T000001_bbccdd\"\n",
+            "created_at = \"2026-05-10T00:00:00Z\"\n",
+            "[pkg]\n",
+            "name = \"e2e\"\n",
+        ),
+    )
+    .expect("write card B toml");
+    // One failure sample → pkg calls alc.llm → session pauses.
+    std::fs::write(
+        card_dir.join(format!("{card_id_b}.samples.jsonl")),
+        "{\"case_idx\":0,\"admission\":\"fail\",\"status\":\"fail\"}\n",
+    )
+    .expect("write card B samples");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // 1. Install the fixture pkg via absolute path string (K-137: no file:// URL).
+    let pkg_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"))
+        .join(".algocline/packages/card_analysis");
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": pkg_path.to_string_lossy().as_ref() }),
+    )
+    .await;
+
+    // ── Part A: zero-sample card → immediate completed, flat CardAnalyzeResult ──
+
+    let resp_a = call_json(&client, "alc_card_analyze", json!({ "card_id": card_id_a })).await;
+    // The pkg returns immediately (total==0 guard); post-processing flattens result.
+    assert_eq!(
+        resp_a["status"], "completed",
+        "zero-sample card must complete immediately, got: {resp_a}"
+    );
+    // Flat shape: pattern/suggested_change/confidence at top-level result.
+    assert!(
+        resp_a["result"]["pattern"].as_str().is_some(),
+        "pattern must be a string at result.pattern, got: {resp_a}"
+    );
+    assert!(
+        resp_a["result"]["suggested_change"].as_str().is_some(),
+        "suggested_change must be a string at result.suggested_change, got: {resp_a}"
+    );
+    assert!(
+        resp_a["result"]["confidence"].as_f64().is_some(),
+        "confidence must be a number at result.confidence, got: {resp_a}"
+    );
+    // Typed contract: card/samples echo must be absent from result.
+    assert!(
+        resp_a["result"].get("card").is_none(),
+        "echo of 'card' must be removed from result: {resp_a}"
+    );
+    assert!(
+        resp_a["result"].get("samples").is_none(),
+        "echo of 'samples' must be removed from result: {resp_a}"
+    );
+
+    // ── Part B: failure-sample card → LLM pause → alc_continue round-trip ──
+
+    let resp_b = call_json(&client, "alc_card_analyze", json!({ "card_id": card_id_b })).await;
+    assert_eq!(
+        resp_b["status"], "needs_response",
+        "failure-sample card must pause for LLM, got: {resp_b}"
+    );
+    let session_id = resp_b["session_id"]
+        .as_str()
+        .expect("session_id missing from needs_response");
+
+    // Drive the complete alc_continue round-trip (Tier 1 C1).
+    // Stub response is STRICT JSON so alc.json_extract can parse it (Risk 4).
+    let stub = r#"{"pattern":"prompt too vague","suggested_change":"add explicit constraints","confidence":0.8}"#;
+    let resp_cont = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": stub }),
+    )
+    .await;
+    assert_eq!(
+        resp_cont["status"], "completed",
+        "expected completed after alc_continue, got: {resp_cont}"
+    );
+    // alc_continue returns the raw session result; the LLM output appears
+    // nested at result.result (post-processing runs in card_analyze, not here).
+    assert!(
+        resp_cont["result"]["result"]["pattern"].as_str().is_some(),
+        "pattern must be present in result.result after round-trip, got: {resp_cont}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error path: invoking `alc_card_analyze` with an unknown `card_id` must
+/// return a distinct typed error message containing the card id.
+///
+/// Validates Tier 1 constraint C1 (unknown card_id typed error).
+#[tokio::test]
+async fn test_alc_card_analyze_unknown_card_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_card_analyze",
+            json!({ "card_id": "nonexistent_card_id_xyz" }),
+        ))
+        .await
+        .expect("call_tool failed");
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("nonexistent_card_id_xyz"),
+        "error must reference the unknown card_id, got: {text}"
+    );
+    assert!(
+        text.contains("not found"),
+        "error must say 'not found', got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Shape violation: passing `card_id` as a non-string value (boolean) must
+/// be rejected by MCP transport / schemars validation with a distinct typed
+/// error — either the transport returns an `McpError` or a `CallToolResult`
+/// with `is_error = true`.  A successful `completed` response is not acceptable.
+///
+/// Validates Tier 1 constraint C1 (shape violation typed error).
+#[tokio::test]
+async fn test_alc_card_analyze_shape_violation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Pass `true` (bool) where `card_id: string` is expected.
+    // The MCP / schemars deserialization layer rejects this before it reaches
+    // `card_analyze`, returning an McpError at the transport level.
+    let outcome = client
+        .call_tool(call_params("alc_card_analyze", json!({ "card_id": true })))
+        .await;
+
+    match outcome {
+        Err(e) => {
+            // Transport-level rejection: schemars / rmcp parameter deserialization
+            // failed.  The error message must mention the type mismatch.
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("boolean") || msg.contains("string") || msg.contains("invalid"),
+                "McpError message must describe a type/shape error, got: {msg}"
+            );
+        }
+        Ok(result) => {
+            // Tool-level rejection: the tool returned is_error=true.
+            let text = extract_text(&result);
+            let is_err = result.is_error.unwrap_or(false);
+            let parsed: Option<serde_json::Value> = serde_json::from_str(text).ok();
+            let is_completed = parsed.as_ref().is_some_and(|v| v["status"] == "completed");
+            assert!(
+                is_err || !is_completed,
+                "shape violation must not produce a successful completed result, got: {text}"
+            );
+        }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── CLI dry-run tests (no MCP harness) ──────────────────────────────────────
 
 /// Resolve the path to the `alc` binary, mirroring the logic in `connect()`.

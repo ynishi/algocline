@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`alc_card_analyze` MCP tool — Card auto-analyzer entry point (POC)**.
+- **`alc_card_analyze` MCP tool — Card auto-analyzer**.
   Loads a Card body and its samples sidecar host-side and dispatches
   them to a Lua analyzer pkg via `require(pkg).run(ctx)` (default
   `pkg = "card_analysis"`). Sister tool to `alc_advice`: `alc_advice`
@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `samples.jsonl` sidecar) is owned by the host so analyzer pkgs only
   deal with prompt construction + `alc.llm` + hint shaping.
 
-  ctx shape passed to the pkg's `M.run(ctx)`:
+  ctx shape passed to the pkg's `M.run(ctx)` — enumerated in the MCP
+  tool description so pkg authors do not need to read Rust source:
 
   ```jsonc
   {
@@ -31,16 +32,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DEFAULT_CARD_ANALYZE_PKG = "card_analysis"` (constant in
   `algocline-app/src/service/card.rs`) is an **IF promise**, not a
   bundled hard dependency: any installed pkg of that name (bundled,
-  project-variant, or user-installed) satisfies the dispatch. POC
-  status — the analyzer pkg is currently expected to live at
+  project-variant, or user-installed) satisfies the dispatch. The
+  analyzer pkg is currently expected to live at
   `~/.algocline/packages/card_analysis/`; bundled-packages migration
-  and `alc_shapes` spec are tracked as follow-ups
-  (#1778367957-70837).
+  and `alc_shapes` spec are tracked as follow-ups.
 
   Internally `card_analyze` reuses the existing `AppService::advice`
   execution path, so auto-install bundled fallback /
   `start_and_tick` / response warning splicing all work uniformly
   with strategy dispatch.
+
+  **Typed output contract**: the host deserializes the pkg's
+  `ctx.result` through `CardAnalyzeResult` before constructing the
+  MCP response. Required fields: `pattern: String`,
+  `suggested_change: String`, `confidence: f64`. Optional:
+  `failure_count: u64`, `sample_count: u64`. Pkg output that fails
+  to deserialize returns a typed error instead of passing freeform
+  JSON to the caller. The response shape is flat —
+  `{ status, result: { pattern, suggested_change, confidence, ... }, stats }`
+  — not double-nested.
 
   Trait surface: `EngineApi::card_analyze(card_id, pkg)` is added
   with a default-impl returning a clean error

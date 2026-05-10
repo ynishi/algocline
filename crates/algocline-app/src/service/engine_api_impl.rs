@@ -356,11 +356,7 @@ impl EngineApi for AppService {
         AppService::card_sink_backfill(self, super::card::SinkBackfillParams { sink, dry_run })
     }
 
-    async fn card_analyze(
-        &self,
-        card_id: &str,
-        pkg: Option<String>,
-    ) -> Result<String, String> {
+    async fn card_analyze(&self, card_id: &str, pkg: Option<String>) -> Result<String, String> {
         AppService::card_analyze(self, card_id, pkg).await
     }
 

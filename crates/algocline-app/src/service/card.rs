@@ -24,6 +24,16 @@ pub struct SinkBackfillParams {
     pub dry_run: bool,
 }
 
+/// Default analyzer package name dispatched from
+/// [`AppService::card_analyze`] when the caller omits `pkg`.
+///
+/// This is an **IF promise**, not a bundled hard dependency: any pkg
+/// (bundled, project-local, or user-installed) named `card_analysis`
+/// that exposes `M.run(ctx) -> ctx` will satisfy it. Not having a pkg
+/// of this name installed surfaces as a normal "package not found"
+/// error from the underlying `advice` dispatch.
+pub const DEFAULT_CARD_ANALYZE_PKG: &str = "card_analysis";
+
 impl AppService {
     /// List Cards as JSON summaries, optionally filtered by package.
     pub fn card_list(&self, pkg: Option<&str>) -> Result<String, String> {
@@ -296,5 +306,63 @@ impl AppService {
             .card_sink_backfill(&params.sink, params.dry_run)?;
         serde_json::to_string(&report)
             .map_err(|e| format!("failed to serialize SinkBackfillReport: {e}"))
+    }
+
+    /// Load a Card + its samples sidecar and dispatch them to a Lua
+    /// analyzer package.
+    ///
+    /// The host owns Card-schema parsing (Tier 1 body + Tier 2
+    /// `samples.jsonl`) so the analyzer pkg gets a ready-to-use ctx
+    /// shape. The pkg owns prompt construction + `alc.llm` + hint
+    /// formatting.
+    ///
+    /// `pkg` defaults to [`DEFAULT_CARD_ANALYZE_PKG`] when omitted —
+    /// an IF promise, not a bundled hard dependency. The call delegates
+    /// to [`AppService::advice`], so all of `advice`'s machinery
+    /// (auto-install bundled fallback, `start_and_tick`, response
+    /// warning splicing) applies.
+    ///
+    /// ctx shape passed to the pkg's `M.run(ctx)`:
+    /// ```jsonc
+    /// {
+    ///   "card_id": "<id>",
+    ///   "card":    <full Card body, same shape as alc_card_get>,
+    ///   "samples": [<sidecar rows, same shape as alc_card_samples>]
+    /// }
+    /// ```
+    /// The pkg is responsible for filtering failures, building prompts,
+    /// and shaping the result.
+    pub async fn card_analyze(
+        &self,
+        card_id: &str,
+        pkg: Option<String>,
+    ) -> Result<String, String> {
+        // Tier 1: Card body
+        let card_value = match self.card_store.get(card_id)? {
+            Some(v) => v,
+            None => return Err(format!("card '{card_id}' not found")),
+        };
+
+        // Tier 2: samples sidecar (full read; analyzer pkg filters failures)
+        let samples = self
+            .card_store
+            .read_samples(card_id, card::SamplesQuery::default())?;
+
+        let mut opts = serde_json::Map::new();
+        opts.insert(
+            "card_id".into(),
+            serde_json::Value::String(card_id.to_string()),
+        );
+        opts.insert("card".into(), card_value);
+        opts.insert("samples".into(), serde_json::Value::Array(samples));
+
+        let pkg_name = pkg.as_deref().unwrap_or(DEFAULT_CARD_ANALYZE_PKG);
+        self.advice(
+            pkg_name,
+            None,
+            Some(serde_json::Value::Object(opts)),
+            None,
+        )
+        .await
     }
 }

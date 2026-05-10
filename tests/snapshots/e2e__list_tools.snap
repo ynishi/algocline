@@ -1,12 +1,13 @@
 ---
 source: tests/e2e.rs
-assertion_line: 110
+assertion_line: 155
 expression: names
 ---
 [
   "alc_advice",
   "alc_card_alias_list",
   "alc_card_alias_set",
+  "alc_card_analyze",
   "alc_card_append",
   "alc_card_find",
   "alc_card_get",

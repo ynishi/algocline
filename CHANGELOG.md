@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`alc_card_analyze` MCP tool — Card auto-analyzer entry point (POC)**.
+  Loads a Card body and its samples sidecar host-side and dispatches
+  them to a Lua analyzer pkg via `require(pkg).run(ctx)` (default
+  `pkg = "card_analysis"`). Sister tool to `alc_advice`: `alc_advice`
+  runs a generic strategy over a free-form task; `alc_card_analyze`
+  runs an analyzer over a Card. The Card schema (Tier 1 body + Tier 2
+  `samples.jsonl` sidecar) is owned by the host so analyzer pkgs only
+  deal with prompt construction + `alc.llm` + hint shaping.
+
+  ctx shape passed to the pkg's `M.run(ctx)`:
+
+  ```jsonc
+  {
+    "card_id": "<id>",
+    "card":    <full Card body, same shape as alc_card_get>,
+    "samples": [<sidecar rows, same shape as alc_card_samples>]
+  }
+  ```
+
+  `DEFAULT_CARD_ANALYZE_PKG = "card_analysis"` (constant in
+  `algocline-app/src/service/card.rs`) is an **IF promise**, not a
+  bundled hard dependency: any installed pkg of that name (bundled,
+  project-variant, or user-installed) satisfies the dispatch. POC
+  status — the analyzer pkg is currently expected to live at
+  `~/.algocline/packages/card_analysis/`; bundled-packages migration
+  and `alc_shapes` spec are tracked as follow-ups
+  (#1778367957-70837).
+
+  Internally `card_analyze` reuses the existing `AppService::advice`
+  execution path, so auto-install bundled fallback /
+  `start_and_tick` / response warning splicing all work uniformly
+  with strategy dispatch.
+
+  Trait surface: `EngineApi::card_analyze(card_id, pkg)` is added
+  with a default-impl returning a clean error
+  ("not implemented by this EngineApi impl"), so external trait
+  implementors are not broken (breaking for trait implementors only;
+  MCP wire shape is purely additive). Issue #1778367957-70837.
+
 ## [0.33.1] - 2026-05-09
 
 ### Changed

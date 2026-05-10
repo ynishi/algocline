@@ -401,6 +401,26 @@ pub trait EngineApi: Send + Sync {
         Err("card_sink_backfill: not implemented by this EngineApi impl".into())
     }
 
+    /// Run a Card analyzer package over a single Card.
+    ///
+    /// The host loads the Card body + samples sidecar, builds a Lua ctx
+    /// (`{ card, samples, card_id }`), and dispatches to the named pkg
+    /// via `require(pkg).run(ctx)`. The default pkg name is
+    /// `"card_analysis"` — an IF promise, not a bundled hard dependency.
+    /// If the pkg is missing the call returns an error.
+    ///
+    /// Sister tool to `advice`: `advice` runs a generic strategy over
+    /// a free-form task, while `card_analyze` runs an analyzer over a
+    /// Card and its samples. The Card domain is owned by the host
+    /// (Card schema parsing + samples sidecar load), not the pkg.
+    async fn card_analyze(
+        &self,
+        _card_id: &str,
+        _pkg: Option<String>,
+    ) -> Result<String, String> {
+        Err("card_analyze: not implemented by this EngineApi impl".into())
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     /// Rebuild hub index from a packages directory.

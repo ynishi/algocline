@@ -569,6 +569,20 @@ pub struct CardAliasSetParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardAnalyzeParams {
+    /// Card ID to analyze. Host loads `~/.algocline/cards/{pkg}/{id}.toml`
+    /// (Tier 1 body) and `{id}.samples.jsonl` (Tier 2 sidecar) and
+    /// passes both to the analyzer pkg as the Lua ctx.
+    pub card_id: String,
+    /// Analyzer package name. Defaults to `"card_analysis"` when
+    /// omitted. The package must expose `M.run(ctx) -> ctx` with
+    /// `ctx.result` populated. Any installed pkg (bundled, project
+    /// variant, or user-installed) of this name will satisfy the
+    /// dispatch — the host does not hard-depend on any specific pkg.
+    pub pkg: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardSamplesParams {
     /// Card ID whose sidecar samples to read.
     pub card_id: String,
@@ -1485,6 +1499,30 @@ impl AlcService {
             .await
     }
 
+    /// Run a Card analyzer package over a single Card.
+    ///
+    /// Loads the Card body + samples sidecar host-side and dispatches
+    /// them to a Lua analyzer pkg via `require(pkg).run(ctx)`. The pkg
+    /// builds a prompt from the failure samples, calls `alc.llm`, and
+    /// returns improvement hints. Default pkg name is `"card_analysis"`
+    /// (overridable via the `pkg` arg) — an IF promise, not a hard
+    /// dependency on bundled-packages.
+    ///
+    /// Sister tool to `alc_advice`: `alc_advice` runs a generic strategy
+    /// over a free-form task; `alc_card_analyze` runs an analyzer over a
+    /// Card. The Card schema is owned by the host so the pkg only deals
+    /// with prompt + `alc.llm` + hint formatting.
+    #[tool(
+        name = "alc_card_analyze",
+        annotations(open_world_hint = false)
+    )]
+    async fn card_analyze(
+        &self,
+        Parameters(params): Parameters<CardAnalyzeParams>,
+    ) -> Result<String, String> {
+        self.app.card_analyze(&params.card_id, params.pkg).await
+    }
+
     /// Walk a Card's lineage tree via `metadata.prior_card_id`.
     ///
     /// Follows the `prior_card_id` parent pointer (`direction="up"`, default),
@@ -1840,7 +1878,8 @@ impl ServerHandler for AlcService {
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true). Supports the same `where` DSL as alc_card_find.\n\
                  - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\
-                 - alc_card_sink_backfill: Backfill one subscriber (ALC_CARD_SINKS URI) with every Card already in the primary store. Drift-safe: existing Cards on the sink are skipped, never overwritten. Supports dry_run.\n\n\
+                 - alc_card_sink_backfill: Backfill one subscriber (ALC_CARD_SINKS URI) with every Card already in the primary store. Drift-safe: existing Cards on the sink are skipped, never overwritten. Supports dry_run.\n\
+                 - alc_card_analyze: Run a Card analyzer pkg over a single Card. Host loads the Card body + samples sidecar and dispatches them to `require(pkg).run(ctx)` (default pkg=`card_analysis`). Sister tool to `alc_advice`: advice runs a generic strategy over a free-form task; card_analyze runs an analyzer over a Card. Returns the pkg's `ctx.result` shape (typically `{ pattern, suggested_change, confidence }`).\n\n\
                  Hub:\n\
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
                  - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\

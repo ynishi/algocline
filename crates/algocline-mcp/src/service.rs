@@ -1,9 +1,10 @@
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CompleteRequestParams, CompleteResult, CompletionInfo, ListResourceTemplatesResult,
-        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, Reference,
-        ServerCapabilities, ServerInfo,
+        CompleteRequestParams, CompleteResult, CompletionInfo, GetPromptRequestParams,
+        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        PaginatedRequestParams, ReadResourceRequestParams, Reference, ServerCapabilities,
+        ServerInfo,
     },
     schemars,
     service::RequestContext,
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use algocline_app::{EngineApi, QueryResponse};
 use algocline_core::AppDir;
 
+use crate::prompts::PromptCatalog;
 use crate::resources::{build_list_resources_result, build_list_templates_result, ResourceCatalog};
 
 // ─── MCP Parameter types (schemars-annotated) ───────────────────
@@ -819,16 +821,19 @@ pub struct AlcService {
     tool_router: ToolRouter<Self>,
     app: Arc<dyn EngineApi>,
     resource_catalog: Arc<ResourceCatalog>,
+    prompt_catalog: Arc<PromptCatalog>,
 }
 
 #[tool_router]
 impl AlcService {
     pub fn new(app: Arc<dyn EngineApi>, app_dir: Arc<AppDir>) -> Self {
-        let resource_catalog = Arc::new(ResourceCatalog::new(app.clone(), app_dir));
+        let resource_catalog = Arc::new(ResourceCatalog::new(app.clone(), app_dir.clone()));
+        let prompt_catalog = Arc::new(PromptCatalog::new(app.clone(), app_dir));
         Self {
             tool_router: Self::tool_router(),
             app,
             resource_catalog,
+            prompt_catalog,
         }
     }
 
@@ -1846,6 +1851,8 @@ impl ServerHandler for AlcService {
             .enable_tools()
             .enable_resources()
             .enable_completions()
+            .enable_prompts()
+            .enable_prompts_list_changed()
             .build();
         info.instructions = Some(
             "algocline — LLM amplification engine. Execute Lua strategies that structurally \
@@ -1963,7 +1970,8 @@ impl ServerHandler for AlcService {
                 req.argument.name.as_str(),
                 req.argument.value.as_str(),
             ),
-            // ref/prompt: algocline has no Prompts capability — return empty
+            // ref/prompt: Phase 1 declares capability only. Full `ref/prompt`
+            // completion is deferred to Phase 1.x — empty response maintained.
             Reference::Prompt(_) => {
                 return Ok(CompleteResult::new(CompletionInfo::default()));
             }
@@ -1982,6 +1990,56 @@ impl ServerHandler for AlcService {
             total: Some(candidates.total),
             has_more: Some(candidates.has_more),
         }))
+    }
+
+    /// Return all installed packages as MCP prompts.
+    ///
+    /// Enumerates packages by reading `alc.toml` + `~/.algocline/packages/` on
+    /// every request via `EngineApi::pkg_list`. No static or startup-time list
+    /// is used (Crux #1 constraint).
+    ///
+    /// # Arguments
+    ///
+    /// * `_req` — optional pagination cursor (ignored; all prompts are returned)
+    /// * `_cx` — MCP request context (unused)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(ListPromptsResult)` with one `Prompt` per installed package, or an
+    /// MCP error when the underlying enumeration fails.
+    async fn list_prompts(
+        &self,
+        _req: Option<PaginatedRequestParams>,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, rmcp::ErrorData> {
+        let prompts = self.prompt_catalog.list_prompts().await?;
+        Ok(ListPromptsResult::with_all_items(prompts))
+    }
+
+    /// Return the prompt messages for the named package with `task` substituted.
+    ///
+    /// Verifies that `name` matches an installed package (enumerating on every
+    /// call — Crux #1) and substitutes the `task` argument into the message
+    /// template at runtime (Crux #2).
+    ///
+    /// # Arguments
+    ///
+    /// * `req` — prompt name and optional `arguments` map (expects `task` key)
+    /// * `_cx` — MCP request context (unused)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(GetPromptResult)` with one `User`-role text message, or:
+    /// * `-32602` (invalid params) when the prompt name is unknown
+    /// * `-32603` (internal error) on enumeration failure
+    async fn get_prompt(
+        &self,
+        req: GetPromptRequestParams,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, rmcp::ErrorData> {
+        self.prompt_catalog
+            .get_prompt(&req.name, req.arguments.as_ref())
+            .await
     }
 }
 

@@ -199,12 +199,64 @@ impl PromptCatalog {
         );
         let body = template.replace("${task}", task_value);
 
-        let message = PromptMessage::new_text(PromptMessageRole::User, body);
+        let text_message = PromptMessage::new_text(PromptMessageRole::User, body);
+
+        // ─── Phase 1.x-D (HOLD): embedded narrative resource ──────────────
+        //
+        // The block below appends a 2nd PromptMessage carrying the package's
+        // narrative markdown as an embedded resource (MCP spec
+        // `PromptMessage.content.type="resource"`). Phase 0 spike on 2026-05-11
+        // verified end-to-end that Claude Code inline-renders the narrative
+        // into the conversation context — UX result documented in issue
+        // #1778486287-98178.
+        //
+        // BLOCKED on upstream rmcp bug: `PromptMessageContent::Resource`
+        // serializes with a doubly-nested `resource` field instead of the
+        // spec-compliant flat shape, causing Zod validators to reject the
+        // response. Tracking:
+        //   - workspace/tasks/1778491320-35761-rmcp-upstream/issue.md
+        //   - upstream issue: modelcontextprotocol/rust-sdk#842
+        //   - upstream PR:    modelcontextprotocol/rust-sdk#843
+        //
+        // To activate after upstream merge + new rmcp release:
+        //   1. Bump `rmcp` in `crates/algocline-mcp/Cargo.toml` to the fixed
+        //      version (≥ the first release that contains the fix).
+        //   2. Remove this comment block and uncomment the implementation
+        //      below (move from text-only to text + resource 2-message build).
+        //   3. Add `pub_get_narrative_md` to the engine API dependency surface
+        //      if not already exposed.
+        //   4. Add e2e: `test_get_prompt_with_narrative_resource` covering
+        //      narrative-present and narrative-absent fallback cases.
+        //
+        // ```rust
+        // let mut messages = vec![text_message];
+        // match self.app.pkg_get_narrative_md(name).await {
+        //     Ok(Some(narrative)) => {
+        //         let uri = format!("alc://packages/{name}/narrative");
+        //         messages.push(PromptMessage::new_resource(
+        //             PromptMessageRole::User,
+        //             uri,
+        //             Some("text/markdown".to_string()),
+        //             Some(narrative),
+        //             None,
+        //             None,
+        //             None,
+        //         ));
+        //     }
+        //     Ok(None) => {
+        //         // text-only fallback (current behavior)
+        //     }
+        //     Err(e) => {
+        //         warn!("narrative fetch failed for {name}: {e}; text-only fallback");
+        //     }
+        // }
+        // ```
+        // ──────────────────────────────────────────────────────────────────
 
         let result = if let Some(desc) = description {
-            GetPromptResult::new(vec![message]).with_description(desc)
+            GetPromptResult::new(vec![text_message]).with_description(desc)
         } else {
-            GetPromptResult::new(vec![message])
+            GetPromptResult::new(vec![text_message])
         };
 
         Ok(result)

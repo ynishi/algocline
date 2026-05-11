@@ -323,7 +323,12 @@ Each slash command optionally accepts a `task` argument. If omitted, the prompt 
 
 ### Capability
 
-algocline declares `prompts: { listChanged: true }`. The `notifications/prompts/list_changed` notification emitter is planned for Phase 1.x; the declaration is present in this release so clients can opt in when it becomes available.
+algocline declares `prompts: { listChanged: true }` and fires
+`notifications/prompts/list_changed` whenever a pkg-mutating operation
+succeeds (`alc_pkg_install`, `alc_pkg_remove`, `alc_pkg_link`,
+`alc_pkg_unlink`, `alc_pkg_repair`, `alc_pkg_scaffold`). MCP clients
+that subscribe to this notification (e.g. Claude Code) will
+automatically refresh their prompt list after each install or removal.
 
 ## Host integration patterns
 

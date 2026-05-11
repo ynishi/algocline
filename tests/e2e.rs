@@ -9,8 +9,8 @@ use std::io::Write;
 
 use rmcp::{
     model::{
-        ArgumentInfo, CallToolRequestParams, CompleteRequestParams, ReadResourceRequestParams,
-        Reference, ResourceReference,
+        ArgumentInfo, CallToolRequestParams, CompleteRequestParams, GetPromptRequestParams,
+        ReadResourceRequestParams, Reference, ResourceReference,
     },
     transport::TokioChildProcess,
     ServiceExt,
@@ -5112,4 +5112,134 @@ fn test_cli_version() {
         "alc -V stdout missing version '{}': {stdout}",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+// ─── MCP Prompts E2E (Phase 1, dynamic flow) ─────────────────────────────────
+
+/// `prompts/list` must return at least one prompt when a fixture package is
+/// installed in the scoped `ALC_PACKAGES_PATH`.
+///
+/// Verifies:
+/// - `list_all_prompts()` succeeds and returns `>= 1` entry
+/// - The fixture package name is present in the result
+/// - Each prompt carries a `task` argument with `required: Some(false)`
+#[tokio::test]
+async fn test_list_prompts_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Place a fixture package directly in the scoped packages directory.
+    // `connect_with_alc_home` sets `ALC_PACKAGES_PATH` to `{tmp}/packages`,
+    // so `pkg_list` will enumerate packages from this dir without installing.
+    let pkg_dir = tmp.path().join("packages").join("test_prompts_pkg");
+    // SAFETY: tempdir was just created; create_dir_all cannot race here.
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir packages/test_prompts_pkg");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "test_prompts_pkg", version = "0.1.0", description = "Test prompt package" }
+return M"#,
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let prompts = client
+        .list_all_prompts()
+        .await
+        .expect("list_all_prompts failed");
+
+    assert!(
+        !prompts.is_empty(),
+        "expected at least one prompt, got empty list"
+    );
+
+    let found = prompts
+        .iter()
+        .find(|p| p.name == "test_prompts_pkg")
+        .expect("fixture package 'test_prompts_pkg' not found in prompt list");
+
+    // Each prompt must expose the `task` argument.
+    let args = found
+        .arguments
+        .as_deref()
+        .expect("prompt must have arguments");
+    assert_eq!(args.len(), 1, "expected exactly 1 argument");
+    assert_eq!(args[0].name, "task");
+    assert_eq!(
+        args[0].required,
+        Some(false),
+        "task argument must be optional"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `prompts/get` must return a single user-role message with the `task` value
+/// substituted into the body at runtime.
+///
+/// Verifies:
+/// - `get_prompt` succeeds and returns exactly 1 message
+/// - `messages[0].role` is `User`
+/// - The task value supplied in `arguments` appears in the message text
+/// - The placeholder `${task}` is NOT present verbatim (substitution happened)
+#[tokio::test]
+async fn test_get_prompt_round_trip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let pkg_dir = tmp.path().join("packages").join("test_prompts_pkg");
+    // SAFETY: same as above — fresh tempdir.
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir packages/test_prompts_pkg");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "test_prompts_pkg", version = "0.1.0", description = "Test prompt package" }
+return M"#,
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let task_text = "解の精度を上げて";
+    // Build the arguments map: { "task": "<task_text>" }
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "task".to_string(),
+        serde_json::Value::String(task_text.to_string()),
+    );
+
+    let result = client
+        .get_prompt(GetPromptRequestParams::new("test_prompts_pkg").with_arguments(arguments))
+        .await
+        .expect("get_prompt failed");
+
+    assert_eq!(
+        result.messages.len(),
+        1,
+        "expected exactly 1 message in get_prompt result"
+    );
+
+    let msg = &result.messages[0];
+    // Role must be User.
+    assert_eq!(
+        msg.role,
+        rmcp::model::PromptMessageRole::User,
+        "message role must be User"
+    );
+
+    // The message content must be a Text variant containing the task value.
+    let text = match &msg.content {
+        rmcp::model::PromptMessageContent::Text { text } => text.as_str(),
+        other => panic!("expected Text content, got: {other:?}"),
+    };
+
+    assert!(
+        text.contains(task_text),
+        "message text must contain the task value '{task_text}', got: {text}"
+    );
+    assert!(
+        !text.contains("${task}"),
+        "placeholder '${{task}}' must be substituted, but was found in: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
 }

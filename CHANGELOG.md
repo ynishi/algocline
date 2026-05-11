@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP Prompts capability (Phase 1, dynamic flow)**.
+  Each installed package is exposed 1:1 as an MCP prompt under
+  `/mcp__algocline__<pkg_name>`. `prompts/list` enumerates packages
+  by reading `alc.toml` + `~/.algocline/packages/` on every request
+  (no compile-time list). `prompts/get` substitutes the `task`
+  argument into a single text message at runtime. Capability declares
+  `prompts: { listChanged: true }`; the `notifications/prompts/list_changed`
+  emitter is deferred to Phase 1.x (declaration only in this release).
+
 ## [0.34.0] - 2026-05-10
 
 ### Changed

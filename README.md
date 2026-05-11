@@ -292,6 +292,39 @@ Reading `alc://hub/index` returns a JSON object with the union of all registered
 
 Individual source read failures are surfaced in `"warnings"` rather than failing the whole request (best-effort aggregate). On a clean install with no cached sources the response is `{"schema_version":"hub_index/v0","packages":[]}`.
 
+## MCP Prompts
+
+algocline exposes each installed package as an [MCP Prompt](https://spec.modelcontextprotocol.io/specification/server/prompts/) — a pre-built, parameterized instruction template that MCP clients can invoke directly.
+
+### How prompts are generated
+
+`prompts/list` enumerates packages by reading `alc.toml` and `~/.algocline/packages/` on every request. Each installed package produces one prompt:
+
+| Prompt field | Value |
+|---|---|
+| `name` | Package name (e.g. `cot`) |
+| `title` | Name with first letter capitalised (e.g. `Cot`) |
+| `description` | Package `description` from its metadata, if present |
+| `arguments` | `[{ name: "task", description: "Task to apply this strategy to", required: false }]` |
+
+`prompts/get` returns a single user-role text message. If the `task` argument is supplied, its value is substituted into the message at runtime before the response is returned.
+
+### Using prompts in Claude Code
+
+When algocline is configured as an MCP server, prompts appear as slash commands in Claude Code. Type `/` followed by `mcp__algocline__` to browse them:
+
+```
+/mcp__algocline__cot       → apply chain-of-thought to a task
+/mcp__algocline__reflect   → apply self-reflection to a task
+/mcp__algocline__panel     → apply multi-perspective deliberation to a task
+```
+
+Each slash command optionally accepts a `task` argument. If omitted, the prompt message includes guidance for a general use.
+
+### Capability
+
+algocline declares `prompts: { listChanged: true }`. The `notifications/prompts/list_changed` notification emitter is planned for Phase 1.x; the declaration is present in this release so clients can opt in when it becomes available.
+
 ## Host integration patterns
 
 algocline's `alc.llm()` is a cooperative yield — it pauses the Lua VM and returns a prompt to the host. How the host handles this determines performance and quality.

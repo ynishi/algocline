@@ -7,17 +7,73 @@ non-standard choices we make within each. Per-capability reference material
 inline; this file captures the design rationale only when it differs from a
 straightforward reading of the spec.
 
-## Capability adoption
+## Coverage
 
-| Capability     | Status           | Reference                                  |
-|----------------|------------------|--------------------------------------------|
-| `tools`        | Adopted          | `crates/algocline-mcp/src/service.rs`      |
-| `resources`    | Adopted          | [mcp-resources.md](../mcp-resources.md)    |
-| `prompts`      | Adopted (Phase 2 rework, see below) | this document       |
-| `sampling`     | Not adopted yet  | tracked under #1776105556-75720            |
-| `elicitation`  | Not adopted yet  | —                                          |
-| `roots`        | Not adopted yet  | —                                          |
-| `completion`   | Partially (`ref/resource` only) | implementation in `resources.rs` |
+Strict feature-by-feature support matrix against the MCP 2025-06-18 spec.
+"Status" values:
+
+- **Full** — every wire-level message, notification, and capability sub-flag
+  defined by the spec for this feature is implemented.
+- **Partial** — the feature is declared as a capability and the primary
+  request/response works, but some sub-flag, notification, or branch is not
+  implemented; specifics are noted in the row.
+- **Not yet** — capability is not declared and no implementation exists.
+- **Not applicable** — the spec topic does not apply to algocline's deployment
+  (e.g. HTTP auth for a STDIO-only server).
+
+### Base protocol
+
+| Spec topic | Status | Notes |
+|---|---|---|
+| [Lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle) (`initialize`, `initialized`, `shutdown`) | Full | Delegated to `rmcp` ServerHandler default. |
+| Messages (JSON-RPC 2.0 requests / responses / notifications) | Full | Delegated to `rmcp`. |
+| Versioning (capability negotiation, spec version exchange) | Full | Delegated to `rmcp`. |
+| Transports — STDIO | Full | `rmcp` `transport-io` feature. |
+| Transports — Streamable HTTP / SSE | Not yet | algocline-mcp ships as a STDIO server only. |
+| [Authorization](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) (OAuth 2.1 for HTTP) | Not applicable | Specified for HTTP transports; STDIO server retrieves credentials from environment per spec. |
+| `_meta` field passthrough | Partial | Standard `rmcp` types accept `_meta` where defined by the spec; algocline does not emit custom `_meta` of its own. |
+
+### Server features
+
+| Spec topic | Status | Notes |
+|---|---|---|
+| [Tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools) — `tools/list`, `tools/call` | Full | All algocline operations are exposed as Tools (see `service.rs`). |
+| Tools — `notifications/tools/list_changed` | Not yet | Tool list is static at server startup; no install/remove path mutates it. |
+| Tools — `outputSchema` / structured content | Partial | Some tools return JSON in text content; explicit `outputSchema` declarations and `structuredContent` round-trip are not yet provided per tool. |
+| [Resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources) — `resources/list`, `resources/read` | Full | See [mcp-resources.md](../mcp-resources.md). |
+| Resources — `resources/templates/list` | Full | Seven URI templates exposed. |
+| Resources — `notifications/resources/list_changed` | Not yet | Static resource list at V1; capability sub-flag not declared. |
+| Resources — `resources/subscribe` / `notifications/resources/updated` | Not yet | Capability sub-flag not declared; client-side polling against `resources/read` is the supported pattern. |
+| Resources — embedded resources in Tool results | Full | Tools may return `type: "resource"` content per spec. |
+| [Prompts](https://modelcontextprotocol.io/specification/2025-06-18/server/prompts) — `prompts/list`, `prompts/get` | Full | Static workflow-trigger set (`advice`, `new_package`); see the Prompts section below for scope rationale. |
+| Prompts — `notifications/prompts/list_changed` | Partial | Capability sub-flag is currently declared `true` and six pkg-mutating MCP tools still fire the notification, but with the static prompt list the notification is a no-op. Cleanup tracked separately. |
+| Prompts — embedded resources in `PromptMessage.content` | Not yet | Blocked on upstream rmcp serialization bug — see [rust-sdk#842](https://github.com/modelcontextprotocol/rust-sdk/issues/842) / [#843](https://github.com/modelcontextprotocol/rust-sdk/pull/843). |
+
+### Server utilities
+
+| Spec topic | Status | Notes |
+|---|---|---|
+| [Completion](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/completion) — capability `completions: {}` | Full | Declared. |
+| Completion — `ref/resource` | Partial | Handled for resource template arguments where the algocline side has a candidate source; other arg names return an empty result with `total: 0`, `hasMore: false`. |
+| Completion — `ref/prompt` | Not yet | Returns an empty completion result; the workflow-trigger arguments are free-form strings without a managed candidate set. |
+| [Pagination](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination) (cursor on `*/list` responses) | Partial | algocline's list responses are small enough to fit in one page and do not emit `nextCursor`; the spec permits this. Cursor support is not implemented for any list endpoint. |
+| [Logging](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/logging) (`logging/setLevel`, `notifications/message`) | Not yet | algocline uses `tracing` internally; no `logging` capability is declared and no `notifications/message` is emitted. |
+
+### Base utilities
+
+| Spec topic | Status | Notes |
+|---|---|---|
+| [Ping](https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/ping) | Full | `rmcp` default handler. |
+| [Cancellation](https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/cancellation) (`notifications/cancelled`) | Partial | `rmcp` routes cancellation notifications; individual algocline tool handlers do not yet cooperatively check cancellation for long-running operations. |
+| [Progress](https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/progress) (`notifications/progress` with `progressToken`) | Not yet | algocline does not emit progress notifications. |
+
+### Client features (server-initiated requests to the client)
+
+| Spec topic | Status | Notes |
+|---|---|---|
+| [Sampling](https://modelcontextprotocol.io/specification/2025-06-18/client/sampling) (`sampling/createMessage`) | Not yet | Tracked under #1776105556-75720. Required before Prompts/Tools can drive recursive host-LLM interactions on the server side. |
+| [Roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots) (`roots/list`, `notifications/roots/list_changed`) | Not yet | algocline does not currently request roots from the client. |
+| [Elicitation](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation) (`elicitation/create`) | Not yet | algocline does not currently solicit additional user input via the client. |
 
 ## Prompts
 

@@ -8,7 +8,7 @@ _default:
 
 # Run all checks (fmt, clippy, test, V0 invariants) — CI equivalent
 [group: 'agent']
-ci: fmt-check clippy test check-invariants
+ci: fmt-check clippy test check-invariants check-agent-index
 
 # Lint with clippy (warnings = errors)
 [group: 'agent']
@@ -192,6 +192,50 @@ publish VERSION:
     cargo publish
     git tag v{{VERSION}}
     git push origin v{{VERSION}}
+
+# ─── Docs ───────────────────────────────────────────────────────
+
+# Verify docs/AGENT_INDEX.md: all linked paths exist + all docs/*.md are
+# referenced (except AGENT_INDEX.md itself).
+[group: 'agent']
+check-agent-index:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    index=docs/AGENT_INDEX.md
+    if [ ! -f "$index" ]; then
+        echo "FAIL: $index not found" >&2
+        exit 1
+    fi
+    fail=0
+    # 1. Every markdown link target referenced from the index must exist.
+    #    Match `](path)` for relative paths (skip http/https/anchor-only).
+    while IFS= read -r target; do
+        # strip optional #anchor
+        path="${target%%#*}"
+        [ -z "$path" ] && continue
+        case "$path" in
+            http://*|https://*) continue ;;
+        esac
+        resolved="docs/$path"
+        case "$path" in ../*) resolved="${path#../}" ;; esac
+        if [ ! -e "$resolved" ]; then
+            echo "FAIL: linked path missing: $path (resolved=$resolved)" >&2
+            fail=1
+        fi
+    done < <(grep -oE '\]\(([^)]+)\)' "$index" | sed -E 's/^\]\(//; s/\)$//')
+    # 2. Every docs/*.md must be referenced from the index (except itself).
+    for f in docs/*.md; do
+        base=$(basename "$f")
+        [ "$base" = "AGENT_INDEX.md" ] && continue
+        if ! grep -qF "$base" "$index"; then
+            echo "FAIL: docs/$base not referenced in $index" >&2
+            fail=1
+        fi
+    done
+    if [ "$fail" -ne 0 ]; then
+        exit 1
+    fi
+    echo "AGENT_INDEX.md OK"
 
 # ─── Codegen ────────────────────────────────────────────────────
 

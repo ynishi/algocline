@@ -4610,6 +4610,184 @@ async fn test_alc_hub_index_aggregate_warnings_emitted_on_corrupt_cache() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── notifications/prompts/list_changed E2E ──────────────────────
+
+/// `ClientHandler` that counts received `notifications/prompts/list_changed`
+/// notifications via an atomic counter shared with the test.
+#[derive(Clone, Default)]
+struct NotifyCapture {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl rmcp::ClientHandler for NotifyCapture {
+    async fn on_prompt_list_changed(
+        &self,
+        _ctx: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Connect with a specific ALC_HOME directory and a custom `ClientHandler`,
+/// returning a `RunningService<RoleClient, NotifyCapture>`.
+///
+/// Mirrors `connect_with_alc_home` but accepts an arbitrary `NotifyCapture`
+/// so tests can observe `notifications/prompts/list_changed` events.
+///
+/// # Panics
+///
+/// Panics if the `alc` binary cannot be spawned or if the MCP handshake fails.
+async fn connect_with_alc_home_capture(
+    alc_home: &std::path::Path,
+    handler: NotifyCapture,
+) -> rmcp::service::RunningService<rmcp::RoleClient, NotifyCapture> {
+    let bin = std::env::var("CARGO_BIN_EXE_alc")
+        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
+    let packages_path = alc_home.join("packages");
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("ALC_HOME", alc_home)
+        .env("ALC_PACKAGES_PATH", &packages_path);
+    // SAFETY: Command::new and env are infallible; TokioChildProcess::new
+    // may fail if the binary is not found — the expect surfaces that clearly.
+    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
+    handler
+        .serve(transport)
+        .await
+        .expect("failed to initialize MCP session")
+}
+
+/// Verify that `pkg_link` and `pkg_unlink` both fire
+/// `notifications/prompts/list_changed` and that the prompt list count
+/// changes accordingly.
+///
+/// Uses `pkg_link` + `pkg_unlink` rather than `pkg_install` + `pkg_remove`
+/// because `pkg_unlink` removes the symlink from the packages search path,
+/// which is immediately visible to `list_all_prompts()`. In contrast,
+/// `pkg_remove scope=global` only removes the manifest entry while leaving
+/// the physical directory intact — the directory would still be scanned.
+///
+/// # Test flow
+///
+/// 1. Create a temporary ALC_HOME with an empty `packages/` dir.
+/// 2. Write a minimal single-package fixture (one `init.lua`).
+/// 3. Connect via `connect_with_alc_home_capture` with a `NotifyCapture` handler.
+/// 4. Obtain baseline prompt count with `list_all_prompts()`.
+/// 5. Call `alc_pkg_link` with the fixture path (K-137: absolute path, no `file://`).
+/// 6. Sleep 200 ms to let the notification propagate.
+/// 7. Assert prompt count increased by 1 and `NotifyCapture.count >= 1`.
+/// 8. Call `alc_pkg_unlink` with the fixture package name.
+/// 9. Sleep 200 ms.
+/// 10. Assert prompt count returned to baseline and `NotifyCapture.count >= 2`.
+#[tokio::test]
+async fn test_pkg_install_remove_fires_prompt_list_changed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Create the packages directory (required by connect_with_alc_home_capture).
+    let packages_dir = tmp.path().join("packages");
+    // SAFETY: fresh tempdir, no race.
+    std::fs::create_dir_all(&packages_dir).expect("mkdir packages");
+
+    // Source fixture: a standalone directory with a single init.lua.
+    // This is treated as a Single package by pkg_link (K-137).
+    let fixture_src = tmp.path().join("fixture_notify_pkg");
+    std::fs::create_dir_all(&fixture_src).expect("mkdir fixture_notify_pkg");
+    std::fs::write(
+        fixture_src.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "fixture_notify_pkg", version = "0.1.0", description = "notify test pkg" }
+return M"#,
+    )
+    .expect("write fixture init.lua");
+
+    let capture = NotifyCapture::default();
+    let counter = std::sync::Arc::clone(&capture.count);
+
+    let client = connect_with_alc_home_capture(tmp.path(), capture).await;
+
+    // Baseline prompt count before any link.
+    let baseline_prompts = client
+        .list_all_prompts()
+        .await
+        .expect("list_all_prompts (baseline) failed");
+    let n0 = baseline_prompts.len();
+
+    // Link the fixture package via absolute path string (K-137: no file:// URL).
+    // pkg_link creates a symlink in {ALC_HOME}/packages/ pointing to the fixture.
+    let link_raw = client
+        .call_tool(call_params(
+            "alc_pkg_link",
+            json!({
+                "path": fixture_src.to_string_lossy().as_ref(),
+                "scope": "global"
+            }),
+        ))
+        .await
+        .expect("alc_pkg_link call_tool failed");
+    assert!(
+        !link_raw.is_error.unwrap_or(false),
+        "pkg_link must succeed; raw result: {:?}",
+        link_raw
+    );
+
+    // Allow time for notification to propagate from server to client handler.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Assert: prompt count increased by 1 (link path).
+    let after_link = client
+        .list_all_prompts()
+        .await
+        .expect("list_all_prompts (after link) failed");
+    assert_eq!(
+        after_link.len(),
+        n0 + 1,
+        "prompt count must increase by 1 after pkg_link; baseline={n0}, got={}",
+        after_link.len()
+    );
+
+    // Assert: at least one notification was received (crux: notify call fires).
+    assert!(
+        counter.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "expected at least 1 prompts/list_changed notification after pkg_link"
+    );
+
+    // Unlink the package: removes the symlink, making the package invisible to pkg_list.
+    let unlink_raw = client
+        .call_tool(call_params(
+            "alc_pkg_unlink",
+            json!({ "name": "fixture_notify_pkg" }),
+        ))
+        .await
+        .expect("alc_pkg_unlink call_tool failed");
+    assert!(
+        !unlink_raw.is_error.unwrap_or(false),
+        "pkg_unlink must succeed; raw result: {:?}",
+        unlink_raw
+    );
+
+    // Allow time for unlink notification to propagate.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Assert: prompt count returned to baseline (unlink path).
+    let after_unlink = client
+        .list_all_prompts()
+        .await
+        .expect("list_all_prompts (after unlink) failed");
+    assert_eq!(
+        after_unlink.len(),
+        n0,
+        "prompt count must return to baseline after pkg_unlink; baseline={n0}, got={}",
+        after_unlink.len()
+    );
+
+    // Assert: at least two notifications received (link + unlink).
+    assert!(
+        counter.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "expected at least 2 prompts/list_changed notifications after link+unlink"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// E2E: `completion/complete` for a resource template arg name that the server
 /// does not provide candidates for must return a non-error response with
 /// `values: []`, `total: 0`, and `has_more: false`.

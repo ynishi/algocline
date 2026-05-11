@@ -9,7 +9,7 @@ use rmcp::{
     schemars,
     service::RequestContext,
     service::RoleServer,
-    tool, tool_handler, tool_router, ServerHandler,
+    tool, tool_handler, tool_router, Peer, ServerHandler,
 };
 use serde::Deserialize;
 
@@ -1044,9 +1044,11 @@ impl AlcService {
     async fn pkg_link(
         &self,
         Parameters(params): Parameters<PkgLinkParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let scope = params.scope.map(|s| s.as_str().to_string());
-        self.app
+        let result = self
+            .app
             .pkg_link(
                 params.path,
                 params.name,
@@ -1054,7 +1056,13 @@ impl AlcService {
                 scope,
                 params.project_root,
             )
-            .await
+            .await;
+        if result.is_ok() {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("notify_prompt_list_changed failed: {e}");
+            }
+        }
+        result
     }
 
     /// List installed packages with metadata.
@@ -1107,10 +1115,18 @@ impl AlcService {
     async fn pkg_install(
         &self,
         Parameters(params): Parameters<PkgInstallParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
-        self.app
+        let result = self
+            .app
             .pkg_install(params.url, params.name, params.force)
-            .await
+            .await;
+        if result.is_ok() {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("notify_prompt_list_changed failed: {e}");
+            }
+        }
+        result
     }
 
     /// Remove a package entry, scoped by `scope`:
@@ -1132,11 +1148,19 @@ impl AlcService {
     async fn pkg_remove(
         &self,
         Parameters(params): Parameters<PkgRemoveParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let scope = params.scope.map(|s| s.as_str().to_string());
-        self.app
+        let result = self
+            .app
             .pkg_remove(&params.name, params.project_root, params.version, scope)
-            .await
+            .await;
+        if result.is_ok() {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("notify_prompt_list_changed failed: {e}");
+            }
+        }
+        result
     }
 
     /// Remove a symlinked package from `~/.algocline/packages/`.
@@ -1150,8 +1174,15 @@ impl AlcService {
     async fn pkg_unlink(
         &self,
         Parameters(params): Parameters<PkgUnlinkParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
-        self.app.pkg_unlink(params.name).await
+        let result = self.app.pkg_unlink(params.name).await;
+        if result.is_ok() {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("notify_prompt_list_changed failed: {e}");
+            }
+        }
+        result
     }
 
     /// Heal broken package state by re-running `pkg_install` for entries whose
@@ -1173,8 +1204,15 @@ impl AlcService {
     async fn pkg_repair(
         &self,
         Parameters(params): Parameters<PkgRepairParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
-        self.app.pkg_repair(params.name, params.project_root).await
+        let result = self.app.pkg_repair(params.name, params.project_root).await;
+        if result.is_ok() {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("notify_prompt_list_changed failed: {e}");
+            }
+        }
+        result
     }
 
     /// Diagnose package state without side effects (read-only counterpart
@@ -1226,15 +1264,23 @@ impl AlcService {
     async fn pkg_scaffold(
         &self,
         Parameters(params): Parameters<PkgScaffoldParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
-        self.app
+        let result = self
+            .app
             .pkg_scaffold(
                 params.name,
                 params.target_dir,
                 params.category,
                 params.description,
             )
-            .await
+            .await;
+        if result.is_ok() {
+            if let Err(e) = peer.notify_prompt_list_changed().await {
+                tracing::warn!("notify_prompt_list_changed failed: {e}");
+            }
+        }
+        result
     }
 
     // ─── Logging ─────────────────────────────────────────────

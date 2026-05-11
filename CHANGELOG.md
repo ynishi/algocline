@@ -9,14 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`notifications/prompts/list_changed` emitter — Phase 1.x-A**.
+  Six pkg-mutating MCP tools now fire
+  `notifications/prompts/list_changed` on success so MCP clients
+  (e.g. Claude Code) can refresh their prompt list without polling:
+  `alc_pkg_install`, `alc_pkg_remove`, `alc_pkg_link`,
+  `alc_pkg_unlink`, `alc_pkg_repair`, `alc_pkg_scaffold`.
+  The notification is best-effort (client disconnects are logged and
+  silently dropped per MCP spec); tool results are unaffected by
+  notification failures. A new E2E test (`test_pkg_link_unlink_prompts_list_changed`)
+  asserts a concrete before/after count change on `prompts/list`
+  after link and unlink, verifying the full round-trip through the
+  MCP notification channel.
+
 - **MCP Prompts capability (Phase 1, dynamic flow)**.
   Each installed package is exposed 1:1 as an MCP prompt under
   `/mcp__algocline__<pkg_name>`. `prompts/list` enumerates packages
   by reading `alc.toml` + `~/.algocline/packages/` on every request
   (no compile-time list). `prompts/get` substitutes the `task`
   argument into a single text message at runtime. Capability declares
-  `prompts: { listChanged: true }`; the `notifications/prompts/list_changed`
-  emitter is deferred to Phase 1.x (declaration only in this release).
+  `prompts: { listChanged: true }`.
 
 ## [0.34.0] - 2026-05-10
 

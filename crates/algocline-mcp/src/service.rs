@@ -9,7 +9,7 @@ use rmcp::{
     schemars,
     service::RequestContext,
     service::RoleServer,
-    tool, tool_handler, tool_router, Peer, ServerHandler,
+    tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
 
@@ -1044,7 +1044,6 @@ impl AlcService {
     async fn pkg_link(
         &self,
         Parameters(params): Parameters<PkgLinkParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let scope = params.scope.map(|s| s.as_str().to_string());
         let result = self
@@ -1057,11 +1056,6 @@ impl AlcService {
                 params.project_root,
             )
             .await;
-        if result.is_ok() {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("notify_prompt_list_changed failed: {e}");
-            }
-        }
         result
     }
 
@@ -1115,17 +1109,11 @@ impl AlcService {
     async fn pkg_install(
         &self,
         Parameters(params): Parameters<PkgInstallParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let result = self
             .app
             .pkg_install(params.url, params.name, params.force)
             .await;
-        if result.is_ok() {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("notify_prompt_list_changed failed: {e}");
-            }
-        }
         result
     }
 
@@ -1148,18 +1136,12 @@ impl AlcService {
     async fn pkg_remove(
         &self,
         Parameters(params): Parameters<PkgRemoveParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let scope = params.scope.map(|s| s.as_str().to_string());
         let result = self
             .app
             .pkg_remove(&params.name, params.project_root, params.version, scope)
             .await;
-        if result.is_ok() {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("notify_prompt_list_changed failed: {e}");
-            }
-        }
         result
     }
 
@@ -1174,14 +1156,8 @@ impl AlcService {
     async fn pkg_unlink(
         &self,
         Parameters(params): Parameters<PkgUnlinkParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let result = self.app.pkg_unlink(params.name).await;
-        if result.is_ok() {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("notify_prompt_list_changed failed: {e}");
-            }
-        }
         result
     }
 
@@ -1204,14 +1180,8 @@ impl AlcService {
     async fn pkg_repair(
         &self,
         Parameters(params): Parameters<PkgRepairParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let result = self.app.pkg_repair(params.name, params.project_root).await;
-        if result.is_ok() {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("notify_prompt_list_changed failed: {e}");
-            }
-        }
         result
     }
 
@@ -1264,7 +1234,6 @@ impl AlcService {
     async fn pkg_scaffold(
         &self,
         Parameters(params): Parameters<PkgScaffoldParams>,
-        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         let result = self
             .app
@@ -1275,11 +1244,6 @@ impl AlcService {
                 params.description,
             )
             .await;
-        if result.is_ok() {
-            if let Err(e) = peer.notify_prompt_list_changed().await {
-                tracing::warn!("notify_prompt_list_changed failed: {e}");
-            }
-        }
         result
     }
 
@@ -1898,7 +1862,6 @@ impl ServerHandler for AlcService {
             .enable_resources()
             .enable_completions()
             .enable_prompts()
-            .enable_prompts_list_changed()
             .build();
         info.instructions = Some(
             "algocline — LLM amplification engine. Execute Lua strategies that structurally \

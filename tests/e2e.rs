@@ -4704,15 +4704,14 @@ return M"#,
 
     let client = connect_with_alc_home_capture(tmp.path(), capture).await;
 
-    // Baseline prompt count before any link.
-    let baseline_prompts = client
-        .list_all_prompts()
-        .await
-        .expect("list_all_prompts (baseline) failed");
-    let n0 = baseline_prompts.len();
+    // The prompts list is static (workflow-trigger only; see
+    // `docs/design/mcp-support.md`), so pkg_link / pkg_unlink no longer
+    // change the list length. This test now only validates that the pkg
+    // hooks still emit `notifications/prompts/list_changed` — the hook
+    // firing behaviour is unrelated to the Prompts scope decision and
+    // remains in place pending a separate cleanup.
 
     // Link the fixture package via absolute path string (K-137: no file:// URL).
-    // pkg_link creates a symlink in {ALC_HOME}/packages/ pointing to the fixture.
     let link_raw = client
         .call_tool(call_params(
             "alc_pkg_link",
@@ -4732,25 +4731,12 @@ return M"#,
     // Allow time for notification to propagate from server to client handler.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Assert: prompt count increased by 1 (link path).
-    let after_link = client
-        .list_all_prompts()
-        .await
-        .expect("list_all_prompts (after link) failed");
-    assert_eq!(
-        after_link.len(),
-        n0 + 1,
-        "prompt count must increase by 1 after pkg_link; baseline={n0}, got={}",
-        after_link.len()
-    );
-
-    // Assert: at least one notification was received (crux: notify call fires).
     assert!(
         counter.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "expected at least 1 prompts/list_changed notification after pkg_link"
     );
 
-    // Unlink the package: removes the symlink, making the package invisible to pkg_list.
+    // Unlink the package.
     let unlink_raw = client
         .call_tool(call_params(
             "alc_pkg_unlink",
@@ -4764,22 +4750,8 @@ return M"#,
         unlink_raw
     );
 
-    // Allow time for unlink notification to propagate.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Assert: prompt count returned to baseline (unlink path).
-    let after_unlink = client
-        .list_all_prompts()
-        .await
-        .expect("list_all_prompts (after unlink) failed");
-    assert_eq!(
-        after_unlink.len(),
-        n0,
-        "prompt count must return to baseline after pkg_unlink; baseline={n0}, got={}",
-        after_unlink.len()
-    );
-
-    // Assert: at least two notifications received (link + unlink).
     assert!(
         counter.load(std::sync::atomic::Ordering::SeqCst) >= 2,
         "expected at least 2 prompts/list_changed notifications after link+unlink"
@@ -5292,32 +5264,19 @@ fn test_cli_version() {
     );
 }
 
-// ─── MCP Prompts E2E (Phase 1, dynamic flow) ─────────────────────────────────
+// ─── MCP Prompts E2E (workflow-trigger) ──────────────────────────────────────
 
-/// `prompts/list` must return at least one prompt when a fixture package is
-/// installed in the scoped `ALC_PACKAGES_PATH`.
+/// `prompts/list` returns the static workflow-trigger prompts (`advice`,
+/// `new_package`). See `docs/design/mcp-support.md` for the scope rationale.
 ///
 /// Verifies:
-/// - `list_all_prompts()` succeeds and returns `>= 1` entry
-/// - The fixture package name is present in the result
-/// - Each prompt carries a `task` argument with `required: Some(false)`
+/// - `list_all_prompts()` succeeds.
+/// - Both `advice` and `new_package` are present.
+/// - `advice` exposes a required `task` argument.
+/// - `new_package` exposes a required `name` argument and an optional `category`.
 #[tokio::test]
 async fn test_list_prompts_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
-
-    // Place a fixture package directly in the scoped packages directory.
-    // `connect_with_alc_home` sets `ALC_PACKAGES_PATH` to `{tmp}/packages`,
-    // so `pkg_list` will enumerate packages from this dir without installing.
-    let pkg_dir = tmp.path().join("packages").join("test_prompts_pkg");
-    // SAFETY: tempdir was just created; create_dir_all cannot race here.
-    std::fs::create_dir_all(&pkg_dir).expect("mkdir packages/test_prompts_pkg");
-    std::fs::write(
-        pkg_dir.join("init.lua"),
-        r#"local M = {}
-M.meta = { name = "test_prompts_pkg", version = "0.1.0", description = "Test prompt package" }
-return M"#,
-    )
-    .expect("write init.lua");
 
     let client = connect_with_alc_home(tmp.path()).await;
 
@@ -5326,59 +5285,71 @@ return M"#,
         .await
         .expect("list_all_prompts failed");
 
-    assert!(
-        !prompts.is_empty(),
-        "expected at least one prompt, got empty list"
-    );
-
-    let found = prompts
+    let advice = prompts
         .iter()
-        .find(|p| p.name == "test_prompts_pkg")
-        .expect("fixture package 'test_prompts_pkg' not found in prompt list");
-
-    // Each prompt must expose the `task` argument.
-    let args = found
+        .find(|p| p.name == "advice")
+        .expect("`advice` prompt missing from list");
+    let advice_args = advice
         .arguments
         .as_deref()
-        .expect("prompt must have arguments");
-    assert_eq!(args.len(), 1, "expected exactly 1 argument");
-    assert_eq!(args[0].name, "task");
+        .expect("advice must declare arguments");
+    assert_eq!(advice_args.len(), 1, "advice expects exactly 1 argument");
+    assert_eq!(advice_args[0].name, "task");
     assert_eq!(
-        args[0].required,
+        advice_args[0].required,
+        Some(true),
+        "advice.task must be required"
+    );
+
+    let new_pkg = prompts
+        .iter()
+        .find(|p| p.name == "new_package")
+        .expect("`new_package` prompt missing from list");
+    let new_pkg_args = new_pkg
+        .arguments
+        .as_deref()
+        .expect("new_package must declare arguments");
+    assert_eq!(
+        new_pkg_args.len(),
+        2,
+        "new_package expects exactly 2 arguments"
+    );
+    let name_arg = new_pkg_args
+        .iter()
+        .find(|a| a.name == "name")
+        .expect("new_package.name argument missing");
+    assert_eq!(
+        name_arg.required,
+        Some(true),
+        "new_package.name must be required"
+    );
+    let category_arg = new_pkg_args
+        .iter()
+        .find(|a| a.name == "category")
+        .expect("new_package.category argument missing");
+    assert_eq!(
+        category_arg.required,
         Some(false),
-        "task argument must be optional"
+        "new_package.category must be optional"
     );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// `prompts/get` must return a single user-role message with the `task` value
-/// substituted into the body at runtime.
+/// `prompts/get` must return a single user-role text message with declared
+/// arguments substituted into the template.
 ///
-/// Verifies:
-/// - `get_prompt` succeeds and returns exactly 1 message
-/// - `messages[0].role` is `User`
-/// - The task value supplied in `arguments` appears in the message text
-/// - The placeholder `${task}` is NOT present verbatim (substitution happened)
+/// Verifies on the `advice` prompt:
+/// - exactly 1 message of role `User` is returned;
+/// - the supplied `task` value appears verbatim in the message text;
+/// - the `${task}` placeholder is not present verbatim (substitution happened).
 #[tokio::test]
 async fn test_get_prompt_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    let pkg_dir = tmp.path().join("packages").join("test_prompts_pkg");
-    // SAFETY: same as above — fresh tempdir.
-    std::fs::create_dir_all(&pkg_dir).expect("mkdir packages/test_prompts_pkg");
-    std::fs::write(
-        pkg_dir.join("init.lua"),
-        r#"local M = {}
-M.meta = { name = "test_prompts_pkg", version = "0.1.0", description = "Test prompt package" }
-return M"#,
-    )
-    .expect("write init.lua");
-
     let client = connect_with_alc_home(tmp.path()).await;
 
     let task_text = "解の精度を上げて";
-    // Build the arguments map: { "task": "<task_text>" }
     let mut arguments = serde_json::Map::new();
     arguments.insert(
         "task".to_string(),
@@ -5386,7 +5357,7 @@ return M"#,
     );
 
     let result = client
-        .get_prompt(GetPromptRequestParams::new("test_prompts_pkg").with_arguments(arguments))
+        .get_prompt(GetPromptRequestParams::new("advice").with_arguments(arguments))
         .await
         .expect("get_prompt failed");
 
@@ -5397,14 +5368,12 @@ return M"#,
     );
 
     let msg = &result.messages[0];
-    // Role must be User.
     assert_eq!(
         msg.role,
         rmcp::model::PromptMessageRole::User,
         "message role must be User"
     );
 
-    // The message content must be a Text variant containing the task value.
     let text = match &msg.content {
         rmcp::model::PromptMessageContent::Text { text } => text.as_str(),
         other => panic!("expected Text content, got: {other:?}"),

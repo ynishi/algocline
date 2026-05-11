@@ -33,6 +33,8 @@ want one.
 
 ## MCP Surface
 
+- [docs/design/mcp-support.md](design/mcp-support.md) — algocline-wide MCP
+  capability adoption and non-standard design choices (Prompts scope etc.)
 - [docs/mcp-resources.md](mcp-resources.md) — MCP resource catalog exposed by
   the server
 - [docs/lua-stdlib.md](lua-stdlib.md) — `alc.*` Lua stdlib API reference

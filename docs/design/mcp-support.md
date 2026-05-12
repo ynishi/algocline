@@ -25,7 +25,7 @@ Strict feature-by-feature support matrix against the MCP 2025-06-18 spec.
 
 | Spec topic | Status | Notes |
 |---|---|---|
-| [Lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle) (`initialize`, `initialized`, `shutdown`) | Full | Delegated to `rmcp` ServerHandler default. |
+| [Lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle) (`initialize` request + `notifications/initialized`; shutdown is transport-level per spec) | Full | Delegated to `rmcp` ServerHandler default. |
 | Messages (JSON-RPC 2.0 requests / responses / notifications) | Full | Delegated to `rmcp`. |
 | Versioning (capability negotiation, spec version exchange) | Full | Delegated to `rmcp`. |
 | Transports — STDIO | Full | `rmcp` `transport-io` feature. |
@@ -41,10 +41,10 @@ Strict feature-by-feature support matrix against the MCP 2025-06-18 spec.
 | Tools — `notifications/tools/list_changed` | Not yet | Tool list is static at server startup; no install/remove path mutates it. |
 | Tools — `outputSchema` / structured content | Partial | Some tools return JSON in text content; explicit `outputSchema` declarations and `structuredContent` round-trip are not yet provided per tool. |
 | [Resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources) — `resources/list`, `resources/read` | Full | See [mcp-resources.md](../mcp-resources.md). |
-| Resources — `resources/templates/list` | Full | Seven URI templates exposed. |
+| Resources — `resources/templates/list` | Full | Eight URI templates exposed. |
 | Resources — `notifications/resources/list_changed` | Not yet | Static resource list at V1; capability sub-flag not declared. |
 | Resources — `resources/subscribe` / `notifications/resources/updated` | Not yet | Capability sub-flag not declared; client-side polling against `resources/read` is the supported pattern. |
-| Resources — embedded resources in Tool results | Full | Tools may return `type: "resource"` content per spec. |
+| Resources — embedded resources in Tool results | Partial | rmcp structurally supports `type: "resource"` and `type: "resource_link"` content variants, but no algocline tool currently emits them — all tools return `Result<String, String>` so the macro produces only `RawContent::Text`. |
 | [Prompts](https://modelcontextprotocol.io/specification/2025-06-18/server/prompts) — `prompts/list`, `prompts/get` | Full | Static workflow-trigger set (`advice`, `new_package`); see the Prompts section below for scope rationale. |
 | Prompts — `notifications/prompts/list_changed` | Not supported (intentional) | The spec defines this notification as scoped to changes in the `prompts/list` output ("SHOULD send when the list of available prompts changes"). algocline's Prompts surface is a fixed set of kicker workflows (`advice`, `new_package`) with no mutation path, so the SHOULD condition never holds and the notification has no role here. The capability sub-flag is declared `false` (i.e. omitted) and no emit sites exist. **This notification is independent of `notifications/resources/list_changed`**, which is governed by the `resources.listChanged` sub-flag and is the correct hook for changes to the resource list. |
 | Prompts — embedded resources in `PromptMessage.content` | Not yet | Blocked on upstream rmcp serialization bug — see [rust-sdk#842](https://github.com/modelcontextprotocol/rust-sdk/issues/842) / [#843](https://github.com/modelcontextprotocol/rust-sdk/pull/843). |

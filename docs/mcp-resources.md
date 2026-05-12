@@ -7,13 +7,11 @@ Service-layer read-only paths are projected as resources under the `alc://` sche
 
 **V1 scope:**
 
-- Fixed resources (2): `alc://types/alc.d.lua`, `alc://types/alc_shapes.d.lua`
-- Template resources (7): packages, cards, scenarios, evals, logs
+- Fixed resources (3): `alc://types/alc.d.lua`, `alc://types/alc_shapes.d.lua`, `alc://hub/index`
+- Template resources (8): packages, cards, scenarios, evals, logs
 
 **V2 candidates (out of scope for this release):**
 
-- `alc://hub/index` — pending canonical AppDir path for `hub_reindex` default output
-- `alc://packages/{name}/narrative` — `hub_gendoc` emits to an external `out_dir`, not AppDir
 - `list_changed` notifications and `resources/subscribe` — V1 is static capability only
 
 ## Fixed Resources
@@ -24,6 +22,7 @@ Returned by `resources/list`. Always listed; a `read` for a missing file returns
 |---|---|---|---|---|
 | `alc://types/alc.d.lua` | `alc.d.lua` | Lua type stubs for `alc.*` StdLib | `text/x-lua` | `$ALC_HOME/types/alc.d.lua` |
 | `alc://types/alc_shapes.d.lua` | `alc_shapes.d.lua` | Lua type stubs for alc_shapes DSL | `text/x-lua` | `$ALC_HOME/types/alc_shapes.d.lua` |
+| `alc://hub/index` | `hub-index` | Aggregated package catalog merged across all installed hub sources | `application/json` | (computed from `~/.algocline/hub/*/hub_index.json`) |
 
 ## Resource Templates
 
@@ -33,6 +32,7 @@ Returned by `resources/templates/list`. URI templates follow RFC 6570 level-1 (`
 |---|---|---|---|
 | `alc://packages/{name}/init.lua` | Package init.lua source | `text/x-lua` | Resolves global and variant-scoped packages |
 | `alc://packages/{name}/meta` | Package metadata (M.meta table) | `application/json` | Extracted without running the Lua VM |
+| `alc://packages/{name}/narrative` | Markdown narrative for a bundled package | `text/markdown` | Stdpkg reference text |
 | `alc://cards/{card_id}` | Full Card JSON | `application/json` | card_id is a UUID |
 | `alc://cards/{card_id}/samples` | Card samples JSONL | `application/json` | Supports `?offset=N&limit=M` |
 | `alc://scenarios/{name}` | Scenario source | `text/x-lua` | Name without `.lua` extension |

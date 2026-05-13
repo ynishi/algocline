@@ -9,6 +9,27 @@ use super::transcript::write_transcript_log;
 use super::AppService;
 use crate::pool::dispatch::{continue_via_pool, run_via_pool};
 
+/// Recover from MCP clients that JSON-stringify an object-typed field
+/// before sending. The MCP `inputSchema` for `ctx` / `opts` /
+/// `strategy_opts` declares `type: object`, but some clients send a
+/// JSON-encoded string instead. Without this normalisation the value
+/// reaches Lua as a string and breaks pkgs that require a table
+/// (issue 1778656404-63015).
+///
+/// Only `Value::String` payloads that parse into a JSON object or
+/// array are replaced; ordinary strings and primitive scalars pass
+/// through untouched.
+pub(crate) fn normalize_stringified_json_object(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(ref s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(parsed @ serde_json::Value::Object(_)) => parsed,
+            Ok(parsed @ serde_json::Value::Array(_)) => parsed,
+            _ => v,
+        },
+        other => other,
+    }
+}
+
 /// Splice `save_warning` into the JSON `result` when the optional
 /// warning is `Some(_)`. Returns the original string unchanged when
 /// there is no warning.
@@ -58,7 +79,7 @@ impl AppService {
         host_mode: Option<bool>,
     ) -> Result<String, String> {
         let code = resolve_code(code, code_file)?;
-        let ctx = ctx.unwrap_or(serde_json::Value::Null);
+        let ctx = normalize_stringified_json_object(ctx.unwrap_or(serde_json::Value::Null));
         let (extra, extra_warnings) = self.resolve_extra_lib_paths(project_root.as_deref());
         let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
         let mut warnings: Vec<String> = extra_warnings;
@@ -156,6 +177,7 @@ impl AppService {
 
         let code = make_require_code(strategy);
 
+        let opts = opts.map(normalize_stringified_json_object);
         let mut ctx_map = match opts {
             Some(serde_json::Value::Object(m)) => m,
             _ => serde_json::Map::new(),

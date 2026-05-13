@@ -4,6 +4,7 @@ use super::eval_store::{
 };
 use super::path::ContainedPath;
 use super::resolve::{is_package_installed, resolve_scenario_code};
+use super::run::normalize_stringified_json_object;
 use super::AppService;
 
 /// Lua shim that bridges algocline's `alc.*` primitives to the `std` global
@@ -74,6 +75,7 @@ impl AppService {
             resolve_scenario_code(&app_dir, scenario, scenario_file, scenario_name.clone())?;
 
         // Build strategy opts Lua table literal
+        let strategy_opts = strategy_opts.map(normalize_stringified_json_object);
         let opts_lua = match &strategy_opts {
             Some(v) if !v.is_null() => format!("alc.json_decode('{}')", v),
             _ => "nil".to_string(),

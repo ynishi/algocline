@@ -1,5 +1,6 @@
 mod bridge;
 pub mod card;
+pub mod execution;
 mod executor;
 mod llm_bridge;
 mod resolver_factory;

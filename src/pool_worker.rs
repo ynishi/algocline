@@ -827,8 +827,11 @@ mod tests {
         .expect("register worker");
 
         // Give the worker time to start and install the SIGTERM handler.
-        // On a cold binary startup, 300ms is insufficient; 1s covers slow CI.
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        // Cold binary startup under parallel test load (all 21 tests in this
+        // bin running concurrently, plus other workspace crates) can take
+        // 1500-2500ms; 3s covers the worst case observed locally (see
+        // `cargo test --bin alc` 21-parallel reproduction).
+        tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
 
         // Send SIGTERM.
         // SAFETY: libc::kill(pid, sig) is a thin POSIX syscall wrapper.

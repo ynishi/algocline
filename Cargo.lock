@@ -59,6 +59,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "toml",
  "toml_edit",
  "tracing",

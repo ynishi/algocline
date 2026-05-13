@@ -546,14 +546,18 @@ fn log_list_prefers_meta_file() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -605,14 +609,18 @@ fn stats_empty_dir() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -678,14 +686,18 @@ fn stats_aggregates_by_strategy() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -755,14 +767,18 @@ fn stats_legacy_logs_without_strategy() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -805,14 +821,18 @@ fn info_returns_valid_json_with_expected_keys() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -859,14 +879,18 @@ fn info_stderr_only_when_no_log_dir() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -911,14 +935,18 @@ fn require_log_dir_returns_path_when_present() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -955,14 +983,18 @@ fn require_log_dir_returns_err_when_none() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -1038,14 +1070,18 @@ fn log_list_returns_empty_when_no_log_dir() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),
@@ -1084,14 +1120,18 @@ fn stats_returns_zero_when_no_log_dir() {
     // `AppService::new` spawns a GC task via `tokio::spawn`, which panics
     // when no reactor is running.  Subtask 2c swaps the relative
     // `.algocline/` paths for a tempdir.
+    let _test_executor: Arc<algocline_engine::Executor> = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
+    );
     let app = AppService {
-        executor: Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap()
-                .block_on(async { algocline_engine::Executor::new(vec![]).await.unwrap() }),
-        ),
+        executor: _test_executor.clone(),
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
+        execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            _test_executor.clone(),
+        )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
             std::path::PathBuf::from("."),

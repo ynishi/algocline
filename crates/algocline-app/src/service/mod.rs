@@ -9,6 +9,7 @@ mod dist;
 mod engine_api_impl;
 mod eval;
 mod eval_store;
+mod execution_service_impl;
 pub(crate) mod gendoc;
 mod hub;
 pub mod hub_dist_preset;
@@ -74,6 +75,12 @@ type SessionStrategies = std::sync::Mutex<std::collections::HashMap<String, Stri
 pub struct AppService {
     executor: Arc<Executor>,
     registry: Arc<SessionRegistry>,
+    /// V2 execution registry for [`algocline_core::execution::ExecutionService`] impl.
+    ///
+    /// Coexists with the legacy `registry` field; legacy paths continue to use
+    /// `registry`, new paths (`execution_service_impl.rs`) use this field.
+    /// `Arc` makes `Clone` cheap.
+    pub(crate) execution_registry: Arc<algocline_engine::execution::SessionRegistryV2>,
     log_config: AppConfig,
     /// Package search paths in priority order (first = highest).
     search_paths: Vec<resolve::SearchPath>,
@@ -127,6 +134,12 @@ impl AppService {
         // TTL = 3 hours. Complex strategies may run 30–60 min; 3h covers
         // legitimate paused sessions while eventually reclaiming abandoned ones.
         registry.spawn_gc_task(std::time::Duration::from_secs(10800));
+
+        // V2 execution registry — shares the same Executor as the legacy path.
+        let execution_registry = Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            Arc::clone(&executor),
+        ));
+
         let app_dir = log_config.app_dir();
         let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
         let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
@@ -169,6 +182,7 @@ impl AppService {
         Self {
             executor,
             registry,
+            execution_registry,
             log_config,
             search_paths,
             state_store,

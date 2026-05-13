@@ -620,15 +620,20 @@ mod tests {
         let _ = registry.await_terminal(&sid).await;
 
         // Each observer must receive at least the terminal StateTransition.
-        // We drain each until Closed.
+        // Drain with idle-timeout: bus_tx is retained in SessionRecord for
+        // sink-free late-subscribe (Crux R3), so Closed never fires while the
+        // registry is alive.  A 100ms idle window after await_terminal() is
+        // sufficient — all events are already buffered.
+        use std::time::Duration;
         for (label, handle) in [("h1", &mut h1), ("h2", &mut h2), ("h3", &mut h3)] {
             let mut got_transition = false;
             loop {
-                match handle.recv().await {
-                    Ok(ProgressEvent::StateTransition { .. }) => got_transition = true,
-                    Ok(_) => {}
-                    Err(ObserverRecvError::Closed) => break,
-                    Err(ObserverRecvError::Lagged(_)) => {}
+                match tokio::time::timeout(Duration::from_millis(100), handle.recv()).await {
+                    Ok(Ok(ProgressEvent::StateTransition { .. })) => got_transition = true,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(ObserverRecvError::Closed)) => break,
+                    Ok(Err(ObserverRecvError::Lagged(_))) => {}
+                    Err(_) => break, // idle-timeout: no more events coming
                 }
             }
             assert!(

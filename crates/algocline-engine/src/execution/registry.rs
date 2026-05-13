@@ -31,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 use super::driver::{build_cancel_info, driver_loop, now_ms, transition_state};
 use super::observer::BroadcastObserverHandle;
 use super::record::{RespTxsMap, SessionRecord};
+use crate::card::FileCardStore;
 use crate::executor::Executor;
+use crate::state::JsonFileStore;
 
 // ---------------------------------------------------------------------------
 // SessionRegistryV2
@@ -44,14 +46,30 @@ use crate::executor::Executor;
 pub struct SessionRegistryV2 {
     sessions: Arc<RwLock<HashMap<SessionId, Arc<SessionRecord>>>>,
     executor: Arc<Executor>,
+    state_store: Arc<JsonFileStore>,
+    card_store: Arc<FileCardStore>,
+    scenarios_dir: std::path::PathBuf,
 }
 
 impl SessionRegistryV2 {
-    /// Create a new empty registry backed by `executor`.
-    pub fn new(executor: Arc<Executor>) -> Self {
+    /// Create a new empty registry backed by `executor`, with the storage paths
+    /// that will be injected into each spawned VM session.
+    ///
+    /// The `state_store` / `card_store` / `scenarios_dir` mirror the legacy
+    /// `AppService` resolution against the `AppConfig::app_dir()` layout, so a
+    /// v2 caller produces the same on-disk side effects as a legacy caller.
+    pub fn new(
+        executor: Arc<Executor>,
+        state_store: Arc<JsonFileStore>,
+        card_store: Arc<FileCardStore>,
+        scenarios_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             executor,
+            state_store,
+            card_store,
+            scenarios_dir,
         }
     }
 
@@ -96,23 +114,18 @@ impl SessionRegistryV2 {
 
         let ctx = spec.ctx.unwrap_or_else(|| serde_json::json!({}));
 
-        // Dummy paths — Subtask 3 will inject real AppConfig values.
-        let dummy = std::path::PathBuf::from("/tmp/algocline-v2-dummy");
-        let state_store = Arc::new(crate::state::JsonFileStore::new(dummy.join("state")));
-        let card_store = Arc::new(crate::card::FileCardStore::new(dummy.join("cards")));
-        let scenarios_dir = dummy.join("scenarios");
-
-        // Start the per-session VM.
+        // Start the per-session VM using the storage paths injected at
+        // registry construction (mirrors legacy AppService::start_and_tick).
         let session = self
             .executor
             .start_session(
                 code,
                 ctx,
-                vec![], // extra_lib_paths — Subtask 3 injects real paths
-                vec![], // variant_pkgs   — Subtask 3 injects real pkgs
-                state_store,
-                card_store,
-                scenarios_dir,
+                vec![], // extra_lib_paths — populated by Advice/Eval kinds later
+                vec![], // variant_pkgs   — populated by Advice/Eval kinds later
+                Arc::clone(&self.state_store),
+                Arc::clone(&self.card_store),
+                self.scenarios_dir.clone(),
             )
             .await
             .map_err(SpawnError::Engine)?;
@@ -421,6 +434,20 @@ mod tests {
         Arc::new(Executor::new(vec![]).await.expect("Executor::new"))
     }
 
+    /// Construct a registry backed by per-test tempdir paths so the legacy
+    /// AppConfig::app_dir() layout is approximated without touching the user's
+    /// `~/.algocline` directory.
+    fn make_registry(executor: Arc<Executor>) -> (SessionRegistryV2, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_store = Arc::new(JsonFileStore::new(tmp.path().join("state")));
+        let card_store = Arc::new(FileCardStore::new(tmp.path().join("cards")));
+        let scenarios_dir = tmp.path().join("scenarios");
+        (
+            SessionRegistryV2::new(executor, state_store, card_store, scenarios_dir),
+            tmp,
+        )
+    }
+
     fn simple_spec(code: &str) -> SessionSpec {
         SessionSpec {
             kind: SpecKind::Run {
@@ -447,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_returns_session_id_immediately() {
         let executor = make_executor().await;
-        let registry = SessionRegistryV2::new(executor);
+        let (registry, _tmp) = make_registry(executor);
 
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
@@ -477,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn state_query_running() {
         let executor = make_executor().await;
-        let registry = SessionRegistryV2::new(executor);
+        let (registry, _tmp) = make_registry(executor);
 
         // Lua that pauses immediately so the session is observable.
         let sid = registry
@@ -505,7 +532,7 @@ mod tests {
         use algocline_core::execution::{ResumeError, ResumePayload};
 
         let executor = make_executor().await;
-        let registry = SessionRegistryV2::new(executor);
+        let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
             .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
@@ -553,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_idempotent() {
         let executor = make_executor().await;
-        let registry = SessionRegistryV2::new(executor);
+        let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
             .spawn_v2(simple_spec("return 1"))
@@ -578,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn observe_sink_free_registry() {
         let executor = make_executor().await;
-        let registry = SessionRegistryV2::new(executor);
+        let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
             .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
@@ -603,7 +630,7 @@ mod tests {
         use algocline_core::execution::ObserverRecvError;
 
         let executor = make_executor().await;
-        let registry = SessionRegistryV2::new(executor);
+        let (registry, _tmp) = make_registry(executor);
 
         // A script that returns immediately — the driver will publish Done.
         let sid = registry

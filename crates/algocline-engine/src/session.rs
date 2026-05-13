@@ -542,6 +542,24 @@ impl Session {
     pub fn is_expired(&self, ttl: Duration) -> bool {
         is_expired_impl(self.last_active, ttl)
     }
+
+    /// Decompose the session into the parts needed by `driver_loop` (v2 path).
+    ///
+    /// Returns `(exec_task, llm_rx, vm_driver)`.  The remaining legacy state
+    /// (`metrics`, `observer`, `resp_txs`, `state`) are discarded — the v2 driver
+    /// manages state independently via `SessionRecord`.
+    ///
+    /// This accessor is `pub(crate)` so only the `execution` module (same crate)
+    /// can call it; the public API does not expose internal VM handles.
+    pub(crate) fn into_driver_parts(
+        self,
+    ) -> (
+        AsyncTask,
+        tokio::sync::mpsc::Receiver<LlmRequest>,
+        AsyncIsleDriver,
+    ) {
+        (self.exec_task, self.llm_rx, self._vm_driver)
+    }
 }
 
 /// Core expiry check, extracted for testability.

@@ -1,6 +1,12 @@
 //! Session identifier type for the `ExecutionService` layer.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
+
+/// Global counter to ensure uniqueness within a process even at sub-millisecond resolution.
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Opaque handle that uniquely identifies an execution session across all verb calls.
 ///
@@ -19,6 +25,20 @@ impl SessionId {
     /// Wraps an existing string as a `SessionId`.
     pub fn new(s: String) -> Self {
         Self(s)
+    }
+
+    /// Generate a new unique `SessionId`.
+    ///
+    /// Uses Unix milliseconds combined with a process-global counter to ensure
+    /// uniqueness within a process even at sub-millisecond resolution.
+    /// Format: `"ses-{ms}-{counter}"`.
+    pub fn generate() -> Self {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(format!("ses-{ms}-{counter}"))
     }
 
     /// Returns the inner string value.

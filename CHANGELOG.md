@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream error types. No `#[non_exhaustive]` (wire boundary adapter is responsible
   for string conversion before crossing the MCP boundary).
 
+### Changed
+
+- **Bump `rmcp` 1.5 → 1.7** across the workspace (`Cargo.toml`,
+  `crates/algocline-mcp/Cargo.toml`). rmcp 1.7.0 ships
+  [rust-sdk#843](https://github.com/modelcontextprotocol/rust-sdk/pull/843)
+  which flattens `PromptMessageContent::Resource` so embedded resource
+  serialization matches the MCP spec (`{ "type": "resource", "resource":
+  { uri, mimeType, text } }` instead of the previous doubly-nested
+  `content.resource.resource.{uri,...}` shape). This unblocks Phase
+  1.x-D embedded resource support in `prompts/get` responses (no Phase
+  1.x-D wire change in this release; the bump only lifts the upstream
+  technical blocker). No source changes required in algocline — the
+  current MCP server compiles against 1.7 unchanged.
+
 ### Fixed
 
 - **MCP `alc_run.ctx` / `alc_advice.opts` / `alc_eval.strategy_opts`

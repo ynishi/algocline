@@ -135,14 +135,19 @@ impl AppService {
         // legitimate paused sessions while eventually reclaiming abandoned ones.
         registry.spawn_gc_task(std::time::Duration::from_secs(10800));
 
-        // V2 execution registry — shares the same Executor as the legacy path.
-        let execution_registry = Arc::new(algocline_engine::execution::SessionRegistryV2::new(
-            Arc::clone(&executor),
-        ));
-
         let app_dir = log_config.app_dir();
         let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
         let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
+
+        // V2 execution registry — shares the Executor + AppConfig-derived
+        // storage paths with the legacy `start_and_tick` path so a v2 caller
+        // produces the same on-disk side effects as a legacy caller.
+        let execution_registry = Arc::new(algocline_engine::execution::SessionRegistryV2::new(
+            Arc::clone(&executor),
+            Arc::clone(&state_store),
+            Arc::clone(&card_store),
+            app_dir.scenarios_dir(),
+        ));
 
         // ─── Pool registry setup ───────────────────────────────────────────────
         // Paths: ~/.algocline/state/pool/{registry.json, registry.lock}

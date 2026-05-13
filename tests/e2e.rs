@@ -405,6 +405,37 @@ async fn test_alc_run_lua_error() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Regression: when a non-conforming MCP client sends `ctx` as a
+/// JSON-encoded string instead of an object (issue 1778656404-63015),
+/// the server normalises it back to an object before injecting into
+/// the Lua VM so the existing `lua.to_value` path produces a Lua
+/// table.
+#[tokio::test]
+async fn test_alc_run_ctx_stringified_json_normalized_to_table() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_run",
+            json!({
+                "code": "return type(ctx) .. \"/\" .. tostring(ctx.task)",
+                "ctx": "{\"task\":\"probe\"}",
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    let parsed: Value = serde_json::from_str(text).expect("response should be JSON");
+
+    assert_eq!(parsed["status"], "completed");
+    assert_eq!(
+        parsed["result"], "table/probe",
+        "stringified ctx must be auto-decoded into a table, got {parsed}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Regression: `alc_run.ctx` must advertise `type: object` in its MCP
 /// inputSchema. Without the `#[schemars(with = "Option<Map<...>>")]`
 /// annotation on `RunParams.ctx`, schemars emits an unconstrained

@@ -405,6 +405,42 @@ async fn test_alc_run_lua_error() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Regression: `alc_run.ctx` must advertise `type: object` in its MCP
+/// inputSchema. Without the `#[schemars(with = "Option<Map<...>>")]`
+/// annotation on `RunParams.ctx`, schemars emits an unconstrained
+/// schema (`true`) for `serde_json::Value`, which lets some MCP clients
+/// JSON-stringify the field and break the Lua-side `ctx` global
+/// (issue 1778656404-63015).
+#[tokio::test]
+async fn test_alc_run_ctx_schema_is_object() {
+    let client = connect().await;
+
+    let tools = client
+        .list_all_tools()
+        .await
+        .expect("list_all_tools failed");
+
+    let alc_run = tools
+        .iter()
+        .find(|t| t.name.as_ref() == "alc_run")
+        .expect("alc_run tool should be present");
+
+    let schema_json: Value =
+        serde_json::to_value(&alc_run.input_schema).expect("schema serializable");
+    let ctx_schema = schema_json
+        .get("properties")
+        .and_then(|p| p.get("ctx"))
+        .unwrap_or_else(|| panic!("alc_run schema missing `ctx`: {schema_json}"));
+
+    let rendered = serde_json::to_string(ctx_schema).expect("ctx schema serializable");
+    assert!(
+        rendered.contains("\"object\""),
+        "ctx schema should constrain to object (got {rendered})"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 #[tokio::test]
 async fn test_alc_continue_invalid_session() {
     let client = connect().await;

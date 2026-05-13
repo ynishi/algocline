@@ -30,6 +30,7 @@ pub struct RunParams {
     /// Path to a Lua source file. Provide either `code` or `code_file`, not both.
     pub code_file: Option<String>,
     /// Context passed to Lua as the `ctx` global (JSON object).
+    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
     pub ctx: Option<serde_json::Value>,
     /// Optional absolute path to the project root containing `alc.lock`.
     /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
@@ -375,6 +376,7 @@ pub struct AdviceParams {
     /// The task or question to process (optional).
     pub task: Option<String>,
     /// Additional strategy-specific options (merged into ctx).
+    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
     pub opts: Option<serde_json::Value>,
     /// Optional absolute path to the project root containing `alc.lock`.
     /// Falls back to `ALC_PROJECT_ROOT` env or ancestor walk from cwd.
@@ -407,6 +409,7 @@ pub struct EvalParams {
     /// Loaded via `ef.providers.algocline { strategy = "..." }`.
     pub strategy: String,
     /// Additional strategy-specific options (merged into provider opts).
+    #[schemars(with = "Option<serde_json::Map<String, serde_json::Value>>")]
     pub strategy_opts: Option<serde_json::Value>,
     /// If true, also emit an immutable Card (`~/.algocline/cards/{strategy}/{card_id}.toml`)
     /// summarizing this eval run. Default: false. Schema: `card/v0`.

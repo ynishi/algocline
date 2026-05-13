@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP `alc_run.ctx` / `alc_advice.opts` / `alc_eval.strategy_opts`
+  schema now declares `type: object`** instead of the unconstrained
+  schemars default for `serde_json::Value`. Some MCP clients infer an
+  unconstrained field as a free-form string and JSON-stringify it
+  before sending, which previously caused the Lua-side `ctx` global
+  to arrive as `type(ctx) == "string"` and broke pkgs that required
+  a table (`swarm_frame.normalize_ctx: ctx must be a table (got
+  string)`). With the schema constrained to object, conforming
+  clients send the value as a real JSON object and the existing
+  `lua.to_value` path materialises a Lua table as documented. Tracked
+  in `tests/e2e.rs::test_alc_run_ctx_schema_is_object`. No runtime
+  type change — Rust deserialisation still accepts `serde_json::Value`.
+
 ## [0.34.0] - 2026-05-10
 
 ### Changed

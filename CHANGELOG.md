@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ExecutionService` trait — pure Service-layer execution API** (`algocline-core::execution`).
+  A new `ExecutionService` trait with six verbs (`spawn`, `state`, `resume`, `cancel`,
+  `observe`, `await_terminal`) provides a wire-concept-free API surface for session
+  lifecycle management. All types live under `algocline-core::execution` with zero
+  dependency on `rmcp::*`, `progressToken`, `_meta`, or any other MCP wire concept,
+  enforcing invariant 1 (transport-independent domain layer) at the type-system level.
+  The trait coexists with the legacy `EngineApi` trait; `AppService` implements both.
+
+- **`SessionRegistryV2` + cooperative cancellation (4-checkpoint driver loop)**
+  (`algocline-engine::execution`). A new `SessionRecord` struct bundles a per-session
+  `broadcast::Sender<ProgressEvent>` (capacity 256), a `CancellationToken`, and a
+  `JoinHandle` for the background driver task. `SessionRegistryV2` manages a
+  `HashMap<SessionId, Arc<SessionRecord>>` with a clone-then-release lock pattern to
+  avoid holding the map lock across `.await` points (K-4). The driver loop checks
+  cancellation at exactly four checkpoints:
+
+  - **A** — before the Lua chunk begins (`cancel_token.is_cancelled()`)
+  - **B** — before publishing a pause notification (`cancel_token.is_cancelled()`)
+  - **C** — at the resume entry path (`cancel_token.is_cancelled()`)
+  - **D** — long-IO wait via `tokio::select!` racing `cancel_token.cancelled()`
+    against `exec_task` / `llm_rx.recv()`
+
+  No `JoinHandle::abort()` or process-kill path is introduced; shutdown is always
+  cooperative. Sessions return immediately from `spawn` while the driver runs in the
+  background (`tokio::spawn`), resolving debt #1778655047-40955 (blocking
+  `wait_event` before `SessionId` return).
+
+- **`ProgressEvent` broadcast bus — sink-free multi-observer fan-out**
+  (`algocline-core::execution::progress`). A `tokio::sync::broadcast` channel with
+  capacity 256 carries a tagged enum of seven variants (`StateTransition`,
+  `LlmCallBegin`, `LlmCallEnd`, `PauseRequested`, `ResumeReceived`,
+  `CancelRequested`, `Tick`). The `observe` verb returns a `broadcast::Receiver`
+  wrapped in `ObserverHandle` as a synchronous call — no pre-registered sink is
+  required. Zero-observer sessions accept `send()` calls without error (broadcast
+  standard behaviour). Slow observers receive `RecvError::Lagged(n)` rather than
+  silent drops, preserving loss observability. Multiple independent subscribers each
+  receive the full event stream without affecting one another.
+
+- **`impl ExecutionService for AppService`**
+  (`algocline-app::service::execution_service_impl`). Wires the six trait verbs to
+  the new `SessionRegistryV2`. The legacy `AppService::run` / `EngineApi` path is
+  untouched; the new `Arc<SessionRegistryV2>` field added to `AppService` is additive.
+
+- **Value types for execution module** (`algocline-core::execution`).
+  Approximately 20 public types exported from `algocline-core`: `SessionId`,
+  `SessionSpec`, `ExecutionStateV2`, `ExecutionStateTag`, `PauseInfo`, `ResumePayload`,
+  `ResumeOutcome`, `CancelReason`, `CancelCode`, `CancelInfo`, `ExecutionResult`,
+  `FailureInfo`, `TerminalOutcome`, `ProgressEvent`, `ObserverHandle`, and seven closed
+  error enums (`SpawnError`, `StateError`, `ResumeError`, `CancelError`, `ObserveError`,
+  `AwaitError`, `ObserverRecvError`). All types implement `serde::Serialize +
+  serde::Deserialize`. Error enums use `thiserror::Error` with `#[from]` converters for
+  upstream error types. No `#[non_exhaustive]` (wire boundary adapter is responsible
+  for string conversion before crossing the MCP boundary).
+
 ### Fixed
 
 - **MCP `alc_run.ctx` / `alc_advice.opts` / `alc_eval.strategy_opts`

@@ -201,7 +201,10 @@ mod tests {
             },
         ];
         let mut args = serde_json::Map::new();
-        args.insert("task".to_string(), serde_json::Value::String("refactor".into()));
+        args.insert(
+            "task".to_string(),
+            serde_json::Value::String("refactor".into()),
+        );
         args.insert(
             "category".to_string(),
             serde_json::Value::String("reasoning".into()),

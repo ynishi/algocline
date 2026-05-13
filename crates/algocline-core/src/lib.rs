@@ -3,6 +3,7 @@ mod budget;
 mod custom;
 pub mod domain;
 mod engine_api;
+pub mod execution;
 pub mod metrics;
 mod observer;
 pub mod pkg;

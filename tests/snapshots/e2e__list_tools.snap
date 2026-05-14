@@ -50,5 +50,9 @@ expression: names
   "alc_session_new",
   "alc_stats",
   "alc_status",
-  "alc_update"
+  "alc_update",
+  "alc_v2_cancel",
+  "alc_v2_resume",
+  "alc_v2_run",
+  "alc_v2_state"
 ]

@@ -1,14 +1,16 @@
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{
+        router::tool::ToolRouter, tool::RequestId as RmcpRequestId, wrapper::Parameters,
+    },
     model::{
-        CompleteRequestParams, CompleteResult, CompletionInfo, GetPromptRequestParams,
-        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        PaginatedRequestParams, ReadResourceRequestParams, Reference, ServerCapabilities,
-        ServerInfo,
+        CancelledNotificationParam, CompleteRequestParams, CompleteResult, CompletionInfo,
+        GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, Meta, PaginatedRequestParams, ReadResourceRequestParams, Reference,
+        ServerCapabilities, ServerInfo,
     },
     schemars,
-    service::RequestContext,
     service::RoleServer,
+    service::{NotificationContext, Peer, RequestContext},
     tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::Deserialize;
@@ -16,8 +18,15 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use algocline_app::{EngineApi, QueryResponse};
-use algocline_core::{execution::ExecutionService, AppDir};
+use algocline_core::{
+    execution::{
+        CancelCode, CancelReason, ExecutionService, ResumePayload, SessionId, SessionSpec, SpecKind,
+    },
+    AppDir,
+};
+use tokio::task::JoinHandle;
 
+use crate::progress_forwarder::spawn_progress_forwarder;
 use crate::req_registry::ReqIdRegistry;
 
 use crate::prompts::PromptCatalog;
@@ -818,6 +827,82 @@ pub struct HubSearchParams {
     pub verbose: Option<String>,
 }
 
+// ─── V2 MCP Parameter types ──────────────────────────────────────
+
+/// Parameters for `alc_v2_run`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct V2RunParams {
+    /// Lua source code to execute.
+    pub code: String,
+    /// Optional JSON context forwarded to the Lua environment as `ctx`.
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub ctx: Option<serde_json::Value>,
+    /// Optional absolute path to the project root containing `alc.lock`.
+    pub project_root: Option<String>,
+}
+
+/// Parameters for `alc_v2_state`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct V2StateParams {
+    /// Session ID returned by `alc_v2_run`.
+    pub session_id: String,
+}
+
+/// Parameters for `alc_v2_resume`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct V2ResumeParams {
+    /// Session ID returned by `alc_v2_run`.
+    pub session_id: String,
+    /// Resume payload — must match the pause kind of the session.
+    #[schemars(with = "serde_json::Value")]
+    pub payload: ResumePayload,
+}
+
+/// Parameters for `alc_v2_cancel`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct V2CancelParams {
+    /// Session ID returned by `alc_v2_run`.
+    pub session_id: String,
+    /// Optional cancellation reason. Defaults to `CancelCode::User` with no detail.
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub reason: Option<CancelReason>,
+}
+
+// ─── V2 adapter helpers ───────────────────────────────────────────
+
+/// Returns the current time as a Unix timestamp in milliseconds.
+///
+/// `unwrap_or(0)` is used as a defensive default: the only reachable failure is a
+/// system clock set before the Unix epoch, which is not a realistic production
+/// scenario.  Returning 0 is preferable to panicking (panic-free invariant).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Spawn a background task that awaits the terminal state of a session and then
+/// removes its entry from the registry (entry-deletion path (a)).
+///
+/// The `await_terminal` result is intentionally absorbed with `let _ = ...` so that
+/// a `NotFound` or `Joined` error does not prevent the registry cleanup.  The
+/// `remove_by_session` call is unconditional — this satisfies the
+/// `test_terminal_cleanup_task_unconditional_remove` invariant.
+fn spawn_terminal_cleanup(
+    exec: Arc<dyn ExecutionService>,
+    registry: Arc<ReqIdRegistry>,
+    sid: SessionId,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = exec.await_terminal(&sid).await {
+            tracing::warn!("alc_v2_run terminal-cleanup: await_terminal error for sid={sid}: {e}");
+        }
+        // Unconditional: always remove even when await_terminal returns Err.
+        registry.remove_by_session(&sid).await;
+    })
+}
+
 // ─── MCP Handler ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -829,10 +914,8 @@ pub struct AlcService {
     prompt_catalog: Arc<PromptCatalog>,
     /// Adapter-exclusive mapping from MCP `RequestId` to [`SessionId`].
     /// Service-layer crates must never reference this field or any wire type it contains.
-    #[allow(dead_code)]
     execution: Arc<dyn ExecutionService>,
     /// Owned by the adapter; service layer is never exposed to wire identifiers.
-    #[allow(dead_code)]
     req_registry: Arc<ReqIdRegistry>,
 }
 
@@ -1869,6 +1952,119 @@ impl AlcService {
     async fn info(&self) -> Result<String, String> {
         Ok(self.app.info().await)
     }
+
+    // ─── V2 execution tools ───────────────────────────────────────
+
+    /// Spawn a new execution session from Lua code (v2 API).
+    ///
+    /// Returns a JSON object `{"session_id": "<id>"}`.  The session runs in the
+    /// background; use `alc_v2_state` to poll status, `alc_v2_resume` to feed LLM
+    /// responses when paused, and `alc_v2_cancel` to cancel.
+    ///
+    /// When `_meta.progressToken` is present, a progress forwarder task is spawned
+    /// and execution events are forwarded as `ProgressNotification` messages.
+    #[tool(name = "alc_v2_run", annotations(open_world_hint = false))]
+    async fn v2_run(
+        &self,
+        Parameters(params): Parameters<V2RunParams>,
+        RmcpRequestId(req_id): RmcpRequestId,
+        meta: Meta,
+        peer: Peer<RoleServer>,
+    ) -> Result<String, String> {
+        let project_root = params.project_root.map(std::path::PathBuf::from);
+        let spec = SessionSpec {
+            kind: SpecKind::Run { code: params.code },
+            project_root,
+            ctx: params.ctx,
+        };
+        let sid = self
+            .execution
+            .spawn(spec)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Register request_id → session_id mapping for on_cancelled reverse-lookup.
+        self.req_registry.insert(req_id, sid.clone()).await;
+
+        // Spawn progress forwarder only when progressToken is present (Crux).
+        if let Some(token) = meta.get_progress_token() {
+            spawn_progress_forwarder(self.execution.clone(), peer, sid.clone(), token);
+        }
+
+        // Spawn terminal-cleanup task: removes registry entry when session finishes.
+        spawn_terminal_cleanup(
+            self.execution.clone(),
+            self.req_registry.clone(),
+            sid.clone(),
+        );
+
+        Ok(serde_json::json!({"session_id": sid.as_str()}).to_string())
+    }
+
+    /// Query the current state of a v2 execution session.
+    ///
+    /// Returns the `ExecutionState` serialized as JSON.
+    #[tool(
+        name = "alc_v2_state",
+        annotations(read_only_hint = true, open_world_hint = false, idempotent_hint = true)
+    )]
+    async fn v2_state(
+        &self,
+        Parameters(params): Parameters<V2StateParams>,
+    ) -> Result<String, String> {
+        let sid = SessionId::from(params.session_id.as_str());
+        let state = self
+            .execution
+            .state(&sid)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&state).map_err(|e| e.to_string())
+    }
+
+    /// Resume a paused v2 execution session by supplying LLM responses.
+    ///
+    /// The `payload` must match the pause kind of the session (`single` or `batch`).
+    /// Returns a `ResumeOutcome` serialized as JSON.
+    #[tool(name = "alc_v2_resume", annotations(open_world_hint = false))]
+    async fn v2_resume(
+        &self,
+        Parameters(params): Parameters<V2ResumeParams>,
+    ) -> Result<String, String> {
+        let sid = SessionId::from(params.session_id.as_str());
+        let outcome = self
+            .execution
+            .resume(&sid, params.payload)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&outcome).map_err(|e| e.to_string())
+    }
+
+    /// Request cooperative cancellation of a v2 execution session.
+    ///
+    /// Idempotent: cancelling a session already in a terminal state returns `{}`.
+    /// Returns `{}` on success.
+    #[tool(
+        name = "alc_v2_cancel",
+        annotations(open_world_hint = false, idempotent_hint = true)
+    )]
+    async fn v2_cancel(
+        &self,
+        Parameters(params): Parameters<V2CancelParams>,
+    ) -> Result<String, String> {
+        let sid = SessionId::from(params.session_id.as_str());
+        let reason = params.reason.unwrap_or_else(|| CancelReason {
+            code: CancelCode::User,
+            detail: None,
+            requested_at: now_ms(),
+        });
+        self.execution
+            .cancel(&sid, reason)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Entry-deletion path (b): remove after successful cancel.
+        self.req_registry.remove_by_session(&sid).await;
+        Ok("{}".to_string())
+    }
 }
 
 #[tool_handler]
@@ -2068,6 +2264,36 @@ impl ServerHandler for AlcService {
             .get_prompt(&req.name, req.arguments.as_ref())
             .await
     }
+
+    /// Handle `notifications/cancelled` from the MCP client.
+    ///
+    /// Resolves the `request_id` → `SessionId` via the registry and delegates
+    /// cancellation to `ExecutionService::cancel` exclusively (Crux:
+    /// `on_cancelled reverse-lookup via registry`).  No `JoinHandle::abort()` or
+    /// direct channel-close path is used.
+    async fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        _context: NotificationContext<RoleServer>,
+    ) {
+        let req_id = notification.request_id;
+        let sid = match self.req_registry.lookup(&req_id).await {
+            Some(s) => s,
+            None => {
+                tracing::debug!("on_cancelled: no mapping for request_id {req_id:?}");
+                return;
+            }
+        };
+        let reason = CancelReason {
+            code: CancelCode::User,
+            detail: notification.reason,
+            requested_at: now_ms(),
+        };
+        if let Err(e) = self.execution.cancel(&sid, reason).await {
+            tracing::warn!("on_cancelled: cancel failed for sid={sid}: {e}");
+        }
+        self.req_registry.remove_by_request(&req_id).await;
+    }
 }
 
 #[cfg(test)]
@@ -2208,5 +2434,88 @@ mod tests {
         assert!(s.contains("\"project\""), "schema missing project: {s}");
         assert!(s.contains("\"global\""), "schema missing global: {s}");
         assert!(s.contains("\"all\""), "schema missing all: {s}");
+    }
+
+    // ── V2 adapter tests ──────────────────────────────────────────
+
+    /// Verifies that the terminal-cleanup background task unconditionally removes the
+    /// registry entry even when `await_terminal` returns `Err(AwaitError::NotFound)`.
+    ///
+    /// This is the direct invariant gate for the registry-entry-leak risk
+    /// (plan.md §Risks: "registry entry of the leak").
+    ///
+    /// Uses `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` as required by
+    /// concurrency-analysis.md §2 `test_terminal_cleanup_task_unconditional_remove`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_cleanup_task_unconditional_remove() {
+        use algocline_core::execution::state::ExecutionState;
+        use algocline_core::execution::{
+            AwaitError, CancelError, CancelReason, ExecutionService, ObserveError, ObserverHandle,
+            ResumeError, ResumeOutcome, ResumePayload, SessionId, SessionSpec, SpawnError,
+            StateError, TerminalOutcome,
+        };
+        use std::sync::Arc;
+
+        // Mock ExecutionService whose await_terminal always returns Err(NotFound).
+        struct MockExecErrTerminal;
+
+        #[async_trait::async_trait]
+        impl ExecutionService for MockExecErrTerminal {
+            async fn spawn(&self, _spec: SessionSpec) -> Result<SessionId, SpawnError> {
+                unimplemented!()
+            }
+
+            async fn state(&self, _id: &SessionId) -> Result<ExecutionState, StateError> {
+                unimplemented!()
+            }
+
+            async fn resume(
+                &self,
+                _id: &SessionId,
+                _payload: ResumePayload,
+            ) -> Result<ResumeOutcome, ResumeError> {
+                unimplemented!()
+            }
+
+            async fn cancel(
+                &self,
+                _id: &SessionId,
+                _reason: CancelReason,
+            ) -> Result<(), CancelError> {
+                unimplemented!()
+            }
+
+            fn observe(&self, _id: &SessionId) -> Result<Box<dyn ObserverHandle>, ObserveError> {
+                unimplemented!()
+            }
+
+            async fn await_terminal(&self, id: &SessionId) -> Result<TerminalOutcome, AwaitError> {
+                Err(AwaitError::NotFound(id.clone()))
+            }
+        }
+
+        let exec: Arc<dyn ExecutionService> = Arc::new(MockExecErrTerminal);
+        let registry = Arc::new(ReqIdRegistry::default());
+        let sid = SessionId::new("cleanup-test-sid".to_string());
+        let req_id = crate::req_registry::RequestId::Number(99);
+
+        // Pre-populate the registry.
+        registry.insert(req_id.clone(), sid.clone()).await;
+        assert_eq!(
+            registry.lookup(&req_id).await,
+            Some(sid.clone()),
+            "entry must be present before cleanup"
+        );
+
+        // Run the cleanup task — await_terminal will Err immediately.
+        let handle = spawn_terminal_cleanup(exec, registry.clone(), sid.clone());
+        handle.await.expect("cleanup task panicked");
+
+        // Registry entry must be removed despite the await_terminal error.
+        assert_eq!(
+            registry.lookup(&req_id).await,
+            None,
+            "registry entry must be removed even when await_terminal returns Err"
+        );
     }
 }

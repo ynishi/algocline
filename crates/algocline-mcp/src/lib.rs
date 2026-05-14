@@ -1,4 +1,6 @@
+pub mod progress_forwarder;
 pub mod prompts;
+pub mod req_registry;
 pub mod resources;
 mod service;
 

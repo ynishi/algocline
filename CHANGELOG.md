@@ -47,6 +47,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silent drops, preserving loss observability. Multiple independent subscribers each
   receive the full event stream without affecting one another.
 
+- **`alc_v2_run`, `alc_v2_state`, `alc_v2_resume`, `alc_v2_cancel` MCP tools**
+  (`algocline-mcp`). Four new MCP tools that expose the `ExecutionService` API over
+  the MCP wire with zero wire-concept leakage into the Service layer. All four tools
+  coexist with the legacy `alc_run` / `alc_continue` path under a `_v2` prefix;
+  neither the wire shape nor the behaviour of existing tools is altered.
+
+  - **`alc_v2_run`** — spawns a new execution session via `ExecutionService::spawn`.
+    Accepts `code` (Lua source), optional `session_id` (caller-supplied idempotency
+    key), and optional `ctx` (JSON context). When the caller's MCP request carries
+    `_meta.progressToken`, a `ProgressForwarder` task is spawned to stream
+    `ProgressEvent` notifications back to the caller via
+    `Peer::notify_progress`; if no token is present no forwarder is spawned and no
+    progress notification is emitted for that request (Crux invariant 2).
+    Returns `{ session_id, status, result?, error? }`.
+
+  - **`alc_v2_state`** — returns the current `ExecutionStateV2` snapshot for a
+    session (`ExecutionService::state`). Read-only; annotated
+    `read_only_hint = true, idempotent_hint = true`.
+
+  - **`alc_v2_resume`** — resumes a paused session by injecting a `ResumePayload`
+    (`Single { response, usage?, query_id }` or `Batch(Vec<QueryResponse>)`) via
+    `ExecutionService::resume`. Returns the updated session state.
+
+  - **`alc_v2_cancel`** — cancels a session via `ExecutionService::cancel` with
+    `CancelCode::User`. Annotated `idempotent_hint = true`; cancelling a session
+    that is already at a terminal state is a no-op.
+
+- **`ReqIdRegistry` — adapter-owned request-id ↔ session-id mapping**
+  (`algocline-mcp::req_registry`). A new `ReqIdRegistry` struct wraps
+  `Arc<RwLock<HashMap<RequestId, SessionId>>>` and provides `insert` / `lookup` /
+  `remove_by_session` / `remove_by_request` with a clone-then-release lock pattern
+  that never holds the lock across an `.await` point (K-4). The registry is owned
+  exclusively by the MCP adapter crate; no wire type (`RequestId`, `ProgressToken`,
+  `_meta.*`) crosses the crate boundary into `algocline-core` or `algocline-app`
+  (Crux invariant 1). Entry lifetime: inserted on `alc_v2_run` success, removed
+  unconditionally by a background `await_terminal` task on session completion, and
+  also removed on `alc_v2_cancel` success.
+
+- **`ProgressForwarder` — per-token progress bridge**
+  (`algocline-mcp::progress_forwarder`). A free function
+  `spawn_progress_forwarder(execution, peer, sid, token)` that calls
+  `ExecutionService::observe` to obtain a `broadcast::Receiver<ProgressEvent>` and
+  then forwards each event to the MCP caller via `peer.notify_progress`. Slow-reader
+  `RecvError::Lagged(n)` is forwarded as a synthetic `{"kind":"lagged","n":n}`
+  notification so the caller can detect message loss without silently dropping events.
+  `RecvError::Closed` and a `notify_progress` send error both cause the task to exit
+  cleanly without panic. Spawned if and only if `_meta.progressToken` is `Some`
+  (Crux invariant 2).
+
+- **`ServerHandler::on_cancelled` override — cooperative cancellation from MCP**
+  (`algocline-mcp::AlcService`). Overrides the default empty `on_cancelled`
+  implementation. When the MCP client sends a `notifications/cancelled` message, the
+  handler resolves `request_id → SessionId` via `ReqIdRegistry::lookup` and then
+  calls `ExecutionService::cancel` with `CancelCode::User` (Crux invariant 3). A
+  lookup miss (mapping already removed or request never registered) is logged at
+  `DEBUG` and treated as a no-op. No `JoinHandle::abort()` or direct channel-close
+  path is introduced; cancellation is always routed through `ExecutionService`.
+
 - **`impl ExecutionService for AppService`**
   (`algocline-app::service::execution_service_impl`). Wires the six trait verbs to
   the new `SessionRegistryV2`. The legacy `AppService::run` / `EngineApi` path is

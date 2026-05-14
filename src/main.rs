@@ -51,6 +51,7 @@ mod pool_worker;
 use std::sync::Arc;
 
 use algocline_app::{AppConfig, AppService, EngineApi};
+use algocline_core::execution::ExecutionService;
 use algocline_engine::Executor;
 use algocline_mcp::AlcService;
 use clap::{Parser, Subcommand};
@@ -190,8 +191,12 @@ async fn main() -> anyhow::Result<()> {
     let lib_paths: Vec<_> = search_paths.iter().map(|sp| sp.path.clone()).collect();
     let executor = Arc::new(Executor::new(lib_paths).await?);
     let app_dir = config.app_dir(); // Arc<AppDir> — resolved before AppService construction
-    let app = Arc::new(AppService::new(executor, config, search_paths));
-    let server = AlcService::new(app as Arc<dyn EngineApi>, app_dir);
+    let app: Arc<AppService> = Arc::new(AppService::new(executor, config, search_paths));
+    let server = AlcService::new(
+        app.clone() as Arc<dyn EngineApi>,
+        app.clone() as Arc<dyn ExecutionService>,
+        app_dir,
+    );
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
 

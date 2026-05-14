@@ -328,14 +328,17 @@ mod tests {
         let join = result.unwrap();
         assert!(join.is_ok(), "forwarder task panicked");
 
-        // Let any pending writes flush onto the pipe before we drop the server side.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Drop the server end of the duplex; the client side will see EOF after
+        // draining any in-flight writes already queued in the pipe buffer.
+        // Replaces a previous `sleep(50ms)` flush wait — drop + read_to_end is
+        // deterministic because the duplex buffer preserves enqueued bytes past
+        // the server-side drop, so we do not need a wall-clock delay.
         drop(running);
 
         // Drain the client side. read_to_end returns once the server end is closed.
         let mut buf = Vec::new();
         let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(500),
             client_t.read_to_end(&mut buf),
         )
         .await

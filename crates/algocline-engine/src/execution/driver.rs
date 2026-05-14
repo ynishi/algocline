@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use algocline_core::execution::{
-    CancelCode, CancelInfo, CancelReason, ExecutionResult, ExecutionState, FailureInfo,
-    FailureKind, PauseInfo, PauseKind, PausePrompt, ProgressEvent,
+    CancelCode, CancelInfo, CancelReason, ExecutionResult, ExecutionState, ExecutionStateTag,
+    FailureInfo, FailureKind, PauseInfo, PauseKind, PausePrompt, ProgressEvent,
 };
 use mlua_isle::AsyncTask;
 use tokio::sync::broadcast;
@@ -47,6 +47,13 @@ pub(crate) fn now_ms() -> i64 {
 ///
 /// The `Mutex` guard is dropped **before** the broadcast `send` to avoid holding
 /// it across the (sync but potentially contended) send path (K-4 pattern).
+///
+/// **Idempotent on terminal states**: when the current state is already terminal
+/// (`Done` / `Failed` / `Cancelled`) and the requested transition would also be
+/// to a terminal state, this is a no-op (state is not overwritten, no event is
+/// emitted). This prevents nested `state_before` accumulation in `CancelInfo`
+/// when both `registry::cancel()` and a `driver_loop` checkpoint attempt to
+/// transition a Paused session to `Cancelled`.
 pub(crate) async fn transition_state(
     state: &Arc<Mutex<ExecutionState>>,
     bus_tx: &broadcast::Sender<ProgressEvent>,
@@ -57,6 +64,12 @@ pub(crate) async fn transition_state(
         guard.tag()
     };
     let to_tag = new_state.tag();
+
+    // Terminal → terminal is a no-op: the first transition wins.
+    if is_terminal_tag(from_tag) && is_terminal_tag(to_tag) {
+        return;
+    }
+
     {
         let mut guard = state.lock().await;
         *guard = new_state;
@@ -69,14 +82,30 @@ pub(crate) async fn transition_state(
     });
 }
 
+fn is_terminal_tag(tag: ExecutionStateTag) -> bool {
+    matches!(
+        tag,
+        ExecutionStateTag::Done | ExecutionStateTag::Failed | ExecutionStateTag::Cancelled
+    )
+}
+
 /// Build a `CancelInfo` snapshot capturing `reason` and the current state.
+///
+/// **Nested-aware**: if the current state is already `Cancelled`, the new
+/// `state_before` inherits the inner `state_before` rather than wrapping the
+/// outer `Cancelled` (which would create `Cancelled(state_before=Cancelled(...))`
+/// chains on repeated cancel attempts). The pre-cancellation state is preserved
+/// across idempotent re-cancel paths.
 pub(crate) async fn build_cancel_info(
     state: &Arc<Mutex<ExecutionState>>,
     reason: CancelReason,
 ) -> CancelInfo {
     let state_before = {
         let guard = state.lock().await;
-        guard.clone()
+        match &*guard {
+            ExecutionState::Cancelled(prior) => (*prior.state_before).clone(),
+            other => other.clone(),
+        }
     };
     CancelInfo {
         reason,
@@ -414,6 +443,113 @@ mod tests {
         // Second cancel must not panic.
         cancel_token.cancel();
         assert!(cancel_token.is_cancelled());
+    }
+
+    // -----------------------------------------------------------------------
+    // transition_state idempotency on terminal states
+    // -----------------------------------------------------------------------
+
+    /// Regression: a second transition into a terminal state must NOT overwrite
+    /// the first one. This prevents the `state_before` field of `CancelInfo`
+    /// (and any downstream consumer of `ExecutionState`) from being silently
+    /// replaced by a later transition.
+    #[tokio::test]
+    async fn transition_state_terminal_is_idempotent() {
+        let (state, bus_tx, _rx) = make_state_and_bus();
+
+        // First transition: Running → Cancelled(state_before=Running).
+        let info1 = CancelInfo {
+            reason: CancelReason {
+                code: CancelCode::User,
+                detail: Some("first".into()),
+                requested_at: 100,
+            },
+            observed_at: 110,
+            state_before: Box::new(ExecutionState::Running),
+        };
+        transition_state(&state, &bus_tx, ExecutionState::Cancelled(info1.clone())).await;
+
+        // Second transition attempt: must be a no-op.
+        let info2 = CancelInfo {
+            reason: CancelReason {
+                code: CancelCode::Internal,
+                detail: Some("second".into()),
+                requested_at: 200,
+            },
+            observed_at: 210,
+            state_before: Box::new(ExecutionState::Paused(PauseInfo {
+                kind: PauseKind::Single,
+                prompts: vec![],
+                paused_at: 150,
+            })),
+        };
+        transition_state(&state, &bus_tx, ExecutionState::Cancelled(info2)).await;
+
+        let guard = state.lock().await;
+        match &*guard {
+            ExecutionState::Cancelled(seen) => {
+                assert_eq!(
+                    seen.reason.detail.as_deref(),
+                    Some("first"),
+                    "second transition must not overwrite the first CancelInfo"
+                );
+                assert!(
+                    matches!(*seen.state_before, ExecutionState::Running),
+                    "state_before must remain the original pre-cancel state, got: {:?}",
+                    seen.state_before
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cancel_info nested-awareness
+    // -----------------------------------------------------------------------
+
+    /// Regression: when the state is ALREADY Cancelled, `build_cancel_info`
+    /// must NOT wrap the outer `Cancelled` as the new `state_before` (that
+    /// would yield `Cancelled(state_before=Cancelled(state_before=...))`).
+    /// Instead it inherits the inner `state_before`, preserving the original
+    /// pre-cancellation snapshot across repeated cancel attempts.
+    #[tokio::test]
+    async fn build_cancel_info_does_not_nest_on_already_cancelled_state() {
+        // Pre-set the state to Cancelled(state_before=Paused) — the shape we
+        // would observe after registry::cancel() transitions a Paused session.
+        let original_pause = ExecutionState::Paused(PauseInfo {
+            kind: PauseKind::Single,
+            prompts: vec![],
+            paused_at: 100,
+        });
+        let outer = ExecutionState::Cancelled(CancelInfo {
+            reason: CancelReason {
+                code: CancelCode::User,
+                detail: Some("first".into()),
+                requested_at: 200,
+            },
+            observed_at: 210,
+            state_before: Box::new(original_pause.clone()),
+        });
+        let state = Arc::new(Mutex::new(outer));
+
+        // Driver checkpoint later requests another build_cancel_info.
+        let second_reason = CancelReason {
+            code: CancelCode::Internal,
+            detail: Some("driver-checkpoint".into()),
+            requested_at: 300,
+        };
+        let info = build_cancel_info(&state, second_reason).await;
+
+        // The new state_before must be the ORIGINAL Paused, not the
+        // intermediate Cancelled wrapper.
+        match *info.state_before {
+            ExecutionState::Paused(ref p) => {
+                assert_eq!(p.paused_at, 100, "expected original Paused snapshot");
+            }
+            ref other => {
+                panic!("state_before must inherit inner pre-cancel state, got nested: {other:?}")
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

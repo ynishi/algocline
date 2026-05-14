@@ -1,0 +1,16 @@
+---
+source: tests/e2e.rs
+assertion_line: 5614
+expression: state_redacted
+---
+{
+  "kind": "single",
+  "paused_at": <TIMESTAMP_MS>,
+  "prompts": [
+    {
+      "prompt": "hi",
+      "query_id": "q-0"
+    }
+  ],
+  "state": "paused"
+}

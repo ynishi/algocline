@@ -280,13 +280,20 @@ mod tests {
         assert!(join.is_ok(), "forwarder task panicked");
     }
 
-    // ── Test: Lagged does NOT break the loop; forwarder continues to Closed ───
+    // ── Test: Lagged does NOT break the loop AND emits the wrapper event ────
 
-    /// `lagged_loop_continues`: sequence is Ok(event1) → Lagged(3) → Ok(event2) → Closed.
-    /// The forwarder must NOT exit on Lagged — it must complete all events and exit on Closed.
-    /// Verified by observing that the JoinHandle completes (meaning it ran to Closed).
+    /// `lagged_emits_wrapper_event`: sequence is Ok(event1) → Lagged(3) → Ok(event2) → Closed.
+    ///
+    /// Two invariants verified:
+    ///   1. The forwarder runs to Closed (loop must NOT exit on Lagged).
+    ///   2. The 2nd `notifications/progress` carries `params.message = {"kind":"lagged","n":3}`.
+    ///
+    /// Invariant 2 prevents a regression where the wrapper payload silently changes
+    /// shape (e.g. `{"kind":"foo"}`) while the loop-continues invariant alone would pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn lagged_loop_continues() {
+    async fn lagged_emits_wrapper_event() {
+        use tokio::io::AsyncReadExt;
+
         let event1 = ProgressEvent::Tick {
             phase: "step1".to_string(),
             at: 1,
@@ -303,11 +310,16 @@ mod tests {
             Err(ObserverRecvError::Closed),
         ]);
         let exec = Arc::new(MockExecution::with_observer(obs));
-        let running = make_test_server();
+
+        // Build a duplex pair so we can read what the server actually sends.
+        // Drop-by-explicit-close at the end terminates the reader's read_to_end.
+        let (server_t, mut client_t) = tokio::io::duplex(4096);
+        let running = rmcp::service::serve_directly(NullServer, server_t, None);
         let peer = running.peer().clone();
 
         let handle = spawn_progress_forwarder(exec, peer, make_sid(), make_token());
-        // Must complete (Closed terminates the loop) within generous timeout.
+
+        // Invariant 1: forwarder reaches Closed within a generous timeout.
         let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
         assert!(
             result.is_ok(),
@@ -315,6 +327,60 @@ mod tests {
         );
         let join = result.unwrap();
         assert!(join.is_ok(), "forwarder task panicked");
+
+        // Let any pending writes flush onto the pipe before we drop the server side.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(running);
+
+        // Drain the client side. read_to_end returns once the server end is closed.
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            client_t.read_to_end(&mut buf),
+        )
+        .await
+        .expect("client-side drain timed out");
+
+        let text = String::from_utf8_lossy(&buf);
+        let messages: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+
+        let progress_msgs: Vec<&serde_json::Value> = messages
+            .iter()
+            .filter(|m| m.get("method").and_then(|v| v.as_str()) == Some("notifications/progress"))
+            .collect();
+
+        // Expected order on the wire: event1 tick → lagged wrapper → event2 tick.
+        assert!(
+            progress_msgs.len() >= 2,
+            "expected >= 2 progress notifications (tick + lagged wrapper); got {} from bytes: {:?}",
+            progress_msgs.len(),
+            text
+        );
+
+        // Invariant 2: 2nd progress notification carries the lagged wrapper.
+        let lagged = progress_msgs[1];
+        let message_str = lagged
+            .get("params")
+            .and_then(|p| p.get("message"))
+            .and_then(|m| m.as_str())
+            .expect("notifications/progress params.message missing or not a string");
+        let lagged_obj: serde_json::Value =
+            serde_json::from_str(message_str).expect("params.message is not valid JSON");
+
+        assert_eq!(
+            lagged_obj.get("kind").and_then(|v| v.as_str()),
+            Some("lagged"),
+            "expected kind=lagged, got: {lagged_obj:?}"
+        );
+        assert_eq!(
+            lagged_obj.get("n").and_then(|v| v.as_i64()),
+            Some(3),
+            "expected n=3, got: {lagged_obj:?}"
+        );
     }
 
     // ── Test: Wire close (notify_progress Err) breaks the loop ───────────────

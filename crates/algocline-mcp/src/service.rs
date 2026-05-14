@@ -16,7 +16,9 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use algocline_app::{EngineApi, QueryResponse};
-use algocline_core::AppDir;
+use algocline_core::{execution::ExecutionService, AppDir};
+
+use crate::req_registry::ReqIdRegistry;
 
 use crate::prompts::PromptCatalog;
 use crate::resources::{build_list_resources_result, build_list_templates_result, ResourceCatalog};
@@ -825,11 +827,22 @@ pub struct AlcService {
     app: Arc<dyn EngineApi>,
     resource_catalog: Arc<ResourceCatalog>,
     prompt_catalog: Arc<PromptCatalog>,
+    /// Adapter-exclusive mapping from MCP `RequestId` to [`SessionId`].
+    /// Service-layer crates must never reference this field or any wire type it contains.
+    #[allow(dead_code)]
+    execution: Arc<dyn ExecutionService>,
+    /// Owned by the adapter; service layer is never exposed to wire identifiers.
+    #[allow(dead_code)]
+    req_registry: Arc<ReqIdRegistry>,
 }
 
 #[tool_router]
 impl AlcService {
-    pub fn new(app: Arc<dyn EngineApi>, app_dir: Arc<AppDir>) -> Self {
+    pub fn new(
+        app: Arc<dyn EngineApi>,
+        execution: Arc<dyn ExecutionService>,
+        app_dir: Arc<AppDir>,
+    ) -> Self {
         let resource_catalog = Arc::new(ResourceCatalog::new(app.clone(), app_dir.clone()));
         let prompt_catalog = Arc::new(PromptCatalog::new(app.clone(), app_dir));
         Self {
@@ -837,6 +850,8 @@ impl AlcService {
             app,
             resource_catalog,
             prompt_catalog,
+            execution,
+            req_registry: Arc::new(ReqIdRegistry::default()),
         }
     }
 

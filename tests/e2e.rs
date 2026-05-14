@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::io::Write;
+use std::time::Duration;
 
 use rmcp::{
     model::{
@@ -16,6 +17,8 @@ use rmcp::{
     ServiceExt,
 };
 use serde_json::{json, Map, Value};
+
+use tokio::time::{sleep, timeout};
 
 use algocline_app::PRESET_CATALOG_VERSION;
 
@@ -137,6 +140,28 @@ async fn call_json(
         .expect("call_tool failed");
     let text = extract_text(&result);
     serde_json::from_str(text).unwrap_or_else(|e| panic!("JSON parse failed: {e}\nraw: {text}"))
+}
+
+/// Poll `alc_v2_state` at 10ms intervals until the session reaches the `paused` state.
+///
+/// Panics if the session does not become paused within `max_wait`. Safe for use only
+/// in test code.
+async fn poll_until_paused(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    session_id: &str,
+    max_wait: Duration,
+) -> Value {
+    timeout(max_wait, async {
+        loop {
+            let state = call_json(client, "alc_v2_state", json!({"session_id": session_id})).await;
+            if state["state"].as_str() == Some("paused") {
+                return state;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for paused state")
 }
 
 // ─── Tests ───────────────────────────────────────────────────────
@@ -5304,6 +5329,331 @@ async fn test_get_prompt_round_trip() {
         !text.contains("${task}"),
         "placeholder '${{task}}' must be substituted, but was found in: {text}"
     );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+// ─── alc_v2 E2E tests ─────────────────────────────────────────────
+
+/// Case 1: `alc_v2_run` with a simple pure-Lua expression returns a JSON object
+/// containing a `session_id` string field.
+#[tokio::test]
+async fn test_alc_v2_run_basic() {
+    let client = connect().await;
+
+    let resp = call_json(&client, "alc_v2_run", json!({ "code": "return {ok=true}" })).await;
+
+    assert!(
+        resp["session_id"].is_string(),
+        "expected session_id string in response, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 2: `alc_v2_state` with a non-existent session id returns an error
+/// message containing "not found".
+#[tokio::test]
+async fn test_alc_v2_state_unknown_session_errors() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_v2_state",
+            json!({ "session_id": "ses-nonexistent-00000000" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.to_lowercase().contains("not found"),
+        "expected 'not found' error, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 3: `alc_v2_state` is idempotent — two successive calls with the same
+/// `session_id` return equal JSON.
+#[tokio::test]
+async fn test_alc_v2_state_idempotent() {
+    let client = connect().await;
+
+    // Run a session that completes immediately.
+    let run_resp = call_json(&client, "alc_v2_run", json!({ "code": "return {ok=true}" })).await;
+    let sid = run_resp["session_id"].as_str().expect("session_id");
+
+    // Poll until the session reaches a terminal state (done / cancelled / failed).
+    let first = timeout(Duration::from_secs(5), async {
+        loop {
+            let s = call_json(&client, "alc_v2_state", json!({"session_id": sid})).await;
+            let state_tag = s["state"].as_str().unwrap_or("");
+            if matches!(state_tag, "done" | "cancelled" | "failed") {
+                return s;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("session did not reach terminal state within 5s");
+
+    // A second call with the same session_id must return the same JSON.
+    let second = call_json(&client, "alc_v2_state", json!({"session_id": sid})).await;
+
+    assert_eq!(
+        first, second,
+        "alc_v2_state must be idempotent — two calls returned different JSON"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 4: `alc_v2_resume` with a non-existent session id returns an error
+/// containing "not found".
+#[tokio::test]
+async fn test_alc_v2_resume_unknown_session_errors() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_v2_resume",
+            json!({
+                "session_id": "ses-nonexistent-00000000",
+                "payload": {
+                    "payload_kind": "single",
+                    "response": "ok",
+                    "query_id": "q-0",
+                    "usage": null
+                }
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.to_lowercase().contains("not found"),
+        "expected 'not found' error, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 5: `alc_v2_resume` on a running (non-paused) session returns an error
+/// containing "not paused".
+#[tokio::test]
+async fn test_alc_v2_resume_not_paused_errors() {
+    let client = connect().await;
+
+    // Start a session that completes without pausing.
+    let run_resp = call_json(&client, "alc_v2_run", json!({ "code": "return 42" })).await;
+    let sid = run_resp["session_id"].as_str().expect("session_id");
+
+    // Wait until the session is done.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let s = call_json(&client, "alc_v2_state", json!({"session_id": sid})).await;
+            if s["state"].as_str() == Some("done") {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("session did not reach done state within 5s");
+
+    // Attempt to resume the done session — must fail with "not paused".
+    let result = client
+        .call_tool(call_params(
+            "alc_v2_resume",
+            json!({
+                "session_id": sid,
+                "payload": {
+                    "payload_kind": "single",
+                    "response": "ok",
+                    "query_id": "q-0",
+                    "usage": null
+                }
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.to_lowercase().contains("not paused"),
+        "expected 'not paused' error, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 6: `alc_v2_cancel` with a non-existent session id returns an error
+/// containing "not found".
+#[tokio::test]
+async fn test_alc_v2_cancel_unknown_session_errors() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_v2_cancel",
+            json!({ "session_id": "ses-nonexistent-00000000" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.to_lowercase().contains("not found"),
+        "expected 'not found' error, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 7: `alc_v2_cancel` is idempotent — cancelling a session twice both
+/// succeed (terminal states are idempotent per spec).
+#[tokio::test]
+async fn test_alc_v2_cancel_idempotent() {
+    let client = connect().await;
+
+    // Run a session that pauses so we have a live session to cancel.
+    let run_resp = call_json(
+        &client,
+        "alc_v2_run",
+        json!({ "code": "return alc.llm('hi')" }),
+    )
+    .await;
+    let sid = run_resp["session_id"].as_str().expect("session_id");
+
+    // Wait until paused so the registry entry is live.
+    let _state = poll_until_paused(&client, sid, Duration::from_secs(5)).await;
+
+    // First cancel — must succeed.
+    let first = call_json(&client, "alc_v2_cancel", json!({ "session_id": sid })).await;
+    // A success response is `{}` — any JSON parse succeeding is the criterion.
+    let _ = first; // value captured for completeness
+
+    // Second cancel — must also succeed (idempotent).
+    let second_result = client
+        .call_tool(call_params("alc_v2_cancel", json!({ "session_id": sid })))
+        .await
+        .expect("call_tool failed");
+    let second_text = extract_text(&second_result);
+    // Idempotent cancel must not return an error — the text must parse as JSON `{}`.
+    let second_json: Value = serde_json::from_str(second_text)
+        .unwrap_or_else(|e| panic!("second cancel must return JSON, got: {second_text} ({e})"));
+    assert_eq!(
+        second_json,
+        json!({}),
+        "second cancel must return {{}} for idempotent terminal cancel, got: {second_json}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 8: Full paused lifecycle — run → paused → resume → terminal.
+///
+/// Verifies the complete `alc_v2_run` → `alc_v2_state` → `alc_v2_resume` flow for a
+/// session that invokes `alc.llm()`.
+#[tokio::test]
+async fn test_alc_v2_run_paused_lifecycle() {
+    let client = connect().await;
+
+    // 1. Start a session that will pause at alc.llm().
+    let run_resp = call_json(
+        &client,
+        "alc_v2_run",
+        json!({ "code": "return alc.llm('hi')" }),
+    )
+    .await;
+    let sid = run_resp["session_id"].as_str().expect("session_id");
+
+    // 2. Poll until paused.
+    let state = poll_until_paused(&client, sid, Duration::from_secs(5)).await;
+    assert_eq!(
+        state["state"].as_str(),
+        Some("paused"),
+        "session must be in paused state"
+    );
+
+    // Capture the paused state projection for snapshot verification.
+    // Redact UUIDs and Unix-millisecond timestamps so the snapshot is stable.
+    let state_redacted = {
+        let s = serde_json::to_string_pretty(&state).expect("serialize state");
+        let s = redact_uuids(&s);
+        // Replace 13-digit numbers (Unix-ms timestamps like 1778723417409) with a placeholder.
+        let re = regex::Regex::new(r"\b[0-9]{13}\b").expect("regex");
+        re.replace_all(&s, "<TIMESTAMP_MS>").to_string()
+    };
+    insta::assert_snapshot!("alc_v2_state_paused", state_redacted);
+
+    // 3. Extract the query_id from the pause payload.
+    // The PauseInfo struct serialises pending prompts under a "prompts" key.
+    let query_id = state["prompts"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|q| q["query_id"].as_str())
+        .unwrap_or("q-0")
+        .to_string();
+
+    // 4. Resume with a Single response.
+    let resume_resp = call_json(
+        &client,
+        "alc_v2_resume",
+        json!({
+            "session_id": sid,
+            "payload": {
+                "payload_kind": "single",
+                "response": "ok",
+                "query_id": query_id,
+                "usage": null
+            }
+        }),
+    )
+    .await;
+
+    // Outcome must be "continued" or "terminal".
+    let outcome = resume_resp["outcome"].as_str().unwrap_or("");
+    assert!(
+        outcome == "continued" || outcome == "terminal",
+        "resume outcome must be 'continued' or 'terminal', got: {outcome}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Case 9: `alc_v2_run` with missing required `code` field yields an error.
+///
+/// rmcp may surface the missing-required-field failure either as a JSON-RPC error
+/// (Err from `call_tool`) or as a tool-level error text.  Both are acceptable; we
+/// verify that the call does not succeed silently.
+#[tokio::test]
+async fn test_alc_v2_run_shape_validation() {
+    let client = connect().await;
+
+    // Pass empty args — `code` field is required.
+    let outcome = client.call_tool(call_params("alc_v2_run", json!({}))).await;
+
+    // The call must either return a ServiceError (JSON-RPC level rejection) or a
+    // tool-level error result with non-empty text.  A successful JSON parse of the
+    // response (i.e. a valid session_id) would indicate the constraint was not enforced.
+    match outcome {
+        Err(_service_err) => {
+            // JSON-RPC protocol error — the missing required field was caught by rmcp.
+        }
+        Ok(result) => {
+            let text = extract_text(&result);
+            // If the server returned Ok, it must at minimum contain an error message.
+            // A valid non-error response would have a session_id JSON field.
+            let parsed: Option<Value> = serde_json::from_str(text).ok();
+            assert!(
+                parsed.as_ref().and_then(|v| v.get("session_id")).is_none(),
+                "alc_v2_run with missing code must not return a session_id, got: {text}"
+            );
+        }
+    }
 
     client.cancel().await.expect("cancel failed");
 }

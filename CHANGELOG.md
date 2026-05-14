@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.35.0] - 2026-05-14
 
 ### Added
 
@@ -135,6 +135,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   technical blocker). No source changes required in algocline — the
   current MCP server compiles against 1.7 unchanged.
 
+- **`await_terminal` no longer busy-polls — JoinHandle take-and-await**
+  (`algocline-engine::execution`). The previous implementation looped
+  `state.lock().await → match → tokio::task::yield_now().await`
+  indefinitely until the state transitioned to a terminal variant.
+  `yield_now()` consumes no CPU but keeps the task in the scheduler's
+  ready queue, so N parallel `await_terminal` callers occupy N worker
+  slots that legitimate work cannot use. `SessionRecord.join_handle`
+  is now `Mutex<Option<JoinHandle<()>>>` and `await_terminal` takes the
+  handle, `.await`-s it directly, then reads the (now-terminal) state
+  once via the existing mutex. Single-awaiter discipline is documented;
+  a second concurrent caller that observes `None` falls through to a
+  direct state read, returning `AwaitError::Joined("...concurrent
+  awaiter race...")` only in the rare race where the state has not yet
+  been written. Current production usage is single-caller, so the race
+  branch is purely defensive. No API change. Regression coverage:
+  `await_terminal_returns_done_for_trivial_script`,
+  `await_terminal_does_not_panic_on_second_concurrent_caller`.
+
+- **Remove `SessionRecord._sentinel_rx` (sink-free invariant clarified)**
+  (`algocline-engine::execution::record`). The sentinel
+  `broadcast::Receiver<ProgressEvent>` was held only to ensure
+  `bus_tx.send(...)` returned `Ok` when 0 user observers were subscribed,
+  but every production call site already uses `let _ = bus_tx.send(...)`
+  to absorb the result. The sentinel only added cost — a 256-deep buffer
+  per session with `ProgressEvent` clones cycling under `Lagged` eviction
+  — without protecting anything that wasn't already protected by the
+  `let _ = ...` pattern. The Crux R3 (sink-free fan-out) doc comment in
+  `record.rs` is reworded to reflect the actual invariant: "caller is not
+  crashed by 0 observers", not "`send` always returns `Ok`". The matching
+  unit test is renamed `bus_tx_send_succeeds_with_zero_observers` →
+  `bus_tx_does_not_crash_caller_with_zero_observers` with the
+  `assert!(result.is_ok())` removed (the new contract is panic-freedom).
+  No API change at `ExecutionService::observe`; existing observers
+  continue to receive the full event stream with the same late-subscribe
+  semantics.
+
+- **`lagged_emits_wrapper_event` test flush is now deterministic**
+  (`algocline-mcp::progress_forwarder`). Removed the 50ms wall-clock
+  `tokio::time::sleep` that preceded the duplex-transport drop. The
+  duplex pipe buffer preserves bytes the server side has already
+  written past the server-side drop, so `drop(running) → read_to_end`
+  on the client side drains them without a timing-dependent delay.
+  Bumps the `read_to_end` timeout 300ms → 500ms so the overall
+  wall-clock upper bound is unchanged on slow CI runners. Test-only
+  change; no production code touched.
+
 ### Fixed
 
 - **MCP `alc_run.ctx` / `alc_advice.opts` / `alc_eval.strategy_opts`
@@ -161,6 +207,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `alc.json_decode(ctx)` to recover from the bug — keep working
   without code changes. Regression coverage:
   `tests/e2e.rs::test_alc_run_ctx_stringified_json_normalized_to_table`.
+
+- **Prevent `state_before` nesting in `CancelInfo` on `Paused → Cancelled`**
+  (`algocline-engine::execution::driver`). When a session was cancelled
+  while in the `Paused` state, two `Cancelled` transitions could fire in
+  sequence — first from `SessionRegistryV2::cancel` (which transitions
+  immediately so a paused driver does not hang waiting on a resume),
+  then from `driver_loop` checkpoint D once `cancel_token` fires. Both
+  paths called `build_cancel_info` independently and the second call
+  read the now-`Cancelled` state, producing
+  `Cancelled(state_before=Cancelled(state_before=Paused))` instead of
+  `Cancelled(state_before=Paused)`. The fix is two cooperating changes:
+  (1) `transition_state` is now idempotent on terminal → terminal
+  transitions (first transition wins — state is not overwritten and no
+  `StateTransition` event is emitted), and (2) `build_cancel_info` is
+  nested-aware (when the current state is already `Cancelled`, the new
+  `state_before` inherits the inner `state_before` rather than wrapping
+  the outer `Cancelled`). Either change alone breaks the regression;
+  both together also future-proof against new cancel paths that may add
+  similar double-transition scenarios. Regression coverage:
+  `transition_state_terminal_is_idempotent`,
+  `build_cancel_info_does_not_nest_on_already_cancelled_state`.
+  Verified on the wire via `alc_v2_run` paused → `alc_v2_cancel` →
+  `alc_v2_state` — `state_before` is now the original `Paused` snapshot,
+  not a nested `Cancelled` wrapper.
 
 ## [0.34.0] - 2026-05-10
 

@@ -849,23 +849,51 @@ pub struct V2StateParams {
 }
 
 /// Parameters for `alc_v2_resume`.
+///
+/// `payload` is typed as raw `serde_json::Value` because some clients ship
+/// the field as a stringified JSON object even though the published schema
+/// declares `type: object`. The handler reparses a `Value::String` into a
+/// `Value::Object` via [`normalize_stringified_json_object`] before
+/// deserializing into [`ResumePayload`]. Conforming clients pay no extra
+/// cost — their object passes through the normalize helper unchanged.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct V2ResumeParams {
     /// Session ID returned by `alc_v2_run`.
     pub session_id: String,
     /// Resume payload — must match the pause kind of the session.
-    #[schemars(with = "serde_json::Value")]
-    pub payload: ResumePayload,
+    pub payload: serde_json::Value,
 }
 
 /// Parameters for `alc_v2_cancel`.
+///
+/// `reason` mirrors the `payload` decoding strategy of [`V2ResumeParams`]
+/// to tolerate clients that stringify the object form.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct V2CancelParams {
     /// Session ID returned by `alc_v2_run`.
     pub session_id: String,
     /// Optional cancellation reason. Defaults to `CancelCode::User` with no detail.
-    #[schemars(with = "Option<serde_json::Value>")]
-    pub reason: Option<CancelReason>,
+    pub reason: Option<serde_json::Value>,
+}
+
+/// Reparse a `Value::String` whose body is itself a JSON object or array
+/// into the corresponding `Value::Object` / `Value::Array`. All other shapes
+/// (primitive scalars, valid objects/arrays, non-JSON strings) pass through
+/// untouched.
+///
+/// Mirrors `algocline_app::service::run::normalize_stringified_json_object`
+/// which is `pub(crate)` to that crate; duplicating the 8-line helper here
+/// avoids cross-crate API widening for a wire-layer concern. Same rationale
+/// as commit 0154010 (`fix(mcp): auto-decode stringified ctx/opts`).
+fn normalize_stringified_json_object(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(ref s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(parsed @ serde_json::Value::Object(_)) => parsed,
+            Ok(parsed @ serde_json::Value::Array(_)) => parsed,
+            _ => v,
+        },
+        other => other,
+    }
 }
 
 // ─── V2 adapter helpers ───────────────────────────────────────────
@@ -2031,9 +2059,13 @@ impl AlcService {
         Parameters(params): Parameters<V2ResumeParams>,
     ) -> Result<String, String> {
         let sid = SessionId::from(params.session_id.as_str());
+        // Tolerate stringified JSON payloads (see V2ResumeParams doc).
+        let payload_value = normalize_stringified_json_object(params.payload);
+        let payload: ResumePayload =
+            serde_json::from_value(payload_value).map_err(|e| format!("invalid payload: {e}"))?;
         let outcome = self
             .execution
-            .resume(&sid, params.payload)
+            .resume(&sid, payload)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&outcome).map_err(|e| e.to_string())
@@ -2052,11 +2084,19 @@ impl AlcService {
         Parameters(params): Parameters<V2CancelParams>,
     ) -> Result<String, String> {
         let sid = SessionId::from(params.session_id.as_str());
-        let reason = params.reason.unwrap_or_else(|| CancelReason {
-            code: CancelCode::User,
-            detail: None,
-            requested_at: now_ms(),
-        });
+        // Tolerate stringified JSON reason (see V2CancelParams doc).
+        let reason = match params.reason {
+            Some(raw) => {
+                let normalized = normalize_stringified_json_object(raw);
+                serde_json::from_value::<CancelReason>(normalized)
+                    .map_err(|e| format!("invalid reason: {e}"))?
+            }
+            None => CancelReason {
+                code: CancelCode::User,
+                detail: None,
+                requested_at: now_ms(),
+            },
+        };
         self.execution
             .cancel(&sid, reason)
             .await

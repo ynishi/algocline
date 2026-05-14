@@ -5624,6 +5624,74 @@ async fn test_alc_v2_run_paused_lifecycle() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Regression: clients that ship `payload` / `reason` as a stringified JSON object
+/// (instead of a real object — observed with Claude Code's MCP client even when
+/// the schema declares `type: object`) must still be accepted.  The handler
+/// reparses `Value::String` via `normalize_stringified_json_object`.
+///
+/// Without that decode path, `alc_v2_resume` and `alc_v2_cancel` fail with
+/// "invalid type: string ..., expected ..." at the rmcp deserializer.
+#[tokio::test]
+async fn test_alc_v2_resume_and_cancel_accept_stringified_payload() {
+    let client = connect().await;
+
+    // 1. Spawn a session that immediately pauses on `alc.llm`.
+    let spawn = call_json(
+        &client,
+        "alc_v2_run",
+        json!({"code": "local r = alc.llm(\"ping?\"); return \"got: \" .. r"}),
+    )
+    .await;
+    let sid = spawn["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    // 2. Wait for the paused state.
+    poll_until_paused(&client, &sid, Duration::from_secs(2)).await;
+
+    // 3. Resume with payload encoded as a STRING (the regression path).
+    let payload_str = serde_json::to_string(&json!({
+        "payload_kind": "single",
+        "response": "pong",
+        "query_id": "q-0",
+        "usage": null
+    }))
+    .expect("encode payload");
+    let resume_resp = call_json(
+        &client,
+        "alc_v2_resume",
+        json!({
+            "session_id": sid,
+            "payload": payload_str,
+        }),
+    )
+    .await;
+
+    let outcome = resume_resp["outcome"].as_str().unwrap_or("");
+    assert!(
+        outcome == "continued" || outcome == "terminal",
+        "stringified payload must be accepted; got outcome: {outcome} / full: {resume_resp}"
+    );
+
+    // 4. Cancel the same session with a stringified `reason` to exercise the
+    //    parallel decode path on `alc_v2_cancel`.  Idempotent on terminal sessions.
+    let reason_str = serde_json::to_string(&json!({
+        "code": "user",
+        "detail": "smoke test",
+        "requested_at": 0,
+    }))
+    .expect("encode reason");
+    let _ = call_json(
+        &client,
+        "alc_v2_cancel",
+        json!({"session_id": sid, "reason": reason_str}),
+    )
+    .await;
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Case 9: `alc_v2_run` with missing required `code` field yields an error.
 ///
 /// rmcp may surface the missing-required-field failure either as a JSON-RPC error

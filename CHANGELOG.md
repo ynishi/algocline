@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — **BREAKING**: `pkg_install` single-package mode removed
+
+`SourceKind::Single` and the staging `init.lua` auto-detection in `pkg_install`
+have been removed. Hub publishing now requires `hub_index.json` (1 entry is
+sufficient for single-package repos).
+
+**Before** (v0.35.x and earlier):
+
+```
+# Single-package repo (init.lua at repo root) auto-detected:
+alc_pkg_install({ url: "github.com/user/my-pkg" })
+# → installed as ~/.algocline/packages/my-pkg/
+# Response: { mode: "single", installed: ["my-pkg"] }
+```
+
+**After** (v0.36.0+):
+
+```
+# Collection-layout repo with hub_index.json:
+alc_pkg_install({ url: "github.com/user/my-pkg-collection" })
+# → installed as ~/.algocline/packages/<each-subdir>/
+# Response: { mode: "collection", installed: [...] }
+```
+
+**Migrate (1-pkg authors)**:
+
+1. Move `init.lua` from repo root to `<repo>/<pkg_name>/init.lua` (nested layout).
+2. Add a minimal `alc.toml` at repo root with a `[hub]` section.
+3. Run `alc_hub_dist` from a Claude Code / rmcp MCP session:
+   ```
+   alc_hub_dist(
+     source_dir = ".",
+     output_path = "hub_index.json",
+     projections = ["hub", "narrative"]
+   )
+   ```
+4. `git add hub_index.json docs/ && git commit && git push`.
+
+See `docs/pkg-author-conventions.md §7` for the full step-by-step guide.
+
+### Removed — **BREAKING**: evalframe no longer bundled
+
+`evalframe` was previously auto-installed via `alc init` and listed in
+`AUTO_INSTALL_SOURCES` as a Single-kind source. Since evalframe v0.3.0 does
+not ship with `hub_index.json` and its layout is `evalframe/evalframe/init.lua`
+(nested), the prior Single-mode installation was non-functional and surfaced
+as a Tier 3 404 warning in `alc_hub_search`.
+
+To remove the orphan directory left by previous `alc init` runs:
+
+```sh
+rm -rf ~/.algocline/packages/evalframe/
+```
+
+evalframe re-bundling will be tracked as a separate follow-up once it ships
+its own `hub_index.json`.
+
 ## [0.35.0] - 2026-05-14
 
 ### Added

@@ -528,12 +528,11 @@ alc_pkg_install({ url: "/path/to/algocline-bundled-packages" })
 alc_pkg_install({ url: "github.com/user/my-strategy" })
 ```
 
-`alc_pkg_install` automatically detects the repository layout:
-
-| Layout | Detection | Behavior |
-|---|---|---|
-| **Single package** | `init.lua` at repo root | Installed as one package |
-| **Collection** | Subdirs containing `init.lua` | Each subdir installed as a separate package |
+`alc_pkg_install` expects the repository to use **collection layout** and ship a
+`hub_index.json` at its root. Each subdirectory with an `init.lua` is installed
+as a separate package. A single-package repo is fully supported — place
+`init.lua` at `<repo>/<pkg_name>/init.lua` and generate `hub_index.json` with
+`alc_hub_dist` (see `docs/pkg-author-conventions.md §7`).
 
 Supported URL formats:
 
@@ -548,8 +547,7 @@ Supported URL formats:
 Optional parameters:
 
 ```
-alc_pkg_install({ url: "/path/to/repo", name: "custom-name" })  # name override (single package mode only)
-alc_pkg_install({ url: "/path/to/repo", force: true })          # overwrite if already installed
+alc_pkg_install({ url: "/path/to/repo", force: true })  # overwrite if already installed
 ```
 
 ### Managing packages

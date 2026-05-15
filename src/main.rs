@@ -86,6 +86,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
+    /// Print runtime configuration / version (mise doctor style).
+    ///
+    /// Returns the same JSON shape as the `alc_info` MCP tool: version,
+    /// log_dir, packages_dir, search_paths, tracing mode, etc.
+    Info,
     /// (Internal) Pool worker subprocess entrypoint — not for direct use.
     #[command(hide = true)]
     PoolWorker {
@@ -155,6 +160,18 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Init { rest }) => return init::run(&rest, false).await,
         Some(Commands::Update { rest }) => return init::run(&rest, true).await,
+        Some(Commands::Info) => {
+            // Bootstrap a minimal AppService and emit the same JSON as the
+            // `alc_info` MCP tool. Skips setup_tracing to avoid creating
+            // a log file for this one-shot diagnostic subcommand.
+            let config = AppConfig::from_env();
+            let search_paths = resolve_lib_paths();
+            let lib_paths: Vec<_> = search_paths.iter().map(|sp| sp.path.clone()).collect();
+            let executor = Arc::new(Executor::new(lib_paths).await?);
+            let app = AppService::new(executor, config, search_paths);
+            println!("{}", app.info());
+            return Ok(());
+        }
         Some(Commands::PoolWorker { sid, sock }) => {
             let config = AppConfig::from_env();
             setup_tracing(config.log_dir.as_deref())?;

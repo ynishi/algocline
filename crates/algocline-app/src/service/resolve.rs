@@ -153,16 +153,14 @@ pub(crate) fn resolve_scenario_code(
     }
 }
 
-/// Git URLs for auto-installation. Collection repos contain multiple packages
-/// as subdirectories; single repos have init.lua at root.
-pub(super) const AUTO_INSTALL_SOURCES: &[&str] = &[
-    "https://github.com/ynishi/algocline-bundled-packages",
-    "https://github.com/ynishi/evalframe",
-];
+/// Git URLs for auto-installation. All repos use the Collection layout
+/// (`<repo>/<name>/init.lua`) and must publish a `hub_index.json` at root.
+pub(super) const AUTO_INSTALL_SOURCES: &[&str] =
+    &["https://github.com/ynishi/algocline-bundled-packages"];
 
 /// System packages: installed alongside user packages but not user-facing strategies.
 /// Excluded from `pkg_list` and not loaded via `require` for meta extraction.
-const SYSTEM_PACKAGES: &[&str] = &["evalframe"];
+const SYSTEM_PACKAGES: &[&str] = &[];
 
 /// Check whether a package is a system (non-user-facing) package.
 pub(super) fn is_system_package(name: &str) -> bool {

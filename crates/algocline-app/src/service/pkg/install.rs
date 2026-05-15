@@ -111,7 +111,6 @@ impl AppService {
         // scheme-prefixed form (e.g. `https://github.com/x`).
         let url = git_url.clone();
 
-        // Clone to temp directory first to detect single vs collection
         let staging = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
         // Bound `git clone` wall time. Without this a misconfigured remote
@@ -148,86 +147,14 @@ impl AppService {
             }
         }
 
-        // Detect: single package (init.lua at root) vs collection (subdirs with init.lua)
-        if staging.path().join("init.lua").exists() {
-            // Single package mode
-            let name = name.unwrap_or_else(|| {
-                url.trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("unknown")
-                    .trim_end_matches(".git")
-                    .to_string()
-            });
-
-            let dest = ContainedPath::child(&pkg_dir, &name)?;
-            if dest.as_ref().exists() {
-                return Err(format!(
-                    "Package '{name}' already exists at {}. Remove it first.",
-                    dest.as_ref().display()
-                ));
-            }
-
-            copy_dir(staging.path(), dest.as_ref())
-                .map_err(|e| format!("Failed to copy package: {e}"))?;
-
-            // Record in manifest + hub registry. Storage failures here
-            // do not roll back the on-disk copy (install already
-            // succeeded) — they surface as `storage_warnings` so the
-            // operator notices that the metadata layer drifted.
-            let mut storage_warnings: Vec<String> = Vec::new();
-            if let Err(e) = manifest::record_install(
-                &app_dir,
-                &name,
-                None,
-                super::super::source::PackageSource::Git {
-                    url: url.clone(),
-                    rev: None,
-                },
-            ) {
-                storage_warnings.push(format!("manifest record_install: {e}"));
-            }
-            if let Err(e) = hub::register_source(&app_dir, &url, "pkg_install") {
-                storage_warnings.push(format!("hub register_source: {e}"));
-            }
-
-            // Update alc.toml + alc.lock if project root is found.
-            // Fatal errors from the update (e.g. alc.toml load failure) are
-            // degraded to warnings — the pkg copy already succeeded.
-            let project_files_warnings = match self
-                .update_project_files_for_install(std::slice::from_ref(&name))
-                .await
-            {
-                Ok(ws) => ws,
-                Err(e) => vec![e.to_string()],
-            };
-
-            let mut response = serde_json::json!({
-                "installed": [name],
-                "mode": "single",
-            });
-            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
-                response["types_path"] = serde_json::Value::String(tp);
-            }
-            if let Some(tp) = super::super::resolve::alc_shapes_types_stub_path(&app_dir) {
-                response["alc_shapes_types_path"] = serde_json::Value::String(tp);
-            }
-            if !storage_warnings.is_empty() {
-                response["storage_warnings"] = serde_json::json!(storage_warnings);
-            }
-            if !project_files_warnings.is_empty() {
-                response["project_files_warnings"] = serde_json::json!(project_files_warnings);
-            }
-            Ok(response.to_string())
-        } else {
-            // Collection mode: scan for subdirs containing init.lua
+        // Collection mode: scan for subdirs containing init.lua
+        {
             if name.is_some() {
-                // name parameter is only meaningful for single-package repos
-                return Err(
-                    "The 'name' parameter is only supported for single-package repos (init.lua at root). \
-                     This repository is a collection (subdirs with init.lua)."
-                        .to_string(),
-                );
+                return Err("The 'name' parameter is no longer supported. \
+                     Single-package install mode was removed in v0.36.0; \
+                     package names are derived from subdirectory names in collection layout \
+                     (<repo>/<name>/init.lua)."
+                    .to_string());
             }
 
             let force = force.unwrap_or(false);
@@ -333,13 +260,12 @@ impl AppService {
 
             if installed.is_empty() && skipped.is_empty() && skipped_symlinks.is_empty() {
                 return Err(
-                    "No packages found. Expected init.lua at root (single) or */init.lua (collection)."
+                    "Expected */init.lua (collection layout). Single-package mode (init.lua at root) was removed in v0.36.0."
                         .to_string(),
                 );
             }
 
-            // Record in manifest + hub registry. Same propagation
-            // discipline as the single-package branch above.
+            // Record in manifest + hub registry.
             let mut storage_warnings: Vec<String> = Vec::new();
             if let Err(e) = manifest::record_install_batch(
                 &app_dir,
@@ -398,111 +324,23 @@ impl AppService {
     ) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
         // Reject a missing source dir up front. Without this check, a missing
-        // path falls through to the Collection branch (since `init.lua` isn't
-        // present) and surfaces as the misleading "'name' parameter is only
-        // supported for single-package dirs" error when `name` is provided —
-        // which hides the real failure mode (source gone) from the caller.
+        // path surfaces as a misleading scan error rather than a clear
+        // diagnostic.
         if !source.exists() {
             return Err(format!(
                 "Source directory does not exist: {}",
                 source.display()
             ));
         }
-        if source.join("init.lua").exists() {
-            // Single package
-            let name = name.unwrap_or_else(|| {
-                source
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            });
 
-            let dest = ContainedPath::child(pkg_dir, &name)?;
-            if dest.as_ref().exists() {
-                // Overwrite for local installs (dev workflow). Log failures —
-                // silent `let _ =` used to hide Permission Denied / Busy
-                // errors and surfaced later as a confusing "File exists" from
-                // copy_dir.
-                if let Err(e) = std::fs::remove_dir_all(&dest) {
-                    tracing::warn!(
-                        "pkg_install: failed to remove existing dest {} before overwrite: {e}",
-                        dest.as_ref().display()
-                    );
-                }
-            }
-
-            copy_dir(source, dest.as_ref()).map_err(|e| format!("Failed to copy package: {e}"))?;
-            // Remove .git if copied (best-effort; absent .git is the common case).
-            if let Err(e) = std::fs::remove_dir_all(dest.as_ref().join(".git")) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        "pkg_install: failed to strip .git from {}: {e}",
-                        dest.as_ref().display()
-                    );
-                }
-            }
-
-            // Record in manifest. Local-path installs are recorded as
-            // `Path { path }` so the original source location is
-            // preserved in the typed form — this keeps `pkg_repair` able
-            // to re-copy from the same source, and `pkg_list` can show
-            // where the bytes came from. (Pre-typed manifests stored the
-            // path as a bare string; `infer_from_legacy_source_string`
-            // coerced it to `Installed`, which lost the path — the typed
-            // form fixes that regression by carrying `path` explicitly.)
-            // Storage failures surface as `storage_warnings` so the
-            // operator notices when metadata drifts from the on-disk copy.
-            let source_str_local = source.display().to_string();
-            let mut storage_warnings: Vec<String> = Vec::new();
-            if let Err(e) = manifest::record_install(
-                &app_dir,
-                &name,
-                None,
-                super::super::source::PackageSource::Path {
-                    path: source_str_local.clone(),
-                },
-            ) {
-                storage_warnings.push(format!("manifest record_install: {e}"));
-            }
-            if let Err(e) = hub::register_source(&app_dir, &source_str_local, "pkg_install") {
-                storage_warnings.push(format!("hub register_source: {e}"));
-            }
-
-            // Update alc.toml + alc.lock if project root is found.
-            // Fatal errors from the update (e.g. alc.toml load failure) are
-            // degraded to warnings — the pkg copy already succeeded.
-            let project_files_warnings = match self
-                .update_project_files_for_install(std::slice::from_ref(&name))
-                .await
-            {
-                Ok(ws) => ws,
-                Err(e) => vec![e.to_string()],
-            };
-
-            let mut response = serde_json::json!({
-                "installed": [name],
-                "mode": "local_single",
-            });
-            if let Some(tp) = super::super::resolve::types_stub_path(&app_dir) {
-                response["types_path"] = serde_json::Value::String(tp);
-            }
-            if let Some(tp) = super::super::resolve::alc_shapes_types_stub_path(&app_dir) {
-                response["alc_shapes_types_path"] = serde_json::Value::String(tp);
-            }
-            if !storage_warnings.is_empty() {
-                response["storage_warnings"] = serde_json::json!(storage_warnings);
-            }
-            if !project_files_warnings.is_empty() {
-                response["project_files_warnings"] = serde_json::json!(project_files_warnings);
-            }
-            Ok(response.to_string())
-        } else {
-            // Collection mode
+        // Collection mode: scan for subdirs containing init.lua
+        {
             if name.is_some() {
-                return Err(
-                    "The 'name' parameter is only supported for single-package dirs (init.lua at root)."
-                        .to_string(),
-                );
+                return Err("The 'name' parameter is no longer supported. \
+                     Single-package install mode was removed in v0.36.0; \
+                     package names are derived from subdirectory names in collection layout \
+                     (<repo>/<name>/init.lua)."
+                    .to_string());
             }
 
             let mut installed = Vec::new();
@@ -549,7 +387,7 @@ impl AppService {
 
             if installed.is_empty() && updated.is_empty() {
                 return Err(
-                    "No packages found. Expected init.lua at root (single) or */init.lua (collection)."
+                    "Expected */init.lua (collection layout). Single-package mode (init.lua at root) was removed in v0.36.0."
                         .to_string(),
                 );
             }
@@ -565,8 +403,9 @@ impl AppService {
             }
 
             // Record in manifest. Batch local-path installs use
-            // `Path { path }` for the same reason as single-install
-            // (preserve the source path in the typed form). Storage
+            // `Path { path }` to preserve the source location in the typed
+            // form so `pkg_repair` can re-copy from the same source and
+            // `pkg_list` can show where the bytes came from. Storage
             // failures surface via `storage_warnings`.
             let source_str = source.display().to_string();
             let all_names: Vec<String> = installed.iter().chain(updated.iter()).cloned().collect();
@@ -713,7 +552,7 @@ return (pkg.meta or {{}}).version"#
         }
     }
 
-    /// Install all bundled sources (collections + single packages).
+    /// Install all bundled sources (collection layout).
     pub(in crate::service) async fn auto_install_bundled_packages(&self) -> Result<(), String> {
         let mut errors: Vec<String> = Vec::new();
         for url in AUTO_INSTALL_SOURCES {
@@ -956,7 +795,7 @@ mod tests {
         };
 
         // Gate mirrors the `if !project_files_warnings.is_empty()` check in callers
-        let mut response = serde_json::json!({ "installed": ["mypkg"], "mode": "single" });
+        let mut response = serde_json::json!({ "installed": ["mypkg"], "mode": "collection" });
         if !project_files_warnings.is_empty() {
             response["project_files_warnings"] = serde_json::json!(project_files_warnings);
         }

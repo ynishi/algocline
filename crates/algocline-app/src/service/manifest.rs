@@ -189,6 +189,10 @@ pub(crate) trait InstalledManifestStore: Send + Sync {
 
     /// Record a successful install / update (see `record_install` free-fn
     /// docs for semantics).
+    ///
+    /// Used in tests and by the `repair` path; not called during normal
+    /// collection-mode installs (those use `record_install_batch`).
+    #[allow(dead_code)]
     fn record_install(
         &self,
         name: &str,
@@ -512,6 +516,10 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
 ///   `version` verbatim (may be `None`).
 ///
 /// `version` is extracted from the package's `M.meta.version` field if provided.
+///
+/// Used in tests and by the `repair` path; not called during normal
+/// collection-mode installs (those use `record_install_batch`).
+#[allow(dead_code)]
 pub(crate) fn record_install(
     app_dir: &AppDir,
     name: &str,

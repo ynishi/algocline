@@ -1995,10 +1995,10 @@ async fn pkg_list_default_summary_is_compact() {
 ///
 /// - `hub.collection_url` is unset → no Tier 0 entry.
 /// - No registries / manifest → only the compiled-in `AUTO_INSTALL_SOURCES`
-///   remain (2 entries), transformed by `repo_to_index_url` to raw
+///   remain (1 entry), transformed by `repo_to_index_url` to raw
 ///   GitHub URLs.
 ///
-/// Populating the cache for those 2 URLs with an empty `HubIndex` means
+/// Populating the cache for that URL with an empty `HubIndex` means
 /// `fetch_one` returns early and never makes an HTTP call, so the test
 /// works offline and finishes in milliseconds.
 #[tokio::test]
@@ -2023,10 +2023,8 @@ async fn hub_search_default_summary_is_compact() {
     // `repo_to_index_url` before hitting the cache layer. If this
     // list drifts the test must follow — `repo_to_index_url` is
     // verified verbatim by `hub.rs` unit tests.
-    for repo in [
-        "https://github.com/ynishi/algocline-bundled-packages",
-        "https://github.com/ynishi/evalframe",
-    ] {
+    {
+        let repo = "https://github.com/ynishi/algocline-bundled-packages";
         let owner_repo = repo.trim_start_matches("https://github.com/");
         let index_url =
             format!("https://raw.githubusercontent.com/{owner_repo}/main/hub_index.json");
@@ -2122,10 +2120,8 @@ async fn hub_search_limit_zero_returns_all() {
     })
     .to_string();
 
-    for repo in [
-        "https://github.com/ynishi/algocline-bundled-packages",
-        "https://github.com/ynishi/evalframe",
-    ] {
+    {
+        let repo = "https://github.com/ynishi/algocline-bundled-packages";
         let owner_repo = repo.trim_start_matches("https://github.com/");
         let index_url =
             format!("https://raw.githubusercontent.com/{owner_repo}/main/hub_index.json");

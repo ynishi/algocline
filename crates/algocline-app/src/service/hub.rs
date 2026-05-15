@@ -52,7 +52,7 @@
 //!      by `pkg_install` and `card_install`.
 //!   2. **Installed manifest** — `~/.algocline/installed.json`, fallback for
 //!      sources registered before registries existed.
-//!   3. **Compiled-in seeds** — `AUTO_INSTALL_SOURCES` for first-run bootstrap.
+//!   3. **Compiled-in seeds** — bundled-packages source for first-run bootstrap.
 //!
 //! GitHub repo URLs are transformed to raw index URLs:
 //!
@@ -223,8 +223,8 @@ impl SearchResult {
 //
 // Persistent file (`~/.algocline/hub_registries.json`) that records
 // source URLs from `pkg_install` and `card_install`.  This is the
-// primary source for Hub index URL discovery — the manifest and
-// `AUTO_INSTALL_SOURCES` serve as fallback seeds.
+// primary source for Hub index URL discovery — the manifest and the
+// bundled-packages seed serve as fallback sources.
 
 /// One entry in `hub_registries.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,7 +393,7 @@ fn collection_url_from_config(app_dir: &AppDir) -> Result<Option<String>, String
 //   0. Hub Collection URL (from config.toml) — aggregated index
 //   1. Hub registries (`hub_registries.json`) — primary source
 //   2. Unique `source` fields in the installed-packages manifest
-//   3. `AUTO_INSTALL_SOURCES` as fallback seeds (for first run)
+//   3. Bundled-packages seed (for first-run bootstrap)
 //
 // GitHub repos are transformed:
 //   https://github.com/{owner}/{repo}  →

@@ -115,16 +115,15 @@ pub struct McpQueryResponse {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgInstallParams {
-    /// Git URL or local path of a package or collection
+    /// Git URL or local path of a package collection.
     /// (e.g. "github.com/user/my-pkg", "file:///path/to/local/pkg").
-    /// Single package: repo has init.lua at root → installed as one package.
-    /// Collection: repo has subdirs with init.lua → each subdir installed as a package.
+    /// The repository must use collection layout: each subdirectory with
+    /// an `init.lua` is installed as a separate package.
     pub url: String,
-    /// Optional package name override (single package mode only).
-    /// Defaults to the last segment of the URL. Ignored for collections.
+    /// Optional package name hint. Reserved for future use; currently ignored
+    /// for collection-mode installs. Defaults to the last segment of the URL.
     pub name: Option<String>,
-    /// Collection mode only: overwrite existing packages at dest (default `false`).
-    /// Single mode rejects pre-existing dest with an error regardless of this flag.
+    /// Overwrite existing packages at dest (default `false`).
     #[serde(default)]
     pub force: Option<bool>,
 }
@@ -168,11 +167,12 @@ impl PkgLinkScope {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgLinkParams {
     /// Absolute or relative path to the directory to link as a package.
-    /// If the directory contains init.lua: single package mode.
-    /// If subdirectories contain init.lua: collection mode (each subdir becomes a package).
+    /// Must follow collection layout: subdirectories containing `init.lua`
+    /// (each subdirectory becomes one linked package). Single-package mode
+    /// (`init.lua` at the directory root) was removed in v0.36.0.
     pub path: String,
-    /// Optional name override for the package (single package mode only).
-    /// Defaults to the directory name.
+    /// Reserved for future use; currently ignored. Package names are derived
+    /// from subdirectory names under `path`.
     pub name: Option<String>,
     /// Force overwrite of existing symlinks. Default: false.
     /// Only meaningful when `scope = "global"` — ignored in `"variant"` scope.
@@ -1160,7 +1160,6 @@ impl AlcService {
     ///   (git-ignored, loaded every `alc_run`). No symlink is created, so
     ///   sibling worktrees are unaffected.
     ///
-    /// Single mode: directory has `init.lua` at root → one package (name = dirname or `name` param).
     /// Collection mode: subdirectories have `init.lua` → each subdir is a package.
     #[tool(
         name = "alc_pkg_link",
@@ -1225,12 +1224,12 @@ impl AlcService {
             .await
     }
 
-    /// Install a package from a Git URL or local path.
+    /// Install a package collection from a Git URL or local path.
     /// Clones the repository into ~/.algocline/packages/{name}/.
     /// Supports: `github.com/user/pkg`, `https://...`, `git@...`,
     /// `file:///absolute/path`, or bare `/absolute/path`.
-    /// The package must have an init.lua at its root.
-    /// `force` (optional, default false): Collection mode only — overwrite existing packages at dest.
+    /// The repository must use collection layout (`<name>/init.lua` nested under a subdir).
+    /// `force` (optional, default false): overwrite existing packages at dest.
     #[tool(
         name = "alc_pkg_install",
         annotations(destructive_hint = true, open_world_hint = true)

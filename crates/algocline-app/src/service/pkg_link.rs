@@ -61,6 +61,26 @@ impl AppService {
     }
 
     /// `scope = global` — create a symlink in `~/.algocline/packages/{name}`.
+    ///
+    /// Only collection layout (`<dir>/<name>/init.lua`) is supported. Single-package
+    /// layout (root-level `init.lua`) was removed in v0.36.0; reorganise the source
+    /// directory into a collection before calling this function.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` — local directory path (absolute or relative to cwd)
+    /// * `name` — must be `None`; the `name` parameter is not supported in collection
+    ///   mode (package names are derived from subdirectory names)
+    /// * `force` — overwrite an existing real directory at the destination
+    ///
+    /// # Returns
+    ///
+    /// JSON string with `linked`, `mode`, `targets`, and `scope` fields on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the path is not a directory, if `name` is provided, if no
+    /// `*/init.lua` subdirectories are found, or if a symlink operation fails.
     async fn pkg_link_global(
         &self,
         path: String,
@@ -77,6 +97,16 @@ impl AppService {
 
         #[cfg(unix)]
         {
+            // Reject 'name' parameter — collection mode derives names from subdirectory names.
+            if name.is_some() {
+                return Err(
+                    "The 'name' parameter is no longer supported. Single-mode link was removed \
+                     in v0.36.0; package names are derived from subdirectory names in collection \
+                     layout (<dir>/<name>/init.lua)."
+                        .to_string(),
+                );
+            }
+
             let force = force.unwrap_or(false);
 
             // 1. Resolve source path (absolute: use as-is; relative: join with cwd).
@@ -93,85 +123,51 @@ impl AppService {
                 return Err(format!("Path is not a directory: {}", source.display()));
             }
 
-            // 2. Detect mode: single package (init.lua at root) or collection.
-            let mode = detect_mode(&source)?;
-
-            // 3. Get packages_dir.
+            // 2. Get packages_dir.
             let pkgs = packages_dir(&self.log_config.app_dir());
             std::fs::create_dir_all(&pkgs)
                 .map_err(|e| format!("Cannot create packages dir {}: {e}", pkgs.display()))?;
 
-            // 4. Link packages.
-            let mode_str;
+            // 3. Link packages (collection layout only: scan */init.lua).
             let mut linked_names: Vec<String> = Vec::new();
             let mut targets: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-            match mode {
-                PackageMode::Single => {
-                    mode_str = "single";
-                    let pkg_name = if let Some(n) = name {
-                        n
-                    } else {
-                        source
-                            .file_name()
-                            .ok_or_else(|| {
-                                format!("Cannot determine package name from: {}", source.display())
-                            })?
-                            .to_string_lossy()
-                            .to_string()
-                    };
-                    validate_package_name(&pkg_name)?;
+            let entries = std::fs::read_dir(&source)
+                .map_err(|e| format!("Failed to read directory {}: {e}", source.display()))?;
 
-                    let dest = pkgs.join(&pkg_name);
-                    create_symlink(&source, &dest, force)?;
-
-                    targets.insert(
-                        pkg_name.clone(),
-                        serde_json::Value::String(source.display().to_string()),
-                    );
-                    linked_names.push(pkg_name);
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+                let pkg_path = entry.path();
+                // Skip non-dirs and dirs without init.lua.
+                if !pkg_path.is_dir() || !pkg_path.join("init.lua").exists() {
+                    continue;
                 }
-                PackageMode::Collection => {
-                    mode_str = "collection";
-                    let entries = std::fs::read_dir(&source).map_err(|e| {
-                        format!("Failed to read directory {}: {e}", source.display())
-                    })?;
+                let pkg_name = entry.file_name().to_string_lossy().to_string();
+                validate_package_name(&pkg_name)?;
 
-                    for entry in entries {
-                        let entry =
-                            entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
-                        let pkg_path = entry.path();
-                        // Skip non-dirs and dirs without init.lua.
-                        if !pkg_path.is_dir() || !pkg_path.join("init.lua").exists() {
-                            continue;
-                        }
-                        let pkg_name = entry.file_name().to_string_lossy().to_string();
-                        validate_package_name(&pkg_name)?;
+                let dest = pkgs.join(&pkg_name);
+                create_symlink(&pkg_path, &dest, force)?;
 
-                        let dest = pkgs.join(&pkg_name);
-                        create_symlink(&pkg_path, &dest, force)?;
-
-                        targets.insert(
-                            pkg_name.clone(),
-                            serde_json::Value::String(pkg_path.display().to_string()),
-                        );
-                        linked_names.push(pkg_name);
-                    }
-
-                    if linked_names.is_empty() {
-                        return Err(format!(
-                            "No init.lua found in any subdirectory of: {}",
-                            source.display()
-                        ));
-                    }
-
-                    linked_names.sort();
-                }
+                targets.insert(
+                    pkg_name.clone(),
+                    serde_json::Value::String(pkg_path.display().to_string()),
+                );
+                linked_names.push(pkg_name);
             }
+
+            if linked_names.is_empty() {
+                return Err(format!(
+                    "No init.lua found in any subdirectory of: {} \
+                     (expected */init.lua collection layout)",
+                    source.display()
+                ));
+            }
+
+            linked_names.sort();
 
             Ok(serde_json::json!({
                 "linked": linked_names,
-                "mode": mode_str,
+                "mode": "collection",
                 "targets": targets,
                 "scope": "global",
             })
@@ -180,12 +176,41 @@ impl AppService {
     }
 
     /// `scope = variant` — record the path in `alc.local.toml`.
+    ///
+    /// Only collection layout (`<dir>/<name>/init.lua`) is supported. Single-package
+    /// layout (root-level `init.lua`) was removed in v0.36.0.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` — local directory path containing one or more `<name>/init.lua` subdirs
+    /// * `name` — must be `None`; package names are derived from subdirectory names
+    /// * `project_root` — root directory for `alc.local.toml`; falls back to walk-up
+    ///   / env if `None`
+    ///
+    /// # Returns
+    ///
+    /// JSON string with `linked`, `mode`, `targets`, `scope`, and `alc_local_toml` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the path is not a directory, if `name` is provided, if no
+    /// `*/init.lua` subdirectories are found, or if writing `alc.local.toml` fails.
     async fn pkg_link_variant(
         &self,
         path: String,
         name: Option<String>,
         project_root: Option<String>,
     ) -> Result<String, String> {
+        // Reject 'name' parameter — collection mode derives names from subdirectory names.
+        if name.is_some() {
+            return Err(
+                "The 'name' parameter is no longer supported. Single-mode link was removed \
+                 in v0.36.0; package names are derived from subdirectory names in collection \
+                 layout (<dir>/<name>/init.lua)."
+                    .to_string(),
+            );
+        }
+
         // 1. Resolve source path.
         let raw = Path::new(&path);
         let source: PathBuf = if raw.is_absolute() {
@@ -200,15 +225,12 @@ impl AppService {
             return Err(format!("Path is not a directory: {}", source.display()));
         }
 
-        // 2. Detect mode.
-        let mode = detect_mode(&source)?;
-
-        // 3. Resolve project root (P > S > E > W).
+        // 2. Resolve project root (P > S > E > W).
         let root = self.resolve_root(project_root.as_deref()).ok_or_else(|| {
             "No project root found. Pass project_root or activate via alc_session_new, set ALC_PROJECT_ROOT, or run from within a project containing alc.toml.".to_string()
         })?;
 
-        // 4. Load or create alc.local.toml document.
+        // 3. Load or create alc.local.toml document.
         let mut doc = match alc_toml::load_alc_local_toml_document(&root)? {
             Some(d) => d,
             None => "[packages]\n"
@@ -216,93 +238,57 @@ impl AppService {
                 .map_err(|e| format!("Failed to create empty alc.local.toml document: {e}"))?,
         };
 
-        // 5. Build entries to add.
-        let mode_str;
+        // 4. Build entries to add (collection layout only: scan */init.lua).
         let mut linked_names: Vec<String> = Vec::new();
         let mut targets: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-        match mode {
-            PackageMode::Single => {
-                mode_str = "single";
-                let pkg_name = if let Some(n) = name {
-                    n
-                } else {
-                    source
-                        .file_name()
-                        .ok_or_else(|| {
-                            format!("Cannot determine package name from: {}", source.display())
-                        })?
-                        .to_string_lossy()
-                        .to_string()
-                };
-                validate_package_name(&pkg_name)?;
+        let entries = std::fs::read_dir(&source)
+            .map_err(|e| format!("Failed to read directory {}: {e}", source.display()))?;
 
-                let abs = source.display().to_string();
-                let added = add_package_entry(
-                    &mut doc,
-                    &pkg_name,
-                    &PackageDep::Path {
-                        path: abs.clone(),
-                        version: None,
-                    },
-                );
-
-                targets.insert(pkg_name.clone(), serde_json::Value::String(abs));
-                if added {
-                    linked_names.push(pkg_name);
-                }
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+            let pkg_path = entry.path();
+            if !pkg_path.is_dir() || !pkg_path.join("init.lua").exists() {
+                continue;
             }
-            PackageMode::Collection => {
-                mode_str = "collection";
-                let entries = std::fs::read_dir(&source)
-                    .map_err(|e| format!("Failed to read directory {}: {e}", source.display()))?;
+            let pkg_name = entry.file_name().to_string_lossy().to_string();
+            validate_package_name(&pkg_name)?;
+            candidates.push((pkg_name, pkg_path.display().to_string()));
+        }
 
-                let mut candidates: Vec<(String, String)> = Vec::new();
-                for entry in entries {
-                    let entry =
-                        entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
-                    let pkg_path = entry.path();
-                    if !pkg_path.is_dir() || !pkg_path.join("init.lua").exists() {
-                        continue;
-                    }
-                    let pkg_name = entry.file_name().to_string_lossy().to_string();
-                    validate_package_name(&pkg_name)?;
-                    candidates.push((pkg_name, pkg_path.display().to_string()));
-                }
+        if candidates.is_empty() {
+            return Err(format!(
+                "No init.lua found in any subdirectory of: {} \
+                 (expected */init.lua collection layout)",
+                source.display()
+            ));
+        }
 
-                if candidates.is_empty() {
-                    return Err(format!(
-                        "No init.lua found in any subdirectory of: {}",
-                        source.display()
-                    ));
-                }
-
-                candidates.sort();
-                for (pkg_name, abs) in candidates {
-                    let added = add_package_entry(
-                        &mut doc,
-                        &pkg_name,
-                        &PackageDep::Path {
-                            path: abs.clone(),
-                            version: None,
-                        },
-                    );
-                    targets.insert(pkg_name.clone(), serde_json::Value::String(abs));
-                    if added {
-                        linked_names.push(pkg_name);
-                    }
-                }
+        candidates.sort();
+        for (pkg_name, abs) in candidates {
+            let added = add_package_entry(
+                &mut doc,
+                &pkg_name,
+                &PackageDep::Path {
+                    path: abs.clone(),
+                    version: None,
+                },
+            );
+            targets.insert(pkg_name.clone(), serde_json::Value::String(abs));
+            if added {
+                linked_names.push(pkg_name);
             }
         }
 
-        // 6. Save.
+        // 5. Save.
         alc_toml::save_alc_local_toml(&root, &doc)?;
 
         let alc_local_path = alc_toml::local_alc_toml_path(&root);
 
         Ok(serde_json::json!({
             "linked": linked_names,
-            "mode": mode_str,
+            "mode": "collection",
             "targets": targets,
             "scope": "variant",
             "alc_local_toml": alc_local_path.display().to_string(),
@@ -312,34 +298,6 @@ impl AppService {
 }
 
 // ─── Internal helpers ────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum PackageMode {
-    Single,
-    Collection,
-}
-
-/// Determine whether `path` is a single package or a collection.
-fn detect_mode(path: &Path) -> Result<PackageMode, String> {
-    if path.join("init.lua").exists() {
-        return Ok(PackageMode::Single);
-    }
-
-    let entries = std::fs::read_dir(path).map_err(|e| format!("Failed to read directory: {e}"))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
-        let sub = entry.path();
-        if sub.is_dir() && sub.join("init.lua").exists() {
-            return Ok(PackageMode::Collection);
-        }
-    }
-
-    Err(format!(
-        "No init.lua found in {} or any of its subdirectories",
-        path.display()
-    ))
-}
 
 /// Create a symlink at `dest` pointing to `source`.
 ///
@@ -391,28 +349,33 @@ mod tests {
     use crate::service::test_support::make_app_service_at;
 
     #[tokio::test]
-    async fn pkg_link_single_creates_symlink() {
+    async fn pkg_link_creates_symlink_in_collection_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout: <coll>/<name>/init.lua
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
-            .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
+            .pkg_link(coll.to_string_lossy().to_string(), None, None, None, None)
             .await
             .unwrap();
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["mode"], "single");
+        assert_eq!(json["mode"], "collection");
         assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
-        assert_eq!(json["targets"]["my_pkg"], src.to_string_lossy().as_ref());
+        assert_eq!(
+            json["targets"]["my_pkg"],
+            pkg_dir.to_string_lossy().as_ref()
+        );
 
         let dest = home.join("packages").join("my_pkg");
         assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_link(&dest).unwrap(), src);
+        assert_eq!(std::fs::read_link(&dest).unwrap(), pkg_dir);
     }
 
     #[tokio::test]
@@ -460,18 +423,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+        // Pre-existing symlink at destination.
         let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
         let dest = pkgs.join("my_pkg");
-        symlink(&src, &dest).unwrap();
+        symlink(&pkg_dir, &dest).unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
-            .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
+            .pkg_link(coll.to_string_lossy().to_string(), None, None, None, None)
             .await
             .unwrap();
 
@@ -485,10 +451,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+        // Pre-existing real directory at destination.
         let pkgs = home.join("packages");
         let dest = pkgs.join("my_pkg");
         std::fs::create_dir_all(&dest).unwrap();
@@ -496,7 +465,7 @@ mod tests {
         let svc = make_app_service_at(home.to_path_buf()).await;
 
         let err = svc
-            .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
+            .pkg_link(coll.to_string_lossy().to_string(), None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -506,7 +475,7 @@ mod tests {
 
         let result = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 Some(true),
                 None,
@@ -524,10 +493,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
+        // Pre-existing dangling symlink at destination.
         let pkgs = home.join("packages");
         std::fs::create_dir_all(&pkgs).unwrap();
         let dest = pkgs.join("my_pkg");
@@ -536,7 +508,7 @@ mod tests {
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
-            .pkg_link(src.to_string_lossy().to_string(), None, None, None, None)
+            .pkg_link(coll.to_string_lossy().to_string(), None, None, None, None)
             .await
             .unwrap();
 
@@ -574,15 +546,16 @@ mod tests {
         let home = tmp.path();
         let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        // Source pkg.
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 None,
                 Some("variant".to_string()),
@@ -593,7 +566,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["scope"], "variant");
-        assert_eq!(json["mode"], "single");
+        assert_eq!(json["mode"], "collection");
         assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
 
         // File was written.
@@ -601,7 +574,7 @@ mod tests {
         assert!(local.exists());
         let content = std::fs::read_to_string(&local).unwrap();
         assert!(content.contains("my_pkg"));
-        assert!(content.contains(src.to_string_lossy().as_ref()));
+        assert!(content.contains(pkg_dir.to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
@@ -610,13 +583,15 @@ mod tests {
         let home = tmp.path();
         let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         svc.pkg_link(
-            src.to_string_lossy().to_string(),
+            coll.to_string_lossy().to_string(),
             None,
             None,
             Some("variant".to_string()),
@@ -638,13 +613,15 @@ mod tests {
         let home = tmp.path();
         let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         svc.pkg_link(
-            src.to_string_lossy().to_string(),
+            coll.to_string_lossy().to_string(),
             None,
             None,
             Some("variant".to_string()),
@@ -656,7 +633,7 @@ mod tests {
         // Second call — entry already exists, should be linked:[] (skipped).
         let result = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 None,
                 Some("variant".to_string()),
@@ -668,7 +645,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["linked"], serde_json::json!([]));
         // targets still records the current state.
-        assert_eq!(json["targets"]["my_pkg"], src.to_string_lossy().as_ref());
+        assert_eq!(
+            json["targets"]["my_pkg"],
+            pkg_dir.to_string_lossy().as_ref()
+        );
 
         // File must still contain exactly one entry.
         // Parse the TOML and count keys under [packages] rather than
@@ -686,9 +666,11 @@ mod tests {
     async fn pkg_link_scope_variant_requires_project_root() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         // No project_root, no ALC_PROJECT_ROOT (test env doesn't set it).
@@ -697,7 +679,7 @@ mod tests {
         let nonexistent = home.join("no_such_project_root_zzz");
         let err = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 None,
                 Some("variant".to_string()),
@@ -717,14 +699,16 @@ mod tests {
     async fn pkg_link_invalid_scope_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout (scope error fires before layout check).
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 None,
                 Some("unknown".to_string()),
@@ -742,14 +726,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 None,
                 Some("global".to_string()),
@@ -760,6 +746,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["scope"], "global");
+        assert_eq!(json["mode"], "collection");
         assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
         let dest = home.join("packages").join("my_pkg");
         assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
@@ -811,14 +798,16 @@ mod tests {
         let home = tmp.path();
         let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout (force check fires before layout scan).
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let err = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 Some(true),
                 Some("variant".to_string()),
@@ -845,14 +834,16 @@ mod tests {
         let home = tmp.path();
         let root = home.join("proj");
         std::fs::create_dir_all(&root).unwrap();
-        let src = home.join("my_pkg");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("init.lua"), "return {}").unwrap();
+        // Collection 1-entry layout.
+        let coll = home.join("my_coll");
+        let pkg_dir = coll.join("my_pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
         let svc = make_app_service_at(home.to_path_buf()).await;
         let result = svc
             .pkg_link(
-                src.to_string_lossy().to_string(),
+                coll.to_string_lossy().to_string(),
                 None,
                 Some(false),
                 Some("variant".to_string()),
@@ -863,6 +854,7 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["scope"], "variant");
+        assert_eq!(json["mode"], "collection");
         assert_eq!(json["linked"], serde_json::json!(["my_pkg"]));
     }
 }

@@ -1611,8 +1611,9 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
 
-    // Build a source pkg dir outside of HOME.
-    let source = home.join("src_repo").join("repair_pkg");
+    // Build a source pkg in collection layout: <coll>/<name>/init.lua.
+    let coll = home.join("src_repo");
+    let source = coll.join("repair_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(
         source.join("init.lua"),
@@ -1622,8 +1623,8 @@ async fn pkg_repair_reinstalls_missing_installed_dir() {
 
     let svc = make_app_service_at(home.to_path_buf()).await;
 
-    // Initial install — populates installed.json and creates dest dir.
-    svc.pkg_install(source.display().to_string(), None, None)
+    // Initial install — populates installed.json and creates dest dir (pass collection root).
+    svc.pkg_install(coll.display().to_string(), None, None)
         .await
         .expect("initial install");
 
@@ -1652,12 +1653,14 @@ async fn pkg_repair_skips_healthy_pkg() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
 
-    let source = home.join("src_repo").join("healthy_pkg");
+    // Collection layout: <coll>/<name>/init.lua.
+    let coll = home.join("src_repo");
+    let source = coll.join("healthy_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
     let svc = make_app_service_at(home.to_path_buf()).await;
-    svc.pkg_install(source.display().to_string(), None, None)
+    svc.pkg_install(coll.display().to_string(), None, None)
         .await
         .unwrap();
 
@@ -1805,19 +1808,24 @@ async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
 
-    let source = home.join("gone").join("ghost_pkg");
+    // Collection 1-entry layout: <coll>/<name>/init.lua.
+    // Manifest records the collection root as the source path.
+    let coll = home.join("gone");
+    let source = coll.join("ghost_pkg");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("init.lua"), "return {}").unwrap();
 
     let svc = make_app_service_at(home.to_path_buf()).await;
-    svc.pkg_install(source.display().to_string(), None, None)
+    svc.pkg_install(coll.display().to_string(), None, None)
         .await
         .expect("initial install");
 
-    // Break both the installed dest AND the source so repair can't auto-heal.
+    // Break both the installed dest AND the entire collection root so repair
+    // can't auto-heal.  The manifest records the collection root path, so
+    // removing it triggers the "source directory missing" pre-check.
     let dest = home.join("packages").join("ghost_pkg");
     std::fs::remove_dir_all(&dest).unwrap();
-    std::fs::remove_dir_all(&source).unwrap();
+    std::fs::remove_dir_all(&coll).unwrap();
 
     let result = svc.pkg_repair(None, None).await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1837,44 +1845,56 @@ async fn pkg_repair_reports_localpath_source_missing_as_unrepairable() {
         reason.contains("source directory missing"),
         "reason should mention missing source, got: {reason}"
     );
+    // In collection layout the recorded source path is the collection root
+    // ("gone/"), not the package sub-directory ("gone/ghost_pkg").  The
+    // package identity is already verified via entry["name"] == "ghost_pkg"
+    // above; here we verify that the reason cites the missing collection path.
     assert!(
-        reason.contains("ghost_pkg"),
-        "reason should name the path, got: {reason}"
+        reason.contains("gone"),
+        "reason should cite the collection path, got: {reason}"
     );
 }
 
-/// LocalPath source exists but has no `init.lua` at root: current install
-/// layer routes this into collection mode which rejects `name`, so repair
-/// can't produce bytes for the named pkg. Classify Unrepairable (structural
-/// impossibility) rather than Failed.
+/// LocalPath source (collection root) exists but the named package's
+/// `init.lua` has been removed from the source: repair classifies this as
+/// Unrepairable (installed_missing) because the pre-check
+/// `<source>/<name>/init.lua` must be present before a re-install attempt.
+/// This test verifies the unrepairable classification fires when the source
+/// init.lua disappears independently of the installed dest.
 #[tokio::test]
 async fn pkg_repair_reports_localpath_without_init_lua_as_unrepairable() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
 
-    // Build a valid source first so pkg_install succeeds and writes manifest.
-    let source = home.join("shell").join("shell_pkg");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(source.join("init.lua"), "return {}").unwrap();
+    // Collection 1-entry layout: <coll>/<name>/init.lua.
+    // Use <coll> as the install source so the manifest records
+    // PackageSource::Path { path: coll }.
+    let coll = home.join("shell");
+    let pkg_dir = coll.join("shell_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
 
     let svc = make_app_service_at(home.to_path_buf()).await;
-    svc.pkg_install(source.display().to_string(), None, None)
+    svc.pkg_install(coll.display().to_string(), None, None)
         .await
         .expect("initial install");
 
-    // Break the installed dest, then mutate the source into an empty-dir
-    // shape (remove init.lua) so repair's pre-check lands on the
-    // "no init.lua at root" branch rather than the source-missing one.
+    // Break the installed dest so repair considers re-install.
     let dest = home.join("packages").join("shell_pkg");
     std::fs::remove_dir_all(&dest).unwrap();
-    std::fs::remove_file(source.join("init.lua")).unwrap();
+
+    // Also remove the source init.lua so the pre-check
+    // `<coll>/shell_pkg/init.lua` fails.  The collection root still exists,
+    // so this is the "no init.lua at named subdir" branch rather than the
+    // "source directory missing" branch.
+    std::fs::remove_file(pkg_dir.join("init.lua")).unwrap();
 
     let result = svc.pkg_repair(None, None).await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&result).unwrap();
 
     assert!(
         json["failed"].as_array().unwrap().is_empty(),
-        "init.lua-missing must not leak into `failed`; got: {json}"
+        "missing-init-lua source must not leak into `failed`; got: {json}"
     );
     let entry = json["unrepairable"]
         .as_array()

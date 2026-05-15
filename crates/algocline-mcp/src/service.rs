@@ -825,6 +825,12 @@ pub struct HubSearchParams {
     /// `sources`, `warnings`) are always returned regardless of the
     /// chosen preset or field list.
     pub verbose: Option<String>,
+    /// Local `hub_index.json` file paths to merge into search results.
+    /// Useful for pre-push verification or air-gapped use. Each path
+    /// is read as a single `HubIndex` JSON file and its packages are
+    /// appended to the remote-fetched results (same dedup as Collection
+    /// sources via `seen_names`).
+    pub local_indices: Option<Vec<String>>,
 }
 
 // ─── V2 MCP Parameter types ──────────────────────────────────────
@@ -1903,6 +1909,7 @@ impl AlcService {
                 params.filter,
                 params.fields,
                 params.verbose,
+                params.local_indices,
             )
             .await
     }

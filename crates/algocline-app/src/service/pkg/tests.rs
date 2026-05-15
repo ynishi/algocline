@@ -2057,7 +2057,7 @@ async fn hub_search_default_summary_is_compact() {
     // `engine_api_impl::hub_search` uses after folding MCP params into
     // `ListOpts`). Keeps the test at the app-layer boundary and avoids
     // the EngineApi trait import dance.
-    let out = svc.hub_search(None, None, None, opts()).unwrap();
+    let out = svc.hub_search(None, None, None, opts(), None).unwrap();
 
     assert!(
         out.len() < 10_000,
@@ -2159,6 +2159,7 @@ async fn hub_search_limit_zero_returns_all() {
                 limit: Some(0),
                 ..opts()
             },
+            None,
         )
         .unwrap();
 

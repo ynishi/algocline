@@ -553,6 +553,7 @@ pub trait EngineApi: Send + Sync {
         filter: Option<serde_json::Value>,
         fields: Option<Vec<String>>,
         verbose: Option<String>,
+        local_indices: Option<Vec<String>>,
     ) -> Result<String, String>;
 
     // ─── Package scaffold ─────────────────────────────────────

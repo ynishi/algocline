@@ -2022,6 +2022,83 @@ async fn test_alc_info_includes_preset_catalog_version() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// `alc_hub_search` with `local_indices` must merge packages from a local
+/// `hub_index.json` file into the search results.
+///
+/// The test writes a minimal single-entry `hub_index.json` to a temp dir,
+/// then calls `alc_hub_search` with `local_indices` pointing to that file.
+/// It verifies that:
+/// - The package `testpkg` appears in `results`.
+/// - The top-level `sources` field is present.
+/// - No `warnings` entry mentioning the local file is present (success path).
+#[tokio::test]
+async fn test_hub_search_local_indices_merges_results() {
+    let alc_home = tempfile::tempdir().expect("tempdir failed");
+    std::fs::create_dir_all(alc_home.path().join("packages"))
+        .expect("create packages dir failed");
+
+    let idx_dir = tempfile::tempdir().expect("tempdir for index failed");
+    let idx_path = idx_dir.path().join("hub_index.json");
+
+    // Write a minimal 1-entry hub_index.json.
+    let idx_json = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "2026-05-15T00:00:00Z",
+        "packages": [
+            {
+                "name": "testpkg",
+                "version": "0.1.0",
+                "description": "A local-index test package",
+                "category": "testing"
+            }
+        ]
+    });
+    std::fs::write(&idx_path, idx_json.to_string()).expect("write hub_index.json failed");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_hub_search",
+        json!({
+            "query": "testpkg",
+            "local_indices": [idx_path.to_str().expect("utf-8 path")],
+            "verbose": "full",
+        }),
+    )
+    .await;
+
+    // The package must appear in results.
+    let results = resp["results"].as_array().expect("results must be array");
+    let found = results
+        .iter()
+        .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("testpkg"));
+    assert!(
+        found,
+        "expected testpkg in results from local_indices, got: {resp}"
+    );
+
+    // sources field must be present (may be empty for a fresh alc_home).
+    assert!(
+        resp.get("sources").is_some(),
+        "expected top-level 'sources' in response, got: {resp}"
+    );
+
+    // No warning mentioning the local file path (success path — file was readable).
+    if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array()) {
+        let idx_str = idx_path.to_str().unwrap_or("");
+        let has_path_warning = warnings
+            .iter()
+            .any(|w| w.as_str().map(|s| s.contains(idx_str)).unwrap_or(false));
+        assert!(
+            !has_path_warning,
+            "unexpected warning referencing local index path: {warnings:?}"
+        );
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
 #[tokio::test]
 async fn test_alc_hub_dist_preset_publish_uses_alc_toml_override() {
     let client = connect().await;

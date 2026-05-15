@@ -38,10 +38,16 @@ struct BundledSource {
 /// To add a new source: append an entry here. The repo must use the
 /// Collection layout (`<repo>/<name>/init.lua`) and publish a
 /// `hub_index.json` so `alc_hub_search` can discover its packages.
-const BUNDLED_SOURCES: &[BundledSource] = &[BundledSource {
-    url: "https://github.com/ynishi/algocline-bundled-packages",
-    tag: "v0.23.0",
-}];
+const BUNDLED_SOURCES: &[BundledSource] = &[
+    BundledSource {
+        url: "https://github.com/ynishi/algocline-bundled-packages",
+        tag: "v0.23.0",
+    },
+    BundledSource {
+        url: "https://github.com/ynishi/evalframe",
+        tag: "v0.4.0",
+    },
+];
 
 fn packages_dir() -> anyhow::Result<PathBuf> {
     let home =

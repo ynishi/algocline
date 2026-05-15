@@ -47,22 +47,27 @@ alc_pkg_install({ url: "github.com/user/my-pkg-collection" })
 
 See `docs/pkg-author-conventions.md §7` for the full step-by-step guide.
 
-### Removed — **BREAKING**: evalframe no longer bundled
+### Changed: evalframe v0.4.0 integrated into Hub as a Collection source
 
-`evalframe` was previously auto-installed via `alc init` and listed in
-`AUTO_INSTALL_SOURCES` as a Single-kind source. Since evalframe v0.3.0 does
-not ship with `hub_index.json` and its layout is `evalframe/evalframe/init.lua`
-(nested), the prior Single-mode installation was non-functional and surfaced
-as a Tier 3 404 warning in `alc_hub_search`.
+`evalframe` v0.4.0 now ships `hub_index.json` at the repo root and uses the
+standard Collection layout (`evalframe/<pkg>/init.lua`). It is re-integrated
+into `BUNDLED_SOURCES` (tag `v0.4.0`) and `AUTO_INSTALL_SOURCES` so that
+`alc init` and `pkg_install` auto-routes pick it up alongside
+`algocline-bundled-packages`.
 
-To remove the orphan directory left by previous `alc init` runs:
+`evalframe` packages are listed as system packages (`SYSTEM_PACKAGES`) and are
+therefore excluded from `pkg_list` user-facing output while still being
+discoverable via `alc_hub_search`.
 
-```sh
-rm -rf ~/.algocline/packages/evalframe/
-```
+### Added: `alc_hub_search` accepts `local_indices` parameter
 
-evalframe re-bundling will be tracked as a separate follow-up once it ships
-its own `hub_index.json`.
+`alc_hub_search` now accepts an optional `local_indices: Vec<String>` field.
+Each path is read as a `hub_index.json` file and its packages are merged into
+the search results after the remote-fetched results (same deduplication via
+`seen_names`). Parse or I/O failures are surfaced as `warnings` entries in the
+response rather than hard errors, so a missing or malformed local file does not
+abort the search. This is useful for pre-push verification of a new
+`hub_index.json` before committing.
 
 ## [0.35.0] - 2026-05-14
 

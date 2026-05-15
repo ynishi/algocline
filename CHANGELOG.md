@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.36.0] - 2026-05-15
+
+### Changed: bundled-packages bumped to `v0.24.0`
+
+`BUNDLED_SOURCES` in `src/init.rs` now points `algocline-bundled-packages`
+at tag `v0.24.0` (was `v0.23.0`). `alc init` and the `AUTO_INSTALL_SOURCES`
+seed picked up by `pkg_install` will fetch this newer tag.
 
 ### Changed — **BREAKING**: `pkg_install` single-package mode removed
 

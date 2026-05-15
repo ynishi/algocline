@@ -85,7 +85,7 @@ use super::list_opts::{
     HUB_SEARCH_FULL, HUB_SEARCH_SUMMARY,
 };
 use super::manifest;
-use super::resolve::{is_package_installed, AUTO_INSTALL_SOURCES};
+use super::resolve::AUTO_INSTALL_SOURCES;
 use super::source::PackageSource;
 use super::AppService;
 use super::HubRegistriesError;
@@ -1283,16 +1283,24 @@ impl AppService {
         local_indices: Option<Vec<String>>,
     ) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
-        let (remote, mut warnings) = fetch_remote_indices(&app_dir)?;
-        let mut results = merge(&app_dir, &remote)?;
+        let (mut remote, mut warnings) = fetch_remote_indices(&app_dir)?;
 
-        // Merge local index files (pre-push verification / air-gapped use).
-        // Each path is read and deserialized as a HubIndex. Failures are
-        // collected as warnings and do not abort the search (partial results
-        // are better than hard failure for local verification workflows).
+        // Merge local index files (pre-push verification / air-gapped use)
+        // BEFORE the main `merge` step so that installed packages whose
+        // metadata appears in a local index are surfaced with their full
+        // entry (version / source / category) instead of the `Unknown`
+        // stub produced by `merge`'s local-only fallback path. Each path
+        // is read and deserialized as a HubIndex; failures go to warnings
+        // and do not abort the search (partial results > hard failure for
+        // local verification workflows). Collection results from
+        // `fetch_remote_indices` take priority on name collisions.
+        let local_index_paths: Vec<String> = local_indices.clone().unwrap_or_default();
         if let Some(paths) = local_indices {
-            let mut seen_names: HashSet<String> =
-                results.iter().map(|r| r.entity.name.clone()).collect();
+            let mut existing: HashSet<String> = remote
+                .packages
+                .iter()
+                .map(|p| p.entity.name.clone())
+                .collect();
             for path in &paths {
                 match std::fs::read_to_string(path) {
                     Err(e) => {
@@ -1306,18 +1314,8 @@ impl AppService {
                         }
                         Ok(idx) => {
                             for entry in idx.packages {
-                                if seen_names.insert(entry.entity.name.clone()) {
-                                    results.push(SearchResult {
-                                        installed: is_package_installed(
-                                            &app_dir,
-                                            &entry.entity.name,
-                                        ),
-                                        entity: entry.entity,
-                                        source: entry.source,
-                                        card_count: entry.card_count,
-                                        best_card: entry.best_card,
-                                        docstring_matched: None,
-                                    });
+                                if existing.insert(entry.entity.name.clone()) {
+                                    remote.packages.push(entry);
                                 }
                             }
                         }
@@ -1325,6 +1323,8 @@ impl AppService {
                 }
             }
         }
+
+        let mut results = merge(&app_dir, &remote)?;
 
         // Filter by query (internal signal covers name/description/
         // category/docstring — `matches_query` unchanged).
@@ -1440,7 +1440,10 @@ impl AppService {
         // already present in `warnings` from `fetch_remote_indices` above;
         // use a throwaway buffer here to avoid duplicating them.
         let mut _src_warnings: Vec<String> = Vec::new();
-        let sources = discover_index_urls(&app_dir, &mut _src_warnings)?;
+        let mut sources = discover_index_urls(&app_dir, &mut _src_warnings)?;
+        // Surface local_indices paths in `sources` so callers can see
+        // what was actually consulted (transparency / debug aid).
+        sources.extend(local_index_paths);
 
         let mut json = serde_json::json!({
             "results": projected,

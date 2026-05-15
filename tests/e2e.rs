@@ -2034,8 +2034,7 @@ async fn test_alc_info_includes_preset_catalog_version() {
 #[tokio::test]
 async fn test_hub_search_local_indices_merges_results() {
     let alc_home = tempfile::tempdir().expect("tempdir failed");
-    std::fs::create_dir_all(alc_home.path().join("packages"))
-        .expect("create packages dir failed");
+    std::fs::create_dir_all(alc_home.path().join("packages")).expect("create packages dir failed");
 
     let idx_dir = tempfile::tempdir().expect("tempdir for index failed");
     let idx_path = idx_dir.path().join("hub_index.json");

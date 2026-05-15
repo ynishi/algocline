@@ -1308,9 +1308,7 @@ impl AppService {
                     }
                     Ok(raw) => match serde_json::from_str::<HubIndex>(&raw) {
                         Err(e) => {
-                            warnings.push(format!(
-                                "Failed to parse local index {path}: {e}"
-                            ));
+                            warnings.push(format!("Failed to parse local index {path}: {e}"));
                         }
                         Ok(idx) => {
                             for entry in idx.packages {

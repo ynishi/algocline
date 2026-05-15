@@ -3,11 +3,10 @@
 //! Clones packages from multiple Git sources and installs them into
 //! `~/.algocline/packages/`.
 //!
-//! Two source kinds:
-//! - **Collection**: repo contains subdirectories, each with `init.lua`
-//!   (e.g. algocline-bundled-packages with ucb/, cove/, etc.)
-//! - **Single**: repo root has `init.lua` and is itself a package
-//!   (e.g. evalframe). Copied as a directory tree preserving subdirs.
+//! All sources use the **Collection** layout: the repo contains subdirectories,
+//! each with `init.lua` (e.g. algocline-bundled-packages with ucb/, cove/, etc.).
+//! Package authors must publish a `hub_index.json` at the repo root so that
+//! `alc_hub_search` can discover their packages via `repo_to_index_url`.
 //!
 //! Sources are defined in [`BUNDLED_SOURCES`] and processed in order.
 //!
@@ -23,38 +22,30 @@
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
-/// Source kind: collection of packages or a single package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
-    /// Repo contains multiple packages as subdirectories.
-    Collection,
-    /// Repo root is itself a package (has init.lua at root).
-    Single,
-}
-
-/// A bundled package source: Git URL, tag, and kind.
+/// A bundled package source: Git URL and tag.
+///
+/// All bundled sources use the Collection layout — the repo contains
+/// subdirectories each with `init.lua`. The repo must also have a
+/// `hub_index.json` at root so that `alc_hub_search` can discover it.
 #[derive(Debug)]
 struct BundledSource {
     url: &'static str,
     tag: &'static str,
-    kind: SourceKind,
 }
 
 /// All bundled sources, processed in order during `alc init`.
 ///
-/// To add a new source: append an entry here. Collection repos install
-/// all discovered sub-packages; Single repos install as one package
-/// named after the repo (or the directory name).
+/// To add a new source: append an entry here. The repo must use the
+/// Collection layout (`<repo>/<name>/init.lua`) and publish a
+/// `hub_index.json` so `alc_hub_search` can discover its packages.
 const BUNDLED_SOURCES: &[BundledSource] = &[
     BundledSource {
         url: "https://github.com/ynishi/algocline-bundled-packages",
         tag: "v0.23.0",
-        kind: SourceKind::Collection,
     },
     BundledSource {
         url: "https://github.com/ynishi/evalframe",
-        tag: "v0.3.0",
-        kind: SourceKind::Single,
+        tag: "v0.4.0",
     },
 ];
 
@@ -289,38 +280,6 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Install a single-package repo into `dest/{name}/`.
-///
-/// Copies the entire directory tree (preserving subdirectories like
-/// `eval/`, `model/`, etc.) so that Lua `require("pkg.sub.mod")` works.
-fn install_single_package(
-    source: &Path,
-    dest: &Path,
-    name: &str,
-    force: bool,
-) -> anyhow::Result<bool> {
-    let dest_dir = dest.join(name);
-    let dest_init = dest_dir.join("init.lua");
-
-    if dest_init.exists() && !force {
-        let src_len = std::fs::metadata(source.join("init.lua"))?.len();
-        let dst_len = std::fs::metadata(&dest_init)?.len();
-        if src_len == dst_len {
-            return Ok(false);
-        }
-        eprintln!("    (repairing truncated file for {name})");
-    }
-
-    if dest_dir.exists() {
-        std::fs::remove_dir_all(&dest_dir)?;
-    }
-    copy_dir(source, &dest_dir)?;
-    // Remove .git if present
-    let _ = std::fs::remove_dir_all(dest_dir.join(".git"));
-
-    Ok(true)
-}
-
 /// Clone a single source and install its packages.
 async fn install_source_from_git(
     source: &BundledSource,
@@ -349,22 +308,7 @@ async fn install_source_from_git(
         anyhow::bail!("git clone failed (tag {}): {stderr}", source.tag);
     }
 
-    match source.kind {
-        SourceKind::Collection => install_from_local(staging.path(), dest, force),
-        SourceKind::Single => {
-            let name = source
-                .url
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or("unknown");
-            match install_single_package(staging.path(), dest, name, force)? {
-                true => eprintln!("  + {name}"),
-                false => eprintln!("  = {name} (already installed, use --force to overwrite)"),
-            }
-            Ok(())
-        }
-    }
+    install_from_local(staging.path(), dest, force)
 }
 
 /// Clone all bundled sources and install.
@@ -517,17 +461,7 @@ pub async fn run(args: &[String], force_override: bool) -> anyhow::Result<()> {
             let name = repo_name(source.url);
             if let Some(local) = find_local_source(name) {
                 found_any = true;
-                match source.kind {
-                    SourceKind::Collection => install_from_local(&local, &dest, force)?,
-                    SourceKind::Single => {
-                        match install_single_package(&local, &dest, name, force)? {
-                            true => eprintln!("  + {name} (local)"),
-                            false => eprintln!(
-                                "  = {name} (already installed, use --force to overwrite)"
-                            ),
-                        }
-                    }
-                }
+                install_from_local(&local, &dest, force)?;
             } else {
                 eprintln!("  ? {name}: local directory not found, skipping");
             }

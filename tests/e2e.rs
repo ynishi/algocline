@@ -687,10 +687,12 @@ async fn test_alc_parallel_roundtrip() {
 async fn test_alc_fork_roundtrip() {
     let client = connect().await;
 
-    // 1. Create temp packages and install them
+    // 1. Create temp packages in collection layout (<coll>/<name>/init.lua) and install them.
     let tmp_dir = tempfile::tempdir().expect("failed to create tempdir");
 
-    let pkg_a_dir = tmp_dir.path().join("e2e_fork_a");
+    // Collection A: coll_a/e2e_fork_a/init.lua
+    let coll_a = tmp_dir.path().join("coll_a");
+    let pkg_a_dir = coll_a.join("e2e_fork_a");
     std::fs::create_dir_all(&pkg_a_dir).expect("mkdir");
     let mut f = std::fs::File::create(pkg_a_dir.join("init.lua")).expect("create init.lua");
     write!(
@@ -704,7 +706,9 @@ return M"#
     )
     .expect("write init.lua");
 
-    let pkg_b_dir = tmp_dir.path().join("e2e_fork_b");
+    // Collection B: coll_b/e2e_fork_b/init.lua
+    let coll_b = tmp_dir.path().join("coll_b");
+    let pkg_b_dir = coll_b.join("e2e_fork_b");
     std::fs::create_dir_all(&pkg_b_dir).expect("mkdir");
     let mut f = std::fs::File::create(pkg_b_dir.join("init.lua")).expect("create init.lua");
     write!(
@@ -718,17 +722,17 @@ return M"#
     )
     .expect("write init.lua");
 
-    // Install via MCP
+    // Install via MCP (pass collection roots)
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_a_dir.to_string_lossy() }),
+        json!({ "url": coll_a.to_string_lossy() }),
     )
     .await;
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_b_dir.to_string_lossy() }),
+        json!({ "url": coll_b.to_string_lossy() }),
     )
     .await;
 
@@ -839,9 +843,10 @@ return M"#
 async fn test_pkg_install_returns_types_path() {
     let client = connect().await;
 
-    // Create a temporary package
+    // Create a temporary package in collection layout: <coll>/<name>/init.lua
     let tmp_dir = tempfile::tempdir().expect("tempdir");
-    let pkg_dir = tmp_dir.path().join("e2e_types_test");
+    let coll_dir = tmp_dir.path().join("e2e_types_test_coll");
+    let pkg_dir = coll_dir.join("e2e_types_test");
     std::fs::create_dir_all(&pkg_dir).expect("mkdir");
     std::fs::write(
         pkg_dir.join("init.lua"),
@@ -852,11 +857,11 @@ return M"#,
     )
     .expect("write init.lua");
 
-    // Install and check response
+    // Install and check response (pass collection root)
     let resp = call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_dir.to_string_lossy() }),
+        json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
@@ -883,9 +888,10 @@ return M"#,
 async fn test_pkg_install_returns_alc_shapes_types_path() {
     let client = connect().await;
 
-    // Create a temporary package
+    // Create a temporary package in collection layout: <coll>/<name>/init.lua
     let tmp_dir = tempfile::tempdir().expect("tempdir");
-    let pkg_dir = tmp_dir.path().join("e2e_alc_shapes_types_test");
+    let coll_dir = tmp_dir.path().join("e2e_alc_shapes_types_test_coll");
+    let pkg_dir = coll_dir.join("e2e_alc_shapes_types_test");
     std::fs::create_dir_all(&pkg_dir).expect("mkdir");
     std::fs::write(
         pkg_dir.join("init.lua"),
@@ -896,11 +902,11 @@ return M"#,
     )
     .expect("write init.lua");
 
-    // Install and check response
+    // Install and check response (pass collection root)
     let resp = call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_dir.to_string_lossy() }),
+        json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
@@ -946,7 +952,9 @@ async fn test_pkg_remove_scope_global_cleans_manifest_not_files() {
     // Install a unique package so we don't collide with real user state.
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let pkg_name = "e2e_remove_global";
-    let pkg_dir = tmp_dir.path().join(pkg_name);
+    // Collection layout: <coll>/<name>/init.lua
+    let coll_dir = tmp_dir.path().join("e2e_remove_global_coll");
+    let pkg_dir = coll_dir.join(pkg_name);
     std::fs::create_dir_all(&pkg_dir).expect("mkdir");
     std::fs::write(
         pkg_dir.join("init.lua"),
@@ -960,7 +968,7 @@ return M"#,
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_dir.to_string_lossy() }),
+        json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
@@ -1021,8 +1029,10 @@ async fn test_variant_scope_link_then_run_require() {
     let project_root = tmp.path();
     std::fs::write(project_root.join("alc.toml"), "[packages]\n").expect("write alc.toml");
 
-    // 2. Create a temp pkg dir living OUTSIDE the project root (typical worktree workflow).
-    let pkg_dir = tmp.path().join("variant_src").join("e2e_variant_pkg");
+    // 2. Create a temp collection dir living OUTSIDE the project root (typical worktree
+    //    workflow). Collection layout: <coll>/<name>/init.lua.
+    let coll_dir = tmp.path().join("variant_src");
+    let pkg_dir = coll_dir.join("e2e_variant_pkg");
     std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_dir");
     std::fs::write(
         pkg_dir.join("init.lua"),
@@ -1035,7 +1045,7 @@ async fn test_variant_scope_link_then_run_require() {
         &client,
         "alc_pkg_link",
         json!({
-            "path": pkg_dir.to_string_lossy(),
+            "path": coll_dir.to_string_lossy(),
             "scope": "variant",
             "project_root": project_root.to_string_lossy(),
         }),
@@ -1097,9 +1107,10 @@ async fn test_variant_scope_link_then_run_require() {
 async fn test_pkg_repair_reinstalls_deleted_dir() {
     let client = connect().await;
 
-    // Source pkg dir outside HOME.
+    // Source pkg dir outside HOME (collection layout: <coll>/<name>/init.lua).
     let tmp = tempfile::tempdir().expect("tempdir");
-    let source = tmp.path().join("e2e_repair_pkg");
+    let coll_dir = tmp.path().join("e2e_repair_coll");
+    let source = coll_dir.join("e2e_repair_pkg");
     std::fs::create_dir_all(&source).expect("mkdir");
     std::fs::write(
         source.join("init.lua"),
@@ -1110,11 +1121,11 @@ return M"#,
     )
     .expect("write init.lua");
 
-    // Install.
+    // Install (pass collection root).
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": source.to_string_lossy() }),
+        json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
@@ -1154,9 +1165,10 @@ return M"#,
 async fn test_pkg_doctor_reports_installed_missing() {
     let client = connect().await;
 
-    // Source pkg dir outside HOME.
+    // Source pkg dir outside HOME (collection layout: <coll>/<name>/init.lua).
     let tmp = tempfile::tempdir().expect("tempdir");
-    let source = tmp.path().join("e2e_doctor_pkg");
+    let coll_dir = tmp.path().join("e2e_doctor_coll");
+    let source = coll_dir.join("e2e_doctor_pkg");
     std::fs::create_dir_all(&source).expect("mkdir");
     std::fs::write(
         source.join("init.lua"),
@@ -1167,11 +1179,11 @@ return M"#,
     )
     .expect("write init.lua");
 
-    // Install.
+    // Install (pass collection root).
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": source.to_string_lossy() }),
+        json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
@@ -2006,6 +2018,83 @@ async fn test_alc_info_includes_preset_catalog_version() {
         Some(PRESET_CATALOG_VERSION),
         "expected preset_catalog_version in alc_info, got: {resp}"
     );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `alc_hub_search` with `local_indices` must merge packages from a local
+/// `hub_index.json` file into the search results.
+///
+/// The test writes a minimal single-entry `hub_index.json` to a temp dir,
+/// then calls `alc_hub_search` with `local_indices` pointing to that file.
+/// It verifies that:
+/// - The package `testpkg` appears in `results`.
+/// - The top-level `sources` field is present.
+/// - No `warnings` entry mentioning the local file is present (success path).
+#[tokio::test]
+async fn test_hub_search_local_indices_merges_results() {
+    let alc_home = tempfile::tempdir().expect("tempdir failed");
+    std::fs::create_dir_all(alc_home.path().join("packages"))
+        .expect("create packages dir failed");
+
+    let idx_dir = tempfile::tempdir().expect("tempdir for index failed");
+    let idx_path = idx_dir.path().join("hub_index.json");
+
+    // Write a minimal 1-entry hub_index.json.
+    let idx_json = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "2026-05-15T00:00:00Z",
+        "packages": [
+            {
+                "name": "testpkg",
+                "version": "0.1.0",
+                "description": "A local-index test package",
+                "category": "testing"
+            }
+        ]
+    });
+    std::fs::write(&idx_path, idx_json.to_string()).expect("write hub_index.json failed");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_hub_search",
+        json!({
+            "query": "testpkg",
+            "local_indices": [idx_path.to_str().expect("utf-8 path")],
+            "verbose": "full",
+        }),
+    )
+    .await;
+
+    // The package must appear in results.
+    let results = resp["results"].as_array().expect("results must be array");
+    let found = results
+        .iter()
+        .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("testpkg"));
+    assert!(
+        found,
+        "expected testpkg in results from local_indices, got: {resp}"
+    );
+
+    // sources field must be present (may be empty for a fresh alc_home).
+    assert!(
+        resp.get("sources").is_some(),
+        "expected top-level 'sources' in response, got: {resp}"
+    );
+
+    // No warning mentioning the local file path (success path — file was readable).
+    if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array()) {
+        let idx_str = idx_path.to_str().unwrap_or("");
+        let has_path_warning = warnings
+            .iter()
+            .any(|w| w.as_str().map(|s| s.contains(idx_str)).unwrap_or(false));
+        assert!(
+            !has_path_warning,
+            "unexpected warning referencing local index path: {warnings:?}"
+        );
+    }
 
     client.cancel().await.expect("cancel failed");
 }
@@ -3820,9 +3909,10 @@ async fn test_pkg_doctor_multifile_healthy() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = connect_with_alc_home(tmp.path()).await;
 
-    // Build source package with init.lua + sub.lua.
+    // Build source package in collection layout: <coll>/<name>/init.lua + sub.lua
     let source_root = tempfile::tempdir().expect("source tempdir");
-    let pkg_src = source_root.path().join("e2e_doctor_complete");
+    let coll_root = source_root.path();
+    let pkg_src = coll_root.join("e2e_doctor_complete");
     std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
     std::fs::write(
         pkg_src.join("init.lua"),
@@ -3839,11 +3929,11 @@ return M"#,
     )
     .expect("write sub.lua");
 
-    // Install the package into the isolated ALC_HOME.
+    // Install the package into the isolated ALC_HOME (pass collection root).
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_src.to_string_lossy() }),
+        json!({ "url": coll_root.to_string_lossy() }),
     )
     .await;
 
@@ -3883,9 +3973,10 @@ async fn test_pkg_doctor_incomplete_pkg_detected() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = connect_with_alc_home(tmp.path()).await;
 
-    // Build source package with init.lua + missing_sub.lua.
+    // Build source package in collection layout: <coll>/<name>/init.lua + missing_sub.lua
     let source_root = tempfile::tempdir().expect("source tempdir");
-    let pkg_src = source_root.path().join("e2e_doctor_incomplete");
+    let coll_root = source_root.path();
+    let pkg_src = coll_root.join("e2e_doctor_incomplete");
     std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
     std::fs::write(
         pkg_src.join("init.lua"),
@@ -3902,11 +3993,11 @@ return M"#,
     )
     .expect("write missing_sub.lua");
 
-    // Install.
+    // Install (pass collection root).
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_src.to_string_lossy() }),
+        json!({ "url": coll_root.to_string_lossy() }),
     )
     .await;
 
@@ -4979,12 +5070,15 @@ async fn test_alc_card_analyze_roundtrip() {
     let client = connect_with_alc_home(tmp.path()).await;
 
     // 1. Install the fixture pkg via absolute path string (K-137: no file:// URL).
-    let pkg_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"))
-        .join(".algocline/packages/card_analysis");
+    // Use the user's packages dir as a Collection root so that card_analysis
+    // (at <packages>/card_analysis/init.lua) is discovered via Collection layout.
+    // Single-package mode (root-level init.lua) was removed in v0.36.0.
+    let packages_dir =
+        std::path::PathBuf::from(std::env::var("HOME").expect("HOME")).join(".algocline/packages");
     call_json(
         &client,
         "alc_pkg_install",
-        json!({ "url": pkg_path.to_string_lossy().as_ref() }),
+        json!({ "url": packages_dir.to_string_lossy().as_ref() }),
     )
     .await;
 
@@ -5721,6 +5815,143 @@ async fn test_alc_v2_run_shape_validation() {
                 "alc_v2_run with missing code must not return a session_id, got: {text}"
             );
         }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+// ─── Single-package mode removal (Crux #2) ───────────────────────────────────
+
+/// Crux #2 enforcement: E2E fixture must match production env — no cache bypass.
+///
+/// Pre-seeds:
+/// - `alc_home/hub_registries.json` with one Git source URL (production Tier 1
+///   registry entry).
+/// - `alc_home/packages/e2e_crux2_pkg/init.lua` as a valid installed package.
+///
+/// Does NOT pre-seed `hub_cache/`, so the hub discovery path flows through
+/// Tier 0/1/2/3 without a cache shortcut (Crux #2: no cache-bypass shortcut).
+///
+/// Assertions:
+/// - `alc_pkg_install` with a local Collection-layout path (`<coll>/<name>/init.lua`)
+///   succeeds and the response includes entries in `installed` without `mode=single`.
+/// - `alc_pkg_install` with a Single-layout path (root-level `init.lua`, no subdir)
+///   returns `is_error = true` and the error message cites v0.36.0.
+#[tokio::test]
+async fn test_pkg_install_collection_only_after_single_removal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let alc_home = tmp.path();
+
+    // ── Crux #2: pre-seed hub_registries.json (Tier 1 registry entry) ──
+    // This establishes the production hub discovery path without relying on
+    // a cache pre-seed (hub_cache/ is intentionally absent).
+    let registries_json = serde_json::json!({
+        "registries": [
+            {
+                "source": "https://github.com/ynishi/algocline-bundled-packages",
+                "origin": "pkg_install",
+                "added_at": "2026-01-01T00:00:00Z"
+            }
+        ]
+    });
+    std::fs::write(
+        alc_home.join("hub_registries.json"),
+        serde_json::to_string(&registries_json).expect("serialize hub_registries"),
+    )
+    .expect("write hub_registries.json");
+
+    // ── Crux #2: pre-seed packages dir (valid installed package) ──
+    // Direct filesystem seeding — not via alc_pkg_install — to match the
+    // production-equivalent state described by Crux #2.
+    let installed_pkg_dir = alc_home.join("packages").join("e2e_crux2_pkg");
+    std::fs::create_dir_all(&installed_pkg_dir).expect("mkdir installed pkg");
+    std::fs::write(
+        installed_pkg_dir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'e2e_crux2_pkg', version = '0.1.0' }\n",
+            "function M.run(ctx) return 'crux2' end\n",
+            "return M\n",
+        ),
+    )
+    .expect("write installed pkg init.lua");
+
+    // hub_cache/ is intentionally NOT pre-seeded (Crux #2 constraint).
+
+    let client = connect_with_alc_home(alc_home).await;
+
+    // ── T1: Collection install succeeds with no mode=single ──
+    //
+    // Build a local Collection source: <coll>/<name>/init.lua.
+    let src_tmp = tempfile::tempdir().expect("src tempdir");
+    let coll_dir = src_tmp.path().join("e2e_crux2_coll");
+    let pkg_subdir = coll_dir.join("e2e_crux2_install_pkg");
+    std::fs::create_dir_all(&pkg_subdir).expect("mkdir pkg subdir");
+    std::fs::write(
+        pkg_subdir.join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = 'e2e_crux2_install_pkg', version = '0.1.0' }\n",
+            "function M.run(ctx) return 'ok' end\n",
+            "return M\n",
+        ),
+    )
+    .expect("write collection pkg init.lua");
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": coll_dir.to_string_lossy() }),
+    )
+    .await;
+
+    assert!(
+        resp["installed"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v == "e2e_crux2_install_pkg"))
+            .unwrap_or(false),
+        "e2e_crux2_install_pkg should appear in installed, got: {resp}"
+    );
+    // mode field must not be "single" — Collection-only world after v0.36.0.
+    assert!(
+        resp.get("mode").is_none() || resp["mode"] != "single",
+        "response must not contain mode=single after Single-mode removal, got: {resp}"
+    );
+
+    // ── T2: Single-layout install returns error citing v0.36.0 ──
+    //
+    // Build a Single-layout source: root-level init.lua (no subdir).
+    let single_tmp = tempfile::tempdir().expect("single tempdir");
+    let single_dir = single_tmp.path().join("e2e_crux2_single");
+    std::fs::create_dir_all(&single_dir).expect("mkdir single dir");
+    std::fs::write(
+        single_dir.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'should_fail', version = '0.1.0' }\nreturn M\n",
+    )
+    .expect("write single-layout init.lua");
+
+    let single_outcome = client
+        .call_tool(call_params(
+            "alc_pkg_install",
+            json!({ "url": single_dir.to_string_lossy() }),
+        ))
+        .await;
+
+    match single_outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for Single-layout install after v0.36.0 removal, \
+                 got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("v0.36.0"),
+                "error message must cite v0.36.0 removal, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err for Single-layout install: {e}"),
     }
 
     client.cancel().await.expect("cancel failed");

@@ -269,14 +269,13 @@ impl AppService {
 
         // Pre-check: a LocalPath is structurally unrepairable when
         // (a) the source directory no longer exists, or
-        // (b) the source exists but has no `init.lua` at its root.
-        // (b) matters because `install_from_local_path` routes a no-root-init
-        // source into collection mode, which rejects the `name` argument that
-        // repair must pass — the combination is unreachable with the current
-        // install layer, so there are no bytes to copy for *this* named pkg.
-        // Classify both up front rather than letting the install layer fail
-        // at runtime; that would land in `failed`, mixing structural
-        // impossibility with transient runtime failures.
+        // (b) the source exists but the named package's subdirectory
+        //     (`<source>/<name>/init.lua`) is absent.
+        //
+        // Since Single-package mode was removed in v0.36.0, all local installs
+        // use collection layout: the recorded source is the collection root and
+        // each package lives at `<source>/<name>/init.lua`.  We check for the
+        // named package's own init.lua rather than a root-level one.
         //
         // Git sources are deliberately not pre-checked here: network/remote
         // availability is a runtime concern that belongs in the attempt path.
@@ -290,7 +289,7 @@ impl AppService {
                     ),
                 };
             }
-            if !p.join("init.lua").exists() {
+            if !p.join(name).join("init.lua").exists() {
                 return RepairOutcome::Unrepairable {
                     kind: "installed_missing",
                     reason: format!(
@@ -304,10 +303,12 @@ impl AppService {
             }
         }
 
-        match self
-            .pkg_install_typed(install_source, Some(name.to_string()), None)
-            .await
-        {
+        // Re-install from the collection root.  Single-package mode was removed
+        // in v0.36.0, so `name` is not passed; `install_from_local_path` will
+        // scan `<source>/<name>/init.lua` and reinstall all packages found in
+        // the collection.  For the common case of a 1-entry collection this is
+        // equivalent to targeted reinstall.
+        match self.pkg_install_typed(install_source, None, None).await {
             Ok(_) => RepairOutcome::Repaired {
                 // Emit a human-readable source string (legacy schema). The
                 // typed source is already persisted back into the manifest

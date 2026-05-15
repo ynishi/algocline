@@ -1320,6 +1320,7 @@ mod tests {
                     _filter: Option<serde_json::Value>,
                     _fields: Option<Vec<String>>,
                     _verbose: Option<String>,
+                    _local_indices: Option<Vec<String>>,
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1972,6 +1973,7 @@ mod tests {
             _: Option<serde_json::Value>,
             _: Option<Vec<String>>,
             _: Option<String>,
+            _: Option<Vec<String>>,
         ) -> Result<String, String> {
             Err("noop".into())
         }
@@ -2296,6 +2298,7 @@ mod tests {
                 _: Option<serde_json::Value>,
                 _: Option<Vec<String>>,
                 _: Option<String>,
+                _: Option<Vec<String>>,
             ) -> Result<String, String> {
                 Err("noop".into())
             }

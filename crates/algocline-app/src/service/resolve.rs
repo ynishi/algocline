@@ -153,8 +153,8 @@ pub(crate) fn resolve_scenario_code(
     }
 }
 
-/// Git URLs for auto-installation. Collection repos contain multiple packages
-/// as subdirectories; single repos have init.lua at root.
+/// Git URLs for auto-installation. All repos use the Collection layout
+/// (`<repo>/<name>/init.lua`) and must publish a `hub_index.json` at root.
 pub(super) const AUTO_INSTALL_SOURCES: &[&str] = &[
     "https://github.com/ynishi/algocline-bundled-packages",
     "https://github.com/ynishi/evalframe",

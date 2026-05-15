@@ -445,6 +445,7 @@ impl EngineApi for AppService {
         filter: Option<serde_json::Value>,
         fields: Option<Vec<String>>,
         verbose: Option<String>,
+        local_indices: Option<Vec<String>>,
     ) -> Result<String, String> {
         let svc = self.clone();
 
@@ -485,6 +486,7 @@ impl EngineApi for AppService {
                 category.as_deref(),
                 installed_only,
                 opts,
+                local_indices,
             )
         })
         .await

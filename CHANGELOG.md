@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — **BREAKING**: `pkg_install` single-package mode removed
+
+`SourceKind::Single` and the staging `init.lua` auto-detection in `pkg_install`
+have been removed. Hub publishing now requires `hub_index.json` (1 entry is
+sufficient for single-package repos).
+
+**Before** (v0.35.x and earlier):
+
+```
+# Single-package repo (init.lua at repo root) auto-detected:
+alc_pkg_install({ url: "github.com/user/my-pkg" })
+# → installed as ~/.algocline/packages/my-pkg/
+# Response: { mode: "single", installed: ["my-pkg"] }
+```
+
+**After** (v0.36.0+):
+
+```
+# Collection-layout repo with hub_index.json:
+alc_pkg_install({ url: "github.com/user/my-pkg-collection" })
+# → installed as ~/.algocline/packages/<each-subdir>/
+# Response: { mode: "collection", installed: [...] }
+```
+
+**Migrate (1-pkg authors)**:
+
+1. Move `init.lua` from repo root to `<repo>/<pkg_name>/init.lua` (nested layout).
+2. Add a minimal `alc.toml` at repo root with a `[hub]` section.
+3. Run `alc_hub_dist` from a Claude Code / rmcp MCP session:
+   ```
+   alc_hub_dist(
+     source_dir = ".",
+     output_path = "hub_index.json",
+     projections = ["hub", "narrative"]
+   )
+   ```
+4. `git add hub_index.json docs/ && git commit && git push`.
+
+See `docs/pkg-author-conventions.md §7` for the full step-by-step guide.
+
+### Changed: evalframe v0.4.0 integrated into Hub as a Collection source
+
+`evalframe` v0.4.0 now ships `hub_index.json` at the repo root and uses the
+standard Collection layout (`evalframe/<pkg>/init.lua`). It is re-integrated
+into `BUNDLED_SOURCES` (tag `v0.4.0`) and `AUTO_INSTALL_SOURCES` so that
+`alc init` and `pkg_install` auto-routes pick it up alongside
+`algocline-bundled-packages`.
+
+`evalframe` packages are listed as system packages (`SYSTEM_PACKAGES`) and are
+therefore excluded from `pkg_list` user-facing output while still being
+discoverable via `alc_hub_search`.
+
+### Added: `alc_hub_search` accepts `local_indices` parameter
+
+`alc_hub_search` now accepts an optional `local_indices: Vec<String>` field.
+Each path is read as a `hub_index.json` file and its packages are merged into
+the search results after the remote-fetched results (same deduplication via
+`seen_names`). Parse or I/O failures are surfaced as `warnings` entries in the
+response rather than hard errors, so a missing or malformed local file does not
+abort the search. This is useful for pre-push verification of a new
+`hub_index.json` before committing.
+
 ## [0.35.0] - 2026-05-14
 
 ### Added

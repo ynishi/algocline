@@ -158,6 +158,7 @@ pub(crate) fn resolve_scenario_code(
 pub(super) const AUTO_INSTALL_SOURCES: &[&str] = &[
     "https://github.com/ynishi/algocline-bundled-packages",
     "https://github.com/ynishi/evalframe",
+    "https://github.com/ynishi/algocline-swarm-frame",
 ];
 
 /// System packages: installed alongside user packages but not user-facing strategies.

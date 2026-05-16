@@ -679,3 +679,32 @@ a typed error on the MCP wire.
 Existing bundled-packages tests use a flat `tests/test_<pkg>.lua` layout and
 continue to work via `mcp__lua-debugger__test_launch`. New packages should
 adopt the `<pkg>/spec/<file>_spec.lua` layout and use `alc_pkg_test`.
+
+## Bundled Hub Sources (Collection-Only Install)
+
+algocline ships with multiple bundled Hub Collection sources, listed in
+`src/init.rs::BUNDLED_SOURCES`. These are auto-installed via `alc init` /
+`alc update` as a single batch. Each source is a Collection repository
+(`<repo>/<pkg-name>/init.lua` layout) and must publish a `hub_index.json`
+at the repository root.
+
+**Canonical: collection-unit install.** All bundled sources are designed to
+coexist when installed together. Cross-package `require()` chains within a
+Collection (e.g., `swarm_frame_algocline` requires `swarm_frame` at the
+top level) assume that the entire Collection batch has been installed.
+Individual cherry-pick install via `alc_pkg_install` for only a subset of
+a Collection may fail at runtime due to unresolved `require()` chains.
+algocline does not currently maintain a dependency resolver across packages.
+
+**Discouraged: individual cherry-pick install.** Avoid installing only a
+subset of a Collection with `mcp__algocline__alc_pkg_install`. If a
+package has cross-package `require()` dependencies within its Collection,
+those dependencies will be missing and the package will error at load time.
+
+If you need to remove a specific bundled package (`alc_pkg_remove <name>`),
+be aware that other packages in the same Collection may have a runtime
+`require()` to it; the registry will not warn you. Re-run `alc update
+--force` to restore the full Collection to the pinned bundled version.
+
+The full list of bundled sources and their pinned tags is in
+`src/init.rs::BUNDLED_SOURCES`.

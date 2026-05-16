@@ -502,7 +502,10 @@ alc_advice({ strategy: "my-strategy", task: "..." })
 
 ### Bundled packages
 
-Bundled packages are maintained in [algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages). Install them via CLI:
+Bundled packages are maintained across several Hub Collection repositories:
+[algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages) (core strategy packages),
+[algocline-swarm-frame](https://github.com/ynishi/algocline-swarm-frame) (swarm orchestration — `swarm_frame`, `swarm_frame_algocline`, `swarm_aggregate_plugin`).
+Install them via CLI:
 
 ```bash
 alc init            # Download and install all bundled packages

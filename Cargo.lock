@@ -52,6 +52,7 @@ dependencies = [
  "fs4",
  "libc",
  "mlua",
+ "mlua-lspec",
  "proptest",
  "semver",
  "serde",
@@ -993,6 +994,15 @@ dependencies = [
  "mlua",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "mlua-lspec"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da7947fe15757dd9886b839468f34871abfa3983990aa42a82431f0f40dc5e2"
+dependencies = [
+ "mlua",
 ]
 
 [[package]]

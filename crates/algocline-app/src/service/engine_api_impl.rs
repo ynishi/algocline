@@ -212,6 +212,33 @@ impl EngineApi for AppService {
         AppService::pkg_doctor(self, name, project_root).await
     }
 
+    /// Run mlua-lspec tests for a package, a single file, or inline code.
+    ///
+    /// Forwards to [`AppService::pkg_test`]. See trait doc for full contract.
+    #[allow(clippy::too_many_arguments)]
+    async fn pkg_test(
+        &self,
+        pkg: Option<String>,
+        code_file: Option<String>,
+        code: Option<String>,
+        spec_dir: Option<String>,
+        filter: Option<String>,
+        search_paths: Option<Vec<String>>,
+        project_root: Option<String>,
+    ) -> Result<String, String> {
+        AppService::pkg_test(
+            self,
+            pkg,
+            code_file,
+            code,
+            spec_dir,
+            filter,
+            search_paths,
+            project_root,
+        )
+        .await
+    }
+
     // ─── Logging ─────────────────────────────────────────────
 
     async fn add_note(

@@ -5955,3 +5955,77 @@ async fn test_pkg_install_collection_only_after_single_removal() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_pkg_test ─────────────────────────────────────────────────────────────
+
+/// Normal path: inline `code` with a passing lspec assertion returns
+/// `{passed: 1, failed: 0}`.
+#[tokio::test]
+async fn test_pkg_test_inline_passing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let lua_code = concat!(
+        "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+        "describe('suite', function()\n",
+        "    it('passes', function() expect(1).to.equal(1) end)\n",
+        "end)\n",
+    );
+
+    let resp = call_json(&client, "alc_pkg_test", json!({ "code": lua_code })).await;
+
+    assert_eq!(resp["passed"], 1, "expected passed=1, got: {resp}");
+    assert_eq!(resp["failed"], 0, "expected failed=0, got: {resp}");
+    assert_eq!(resp["pending"], 0, "expected pending=0, got: {resp}");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error path: calling `alc_pkg_test` with no input source returns the
+/// typed exclusivity error (crux constraint 1).
+#[tokio::test]
+async fn test_pkg_test_exclusivity_error_zero_inputs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .call_tool(call_params_empty("alc_pkg_test"))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("provide exactly one of pkg, code_file, code"),
+        "expected exclusivity error, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error path: `alc_pkg_test` with an unknown package name returns the
+/// typed not-found error (crux constraint 2 — propagated tier).
+#[tokio::test]
+async fn test_pkg_test_pkg_not_found() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_pkg_test",
+            json!({ "pkg": "nonexistent_pkg_xyz" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("nonexistent_pkg_xyz"),
+        "error must name the missing package, got: {text}"
+    );
+    assert!(
+        text.contains("not found"),
+        "error must say not found, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

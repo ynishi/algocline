@@ -1,6 +1,6 @@
 ---
 source: tests/e2e.rs
-assertion_line: 155
+assertion_line: 180
 expression: names
 ---
 [
@@ -39,6 +39,7 @@ expression: names
   "alc_pkg_remove",
   "alc_pkg_repair",
   "alc_pkg_scaffold",
+  "alc_pkg_test",
   "alc_pkg_unlink",
   "alc_pool_ensure",
   "alc_pool_status",

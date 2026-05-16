@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use algocline_core::QueryId;
 use algocline_engine::{FeedResult, VariantPkg};
 
+use super::alc_toml::load_alc_toml;
 use super::eval_store::{splice_response_string, splice_response_warnings};
 use super::resolve::{is_package_installed, make_require_code, resolve_code, QueryResponse};
 use super::transcript::write_transcript_log;
@@ -48,6 +50,134 @@ fn splice_transcript_warning(result_json: &str, warning: Option<String>) -> Stri
         Some(msg) => splice_response_string(result_json, "transcript_warning", &msg),
         None => result_json.to_string(),
     }
+}
+
+/// Build a frozen env snapshot from up to three sources and an optional allowlist.
+///
+/// # Sources (applied in priority order, lower overwritten by higher)
+///
+/// 1. **OS environment** (`ctx.env.allow_os = true` only) — `std::env::vars()` snapshot.
+/// 2. **dotenv file** (`ctx.env.dotenv`) — parsed via `dotenvy`; keys overwrite OS layer.
+/// 3. **inject** (`ctx.env.inject`) — explicit key/value map; highest priority, overwrites all.
+///
+/// # Arguments
+///
+/// - `ctx` — the full `alc_run` context value; `ctx["env"]` is extracted here.
+/// - `project_root` — required when `ctx.env.dotenv` is a relative path.
+///   `None` with a relative dotenv path is an error (avoids CWD ambiguity).
+/// - `alc_toml_allow` — optional allowlist from `alc.toml [env].allow`.
+///   When `Some`, the merged map is filtered to only keys present in the list.
+///   `None` means no filtering (all resolved keys are kept).
+///
+/// # Errors
+///
+/// Returns `Err(String)` for:
+/// - `ctx.env.inject` values that are not JSON strings
+/// - `ctx.env.dotenv` is a relative path but `project_root` is `None`
+/// - `dotenvy` I/O error opening the dotenv file
+/// - `dotenvy` parse error for any entry in the dotenv file
+pub(super) fn resolve_env(
+    ctx: &serde_json::Value,
+    project_root: Option<&std::path::Path>,
+    alc_toml_allow: Option<&[String]>,
+) -> Result<Arc<HashMap<String, String>>, String> {
+    let env_obj = ctx.get("env").and_then(|v| v.as_object());
+
+    // ── Layer 3 (highest): inject ──────────────────────────────────────────────
+    let inject: HashMap<String, String> = if let Some(obj) = env_obj {
+        if let Some(inject_val) = obj.get("inject") {
+            match inject_val.as_object() {
+                Some(m) => {
+                    let mut map = HashMap::new();
+                    for (k, v) in m {
+                        match v.as_str() {
+                            Some(s) => {
+                                map.insert(k.clone(), s.to_string());
+                            }
+                            None => {
+                                return Err(format!(
+                                    "ctx.env.inject: value for key '{k}' must be a string, got {v}"
+                                ));
+                            }
+                        }
+                    }
+                    map
+                }
+                None => {
+                    return Err(format!(
+                        "ctx.env.inject must be an object, got {}",
+                        inject_val
+                    ));
+                }
+            }
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // Resolved dotenv path (if any)
+    let dotenv_path: Option<std::path::PathBuf> = if let Some(p) = env_obj
+        .and_then(|o| o.get("dotenv"))
+        .and_then(|v| v.as_str())
+    {
+        let path = std::path::Path::new(p);
+        if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            match project_root {
+                Some(root) => Some(root.join(p)),
+                None => {
+                    return Err(format!(
+                        "ctx.env.dotenv: relative path '{p}' requires project_root to be set"
+                    ));
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    let allow_os = env_obj
+        .and_then(|o| o.get("allow_os"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut merged: HashMap<String, String> = HashMap::new();
+
+    // ── Layer 1 (lowest): OS environment ──────────────────────────────────────
+    if allow_os {
+        for (k, v) in std::env::vars() {
+            merged.insert(k, v);
+        }
+    }
+
+    // ── Layer 2: dotenv file ───────────────────────────────────────────────────
+    if let Some(ref full) = dotenv_path {
+        let iter = dotenvy::from_path_iter(full)
+            .map_err(|e| format!("ctx.env.dotenv: failed to open '{}': {e}", full.display()))?;
+        for item in iter {
+            let (k, v) = item
+                .map_err(|e| format!("ctx.env.dotenv: parse error in '{}': {e}", full.display()))?;
+            merged.insert(k, v);
+        }
+    }
+
+    // ── Layer 3: inject (overwrite, highest priority) ──────────────────────────
+    for (k, v) in inject {
+        merged.insert(k, v);
+    }
+
+    // ── Optional allowlist filter (alc.toml [env].allow) ──────────────────────
+    if let Some(allow) = alc_toml_allow {
+        if !allow.is_empty() {
+            let allowset: std::collections::HashSet<&String> = allow.iter().collect();
+            merged.retain(|k, _| allowset.contains(k));
+        }
+    }
+
+    Ok(Arc::new(merged))
 }
 
 impl AppService {
@@ -139,8 +269,30 @@ impl AppService {
         }
 
         // ── In-process path (default) ──────────────────────────────────────────
+
+        // Build the frozen env snapshot at alc_run invocation time (TIME boundary).
+        // Load alc.toml to get the optional env.allow allowlist.
+        let alc_toml_allow_list: Vec<String> = if let Some(root) = project_root.as_deref() {
+            let root_path = std::path::Path::new(root);
+            match load_alc_toml(root_path) {
+                Ok(Some(t)) => t.env.map(|e| e.allow).unwrap_or_default(),
+                Ok(None) => Vec::new(),
+                Err(e) => return Err(format!("alc.toml load error: {e}")),
+            }
+        } else {
+            Vec::new()
+        };
+        let alc_toml_allow = if alc_toml_allow_list.is_empty() {
+            None
+        } else {
+            Some(alc_toml_allow_list.as_slice())
+        };
+
+        let project_root_path = project_root.as_deref().map(std::path::Path::new);
+        let env_map = resolve_env(&ctx, project_root_path, alc_toml_allow)?;
+
         let json = self
-            .start_and_tick(code, ctx, None, extra, variants)
+            .start_and_tick(env_map, code, ctx, None, extra, variants)
             .await?;
         Ok(splice_response_warnings(
             &json,
@@ -191,8 +343,11 @@ impl AppService {
         let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
         let mut warnings: Vec<String> = extra_warnings;
         warnings.extend(variant_warnings);
+        // advice() does not accept ctx.env; pass an empty map so AlcEnv is
+        // present but empty (no env vars visible to advice strategies).
+        let env_map = Arc::new(HashMap::new());
         let json = self
-            .start_and_tick(code, ctx, Some(strategy), extra, variants)
+            .start_and_tick(env_map, code, ctx, Some(strategy), extra, variants)
             .await?;
         Ok(splice_response_warnings(
             &json,
@@ -427,8 +582,26 @@ impl AppService {
         })
     }
 
+    /// Start a Lua session with the given env snapshot and tick until the first
+    /// pause or completion.
+    ///
+    /// # Arguments
+    ///
+    /// - `env_map` — frozen env snapshot built by `resolve_env`; passed to
+    ///   `executor.start_session_with_env` so `alc.env` is populated before any
+    ///   Lua code runs (TIME boundary: snapshot is taken before this call).
+    /// - `code` — Lua source to execute.
+    /// - `ctx` — JSON context accessible as `ctx` global in the Lua VM.
+    /// - `strategy` — optional strategy name (used to correlate eval sessions).
+    /// - `extra_lib_paths` — additional `require` search paths.
+    /// - `variant_pkgs` — variant package overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` if session spawn or initial execution fails.
     pub(super) async fn start_and_tick(
         &self,
+        env_map: Arc<HashMap<String, String>>,
         code: String,
         ctx: serde_json::Value,
         strategy: Option<&str>,
@@ -438,7 +611,8 @@ impl AppService {
         let scenarios_dir = self.log_config.app_dir().scenarios_dir();
         let session = self
             .executor
-            .start_session(
+            .start_session_with_env(
+                env_map,
                 code,
                 ctx,
                 extra_lib_paths,
@@ -779,6 +953,217 @@ mod tests {
         assert!(
             !msg.contains("session not found") || msg.contains("Continue failed"),
             "error must be from pool path (UDS connect), got: {msg}"
+        );
+    }
+
+    // ── resolve_env unit tests ──────────────────────────────────────────────────
+
+    use super::resolve_env;
+
+    /// T1 (happy path): inject keys are accessible in the resolved map.
+    ///
+    /// Verifies the SPACE boundary inject path: keys supplied via
+    /// `ctx.env.inject` appear in the frozen snapshot.
+    #[test]
+    fn resolve_env_inject_keys_readable() {
+        let ctx = serde_json::json!({
+            "env": {
+                "inject": { "FOO": "bar", "BAZ": "qux" }
+            }
+        });
+        let map = resolve_env(&ctx, None, None).expect("resolve_env should succeed");
+        assert_eq!(map.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(map.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    /// T1b (happy path): empty ctx produces an empty env map.
+    ///
+    /// Verifies that `alc.env` is always present (empty map is valid) even
+    /// when no env configuration is supplied in the invocation context.
+    #[test]
+    fn resolve_env_empty_ctx_produces_empty_map() {
+        let ctx = serde_json::Value::Null;
+        let map = resolve_env(&ctx, None, None).expect("resolve_env with null ctx should succeed");
+        assert!(map.is_empty(), "empty ctx must produce an empty env map");
+    }
+
+    /// T1c (happy path): inject priority over dotenv file for same key.
+    ///
+    /// Verifies the SOURCE boundary: inject (Layer 3) overwrites dotenv (Layer 2).
+    #[test]
+    fn resolve_env_inject_overwrites_dotenv() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let env_file = tmp.path().join(".env");
+        // The .env file declares PRIORITY=from_dotenv.
+        std::fs::write(&env_file, b"PRIORITY=from_dotenv\n").expect("write .env");
+
+        let ctx = serde_json::json!({
+            "env": {
+                "dotenv": env_file.to_str().expect("valid path"),
+                "inject": { "PRIORITY": "from_inject" }
+            }
+        });
+        let map = resolve_env(&ctx, None, None).expect("resolve_env should succeed");
+        // inject (higher priority) must win over dotenv.
+        assert_eq!(
+            map.get("PRIORITY").map(String::as_str),
+            Some("from_inject"),
+            "inject must shadow dotenv for the same key"
+        );
+    }
+
+    /// T1d (happy path): dotenv file keys are loaded when path is absolute.
+    ///
+    /// Verifies Layer 2 (dotenv) of the SOURCE boundary merge chain.
+    #[test]
+    fn resolve_env_dotenv_absolute_path_loaded() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let env_file = tmp.path().join(".env");
+        std::fs::write(&env_file, b"DOTENV_KEY=dotenv_val\n").expect("write .env");
+
+        let ctx = serde_json::json!({
+            "env": {
+                "dotenv": env_file.to_str().expect("valid path")
+            }
+        });
+        let map = resolve_env(&ctx, None, None).expect("resolve_env should succeed");
+        assert_eq!(
+            map.get("DOTENV_KEY").map(String::as_str),
+            Some("dotenv_val"),
+            "key from dotenv file must be accessible"
+        );
+    }
+
+    /// T1e (happy path): allowlist filter retains only listed keys.
+    ///
+    /// Verifies alc.toml [env].allow filtering is applied after 3-source merge.
+    #[test]
+    fn resolve_env_allowlist_filters_inject_keys() {
+        let ctx = serde_json::json!({
+            "env": {
+                "inject": { "ALLOWED": "yes", "BLOCKED": "no" }
+            }
+        });
+        let allow = vec!["ALLOWED".to_string()];
+        let map =
+            resolve_env(&ctx, None, Some(allow.as_slice())).expect("resolve_env should succeed");
+        assert_eq!(map.get("ALLOWED").map(String::as_str), Some("yes"));
+        assert!(
+            map.get("BLOCKED").is_none(),
+            "BLOCKED key must be excluded by allowlist"
+        );
+    }
+
+    /// T2 (boundary): allow_os=false (default) must not include any OS env vars.
+    ///
+    /// Verifies the SOURCE boundary: OS env is excluded unless explicitly opted in.
+    #[test]
+    fn resolve_env_allow_os_false_excludes_os_vars() {
+        // PATH is nearly always set in the test environment.
+        let ctx = serde_json::json!({ "env": { "allow_os": false } });
+        let map = resolve_env(&ctx, None, None).expect("resolve_env should succeed");
+        // Even if PATH is set in the OS, it must not appear in the snapshot.
+        assert!(
+            map.get("PATH").is_none(),
+            "OS env must not leak when allow_os is false"
+        );
+    }
+
+    /// T2b (boundary): relative dotenv path without project_root returns Err.
+    ///
+    /// Verifies the plan Risks #3 decision: relative path + None project_root = Err.
+    #[test]
+    fn resolve_env_relative_dotenv_without_project_root_errors() {
+        let ctx = serde_json::json!({
+            "env": { "dotenv": ".env" }
+        });
+        let result = resolve_env(&ctx, None, None);
+        assert!(
+            result.is_err(),
+            "relative dotenv path without project_root must return Err"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("project_root"),
+            "error must mention project_root, got: {msg}"
+        );
+    }
+
+    /// T2c (boundary): relative dotenv path with project_root is resolved correctly.
+    ///
+    /// Verifies that a relative path is joined against project_root.
+    #[test]
+    fn resolve_env_relative_dotenv_with_project_root_resolved() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        std::fs::write(tmp.path().join(".env"), b"REL_KEY=rel_val\n").expect("write .env");
+
+        let ctx = serde_json::json!({ "env": { "dotenv": ".env" } });
+        let map = resolve_env(&ctx, Some(tmp.path()), None).expect("resolve_env should succeed");
+        assert_eq!(
+            map.get("REL_KEY").map(String::as_str),
+            Some("rel_val"),
+            "relative dotenv path must be resolved against project_root"
+        );
+    }
+
+    /// T2d (boundary): empty allowlist (None) means no filtering — all keys pass through.
+    #[test]
+    fn resolve_env_none_allowlist_keeps_all_inject_keys() {
+        let ctx = serde_json::json!({
+            "env": { "inject": { "A": "1", "B": "2" } }
+        });
+        let map = resolve_env(&ctx, None, None).expect("resolve_env should succeed");
+        assert_eq!(
+            map.len(),
+            2,
+            "all inject keys must be retained when allowlist is None"
+        );
+    }
+
+    /// T3 (error path): inject value that is not a string returns Err.
+    ///
+    /// Verifies that non-string inject values propagate as Result::Err (no silent drop).
+    #[test]
+    fn resolve_env_inject_non_string_value_errors() {
+        let ctx = serde_json::json!({
+            "env": { "inject": { "BAD": 42 } }
+        });
+        let result = resolve_env(&ctx, None, None);
+        assert!(result.is_err(), "non-string inject value must return Err");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("BAD"),
+            "error must mention the offending key, got: {msg}"
+        );
+    }
+
+    /// T3b (error path): inject object that is not an object returns Err.
+    #[test]
+    fn resolve_env_inject_not_an_object_errors() {
+        let ctx = serde_json::json!({
+            "env": { "inject": ["not", "an", "object"] }
+        });
+        let result = resolve_env(&ctx, None, None);
+        assert!(result.is_err(), "non-object inject value must return Err");
+    }
+
+    /// T3c (error path): missing dotenv file propagates as Err (no silent skip).
+    ///
+    /// Verifies SOURCE boundary: dotenv I/O errors are surfaced, not swallowed.
+    #[test]
+    fn resolve_env_missing_dotenv_file_errors() {
+        let ctx = serde_json::json!({
+            "env": { "dotenv": "/nonexistent/path/to/.env" }
+        });
+        let result = resolve_env(&ctx, None, None);
+        assert!(
+            result.is_err(),
+            "missing dotenv file must return Err, not empty map"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("dotenv"),
+            "error must mention dotenv, got: {msg}"
         );
     }
 }

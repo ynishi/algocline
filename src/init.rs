@@ -47,6 +47,10 @@ const BUNDLED_SOURCES: &[BundledSource] = &[
         url: "https://github.com/ynishi/evalframe",
         tag: "v0.4.0",
     },
+    BundledSource {
+        url: "https://github.com/ynishi/algocline-swarm-frame",
+        tag: "v0.2.0",
+    },
 ];
 
 fn packages_dir() -> anyhow::Result<PathBuf> {

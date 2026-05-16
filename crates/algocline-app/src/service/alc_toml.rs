@@ -29,6 +29,34 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct AlcToml {
     #[serde(default)]
     pub packages: BTreeMap<String, PackageDep>,
+    /// Optional `[env]` section that declares an allowlist of OS environment
+    /// variable names accessible to Lua strategies via `alc.env`.
+    ///
+    /// When absent (the common case), the allowlist is empty and no OS env
+    /// variables are passed through unless explicitly injected via `ctx.env.inject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<EnvSection>,
+}
+
+/// The `[env]` section of `alc.toml`.
+///
+/// Controls which OS environment variable names are permitted to flow into
+/// the Lua sandbox when `ctx.env.allow_os = true` is set at invocation time.
+///
+/// # Example (alc.toml)
+/// ```toml
+/// [env]
+/// allow = ["HOME", "PATH"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvSection {
+    /// Allowlist of OS environment variable names.
+    ///
+    /// When non-empty, only variables whose names appear in this list are
+    /// included in the env snapshot forwarded to `alc.env`. An empty `allow`
+    /// with `allow_os = true` results in an empty snapshot.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// A single package dependency declaration.
@@ -631,7 +659,10 @@ invalid_key = 42
                 version: None,
             },
         );
-        let local = AlcToml { packages };
+        let local = AlcToml {
+            packages,
+            env: None,
+        };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
         assert_eq!(resolved, vec![abs]);
@@ -652,7 +683,10 @@ invalid_key = 42
                 version: None,
             },
         );
-        let local = AlcToml { packages };
+        let local = AlcToml {
+            packages,
+            env: None,
+        };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
         assert_eq!(resolved, vec![abs]);
@@ -669,7 +703,10 @@ invalid_key = 42
                 version: None,
             },
         );
-        let local = AlcToml { packages };
+        let local = AlcToml {
+            packages,
+            env: None,
+        };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
         assert!(resolved.is_empty());
@@ -697,7 +734,10 @@ invalid_key = 42
                 version: None,
             },
         );
-        let local = AlcToml { packages };
+        let local = AlcToml {
+            packages,
+            env: None,
+        };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
         assert_eq!(resolved, vec![abs]);
@@ -726,7 +766,10 @@ invalid_key = 42
                 version: None,
             },
         );
-        let local = AlcToml { packages };
+        let local = AlcToml {
+            packages,
+            env: None,
+        };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
         // BTreeMap iterates keys in ascending order → cot first, ucb second.

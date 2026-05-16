@@ -1354,6 +1354,19 @@ mod tests {
                 async fn pool_stop(&self, _sid: Option<String>) -> Result<String, String> {
                     Err($err.into())
                 }
+                #[allow(clippy::too_many_arguments)]
+                async fn pkg_test(
+                    &self,
+                    _pkg: Option<String>,
+                    _code_file: Option<String>,
+                    _code: Option<String>,
+                    _spec_dir: Option<String>,
+                    _filter: Option<String>,
+                    _search_paths: Option<Vec<String>>,
+                    _project_root: Option<String>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
             }
         };
     }
@@ -2003,6 +2016,19 @@ mod tests {
         async fn pool_stop(&self, _sid: Option<String>) -> Result<String, String> {
             Err("not configured".into())
         }
+        #[allow(clippy::too_many_arguments)]
+        async fn pkg_test(
+            &self,
+            _pkg: Option<String>,
+            _code_file: Option<String>,
+            _code: Option<String>,
+            _spec_dir: Option<String>,
+            _filter: Option<String>,
+            _search_paths: Option<Vec<String>>,
+            _project_root: Option<String>,
+        ) -> Result<String, String> {
+            Err("not configured".into())
+        }
     }
 
     fn make_fake_catalog(engine: FakeEngine) -> (ResourceCatalog, tempfile::TempDir) {
@@ -2325,6 +2351,19 @@ mod tests {
             }
             async fn pool_stop(&self, _sid: Option<String>) -> Result<String, String> {
                 Err("not found".into())
+            }
+            #[allow(clippy::too_many_arguments)]
+            async fn pkg_test(
+                &self,
+                _pkg: Option<String>,
+                _code_file: Option<String>,
+                _code: Option<String>,
+                _spec_dir: Option<String>,
+                _filter: Option<String>,
+                _search_paths: Option<Vec<String>>,
+                _project_root: Option<String>,
+            ) -> Result<String, String> {
+                Err("noop".into())
             }
         }
         let tmp = tempfile::tempdir().unwrap();

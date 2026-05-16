@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `alc_pkg_test`: Run mlua-lspec tests against a package's spec directory (`<pkg>/spec/*_spec.lua`), a single `code_file`, or inline `code`. Returns JSON `{passed, failed, pending, total, duration_ms, spec_files[]}` with per-file and per-test breakdown. `pkg` / `code_file` / `code` are mutually exclusive — exactly one must be provided. (breaking for trait implementors only; `EngineApi::pkg_test` has no default impl)
+
 ## [0.36.0] - 2026-05-15
 
 ### Changed: bundled-packages bumped to `v0.24.0`

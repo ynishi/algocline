@@ -608,3 +608,74 @@ git push
 
 Consumers can now install via `alc_pkg_install({ url: "github.com/you/my-cool-pkg" })`
 and your package will appear in `alc_hub_search` results.
+
+---
+
+## 8. Testing
+
+algocline packages should ship tests under `<pkg>/spec/<file>_spec.lua`. Run
+them via `mcp__algocline__alc_pkg_test`.
+
+### Spec file layout
+
+Place spec files at `<pkg_root>/spec/<name>_spec.lua`. Each file is a
+self-contained lspec suite. The `lust` global (`describe`, `it`, `expect`,
+`spy`, etc.) is pre-loaded automatically — no `require` needed.
+
+```lua
+-- <pkg_root>/spec/myfeature_spec.lua
+
+local describe, it, expect = lust.describe, lust.it, lust.expect
+
+describe('myfeature', function()
+    it('does X correctly', function()
+        local result = require('mypkg').do_x()
+        expect(result).to.equal('expected_value')
+    end)
+end)
+```
+
+### Running tests
+
+- `alc_pkg_test pkg="mypkg"` — run all `<pkg_root>/spec/*_spec.lua`
+- `alc_pkg_test pkg="mypkg" filter="feature"` — run only specs whose stem
+  contains `"feature"` (e.g. `feature_spec.lua`)
+- `alc_pkg_test pkg="mypkg" spec_dir="tests"` — use a custom spec directory
+- `alc_pkg_test code_file="<abs_path>"` — run a single file (escape hatch;
+  use absolute paths in worktree environments)
+- `alc_pkg_test code="<inline lua>"` — ad-hoc inline test
+
+### Output shape
+
+```json
+{
+  "passed": 3,
+  "failed": 0,
+  "pending": 0,
+  "total": 3,
+  "duration_ms": 42,
+  "spec_files": [
+    {
+      "path": "/path/to/myfeature_spec.lua",
+      "passed": 3,
+      "failed": 0,
+      "total": 3,
+      "duration_ms": 40,
+      "tests": [
+        { "suite": "myfeature", "name": "does X correctly",
+          "passed": true, "pending": false, "error": null }
+      ]
+    }
+  ]
+}
+```
+
+Per-spec-file Lua crashes increment `failed` and continue (execution is not
+aborted). Setup failures (package not found, zero spec files) are returned as
+a typed error on the MCP wire.
+
+### Migration from `tests/test_<pkg>.lua`
+
+Existing bundled-packages tests use a flat `tests/test_<pkg>.lua` layout and
+continue to work via `mcp__lua-debugger__test_launch`. New packages should
+adopt the `<pkg>/spec/<file>_spec.lua` layout and use `alc_pkg_test`.

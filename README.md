@@ -128,6 +128,26 @@ local final = alc.llm("Revise based on critique:\n" .. draft .. "\n\nCritique:\n
 return { result = final }
 ```
 
+To pass environment variables to the Lua VM, use `ctx.env`:
+
+```
+alc_run({
+  code: "return { api_url = alc.env.API_URL }",
+  ctx: {
+    env: {
+      inject: { "API_URL": "https://example.com" }
+    }
+  }
+})
+```
+
+`ctx.env` supports three sources merged in priority order (`inject > dotenv > os.env`):
+- `inject` — key/value map supplied inline (highest priority)
+- `dotenv` — path to a `.env` file relative to the project root
+- `allow_os: true` — expose the server's OS environment (opt-in, lowest priority)
+
+An optional `alc.toml [env.allow]` allowlist filters which keys reach the Lua VM. Writes to `alc.env` always raise a runtime error — the snapshot is immutable for the lifetime of the run.
+
 ## Architecture
 
 ### Three-Layer StdLib
@@ -144,6 +164,7 @@ Layer 0: Runtime Primitives (Rust → alc.*)
 │  alc.match_bool(text)          — yes/no normalizer for LLM output
 │  alc.budget_remaining()        — remaining budget (calls/time)
 │  alc.progress(step, total, m?) — structured progress reporting
+│  alc.env                       — host-owned readonly env snapshot (inject/dotenv/os); alc.env:use{...} declare-at-use proxy
 │
 Layer 1: Prelude Combinators (Lua → alc.*)
 │  alc.cache(prompt, opts?)      — memoized LLM call (session-scoped)

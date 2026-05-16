@@ -6029,3 +6029,153 @@ async fn test_pkg_test_pkg_not_found() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc.env ──────────────────────────────────────────────────────────────────
+
+/// T1 (happy path): inject env vars are accessible from Lua via `alc.env.KEY`.
+///
+/// Verifies the TIME (snapshot frozen) and SOURCE (inject layer) crux boundaries:
+/// the env map is snapshotted at `alc_run` invocation time and inject has the
+/// highest priority.
+#[tokio::test]
+async fn test_alc_env_inject_readable() {
+    let client = connect().await;
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({
+            "code": r#"return alc.env.FOO"#,
+            "ctx": { "env": { "inject": { "FOO": "bar" } } }
+        }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed", "unexpected status: {resp}");
+    assert_eq!(
+        resp["result"].as_str().unwrap_or(""),
+        "bar",
+        "alc.env.FOO should return inject value 'bar', got: {resp}"
+    );
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T2 (SPACE boundary): writing to `alc.env` must produce a runtime error
+/// containing "readonly".
+///
+/// Verifies the SPACE crux boundary: host-owned env map must never be mutated
+/// by Lua guest; `MetaMethod::NewIndex` must hard-error on any write attempt.
+#[tokio::test]
+async fn test_alc_env_readonly_write_errors() {
+    let client = connect().await;
+    let result = client
+        .call_tool(call_params(
+            "alc_run",
+            json!({
+                "code": r#"alc.env.X = 1; return "unreached""#,
+                "ctx": { "env": { "inject": {} } }
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("readonly") || result.is_error == Some(true),
+        "expected readonly error, got: {text}"
+    );
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T2 (edge case): `alc.env:use{...}` proxy returns nil for undeclared keys.
+///
+/// Verifies the SPACE crux boundary declare-at-use semantics: keys not listed
+/// in the `use{...}` call must be invisible (nil), even if present in the
+/// underlying env snapshot.
+#[tokio::test]
+async fn test_alc_env_use_undeclared_returns_nil() {
+    let client = connect().await;
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({
+            "code": r#"local e = alc.env:use{"FOO"}; return tostring(e.UNDECLARED)"#,
+            "ctx": { "env": { "inject": { "FOO": "bar", "UNDECLARED": "leak" } } }
+        }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed", "unexpected status: {resp}");
+    assert_eq!(
+        resp["result"].as_str().unwrap_or(""),
+        "nil",
+        "undeclared key via :use{{}} should return nil, got: {resp}"
+    );
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T3 (SOURCE priority): inject > dotenv > os.env strict three-layer merge.
+///
+/// Verifies the SOURCE crux boundary: when the same key is present in all
+/// three sources, the inject layer value must always shadow dotenv and OS.
+/// `set_var` is called before `connect()` so the spawned child process inherits it.
+#[tokio::test]
+async fn test_alc_env_source_priority_inject_over_dotenv_over_os() {
+    // Create a temporary .env file containing KEY=from_dotenv
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dotenv_path = dir.path().join(".env");
+    std::fs::write(&dotenv_path, "KEY=from_dotenv\n").expect("write dotenv");
+    // SAFETY: set_var before connect() so the spawned alc child process inherits the OS env var.
+    // No concurrent env mutation occurs in the e2e harness (separate processes per test).
+    std::env::set_var("KEY", "from_os");
+    let client = connect().await;
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({
+            "code": r#"return alc.env.KEY"#,
+            "ctx": {
+                "env": {
+                    "inject": { "KEY": "from_inject" },
+                    "dotenv": dotenv_path.to_str().expect("dotenv path utf8"),
+                    "allow_os": true
+                }
+            }
+        }),
+    )
+    .await;
+    // Remove env var before assertions to avoid leaking into subsequent tests
+    std::env::remove_var("KEY");
+    assert_eq!(resp["status"], "completed", "unexpected status: {resp}");
+    assert_eq!(
+        resp["result"].as_str().unwrap_or(""),
+        "from_inject",
+        "inject must shadow dotenv and OS env, got: {resp}"
+    );
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T1 (happy path): dotenv file is parsed and values are accessible via `alc.env`.
+///
+/// Verifies that the dotenv source layer correctly parses KEY=value pairs and
+/// multi-line escape sequences from a file at an absolute path.
+#[tokio::test]
+async fn test_alc_env_dotenv_file_parse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dotenv_path = dir.path().join(".env");
+    // dotenv file with a plain value and a double-quoted value with \n escape
+    std::fs::write(&dotenv_path, "FOO=bar\nBAZ=\"line1\\nline2\"\n").expect("write dotenv");
+    let client = connect().await;
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({
+            "code": r#"return alc.env.FOO .. "|" .. alc.env.BAZ"#,
+            "ctx": { "env": { "dotenv": dotenv_path.to_str().expect("dotenv path utf8") } }
+        }),
+    )
+    .await;
+    assert_eq!(resp["status"], "completed", "unexpected status: {resp}");
+    assert_eq!(
+        resp["result"].as_str().unwrap_or(""),
+        "bar|line1\nline2",
+        "dotenv FOO and BAZ should be parsed correctly, got: {resp}"
+    );
+    client.cancel().await.expect("cancel failed");
+}

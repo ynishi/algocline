@@ -4,6 +4,7 @@
 //! LLM requests from all children are batched and sent through the parent's
 //! llm_tx, achieving true LLM parallelism.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use mlua::LuaSerdeExt;
 use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use mlua_pkg::Registry;
 
-use super::{register, BridgeConfig, PRELUDE};
+use super::{register, register_env, BridgeConfig, PRELUDE};
 use crate::card::FileCardStore;
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 use crate::resolver_factory::make_resolver;
@@ -106,6 +107,14 @@ pub(crate) fn register_fork(
                 let (event_tx, mut event_rx) =
                     tokio::sync::mpsc::channel::<ForkEvent>(16 * n.max(1));
 
+                // Extract parent env snapshot (if any) for TIME-boundary fork inheritance.
+                // We clone the Arc here, outside the loop, so each child iteration
+                // gets its own Arc::clone without re-borrowing the parent Lua handle.
+                // If the parent session was started without env (legacy path), this is None.
+                let parent_env: Option<Arc<HashMap<String, String>>> = lua
+                    .app_data_ref::<Arc<HashMap<String, String>>>()
+                    .map(|r| Arc::clone(&*r));
+
                 // Spawn child VMs and their event-forwarding tasks.
                 // drivers must stay alive to keep child VMs running.
                 let mut drivers: Vec<AsyncIsleDriver> = Vec::with_capacity(n);
@@ -164,11 +173,19 @@ pub(crate) fn register_fork(
                         // Fork child sessions don't expose recent_logs via alc_status.
                         log_sink: None,
                     };
+                    // Clone per-iteration so each child captures its own Arc.
+                    let child_env = parent_env.clone();
 
                     child_isle
                         .exec(move |child_lua| {
                             let alc_table = child_lua.create_table()?;
                             register(child_lua, &alc_table, child_config)?;
+                            // Inherit parent TIME snapshot via Arc::clone (CRUX TIME boundary).
+                            // If parent had no env (legacy path), skip — no regression.
+                            if let Some(env_arc) = child_env {
+                                register_env(child_lua, &alc_table, env_arc)
+                                    .map_err(|e| mlua_isle::IsleError::Lua(e.to_string()))?;
+                            }
                             child_lua.globals().set("alc", alc_table)?;
 
                             let ctx_value = child_lua.to_value(&child_ctx)?;

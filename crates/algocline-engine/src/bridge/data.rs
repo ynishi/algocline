@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -557,6 +558,74 @@ pub(super) fn register_stats(
     Ok(())
 }
 
+// ─── alc.env ─────────────────────────────────────────────────────────────────
+
+/// Read-only Lua UserData view of the frozen env snapshot.
+///
+/// The underlying `HashMap` is owned by the host (Rust) and wrapped in an
+/// `Arc` so it can be shared across the parent session and fork children
+/// without copying.  Guest Lua code may only read keys via `alc.env.KEY`
+/// (`__index`) or `alc.env:get(key, default)`.  Any write attempt
+/// (`alc.env.KEY = value`) returns a hard runtime error — this is the SPACE
+/// boundary that keeps host env state immutable from the Lua side.
+pub struct AlcEnv(pub Arc<HashMap<String, String>>);
+
+impl mlua::UserData for AlcEnv {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // __index: read a key from the frozen snapshot.
+        methods.add_meta_method(mlua::MetaMethod::Index, |_, this, key: String| {
+            Ok(this.0.get(&key).cloned())
+        });
+
+        // __newindex: hard runtime error on any write attempt.
+        // CRUX must_not_simplify: never silently ignore writes.
+        methods.add_meta_method(
+            mlua::MetaMethod::NewIndex,
+            |_, _, (_k, _v): (mlua::Value, mlua::Value)| {
+                Err::<(), _>(mlua::Error::external("alc.env is readonly"))
+            },
+        );
+
+        // get(key [, default]) — explicit lookup with optional fallback.
+        methods.add_method(
+            "get",
+            |_, this, (key, default): (String, Option<String>)| {
+                Ok(this.0.get(&key).cloned().or(default))
+            },
+        );
+
+        // use({key1, key2, ...}) — declare-at-use: returns a plain Lua table
+        // containing only the declared keys that exist in the snapshot.
+        // Undeclared keys are absent (nil when accessed).
+        methods.add_method("use", |lua, this, declared: Vec<String>| {
+            let proxy = lua.create_table()?;
+            for k in &declared {
+                if let Some(v) = this.0.get(k) {
+                    proxy.set(k.clone(), v.clone())?;
+                }
+            }
+            Ok(proxy)
+        });
+    }
+}
+
+/// Register `alc.env` on the given `alc` table and store the snapshot as
+/// side-band app-data on `lua` so fork children can inherit it via
+/// `lua.app_data_ref::<Arc<HashMap<String,String>>>()`.
+///
+/// This function is intentionally `pub` (not `pub(super)`) because it is
+/// re-exported from `bridge::mod.rs` and called from `executor.rs` and
+/// `fork.rs` outside this module.
+pub fn register_env(
+    lua: &mlua::Lua,
+    alc_table: &mlua::Table,
+    env_map: Arc<HashMap<String, String>>,
+) -> mlua::Result<()> {
+    alc_table.set("env", AlcEnv(Arc::clone(&env_map)))?;
+    lua.set_app_data(env_map);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,5 +1103,113 @@ mod tests {
         // nil → "nil", bool → "true", int → "42", float → formatted per Lua convention
         let msg = &entries[0].message;
         assert!(msg.starts_with("nil\ttrue\t42\t"), "got: {msg}");
+    }
+
+    // ─── alc.env unit tests ───────────────────────────────────────────────────
+
+    fn make_env_lua(pairs: &[(&str, &str)]) -> (Lua, Arc<HashMap<String, String>>) {
+        let mut map = HashMap::new();
+        for (k, v) in pairs {
+            map.insert(k.to_string(), v.to_string());
+        }
+        let env_map = Arc::new(map);
+        let lua = Lua::new();
+        let alc_table = lua.create_table().unwrap();
+        register_env(&lua, &alc_table, Arc::clone(&env_map)).unwrap();
+        lua.globals().set("alc", alc_table).unwrap();
+        (lua, env_map)
+    }
+
+    #[test]
+    fn env_index_reads_existing_key() {
+        let (lua, _) = make_env_lua(&[("FOO", "bar")]);
+        let val: Option<String> = lua.load(r#"return alc.env.FOO"#).eval().unwrap();
+        assert_eq!(val, Some("bar".to_string()));
+    }
+
+    #[test]
+    fn env_index_missing_key_returns_nil() {
+        let (lua, _) = make_env_lua(&[("FOO", "bar")]);
+        let val: LuaValue = lua.load(r#"return alc.env.MISSING"#).eval().unwrap();
+        assert!(val.is_nil());
+    }
+
+    #[test]
+    fn env_newindex_returns_error() {
+        let (lua, _) = make_env_lua(&[("FOO", "bar")]);
+        let result: Result<(), _> = lua.load(r#"alc.env.FOO = "x""#).exec();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("alc.env is readonly"),
+            "expected readonly error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn env_get_with_default_returns_default_on_miss() {
+        let (lua, _) = make_env_lua(&[]);
+        let val: Option<String> = lua
+            .load(r#"return alc.env:get("MISSING", "fallback")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(val, Some("fallback".to_string()));
+    }
+
+    #[test]
+    fn env_get_returns_value_when_present() {
+        let (lua, _) = make_env_lua(&[("KEY", "val")]);
+        let val: Option<String> = lua
+            .load(r#"return alc.env:get("KEY", "default")"#)
+            .eval()
+            .unwrap();
+        assert_eq!(val, Some("val".to_string()));
+    }
+
+    #[test]
+    fn env_use_returns_declared_keys_only() {
+        let (lua, _) = make_env_lua(&[("FOO", "foo_val"), ("BAR", "bar_val"), ("SECRET", "s")]);
+        let result: LuaValue = lua
+            .load(
+                r#"
+                local e = alc.env:use{"FOO", "BAR"}
+                return e
+            "#,
+            )
+            .eval()
+            .unwrap();
+        let tbl = result.as_table().unwrap();
+        assert_eq!(tbl.get::<String>("FOO").unwrap(), "foo_val");
+        assert_eq!(tbl.get::<String>("BAR").unwrap(), "bar_val");
+        // SECRET was not declared — should be absent (nil)
+        let secret: LuaValue = tbl.get("SECRET").unwrap();
+        assert!(secret.is_nil(), "SECRET should be nil in proxy");
+    }
+
+    #[test]
+    fn env_use_undeclared_key_is_nil() {
+        let (lua, _) = make_env_lua(&[("FOO", "foo_val")]);
+        let val: LuaValue = lua
+            .load(
+                r#"
+                local e = alc.env:use{"FOO"}
+                return e.UNDECLARED
+            "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(val.is_nil());
+    }
+
+    #[test]
+    fn register_env_sets_app_data() {
+        let mut map = HashMap::new();
+        map.insert("X".to_string(), "1".to_string());
+        let env_map = Arc::new(map);
+        let lua = Lua::new();
+        let alc_table = lua.create_table().unwrap();
+        register_env(&lua, &alc_table, Arc::clone(&env_map)).unwrap();
+        // Verify app_data is set and accessible
+        let retrieved = lua.app_data_ref::<Arc<HashMap<String, String>>>().unwrap();
+        assert_eq!(retrieved.get("X").unwrap(), "1");
     }
 }

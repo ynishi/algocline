@@ -225,6 +225,8 @@ alc_continue({ session_id, response })
 | `alc_pkg_list` | List installed packages with metadata. Pass `project_root` to include project-local packages |
 | `alc_pkg_install` | Install a package or collection from Git URL or local path. Pass `force: true` to overwrite an already-installed package. Response includes `types_path` (absolute path to `alc.d.lua`) |
 | `alc_pkg_remove` | Remove an installed package from `alc.toml` + `alc.lock`. Pass `project_root` to target project scope |
+| `alc_pkg_doctor` | Diagnose package state (read-only). Returns JSON with `healthy` / `incomplete_pkg` / `installed_missing` / `symlink_dangling` / `path_missing` buckets. Safe to invoke freely — no filesystem writes |
+| `alc_pkg_test` | Run mlua-lspec tests against a package's spec directory (`<pkg>/spec/*_spec.lua`), a single `code_file`, or inline `code`. Returns JSON `{passed, failed, pending, total, duration_ms, spec_files[]}`. Exactly one of `pkg` / `code_file` / `code` must be provided |
 | `alc_init` | Initialize a project — creates `alc.toml` in the project root if absent |
 | `alc_update` | Update packages declared in `alc.toml` by re-installing from their recorded sources |
 | `alc_migrate` | Migrate a legacy `alc.lock` to the new `alc.toml` + `alc.lock` schema |

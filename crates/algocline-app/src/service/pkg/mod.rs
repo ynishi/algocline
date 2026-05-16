@@ -65,6 +65,7 @@ mod list;
 pub(crate) mod read;
 mod remove;
 mod repair;
+mod test_run;
 
 #[cfg(test)]
 mod tests;

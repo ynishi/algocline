@@ -240,6 +240,55 @@ pub trait EngineApi: Send + Sync {
         project_root: Option<String>,
     ) -> Result<String, String>;
 
+    /// Run mlua-lspec tests for a package, a single file, or inline code.
+    ///
+    /// Exactly one of `pkg`, `code_file`, or `code` must be provided; providing
+    /// zero or more than one returns a typed `Err`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pkg` — installed package name; spec files are discovered under
+    ///   `<pkg_root>/<spec_dir>/*_spec.lua` (default `spec_dir = "spec"`).
+    /// * `code_file` — absolute path to a single `.lua` test file.
+    /// * `code` — inline Lua source code containing lspec tests.
+    /// * `spec_dir` — subdirectory within the package root that holds spec files
+    ///   (default `"spec"`). Only used when `pkg` is provided.
+    /// * `filter` — substring filter applied to spec file stems (only when `pkg`
+    ///   is provided).
+    /// * `search_paths` — additional directories prepended to `package.path`
+    ///   inside the Lua VM.
+    /// * `project_root` — optional project root for variant-scope package
+    ///   resolution (`alc.local.toml`). Falls back to ancestor walk from cwd.
+    ///
+    /// # Returns
+    ///
+    /// On success: JSON string `{passed, failed, pending, total, duration_ms,
+    /// spec_files: [{path, passed, failed, total, duration_ms, tests: [{suite,
+    /// name, passed, pending, error}]}]}`.
+    ///
+    /// # Errors
+    ///
+    /// * Zero or multiple input sources provided → `"pkg_test: provide exactly
+    ///   one of pkg, code_file, code"`.
+    /// * `pkg` not found → `"pkg_test: package '<name>' not found …"`.
+    /// * No spec files found → `"pkg_test: no spec files found in <path> …"`.
+    /// * mlua VM init failure, I/O errors, or `spawn_blocking` panic → typed
+    ///   `Err` string.
+    // 8 parameters exceed clippy's default limit of 7; the parameter count
+    // is justified by the MCP wire shape which needs distinct named fields
+    // for pkg / code_file / code (mutually exclusive) plus filtering options.
+    #[allow(clippy::too_many_arguments)]
+    async fn pkg_test(
+        &self,
+        pkg: Option<String>,
+        code_file: Option<String>,
+        code: Option<String>,
+        spec_dir: Option<String>,
+        filter: Option<String>,
+        search_paths: Option<Vec<String>>,
+        project_root: Option<String>,
+    ) -> Result<String, String>;
+
     // ─── Logging ─────────────────────────────────────────────
 
     /// Append a note to a session's log file.

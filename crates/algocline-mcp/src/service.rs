@@ -349,6 +349,31 @@ pub struct PkgDoctorParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PkgTestParams {
+    /// Package name to test. Discovers `*_spec.lua` files under
+    /// `<pkg_root>/<spec_dir>/` (default `spec_dir = "spec"`).
+    /// Mutually exclusive with `code_file` and `code` — exactly one required.
+    pub pkg: Option<String>,
+    /// Absolute path to a single `.lua` spec file to run.
+    /// Mutually exclusive with `pkg` and `code` — exactly one required.
+    pub code_file: Option<String>,
+    /// Inline Lua source code containing lspec tests to run.
+    /// Mutually exclusive with `pkg` and `code_file` — exactly one required.
+    pub code: Option<String>,
+    /// Subdirectory within the package root that holds spec files.
+    /// Defaults to `"spec"`. Only used when `pkg` is provided.
+    pub spec_dir: Option<String>,
+    /// Substring filter applied to spec file stems when `pkg` is provided.
+    /// For example `"shape"` matches `shape_spec.lua` but not `other_spec.lua`.
+    pub filter: Option<String>,
+    /// Additional directories prepended to `package.path` inside the Lua VM.
+    pub search_paths: Option<Vec<String>>,
+    /// Absolute path to the project root for variant-scope package resolution
+    /// (`alc.local.toml`). Falls back to ancestor walk from cwd when omitted.
+    pub project_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NoteParams {
     /// Session ID of the execution to annotate.
     pub session_id: String,
@@ -1345,6 +1370,53 @@ impl AlcService {
         self.app.pkg_doctor(params.name, params.project_root).await
     }
 
+    /// Run mlua-lspec tests for a package, a single file, or inline Lua code.
+    ///
+    /// Exactly one of `pkg`, `code_file`, or `code` must be provided:
+    ///
+    /// - `pkg` — inspects `<pkg_root>/<spec_dir>/*_spec.lua` (default
+    ///   `spec_dir = "spec"`). Requires the package to be installed.
+    /// - `code_file` — runs a single `.lua` file at the given absolute path.
+    /// - `code` — runs inline Lua source; useful for quick ad-hoc tests.
+    ///
+    /// Returns JSON `{passed, failed, pending, total, duration_ms,
+    /// spec_files: [{path, passed, failed, total, duration_ms,
+    /// tests: [{suite, name, passed, pending, error}]}]}`.
+    ///
+    /// Per-spec-file Lua crashes are absorbed (failed count incremented,
+    /// execution continues). Setup failures (VM init, package not found,
+    /// zero spec files) are returned as a typed error.
+    ///
+    /// Typed errors:
+    /// - Zero or multiple input sources → `"pkg_test: provide exactly one of
+    ///   pkg, code_file, code"`.
+    /// - `pkg` not installed → `"pkg_test: package '<name>' not found …"`.
+    /// - No spec files found → `"pkg_test: no spec files found in <path> …"`.
+    #[tool(
+        name = "alc_pkg_test",
+        annotations(
+            read_only_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn pkg_test(
+        &self,
+        Parameters(params): Parameters<PkgTestParams>,
+    ) -> Result<String, String> {
+        self.app
+            .pkg_test(
+                params.pkg,
+                params.code_file,
+                params.code,
+                params.spec_dir,
+                params.filter,
+                params.search_paths,
+                params.project_root,
+            )
+            .await
+    }
+
     /// Generate a minimal package skeleton at `<target_dir>/<name>/init.lua`.
     ///
     /// Creates `<target_dir>/<name>/` (via `fs::create_dir_all`) and writes a
@@ -2149,6 +2221,7 @@ impl ServerHandler for AlcService {
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
                  - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
                  - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/incomplete_pkg/installed_missing/symlink_dangling/path_missing buckets. incomplete_pkg fires when init.lua requires sibling submodules that are missing. Use pkg_unlink to remove dangling symlinks.\n\
+                 - alc_pkg_test: Run mlua-lspec tests against a package's spec directory (pkg), a single file (code_file), or inline code. Returns JSON {passed, failed, pending, total, duration_ms, spec_files[]}. Exactly one of pkg/code_file/code must be provided.\n\
                  - alc_pkg_repair: Heal broken packages — reinstalls entries whose installed dir is missing; surfaces dangling symlinks and missing path = ... declarations as unrepairable with suggestions.\n\
                  - alc_init: Initialize alc.toml in the project root and ensure alc.local.toml is listed in .gitignore.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\

@@ -129,7 +129,7 @@ impl AppService {
     /// Returns `Ok(Some(init_lua_path))` when found.
     /// Returns `Ok(None)` when the package is not installed.
     /// Returns `Err` only for I/O errors or malformed `alc.local.toml`.
-    fn pkg_resolve_init_path(&self, name: &str) -> Result<Option<PathBuf>, String> {
+    pub(crate) fn pkg_resolve_init_path(&self, name: &str) -> Result<Option<PathBuf>, String> {
         // ── 1. Variant scope: alc.local.toml ──────────────────────────────
         let resolved_root = self.resolve_root(None);
         if let Some(root) = resolved_root {

@@ -17,6 +17,7 @@
 //!   `alc.llm()` yields the coroutine, and the VM is cleaned up
 //!   when the session completes or is abandoned.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -270,6 +271,103 @@ impl Executor {
 
         // Handle no longer needed — all requests have been sent.
         // The driver keeps the channel alive until the session completes.
+        drop(session_isle);
+
+        Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
+    }
+
+    /// Like [`start_session`] but registers `alc.env` inside the setup closure
+    /// with a pre-built, frozen env snapshot.
+    ///
+    /// The `env_map` must be fully populated from all sources (inject / dotenv /
+    /// os.env) **before** this call — the TIME boundary freeze happens at the
+    /// call site (i.e. `alc_run` invocation in the service layer).
+    ///
+    /// Existing `start_session` call sites remain untouched (out-of-scope wave
+    /// zero design).  Service layer code that resolves env calls this wrapper
+    /// instead.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_session_with_env(
+        &self,
+        env_map: Arc<HashMap<String, String>>,
+        code: String,
+        ctx: serde_json::Value,
+        extra_lib_paths: Vec<PathBuf>,
+        variant_pkgs: Vec<VariantPkg>,
+        state_store: Arc<JsonFileStore>,
+        card_store: Arc<FileCardStore>,
+        scenarios_dir: PathBuf,
+    ) -> Result<Session, String> {
+        let spec = ExecutionSpec::new(code, ctx);
+        let metrics = ExecutionMetrics::new();
+
+        if let Some(budget) = Budget::from_ctx(&spec.ctx) {
+            metrics.set_budget(budget);
+        }
+
+        let (llm_tx, llm_rx) = tokio::sync::mpsc::channel::<LlmRequest>(16);
+
+        let mut effective = extra_lib_paths;
+        effective.extend(self.lib_paths.iter().cloned());
+
+        let log_sink = metrics.log_sink_handle();
+
+        let bridge_config = bridge::BridgeConfig {
+            llm_tx: Some(llm_tx),
+            ns: spec.namespace.clone(),
+            custom_metrics: metrics.custom_metrics_handle(),
+            stats: metrics.stats_handle(),
+            budget: metrics.budget_handle(),
+            progress: metrics.progress_handle(),
+            lib_paths: effective.clone(),
+            variant_pkgs: variant_pkgs.clone(),
+            state_store,
+            card_store,
+            scenarios_dir,
+            log_sink: Some(log_sink.clone()),
+        };
+        let lua_ctx = spec.ctx.clone();
+        let lua_code = spec.code.clone();
+
+        let (session_isle, session_driver) = AsyncIsle::spawn(move |lua| {
+            let mut reg = Registry::new();
+            register_variant_pkgs(&mut reg, &variant_pkgs);
+            for path in &effective {
+                if let Some(resolver) = make_resolver(path) {
+                    reg.add(resolver);
+                }
+            }
+            reg.install(lua)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Session VM spawn failed: {e}"))?;
+
+        session_isle
+            .exec(move |lua| {
+                let alc_table = lua.create_table()?;
+                bridge::register(lua, &alc_table, bridge_config)?;
+                // Register alc.env with the frozen snapshot (TIME boundary: fully
+                // populated before this call, never re-read from OS after this point).
+                bridge::register_env(lua, &alc_table, env_map)
+                    .map_err(|e| IsleError::Lua(e.to_string()))?;
+                lua.globals().set("alc", alc_table)?;
+
+                let ctx_value = lua.to_value(&lua_ctx)?;
+                lua.globals().set("ctx", ctx_value)?;
+
+                lua.load(PRELUDE)
+                    .exec()
+                    .map_err(|e| IsleError::Lua(format!("Prelude load failed: {e}")))?;
+
+                Ok("ok".to_string())
+            })
+            .await
+            .map_err(|e| format!("Session setup failed: {e}"))?;
+
+        let wrapped_code = format!("return alc.json_encode((function()\n{lua_code}\nend)())");
+        let exec_task = session_isle.spawn_coroutine_eval(&wrapped_code);
+
         drop(session_isle);
 
         Ok(Session::new(llm_rx, exec_task, metrics, session_driver))

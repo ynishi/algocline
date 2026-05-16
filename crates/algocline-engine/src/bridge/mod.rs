@@ -66,6 +66,8 @@ pub struct BridgeConfig {
     pub log_sink: Option<LogSink>,
 }
 
+pub use data::register_env;
+
 /// Register all Layer 0 runtime primitives onto the given table.
 pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaResult<()> {
     data::register_json(lua, alc_table)?;

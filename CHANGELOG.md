@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `alc_pkg_test`: Run mlua-lspec tests against a package's spec directory (`<pkg>/spec/*_spec.lua`), a single `code_file`, or inline `code`. Returns JSON `{passed, failed, pending, total, duration_ms, spec_files[]}` with per-file and per-test breakdown. `pkg` / `code_file` / `code` are mutually exclusive — exactly one must be provided. (breaking for trait implementors only; `EngineApi::pkg_test` has no default impl)
 - **swarm-frame v0.2.0 as bundled Hub Collection**: Added `https://github.com/ynishi/algocline-swarm-frame` at tag `v0.2.0` as a third bundled source, auto-installed via `alc init` / `alc update`. Contributes 3 swarm orchestration packages (`swarm_frame`, `swarm_frame_algocline`, `swarm_aggregate_plugin`) to the algocline Hub. The BUNDLED_SOURCES entry carries `tag = "v0.2.0"` (pinned release); the AUTO_INSTALL_SOURCES entry tracks the URL without a tag (main-branch resolution). See `docs/pkg-author-conventions.md` for the collection-only install convention.
+- `alc.env` stdlib (Phase 1) — host-owned readonly env snapshot exposed to the Lua VM.
+  - `alc.env.KEY` returns the env value as a string, or nil if absent.
+  - `alc.env:get(key, default)` returns the value or a fallback default.
+  - `alc.env:use{"FOO", "BAR"}` declare-at-use proxy: undeclared keys return nil regardless of env contents.
+  - Source priority (strict three-layer merge): `inject > dotenv > os.env`. OS env access is opt-in via `ctx.env.allow_os = true`.
+  - dotenv file parsing via the `dotenvy` crate (new dependency); path supplied as absolute path in `ctx.env.dotenv`.
+  - Optional allowlist filter via `alc.toml [env.allow]`; omitting the section allows all resolved keys.
+  - Writes always error: `alc.env.X = 1` raises `"alc.env is readonly"` at the Lua runtime level.
+  - Additive: existing `ctx` fields (e.g. `qwen_env`) are unchanged.
 
 ## [0.36.0] - 2026-05-15
 

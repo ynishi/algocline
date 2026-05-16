@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use super::eval_store::{
     escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, save_compare_result,
     save_eval_result, splice_response_string,
@@ -102,8 +105,11 @@ return alc.eval(scenario, "{strategy}", {{
         );
 
         let ctx = serde_json::Value::Null;
+        // eval path does not accept ctx.env; pass an empty map so alc.env is
+        // present but empty (no env vars visible to eval strategies).
+        let env_map = Arc::new(HashMap::new());
         let result = self
-            .start_and_tick(wrapped, ctx, Some(strategy), vec![], vec![])
+            .start_and_tick(env_map, wrapped, ctx, Some(strategy), vec![], vec![])
             .await?;
 
         // Persist eval result for history/comparison.
@@ -283,8 +289,11 @@ return {{
         );
 
         let ctx = serde_json::Value::Null;
+        // compare path does not accept ctx.env; pass an empty map so alc.env is
+        // present but empty (no env vars visible to compare strategies).
+        let env_map = Arc::new(HashMap::new());
         let raw_result = self
-            .start_and_tick(lua_code, ctx, None, vec![], vec![])
+            .start_and_tick(env_map, lua_code, ctx, None, vec![], vec![])
             .await?;
 
         // Persist comparison result. Storage failure surfaces as an

@@ -262,6 +262,49 @@ alc.state.incr("counter", -2)       -- 4   (6 - 2)
 alc.state.incr("score", 10, 100)    -- 110 (init 100, + 10)
 ```
 
+#### `alc.state.list(namespace) -> string[]`
+
+List keys (file basenames without `.json`) under the dispatched layout `{state_root}/{namespace}/*.json`. Namespace must be a safe segment. Keys are returned sorted lexicographically. `.bak` / `.tmp` files are excluded.
+
+```lua
+local keys = alc.state.list("my_app")  -- {"alpha", "beta"}
+```
+
+> Note: `alc.state.list(ns)` reads the dispatched layout (`{state_root}/{ns}/*.json`). This is distinct from `alc.state.keys()` which reads the legacy single-file layout (`{state_root}/{ns}.json`). They are separate data and not migrated automatically.
+
+#### `alc.state.show(namespace, key) -> table`
+
+Read the full JSON content of `{state_root}/{namespace}/{key}.json`. Both arguments must be safe segments. Raises a typed error if the key does not exist (error message contains `not found`).
+
+```lua
+local state = alc.state.show("my_app", "task_42")
+print(state.data.completed_steps[1])
+```
+
+#### `alc.state.reset(namespace, key, opts?) -> table`
+
+Atomically mutate the JSON file at `{state_root}/{namespace}/{key}.json`:
+
+1. Copy current file to `{key}.json.bak`
+2. Remove items listed in `opts.steps` from the `data.completed_steps` array
+3. Delete keys listed in `opts.fields` from the `data` table
+4. Write the result via tempfile + rename
+
+The file shape is expected to be `{ "data": { "completed_steps": [...], ... } }`. Other shapes raise `state: shape invalid`. The `.bak` snapshot lets callers recover the prior state.
+
+```lua
+local r = alc.state.reset("my_app", "task_42", {
+    steps  = { "1b_REPO_READINESS" },
+    fields = { "repo_readiness", "repo_readiness_report" },
+})
+-- r.ok = true
+-- r.backup_path = "/Users/.../my_app/task_42.json.bak"
+-- r.steps_removed = 1
+-- r.fields_removed = 2
+```
+
+> Note: `namespace` is caller-specified. The engine itself does not know about specific application namespaces like `orch` / `incubator` — the examples here are illustrative only.
+
 ### Text
 
 #### `alc.chunk(text, opts?) -> string[]`

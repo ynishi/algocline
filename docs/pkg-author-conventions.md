@@ -727,6 +727,176 @@ Lua VM test-runtime constraint, not an application-level env access.
 
 ---
 
+## 10. Cards quick reference (`alc_card_find` DSL)
+
+`alc_card_find` filters Cards using a Prisma-style `where` predicate plus
+`order_by`/`limit`/`offset`/`pkg`. Use it to surface eval results, lineage
+records, or any other Card type produced by strategies.
+
+### Common patterns
+
+```jsonc
+// Top 10 cards by pass_rate for a single pkg
+{
+  "pkg": "cot",
+  "where": { "stats": { "pass_rate": { "gte": 0.8 } } },
+  "order_by": "-stats.pass_rate",
+  "limit": 10
+}
+
+// AND / OR / NOT
+{
+  "where": {
+    "_and": [
+      { "model": { "id": "claude-sonnet-4-6" } },
+      { "_or": [
+          { "tags": { "contains": "bench" } },
+          { "category": { "in": ["reasoning", "synthesis"] } }
+      ] }
+    ]
+  }
+}
+
+// Existence + dotted path sort
+{
+  "where": { "stats": { "pass_count": { "exists": true } } },
+  "order_by": ["-created_at"]
+}
+```
+
+### Predicate cheatsheet
+
+| Form | Meaning |
+|---|---|
+| `{ "field": "value" }` | shorthand for `eq` |
+| `{ "field": { "eq": x } }` | equality |
+| `{ "field": { "ne": x } }` | inequality |
+| `{ "field": { "lt": x } / "lte" / "gt" / "gte" }` | numeric / lexical compare |
+| `{ "field": { "in": [a,b] } / "nin": [...] }` | membership |
+| `{ "field": { "exists": true } }` | field present (any value) |
+| `{ "field": { "contains": "sub" } }` | substring match (strings) |
+| `{ "field": { "starts_with": "pre" } }` | prefix match |
+| Nested object | section path (e.g. `stats.pass_rate`) |
+| `_and` / `_or` / `_not` | logical combinators |
+
+`order_by` accepts a single dotted-path string or an array; `-` prefix is
+descending. `pkg` narrows the filesystem scan to one package — pass it
+when you know the target. Default sort: `created_at` descending.
+
+### Wiring tips
+
+- Card schemas are pkg-defined. Inspect `mcp__algocline__alc_card_list`
+  / `alc_card_samples` first to discover available fields per pkg.
+- `where` paths follow Card JSON exactly: nested sections are nested
+  objects, not flattened dotted strings.
+- `limit` defaults are server-side; pass it explicitly for stable paging
+  with `offset`.
+
+## 11. Pre-publish verification workflow
+
+Before pushing a package to Hub, run the local verification chain so
+remote consumers receive a known-good artifact. The chain is built from
+existing read-only MCP tools — no new tooling is required.
+
+### Pre-push checklist
+
+Run these MCP calls in order against the package source directory.
+Each step is read-only except `alc_hub_dist` (writes `hub_index.json`).
+
+1. **`alc_pkg_test`** — run the package's `spec/*_spec.lua` suite.
+   ```jsonc
+   { "pkg": "<pkg_name>" }
+   ```
+   Verify `failed == 0` in the returned JSON. See §8 Testing for spec
+   layout.
+
+2. **`alc_hub_dist`** — regenerate the local `hub_index.json` and Hub
+   docs from the current source tree.
+   ```jsonc
+   {
+     "source_dir": "/abs/path/to/source",
+     "output_path": "/abs/path/to/source/hub_index.json"
+   }
+   ```
+   Confirm `reindex.package_count` matches the number of packages you
+   expect under `source_dir`. A drop to `0` typically means `M.meta.name`
+   is missing in `init.lua` — see `alc_pkg_doctor`'s `missing_meta`
+   verdict.
+
+3. **`alc_pkg_doctor`** — inspect every installed package for known
+   defect patterns.
+   ```jsonc
+   {}   // omit `name` to scan all packages
+   ```
+   For a release-grade run, **all of these arrays must be empty**:
+   - `incomplete_pkg` (missing `require()`-ed submodule files)
+   - `installed_missing` (registered pkg but install dir gone)
+   - `symlink_dangling` (dead `alc_pkg_link` target)
+   - `path_missing` (`alc.toml` `path = ...` resolves nowhere)
+   - `missing_meta` (`init.lua` without `M.meta.name`)
+   - `missing_hub_index` (collection root with 2+ pkgs but no index)
+   - `spec_missing` (declared `spec/` but zero `*_spec.lua` files)
+
+   The `stale_cache` array is informational — re-run `alc_hub_search`
+   to refresh. `healthy` always contains the rest.
+
+4. **`alc_hub_search` with `local_indices`** — verify the freshly
+   regenerated `hub_index.json` is parseable and lists every expected
+   package, before any remote push.
+   ```jsonc
+   {
+     "local_indices": ["/abs/path/to/source/hub_index.json"],
+     "verbose": "full"
+   }
+   ```
+   The returned `results` array includes both remote-fetched packages
+   and the local-only entries. Inspect `name` to confirm every package
+   authored in this push is present. Combined with `installed_only:
+   false` (default), this surfaces the exact set that remote consumers
+   will see after the push lands.
+
+### Local-only verification
+
+For air-gapped or pre-release inspection, drop step 4's remote fetch
+entirely by also passing an offline `filter`:
+
+```jsonc
+{
+  "local_indices": ["/abs/path/to/source/hub_index.json"],
+  "filter": { "installed": false },
+  "limit": 0
+}
+```
+
+`limit: 0` means "no limit" (return all entries — empty-means-all
+idiom). Useful when CI does not have network access.
+
+### When the chain passes
+
+If steps 1–4 all return clean results, the source tree is consistent
+with what remote consumers will fetch after push. Typical push action
+is project-defined (release tag, `git push`, registry publish) and is
+outside the MCP tool surface.
+
+### When a step fails
+
+| Failure | Most likely cause | Fix |
+|---|---|---|
+| `alc_pkg_test` `failed > 0` | spec assertion or runtime error | inspect `spec_files[].tests[].error` |
+| `alc_hub_dist` `reindex.package_count == 0` | every `init.lua` lacks `M.meta.name` | add `M.meta = { name = "...", version = "..." }` |
+| `alc_pkg_doctor` `incomplete_pkg` non-empty | `require("pkg.sub")` references a missing file | add the sub file or remove the `require` |
+| `alc_pkg_doctor` `missing_meta` non-empty | `init.lua` parsed but no `M.meta.name` | declare `M.meta` block; see §2.1 |
+| `alc_pkg_doctor` `missing_hub_index` non-empty | collection root has 2+ pkg dirs but no index | run step 2 (`alc_hub_dist`) to generate it |
+| `alc_pkg_doctor` `spec_missing` non-empty | `spec/` exists but no `*_spec.lua` files | add a `*_spec.lua` file or delete the `spec/` dir |
+| `alc_hub_search` does not list a package | the package's `init.lua` was skipped during reindex (no `M.meta.name`) | re-run step 2 after fixing `M.meta` |
+
+The checklist is intentionally tool-only (no shell wrapper). If you need
+a single one-shot call site, an `alc_pkg_prepublish_check` combo tool is
+tracked as a future convenience; the four-step manual chain remains the
+canonical path.
+
+---
+
 ## Bundled Hub Sources (Collection-Only Install)
 
 algocline ships with multiple bundled Hub Collection sources, listed in

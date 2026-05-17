@@ -680,6 +680,53 @@ Existing bundled-packages tests use a flat `tests/test_<pkg>.lua` layout and
 continue to work via `mcp__lua-debugger__test_launch`. New packages should
 adopt the `<pkg>/spec/<file>_spec.lua` layout and use `alc_pkg_test`.
 
+## 9. Env
+
+Bundled / third-party pkgs MUST NOT read OS env / API keys / dotenv files
+directly inside `init.lua`. Host-platform integration (the caller orch
+entry / Main AI) pre-resolves env into `ctx.env`, and pkg code declares
+the variables it actually consumes via `alc.env:use{...}` at the point of
+use.
+
+| Rule                       | What                                                                                                                |
+|----------------------------|---------------------------------------------------------------------------------------------------------------------|
+| Forbidden inside a pkg     | `os.getenv`, `std.env.get`, hand-rolled dotenv parsing, ad-hoc `API_KEY` / `BASE_URL` lookups                        |
+| Recommended inside a pkg   | `local env = alc.env:use{ "KEY1", "KEY2" }` then `env.KEY1` to read                                                 |
+| Caller-side responsibility | Pass sources at run time: `alc_run(code, ctx = { env = { dotenv = ".env", allow_os = true } })`                     |
+| Reference integration      | `coding_orch` Phase 2 migration (agent-profiles issue `1778976345-92995`) replaces `resolve_*_env` helpers with `alc.env:use` |
+
+### Example (Phase 2 reference)
+
+```lua
+-- inside the pkg (post-Phase 2)
+local env = alc.env:use{ "QWEN_BASE_URL", "QWEN_API_KEY", "QWEN_MODEL" }
+local base_url = env.QWEN_BASE_URL  -- nil if absent
+if base_url == nil then
+    return error("NEEDS_CONTEXT: QWEN_BASE_URL")
+end
+```
+
+### Exception: test path resolution
+
+mlua-probe sandbox test path resolution such as `os.getenv("PWD") or "."`
+is out of scope for `alc.env` and not subject to this rule — it is a
+Lua VM test-runtime constraint, not an application-level env access.
+
+### Why pkg-internal env access is rejected
+
+- Pkgs are portable units; reading env inside an `init.lua` couples the
+  pkg to a specific host's secret-loading convention.
+- `alc.env:use` makes the required vars **declarative** at the point of
+  use, which lets `coding_orch` / future hosts pre-validate and surface
+  a single `NEEDS_CONTEXT: <KEY>` error to the caller instead of failing
+  deep inside pkg code.
+- Audit and caching live in the host (`ctx.env`), not scattered across
+  pkgs. A sweep of `algocline-bundled-packages` v0.24.0 (120 pkgs)
+  confirms zero pkg-internal env access today; this section codifies the
+  existing discipline so future pkgs do not regress.
+
+---
+
 ## Bundled Hub Sources (Collection-Only Install)
 
 algocline ships with multiple bundled Hub Collection sources, listed in

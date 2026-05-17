@@ -159,7 +159,10 @@ Layer 0: Runtime Primitives (Rust → alc.*)
 │  alc.fork(strategies, ctx, o?) — parallel multi-VM strategy execution
 │  alc.json_encode/json_decode   — serde_json bridge
 │  alc.log(level, msg)           — tracing bridge
-│  alc.state.get/set/keys/delete — persistent key-value store
+│  alc.state.get/set/keys/delete — persistent key-value store (legacy single-namespace API)
+│  alc.state.list(ns)           — list keys under dispatched layout {state_root}/{ns}/*.json
+│  alc.state.show(ns, key)      — read full JSON content; typed error when key is absent
+│  alc.state.reset(ns, key, o?) — atomically mutate state file (.bak + tempfile + rename)
 │  alc.match_enum(text, cs, o?)  — fuzzy enum match from LLM output
 │  alc.match_bool(text)          — yes/no normalizer for LLM output
 │  alc.budget_remaining()        — remaining budget (calls/time)

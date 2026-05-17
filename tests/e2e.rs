@@ -6179,3 +6179,124 @@ async fn test_alc_env_dotenv_file_parse() {
     );
     client.cancel().await.expect("cancel failed");
 }
+
+/// Defect path: installed pkg dir has init.lua but M.meta.name is absent →
+/// `missing_meta` bucket with the pkg name and a suggestion.
+///
+/// Fixture layout:
+///   1. Install a package with a valid init.lua (M.meta.name present).
+///   2. Overwrite the installed init.lua to remove M.meta.name.
+///   3. Doctor should classify the package as `missing_meta`.
+#[tokio::test]
+async fn test_pkg_doctor_missing_meta_detected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let source_root = tempfile::tempdir().expect("source tempdir");
+    let coll_root = source_root.path();
+    let pkg_src = coll_root.join("e2e_doctor_missing_meta");
+    std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
+    // First write a valid init.lua so install succeeds.
+    std::fs::write(
+        pkg_src.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_doctor_missing_meta", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": coll_root.to_string_lossy() }),
+    )
+    .await;
+
+    // Overwrite installed init.lua to remove M.meta.name.
+    let installed = tmp.path().join("packages").join("e2e_doctor_missing_meta");
+    std::fs::write(
+        installed.join("init.lua"),
+        r#"local M = {}
+M.meta = { version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("rewrite init.lua without name");
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_doctor_missing_meta" }),
+    )
+    .await;
+
+    let missing_meta = resp["missing_meta"]
+        .as_array()
+        .expect("missing_meta array missing");
+    let entry = missing_meta
+        .iter()
+        .find(|e| e["name"] == "e2e_doctor_missing_meta")
+        .unwrap_or_else(|| {
+            panic!("e2e_doctor_missing_meta not found in missing_meta, got: {resp}")
+        });
+    assert_eq!(entry["kind"], "missing_meta");
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Defect path: project_root has 2+ pkg dirs each with init.lua but
+/// hub_index.json is missing → `missing_hub_index` bucket with pkg_count >= 2.
+///
+/// Fixture layout (synthetic project_root, no packages installed):
+///   project_root/
+///     pkg_alpha/init.lua
+///     pkg_beta/init.lua
+///     (no hub_index.json)
+#[tokio::test]
+async fn test_pkg_doctor_missing_hub_index_detected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Build a synthetic project_root with 2 pkg dirs, no hub_index.json.
+    let project_tmp = tempfile::tempdir().expect("project tempdir");
+    let project_root = project_tmp.path();
+    for pkg_name in ["pkg_alpha", "pkg_beta"] {
+        let pkg_dir = project_root.join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_dir");
+        std::fs::write(
+            pkg_dir.join("init.lua"),
+            format!(
+                r#"local M = {{}}
+M.meta = {{ name = {pkg_name:?}, version = "0.1.0" }}
+return M"#
+            ),
+        )
+        .expect("write init.lua");
+    }
+    // Intentionally no hub_index.json.
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "project_root": project_root.to_string_lossy() }),
+    )
+    .await;
+
+    let missing_hub_index = resp["missing_hub_index"]
+        .as_array()
+        .expect("missing_hub_index array missing");
+    assert_eq!(
+        missing_hub_index.len(),
+        1,
+        "expected 1 missing_hub_index entry, got: {resp}"
+    );
+    let entry = &missing_hub_index[0];
+    assert_eq!(entry["kind"], "missing_hub_index");
+    assert!(
+        entry["pkg_count"].as_u64().unwrap_or(0) >= 2,
+        "pkg_count should be >= 2, got: {entry}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

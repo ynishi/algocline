@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Optional allowlist filter via `alc.toml [env.allow]`; omitting the section allows all resolved keys.
   - Writes always error: `alc.env.X = 1` raises `"alc.env is readonly"` at the Lua runtime level.
   - Additive: existing `ctx` fields (e.g. `qwen_env`) are unchanged.
+- `alc_pkg_doctor`: added two new diagnostic buckets — `missing_meta` (installed pkg with init.lua but no `M.meta.name`) and `missing_hub_index` (Collection-mode project_root with 2+ pkg dirs but missing hub_index.json). JSON output now contains seven top-level arrays (additive; existing five buckets unchanged).
 
 ## [0.36.0] - 2026-05-15
 

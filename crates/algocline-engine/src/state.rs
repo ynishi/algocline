@@ -52,6 +52,90 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+// ═══════════════════════════════════════════════════════════════
+// Typed error for dispatched-layout operations
+// ═══════════════════════════════════════════════════════════════
+
+/// Errors returned by the dispatched-layout helpers
+/// (`list_dispatched`, `show_dispatched`, `reset_dispatched_with_backup`).
+///
+/// Unlike the legacy [`StateStore`] trait methods (which return `String`
+/// errors), these helpers use a typed enum so callers can distinguish
+/// missing-key from I/O failure at the type level without pattern-matching
+/// on OS error codes.
+#[derive(thiserror::Error, Debug)]
+pub enum StateError {
+    /// The requested key does not exist in the given namespace.
+    ///
+    /// # Arguments
+    /// * `namespace` — the namespace that was searched
+    /// * `key` — the key that was not found
+    #[error("state: key '{key}' not found in namespace '{namespace}'")]
+    KeyNotFound { namespace: String, key: String },
+
+    /// A namespace or key segment failed the path-safety check.
+    ///
+    /// # Arguments
+    /// * `which` — either `"namespace"` or `"key"`
+    /// * `value` — the offending segment value
+    #[error("state: unsafe {which} segment '{value}'")]
+    UnsafeSegment { which: &'static str, value: String },
+
+    /// A backup I/O operation (`fs::copy` to `.bak`) failed.
+    ///
+    /// Wraps the underlying [`std::io::Error`].  Kept separate from
+    /// [`StateError::IoWrite`] so callers know that the live file was
+    /// not yet touched when this error occurs.
+    #[error("state: backup I/O failed: {0}")]
+    IoBackup(#[source] std::io::Error),
+
+    /// A read or directory-scan operation failed.
+    ///
+    /// Wraps the underlying [`std::io::Error`].  Covers `fs::read_to_string`,
+    /// `fs::read_dir`, and `DirEntry` iteration.
+    #[error("state: read failed: {0}")]
+    IoRead(#[source] std::io::Error),
+
+    /// A write or rename operation on the live file or its `.tmp`
+    /// staging copy failed.
+    ///
+    /// Wraps the underlying [`std::io::Error`].  Covers `fs::write` and
+    /// `fs::rename`.
+    #[error("state: write failed: {0}")]
+    IoWrite(#[source] std::io::Error),
+
+    /// JSON serialization or deserialization failed.
+    ///
+    /// Uses `#[from]` so `?` auto-converts `serde_json::Error`.
+    #[error("state: serialize/parse failed: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    /// The stored JSON does not have the expected shape.
+    ///
+    /// # Arguments
+    /// * `reason` — human-readable description of the shape violation
+    ///   (e.g. `"missing 'data' top-level field"` or
+    ///   `"data.completed_steps must be an array"`)
+    #[error("state: shape invalid: {reason}")]
+    ShapeInvalid { reason: String },
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ResetReport — return value of reset_dispatched_with_backup
+// ═══════════════════════════════════════════════════════════════
+
+/// Report returned by [`JsonFileStore::reset_dispatched_with_backup`]
+/// describing what was modified.
+#[derive(Debug, Clone)]
+pub struct ResetReport {
+    /// Path to the `.bak` snapshot created before the mutation.
+    pub backup_path: PathBuf,
+    /// Number of entries removed from `data.completed_steps`.
+    pub steps_removed: usize,
+    /// Number of keys deleted from the `data` top-level object.
+    pub fields_removed: usize,
+}
+
 /// Whether a string is a safe path segment for `dispatch_path`.
 ///
 /// Accepts ASCII alphanumerics, `_`, `-`, and `.` (single dots only —
@@ -281,6 +365,255 @@ impl JsonFileStore {
         fs::rename(&tmp, path)
             .map_err(|e| format!("Failed to rename dispatched state file: {e}"))?;
         Ok(())
+    }
+
+    // ─── Dispatched-layout helpers ─────────────────────────────────────────
+
+    /// List all keys in the dispatched layout for a namespace.
+    ///
+    /// Enumerates `{root}/{namespace}/*.json` and returns the file names
+    /// stripped of the `.json` extension, sorted lexicographically.
+    /// Files with extensions other than `.json`, and `.bak` / `.tmp`
+    /// siblings, are excluded.  If the namespace directory does not exist
+    /// the result is an empty `Vec` (namespace-absent ≡ zero keys).
+    ///
+    /// # Arguments
+    /// * `namespace` — the directory name under `root`; must pass
+    ///   [`is_safe_segment`] validation
+    ///
+    /// # Returns
+    /// A sorted list of key strings, or a [`StateError`] on I/O / validation
+    /// failure.
+    ///
+    /// # Errors
+    /// * [`StateError::UnsafeSegment`] if `namespace` fails path-safety check
+    /// * [`StateError::IoRead`] if reading the directory fails
+    pub fn list_dispatched(&self, namespace: &str) -> Result<Vec<String>, StateError> {
+        if !is_safe_segment(namespace) {
+            return Err(StateError::UnsafeSegment {
+                which: "namespace",
+                value: namespace.to_string(),
+            });
+        }
+        let ns_dir = self.root.join(namespace);
+        if !ns_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut keys = Vec::new();
+        let entries = fs::read_dir(&ns_dir).map_err(StateError::IoRead)?;
+        for entry in entries {
+            let entry = entry.map_err(StateError::IoRead)?;
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            // Only include plain `.json` files; skip `.bak`, `.tmp`, and others.
+            if !fname_str.ends_with(".json")
+                || fname_str.ends_with(".json.bak")
+                || fname_str.ends_with(".json.tmp")
+            {
+                continue;
+            }
+            // Strip the `.json` suffix to recover the key name.
+            let key = fname_str
+                .strip_suffix(".json")
+                .unwrap_or(&fname_str)
+                .to_string();
+            keys.push(key);
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Read the full JSON value for a dispatched-layout key.
+    ///
+    /// Reads `{root}/{namespace}/{key}.json` and deserializes it.
+    ///
+    /// # Arguments
+    /// * `namespace` — the subdirectory name; must pass [`is_safe_segment`]
+    /// * `key` — the file stem; must pass [`is_safe_segment`]
+    ///
+    /// # Returns
+    /// The deserialized [`serde_json::Value`] on success.
+    ///
+    /// # Errors
+    /// * [`StateError::UnsafeSegment`] if either segment fails path-safety check
+    /// * [`StateError::KeyNotFound`] if the file does not exist
+    /// * [`StateError::IoRead`] if the file cannot be read
+    /// * [`StateError::Serde`] if the content is not valid JSON
+    pub fn show_dispatched(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, StateError> {
+        if !is_safe_segment(namespace) {
+            return Err(StateError::UnsafeSegment {
+                which: "namespace",
+                value: namespace.to_string(),
+            });
+        }
+        if !is_safe_segment(key) {
+            return Err(StateError::UnsafeSegment {
+                which: "key",
+                value: key.to_string(),
+            });
+        }
+        let target = self.root.join(namespace).join(format!("{key}.json"));
+        if !target.exists() {
+            return Err(StateError::KeyNotFound {
+                namespace: namespace.to_string(),
+                key: key.to_string(),
+            });
+        }
+        let content = fs::read_to_string(&target).map_err(StateError::IoRead)?;
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        Ok(value)
+    }
+
+    /// Atomically reset a dispatched-layout state file with a backup.
+    ///
+    /// Performs the following sequence in order (Crux atomicity contract):
+    ///
+    /// 1. Validate `namespace` and `key` with [`is_safe_segment`].
+    /// 2. Compute target path: `{root}/{namespace}/{key}.json`.
+    /// 3. Return [`StateError::KeyNotFound`] if the file does not exist.
+    /// 4. Acquire the per-path mutex via [`Self::ns_lock`]; hold until rename.
+    /// 5. Copy the live file to `{root}/{namespace}/{key}.json.bak` — the
+    ///    live file is **not** touched before this point.
+    /// 6. Load and parse the live file.
+    /// 7. Apply in-memory mutations:
+    ///    - Remove each element of `steps` from `data.completed_steps` (if
+    ///      the array exists).
+    ///    - Delete each element of `fields` from the `data` top-level object.
+    ///    - If the top-level `data` field is absent or not an object, return
+    ///      [`StateError::ShapeInvalid`].
+    /// 8. Write the mutated value to `{target}.tmp`.
+    /// 9. Rename `.tmp` → target (POSIX atomic on same filesystem).
+    ///
+    /// A crash between steps 5 and 9 leaves the `.bak` intact and the live
+    /// file unmodified (or only partially written to `.tmp`), so the original
+    /// state is always recoverable.
+    ///
+    /// # Arguments
+    /// * `namespace` — subdirectory name; must pass [`is_safe_segment`]
+    /// * `key` — file stem; must pass [`is_safe_segment`]
+    /// * `steps` — step names to remove from `data.completed_steps`
+    /// * `fields` — field names to delete from the `data` top-level object
+    ///
+    /// # Returns
+    /// A [`ResetReport`] with the backup path and counts of removed items.
+    ///
+    /// # Errors
+    /// * [`StateError::UnsafeSegment`] if either segment fails path-safety check
+    /// * [`StateError::KeyNotFound`] if the file does not exist
+    /// * [`StateError::ShapeInvalid`] if the lock is poisoned or the JSON
+    ///   structure is not a `{data: {...}}` object
+    /// * [`StateError::IoBackup`] if the `.bak` copy fails
+    /// * [`StateError::IoRead`] if loading the live file fails
+    /// * [`StateError::IoWrite`] if the `.tmp` write or rename fails
+    /// * [`StateError::Serde`] if the file content is not valid JSON
+    pub fn reset_dispatched_with_backup(
+        &self,
+        namespace: &str,
+        key: &str,
+        steps: &[String],
+        fields: &[String],
+    ) -> Result<ResetReport, StateError> {
+        // (a) Validate path segments.
+        if !is_safe_segment(namespace) {
+            return Err(StateError::UnsafeSegment {
+                which: "namespace",
+                value: namespace.to_string(),
+            });
+        }
+        if !is_safe_segment(key) {
+            return Err(StateError::UnsafeSegment {
+                which: "key",
+                value: key.to_string(),
+            });
+        }
+
+        // (b) Compute target path.
+        let target = self.root.join(namespace).join(format!("{key}.json"));
+
+        // (c) Return KeyNotFound if the file does not exist.
+        if !target.exists() {
+            return Err(StateError::KeyNotFound {
+                namespace: namespace.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        // (c.5) Acquire the per-path mutex and hold it until after rename.
+        let lock = self
+            .ns_lock(&target)
+            .map_err(|s| StateError::ShapeInvalid { reason: s })?;
+        let _guard = lock.lock().map_err(|_| StateError::ShapeInvalid {
+            reason: "lock poisoned".to_string(),
+        })?;
+
+        // (d) Create .bak backup — live file is not touched before this.
+        let bak_path = target.with_extension("json.bak");
+        fs::copy(&target, &bak_path).map_err(StateError::IoBackup)?;
+
+        // (e) Load and parse the live file.
+        let content = fs::read_to_string(&target).map_err(StateError::IoRead)?;
+        let mut value: serde_json::Value = serde_json::from_str(&content)?;
+
+        // (f) Apply in-memory mutations.
+        let data = value
+            .get_mut("data")
+            .ok_or_else(|| StateError::ShapeInvalid {
+                reason: "missing 'data' top-level field".to_string(),
+            })?;
+        let data_obj = data
+            .as_object_mut()
+            .ok_or_else(|| StateError::ShapeInvalid {
+                reason: "'data' top-level field must be an object".to_string(),
+            })?;
+
+        // Remove matching entries from data.completed_steps.
+        let mut steps_removed = 0usize;
+        if !steps.is_empty() {
+            if let Some(cs) = data_obj.get_mut("completed_steps") {
+                if let Some(arr) = cs.as_array_mut() {
+                    let before = arr.len();
+                    arr.retain(|v| {
+                        if let Some(s) = v.as_str() {
+                            !steps.iter().any(|step| step == s)
+                        } else {
+                            true
+                        }
+                    });
+                    steps_removed = before - arr.len();
+                } else {
+                    return Err(StateError::ShapeInvalid {
+                        reason: "data.completed_steps must be an array".to_string(),
+                    });
+                }
+            }
+            // If completed_steps key is absent, nothing to remove — not an error.
+        }
+
+        // Delete requested fields from the data object.
+        let mut fields_removed = 0usize;
+        for field in fields {
+            if data_obj.remove(field.as_str()).is_some() {
+                fields_removed += 1;
+            }
+        }
+
+        // (g) Write mutated value to .tmp staging file.
+        let tmp = target.with_extension("json.tmp");
+        let serialized = serde_json::to_string_pretty(&value)?;
+        fs::write(&tmp, &serialized).map_err(StateError::IoWrite)?;
+
+        // (h) Atomic rename: .tmp → live file.
+        fs::rename(&tmp, &target).map_err(StateError::IoWrite)?;
+
+        Ok(ResetReport {
+            backup_path: bak_path,
+            steps_removed,
+            fields_removed,
+        })
     }
 
     fn load(&self, ns: &str) -> Result<HashMap<String, Value>, String> {
@@ -862,6 +1195,354 @@ mod tests {
         assert!(!is_safe_segment("a\\b"));
         assert!(!is_safe_segment("a b"));
         assert!(!is_safe_segment("a\0b"));
+    }
+
+    // ─── Dispatched-layout helpers ─────────────────────────────────────────
+
+    mod dispatched_layout {
+        use super::*;
+
+        /// Helper: write a JSON file directly into `{tmp}/{ns}/{key}.json`,
+        /// creating the parent directory if needed.
+        fn seed(tmp: &TempDir, ns: &str, key: &str, value: serde_json::Value) {
+            let dir = tmp.path().join(ns);
+            // Safe: test-only helper, directory creation cannot fail in practice
+            fs::create_dir_all(&dir).expect("create ns dir");
+            let path = dir.join(format!("{key}.json"));
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&value).expect("serialize"),
+            )
+            .expect("write seed file");
+        }
+
+        /// `list_dispatched` returns only `.json` files and strips the suffix.
+        #[test]
+        fn list_returns_json_keys_only() {
+            let (store, tmp) = new_store();
+            seed(&tmp, "myns", "alpha", serde_json::json!(1));
+            seed(&tmp, "myns", "beta", serde_json::json!(2));
+            // Place non-.json and sibling files that must be excluded.
+            let ns_dir = tmp.path().join("myns");
+            fs::write(ns_dir.join("alpha.json.bak"), b"backup").expect("write bak");
+            fs::write(ns_dir.join("alpha.json.tmp"), b"tmp").expect("write tmp");
+            fs::write(ns_dir.join("notes.txt"), b"text").expect("write txt");
+
+            let keys = store.list_dispatched("myns").unwrap();
+            assert_eq!(
+                keys,
+                vec!["alpha", "beta"],
+                "must be sorted, .bak/.tmp/.txt excluded"
+            );
+        }
+
+        /// `list_dispatched` returns an empty Vec when the namespace directory
+        /// does not exist (no error).
+        #[test]
+        fn list_returns_empty_for_absent_namespace() {
+            let (store, _tmp) = new_store();
+            let keys = store.list_dispatched("ghost").unwrap();
+            assert!(keys.is_empty(), "absent namespace should return empty Vec");
+        }
+
+        /// `list_dispatched` handles a namespace directory that exists but
+        /// contains only non-`.json` files.
+        #[test]
+        fn list_returns_empty_when_only_non_json_files_present() {
+            let (store, tmp) = new_store();
+            let ns_dir = tmp.path().join("empty_ns");
+            // Safe: test setup
+            fs::create_dir_all(&ns_dir).expect("create dir");
+            fs::write(ns_dir.join("readme.txt"), b"hi").expect("write");
+            let keys = store.list_dispatched("empty_ns").unwrap();
+            assert!(keys.is_empty());
+        }
+
+        /// `show_dispatched` returns `KeyNotFound` when the namespace
+        /// directory itself does not exist.
+        #[test]
+        fn show_returns_key_not_found_for_absent_namespace() {
+            let (store, _tmp) = new_store();
+            let err = store.show_dispatched("nodir", "anykey").unwrap_err();
+            assert!(
+                matches!(err, StateError::KeyNotFound { .. }),
+                "expected KeyNotFound, got: {err}"
+            );
+            // Confirm the message contains "not found" as specified by the error format.
+            assert!(err.to_string().contains("not found"), "{err}");
+        }
+
+        /// `show_dispatched` returns `KeyNotFound` when the namespace
+        /// directory exists but the key file is absent.
+        #[test]
+        fn show_returns_key_not_found_for_absent_key() {
+            let (store, tmp) = new_store();
+            // Create the namespace directory but not the key file.
+            let ns_dir = tmp.path().join("myns2");
+            // Safe: test setup
+            fs::create_dir_all(&ns_dir).expect("create dir");
+
+            let err = store.show_dispatched("myns2", "missing").unwrap_err();
+            assert!(
+                matches!(err, StateError::KeyNotFound { .. }),
+                "expected KeyNotFound, got: {err}"
+            );
+        }
+
+        /// `show_dispatched` returns the full JSON value when the key exists.
+        #[test]
+        fn show_returns_full_value_for_existing_key() {
+            let (store, tmp) = new_store();
+            let expected = serde_json::json!({"data": {"completed_steps": ["a", "b"], "x": 42}});
+            seed(&tmp, "showns", "task1", expected.clone());
+
+            let result = store.show_dispatched("showns", "task1").unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    mod reset_atomicity {
+        use super::*;
+
+        /// Helper: write a JSON file directly into `{tmp}/{ns}/{key}.json`.
+        fn seed(tmp: &TempDir, ns: &str, key: &str, value: serde_json::Value) {
+            let dir = tmp.path().join(ns);
+            // Safe: test setup
+            fs::create_dir_all(&dir).expect("create ns dir");
+            let path = dir.join(format!("{key}.json"));
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&value).expect("serialize"),
+            )
+            .expect("write seed");
+        }
+
+        /// Reset removes specified steps and fields; backup file contains the
+        /// original content; report reflects what was removed.
+        #[test]
+        fn reset_removes_steps_and_fields_and_creates_backup() {
+            let (store, tmp) = new_store();
+            let original = serde_json::json!({
+                "data": {
+                    "completed_steps": ["a", "b", "c"],
+                    "x": 1,
+                    "y": "hello"
+                }
+            });
+            seed(&tmp, "testns", "task1", original.clone());
+
+            let report = store
+                .reset_dispatched_with_backup(
+                    "testns",
+                    "task1",
+                    &["b".to_string()],
+                    &["x".to_string()],
+                )
+                .unwrap();
+
+            // Backup must exist and contain original content.
+            let bak_path = tmp.path().join("testns").join("task1.json.bak");
+            assert!(
+                bak_path.exists(),
+                ".bak file must exist at {}",
+                bak_path.display()
+            );
+            assert_eq!(report.backup_path, bak_path);
+            let bak_content: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&bak_path).expect("read bak"))
+                    .expect("parse bak");
+            assert_eq!(bak_content, original, ".bak must contain original content");
+
+            // Live file must reflect mutations.
+            let live_path = tmp.path().join("testns").join("task1.json");
+            let live_content: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&live_path).expect("read live"))
+                    .expect("parse live");
+            let expected = serde_json::json!({
+                "data": {
+                    "completed_steps": ["a", "c"],
+                    "y": "hello"
+                }
+            });
+            assert_eq!(live_content, expected, "live file must be mutated");
+
+            // Report counts.
+            assert_eq!(report.steps_removed, 1, "one step removed");
+            assert_eq!(report.fields_removed, 1, "one field removed");
+        }
+
+        /// Reset with both steps and fields removed (2-case variant).
+        #[test]
+        fn reset_removes_multiple_steps_and_fields() {
+            let (store, tmp) = new_store();
+            let original = serde_json::json!({
+                "data": {
+                    "completed_steps": ["s1", "s2", "s3", "s4"],
+                    "repo_readiness": "NOT_READY",
+                    "repo_readiness_report": "details here",
+                    "plan_gate_retries": 2
+                }
+            });
+            seed(&tmp, "orchns", "task-abc", original.clone());
+
+            let report = store
+                .reset_dispatched_with_backup(
+                    "orchns",
+                    "task-abc",
+                    &["s2".to_string(), "s3".to_string()],
+                    &[
+                        "repo_readiness".to_string(),
+                        "repo_readiness_report".to_string(),
+                    ],
+                )
+                .unwrap();
+
+            let live_path = tmp.path().join("orchns").join("task-abc.json");
+            let live: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&live_path).expect("read"))
+                    .expect("parse");
+            assert_eq!(
+                live["data"]["completed_steps"],
+                serde_json::json!(["s1", "s4"])
+            );
+            assert!(live["data"].get("repo_readiness").is_none());
+            assert!(live["data"].get("repo_readiness_report").is_none());
+            assert_eq!(live["data"]["plan_gate_retries"], 2);
+
+            assert_eq!(report.steps_removed, 2);
+            assert_eq!(report.fields_removed, 2);
+        }
+
+        /// Reset on a missing key returns `KeyNotFound`.
+        #[test]
+        fn reset_returns_key_not_found_for_absent_file() {
+            let (store, _tmp) = new_store();
+            let err = store
+                .reset_dispatched_with_backup("ns", "missing", &[], &[])
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::KeyNotFound { .. }),
+                "expected KeyNotFound, got: {err}"
+            );
+        }
+
+        /// Reset returns `ShapeInvalid` when `data` top-level field is absent.
+        #[test]
+        fn reset_returns_shape_invalid_when_data_absent() {
+            let (store, tmp) = new_store();
+            // File has no "data" key.
+            let bad = serde_json::json!({"identity": {"task_id": "t1"}});
+            let dir = tmp.path().join("badns");
+            // Safe: test setup
+            fs::create_dir_all(&dir).expect("create dir");
+            fs::write(
+                dir.join("k.json"),
+                serde_json::to_string_pretty(&bad).expect("ser"),
+            )
+            .expect("write");
+
+            let err = store
+                .reset_dispatched_with_backup("badns", "k", &["s".to_string()], &[])
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::ShapeInvalid { .. }),
+                "expected ShapeInvalid, got: {err}"
+            );
+            assert!(err.to_string().contains("data"), "{err}");
+        }
+
+        /// Reset returns `ShapeInvalid` when `data.completed_steps` is not
+        /// an array.
+        #[test]
+        fn reset_returns_shape_invalid_when_completed_steps_not_array() {
+            let (store, tmp) = new_store();
+            // completed_steps is an object, not an array.
+            let bad = serde_json::json!({"data": {"completed_steps": {"step": "a"}}});
+            let dir = tmp.path().join("badns2");
+            // Safe: test setup
+            fs::create_dir_all(&dir).expect("create dir");
+            fs::write(
+                dir.join("k.json"),
+                serde_json::to_string_pretty(&bad).expect("ser"),
+            )
+            .expect("write");
+
+            let err = store
+                .reset_dispatched_with_backup("badns2", "k", &["a".to_string()], &[])
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::ShapeInvalid { .. }),
+                "expected ShapeInvalid, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("completed_steps"),
+                "message should mention completed_steps: {err}"
+            );
+        }
+    }
+
+    mod path_traversal {
+        use super::*;
+
+        /// `list_dispatched` rejects unsafe namespace segments.
+        #[test]
+        fn list_rejects_unsafe_namespace() {
+            let (store, _tmp) = new_store();
+            let err = store.list_dispatched("../evil").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StateError::UnsafeSegment {
+                        which: "namespace",
+                        ..
+                    }
+                ),
+                "expected UnsafeSegment{{namespace}}, got: {err}"
+            );
+        }
+
+        /// `show_dispatched` rejects an unsafe key segment.
+        #[test]
+        fn show_rejects_unsafe_key() {
+            let (store, _tmp) = new_store();
+            let err = store.show_dispatched("ns", "foo/bar").unwrap_err();
+            assert!(
+                matches!(err, StateError::UnsafeSegment { which: "key", .. }),
+                "expected UnsafeSegment{{key}}, got: {err}"
+            );
+        }
+
+        /// `reset_dispatched_with_backup` rejects an empty namespace segment.
+        #[test]
+        fn reset_rejects_empty_namespace() {
+            let (store, _tmp) = new_store();
+            let err = store
+                .reset_dispatched_with_backup("", "key", &[], &[])
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StateError::UnsafeSegment {
+                        which: "namespace",
+                        ..
+                    }
+                ),
+                "expected UnsafeSegment{{namespace}}, got: {err}"
+            );
+        }
+
+        /// `reset_dispatched_with_backup` rejects a `..` key segment.
+        #[test]
+        fn reset_rejects_dotdot_key() {
+            let (store, _tmp) = new_store();
+            let err = store
+                .reset_dispatched_with_backup("ns", "..", &[], &[])
+                .unwrap_err();
+            assert!(
+                matches!(err, StateError::UnsafeSegment { which: "key", .. }),
+                "expected UnsafeSegment{{key}}, got: {err}"
+            );
+        }
     }
 }
 

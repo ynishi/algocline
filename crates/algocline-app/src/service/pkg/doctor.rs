@@ -1,7 +1,7 @@
 //! `pkg_doctor` — read-only diagnosis for package state (Wave 2 of local-first DX).
 //!
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
-//! classifies packages into eight buckets without touching the filesystem:
+//! classifies packages into nine buckets without touching the filesystem:
 //!
 //! | Bucket              | Source-of-truth                                         | Condition                                          |
 //! |---------------------|---------------------------------------------------------|----------------------------------------------------|
@@ -15,6 +15,7 @@
 //! |                     |                                                         | `sub.lua` / `sub/init.lua` is missing              |
 //! | `missing_meta`      | `{pkg_dir}/{name}/init.lua`                             | init.lua absent or does not declare `M.meta.name`  |
 //! | `missing_hub_index` | `{project_root}/hub_index.json`                         | collection root has 2+ pkg dirs but no index file  |
+//! | `spec_missing`      | `{pkg_dir}/{name}/spec/`                                | spec/ exists but contains zero `*_spec.lua` files  |
 //!
 //! Contract:
 //! - **No side effects.** No `fs::write`, `fs::remove_*`, `fs::create_*`,
@@ -23,13 +24,14 @@
 //!   logic authoritative in one place (symlink-dangling suggestion wording and
 //!   the path-missing scan in particular).
 //!
-//! The JSON output schema always contains eight top-level buckets:
+//! The JSON output schema always contains nine top-level buckets:
 //! `healthy`, `incomplete_pkg`, `installed_missing`, `missing_hub_index`,
-//! `missing_meta`, `path_missing`, `stale_cache`, `symlink_dangling`. The `narrative_issues`
-//! bucket was removed in #1778221491-39903 (narrative SSOT decommission).
+//! `missing_meta`, `path_missing`, `spec_missing`, `stale_cache`,
+//! `symlink_dangling`. The `narrative_issues` bucket was removed in
+//! #1778221491-39903 (narrative SSOT decommission).
 //! Key order within the serialized string follows `serde_json`'s default
 //! (alphabetical when `preserve_order` is off, as it is
-//! in this workspace) — the contract is "these eight keys always present", not
+//! in this workspace) — the contract is "these nine keys always present", not
 //! textual ordering.
 //!
 //! ## `incomplete_pkg` detection
@@ -78,6 +80,9 @@ enum DoctorOutcome {
     /// Package directory exists but `init.lua` does not declare a valid
     /// `M.meta.name` field (parse failure, missing field, or absent file).
     MissingMeta { reason: String, suggestion: String },
+    /// Package directory exists and has a `spec/` directory, but contains
+    /// zero `*_spec.lua` files (opt-in: pkgs without `spec/` are skipped).
+    SpecMissing { reason: String, suggestion: String },
 }
 
 /// Accumulator for the JSON output buckets.
@@ -90,6 +95,7 @@ struct DoctorBuckets {
     incomplete_pkg: Vec<serde_json::Value>,
     missing_meta: Vec<serde_json::Value>,
     missing_hub_index: Vec<serde_json::Value>,
+    spec_missing: Vec<serde_json::Value>,
     stale_cache: Vec<serde_json::Value>,
 }
 
@@ -102,6 +108,7 @@ impl DoctorBuckets {
             || !self.incomplete_pkg.is_empty()
             || !self.missing_meta.is_empty()
             || !self.missing_hub_index.is_empty()
+            || !self.spec_missing.is_empty()
             || !self.stale_cache.is_empty()
     }
 
@@ -116,6 +123,7 @@ impl DoctorBuckets {
             "missing_hub_index": self.missing_hub_index,
             "missing_meta": self.missing_meta,
             "path_missing": self.path_missing,
+            "spec_missing": self.spec_missing,
             "stale_cache": self.stale_cache,
             "symlink_dangling": self.symlink_dangling,
         })
@@ -266,6 +274,14 @@ fn push_doctor_outcome(name: &str, outcome: DoctorOutcome, buckets: &mut DoctorB
                 "suggestion": suggestion,
             }))
         }
+        DoctorOutcome::SpecMissing { reason, suggestion } => {
+            buckets.spec_missing.push(serde_json::json!({
+                "name": name,
+                "kind": "spec_missing",
+                "reason": reason,
+                "suggestion": suggestion,
+            }))
+        }
     }
 }
 
@@ -343,6 +359,61 @@ fn check_missing_meta(name: &str, dest: &Path) -> Option<DoctorOutcome> {
     })
 }
 
+/// Check whether the package directory at `dest` has a `spec/` directory
+/// that exists but contains zero `*_spec.lua` files. Narrow scope (opt-in):
+/// packages without a `spec/` directory return `Ok(None)` silently.
+///
+/// Aligns with `alc_pkg_test`'s spec discovery convention
+/// (`<pkg_root>/spec/*_spec.lua`).
+///
+/// Returns `Err(String)` when `fs::read_dir` / `DirEntry::file_type` fails
+/// (judgment-critical fs ops; silent drop would produce false negatives).
+fn check_spec_missing(name: &str, dest: &Path) -> Result<Option<DoctorOutcome>, String> {
+    let spec_dir = dest.join("spec");
+    if !spec_dir.is_dir() {
+        return Ok(None);
+    }
+    let entries = std::fs::read_dir(&spec_dir).map_err(|e| {
+        format!(
+            "spec_missing: failed to read_dir {}: {e}",
+            spec_dir.display()
+        )
+    })?;
+    let mut found_spec = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("spec_missing: failed to read dir entry: {e}"))?;
+        let ft = entry.file_type().map_err(|e| {
+            format!(
+                "spec_missing: failed to read file_type for {}: {e}",
+                entry.path().display()
+            )
+        })?;
+        if !ft.is_file() {
+            continue;
+        }
+        let fname = entry.file_name();
+        if fname.to_string_lossy().ends_with("_spec.lua") {
+            found_spec = true;
+            break;
+        }
+    }
+    if found_spec {
+        return Ok(None);
+    }
+    Ok(Some(DoctorOutcome::SpecMissing {
+        reason: format!(
+            "spec directory at {} exists but contains zero *_spec.lua files",
+            spec_dir.display()
+        ),
+        suggestion: format!(
+            "Package {name:?} declared test intent by creating spec/ at {} — \
+             add at least one <name>_spec.lua file (mlua-lspec convention) or remove \
+             the spec/ directory to opt out of spec discipline",
+            spec_dir.display()
+        ),
+    }))
+}
+
 /// Classify a manifest entry by inspecting only the destination directory.
 /// Mirrors the pre-install branch of [`super::repair::repair_installed`] but
 /// never attempts an install.
@@ -350,7 +421,11 @@ fn check_missing_meta(name: &str, dest: &Path) -> Option<DoctorOutcome> {
 /// After confirming the package directory is reachable, performs an additional
 /// best-effort incomplete check: reads `init.lua` to detect missing sibling
 /// submodule files. See [`check_incomplete`].
-fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> DoctorOutcome {
+fn classify_installed(
+    name: &str,
+    entry: &ManifestEntry,
+    pkg_dir: &Path,
+) -> Result<DoctorOutcome, String> {
     let dest = pkg_dir.join(name);
 
     let is_symlink = dest
@@ -367,14 +442,17 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
             }
         };
         if target_alive {
-            // Symlink alive — check for missing submodule files, then meta.
+            // Symlink alive — check for missing submodule files, then meta, then spec.
             if let Some(incomplete) = check_incomplete(name, &dest, true) {
-                return incomplete;
+                return Ok(incomplete);
             }
             if let Some(mm) = check_missing_meta(name, &dest) {
-                return mm;
+                return Ok(mm);
             }
-            return DoctorOutcome::Healthy;
+            if let Some(sm) = check_spec_missing(name, &dest)? {
+                return Ok(sm);
+            }
+            return Ok(DoctorOutcome::Healthy);
         }
         let link_target = match dest.read_link() {
             Ok(t) => t.display().to_string(),
@@ -383,27 +461,30 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
                 "<unknown>".to_string()
             }
         };
-        return DoctorOutcome::SymlinkDangling {
+        return Ok(DoctorOutcome::SymlinkDangling {
             reason: format!("symlink target missing: {link_target}"),
             suggestion: symlink_dangling_suggestion(name),
-        };
+        });
     }
 
     if dest.exists() {
-        // Directory exists — check for missing submodule files, then meta.
+        // Directory exists — check for missing submodule files, then meta, then spec.
         if let Some(incomplete) = check_incomplete(name, &dest, false) {
-            return incomplete;
+            return Ok(incomplete);
         }
         if let Some(mm) = check_missing_meta(name, &dest) {
-            return mm;
+            return Ok(mm);
         }
-        return DoctorOutcome::Healthy;
+        if let Some(sm) = check_spec_missing(name, &dest)? {
+            return Ok(sm);
+        }
+        return Ok(DoctorOutcome::Healthy);
     }
 
-    DoctorOutcome::InstalledMissing {
+    Ok(DoctorOutcome::InstalledMissing {
         reason: format!("installed directory missing: {}", dest.display()),
         suggestion: installed_missing_suggestion(name, &entry.source),
-    }
+    })
 }
 
 /// Classify every manifest entry into the four buckets. When `target_filter`
@@ -414,18 +495,19 @@ fn run_manifest_pass(
     target_filter: Option<&str>,
     pkg_dir: &Path,
     buckets: &mut DoctorBuckets,
-) {
+) -> Result<(), String> {
     if let Some(target) = target_filter {
         if let Some(entry) = manifest.packages.get(target) {
-            let outcome = classify_installed(target, entry, pkg_dir);
+            let outcome = classify_installed(target, entry, pkg_dir)?;
             push_doctor_outcome(target, outcome, buckets);
         }
-        return;
+        return Ok(());
     }
     for (pkg_name, entry) in &manifest.packages {
-        let outcome = classify_installed(pkg_name, entry, pkg_dir);
+        let outcome = classify_installed(pkg_name, entry, pkg_dir)?;
         push_doctor_outcome(pkg_name, outcome, buckets);
     }
+    Ok(())
 }
 
 /// Drain the unattached-symlink scan results into the `symlink_dangling`
@@ -621,9 +703,9 @@ fn run_stale_cache_pass(cache_dir: &Path, buckets: &mut DoctorBuckets) -> Result
 
 impl AppService {
     /// Diagnose package state without any side effects. Returns a JSON string
-    /// with eight arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
-    /// `missing_hub_index`, `missing_meta`, `path_missing`, `stale_cache`,
-    /// `symlink_dangling`).
+    /// with nine arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
+    /// `missing_hub_index`, `missing_meta`, `path_missing`, `spec_missing`,
+    /// `stale_cache`, `symlink_dangling`).
     ///
     /// `name` restricts the report to a single package; `None` inspects every
     /// known package. `project_root` is only consulted for the
@@ -655,7 +737,7 @@ impl AppService {
         let target_filter = name.as_deref();
 
         let mut buckets = DoctorBuckets::default();
-        run_manifest_pass(&manifest, target_filter, &pkg_dir, &mut buckets);
+        run_manifest_pass(&manifest, target_filter, &pkg_dir, &mut buckets)?;
         run_unattached_symlink_pass(&pkg_dir, target_filter, &manifest, &mut buckets);
         run_path_missing_pass(resolved_root.as_deref(), target_filter, &mut buckets);
         if target_filter.is_none() {
@@ -709,7 +791,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir);
+        let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir).expect("classify ok");
         assert!(matches!(outcome, DoctorOutcome::Healthy));
     }
 
@@ -718,7 +800,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pkg_dir = tmp.path();
 
-        let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir);
+        let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir).expect("classify ok");
         match outcome {
             DoctorOutcome::InstalledMissing { reason, suggestion } => {
                 assert!(
@@ -748,7 +830,7 @@ mod tests {
         let dangling_target = PathBuf::from("/nonexistent/path/for/doctor_test");
         symlink(&dangling_target, pkg_dir.join("p")).unwrap();
 
-        let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir);
+        let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir).expect("classify ok");
         match outcome {
             DoctorOutcome::SymlinkDangling { reason, suggestion } => {
                 assert!(reason.contains("symlink target missing"), "{reason}");
@@ -777,16 +859,16 @@ mod tests {
         std::fs::create_dir(&pkg_dir).unwrap();
         symlink(&real_target, pkg_dir.join("q")).unwrap();
 
-        let outcome = classify_installed("q", &mk_entry("/src/q"), &pkg_dir);
+        let outcome = classify_installed("q", &mk_entry("/src/q"), &pkg_dir).expect("classify ok");
         assert!(matches!(outcome, DoctorOutcome::Healthy));
     }
 
     #[test]
-    fn buckets_into_json_emits_all_eight_keys() {
+    fn buckets_into_json_emits_all_nine_keys() {
         // NOTE: `serde_json` without the `preserve_order` feature emits JSON
         // object keys in alphabetical order, matching `pkg_repair`'s actual
         // behavior. The spec's "fixed order" requirement is satisfied by
-        // always emitting these eight top-level keys; consumers parse as a
+        // always emitting these nine top-level keys; consumers parse as a
         // Map rather than relying on textual key order.
         //
         // Note: `narrative_issues` bucket removed in #1778221491-39903.
@@ -804,6 +886,8 @@ mod tests {
             .push(serde_json::json!({"name": "m", "kind": "missing_meta"}));
         b.missing_hub_index
             .push(serde_json::json!({"kind": "missing_hub_index", "project_root": "/r"}));
+        b.spec_missing
+            .push(serde_json::json!({"name": "sm", "kind": "spec_missing"}));
         b.stale_cache
             .push(serde_json::json!({"kind": "stale_cache", "path": "/p", "age_secs": 7200}));
 
@@ -817,8 +901,9 @@ mod tests {
         assert!(obj.contains_key("incomplete_pkg"));
         assert!(obj.contains_key("missing_meta"));
         assert!(obj.contains_key("missing_hub_index"));
+        assert!(obj.contains_key("spec_missing"));
         assert!(obj.contains_key("stale_cache"));
-        assert_eq!(obj.len(), 8, "exactly eight top-level buckets: {out}");
+        assert_eq!(obj.len(), 9, "exactly nine top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
@@ -827,6 +912,7 @@ mod tests {
         assert_eq!(obj["incomplete_pkg"][0]["name"], "c");
         assert_eq!(obj["missing_meta"][0]["name"], "m");
         assert_eq!(obj["missing_hub_index"][0]["project_root"], "/r");
+        assert_eq!(obj["spec_missing"][0]["name"], "sm");
         assert_eq!(obj["stale_cache"][0]["path"], "/p");
     }
 
@@ -862,8 +948,70 @@ mod tests {
         assert!(b.any_matched());
 
         let mut b = DoctorBuckets::default();
+        b.spec_missing.push(serde_json::json!({}));
+        assert!(b.any_matched());
+
+        let mut b = DoctorBuckets::default();
         b.stale_cache.push(serde_json::json!({}));
         assert!(b.any_matched());
+    }
+
+    // ── spec_missing ─────────────────────────────────────────────────────
+
+    /// T1: pkg has spec/foo_spec.lua → check_spec_missing returns Ok(None).
+    #[test]
+    fn check_spec_missing_returns_none_when_spec_file_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir_all(dest.join("spec")).unwrap();
+        std::fs::write(dest.join("spec/foo_spec.lua"), "return {}").unwrap();
+        let out = check_spec_missing("mypkg", &dest).expect("must not error");
+        assert!(out.is_none(), "expected None, got: {out:?}");
+    }
+
+    /// T2: pkg has empty spec/ → SpecMissing emitted with reason+suggestion.
+    #[test]
+    fn check_spec_missing_detects_empty_spec_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir_all(dest.join("spec")).unwrap();
+        let out = check_spec_missing("mypkg", &dest)
+            .expect("must not error")
+            .expect("expected SpecMissing");
+        match out {
+            DoctorOutcome::SpecMissing { reason, suggestion } => {
+                assert!(reason.contains("spec"), "reason: {reason}");
+                assert!(suggestion.contains("_spec.lua"), "suggestion: {suggestion}");
+            }
+            _ => panic!("expected SpecMissing, got {out:?}"),
+        }
+    }
+
+    /// T3: pkg has spec/ with only non-spec files → SpecMissing emitted.
+    #[test]
+    fn check_spec_missing_detects_spec_dir_with_only_non_spec_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir_all(dest.join("spec")).unwrap();
+        std::fs::write(dest.join("spec/helper.lua"), "return {}").unwrap();
+        std::fs::write(dest.join("spec/README.md"), "docs").unwrap();
+        let out = check_spec_missing("mypkg", &dest)
+            .expect("must not error")
+            .expect("expected SpecMissing");
+        assert!(matches!(out, DoctorOutcome::SpecMissing { .. }));
+    }
+
+    /// T4: pkg has no spec/ → Ok(None) (silent skip, opt-in scope).
+    #[test]
+    fn check_spec_missing_silently_skips_when_spec_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("mypkg");
+        std::fs::create_dir_all(&dest).unwrap();
+        let out = check_spec_missing("mypkg", &dest).expect("must not error");
+        assert!(
+            out.is_none(),
+            "expected None for absent spec/, got: {out:?}"
+        );
     }
 
     // ── stale_cache ──────────────────────────────────────────────────────
@@ -957,7 +1105,8 @@ mod tests {
         // init.lua present but declares no M.meta block.
         std::fs::write(dest.join("init.lua"), "local M = {} return M").unwrap();
 
-        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        let outcome =
+            classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir).expect("classify ok");
         match outcome {
             DoctorOutcome::MissingMeta { reason, suggestion } => {
                 assert!(reason.contains("lacks M.meta.name"), "reason: {reason}");
@@ -990,7 +1139,8 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        let outcome =
+            classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir).expect("classify ok");
         assert!(
             matches!(outcome, DoctorOutcome::MissingMeta { .. }),
             "expected MissingMeta for empty name, got {outcome:?}"
@@ -1011,7 +1161,8 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        let outcome =
+            classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir).expect("classify ok");
         assert!(
             matches!(outcome, DoctorOutcome::Healthy),
             "expected Healthy for complete init.lua, got {outcome:?}"
@@ -1337,7 +1488,8 @@ return {}
         .unwrap();
         // sub.lua intentionally absent
 
-        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        let outcome =
+            classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir).expect("classify ok");
         match outcome {
             DoctorOutcome::IncompletePkg {
                 missing_subs,
@@ -1368,7 +1520,8 @@ return {}
         .unwrap();
         std::fs::write(dest.join("sub.lua"), "return {}").unwrap();
 
-        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        let outcome =
+            classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir).expect("classify ok");
         assert!(
             matches!(outcome, DoctorOutcome::Healthy),
             "expected Healthy, got {outcome:?}"

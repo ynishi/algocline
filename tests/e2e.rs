@@ -6344,3 +6344,55 @@ async fn test_pkg_doctor_stale_cache_detected() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// Defect path: installed pkg has spec/ directory but contains zero
+/// *_spec.lua files → `spec_missing` bucket with the pkg name.
+#[tokio::test]
+async fn test_pkg_doctor_spec_missing_detected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let source_root = tempfile::tempdir().expect("source tempdir");
+    let coll_root = source_root.path();
+    let pkg_src = coll_root.join("e2e_doctor_spec_missing");
+    std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
+    std::fs::write(
+        pkg_src.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_doctor_spec_missing", version = "0.1.0" }
+function M.run(ctx) return "ok" end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": coll_root.to_string_lossy() }),
+    )
+    .await;
+
+    // Create empty spec/ in the installed package dir.
+    let installed = tmp.path().join("packages").join("e2e_doctor_spec_missing");
+    std::fs::create_dir_all(installed.join("spec")).expect("mkdir spec");
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_doctor_spec_missing" }),
+    )
+    .await;
+
+    let spec_missing = resp["spec_missing"]
+        .as_array()
+        .expect("spec_missing array missing");
+    let entry = spec_missing
+        .iter()
+        .find(|e| e["name"] == "e2e_doctor_spec_missing")
+        .unwrap_or_else(|| {
+            panic!("e2e_doctor_spec_missing not found in spec_missing, got: {resp}")
+        });
+    assert_eq!(entry["kind"], "spec_missing");
+
+    client.cancel().await.expect("cancel failed");
+}

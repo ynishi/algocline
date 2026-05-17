@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Additive: existing `ctx` fields (e.g. `qwen_env`) are unchanged.
 - `alc_pkg_doctor`: added two new diagnostic buckets — `missing_meta` (installed pkg with init.lua but no `M.meta.name`) and `missing_hub_index` (Collection-mode project_root with 2+ pkg dirs but missing hub_index.json). JSON output now contains seven top-level arrays (additive; existing five buckets unchanged).
 - `alc_pkg_doctor`: added `stale_cache` bucket (8th verdict) — emits one entry per `~/.algocline/hub_cache/{hash}.json` file whose mtime exceeds `CACHE_TTL_SECS` (3600s). Same TTL discipline as `HubCacheLookup::Stale`, surfaced read-only. JSON output now contains eight top-level arrays (additive; existing seven buckets unchanged). `target_filter=Some` skips the entire pass (hub cache files are not per-package).
+- `alc_pkg_doctor`: added `spec_missing` bucket (9th verdict) — emits one entry per installed pkg whose `spec/` directory exists but contains zero `*_spec.lua` files. Aligns with `alc_pkg_test`'s spec discovery convention. Narrow scope: pkgs without a `spec/` directory are silently skipped (opt-in). JSON output now contains nine top-level arrays (additive; existing eight buckets unchanged).
 
 ## [0.36.0] - 2026-05-15
 

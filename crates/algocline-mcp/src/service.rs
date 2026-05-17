@@ -1347,7 +1347,7 @@ impl AlcService {
     /// Diagnose package state without side effects (read-only counterpart
     /// of `alc_pkg_repair`).
     ///
-    /// Returns JSON with eight arrays:
+    /// Returns JSON with nine arrays:
     ///   - `healthy` — package directory exists and is reachable
     ///   - `incomplete_pkg` — package dir exists but `init.lua` requires
     ///     sibling submodule files (`pkg.sub`) that are missing; use
@@ -1363,6 +1363,8 @@ impl AlcService {
     ///   - `missing_hub_index` — project_root has 2+ pkg dirs but
     ///     hub_index.json is missing; generate it with
     ///     `alc_hub_reindex --source_dir <project_root>`
+    ///   - `spec_missing` — installed pkg has `spec/` dir but contains zero
+    ///     `*_spec.lua` files; add at least one or remove `spec/` to opt out
     ///   - `stale_cache` — hub cache file (`~/.algocline/hub_cache/{hash}.json`)
     ///     older than 3600s (CACHE_TTL_SECS); refresh via `alc_hub_search`
     ///
@@ -2228,7 +2230,7 @@ impl ServerHandler for AlcService {
                  - alc_pkg_install: Install a package or collection from a Git URL (e.g. github.com/user/my-pkg).\n\
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
                  - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
-                 - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/incomplete_pkg/installed_missing/missing_meta/missing_hub_index/path_missing/stale_cache/symlink_dangling buckets. incomplete_pkg fires when init.lua requires sibling submodules that are missing. missing_meta fires when installed pkg dir has init.lua but M.meta.name is absent/empty. missing_hub_index fires when project_root has 2+ pkg dirs but hub_index.json is missing. stale_cache fires when ~/.algocline/hub_cache/{hash}.json mtime exceeds 3600s. Use pkg_unlink to remove dangling symlinks.\n\
+                 - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/incomplete_pkg/installed_missing/missing_meta/missing_hub_index/path_missing/spec_missing/stale_cache/symlink_dangling buckets. incomplete_pkg fires when init.lua requires sibling submodules that are missing. missing_meta fires when installed pkg dir has init.lua but M.meta.name is absent/empty. missing_hub_index fires when project_root has 2+ pkg dirs but hub_index.json is missing. spec_missing fires when installed pkg has spec/ directory but contains zero *_spec.lua files. stale_cache fires when ~/.algocline/hub_cache/{hash}.json mtime exceeds 3600s. Use pkg_unlink to remove dangling symlinks.\n\
                  - alc_pkg_test: Run mlua-lspec tests against a package's spec directory (pkg), a single file (code_file), or inline code. Returns JSON {passed, failed, pending, total, duration_ms, spec_files[]}. Exactly one of pkg/code_file/code must be provided.\n\
                  - alc_pkg_repair: Heal broken packages — reinstalls entries whose installed dir is missing; surfaces dangling symlinks and missing path = ... declarations as unrepairable with suggestions.\n\
                  - alc_init: Initialize alc.toml in the project root and ensure alc.local.toml is listed in .gitignore.\n\

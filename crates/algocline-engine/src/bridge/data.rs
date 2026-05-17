@@ -113,7 +113,7 @@ pub(super) fn register_print(lua: &Lua, log_sink: LogSink) -> LuaResult<()> {
     Ok(())
 }
 
-/// Register `alc.state` table with get/set/keys/delete/has/set_nx/incr.
+/// Register `alc.state` table with get/set/keys/delete/has/set_nx/incr/list/show/reset.
 ///
 /// Lua usage:
 ///   alc.state.set("score", 42)
@@ -126,6 +126,10 @@ pub(super) fn register_print(lua: &Lua, log_sink: LogSink) -> LuaResult<()> {
 ///   alc.state.incr("counter")              -- 1 (init 0 + delta 1)
 ///   alc.state.incr("counter", 5)           -- 6
 ///   alc.state.incr("counter", 10, 100)     -- 16 (default ignored)
+///   alc.state.list("my_ns")               -- {"task_a", "task_b"} (sorted)
+///   alc.state.show("my_ns", "task_a")     -- full JSON table
+///   alc.state.reset("my_ns", "task_a", {steps={"1b_X"}, fields={"x"}})
+///                                          -- { ok=true, backup_path="...", steps_removed=1, fields_removed=1 }
 pub(super) fn register_state(
     lua: &Lua,
     alc_table: &LuaTable,
@@ -201,6 +205,51 @@ pub(super) fn register_state(
         },
     )?;
 
+    // alc.state.list(namespace) -> string[]
+    let store_list = Arc::clone(&state_store);
+    let list = lua.create_function(move |lua, namespace: String| {
+        let keys = store_list
+            .list_dispatched(&namespace)
+            .map_err(LuaError::external)?;
+        lua.to_value(&keys)
+    })?;
+
+    // alc.state.show(namespace, key) -> table
+    let store_show = Arc::clone(&state_store);
+    let show = lua.create_function(move |lua, (namespace, key): (String, String)| {
+        let v = store_show
+            .show_dispatched(&namespace, &key)
+            .map_err(LuaError::external)?;
+        lua.to_value(&v)
+    })?;
+
+    // alc.state.reset(namespace, key, opts?) -> { ok, backup_path, steps_removed, fields_removed }
+    let store_reset = Arc::clone(&state_store);
+    let reset = lua.create_function(
+        move |lua, (namespace, key, opts): (String, String, Option<LuaTable>)| {
+            let (steps, fields) = match opts {
+                Some(t) => {
+                    let s = t.get::<Option<Vec<String>>>("steps")?.unwrap_or_default();
+                    let f = t.get::<Option<Vec<String>>>("fields")?.unwrap_or_default();
+                    (s, f)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            let report = store_reset
+                .reset_dispatched_with_backup(&namespace, &key, &steps, &fields)
+                .map_err(LuaError::external)?;
+            let ret = lua.create_table()?;
+            ret.set("ok", true)?;
+            ret.set(
+                "backup_path",
+                report.backup_path.to_string_lossy().to_string(),
+            )?;
+            ret.set("steps_removed", report.steps_removed)?;
+            ret.set("fields_removed", report.fields_removed)?;
+            Ok(ret)
+        },
+    )?;
+
     state_table.set("get", get)?;
     state_table.set("set", set)?;
     state_table.set("keys", keys)?;
@@ -208,6 +257,9 @@ pub(super) fn register_state(
     state_table.set("has", has)?;
     state_table.set("set_nx", set_nx)?;
     state_table.set("incr", incr)?;
+    state_table.set("list", list)?;
+    state_table.set("show", show)?;
+    state_table.set("reset", reset)?;
 
     alc_table.set("state", state_table)?;
     Ok(())
@@ -1211,5 +1263,172 @@ mod tests {
         // Verify app_data is set and accessible
         let retrieved = lua.app_data_ref::<Arc<HashMap<String, String>>>().unwrap();
         assert_eq!(retrieved.get("X").unwrap(), "1");
+    }
+
+    mod state_dispatched_lua {
+        use super::*;
+        use mlua::Lua;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        fn setup() -> (Lua, Arc<JsonFileStore>, TempDir) {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(JsonFileStore::new(tmp.path().to_path_buf()));
+            let lua = Lua::new();
+            let alc = lua.create_table().unwrap();
+            register_state(&lua, &alc, "default".to_string(), Arc::clone(&store)).unwrap();
+            lua.globals().set("alc", alc).unwrap();
+            (lua, store, tmp)
+        }
+
+        #[test]
+        fn list_returns_sorted_keys() {
+            let (lua, _store, tmp) = setup();
+            // Seed two files directly into the dispatched layout.
+            std::fs::create_dir_all(tmp.path().join("testns")).unwrap();
+            std::fs::write(
+                tmp.path().join("testns/beta.json"),
+                r#"{"data": {"completed_steps": [], "x": 1}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                tmp.path().join("testns/alpha.json"),
+                r#"{"data": {"completed_steps": [], "y": 2}}"#,
+            )
+            .unwrap();
+            lua.load(
+                r#"
+                    local result = alc.state.list("testns")
+                    assert(#result == 2, "expected 2 keys, got " .. #result)
+                    assert(result[1] == "alpha", "first key should be alpha, got " .. tostring(result[1]))
+                    assert(result[2] == "beta", "second key should be beta, got " .. tostring(result[2]))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        }
+
+        #[test]
+        fn show_returns_full_table() {
+            let (lua, _store, tmp) = setup();
+            std::fs::create_dir_all(tmp.path().join("testns")).unwrap();
+            std::fs::write(
+                tmp.path().join("testns/alpha.json"),
+                r#"{"data": {"completed_steps": ["a", "b", "c"], "x": 1, "y": 2}}"#,
+            )
+            .unwrap();
+            lua.load(
+                r#"
+                    local result = alc.state.show("testns", "alpha")
+                    assert(type(result) == "table", "expected table")
+                    assert(type(result.data) == "table", "expected result.data to be a table")
+                    assert(result.data.x == 1, "expected x=1")
+                    assert(result.data.y == 2, "expected y=2")
+                    assert(#result.data.completed_steps == 3, "expected 3 steps")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        }
+
+        #[test]
+        fn show_missing_returns_not_found_error() {
+            let (lua, _store, _tmp) = setup();
+            lua.load(
+                r#"
+                    local ok, err = pcall(alc.state.show, "testns", "missing")
+                    assert(not ok, "expected error but got success")
+                    local msg = tostring(err)
+                    assert(string.find(msg, "not found"), "error message should contain 'not found', got: " .. msg)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        }
+
+        #[test]
+        fn reset_removes_steps_and_fields_with_backup() {
+            let (lua, _store, tmp) = setup();
+            std::fs::create_dir_all(tmp.path().join("testns")).unwrap();
+            let file_path = tmp.path().join("testns/alpha.json");
+            std::fs::write(
+                &file_path,
+                r#"{"data": {"completed_steps": ["a", "b", "c"], "x": 1, "y": 2}}"#,
+            )
+            .unwrap();
+            // Store tmp path as a string for Lua assertions.
+            let tmp_path_str = tmp.path().to_string_lossy().to_string();
+            lua.globals().set("TMP_PATH", tmp_path_str.clone()).unwrap();
+            lua.load(
+                r#"
+                    local r = alc.state.reset("testns", "alpha", {steps={"b"}, fields={"x"}})
+                    assert(r.ok == true, "expected ok=true")
+                    assert(type(r.backup_path) == "string", "backup_path should be a string")
+                    assert(r.steps_removed == 1, "expected steps_removed=1, got " .. tostring(r.steps_removed))
+                    assert(r.fields_removed == 1, "expected fields_removed=1, got " .. tostring(r.fields_removed))
+                "#,
+            )
+            .exec()
+            .unwrap();
+            // Assert .bak exists with original content.
+            let bak_path = tmp.path().join("testns/alpha.json.bak");
+            assert!(
+                bak_path.exists(),
+                "backup file should exist at {:?}",
+                bak_path
+            );
+            let bak_content = std::fs::read_to_string(&bak_path).unwrap();
+            assert!(
+                bak_content.contains("\"b\""),
+                "backup should contain original 'b' step"
+            );
+            // Assert live file was mutated: "b" removed from steps, "x" removed from data.
+            let live_content = std::fs::read_to_string(&file_path).unwrap();
+            let live: serde_json::Value = serde_json::from_str(&live_content).unwrap();
+            let steps = live["data"]["completed_steps"].as_array().unwrap();
+            assert!(
+                !steps.iter().any(|s| s.as_str() == Some("b")),
+                "step 'b' should be removed from completed_steps"
+            );
+            assert!(
+                live["data"]["x"].is_null() || live["data"].get("x").is_none(),
+                "field 'x' should be removed from data"
+            );
+        }
+
+        #[test]
+        fn unsafe_namespace_rejected() {
+            let (lua, _store, _tmp) = setup();
+            lua.load(
+                r#"
+                    local ok, err = pcall(alc.state.list, "../evil")
+                    assert(not ok, "expected error for unsafe namespace")
+                    local msg = tostring(err)
+                    assert(string.find(msg, "unsafe"), "error should contain 'unsafe', got: " .. msg)
+                "#,
+            )
+            .exec()
+            .unwrap();
+            lua.load(
+                r#"
+                    local ok, err = pcall(alc.state.show, "../evil", "key")
+                    assert(not ok, "expected error for unsafe namespace in show")
+                    local msg = tostring(err)
+                    assert(string.find(msg, "unsafe"), "error should contain 'unsafe', got: " .. msg)
+                "#,
+            )
+            .exec()
+            .unwrap();
+            lua.load(
+                r#"
+                    local ok, err = pcall(alc.state.reset, "../evil", "key", {})
+                    assert(not ok, "expected error for unsafe namespace in reset")
+                    local msg = tostring(err)
+                    assert(string.find(msg, "unsafe"), "error should contain 'unsafe', got: " .. msg)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        }
     }
 }

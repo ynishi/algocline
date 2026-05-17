@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-05-17
+
+### Changed: bundled swarm-frame bumped to `v0.3.0`
+
+`BUNDLED_SOURCES` in `src/init.rs` now points `algocline-swarm-frame` at tag `v0.3.0` (was `v0.2.0`). `alc init` and `alc update` will pull the new tag on next invocation.
+
 ### Added
 
 - `alc_pkg_test`: Run mlua-lspec tests against a package's spec directory (`<pkg>/spec/*_spec.lua`), a single `code_file`, or inline `code`. Returns JSON `{passed, failed, pending, total, duration_ms, spec_files[]}` with per-file and per-test breakdown. `pkg` / `code_file` / `code` are mutually exclusive — exactly one must be provided. (breaking for trait implementors only; `EngineApi::pkg_test` has no default impl)

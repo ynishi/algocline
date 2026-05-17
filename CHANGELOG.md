@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `alc_pkg_doctor`: added `stale_cache` bucket (8th verdict) — emits one entry per `~/.algocline/hub_cache/{hash}.json` file whose mtime exceeds `CACHE_TTL_SECS` (3600s). Same TTL discipline as `HubCacheLookup::Stale`, surfaced read-only. JSON output now contains eight top-level arrays (additive; existing seven buckets unchanged). `target_filter=Some` skips the entire pass (hub cache files are not per-package).
 - `alc_pkg_doctor`: added `spec_missing` bucket (9th verdict) — emits one entry per installed pkg whose `spec/` directory exists but contains zero `*_spec.lua` files. Aligns with `alc_pkg_test`'s spec discovery convention. Narrow scope: pkgs without a `spec/` directory are silently skipped (opt-in). JSON output now contains nine top-level arrays (additive; existing eight buckets unchanged).
 - `docs/pkg-author-conventions.md`: added §10 Cards quick reference (`alc_card_find` predicate cheatsheet + AND/OR/NOT examples) and §11 Pre-publish verification workflow (4-step pre-push checklist `alc_pkg_test` → `alc_hub_dist` → `alc_pkg_doctor` → `alc_hub_search local_indices` + failure-mode table).
+- `alc.state.list(namespace) -> string[]`: List keys under the dispatched state layout `{state_root}/{namespace}/*.json`. Returns sorted, `.bak`/`.tmp` excluded.
+- `alc.state.show(namespace, key) -> table`: Read full JSON content of `{state_root}/{namespace}/{key}.json`. Typed error (message contains `not found`) when the key is absent.
+- `alc.state.reset(namespace, key, opts?) -> table`: Atomically mutate the state file. Creates `{key}.json.bak`, removes specified steps from `data.completed_steps` and fields from `data`, writes via tempfile + rename. Returns `{ok, backup_path, steps_removed, fields_removed}`.
+- `StateError` enum (`thiserror`-derived) in `algocline-engine::state` with variants `KeyNotFound`, `UnsafeSegment`, `IoBackup`, `IoWrite`, `Serde`, `ShapeInvalid`. Used by the three new `JsonFileStore` inherent methods (`list_dispatched`, `show_dispatched`, `reset_dispatched_with_backup`).
+
+### Notes
+
+- **No MCP tool** is added (no `alc_state_list` / `alc_state_show` / `alc_state_reset`). Callers run these via `mcp__algocline__alc_run` with a short Lua snippet.
+- **No `EngineApi` trait method** is added. The implementation lives entirely inside the `algocline-engine` crate as inherent methods on `JsonFileStore`.
+- Replaces the rolled-back design from issue `1778990062-86012` (`alc_state_*` MCP tool + `OrchState` types) which leaked application terminology (`orch`) into the shared `algocline-core` / `-engine` / `-app` / `-mcp` crates. The new design keeps all application terms in caller packages (`coding_orch`, `incubator`, etc.).
+- The `agent-profiles` repo's `workspace-pipeline.md §orch state.json 編集 SOP` section will be updated separately to point at the Lua snippet path; that change lives outside this repo.
 
 ## [0.36.0] - 2026-05-15
 

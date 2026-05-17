@@ -141,6 +141,42 @@ function alc.state.set_nx(key, value) end
 ---@return number new_value The value after increment
 function alc.state.incr(key, delta, default) end
 
+---@class AlcStateResetOpts
+---@field steps? string[] Step identifiers to remove from data.completed_steps array
+---@field fields? string[] Top-level field names to delete from data table
+
+---@class AlcStateResetResult
+---@field ok boolean Always true on success (errors raise instead)
+---@field backup_path string Absolute path to the .bak snapshot created before mutation
+---@field steps_removed integer Count of step identifiers actually removed
+---@field fields_removed integer Count of fields actually removed
+
+--- List keys (file basenames without .json) under the dispatched layout
+--- `{state_root}/{namespace}/*.json`. Namespace must be a safe segment
+--- (alphanumerics, _, -, .). Returned keys are sorted lexicographically.
+---@param namespace string Namespace directory name
+---@return string[] keys Sorted list of keys
+function alc.state.list(namespace) end
+
+--- Read the full JSON value at `{state_root}/{namespace}/{key}.json`.
+--- Raises a typed error if the key does not exist (error message contains
+--- "not found"). Namespace and key must be safe segments.
+---@param namespace string Namespace directory name
+---@param key string Key (file basename without .json)
+---@return table value Full JSON content as a Lua table
+function alc.state.show(namespace, key) end
+
+--- Atomically mutate the JSON file at `{state_root}/{namespace}/{key}.json`:
+--- (1) copy current file to `{key}.json.bak`, (2) remove specified steps from
+--- `data.completed_steps` array, (3) delete specified fields from `data`
+--- table, (4) write via tempfile + rename. Returns a result table with the
+--- backup path and removal counts.
+---@param namespace string Namespace directory name
+---@param key string Key (file basename without .json)
+---@param opts? AlcStateResetOpts Steps and fields to remove
+---@return AlcStateResetResult result Reset summary
+function alc.state.reset(namespace, key, opts) end
+
 -- Text ---
 
 ---@class AlcChunkOpts

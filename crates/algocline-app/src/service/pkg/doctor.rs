@@ -1,7 +1,7 @@
 //! `pkg_doctor` — read-only diagnosis for package state (Wave 2 of local-first DX).
 //!
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
-//! classifies packages into five buckets without touching the filesystem:
+//! classifies packages into seven buckets without touching the filesystem:
 //!
 //! | Bucket              | Source-of-truth                                         | Condition                                          |
 //! |---------------------|---------------------------------------------------------|----------------------------------------------------|
@@ -11,6 +11,8 @@
 //! | `path_missing`      | `alc.toml` / `alc.local.toml`                           | declared `path = ...` does not exist               |
 //! | `incomplete_pkg`    | `installed.json` + `{pkg_dir}/{name}/init.lua`          | init.lua requires sibling sub (`pkg.sub`) but      |
 //! |                     |                                                         | `sub.lua` / `sub/init.lua` is missing              |
+//! | `missing_meta`      | `{pkg_dir}/{name}/init.lua`                             | init.lua absent or does not declare `M.meta.name`  |
+//! | `missing_hub_index` | `{project_root}/hub_index.json`                         | collection root has 2+ pkg dirs but no index file  |
 //!
 //! Contract:
 //! - **No side effects.** No `fs::write`, `fs::remove_*`, `fs::create_*`,
@@ -19,13 +21,13 @@
 //!   logic authoritative in one place (symlink-dangling suggestion wording and
 //!   the path-missing scan in particular).
 //!
-//! The JSON output schema always contains five top-level buckets:
-//! `healthy`, `incomplete_pkg`, `installed_missing`, `path_missing`,
-//! `symlink_dangling`. The `narrative_issues` bucket was removed in
-//! #1778221491-39903 (narrative SSOT decommission). Key order within the
-//! serialized string follows `serde_json`'s default (alphabetical when
-//! `preserve_order` is off, as it is
-//! in this workspace) — the contract is "these five keys always present", not
+//! The JSON output schema always contains seven top-level buckets:
+//! `healthy`, `incomplete_pkg`, `installed_missing`, `missing_hub_index`,
+//! `missing_meta`, `path_missing`, `symlink_dangling`. The `narrative_issues`
+//! bucket was removed in #1778221491-39903 (narrative SSOT decommission).
+//! Key order within the serialized string follows `serde_json`'s default
+//! (alphabetical when `preserve_order` is off, as it is
+//! in this workspace) — the contract is "these seven keys always present", not
 //! textual ordering.
 //!
 //! ## `incomplete_pkg` detection
@@ -39,6 +41,7 @@
 
 use std::path::Path;
 
+use algocline_core::PkgEntity;
 use tracing::warn;
 
 use super::super::manifest::{load_manifest, Manifest, ManifestEntry};
@@ -65,6 +68,9 @@ enum DoctorOutcome {
         missing_subs: Vec<String>,
         suggestion: String,
     },
+    /// Package directory exists but `init.lua` does not declare a valid
+    /// `M.meta.name` field (parse failure, missing field, or absent file).
+    MissingMeta { reason: String, suggestion: String },
 }
 
 /// Accumulator for the JSON output buckets.
@@ -75,6 +81,8 @@ struct DoctorBuckets {
     symlink_dangling: Vec<serde_json::Value>,
     path_missing: Vec<serde_json::Value>,
     incomplete_pkg: Vec<serde_json::Value>,
+    missing_meta: Vec<serde_json::Value>,
+    missing_hub_index: Vec<serde_json::Value>,
 }
 
 impl DoctorBuckets {
@@ -84,6 +92,8 @@ impl DoctorBuckets {
             || !self.symlink_dangling.is_empty()
             || !self.path_missing.is_empty()
             || !self.incomplete_pkg.is_empty()
+            || !self.missing_meta.is_empty()
+            || !self.missing_hub_index.is_empty()
     }
 
     fn into_json(self) -> String {
@@ -94,6 +104,8 @@ impl DoctorBuckets {
             "healthy": self.healthy,
             "incomplete_pkg": self.incomplete_pkg,
             "installed_missing": self.installed_missing,
+            "missing_hub_index": self.missing_hub_index,
+            "missing_meta": self.missing_meta,
             "symlink_dangling": self.symlink_dangling,
             "path_missing": self.path_missing,
         })
@@ -236,6 +248,14 @@ fn push_doctor_outcome(name: &str, outcome: DoctorOutcome, buckets: &mut DoctorB
             "missing_subs": missing_subs,
             "suggestion": suggestion,
         })),
+        DoctorOutcome::MissingMeta { reason, suggestion } => {
+            buckets.missing_meta.push(serde_json::json!({
+                "name": name,
+                "kind": "missing_meta",
+                "reason": reason,
+                "suggestion": suggestion,
+            }))
+        }
     }
 }
 
@@ -288,6 +308,31 @@ fn check_incomplete(name: &str, dest: &Path, is_symlink: bool) -> Option<DoctorO
     })
 }
 
+/// Check whether the package at `dest` has a valid `M.meta.name` declaration
+/// in its `init.lua`.
+///
+/// Uses [`PkgEntity::parse_from_init_lua`], which returns `None` for IO
+/// errors, parse failures, or a missing/empty `M.meta` block. All three cases
+/// are treated as `missing_meta` (the best-effort contract of the core parser).
+///
+/// Returns `Some(DoctorOutcome::MissingMeta { .. })` when `parse_from_init_lua`
+/// returns `None`; `None` when the package metadata is present and valid.
+fn check_missing_meta(name: &str, dest: &Path) -> Option<DoctorOutcome> {
+    let init_lua = dest.join("init.lua");
+    if PkgEntity::parse_from_init_lua(&init_lua).is_some() {
+        return None;
+    }
+    Some(DoctorOutcome::MissingMeta {
+        reason: format!("init.lua at {} lacks M.meta.name", init_lua.display()),
+        suggestion: format!(
+            "Package directory at {} lacks M.meta.name in init.lua — \
+             run alc_pkg_install --force {name:?} or fix init.lua to declare \
+             M.meta = {{ name = ..., version = ... }}",
+            dest.display()
+        ),
+    })
+}
+
 /// Classify a manifest entry by inspecting only the destination directory.
 /// Mirrors the pre-install branch of [`super::repair::repair_installed`] but
 /// never attempts an install.
@@ -312,9 +357,12 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
             }
         };
         if target_alive {
-            // Symlink alive — check for missing submodule files.
+            // Symlink alive — check for missing submodule files, then meta.
             if let Some(incomplete) = check_incomplete(name, &dest, true) {
                 return incomplete;
+            }
+            if let Some(mm) = check_missing_meta(name, &dest) {
+                return mm;
             }
             return DoctorOutcome::Healthy;
         }
@@ -332,9 +380,12 @@ fn classify_installed(name: &str, entry: &ManifestEntry, pkg_dir: &Path) -> Doct
     }
 
     if dest.exists() {
-        // Directory exists — check for missing submodule files.
+        // Directory exists — check for missing submodule files, then meta.
         if let Some(incomplete) = check_incomplete(name, &dest, false) {
             return incomplete;
+        }
+        if let Some(mm) = check_missing_meta(name, &dest) {
+            return mm;
         }
         return DoctorOutcome::Healthy;
     }
@@ -410,15 +461,87 @@ fn run_path_missing_pass(
     buckets.path_missing.extend(scratch);
 }
 
+/// Scan the collection project root for a missing `hub_index.json`.
+///
+/// Fires when **all three** conditions hold:
+/// 1. Called only when `target_filter` is `None` and `resolved_root` is `Some`
+///    (enforced by the caller in [`AppService::pkg_doctor`]).
+/// 2. Two or more direct subdirectories of `root` each contain an `init.lua`
+///    file (collection-repo heuristic — single-pkg repos have fewer than 2).
+/// 3. `{root}/hub_index.json` does not exist.
+///
+/// All `fs` errors are propagated through `?` to the MCP wire layer; none are
+/// silently swallowed.
+///
+/// # Errors
+///
+/// Returns `Err(String)` when `fs::read_dir`, `DirEntry::file_type`, or
+/// `Path::try_exists` fails. The error message carries enough context to
+/// identify which path triggered the failure.
+fn run_hub_index_pass(root: &Path, buckets: &mut DoctorBuckets) -> Result<(), String> {
+    let mut pkg_count = 0usize;
+    let entries = std::fs::read_dir(root).map_err(|e| {
+        format!(
+            "hub_index_pass: failed to read project_root {}: {e}",
+            root.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("hub_index_pass: failed to read dir entry: {e}"))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("hub_index_pass: failed to read file_type: {e}"))?;
+        if !ft.is_dir() {
+            continue;
+        }
+        let init_lua = entry.path().join("init.lua");
+        let exists = init_lua.try_exists().map_err(|e| {
+            format!(
+                "hub_index_pass: try_exists failed for {}: {e}",
+                init_lua.display()
+            )
+        })?;
+        if exists {
+            pkg_count += 1;
+        }
+    }
+    if pkg_count < 2 {
+        return Ok(());
+    }
+    let hub_index = root.join("hub_index.json");
+    let has_index = hub_index.try_exists().map_err(|e| {
+        format!(
+            "hub_index_pass: try_exists failed for {}: {e}",
+            hub_index.display()
+        )
+    })?;
+    if has_index {
+        return Ok(());
+    }
+    buckets.missing_hub_index.push(serde_json::json!({
+        "kind": "missing_hub_index",
+        "project_root": root.display().to_string(),
+        "pkg_count": pkg_count,
+        "suggestion": format!(
+            "Collection project root contains {pkg_count} package dirs but \
+             {}/hub_index.json is missing — run alc_hub_reindex --source_dir {} \
+             to generate it",
+            root.display(),
+            root.display()
+        ),
+    }));
+    Ok(())
+}
+
 impl AppService {
     /// Diagnose package state without any side effects. Returns a JSON string
-    /// with five arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
-    /// `symlink_dangling`, `path_missing`).
+    /// with seven arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
+    /// `missing_hub_index`, `missing_meta`, `symlink_dangling`, `path_missing`).
     ///
     /// `name` restricts the report to a single package; `None` inspects every
     /// known package. `project_root` is only consulted for the
-    /// `alc.toml` / `alc.local.toml` pass. Falls back to ancestor walk from
-    /// cwd when `None`.
+    /// `alc.toml` / `alc.local.toml` pass and the `missing_hub_index` scan.
+    /// Falls back to ancestor walk from cwd when `None`.
     ///
     /// Error surface matches `pkg_repair`:
     /// - `load_manifest()` / `packages_dir()` failures propagate via `?`.
@@ -426,6 +549,8 @@ impl AppService {
     ///   are logged via `tracing::warn!` and skipped (helper's behavior).
     /// - `init.lua` read errors during the incomplete check are logged via
     ///   `tracing::warn!` and skipped (best-effort, no propagation).
+    /// - `fs::read_dir` / `try_exists` errors inside `run_hub_index_pass`
+    ///   propagate via `?` (collection-root scan requires reliable fs access).
     /// - When `name = Some(target)` and every bucket ends empty, returns
     ///   `Err` with the same wording used by `pkg_repair`.
     pub async fn pkg_doctor(
@@ -443,6 +568,11 @@ impl AppService {
         run_manifest_pass(&manifest, target_filter, &pkg_dir, &mut buckets);
         run_unattached_symlink_pass(&pkg_dir, target_filter, &manifest, &mut buckets);
         run_path_missing_pass(resolved_root.as_deref(), target_filter, &mut buckets);
+        if target_filter.is_none() {
+            if let Some(ref root) = resolved_root {
+                run_hub_index_pass(root, &mut buckets)?;
+            }
+        }
 
         if let Some(target) = target_filter {
             if !buckets.any_matched() {
@@ -479,7 +609,14 @@ mod tests {
     fn classify_installed_healthy_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let pkg_dir = tmp.path();
-        std::fs::create_dir(pkg_dir.join("p")).unwrap();
+        let dest = pkg_dir.join("p");
+        std::fs::create_dir(&dest).unwrap();
+        // init.lua with valid M.meta so check_missing_meta does not fire.
+        std::fs::write(
+            dest.join("init.lua"),
+            "local M = {} M.meta = { name = \"p\", version = \"0.1.0\" } return M",
+        )
+        .unwrap();
 
         let outcome = classify_installed("p", &mk_entry("/src/p"), pkg_dir);
         assert!(matches!(outcome, DoctorOutcome::Healthy));
@@ -538,6 +675,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let real_target = tmp.path().join("real_target_dir");
         std::fs::create_dir(&real_target).unwrap();
+        // init.lua with valid M.meta so check_missing_meta does not fire.
+        std::fs::write(
+            real_target.join("init.lua"),
+            "local M = {} M.meta = { name = \"q\", version = \"0.1.0\" } return M",
+        )
+        .unwrap();
 
         let pkg_dir = tmp.path().join("pkgs");
         std::fs::create_dir(&pkg_dir).unwrap();
@@ -548,11 +691,11 @@ mod tests {
     }
 
     #[test]
-    fn buckets_into_json_emits_all_five_keys() {
+    fn buckets_into_json_emits_all_seven_keys() {
         // NOTE: `serde_json` without the `preserve_order` feature emits JSON
         // object keys in alphabetical order, matching `pkg_repair`'s actual
         // behavior. The spec's "fixed order" requirement is satisfied by
-        // always emitting these five top-level keys; consumers parse as a
+        // always emitting these seven top-level keys; consumers parse as a
         // Map rather than relying on textual key order.
         //
         // Note: `narrative_issues` bucket removed in #1778221491-39903.
@@ -566,6 +709,10 @@ mod tests {
             .push(serde_json::json!({"name": "p", "kind": "path_missing"}));
         b.incomplete_pkg
             .push(serde_json::json!({"name": "c", "kind": "incomplete_pkg"}));
+        b.missing_meta
+            .push(serde_json::json!({"name": "m", "kind": "missing_meta"}));
+        b.missing_hub_index
+            .push(serde_json::json!({"kind": "missing_hub_index", "project_root": "/r"}));
 
         let out = b.into_json();
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
@@ -575,13 +722,17 @@ mod tests {
         assert!(obj.contains_key("symlink_dangling"));
         assert!(obj.contains_key("path_missing"));
         assert!(obj.contains_key("incomplete_pkg"));
-        assert_eq!(obj.len(), 5, "exactly five top-level buckets: {out}");
+        assert!(obj.contains_key("missing_meta"));
+        assert!(obj.contains_key("missing_hub_index"));
+        assert_eq!(obj.len(), 7, "exactly seven top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
         assert_eq!(obj["symlink_dangling"][0]["name"], "s");
         assert_eq!(obj["path_missing"][0]["name"], "p");
         assert_eq!(obj["incomplete_pkg"][0]["name"], "c");
+        assert_eq!(obj["missing_meta"][0]["name"], "m");
+        assert_eq!(obj["missing_hub_index"][0]["project_root"], "/r");
     }
 
     #[test]
@@ -606,6 +757,170 @@ mod tests {
         let mut b = DoctorBuckets::default();
         b.incomplete_pkg.push(serde_json::json!({}));
         assert!(b.any_matched());
+
+        let mut b = DoctorBuckets::default();
+        b.missing_meta.push(serde_json::json!({}));
+        assert!(b.any_matched());
+
+        let mut b = DoctorBuckets::default();
+        b.missing_hub_index.push(serde_json::json!({}));
+        assert!(b.any_matched());
+    }
+
+    // ── missing_meta ─────────────────────────────────────────────────────
+
+    /// T1 (happy path): a package directory whose init.lua omits `M.meta`
+    /// entirely is classified as `MissingMeta`.
+    #[test]
+    fn classify_installed_missing_meta_when_init_lua_lacks_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path();
+        let dest = pkg_dir.join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        // init.lua present but declares no M.meta block.
+        std::fs::write(dest.join("init.lua"), "local M = {} return M").unwrap();
+
+        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        match outcome {
+            DoctorOutcome::MissingMeta { reason, suggestion } => {
+                assert!(reason.contains("lacks M.meta.name"), "reason: {reason}");
+                assert!(
+                    suggestion.contains("alc_pkg_install"),
+                    "suggestion: {suggestion}"
+                );
+                assert!(
+                    suggestion.contains("mypkg"),
+                    "suggestion carries name: {suggestion}"
+                );
+            }
+            _ => panic!("expected MissingMeta, got {outcome:?}"),
+        }
+    }
+
+    /// T2 (edge case): `M.meta = {{ name = "" }}` — empty name string —
+    /// is treated as missing meta (parse_from_init_lua returns None for empty
+    /// name via option_from_str).
+    #[test]
+    fn classify_installed_missing_meta_when_init_lua_has_empty_meta_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path();
+        let dest = pkg_dir.join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        // M.meta with an empty name string.
+        std::fs::write(
+            dest.join("init.lua"),
+            "local M = {} M.meta = { name = \"\", version = \"0.1.0\" } return M",
+        )
+        .unwrap();
+
+        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        assert!(
+            matches!(outcome, DoctorOutcome::MissingMeta { .. }),
+            "expected MissingMeta for empty name, got {outcome:?}"
+        );
+    }
+
+    /// T3 (no false positive): a complete init.lua with a valid `M.meta.name`
+    /// must not trigger `MissingMeta`.
+    #[test]
+    fn classify_installed_no_missing_meta_when_init_lua_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path();
+        let dest = pkg_dir.join("mypkg");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(
+            dest.join("init.lua"),
+            "local M = {} M.meta = { name = \"mypkg\", version = \"0.1.0\" } return M",
+        )
+        .unwrap();
+
+        let outcome = classify_installed("mypkg", &mk_entry("/src/mypkg"), pkg_dir);
+        assert!(
+            matches!(outcome, DoctorOutcome::Healthy),
+            "expected Healthy for complete init.lua, got {outcome:?}"
+        );
+    }
+
+    // ── run_hub_index_pass ────────────────────────────────────────────────
+
+    /// T1 (happy path): two subdirectories each containing init.lua, with no
+    /// hub_index.json in the root — emits one `missing_hub_index` entry.
+    #[test]
+    fn run_hub_index_pass_emits_when_2_plus_pkgs_and_index_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Two package dirs each with init.lua.
+        for name in &["pkg_a", "pkg_b"] {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("init.lua"), "return {}").unwrap();
+        }
+        // hub_index.json intentionally absent.
+
+        let mut buckets = DoctorBuckets::default();
+        run_hub_index_pass(root, &mut buckets).expect("run_hub_index_pass must not error");
+
+        assert_eq!(
+            buckets.missing_hub_index.len(),
+            1,
+            "expected 1 missing_hub_index entry: {:?}",
+            buckets.missing_hub_index
+        );
+        let entry = &buckets.missing_hub_index[0];
+        assert_eq!(entry["kind"], "missing_hub_index");
+        assert_eq!(entry["pkg_count"], 2);
+        assert!(
+            entry["suggestion"]
+                .as_str()
+                .unwrap_or("")
+                .contains("alc_hub_reindex"),
+            "suggestion: {entry}"
+        );
+    }
+
+    /// T2 (boundary): only one package dir with init.lua — heuristic requires
+    /// 2+, so no entry is emitted.
+    #[test]
+    fn run_hub_index_pass_skips_when_only_1_pkg_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("pkg_a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("init.lua"), "return {}").unwrap();
+        // No hub_index.json — but only 1 pkg dir, so must NOT fire.
+
+        let mut buckets = DoctorBuckets::default();
+        run_hub_index_pass(root, &mut buckets).expect("run_hub_index_pass must not error");
+
+        assert!(
+            buckets.missing_hub_index.is_empty(),
+            "must not emit with only 1 pkg dir: {:?}",
+            buckets.missing_hub_index
+        );
+    }
+
+    /// T3 (error path guard): two package dirs but hub_index.json already
+    /// exists — no entry is emitted.
+    #[test]
+    fn run_hub_index_pass_skips_when_hub_index_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in &["pkg_a", "pkg_b"] {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("init.lua"), "return {}").unwrap();
+        }
+        // hub_index.json present.
+        std::fs::write(root.join("hub_index.json"), "{}").unwrap();
+
+        let mut buckets = DoctorBuckets::default();
+        run_hub_index_pass(root, &mut buckets).expect("run_hub_index_pass must not error");
+
+        assert!(
+            buckets.missing_hub_index.is_empty(),
+            "must not emit when hub_index.json exists: {:?}",
+            buckets.missing_hub_index
+        );
     }
 
     #[test]
@@ -860,14 +1175,18 @@ return {}
 
     #[test]
     fn classify_installed_healthy_when_all_subs_present() {
-        // classify_installed should return Healthy when all required subs exist.
+        // classify_installed should return Healthy when all required subs exist
+        // and M.meta is declared in init.lua.
         let tmp = tempfile::tempdir().unwrap();
         let pkg_dir = tmp.path();
         let dest = pkg_dir.join("mypkg");
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(
             dest.join("init.lua"),
-            r#"local x = require("mypkg.sub") return {}"#,
+            "local M = {}\n\
+             M.meta = { name = \"mypkg\", version = \"0.1.0\" }\n\
+             local x = require(\"mypkg.sub\")\n\
+             return M",
         )
         .unwrap();
         std::fs::write(dest.join("sub.lua"), "return {}").unwrap();

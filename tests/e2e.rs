@@ -6300,3 +6300,47 @@ return M"#
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// Defect path: hub_cache/{hash}.json with mtime > CACHE_TTL_SECS (3600s)
+/// → `stale_cache` bucket with the file path and age_secs.
+///
+/// Fixture: place a `.json` file under {ALC_HOME}/hub_cache/ with mtime
+/// backdated to 2h ago via std::fs::FileTimes.
+#[tokio::test]
+async fn test_pkg_doctor_stale_cache_detected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_dir = tmp.path().join("hub_cache");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir hub_cache");
+    let stale_path = cache_dir.join("deadbeef00000000.json");
+    std::fs::write(&stale_path, r#"{"entries":[]}"#).expect("write cache");
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    let times = std::fs::FileTimes::new().set_modified(past);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale_path)
+        .expect("open for backdate");
+    f.set_times(times).expect("set_times");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+    let resp = call_json(&client, "alc_pkg_doctor", json!({})).await;
+
+    let stale = resp["stale_cache"]
+        .as_array()
+        .expect("stale_cache array missing");
+    assert_eq!(stale.len(), 1, "expected 1 stale_cache entry: {resp}");
+    let entry = &stale[0];
+    assert_eq!(entry["kind"], "stale_cache");
+    assert!(
+        entry["path"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("deadbeef00000000.json"),
+        "path mismatch: {entry}"
+    );
+    assert!(
+        entry["age_secs"].as_u64().unwrap_or(0) >= 7200,
+        "age_secs too small: {entry}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

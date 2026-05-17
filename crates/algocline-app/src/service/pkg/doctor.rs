@@ -1,13 +1,15 @@
 //! `pkg_doctor` — read-only diagnosis for package state (Wave 2 of local-first DX).
 //!
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
-//! classifies packages into seven buckets without touching the filesystem:
+//! classifies packages into eight buckets without touching the filesystem:
 //!
 //! | Bucket              | Source-of-truth                                         | Condition                                          |
 //! |---------------------|---------------------------------------------------------|----------------------------------------------------|
 //! | `healthy`           | `installed.json` + `~/.algocline/packages/{name}`       | dest directory exists (resolved through symlinks)  |
 //! | `installed_missing` | `installed.json`                                        | dest missing (non-symlink), `pkg_install` can heal |
 //! | `symlink_dangling`  | `installed.json` (manifest-pass) + filesystem scan      | dest is a symlink whose target is missing          |
+//! | `stale_cache`       | `~/.algocline/hub_cache/{hash}.json`                    | mtime older than 3600s (CACHE_TTL_SECS); refresh   |
+//! |                     |                                                         | via alc_hub_search                                 |
 //! | `path_missing`      | `alc.toml` / `alc.local.toml`                           | declared `path = ...` does not exist               |
 //! | `incomplete_pkg`    | `installed.json` + `{pkg_dir}/{name}/init.lua`          | init.lua requires sibling sub (`pkg.sub`) but      |
 //! |                     |                                                         | `sub.lua` / `sub/init.lua` is missing              |
@@ -21,13 +23,13 @@
 //!   logic authoritative in one place (symlink-dangling suggestion wording and
 //!   the path-missing scan in particular).
 //!
-//! The JSON output schema always contains seven top-level buckets:
+//! The JSON output schema always contains eight top-level buckets:
 //! `healthy`, `incomplete_pkg`, `installed_missing`, `missing_hub_index`,
-//! `missing_meta`, `path_missing`, `symlink_dangling`. The `narrative_issues`
+//! `missing_meta`, `path_missing`, `stale_cache`, `symlink_dangling`. The `narrative_issues`
 //! bucket was removed in #1778221491-39903 (narrative SSOT decommission).
 //! Key order within the serialized string follows `serde_json`'s default
 //! (alphabetical when `preserve_order` is off, as it is
-//! in this workspace) — the contract is "these seven keys always present", not
+//! in this workspace) — the contract is "these eight keys always present", not
 //! textual ordering.
 //!
 //! ## `incomplete_pkg` detection
@@ -52,6 +54,11 @@ use super::repair::{
     collect_path_missing, collect_unattached_dangling_symlinks, symlink_dangling_suggestion,
     ProjectPathSource,
 };
+
+/// Same TTL discipline as `hub::CACHE_TTL_SECS` (hub.rs:96).
+/// Both consts must be kept in sync; if you change one, change the other.
+/// (hub's const is module-private, so we redefine here instead of importing.)
+const DOCTOR_CACHE_TTL_SECS: u64 = 3600;
 
 /// Classification of a single manifest-tracked package (read-only).
 #[derive(Debug)]
@@ -83,6 +90,7 @@ struct DoctorBuckets {
     incomplete_pkg: Vec<serde_json::Value>,
     missing_meta: Vec<serde_json::Value>,
     missing_hub_index: Vec<serde_json::Value>,
+    stale_cache: Vec<serde_json::Value>,
 }
 
 impl DoctorBuckets {
@@ -94,6 +102,7 @@ impl DoctorBuckets {
             || !self.incomplete_pkg.is_empty()
             || !self.missing_meta.is_empty()
             || !self.missing_hub_index.is_empty()
+            || !self.stale_cache.is_empty()
     }
 
     fn into_json(self) -> String {
@@ -106,8 +115,9 @@ impl DoctorBuckets {
             "installed_missing": self.installed_missing,
             "missing_hub_index": self.missing_hub_index,
             "missing_meta": self.missing_meta,
-            "symlink_dangling": self.symlink_dangling,
             "path_missing": self.path_missing,
+            "stale_cache": self.stale_cache,
+            "symlink_dangling": self.symlink_dangling,
         })
         .to_string()
     }
@@ -533,10 +543,87 @@ fn run_hub_index_pass(root: &Path, buckets: &mut DoctorBuckets) -> Result<(), St
     Ok(())
 }
 
+/// Scan `cache_dir` (= `~/.algocline/hub_cache/`) for `*.json` files whose
+/// mtime is older than `DOCTOR_CACHE_TTL_SECS` (3600s) and emit one
+/// `stale_cache` entry per stale file. Skips when `cache_dir` does not
+/// exist (cache miss = first run = normal, not an error).
+///
+/// `mtime` retrieval failures (`metadata.modified()` / `.elapsed()`) are
+/// treated as "judgment impossible → safe-side fresh" and the file is
+/// skipped, *not* silently dropped. This is an explicit cross-platform
+/// fallback (older filesystems may not support `modified()`, and a system
+/// clock that drifted earlier than the file's mtime produces
+/// `SystemTimeError` from `.elapsed()`).
+///
+/// Returns `Err(String)` when `try_exists` / `read_dir` / `file_type` /
+/// `metadata` fail (these are judgment-critical fs ops; silent drop would
+/// produce false negatives).
+fn run_stale_cache_pass(cache_dir: &Path, buckets: &mut DoctorBuckets) -> Result<(), String> {
+    let exists = cache_dir.try_exists().map_err(|e| {
+        format!(
+            "stale_cache_pass: try_exists failed for {}: {e}",
+            cache_dir.display()
+        )
+    })?;
+    if !exists {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(cache_dir).map_err(|e| {
+        format!(
+            "stale_cache_pass: failed to read_dir {}: {e}",
+            cache_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("stale_cache_pass: failed to read dir entry: {e}"))?;
+        let ft = entry.file_type().map_err(|e| {
+            format!(
+                "stale_cache_pass: failed to read file_type for {}: {e}",
+                entry.path().display()
+            )
+        })?;
+        if !ft.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|e| {
+            format!(
+                "stale_cache_pass: failed to read metadata for {}: {e}",
+                path.display()
+            )
+        })?;
+        // mtime retrieval — `.ok()` here is intentional cross-platform
+        // fallback (see fn doc), not a silent error drop.
+        let Some(modified) = metadata.modified().ok() else {
+            continue;
+        };
+        let Some(age) = modified.elapsed().ok() else {
+            continue;
+        };
+        if age.as_secs() <= DOCTOR_CACHE_TTL_SECS {
+            continue;
+        }
+        buckets.stale_cache.push(serde_json::json!({
+            "kind": "stale_cache",
+            "path": path.display().to_string(),
+            "age_secs": age.as_secs(),
+            "suggestion": format!(
+                "Run alc_hub_search to refresh stale cache (>{DOCTOR_CACHE_TTL_SECS}s old)"
+            ),
+        }));
+    }
+    Ok(())
+}
+
 impl AppService {
     /// Diagnose package state without any side effects. Returns a JSON string
-    /// with seven arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
-    /// `missing_hub_index`, `missing_meta`, `symlink_dangling`, `path_missing`).
+    /// with eight arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
+    /// `missing_hub_index`, `missing_meta`, `path_missing`, `stale_cache`,
+    /// `symlink_dangling`).
     ///
     /// `name` restricts the report to a single package; `None` inspects every
     /// known package. `project_root` is only consulted for the
@@ -551,6 +638,9 @@ impl AppService {
     ///   `tracing::warn!` and skipped (best-effort, no propagation).
     /// - `fs::read_dir` / `try_exists` errors inside `run_hub_index_pass`
     ///   propagate via `?` (collection-root scan requires reliable fs access).
+    /// - `try_exists` / `read_dir` / `file_type` / `metadata` errors inside
+    ///   `run_stale_cache_pass` propagate via `?`. `metadata.modified()` and
+    ///   `.elapsed()` failures (cross-platform fallback) skip the file.
     /// - When `name = Some(target)` and every bucket ends empty, returns
     ///   `Err` with the same wording used by `pkg_repair`.
     pub async fn pkg_doctor(
@@ -569,6 +659,7 @@ impl AppService {
         run_unattached_symlink_pass(&pkg_dir, target_filter, &manifest, &mut buckets);
         run_path_missing_pass(resolved_root.as_deref(), target_filter, &mut buckets);
         if target_filter.is_none() {
+            run_stale_cache_pass(&app_dir.hub_cache_dir(), &mut buckets)?;
             if let Some(ref root) = resolved_root {
                 run_hub_index_pass(root, &mut buckets)?;
             }
@@ -691,11 +782,11 @@ mod tests {
     }
 
     #[test]
-    fn buckets_into_json_emits_all_seven_keys() {
+    fn buckets_into_json_emits_all_eight_keys() {
         // NOTE: `serde_json` without the `preserve_order` feature emits JSON
         // object keys in alphabetical order, matching `pkg_repair`'s actual
         // behavior. The spec's "fixed order" requirement is satisfied by
-        // always emitting these seven top-level keys; consumers parse as a
+        // always emitting these eight top-level keys; consumers parse as a
         // Map rather than relying on textual key order.
         //
         // Note: `narrative_issues` bucket removed in #1778221491-39903.
@@ -713,6 +804,8 @@ mod tests {
             .push(serde_json::json!({"name": "m", "kind": "missing_meta"}));
         b.missing_hub_index
             .push(serde_json::json!({"kind": "missing_hub_index", "project_root": "/r"}));
+        b.stale_cache
+            .push(serde_json::json!({"kind": "stale_cache", "path": "/p", "age_secs": 7200}));
 
         let out = b.into_json();
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
@@ -724,7 +817,8 @@ mod tests {
         assert!(obj.contains_key("incomplete_pkg"));
         assert!(obj.contains_key("missing_meta"));
         assert!(obj.contains_key("missing_hub_index"));
-        assert_eq!(obj.len(), 7, "exactly seven top-level buckets: {out}");
+        assert!(obj.contains_key("stale_cache"));
+        assert_eq!(obj.len(), 8, "exactly eight top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
@@ -733,6 +827,7 @@ mod tests {
         assert_eq!(obj["incomplete_pkg"][0]["name"], "c");
         assert_eq!(obj["missing_meta"][0]["name"], "m");
         assert_eq!(obj["missing_hub_index"][0]["project_root"], "/r");
+        assert_eq!(obj["stale_cache"][0]["path"], "/p");
     }
 
     #[test]
@@ -765,6 +860,88 @@ mod tests {
         let mut b = DoctorBuckets::default();
         b.missing_hub_index.push(serde_json::json!({}));
         assert!(b.any_matched());
+
+        let mut b = DoctorBuckets::default();
+        b.stale_cache.push(serde_json::json!({}));
+        assert!(b.any_matched());
+    }
+
+    // ── stale_cache ──────────────────────────────────────────────────────
+
+    #[test]
+    fn run_stale_cache_pass_emits_when_file_older_than_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path();
+        let stale_file = cache_dir.join("abc123.json");
+        std::fs::write(&stale_file, "{}").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let times = std::fs::FileTimes::new().set_modified(past);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale_file)
+            .unwrap();
+        f.set_times(times).unwrap();
+
+        let mut buckets = DoctorBuckets::default();
+        run_stale_cache_pass(cache_dir, &mut buckets).expect("must not error");
+        assert_eq!(
+            buckets.stale_cache.len(),
+            1,
+            "expected 1 stale entry: {:?}",
+            buckets.stale_cache
+        );
+        let entry = &buckets.stale_cache[0];
+        assert_eq!(entry["kind"], "stale_cache");
+        assert!(entry["path"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("abc123.json"));
+        assert!(entry["age_secs"].as_u64().unwrap_or(0) >= 7200);
+    }
+
+    #[test]
+    fn run_stale_cache_pass_no_emit_for_fresh_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path();
+        let fresh_file = cache_dir.join("xyz789.json");
+        std::fs::write(&fresh_file, "{}").unwrap();
+        let mut buckets = DoctorBuckets::default();
+        run_stale_cache_pass(cache_dir, &mut buckets).expect("must not error");
+        assert!(
+            buckets.stale_cache.is_empty(),
+            "expected no stale entries for fresh file"
+        );
+    }
+
+    #[test]
+    fn run_stale_cache_pass_skips_when_cache_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_dir = tmp.path().join("nonexistent_cache");
+        let mut buckets = DoctorBuckets::default();
+        run_stale_cache_pass(&missing_dir, &mut buckets).expect("absent dir must skip with Ok");
+        assert!(buckets.stale_cache.is_empty());
+    }
+
+    #[test]
+    fn run_stale_cache_pass_ignores_non_json_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path();
+        let garbage = cache_dir.join(".DS_Store");
+        std::fs::write(&garbage, "garbage").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let times = std::fs::FileTimes::new().set_modified(past);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&garbage)
+            .unwrap();
+        f.set_times(times).unwrap();
+
+        let mut buckets = DoctorBuckets::default();
+        run_stale_cache_pass(cache_dir, &mut buckets).expect("must not error");
+        assert!(
+            buckets.stale_cache.is_empty(),
+            "non-json files must be ignored"
+        );
     }
 
     // ── missing_meta ─────────────────────────────────────────────────────

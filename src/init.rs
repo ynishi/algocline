@@ -65,6 +65,18 @@ fn types_dir() -> anyhow::Result<PathBuf> {
     Ok(home.join(".algocline").join("types"))
 }
 
+/// Comment-only template written to `~/.algocline/config.toml` on first `alc init`.
+const CONFIG_TOML_TEMPLATE: &str = r#"# user-global algocline config
+#
+# Write [setting.<target>] tables here; read them via the
+# `alc_setting_resolve` MCP tool.
+#
+# Example:
+# [setting.journal]
+# path = "/Users/.../journal.md"
+# pkg  = false
+"#;
+
 /// LuaCats type definitions for editor completion (alc.d.lua).
 /// Embedded at compile time, distributed to ~/.algocline/types/ on init.
 const ALC_TYPE_STUB: &str = include_str!("../types/alc.d.lua");
@@ -108,8 +120,56 @@ fn print_luarc_guidance(types_path: &Path) {
     );
 }
 
+/// Write `~/.algocline/config.toml` from [`CONFIG_TOML_TEMPLATE`] if absent.
+///
+/// This is the public entrypoint used by [`finalize_init`]. It locates the
+/// user's home directory via `dirs::home_dir` and delegates to
+/// [`ensure_config_toml_template_at`].
+///
+/// # Errors
+///
+/// Returns an error if the home directory cannot be determined or if the
+/// underlying file-system write fails.
+fn ensure_config_toml_template() -> anyhow::Result<()> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let path = home.join(".algocline").join("config.toml");
+    ensure_config_toml_template_at(&path)
+}
+
+/// Write `CONFIG_TOML_TEMPLATE` to `path` unless the file already exists.
+///
+/// Idempotent: returns `Ok(())` without touching the file when it exists.
+/// Parent directories are created on demand.
+///
+/// # Arguments
+///
+/// * `path` - Destination path for the config template.
+///
+/// # Errors
+///
+/// Returns an error if the parent directory cannot be created or if the
+/// file write fails.
+fn ensure_config_toml_template_at(path: &std::path::Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, CONFIG_TOML_TEMPLATE)
+        .with_context(|| format!("write config.toml template at {}", path.display()))?;
+    eprintln!("installed: {}", path.display());
+    Ok(())
+}
+
 /// Distribute type stubs and print guidance. Non-fatal: warnings only on error.
 fn finalize_init() {
+    // Ensure ~/.algocline/config.toml template exists (touch-once, idempotent).
+    if let Err(e) = ensure_config_toml_template() {
+        eprintln!("Warning: failed to create config.toml template: {e}");
+    }
+
     match distribute_types() {
         Ok(DistributedTypes { alc, alc_shapes }) => {
             eprintln!("installed: {}", alc.display());
@@ -486,6 +546,70 @@ pub async fn run(args: &[String], force_override: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ensure_config_toml_template_at ────────────────────────────────────────
+
+    /// T1 (happy path): writes the template when the file does not exist.
+    #[test]
+    fn writes_template_when_absent() {
+        // unwrap: OS failure to create a temp directory is a fatal environment
+        // issue that cannot be recovered within the test.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        ensure_config_toml_template_at(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("[setting.<target>]"),
+            "template must contain example [setting.<target>] comment"
+        );
+        assert!(
+            content.contains("alc_setting_resolve"),
+            "template must reference alc_setting_resolve"
+        );
+    }
+
+    /// T2 (edge case): does not overwrite an existing file.
+    #[test]
+    fn does_not_overwrite_existing() {
+        // unwrap: same justification as writes_template_when_absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "existing content").unwrap();
+
+        ensure_config_toml_template_at(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "existing content",
+            "existing file must not be modified"
+        );
+    }
+
+    /// T3 (error path): returns an error when the parent directory cannot be
+    /// created because a file already occupies the path segment.
+    #[cfg(unix)]
+    #[test]
+    fn errors_when_parent_is_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // unwrap: same justification as writes_template_when_absent.
+        let tmp = tempfile::tempdir().unwrap();
+        // Place a regular file where the parent directory should be.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "block").unwrap();
+        let path = blocker.join("config.toml");
+
+        let result = ensure_config_toml_template_at(&path);
+        assert!(
+            result.is_err(),
+            "should fail when parent path is occupied by a file"
+        );
+        // Restore for cleanup
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    // ── existing tests ────────────────────────────────────────────────────────
 
     #[test]
     fn bundled_source_tags_are_valid_semver() {

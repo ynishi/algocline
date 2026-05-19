@@ -68,6 +68,15 @@ pub struct PoolStopParams {
     pub sid: Option<String>,
 }
 
+/// Parameters for `alc_setting_resolve`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SettingResolveParams {
+    /// When omitted, returns all `[setting.*]` tables across all layers.
+    /// When set, returns only the specified target (snake_case, e.g. `"journal"`).
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
 /// Host-reported token usage for an LLM call (MCP schema).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpTokenUsage {
@@ -2067,6 +2076,21 @@ impl AlcService {
     )]
     async fn info(&self) -> Result<String, String> {
         Ok(self.app.info().await)
+    }
+
+    /// Resolve `[setting.<target>]` config layered across env, project, and global TOML.
+    ///
+    /// Returns `{"resolved": {"<target>": {"<field>": <value>}}, "sources": {"<target>": {"<field>": "<layer>"}}}`
+    /// where `layer` is one of `"env"`, `"project"`, or `"global"`.
+    #[tool(
+        name = "alc_setting_resolve",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn setting_resolve(
+        &self,
+        Parameters(params): Parameters<SettingResolveParams>,
+    ) -> Result<String, String> {
+        self.app.setting_resolve(params.target).await
     }
 
     // ─── V2 execution tools ───────────────────────────────────────

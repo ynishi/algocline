@@ -1367,6 +1367,9 @@ mod tests {
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
+                async fn setting_resolve(&self, _target: Option<String>) -> Result<String, String> {
+                    Err($err.into())
+                }
             }
         };
     }
@@ -2029,6 +2032,9 @@ mod tests {
         ) -> Result<String, String> {
             Err("not configured".into())
         }
+        async fn setting_resolve(&self, _target: Option<String>) -> Result<String, String> {
+            Err("not configured".into())
+        }
     }
 
     fn make_fake_catalog(engine: FakeEngine) -> (ResourceCatalog, tempfile::TempDir) {
@@ -2363,6 +2369,9 @@ mod tests {
                 _search_paths: Option<Vec<String>>,
                 _project_root: Option<String>,
             ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn setting_resolve(&self, _target: Option<String>) -> Result<String, String> {
                 Err("noop".into())
             }
         }

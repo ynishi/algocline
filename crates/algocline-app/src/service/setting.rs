@@ -1,8 +1,3 @@
-// Public API items are consumed by the EngineApi impl and MCP tool layer
-// (algocline-app/src/service/engine_api_impl.rs + algocline-mcp/src/service.rs)
-// added in Subtask 2. Suppress dead_code lint until those callers are wired in.
-#![allow(dead_code)]
-
 //! `[setting.*]` generic config table — parse and field-level resolution.
 //!
 //! ## Resolution order (per-field, highest priority first)

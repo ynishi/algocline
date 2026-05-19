@@ -1,5 +1,6 @@
 pub(crate) mod alc_toml;
 mod error;
+pub(crate) mod setting;
 pub(crate) use error::{
     HubRegistriesError, PkgListError, ProjectFilesError, ServiceError, TranscriptError,
 };

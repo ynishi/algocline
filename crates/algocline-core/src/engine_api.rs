@@ -640,6 +640,27 @@ pub trait EngineApi: Send + Sync {
     /// when the package is unknown.
     async fn pkg_meta(&self, name: &str) -> Result<String, String>;
 
+    // ─── Settings ────────────────────────────────────────────
+
+    /// Resolve `[setting.<target>]` config across env, project (`alc.toml`/`alc.local.toml`),
+    /// and global (`~/.algocline/config.toml`) layers.
+    ///
+    /// Field-level merge: each field independently selects the highest-priority layer
+    /// that defines it (env > project > global). The returned JSON contains both the
+    /// resolved values and a per-field `sources` map identifying the winning layer.
+    ///
+    /// When `target` is `None`, all `[setting.*]` tables across all layers are returned.
+    /// When `target` is `Some(t)`, only the specified target (snake_case) is returned.
+    ///
+    /// Returns JSON string with shape:
+    /// ```json
+    /// {
+    ///   "resolved": { "journal": { "path": "...", "pkg": true } },
+    ///   "sources":  { "journal": { "path": "env",  "pkg": "global" } }
+    /// }
+    /// ```
+    async fn setting_resolve(&self, target: Option<String>) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

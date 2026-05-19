@@ -17,6 +17,10 @@ expression: redacted
       "source": "default"
     }
   ],
+  "settings": {
+    "resolved": {},
+    "sources": {}
+  },
   "tracing": "file + stderr",
   "version": "0.37.0"
 }

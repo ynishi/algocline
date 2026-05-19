@@ -6396,3 +6396,201 @@ return M"#,
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_setting_resolve ──────────────────────────────────────────────────────
+
+/// Connect with a specific ALC_HOME and additional env vars.
+///
+/// Used by `alc_setting_resolve` tests that need to inject `ALC_SETTING_*`
+/// env vars into the child server process without using `std::env::set_var`
+/// (which would affect the test process itself and cause cross-test pollution).
+async fn connect_with_alc_home_and_env(
+    alc_home: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let bin = std::env::var("CARGO_BIN_EXE_alc")
+        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
+    let packages_path = alc_home.join("packages");
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.env("ALC_HOME", alc_home)
+        .env("ALC_PACKAGES_PATH", &packages_path);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
+    ().serve(transport)
+        .await
+        .expect("failed to initialize MCP session")
+}
+
+/// Normal path (target absent): `alc_setting_resolve` with no target returns all
+/// `[setting.*]` tables merged across global config + project config.
+///
+/// Setup:
+///  - global config.toml:  `[setting.journal] path = "/global/j.md"`
+///                         `[setting.advisor] path = "/global/a.md"`
+///  - project alc.toml:    `[setting.journal] path = "/project/j.md"`
+///  - env override:        `ALC_SETTING_JOURNAL_PKG=true`
+///
+/// Assertions:
+///  - `resolved.journal.path` == "/project/j.md" (project wins over global)
+///  - `resolved.journal.pkg`  == true (env adds new field)
+///  - `resolved.advisor.path` == "/global/a.md" (global only)
+///  - `sources.journal.path`  == "project"
+///  - `sources.journal.pkg`   == "env"
+///  - `sources.advisor.path`  == "global"
+///  - both `resolved` and `sources` are present in the response (crux #3)
+#[tokio::test]
+async fn test_alc_setting_resolve_returns_all_when_target_absent() {
+    let alc_home_tmp = tempfile::tempdir().expect("alc_home tempdir");
+    let project_tmp = tempfile::tempdir().expect("project tempdir");
+
+    // Write global config.toml inside alc_home
+    std::fs::write(
+        alc_home_tmp.path().join("config.toml"),
+        "[setting.journal]\npath = \"/global/j.md\"\n\n[setting.advisor]\npath = \"/global/a.md\"\n",
+    )
+    .expect("write config.toml");
+
+    // Write project alc.toml
+    std::fs::write(
+        project_tmp.path().join("alc.toml"),
+        "[setting.journal]\npath = \"/project/j.md\"\n",
+    )
+    .expect("write alc.toml");
+
+    // Inject ALC_SETTING_JOURNAL_PKG=true and ALC_PROJECT_ROOT to the child process.
+    let client = connect_with_alc_home_and_env(
+        alc_home_tmp.path(),
+        &[
+            ("ALC_SETTING_JOURNAL_PKG", "true"),
+            (
+                "ALC_PROJECT_ROOT",
+                project_tmp.path().to_str().expect("project root utf8"),
+            ),
+        ],
+    )
+    .await;
+
+    let resp = call_json(&client, "alc_setting_resolve", json!({})).await;
+
+    // Both top-level keys must be present (crux #3: single-call contract)
+    assert!(
+        resp.get("resolved").is_some(),
+        "response must contain 'resolved', got: {resp}"
+    );
+    assert!(
+        resp.get("sources").is_some(),
+        "response must contain 'sources', got: {resp}"
+    );
+
+    // journal.path: project wins over global
+    assert_eq!(
+        resp["resolved"]["journal"]["path"].as_str(),
+        Some("/project/j.md"),
+        "project should win for journal.path, got: {resp}"
+    );
+    // journal.pkg: env adds new field
+    assert_eq!(
+        resp["resolved"]["journal"]["pkg"].as_bool(),
+        Some(true),
+        "env should add journal.pkg=true, got: {resp}"
+    );
+    // advisor.path: global only (no project override)
+    assert_eq!(
+        resp["resolved"]["advisor"]["path"].as_str(),
+        Some("/global/a.md"),
+        "global should provide advisor.path, got: {resp}"
+    );
+
+    // Sources attribution (crux #2: field-level)
+    assert_eq!(
+        resp["sources"]["journal"]["path"].as_str(),
+        Some("project"),
+        "journal.path source should be 'project', got: {resp}"
+    );
+    assert_eq!(
+        resp["sources"]["journal"]["pkg"].as_str(),
+        Some("env"),
+        "journal.pkg source should be 'env', got: {resp}"
+    );
+    assert_eq!(
+        resp["sources"]["advisor"]["path"].as_str(),
+        Some("global"),
+        "advisor.path source should be 'global', got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Normal path (target specified): `alc_setting_resolve` with `target="journal"` returns
+/// only the journal target — advisor must be absent.
+#[tokio::test]
+async fn test_alc_setting_resolve_target_filter() {
+    let alc_home_tmp = tempfile::tempdir().expect("alc_home tempdir");
+
+    // Write global config.toml with two targets
+    std::fs::write(
+        alc_home_tmp.path().join("config.toml"),
+        "[setting.journal]\npath = \"/global/j.md\"\n\n[setting.advisor]\nmodel = \"gpt4\"\n",
+    )
+    .expect("write config.toml");
+
+    let client = connect_with_alc_home(alc_home_tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_setting_resolve",
+        json!({ "target": "journal" }),
+    )
+    .await;
+
+    assert!(
+        resp["resolved"].get("journal").is_some(),
+        "resolved should contain 'journal', got: {resp}"
+    );
+    assert!(
+        resp["resolved"].get("advisor").is_none(),
+        "resolved must NOT contain 'advisor' when filtering for 'journal', got: {resp}"
+    );
+    assert!(
+        resp["sources"].get("journal").is_some(),
+        "sources should contain 'journal', got: {resp}"
+    );
+    assert!(
+        resp["sources"].get("advisor").is_none(),
+        "sources must NOT contain 'advisor' when filtering for 'journal', got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error path: `target="Invalid-Name"` (contains uppercase / hyphens) must return a
+/// typed `InvalidTarget` error propagated through the MCP wire layer.
+#[tokio::test]
+async fn test_alc_setting_resolve_rejects_invalid_target_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_setting_resolve",
+            json!({ "target": "Invalid-Name" }),
+        ))
+        .await
+        .expect("call_tool should not fail at transport level");
+
+    let is_error = result.is_error.unwrap_or(false);
+    let text = extract_text(&result);
+
+    assert!(
+        is_error,
+        "expected is_error=true for invalid target name, got is_error={is_error:?}, text: {text}"
+    );
+    assert!(
+        text.contains("invalid characters"),
+        "error message should mention 'invalid characters', got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

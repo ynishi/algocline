@@ -605,6 +605,26 @@ impl EngineApi for AppService {
             .map_err(|e| format!("hub_index_aggregate: serialize final: {e}"))
     }
 
+    // ─── Settings ────────────────────────────────────────────
+
+    async fn setting_resolve(&self, target: Option<String>) -> Result<String, String> {
+        let app_dir = self.log_config.app_dir();
+        let project_root = self.resolve_root(None);
+        tokio::task::spawn_blocking(move || {
+            crate::service::setting::resolve_setting(
+                &app_dir,
+                project_root.as_deref(),
+                target.as_deref(),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|r| {
+                serde_json::to_string(&r).map_err(|e| format!("setting_resolve: serialize: {e}"))
+            })
+        })
+        .await
+        .map_err(|e| format!("setting_resolve: task panicked: {e}"))?
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

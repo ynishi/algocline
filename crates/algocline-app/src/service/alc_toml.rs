@@ -36,6 +36,16 @@ pub(crate) struct AlcToml {
     /// variables are passed through unless explicitly injected via `ctx.env.inject`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvSection>,
+    /// `[setting.<target>]` tables — schemaless per-target configuration.
+    ///
+    /// Field types are preserved via `toml::Value` (string / bool / number /
+    /// array / table).  Resolution across env / project / global layers is
+    /// performed by `service::setting::resolve_setting`.
+    ///
+    /// The `#[serde(default)]` attribute ensures that existing `alc.toml`
+    /// files without a `[setting.*]` section deserialise without error.
+    #[serde(default)]
+    pub setting: BTreeMap<String, BTreeMap<String, toml::Value>>,
 }
 
 /// The `[env]` section of `alc.toml`.
@@ -662,6 +672,7 @@ invalid_key = 42
         let local = AlcToml {
             packages,
             env: None,
+            setting: Default::default(),
         };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
@@ -686,6 +697,7 @@ invalid_key = 42
         let local = AlcToml {
             packages,
             env: None,
+            setting: Default::default(),
         };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
@@ -706,6 +718,7 @@ invalid_key = 42
         let local = AlcToml {
             packages,
             env: None,
+            setting: Default::default(),
         };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
@@ -737,6 +750,7 @@ invalid_key = 42
         let local = AlcToml {
             packages,
             env: None,
+            setting: Default::default(),
         };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
@@ -769,10 +783,41 @@ invalid_key = 42
         let local = AlcToml {
             packages,
             env: None,
+            setting: Default::default(),
         };
 
         let resolved = resolve_local_path_entries(tmp.path(), &local);
         // BTreeMap iterates keys in ascending order → cot first, ucb second.
         assert_eq!(resolved, vec![cot, ucb]);
+    }
+
+    // ── setting field round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn parse_setting_dep() {
+        let toml = r#"
+[setting.journal]
+path = "/logs"
+enabled = true
+count = 3
+"#;
+        let parsed: AlcToml = toml::from_str(toml).unwrap();
+        let j = parsed.setting.get("journal").expect("expected 'journal'");
+        assert_eq!(
+            j.get("path"),
+            Some(&toml::Value::String("/logs".to_string()))
+        );
+        assert_eq!(j.get("enabled"), Some(&toml::Value::Boolean(true)));
+        assert_eq!(j.get("count"), Some(&toml::Value::Integer(3)));
+    }
+
+    #[test]
+    fn setting_default_empty_when_absent() {
+        let toml = "[packages]\ncot = \"*\"\n";
+        let parsed: AlcToml = toml::from_str(toml).unwrap();
+        assert!(
+            parsed.setting.is_empty(),
+            "setting must default to empty when absent from TOML"
+        );
     }
 }

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[setting.<target>]` tables in `alc.toml` / `alc.local.toml` / `~/.algocline/config.toml` — schemaless per-target configuration. Target names and field names are arbitrary; algocline core does not validate or enforce any per-target schema.
+- MCP tool `alc_setting_resolve(target?)` — returns `{resolved, sources}` with per-field layer attribution (`env > project > global`) in a single call. Omit `target` to receive all configured targets.
+- `alc init` now creates `~/.algocline/config.toml` from a commented template when the file is absent. Re-runs are idempotent (existing file is never overwritten).
+- `alc info` JSON output gains a `settings` field surfacing the resolved `[setting.*]` tables and per-field source attribution. Parse errors are surfaced as `settings_error` (non-fatal; info remains usable as a doctor tool).
+
+### Notes
+
+- Breaking for `EngineApi` trait implementors only (a new required method `setting_resolve` is added; only `AppService` exists upstream). MCP wire shape is additive.
+- env override naming: `ALC_SETTING_<TARGET>_<FIELD>` (uppercase snake). No legacy short aliases (e.g. `ALC_JOURNAL_PATH`) are provided.
+
 ## [0.37.0] - 2026-05-17
 
 ### Changed: bundled swarm-frame bumped to `v0.3.0`

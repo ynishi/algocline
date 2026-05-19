@@ -148,6 +148,55 @@ alc_run({
 
 An optional `alc.toml [env.allow]` allowlist filters which keys reach the Lua VM. Writes to `alc.env` always raise a runtime error — the snapshot is immutable for the lifetime of the run.
 
+## Configuration
+
+algocline reads configuration from layered TOML files plus environment overrides.
+
+### Files
+
+| Layer | Path | Notes |
+|-------|------|-------|
+| User-global | `~/.algocline/config.toml` (override with `ALC_HOME`) | Created on first `alc init` with a commented template. |
+| Project | `<project>/alc.toml` | Shared (git-tracked). |
+| Project (local) | `<project>/alc.local.toml` | Worktree-scoped, git-ignored. Overrides `alc.toml`. |
+
+### `[setting.<target>]` tables
+
+A generic per-target configuration table. Each `<target>` is a snake_case name
+(for example `journal`, `advisor`). Field names and types are caller-defined;
+algocline core does not impose a schema.
+
+```toml
+[setting.journal]
+path = "/Users/me/journal.md"
+pkg  = false
+```
+
+### Resolution order
+
+For each field, the highest-priority layer that defines it wins. Lower layers
+are not discarded — fields they uniquely define are still surfaced.
+
+1. Environment variable `ALC_SETTING_<TARGET>_<FIELD>` (uppercase snake)
+2. Project (`alc.local.toml` → `alc.toml`)
+3. User-global (`~/.algocline/config.toml`)
+4. Missing — field is absent from the response; the caller decides.
+
+### `alc_setting_resolve` MCP tool
+
+```jsonc
+// Tool call
+{ "name": "alc_setting_resolve", "arguments": { "target": "journal" } }
+
+// Response (JSON string)
+{
+  "resolved": { "journal": { "path": "/Users/me/journal.md", "pkg": true } },
+  "sources":  { "journal": { "path": "env", "pkg": "project" } }
+}
+```
+
+Omit `target` to receive all configured targets in a single call.
+
 ## Architecture
 
 ### Three-Layer StdLib

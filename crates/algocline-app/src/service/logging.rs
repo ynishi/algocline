@@ -208,6 +208,28 @@ impl AppService {
             info["packages_dir"] = serde_json::json!(packages.display().to_string());
         }
 
+        // Settings — resolve all [setting.*] layers in one call.
+        // resolve_setting is synchronous; info() is also synchronous, so no
+        // spawn_blocking is needed.
+        // On error, surface a warning string under settings_error rather than
+        // failing info() entirely — info() is used as a doctor/diagnostics tool
+        // and must return a useful response even when config files are corrupt
+        // (CLAUDE.md §Service 層 Error 伝播規律, warning-field pattern).
+        let app_dir = self.log_config.app_dir();
+        match crate::service::setting::resolve_setting(&app_dir, None, None) {
+            Ok(resolved) => match serde_json::to_value(&resolved) {
+                Ok(v) => {
+                    info["settings"] = v;
+                }
+                Err(e) => {
+                    info["settings_error"] = serde_json::json!(e.to_string());
+                }
+            },
+            Err(e) => {
+                info["settings_error"] = serde_json::json!(e.to_string());
+            }
+        }
+
         serde_json::to_string_pretty(&info).unwrap_or_else(|_| "{}".to_string())
     }
 

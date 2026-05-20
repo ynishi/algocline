@@ -18,17 +18,220 @@
 //! - **Setup failures** (VM init, pkg not found, zero spec files, I/O errors,
 //!   `spawn_blocking` panic): propagated as typed `Err(String)` to MCP wire.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlua::Lua;
 use mlua_lspec::framework;
+use serde::Serialize;
 use serde_json::{json, Value};
+use tracing::warn;
 
+use super::super::alc_toml::{load_alc_local_toml, load_alc_toml, PackageDep};
 use super::super::AppService;
 
+// ─── Auto search path types ───────────────────────────────────────────────────
+
+/// Source of an auto-resolved search path entry.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AutoSearchPathSource {
+    /// Path comes from the installed packages directory (`~/.algocline/packages/`).
+    Installed,
+    /// Path comes from a `[packages]` path entry in `alc.toml`.
+    #[serde(rename = "alc.toml")]
+    AlcToml,
+    /// Path comes from a `[packages]` path entry in `alc.local.toml`.
+    #[serde(rename = "alc.local.toml")]
+    AlcLocalToml,
+}
+
+/// A single package-name → parent-dir mapping returned by auto-resolution.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ResolvedSearchPath {
+    /// Package name as declared in the registry.
+    pub name: String,
+    /// Canonicalized parent directory that should be added to `package.path`.
+    pub search_dir: String,
+    /// Which registry source this entry came from.
+    pub source: AutoSearchPathSource,
+}
+
 impl AppService {
+    /// Collect auto-resolved `package.path` directories from all three
+    /// registry sources.
+    ///
+    /// # Arguments
+    ///
+    /// * `project_root` — optional project root string; if `None` (or if root
+    ///   resolution fails), `alc.toml` / `alc.local.toml` sources are skipped
+    ///   and only installed packages are returned.
+    ///
+    /// # Returns
+    ///
+    /// `(mapping, warnings)` where:
+    /// - `mapping` — one row per package, preserving per-package detail even
+    ///   when multiple packages share the same parent directory.
+    /// - `warnings` — non-fatal errors encountered during resolution (parse
+    ///   failures, canonicalize errors, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err`; all errors are surfaced in the `warnings` vector.
+    pub(crate) fn collect_auto_search_paths(
+        &self,
+        project_root: Option<&str>,
+    ) -> (Vec<ResolvedSearchPath>, Vec<String>) {
+        let mut results: Vec<ResolvedSearchPath> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        // Track parent dirs already added to avoid injecting the same dir
+        // multiple times into `package.path` (dir-level dedupe).
+        // Note: `results` still retains one row per package for diagnostic
+        // purposes — the dedupe only applies to the actual dirs injected.
+        let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
+
+        // ── Source 1: ~/.algocline/packages/ sub-dirs ─────────────────────────
+        let app_dir = self.log_config.app_dir();
+        let pkg_dir = app_dir.packages_dir();
+        match std::fs::read_dir(&pkg_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    // Only directories (including symlinks to dirs).
+                    let is_dir = path.metadata().map(|m| m.is_dir()).unwrap_or(false);
+                    if !is_dir {
+                        continue;
+                    }
+                    // Only include dirs that contain an `init.lua`.
+                    if !path.join("init.lua").exists() {
+                        continue;
+                    }
+                    let pkg_name = entry.file_name().to_string_lossy().into_owned();
+                    // The search dir is the parent of the pkg dir, i.e. pkg_dir
+                    // itself (so `require("pkg_name")` resolves to
+                    // `pkg_dir/pkg_name/init.lua`).
+                    let search_dir = pkg_dir.clone();
+                    results.push(ResolvedSearchPath {
+                        name: pkg_name,
+                        search_dir: search_dir.to_string_lossy().into_owned(),
+                        source: AutoSearchPathSource::Installed,
+                    });
+                    seen_dirs.insert(search_dir);
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "failed to read packages dir {}: {e}",
+                    pkg_dir.display()
+                ));
+            }
+        }
+
+        // ── Sources 2 + 3: alc.toml and alc.local.toml ───────────────────────
+        // Only available when project root can be resolved.
+        let resolved_root = self.resolve_root(project_root);
+        if let Some(ref root) = resolved_root {
+            // Source 2: alc.toml [packages] path entries
+            match load_alc_toml(root) {
+                Ok(Some(toml_data)) => {
+                    for (name, dep) in &toml_data.packages {
+                        let PackageDep::Path { path, .. } = dep else {
+                            continue;
+                        };
+                        let raw = std::path::Path::new(path);
+                        let abs = if raw.is_absolute() {
+                            raw.to_path_buf()
+                        } else {
+                            root.join(raw)
+                        };
+                        match abs.canonicalize() {
+                            Ok(canonical_pkg_dir) => {
+                                // The pkg_dir is the package directory itself
+                                // (e.g. `.../packages/swarm_frame`). The search
+                                // dir for `require` is its parent
+                                // (`.../packages/`).
+                                let search_dir = canonical_pkg_dir
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| canonical_pkg_dir.clone());
+                                results.push(ResolvedSearchPath {
+                                    name: name.clone(),
+                                    search_dir: search_dir.to_string_lossy().into_owned(),
+                                    source: AutoSearchPathSource::AlcToml,
+                                });
+                                seen_dirs.insert(search_dir);
+                            }
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "cannot canonicalize alc.toml path entry for '{}' ({}): {e}",
+                                    name,
+                                    abs.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warnings.push(format!(
+                        "failed to load alc.toml at {}: {e}",
+                        root.display()
+                    ));
+                }
+            }
+
+            // Source 3: alc.local.toml [packages] path entries
+            match load_alc_local_toml(root) {
+                Ok(Some(local_data)) => {
+                    for (name, dep) in &local_data.packages {
+                        let PackageDep::Path { path, .. } = dep else {
+                            continue;
+                        };
+                        let raw = std::path::Path::new(path);
+                        let abs = if raw.is_absolute() {
+                            raw.to_path_buf()
+                        } else {
+                            root.join(raw)
+                        };
+                        match abs.canonicalize() {
+                            Ok(canonical_pkg_dir) => {
+                                let search_dir = canonical_pkg_dir
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| canonical_pkg_dir.clone());
+                                results.push(ResolvedSearchPath {
+                                    name: name.clone(),
+                                    search_dir: search_dir.to_string_lossy().into_owned(),
+                                    source: AutoSearchPathSource::AlcLocalToml,
+                                });
+                                seen_dirs.insert(search_dir);
+                            }
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "cannot canonicalize alc.local.toml path entry for '{}' ({}): {e}",
+                                    name,
+                                    abs.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warnings.push(format!(
+                        "failed to load alc.local.toml at {}: {e}",
+                        root.display()
+                    ));
+                }
+            }
+        }
+        // When resolved_root is None: alc.toml / alc.local.toml are skipped
+        // gracefully (no warning added — Crux constraint 1 note).
+
+        (results, warnings)
+    }
+
     /// Run mlua-lspec tests for a package, a single file, or inline code.
     ///
     /// Exactly one of `pkg`, `code_file`, `code` must be provided.
@@ -44,24 +247,32 @@ impl AppService {
     ///   (default `"spec"`). Only used when `pkg` is provided.
     /// * `filter` — substring filter on spec file stems (only for `pkg`).
     /// * `search_paths` — additional dirs prepended to `package.path` inside
-    ///   the Lua VM.
+    ///   the Lua VM. These are appended *after* auto-resolved paths.
     /// * `project_root` — optional project root for variant-scope resolution
     ///   (`alc.local.toml`). Falls back to ancestor walk from cwd.
+    /// * `auto_search_paths` — when `true` (default) or `None`, auto-prepends
+    ///   parent dirs of all linked/installed packages (installed
+    ///   `~/.algocline/packages/`, `alc.toml` path entries, `alc.local.toml`
+    ///   path entries) to `package.path`. When `false`, no auto-resolve is
+    ///   performed. Resolved mapping is returned in the JSON response
+    ///   `resolved_search_paths` field.
     ///
     /// # Returns
     ///
     /// On success: JSON string with shape
     /// `{passed, failed, pending, total, duration_ms, spec_files: [{path,
     /// passed, failed, total, duration_ms, tests: [{suite, name, passed,
-    /// pending, error}]}]}`.
+    /// pending, error}]}], resolved_search_paths: [{name, search_dir,
+    /// source}], search_path_warnings?: [...]}`.
     ///
     /// # Errors
     ///
     /// Returns `Err(String)` for setup failures (VM init, pkg not found, zero
     /// spec files, I/O errors, `spawn_blocking` panic). Per-spec Lua crashes
     /// are absorbed, not propagated.
-    // 8 parameters are justified by the MCP wire shape: 3 mutually exclusive
-    // input sources (pkg / code_file / code) plus filtering/path options.
+    // 9 parameters are justified by the MCP wire shape: 3 mutually exclusive
+    // input sources (pkg / code_file / code) plus filtering/path/auto-resolve
+    // options.
     #[allow(clippy::too_many_arguments)]
     pub async fn pkg_test(
         &self,
@@ -71,7 +282,8 @@ impl AppService {
         spec_dir: Option<String>,
         filter: Option<String>,
         search_paths: Option<Vec<String>>,
-        _project_root: Option<String>,
+        project_root: Option<String>,
+        auto_search_paths: Option<bool>,
     ) -> Result<String, String> {
         // ── Crux constraint 1: exactly-one input exclusivity ──────────────────
         let input_count = pkg.is_some() as u8 + code_file.is_some() as u8 + code.is_some() as u8;
@@ -79,13 +291,45 @@ impl AppService {
             return Err("pkg_test: provide exactly one of pkg, code_file, code".to_string());
         }
 
-        let extra_search_paths: Vec<String> = search_paths.unwrap_or_default();
+        let caller_search_paths: Vec<String> = search_paths.unwrap_or_default();
+
+        // ── Auto-resolve: collect parent dirs from all 3 registry sources ─────
+        // Crux constraint 2: when auto_search_paths == Some(false), skip
+        // entirely (zero I/O, zero injection).
+        let (resolved_mapping, search_path_warnings) = if auto_search_paths == Some(false) {
+            (Vec::new(), Vec::new())
+        } else {
+            self.collect_auto_search_paths(project_root.as_deref())
+        };
+
+        // Deduplicate auto-resolved parent dirs (dir-level, not pkg-level)
+        // to avoid duplicate entries in package.path.
+        let mut seen_auto_dirs: HashSet<&str> = HashSet::new();
+        let auto_dirs: Vec<String> = resolved_mapping
+            .iter()
+            .filter_map(|r| {
+                if seen_auto_dirs.insert(r.search_dir.as_str()) {
+                    Some(r.search_dir.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         if let Some(inline_code) = code {
             // `code` path: single VM, inline source.
-            run_inline(inline_code, extra_search_paths).await
+            // Order: [auto..., caller...]
+            let mut search = auto_dirs;
+            search.extend(caller_search_paths);
+            let result_json = run_inline(inline_code, search).await?;
+            Ok(attach_resolved_meta(
+                result_json,
+                &resolved_mapping,
+                &search_path_warnings,
+            ))
         } else if let Some(file_path) = code_file {
             // `code_file` path: read file then run.
+            // Order: [file_parent, auto..., caller...]
             let abs_path = PathBuf::from(&file_path);
             let src = std::fs::read_to_string(&abs_path)
                 .map_err(|e| format!("pkg_test: failed to read {file_path}: {e}"))?;
@@ -95,8 +339,14 @@ impl AppService {
                 .unwrap_or_default();
             let chunk_name = format!("@{file_path}");
             let mut paths = vec![parent];
-            paths.extend(extra_search_paths);
-            run_single_spec(src, chunk_name, paths).await
+            paths.extend(auto_dirs);
+            paths.extend(caller_search_paths);
+            let result_json = run_single_spec(src, chunk_name, paths).await?;
+            Ok(attach_resolved_meta(
+                result_json,
+                &resolved_mapping,
+                &search_path_warnings,
+            ))
         } else {
             // `pkg` path: spec_dir scan.
             // input_count == 1 and neither `code` nor `code_file` is Some,
@@ -123,13 +373,72 @@ impl AppService {
             // Collect *_spec.lua files deterministically.
             let spec_files = collect_spec_files(&spec_dir_path, filter.as_deref())?;
 
+            // Order: [pkg_root, auto..., caller...]
             let pkg_root_str = pkg_root.to_string_lossy().into_owned();
             let mut search = vec![pkg_root_str];
-            search.extend(extra_search_paths);
+            search.extend(auto_dirs);
+            search.extend(caller_search_paths);
 
-            run_pkg_specs(spec_files, search).await
+            let result_json = run_pkg_specs(spec_files, search).await?;
+            Ok(attach_resolved_meta(
+                result_json,
+                &resolved_mapping,
+                &search_path_warnings,
+            ))
         }
     }
+}
+
+/// Attach `resolved_search_paths` (and optionally `search_path_warnings`) to a
+/// JSON result string returned by the internal run helpers.
+///
+/// # Arguments
+///
+/// * `result_json` — the JSON string produced by `run_inline`,
+///   `run_single_spec`, or `run_pkg_specs`.
+/// * `resolved_mapping` — per-package mapping collected by
+///   `collect_auto_search_paths`.
+/// * `warnings` — non-fatal warnings from auto-resolution.
+///
+/// # Returns
+///
+/// A new JSON string with `resolved_search_paths` added. When `warnings` is
+/// non-empty, `search_path_warnings` is also added.
+fn attach_resolved_meta(
+    result_json: String,
+    resolved_mapping: &[ResolvedSearchPath],
+    warnings: &[String],
+) -> String {
+    let mut obj: Value = match serde_json::from_str(&result_json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("attach_resolved_meta: failed to parse result JSON: {e}");
+            return result_json;
+        }
+    };
+    if let Some(map) = obj.as_object_mut() {
+        // Crux constraint 3: resolved_search_paths must appear in the JSON
+        // return value as a structured field (not only in logs).
+        let rows: Vec<Value> = resolved_mapping
+            .iter()
+            .map(|r| {
+                json!({
+                    "name": r.name,
+                    "search_dir": r.search_dir,
+                    "source": serde_json::to_value(&r.source)
+                        .unwrap_or(Value::String(String::new()))
+                })
+            })
+            .collect();
+        map.insert("resolved_search_paths".to_string(), Value::Array(rows));
+        if !warnings.is_empty() {
+            map.insert(
+                "search_path_warnings".to_string(),
+                Value::Array(warnings.iter().map(|w| Value::String(w.clone())).collect()),
+            );
+        }
+    }
+    obj.to_string()
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -424,6 +733,8 @@ async fn run_pkg_specs(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::super::super::test_support::make_app_service_at;
 
     // T1: happy path — inline code with a passing test.
@@ -441,7 +752,7 @@ mod tests {
         .to_string();
 
         let result = svc
-            .pkg_test(None, None, Some(lua_code), None, None, None, None)
+            .pkg_test(None, None, Some(lua_code), None, None, None, None, None)
             .await
             .expect("pkg_test should succeed");
 
@@ -467,7 +778,7 @@ mod tests {
         .to_string();
 
         let result = svc
-            .pkg_test(None, None, Some(lua_code), None, None, None, None)
+            .pkg_test(None, None, Some(lua_code), None, None, None, None, None)
             .await
             .expect("pkg_test returns Ok even for failing tests");
 
@@ -483,7 +794,7 @@ mod tests {
         let svc = make_app_service_at(tmp.path().to_path_buf()).await;
 
         let err = svc
-            .pkg_test(None, None, None, None, None, None, None)
+            .pkg_test(None, None, None, None, None, None, None, None)
             .await
             .expect_err("should return Err for zero inputs");
 
@@ -505,6 +816,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("should return Err for multiple inputs");
@@ -522,6 +834,7 @@ mod tests {
         let err = svc
             .pkg_test(
                 Some("nonexistent_pkg_xyz".into()),
+                None,
                 None,
                 None,
                 None,
@@ -554,6 +867,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect_err("should return Err for missing code_file");
@@ -561,6 +875,280 @@ mod tests {
         assert!(
             err.contains("failed to read"),
             "error must describe I/O failure: {err}"
+        );
+    }
+
+    // T1 (new): opt-out — auto_search_paths=false returns resolved_search_paths: []
+    // Crux constraint 2: zero auto-resolved paths when opt-out.
+    #[tokio::test]
+    async fn auto_search_paths_false_returns_empty_resolved_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_app_service_at(tmp.path().to_path_buf()).await;
+
+        let lua_code = concat!(
+            "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+            "describe('s', function()\n",
+            "    it('ok', function() expect(1).to.equal(1) end)\n",
+            "end)\n",
+        )
+        .to_string();
+
+        let result = svc
+            .pkg_test(
+                None,
+                None,
+                Some(lua_code),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .await
+            .expect("pkg_test should succeed with auto_search_paths=false");
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Crux 2: resolved_search_paths must be empty array when opt-out.
+        assert!(
+            json["resolved_search_paths"].is_array(),
+            "resolved_search_paths must be present: {result}"
+        );
+        assert_eq!(
+            json["resolved_search_paths"].as_array().unwrap().len(),
+            0,
+            "resolved_search_paths must be empty when auto_search_paths=false: {result}"
+        );
+        // Crux 3: key must be present even when empty.
+        assert!(
+            json.get("resolved_search_paths").is_some(),
+            "resolved_search_paths key must be present: {result}"
+        );
+    }
+
+    // T1 (new): installed source — a pkg with init.lua in packages/ is auto-resolved
+    // and appears in resolved_search_paths with source="installed".
+    // Crux constraint 1: installed source is included.
+    #[tokio::test]
+    async fn installed_pkg_appears_in_resolved_search_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().to_path_buf();
+
+        // Create a dummy installed package: {app_root}/packages/mypkg/init.lua
+        let pkg_dir = app_root.join("packages").join("mypkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+        let svc = make_app_service_at(app_root.clone()).await;
+
+        let lua_code = concat!(
+            "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+            "describe('s', function()\n",
+            "    it('ok', function() expect(1).to.equal(1) end)\n",
+            "end)\n",
+        )
+        .to_string();
+
+        let result = svc
+            .pkg_test(None, None, Some(lua_code), None, None, None, None, None)
+            .await
+            .expect("pkg_test should succeed");
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let rows = json["resolved_search_paths"]
+            .as_array()
+            .expect("resolved_search_paths must be array");
+
+        let installed_row = rows
+            .iter()
+            .find(|r| r["source"] == "installed" && r["name"] == "mypkg");
+        assert!(
+            installed_row.is_some(),
+            "mypkg with source=installed must appear in resolved_search_paths: {result}"
+        );
+
+        // The search_dir should be the packages/ directory (parent of mypkg/).
+        let expected_dir = app_root.join("packages").to_string_lossy().into_owned();
+        let actual_dir = installed_row.unwrap()["search_dir"].as_str().unwrap_or("");
+        assert_eq!(
+            actual_dir, expected_dir,
+            "search_dir must be the packages/ parent dir: {result}"
+        );
+    }
+
+    // T1 (new): alc.toml source — a path entry in alc.toml is resolved and
+    // appears in resolved_search_paths with source="alc.toml".
+    // Crux constraint 1: alc.toml source is included.
+    #[tokio::test]
+    async fn alc_toml_path_entry_appears_in_resolved_search_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().to_path_buf();
+
+        // Create an external pkg directory structure:
+        // {project_root}/ext_pkgs/ext_pkg/init.lua
+        let ext_pkgs = project_root.join("ext_pkgs");
+        let ext_pkg_dir = ext_pkgs.join("ext_pkg");
+        fs::create_dir_all(&ext_pkg_dir).unwrap();
+        fs::write(ext_pkg_dir.join("init.lua"), "return {}").unwrap();
+
+        // Write alc.toml with a path entry pointing to ext_pkgs/ext_pkg.
+        let alc_toml_content = "[packages.ext_pkg]\npath = \"ext_pkgs/ext_pkg\"\n";
+        fs::write(project_root.join("alc.toml"), alc_toml_content).unwrap();
+
+        // AppService rooted at project_root (so app_dir = project_root, and
+        // project root resolution = project_root when passed explicitly).
+        let svc = make_app_service_at(project_root.clone()).await;
+
+        let lua_code = concat!(
+            "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+            "describe('s', function()\n",
+            "    it('ok', function() expect(1).to.equal(1) end)\n",
+            "end)\n",
+        )
+        .to_string();
+
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let result = svc
+            .pkg_test(
+                None,
+                None,
+                Some(lua_code),
+                None,
+                None,
+                None,
+                Some(project_root_str),
+                None,
+            )
+            .await
+            .expect("pkg_test should succeed");
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let rows = json["resolved_search_paths"]
+            .as_array()
+            .expect("resolved_search_paths must be array");
+
+        let toml_row = rows
+            .iter()
+            .find(|r| r["source"] == "alc.toml" && r["name"] == "ext_pkg");
+        assert!(
+            toml_row.is_some(),
+            "ext_pkg with source=alc.toml must appear in resolved_search_paths: {result}"
+        );
+
+        // search_dir should be the parent of ext_pkg_dir (i.e. ext_pkgs/).
+        let expected_parent = ext_pkgs
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let actual_dir = toml_row.unwrap()["search_dir"].as_str().unwrap_or("");
+        assert_eq!(
+            actual_dir, expected_parent,
+            "search_dir must be the canonicalized parent of the pkg dir: {result}"
+        );
+    }
+
+    // T1 (new): alc.local.toml source — a path entry in alc.local.toml appears
+    // in resolved_search_paths with source="alc.local.toml".
+    // Crux constraint 1: alc.local.toml source is included.
+    #[tokio::test]
+    async fn alc_local_toml_path_entry_appears_in_resolved_search_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().to_path_buf();
+
+        // Create variant pkg: {project_root}/variant_pkgs/variant_pkg/init.lua
+        let variant_pkgs = project_root.join("variant_pkgs");
+        let variant_pkg_dir = variant_pkgs.join("variant_pkg");
+        fs::create_dir_all(&variant_pkg_dir).unwrap();
+        fs::write(variant_pkg_dir.join("init.lua"), "return {}").unwrap();
+
+        // Write alc.local.toml with a path entry.
+        // Use [packages.name] table syntax (not [[packages.name]] array) for PackageDep::Path.
+        let alc_local_content = "[packages.variant_pkg]\npath = \"variant_pkgs/variant_pkg\"\n";
+        fs::write(project_root.join("alc.local.toml"), alc_local_content).unwrap();
+
+        let svc = make_app_service_at(project_root.clone()).await;
+
+        let lua_code = concat!(
+            "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+            "describe('s', function()\n",
+            "    it('ok', function() expect(1).to.equal(1) end)\n",
+            "end)\n",
+        )
+        .to_string();
+
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let result = svc
+            .pkg_test(
+                None,
+                None,
+                Some(lua_code),
+                None,
+                None,
+                None,
+                Some(project_root_str),
+                None,
+            )
+            .await
+            .expect("pkg_test should succeed");
+
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let rows = json["resolved_search_paths"]
+            .as_array()
+            .expect("resolved_search_paths must be array");
+
+        let local_row = rows
+            .iter()
+            .find(|r| r["source"] == "alc.local.toml" && r["name"] == "variant_pkg");
+        assert!(
+            local_row.is_some(),
+            "variant_pkg with source=alc.local.toml must appear in resolved_search_paths: {result}"
+        );
+
+        let expected_parent = variant_pkgs
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let actual_dir = local_row.unwrap()["search_dir"].as_str().unwrap_or("");
+        assert_eq!(
+            actual_dir, expected_parent,
+            "search_dir must be the canonicalized parent: {result}"
+        );
+    }
+
+    // T2 (new): prepend order — collect_auto_search_paths helper returns
+    // installed entries before caller-supplied search_paths are appended.
+    // This tests the order invariant: [auto..., caller...] for the inline path.
+    // Crux constraint 1: auto is prepended before caller entries.
+    #[tokio::test]
+    async fn auto_paths_prepended_before_caller_search_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().to_path_buf();
+
+        // Create a dummy installed pkg so auto-resolve returns at least one dir.
+        let pkg_dir = app_root.join("packages").join("autopkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("init.lua"), "return {}").unwrap();
+
+        let svc = make_app_service_at(app_root.clone()).await;
+
+        // Call collect_auto_search_paths directly to verify the mapping.
+        let (mapping, warnings) = svc.collect_auto_search_paths(None);
+        assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
+
+        // The installed source must be present.
+        let found = mapping.iter().any(|r| r.name == "autopkg");
+        assert!(
+            found,
+            "autopkg must appear in auto-resolved mapping: {mapping:?}"
+        );
+
+        // The search_dir must be the packages/ parent (not the pkg dir itself).
+        let expected_parent = app_root.join("packages").to_string_lossy().into_owned();
+        let row = mapping.iter().find(|r| r.name == "autopkg").unwrap();
+        assert_eq!(
+            row.search_dir, expected_parent,
+            "search_dir must be packages/ parent: {row:?}"
         );
     }
 }

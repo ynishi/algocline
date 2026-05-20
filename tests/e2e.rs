@@ -6286,6 +6286,154 @@ async fn test_pkg_test_pkg_not_found() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// T1 (happy path): installed package appears in `resolved_search_paths` when
+/// `auto_search_paths` is omitted (default behaviour).
+///
+/// Creates a minimal package under `{alc_home}/packages/dummy_e2e_pkg_auto/`
+/// and verifies that the JSON response contains a `resolved_search_paths` array
+/// with an entry whose `source` is `"installed"` and `name` matches the pkg.
+#[tokio::test]
+async fn test_pkg_test_auto_search_paths_default_includes_installed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Place a minimal package so the auto-resolve has something to find.
+    let pkg_dir = tmp.path().join("packages").join("dummy_e2e_pkg_auto");
+    // K-185: nested dir — use create_dir_all.
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let lua_code = concat!(
+        "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+        "describe('auto', function()\n",
+        "    it('ok', function() expect(1).to.equal(1) end)\n",
+        "end)\n",
+    );
+    // auto_search_paths omitted → default true.
+    let resp = call_json(&client, "alc_pkg_test", json!({ "code": lua_code })).await;
+
+    // Basic test run health.
+    assert_eq!(resp["passed"], 1, "expected passed=1, got: {resp}");
+
+    // Crux constraint 3: structured mapping must appear in JSON return value.
+    let paths = resp["resolved_search_paths"]
+        .as_array()
+        .expect("resolved_search_paths must be an array");
+    let found = paths.iter().any(|row| {
+        row["name"].as_str() == Some("dummy_e2e_pkg_auto")
+            && row["source"].as_str() == Some("installed")
+    });
+    assert!(
+        found,
+        "expected dummy_e2e_pkg_auto/installed in resolved_search_paths, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T2 (boundary): `auto_search_paths: false` produces an empty
+/// `resolved_search_paths` array even when installed packages exist.
+///
+/// Crux constraint 2: when opt-out flag is set, zero auto-resolved paths must
+/// be injected and the registry must not be consulted.
+#[tokio::test]
+async fn test_pkg_test_auto_search_paths_false_skips_auto() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Place the same package — but with opt-out it must NOT appear.
+    let pkg_dir = tmp.path().join("packages").join("dummy_e2e_pkg_auto");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let lua_code = concat!(
+        "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+        "describe('opt_out', function()\n",
+        "    it('ok', function() expect(1).to.equal(1) end)\n",
+        "end)\n",
+    );
+    let resp = call_json(
+        &client,
+        "alc_pkg_test",
+        json!({ "code": lua_code, "auto_search_paths": false }),
+    )
+    .await;
+
+    // Crux constraint 2: resolved_search_paths must be empty.
+    assert_eq!(
+        resp["resolved_search_paths"],
+        json!([]),
+        "expected empty resolved_search_paths with auto_search_paths=false, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T1 (happy path): a package linked via `alc.local.toml` appears in
+/// `resolved_search_paths` with `source: "alc.local.toml"`.
+///
+/// Creates a temp project root containing `alc.local.toml` that links a
+/// local directory, then verifies the structured mapping is present.
+#[tokio::test]
+async fn test_pkg_test_auto_search_paths_resolves_alc_local_toml() {
+    let tmp_home = tempfile::tempdir().expect("tempdir alc_home");
+    let tmp_project = tempfile::tempdir().expect("tempdir project");
+
+    // Create a minimal linked package directory outside alc_home.
+    let linked_pkg_dir = tmp_project.path().join("packages").join("local_pkg_e2e");
+    std::fs::create_dir_all(&linked_pkg_dir).expect("create linked pkg dir");
+    std::fs::write(linked_pkg_dir.join("init.lua"), "return {}\n").expect("write init.lua");
+
+    // Write alc.local.toml that registers the linked package via an absolute path
+    // to the package directory itself (alc.toml path = pkg_dir, resolve strips
+    // the leaf to get the search dir).
+    let local_toml_content = format!(
+        "[packages.local_pkg_e2e]\npath = \"{}\"\n",
+        linked_pkg_dir.to_str().expect("utf8 path")
+    );
+    std::fs::write(
+        tmp_project.path().join("alc.local.toml"),
+        &local_toml_content,
+    )
+    .expect("write alc.local.toml");
+
+    let client = connect_with_alc_home(tmp_home.path()).await;
+
+    let lua_code = concat!(
+        "local describe, it, expect = lust.describe, lust.it, lust.expect\n",
+        "describe('local_toml', function()\n",
+        "    it('ok', function() expect(1).to.equal(1) end)\n",
+        "end)\n",
+    );
+    let resp = call_json(
+        &client,
+        "alc_pkg_test",
+        json!({
+            "code": lua_code,
+            "project_root": tmp_project.path().to_str().expect("utf8 path"),
+        }),
+    )
+    .await;
+
+    // Basic test run health.
+    assert_eq!(resp["passed"], 1, "expected passed=1, got: {resp}");
+
+    // Crux constraint 3: mapping must appear as structured field.
+    let paths = resp["resolved_search_paths"]
+        .as_array()
+        .expect("resolved_search_paths must be an array");
+    let found = paths.iter().any(|row| {
+        row["name"].as_str() == Some("local_pkg_e2e")
+            && row["source"].as_str() == Some("alc.local.toml")
+    });
+    assert!(
+        found,
+        "expected local_pkg_e2e/alc.local.toml in resolved_search_paths, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── alc.env ──────────────────────────────────────────────────────────────────
 
 /// T1 (happy path): inject env vars are accessible from Lua via `alc.env.KEY`.

@@ -375,11 +375,16 @@ pub struct PkgTestParams {
     /// Substring filter applied to spec file stems when `pkg` is provided.
     /// For example `"shape"` matches `shape_spec.lua` but not `other_spec.lua`.
     pub filter: Option<String>,
-    /// Additional directories prepended to `package.path` inside the Lua VM.
+    /// Additional directories appended to `package.path` inside the Lua VM,
+    /// after auto-resolved paths.
     pub search_paths: Option<Vec<String>>,
     /// Absolute path to the project root for variant-scope package resolution
     /// (`alc.local.toml`). Falls back to ancestor walk from cwd when omitted.
     pub project_root: Option<String>,
+    /// When `true` (default) or omitted, auto-prepends parent dirs of all
+    /// linked/installed packages to `package.path`. Set to `false` to disable
+    /// auto-resolve entirely (no registry I/O, no path injection).
+    pub auto_search_paths: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1402,9 +1407,17 @@ impl AlcService {
     /// - `code_file` — runs a single `.lua` file at the given absolute path.
     /// - `code` — runs inline Lua source; useful for quick ad-hoc tests.
     ///
+    /// By default (`auto_search_paths` omitted or `true`), parent directories
+    /// of all installed and linked packages are auto-prepended to `package.path`
+    /// so that `require("pkg_name")` resolves without manual `search_paths`.
+    /// Set `auto_search_paths: false` to disable this behaviour entirely.
+    ///
     /// Returns JSON `{passed, failed, pending, total, duration_ms,
     /// spec_files: [{path, passed, failed, total, duration_ms,
-    /// tests: [{suite, name, passed, pending, error}]}]}`.
+    /// tests: [{suite, name, passed, pending, error}]},
+    /// resolved_search_paths: [{name, search_dir, source}]}`.
+    /// `resolved_search_paths` lists every package-to-directory mapping that
+    /// was auto-resolved (empty array when `auto_search_paths: false`).
     ///
     /// Per-spec-file Lua crashes are absorbed (failed count incremented,
     /// execution continues). Setup failures (VM init, package not found,
@@ -1436,6 +1449,7 @@ impl AlcService {
                 params.filter,
                 params.search_paths,
                 params.project_root,
+                params.auto_search_paths,
             )
             .await
     }
@@ -2259,7 +2273,7 @@ impl ServerHandler for AlcService {
                  - alc_pkg_remove: Remove a package from alc.toml and alc.lock. Physical files are NOT deleted.\n\
                  - alc_pkg_unlink: Remove a symlinked package from ~/.algocline/packages/. Use pkg_remove for installed packages.\n\
                  - alc_pkg_doctor: Diagnose package state (read-only). Returns JSON with healthy/incomplete_pkg/installed_missing/missing_meta/missing_hub_index/path_missing/spec_missing/stale_cache/symlink_dangling buckets. incomplete_pkg fires when init.lua requires sibling submodules that are missing. missing_meta fires when installed pkg dir has init.lua but M.meta.name is absent/empty. missing_hub_index fires when project_root has 2+ pkg dirs but hub_index.json is missing. spec_missing fires when installed pkg has spec/ directory but contains zero *_spec.lua files. stale_cache fires when ~/.algocline/hub_cache/{hash}.json mtime exceeds 3600s. Use pkg_unlink to remove dangling symlinks.\n\
-                 - alc_pkg_test: Run mlua-lspec tests against a package's spec directory (pkg), a single file (code_file), or inline code. Returns JSON {passed, failed, pending, total, duration_ms, spec_files[]}. Exactly one of pkg/code_file/code must be provided.\n\
+                 - alc_pkg_test: Run mlua-lspec tests against a package's spec directory (pkg), a single file (code_file), or inline code. Returns JSON {passed, failed, pending, total, duration_ms, spec_files[], resolved_search_paths[], search_path_warnings?}. auto_search_paths (default true) prepends directories from installed packages, alc.toml, and alc.local.toml to the Lua VM package.path before caller-supplied search_paths; set false to suppress. Exactly one of pkg/code_file/code must be provided.\n\
                  - alc_pkg_repair: Heal broken packages — reinstalls entries whose installed dir is missing; surfaces dangling symlinks and missing path = ... declarations as unrepairable with suggestions.\n\
                  - alc_init: Initialize alc.toml in the project root and ensure alc.local.toml is listed in .gitignore.\n\
                  - alc_update: Re-resolve all alc.toml entries and rewrite alc.lock.\n\

@@ -255,16 +255,23 @@ pub trait EngineApi: Send + Sync {
     ///   (default `"spec"`). Only used when `pkg` is provided.
     /// * `filter` — substring filter applied to spec file stems (only when `pkg`
     ///   is provided).
-    /// * `search_paths` — additional directories prepended to `package.path`
-    ///   inside the Lua VM.
+    /// * `search_paths` — additional directories appended to `package.path`
+    ///   inside the Lua VM, after auto-resolved paths.
     /// * `project_root` — optional project root for variant-scope package
     ///   resolution (`alc.local.toml`). Falls back to ancestor walk from cwd.
+    /// * `auto_search_paths` — when `true` (default) or `None`, auto-prepends
+    ///   parent dirs of all linked/installed packages (installed
+    ///   `~/.algocline/packages/`, `alc.toml` path entries, `alc.local.toml`
+    ///   path entries) to `package.path`. When `false`, no auto-resolve is
+    ///   performed and zero paths are injected. Resolved mapping is returned in
+    ///   the JSON response `resolved_search_paths` field.
     ///
     /// # Returns
     ///
     /// On success: JSON string `{passed, failed, pending, total, duration_ms,
     /// spec_files: [{path, passed, failed, total, duration_ms, tests: [{suite,
-    /// name, passed, pending, error}]}]}`.
+    /// name, passed, pending, error}]}], resolved_search_paths: [{name,
+    /// search_dir, source}], search_path_warnings?: [...]}`.
     ///
     /// # Errors
     ///
@@ -274,9 +281,9 @@ pub trait EngineApi: Send + Sync {
     /// * No spec files found → `"pkg_test: no spec files found in <path> …"`.
     /// * mlua VM init failure, I/O errors, or `spawn_blocking` panic → typed
     ///   `Err` string.
-    // 8 parameters exceed clippy's default limit of 7; the parameter count
-    // is justified by the MCP wire shape which needs distinct named fields
-    // for pkg / code_file / code (mutually exclusive) plus filtering options.
+    // 9 parameters are justified by the MCP wire shape: 3 mutually exclusive
+    // input sources (pkg / code_file / code) plus filtering/path/auto-resolve
+    // options.
     #[allow(clippy::too_many_arguments)]
     async fn pkg_test(
         &self,
@@ -287,6 +294,7 @@ pub trait EngineApi: Send + Sync {
         filter: Option<String>,
         search_paths: Option<Vec<String>>,
         project_root: Option<String>,
+        auto_search_paths: Option<bool>,
     ) -> Result<String, String>;
 
     // ─── Logging ─────────────────────────────────────────────

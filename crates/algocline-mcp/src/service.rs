@@ -375,11 +375,16 @@ pub struct PkgTestParams {
     /// Substring filter applied to spec file stems when `pkg` is provided.
     /// For example `"shape"` matches `shape_spec.lua` but not `other_spec.lua`.
     pub filter: Option<String>,
-    /// Additional directories prepended to `package.path` inside the Lua VM.
+    /// Additional directories appended to `package.path` inside the Lua VM,
+    /// after auto-resolved paths.
     pub search_paths: Option<Vec<String>>,
     /// Absolute path to the project root for variant-scope package resolution
     /// (`alc.local.toml`). Falls back to ancestor walk from cwd when omitted.
     pub project_root: Option<String>,
+    /// When `true` (default) or omitted, auto-prepends parent dirs of all
+    /// linked/installed packages to `package.path`. Set to `false` to disable
+    /// auto-resolve entirely (no registry I/O, no path injection).
+    pub auto_search_paths: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1436,6 +1441,7 @@ impl AlcService {
                 params.filter,
                 params.search_paths,
                 params.project_root,
+                params.auto_search_paths,
             )
             .await
     }

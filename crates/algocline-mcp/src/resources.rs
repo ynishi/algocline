@@ -1364,6 +1364,7 @@ mod tests {
                     _filter: Option<String>,
                     _search_paths: Option<Vec<String>>,
                     _project_root: Option<String>,
+                    _auto_search_paths: Option<bool>,
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -2029,6 +2030,7 @@ mod tests {
             _filter: Option<String>,
             _search_paths: Option<Vec<String>>,
             _project_root: Option<String>,
+            _auto_search_paths: Option<bool>,
         ) -> Result<String, String> {
             Err("not configured".into())
         }
@@ -2368,6 +2370,7 @@ mod tests {
                 _filter: Option<String>,
                 _search_paths: Option<Vec<String>>,
                 _project_root: Option<String>,
+                _auto_search_paths: Option<bool>,
             ) -> Result<String, String> {
                 Err("noop".into())
             }

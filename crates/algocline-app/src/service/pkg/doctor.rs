@@ -1,7 +1,7 @@
 //! `pkg_doctor` — read-only diagnosis for package state (Wave 2 of local-first DX).
 //!
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
-//! classifies packages into nine buckets without touching the filesystem:
+//! classifies packages into ten buckets without touching the filesystem:
 //!
 //! | Bucket              | Source-of-truth                                         | Condition                                          |
 //! |---------------------|---------------------------------------------------------|----------------------------------------------------|
@@ -16,6 +16,8 @@
 //! | `missing_meta`      | `{pkg_dir}/{name}/init.lua`                             | init.lua absent or does not declare `M.meta.name`  |
 //! | `missing_hub_index` | `{project_root}/hub_index.json`                         | collection root has 2+ pkg dirs but no index file  |
 //! | `spec_missing`      | `{pkg_dir}/{name}/spec/`                                | spec/ exists but contains zero `*_spec.lua` files  |
+//! | `unregistered_pkg`  | `~/.algocline/packages/{name}/init.lua`                 | physical dir with init.lua but not registered in   |
+//! |                     |                                                         | installed.json / alc.toml / alc.local.toml         |
 //!
 //! Contract:
 //! - **No side effects.** No `fs::write`, `fs::remove_*`, `fs::create_*`,
@@ -24,14 +26,14 @@
 //!   logic authoritative in one place (symlink-dangling suggestion wording and
 //!   the path-missing scan in particular).
 //!
-//! The JSON output schema always contains nine top-level buckets:
+//! The JSON output schema always contains ten top-level buckets:
 //! `healthy`, `incomplete_pkg`, `installed_missing`, `missing_hub_index`,
 //! `missing_meta`, `path_missing`, `spec_missing`, `stale_cache`,
-//! `symlink_dangling`. The `narrative_issues` bucket was removed in
+//! `symlink_dangling`, `unregistered_pkg`. The `narrative_issues` bucket was removed in
 //! #1778221491-39903 (narrative SSOT decommission).
 //! Key order within the serialized string follows `serde_json`'s default
 //! (alphabetical when `preserve_order` is off, as it is
-//! in this workspace) — the contract is "these nine keys always present", not
+//! in this workspace) — the contract is "these ten keys always present", not
 //! textual ordering.
 //!
 //! ## `incomplete_pkg` detection

@@ -1407,9 +1407,17 @@ impl AlcService {
     /// - `code_file` — runs a single `.lua` file at the given absolute path.
     /// - `code` — runs inline Lua source; useful for quick ad-hoc tests.
     ///
+    /// By default (`auto_search_paths` omitted or `true`), parent directories
+    /// of all installed and linked packages are auto-prepended to `package.path`
+    /// so that `require("pkg_name")` resolves without manual `search_paths`.
+    /// Set `auto_search_paths: false` to disable this behaviour entirely.
+    ///
     /// Returns JSON `{passed, failed, pending, total, duration_ms,
     /// spec_files: [{path, passed, failed, total, duration_ms,
-    /// tests: [{suite, name, passed, pending, error}]}]}`.
+    /// tests: [{suite, name, passed, pending, error}]},
+    /// resolved_search_paths: [{name, search_dir, source}]}`.
+    /// `resolved_search_paths` lists every package-to-directory mapping that
+    /// was auto-resolved (empty array when `auto_search_paths: false`).
     ///
     /// Per-spec-file Lua crashes are absorbed (failed count incremented,
     /// execution continues). Setup failures (VM init, package not found,

@@ -1356,7 +1356,7 @@ impl AlcService {
     /// Diagnose package state without side effects (read-only counterpart
     /// of `alc_pkg_repair`).
     ///
-    /// Returns JSON with nine arrays:
+    /// Returns JSON with ten arrays:
     ///   - `healthy` — package directory exists and is reachable
     ///   - `incomplete_pkg` — package dir exists but `init.lua` requires
     ///     sibling submodule files (`pkg.sub`) that are missing; use
@@ -1376,6 +1376,10 @@ impl AlcService {
     ///     `*_spec.lua` files; add at least one or remove `spec/` to opt out
     ///   - `stale_cache` — hub cache file (`~/.algocline/hub_cache/{hash}.json`)
     ///     older than 3600s (CACHE_TTL_SECS); refresh via `alc_hub_search`
+    ///   - `unregistered_pkg` — physical directory under `~/.algocline/packages/`
+    ///     contains `init.lua` but is not recorded in installed.json, alc.toml,
+    ///     or alc.local.toml; `suggestion` is an array of fix options
+    ///     (install / link / remove / source note)
     ///
     /// No `pkg_install` calls, no filesystem writes. Safe to invoke freely.
     #[tool(

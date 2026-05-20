@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc_pkg_doctor` gains a tenth bucket `unregistered_pkg`: physical directories under `~/.algocline/packages/` that contain `init.lua` but are not registered in `installed.json`, `alc.toml`, or `alc.local.toml`. The `suggestion` field for this bucket is an `array<string>` (Clippy-style multi-line with install / link / remove / source-note options) rather than the `string` used by all other buckets. `target_filter = Some(name)` for a physically-present-but-unregistered package now routes to this bucket instead of returning an error. Path-dep entries in `alc.toml` / `alc.local.toml` that point inside `packages_dir` are skipped via canonical path comparison to avoid false positives.
 - `[setting.<target>]` tables in `alc.toml` / `alc.local.toml` / `~/.algocline/config.toml` — schemaless per-target configuration. Target names and field names are arbitrary; algocline core does not validate or enforce any per-target schema.
 - MCP tool `alc_setting_resolve(target?)` — returns `{resolved, sources}` with per-field layer attribution (`env > project > global`) in a single call. Omit `target` to receive all configured targets.
 - `alc init` now creates `~/.algocline/config.toml` from a commented template when the file is absent. Re-runs are idempotent (existing file is never overwritten).

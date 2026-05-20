@@ -225,6 +225,7 @@ impl EngineApi for AppService {
         filter: Option<String>,
         search_paths: Option<Vec<String>>,
         project_root: Option<String>,
+        auto_search_paths: Option<bool>,
     ) -> Result<String, String> {
         AppService::pkg_test(
             self,
@@ -235,6 +236,7 @@ impl EngineApi for AppService {
             filter,
             search_paths,
             project_root,
+            auto_search_paths,
         )
         .await
     }

@@ -1,7 +1,7 @@
 //! `pkg_doctor` — read-only diagnosis for package state (Wave 2 of local-first DX).
 //!
 //! The actuator counterpart is [`super::repair`] (`pkg_repair`). `pkg_doctor`
-//! classifies packages into nine buckets without touching the filesystem:
+//! classifies packages into ten buckets without touching the filesystem:
 //!
 //! | Bucket              | Source-of-truth                                         | Condition                                          |
 //! |---------------------|---------------------------------------------------------|----------------------------------------------------|
@@ -16,6 +16,8 @@
 //! | `missing_meta`      | `{pkg_dir}/{name}/init.lua`                             | init.lua absent or does not declare `M.meta.name`  |
 //! | `missing_hub_index` | `{project_root}/hub_index.json`                         | collection root has 2+ pkg dirs but no index file  |
 //! | `spec_missing`      | `{pkg_dir}/{name}/spec/`                                | spec/ exists but contains zero `*_spec.lua` files  |
+//! | `unregistered_pkg`  | `~/.algocline/packages/{name}/init.lua`                 | physical dir with init.lua but not registered in   |
+//! |                     |                                                         | installed.json / alc.toml / alc.local.toml         |
 //!
 //! Contract:
 //! - **No side effects.** No `fs::write`, `fs::remove_*`, `fs::create_*`,
@@ -24,14 +26,14 @@
 //!   logic authoritative in one place (symlink-dangling suggestion wording and
 //!   the path-missing scan in particular).
 //!
-//! The JSON output schema always contains nine top-level buckets:
+//! The JSON output schema always contains ten top-level buckets:
 //! `healthy`, `incomplete_pkg`, `installed_missing`, `missing_hub_index`,
 //! `missing_meta`, `path_missing`, `spec_missing`, `stale_cache`,
-//! `symlink_dangling`. The `narrative_issues` bucket was removed in
+//! `symlink_dangling`, `unregistered_pkg`. The `narrative_issues` bucket was removed in
 //! #1778221491-39903 (narrative SSOT decommission).
 //! Key order within the serialized string follows `serde_json`'s default
 //! (alphabetical when `preserve_order` is off, as it is
-//! in this workspace) — the contract is "these nine keys always present", not
+//! in this workspace) — the contract is "these ten keys always present", not
 //! textual ordering.
 //!
 //! ## `incomplete_pkg` detection
@@ -43,18 +45,20 @@
 //! are acceptable; false positives are not). A future version may use mlua
 //! to perform a real module resolution dry-run.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use algocline_core::PkgEntity;
 use tracing::warn;
 
+use super::super::alc_toml::{load_alc_local_toml, load_alc_toml, PackageDep};
 use super::super::manifest::{load_manifest, Manifest, ManifestEntry};
 use super::super::resolve::packages_dir;
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::repair::{
-    collect_path_missing, collect_unattached_dangling_symlinks, symlink_dangling_suggestion,
-    ProjectPathSource,
+    collect_path_missing, collect_unattached_dangling_symlinks, collect_unregistered_pkg_dirs,
+    symlink_dangling_suggestion, ProjectPathSource,
 };
 
 /// Same TTL discipline as `hub::CACHE_TTL_SECS` (hub.rs:96).
@@ -97,6 +101,13 @@ struct DoctorBuckets {
     missing_hub_index: Vec<serde_json::Value>,
     spec_missing: Vec<serde_json::Value>,
     stale_cache: Vec<serde_json::Value>,
+    /// Physical directories under `~/.algocline/packages/` that contain
+    /// `init.lua` but are not registered in any of the three authoritative
+    /// sources (installed.json / alc.toml / alc.local.toml).
+    ///
+    /// Unlike all other buckets, entries here carry `suggestion: array<string>`
+    /// (Clippy-style multi-line) instead of `suggestion: string`.
+    unregistered_pkg: Vec<serde_json::Value>,
 }
 
 impl DoctorBuckets {
@@ -110,6 +121,7 @@ impl DoctorBuckets {
             || !self.missing_hub_index.is_empty()
             || !self.spec_missing.is_empty()
             || !self.stale_cache.is_empty()
+            || !self.unregistered_pkg.is_empty()
     }
 
     fn into_json(self) -> String {
@@ -126,6 +138,7 @@ impl DoctorBuckets {
             "spec_missing": self.spec_missing,
             "stale_cache": self.stale_cache,
             "symlink_dangling": self.symlink_dangling,
+            "unregistered_pkg": self.unregistered_pkg,
         })
         .to_string()
     }
@@ -701,11 +714,42 @@ fn run_stale_cache_pass(cache_dir: &Path, buckets: &mut DoctorBuckets) -> Result
     Ok(())
 }
 
+/// Walk `pkg_dir` for physical directories with `init.lua` that are not
+/// registered in any manifest source, and push them into
+/// `buckets.unregistered_pkg`.
+///
+/// # Arguments
+///
+/// * `pkg_dir` — `~/.algocline/packages/`
+/// * `registered` — set of package names from all three registration sources
+/// * `registered_paths` — canonicalized `path` entries from alc.toml /
+///   alc.local.toml; dirs whose canonical path matches are skipped to avoid
+///   false positives (crux constraint: canonical path comparison)
+/// * `target_filter` — when `Some(name)`, restrict to that single package
+/// * `buckets` — accumulator; entries are pushed into `buckets.unregistered_pkg`
+///
+/// # Errors
+///
+/// Propagates `Err(String)` from `collect_unregistered_pkg_dirs` when
+/// `pkg_dir` exists but cannot be read.
+fn run_unregistered_pkg_pass(
+    pkg_dir: &Path,
+    registered: &HashSet<String>,
+    registered_paths: &[PathBuf],
+    target_filter: Option<&str>,
+    buckets: &mut DoctorBuckets,
+) -> Result<(), String> {
+    let found =
+        collect_unregistered_pkg_dirs(pkg_dir, registered, registered_paths, target_filter)?;
+    buckets.unregistered_pkg.extend(found);
+    Ok(())
+}
+
 impl AppService {
     /// Diagnose package state without any side effects. Returns a JSON string
-    /// with nine arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
+    /// with ten arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
     /// `missing_hub_index`, `missing_meta`, `path_missing`, `spec_missing`,
-    /// `stale_cache`, `symlink_dangling`).
+    /// `stale_cache`, `symlink_dangling`, `unregistered_pkg`).
     ///
     /// `name` restricts the report to a single package; `None` inspects every
     /// known package. `project_root` is only consulted for the
@@ -736,10 +780,82 @@ impl AppService {
         let resolved_root = self.resolve_root(project_root.as_deref());
         let target_filter = name.as_deref();
 
+        // Build the set of registered package names from all three sources:
+        // installed.json (manifest), alc.toml [packages], alc.local.toml [packages].
+        // Also collect canonicalized paths from path-dep entries to avoid false
+        // positives in unregistered_pkg detection (crux constraint).
+        let mut registered: HashSet<String> = manifest.packages.keys().cloned().collect();
+        let mut registered_paths: Vec<PathBuf> = Vec::new();
+
+        if let Some(ref root) = resolved_root {
+            // alc.toml
+            if let Some(toml_data) = load_alc_toml(root)? {
+                for (name, dep) in &toml_data.packages {
+                    registered.insert(name.clone());
+                    if let PackageDep::Path { path, .. } = dep {
+                        let raw = std::path::Path::new(path);
+                        let abs = if raw.is_absolute() {
+                            raw.to_path_buf()
+                        } else {
+                            root.join(raw)
+                        };
+                        match abs.canonicalize() {
+                            Ok(c) => registered_paths.push(c),
+                            Err(e) => {
+                                // Path entry in alc.toml may point to a
+                                // non-existent dir (caught by path_missing pass).
+                                // Canonicalize failure here is expected; skip
+                                // with a warn to avoid false positives being
+                                // silently missed.
+                                tracing::warn!(
+                                    "pkg: cannot canonicalize alc.toml path entry \
+                                    for '{}' ({}): {e}",
+                                    name,
+                                    abs.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // alc.local.toml
+            if let Some(local_data) = load_alc_local_toml(root)? {
+                for (name, dep) in &local_data.packages {
+                    registered.insert(name.clone());
+                    if let PackageDep::Path { path, .. } = dep {
+                        let raw = std::path::Path::new(path);
+                        let abs = if raw.is_absolute() {
+                            raw.to_path_buf()
+                        } else {
+                            root.join(raw)
+                        };
+                        match abs.canonicalize() {
+                            Ok(c) => registered_paths.push(c),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "pkg: cannot canonicalize alc.local.toml path entry \
+                                    for '{}' ({}): {e}",
+                                    name,
+                                    abs.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut buckets = DoctorBuckets::default();
         run_manifest_pass(&manifest, target_filter, &pkg_dir, &mut buckets)?;
         run_unattached_symlink_pass(&pkg_dir, target_filter, &manifest, &mut buckets);
         run_path_missing_pass(resolved_root.as_deref(), target_filter, &mut buckets);
+        run_unregistered_pkg_pass(
+            &pkg_dir,
+            &registered,
+            &registered_paths,
+            target_filter,
+            &mut buckets,
+        )?;
         if target_filter.is_none() {
             run_stale_cache_pass(&app_dir.hub_cache_dir(), &mut buckets)?;
             if let Some(ref root) = resolved_root {
@@ -864,14 +980,15 @@ mod tests {
     }
 
     #[test]
-    fn buckets_into_json_emits_all_nine_keys() {
+    fn buckets_into_json_emits_all_ten_keys() {
         // NOTE: `serde_json` without the `preserve_order` feature emits JSON
         // object keys in alphabetical order, matching `pkg_repair`'s actual
         // behavior. The spec's "fixed order" requirement is satisfied by
-        // always emitting these nine top-level keys; consumers parse as a
+        // always emitting these ten top-level keys; consumers parse as a
         // Map rather than relying on textual key order.
         //
         // Note: `narrative_issues` bucket removed in #1778221491-39903.
+        // Note: `unregistered_pkg` bucket added (physical dir without manifest entry).
         let mut b = DoctorBuckets::default();
         b.healthy.push(serde_json::json!({"name": "h"}));
         b.installed_missing
@@ -890,6 +1007,13 @@ mod tests {
             .push(serde_json::json!({"name": "sm", "kind": "spec_missing"}));
         b.stale_cache
             .push(serde_json::json!({"kind": "stale_cache", "path": "/p", "age_secs": 7200}));
+        b.unregistered_pkg.push(serde_json::json!({
+            "name": "u",
+            "kind": "unregistered_pkg",
+            "source": "unknown",
+            "reason": "physical dir with init.lua exists but is not registered",
+            "suggestion": ["install", "link", "rm -rf", "note: unknown source"],
+        }));
 
         let out = b.into_json();
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
@@ -903,7 +1027,8 @@ mod tests {
         assert!(obj.contains_key("missing_hub_index"));
         assert!(obj.contains_key("spec_missing"));
         assert!(obj.contains_key("stale_cache"));
-        assert_eq!(obj.len(), 9, "exactly nine top-level buckets: {out}");
+        assert!(obj.contains_key("unregistered_pkg"));
+        assert_eq!(obj.len(), 10, "exactly ten top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
@@ -914,6 +1039,13 @@ mod tests {
         assert_eq!(obj["missing_hub_index"][0]["project_root"], "/r");
         assert_eq!(obj["spec_missing"][0]["name"], "sm");
         assert_eq!(obj["stale_cache"][0]["path"], "/p");
+        assert_eq!(obj["unregistered_pkg"][0]["name"], "u");
+        assert_eq!(obj["unregistered_pkg"][0]["kind"], "unregistered_pkg");
+        // suggestion must be an array (crux constraint: array<string> for unregistered_pkg).
+        assert!(
+            obj["unregistered_pkg"][0]["suggestion"].is_array(),
+            "unregistered_pkg suggestion must be an array"
+        );
     }
 
     #[test]

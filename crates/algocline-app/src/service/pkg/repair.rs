@@ -12,6 +12,7 @@
 //! `alc_pkg_repair` is an actuator (side-effecting). The sensor side
 //! (`alc_pkg_list`) is intentionally read-only — see decisions.md Q3.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::super::alc_toml::{self, PackageDep};
@@ -500,4 +501,144 @@ pub(super) fn collect_path_missing(
             "suggestion": suggestion,
         }));
     }
+}
+
+/// Walk `pkg_dir` and collect physical directories that contain `init.lua` but
+/// are not registered in any of the three authoritative sources:
+/// `installed.json` (manifest), `alc.toml [packages]`, or
+/// `alc.local.toml [packages]`.
+///
+/// # Arguments
+///
+/// * `pkg_dir` — `~/.algocline/packages/` (or the path under test)
+/// * `registered` — set of package names known to any registration source
+/// * `registered_paths` — canonicalized absolute paths declared in
+///   `[packages.x] path = "..."` entries from alc.toml / alc.local.toml; used
+///   to skip false positives where a path-dep points inside `pkg_dir`
+/// * `target_filter` — when `Some(name)`, restrict output to that single name
+///
+/// # Returns
+///
+/// A `Vec<serde_json::Value>` of `unregistered_pkg` bucket entries on success.
+/// Each entry carries `name`, `kind`, `source`, `reason`, and `suggestion`
+/// (array of four strings, Clippy-style multi-line).
+///
+/// # Errors
+///
+/// Returns `Err(String)` if `pkg_dir` exists but cannot be read (any `io::Error`
+/// other than `NotFound`). `NotFound` is treated as empty (no packages installed)
+/// and returns `Ok(vec![])`.
+pub(super) fn collect_unregistered_pkg_dirs(
+    pkg_dir: &Path,
+    registered: &HashSet<String>,
+    registered_paths: &[PathBuf],
+    target_filter: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let read = match std::fs::read_dir(pkg_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // packages_dir absent == empty, not an error (file absent === empty).
+            return Ok(vec![]);
+        }
+        Err(e) => {
+            return Err(format!(
+                "pkg: failed to read packages_dir at {}: {e}",
+                pkg_dir.display()
+            ));
+        }
+    };
+
+    let mut entries = Vec::new();
+
+    for dir_entry_result in read {
+        let dir_entry = match dir_entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    "pkg: skipping unreadable entry in {}: {e}",
+                    pkg_dir.display()
+                );
+                continue;
+            }
+        };
+
+        let path = dir_entry.path();
+        let pkg_name = dir_entry.file_name().to_string_lossy().to_string();
+
+        // When a specific target is requested, skip all others.
+        if let Some(target) = target_filter {
+            if target != pkg_name.as_str() {
+                continue;
+            }
+        }
+
+        // Skip if name is already in one of the three registration sources.
+        if registered.contains(&pkg_name) {
+            continue;
+        }
+
+        // Only physical directories with init.lua qualify.
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("pkg: cannot stat {}: {e}", path.display());
+                continue;
+            }
+        };
+        if !meta.is_dir() {
+            // Symlinks are handled by run_unattached_symlink_pass; skip here.
+            continue;
+        }
+        if !path.join("init.lua").exists() {
+            // Empty or non-package directory — skip (AC-2).
+            continue;
+        }
+
+        // Canonical path comparison: skip if any alc.toml / alc.local.toml
+        // path entry resolves to the same physical directory (AC-4).
+        let canonical_pkg_path = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "pkg: failed to canonicalize existing dir {}: {e}",
+                    path.display()
+                ));
+            }
+        };
+        if registered_paths.contains(&canonical_pkg_path) {
+            continue;
+        }
+
+        // Build Clippy-style multi-line suggestion (crux constraint: 4 elements,
+        // suggestion field is array<string> for unregistered_pkg only).
+        let abs_path = path.display().to_string();
+        let suggestion = serde_json::json!([
+            format!(
+                "If this pkg was scaffolded outside `alc_pkg_scaffold` and you want it installed: \
+                `alc_pkg_install --force {abs_path}` (re-copy + register in installed.json)"
+            ),
+            format!(
+                "If you are actively iterating on this pkg in-tree: \
+                `alc_pkg_link {abs_path}` (symlink-based, no copy)"
+            ),
+            format!("If this dir is stale/abandoned: `rm -rf {abs_path}` to clean it up"),
+            "Note: source is unknown — git URL cannot be inferred from the bare directory. \
+            Re-record via one of the above."
+                .to_string(),
+        ]);
+
+        entries.push(serde_json::json!({
+            "name": pkg_name,
+            "kind": "unregistered_pkg",
+            "source": "unknown",
+            "reason": format!(
+                "physical dir with init.lua exists but is not registered in \
+                installed.json, alc.toml, or alc.local.toml: {}",
+                path.display()
+            ),
+            "suggestion": suggestion,
+        }));
+    }
+
+    Ok(entries)
 }

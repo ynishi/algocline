@@ -4168,6 +4168,262 @@ async fn test_pkg_doctor_narrative_unmigrated_info() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── unregistered_pkg bucket tests ───────────────────────────────────────────
+
+/// AC-1: Physical dir with init.lua but no registration (no installed.json,
+/// no alc.toml) → reported in `unregistered_pkg` bucket with correct fields.
+///
+/// Fixture: `<ALC_HOME>/packages/e2e_unreg_foo/init.lua` placed directly
+/// (no pkg_install, so no installed.json entry). alc.toml absent.
+///
+/// Expectations:
+/// - `unregistered_pkg` array contains an entry with `name == "e2e_unreg_foo"`
+/// - entry has `kind == "unregistered_pkg"`, `source == "unknown"`
+/// - `reason` contains "physical dir with init.lua"
+/// - `suggestion` is a JSON array with exactly 4 string elements
+#[tokio::test]
+async fn test_pkg_doctor_unregistered_pkg_detected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Place init.lua directly in packages dir without installing.
+    let pkg_dir = tmp.path().join("packages").join("e2e_unreg_foo");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'e2e_unreg_foo', version = '0.1.0' }\nreturn M\n",
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(&client, "alc_pkg_doctor", json!({})).await;
+
+    let bucket = resp["unregistered_pkg"]
+        .as_array()
+        .expect("unregistered_pkg array missing");
+    let entry = bucket
+        .iter()
+        .find(|e| e["name"] == "e2e_unreg_foo")
+        .unwrap_or_else(|| panic!("e2e_unreg_foo not found in unregistered_pkg, got: {resp}"));
+
+    assert_eq!(entry["kind"], "unregistered_pkg", "kind mismatch: {entry}");
+    assert_eq!(entry["source"], "unknown", "source mismatch: {entry}");
+    assert!(
+        entry["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("physical dir with init.lua"),
+        "reason should mention 'physical dir with init.lua': {entry}"
+    );
+
+    // Crux constraint: suggestion must be array<string> with exactly 4 elements.
+    let suggestion = entry["suggestion"]
+        .as_array()
+        .expect("suggestion must be an array for unregistered_pkg");
+    assert_eq!(
+        suggestion.len(),
+        4,
+        "suggestion must have exactly 4 elements: {suggestion:?}"
+    );
+    for (i, elem) in suggestion.iter().enumerate() {
+        assert!(
+            elem.is_string(),
+            "suggestion[{i}] must be a string, got: {elem}"
+        );
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// AC-2: Empty directory (no init.lua) is not reported in any bucket.
+///
+/// Fixture: `<ALC_HOME>/packages/e2e_unreg_empty/` with no files inside.
+///
+/// Expectation: `unregistered_pkg` does not contain `e2e_unreg_empty`.
+#[tokio::test]
+async fn test_pkg_doctor_unregistered_pkg_empty_dir_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Create empty directory (no init.lua).
+    let empty_dir = tmp.path().join("packages").join("e2e_unreg_empty");
+    std::fs::create_dir_all(&empty_dir).expect("create empty dir");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(&client, "alc_pkg_doctor", json!({})).await;
+
+    let bucket = resp["unregistered_pkg"]
+        .as_array()
+        .expect("unregistered_pkg array missing");
+    assert!(
+        !bucket.iter().any(|e| e["name"] == "e2e_unreg_empty"),
+        "empty dir must not appear in unregistered_pkg, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// AC-3: Package registered in installed.json (via pkg_install) is not
+/// reported in `unregistered_pkg`.
+///
+/// Fixture: install `e2e_unreg_bar` via alc_pkg_install → it appears in
+/// installed.json and healthy.
+///
+/// Expectation: `unregistered_pkg` does not contain `e2e_unreg_bar`.
+#[tokio::test]
+async fn test_pkg_doctor_unregistered_pkg_manifest_registered_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Build collection with a single package.
+    let source_root = tempfile::tempdir().expect("source tempdir");
+    let pkg_src = source_root.path().join("e2e_unreg_bar");
+    std::fs::create_dir_all(&pkg_src).expect("mkdir pkg_src");
+    std::fs::write(
+        pkg_src.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'e2e_unreg_bar', version = '0.1.0' }\nreturn M\n",
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // Install into the isolated ALC_HOME.
+    call_json(
+        &client,
+        "alc_pkg_install",
+        json!({ "url": source_root.path().to_string_lossy() }),
+    )
+    .await;
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_unreg_bar" }),
+    )
+    .await;
+
+    let bucket = resp["unregistered_pkg"]
+        .as_array()
+        .expect("unregistered_pkg array missing");
+    assert!(
+        !bucket.iter().any(|e| e["name"] == "e2e_unreg_bar"),
+        "manifest-registered pkg must not appear in unregistered_pkg, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// AC-4: Physical dir inside packages_dir that is declared as a path-dep in
+/// alc.toml is skipped (false positive avoidance via canonical path comparison).
+///
+/// Fixture:
+///   - `<ALC_HOME>/packages/e2e_unreg_baz/init.lua` placed directly
+///   - `<project_root>/alc.toml` with `[packages.e2e_unreg_baz] path = <abs_path>`
+///
+/// Expectation: `unregistered_pkg` does not contain `e2e_unreg_baz`.
+#[tokio::test]
+async fn test_pkg_doctor_unregistered_pkg_alc_toml_path_dep_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Place init.lua in packages dir (not via install).
+    let pkg_dir = tmp.path().join("packages").join("e2e_unreg_baz");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'e2e_unreg_baz', version = '0.1.0' }\nreturn M\n",
+    )
+    .expect("write init.lua");
+
+    // Write alc.toml declaring this dir as a path dep.
+    // Use the same tmp dir as project_root for simplicity.
+    let project_root = tmp.path();
+    let alc_toml_content = format!(
+        "[packages.e2e_unreg_baz]\npath = \"{}\"\n",
+        pkg_dir.display()
+    );
+    std::fs::write(project_root.join("alc.toml"), &alc_toml_content).expect("write alc.toml");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "project_root": project_root.to_string_lossy() }),
+    )
+    .await;
+
+    let bucket = resp["unregistered_pkg"]
+        .as_array()
+        .expect("unregistered_pkg array missing");
+    assert!(
+        !bucket.iter().any(|e| e["name"] == "e2e_unreg_baz"),
+        "path-dep in alc.toml must not appear in unregistered_pkg (false positive), got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// AC-5: target_filter Some(name) where the package exists only as a physical
+/// dir → returns non-Err response with `unregistered_pkg` populated.
+///
+/// This is the primary bug fix: previously `pkg_doctor name="quux"` would
+/// return Err("Package 'quux' not found in ...") even when the physical dir
+/// existed. Now it routes to `unregistered_pkg` instead.
+///
+/// Fixture: `<ALC_HOME>/packages/e2e_unreg_quux/init.lua` placed directly
+/// (no installed.json entry, no alc.toml).
+///
+/// Expectations:
+/// - Call does NOT return Err (no panic from call_json)
+/// - `unregistered_pkg` contains `e2e_unreg_quux`
+#[tokio::test]
+async fn test_pkg_doctor_unregistered_pkg_target_filter_routes_to_bucket() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Place init.lua directly in packages dir without installing.
+    let pkg_dir = tmp.path().join("packages").join("e2e_unreg_quux");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'e2e_unreg_quux', version = '0.1.0' }\nreturn M\n",
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(tmp.path()).await;
+
+    // This call previously returned Err. Now it must succeed and populate
+    // unregistered_pkg (crux constraint: target_filter Some routing to bucket).
+    let resp = call_json(
+        &client,
+        "alc_pkg_doctor",
+        json!({ "name": "e2e_unreg_quux" }),
+    )
+    .await;
+
+    let bucket = resp["unregistered_pkg"]
+        .as_array()
+        .expect("unregistered_pkg array missing");
+    assert!(
+        bucket.iter().any(|e| e["name"] == "e2e_unreg_quux"),
+        "e2e_unreg_quux must appear in unregistered_pkg when target_filter is Some, got: {resp}"
+    );
+
+    // Verify suggestion is array<string> with 4 elements (crux constraint).
+    let entry = bucket
+        .iter()
+        .find(|e| e["name"] == "e2e_unreg_quux")
+        .expect("entry not found");
+    let suggestion = entry["suggestion"]
+        .as_array()
+        .expect("suggestion must be an array");
+    assert_eq!(
+        suggestion.len(),
+        4,
+        "suggestion must have exactly 4 elements: {suggestion:?}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// After #1778221491-39903, `narrative_issues` bucket is removed from
 /// `alc_pkg_doctor` output. Verify the doctor call succeeds and the
 /// bucket is absent for a pkg that previously had a clean narrative state.

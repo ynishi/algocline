@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Bumped bundled `algocline-swarm-frame` from `v0.3.0` to `v0.5.0` in `BUNDLED_SOURCES` (`src/init.rs`). Adds `swarm_aggregate_plugin` and Rich Verdict 2-layer separation. `alc init` / `alc update` will pull the new tag.
+- `alc_eval`: scenario-side `provider` field now takes precedence over the auto-wired algocline provider. Falls back to auto-wire (`ef.providers.algocline { strategy = "..." }`) when scenario does not specify one. Enables 0-cost replay providers (e.g. `ef.providers.recorded { log_path = "~/.algocline/logs/s-<id>.json" }`) and `mock.recording` / `mock.map` via inline scenario without changing the MCP wire shape. The `strategy` argument is still required — borrow any installed package name (e.g. `cot`) when running a pure-replay smoke; the borrowed strategy module is loaded but never invoked because the scenario-side provider supersedes it. Smoke: `alc_eval(strategy="cot", scenario=<inline with provider=ef.providers.recorded {...}>)` returns `response.model = "recorded"`, `stats.auto.llm_calls = 0`. (Lua-level change in `crates/algocline-engine/src/prelude.lua`; no MCP wire change.)
 
 ### Added
 

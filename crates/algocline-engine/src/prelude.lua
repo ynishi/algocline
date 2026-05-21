@@ -699,9 +699,16 @@ do
             end
         end
 
+        -- scenario-side `provider` (if any) takes precedence over the auto-wired
+        -- algocline provider. This allows replay / mock providers (e.g.
+        -- ef.providers.recorded, mock.recording) to be used in alc_eval without
+        -- changing the MCP wire shape. Falls back to the auto-wired provider
+        -- when scenario does not specify one.
+        local resolved_provider = spec.provider or provider
+
         if has_bindings then
             -- Full evalframe-compatible spec: copy indexed bindings + cases
-            local suite_spec = { provider = provider }
+            local suite_spec = { provider = resolved_provider }
             for i = 1, #spec do
                 suite_spec[i] = spec[i]
             end
@@ -711,7 +718,7 @@ do
 
         -- Simple form: resolve graders → bindings, cases → ef.case
         local grader_names = spec.graders or { "exact_match" }
-        local suite_spec = { provider = provider }
+        local suite_spec = { provider = resolved_provider }
         for i, g in ipairs(grader_names) do
             suite_spec[i] = ef.bind({ resolve_grader(ef, g) })
         end

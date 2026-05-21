@@ -1,0 +1,19 @@
+{
+  "name": "algocline",
+  "owner": {
+    "name": "Yutaka Nishimura"
+  },
+  "description": "Bundled plugins for the algocline LLM amplification engine.",
+  "plugins": [
+    {
+      "name": "alc",
+      "source": "./plugins/alc",
+      "description": "algocline pkg development DX set (adviser / coder / refiner + alc-build / alc-wake skills).",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "homepage": "https://github.com/ynishi/algocline",
+      "repository": "https://github.com/ynishi/algocline",
+      "keywords": ["algocline", "lua", "llm", "agents", "package-development"]
+    }
+  ]
+}

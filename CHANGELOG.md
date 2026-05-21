@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Docs
 
 - Documented the `ALC_CARD_SINKS` environment variable in README (Card subscriber backends as a `|`-separated URI list; v1 only accepts `file:///absolute/path`; duplicate URIs are first-wins; malformed entries are logged and skipped). The variable has been implemented and tested in `algocline-engine` for a while but was missing from the public docs.
+- Added a Quick-start subsection in README that explains how to install algocline as a Claude Code plugin (`/plugin marketplace add ynishi/algocline` followed by `/plugin install alc@algocline`), so users discover the bundled plugin path without diving into `plugins/alc/`.
 
 ### Notes
 

@@ -111,6 +111,23 @@ Example: writing logs to a custom directory:
 }
 ```
 
+### Optional: Install as a Claude Code plugin
+
+If you use [Claude Code](https://claude.ai/code), you can install algocline together with a curated set of development tools as a single plugin instead of editing `~/.claude.json` by hand:
+
+```
+/plugin marketplace add ynishi/algocline
+/plugin install alc@algocline
+```
+
+The plugin bundles:
+
+- `algocline` and `git-reader` MCP server entries (no manual `mcp.json` edit needed),
+- the `/alc-wake` and `/alc-build` skills,
+- the `@alc-adviser` / `@alc-coder` / `@alc-refiner` agents for algocline package development.
+
+See [`plugins/alc/README.md`](plugins/alc/README.md) for details.
+
 ### 4. Use
 
 Call algocline tools from your MCP host. The host LLM calls these tools on your behalf:

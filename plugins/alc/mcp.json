@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "algocline": {
-      "command": "alc",
-      "args": []
+      "command": "alc"
     },
     "git-reader": {
       "command": "git-workflow-mcp",

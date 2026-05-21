@@ -1,0 +1,12 @@
+{
+  "name": "alc",
+  "version": "0.1.0",
+  "description": "algocline pkg development DX set (adviser / coder / refiner + alc-build / alc-wake skills). Bundled with algocline core engine.",
+  "author": {
+    "name": "Yutaka Nishimura"
+  },
+  "homepage": "https://github.com/ynishi/algocline",
+  "repository": "https://github.com/ynishi/algocline",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["algocline", "lua", "llm", "agents", "package-development"]
+}

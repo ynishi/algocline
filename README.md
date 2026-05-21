@@ -73,12 +73,14 @@ Add algocline as an MCP server in your host's configuration (e.g. Claude Code's 
 {
   "mcpServers": {
     "algocline": {
-      "command": "alc",
-      "env": {}
+      "command": "alc"
     }
   }
 }
 ```
+
+Add an `env` object only when you need to set one of the environment
+variables documented below.
 
 After adding the config, restart your MCP host session so it picks up the new server.
 
@@ -92,6 +94,7 @@ After adding the config, restart your MCP host session so it picks up the new se
 | `ALC_PROJECT_ROOT` | Project root directory for project-local package resolution. When omitted, auto-detected by walking up from cwd to find `alc.toml` | (auto-detect) |
 | `ALC_POOL_STATE_DIR` | Directory for pool registry state (`registry.json`). Overrides the default `~/.algocline/state/pool/` | `~/.algocline/state/pool` |
 | `ALC_POOL_IDLE_TIMEOUT` | Idle timeout in seconds for pool worker subprocesses. Set to `0` to disable. Only relevant when using `host_mode: true` | `1800` |
+| `ALC_CARD_SINKS` | Card subscriber backends (mirror destinations) as a `\|`-separated URI list. v1 only accepts `file:///absolute/path`. Duplicate URIs are first-wins; malformed entries are logged and skipped. | (none) |
 
 Example: writing logs to a custom directory:
 

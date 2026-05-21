@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-05-21
+
+### Added
+
+- `plugins/alc/` — Claude Code Plugin Marketplace plugin for algocline package development (adviser / coder / refiner agents + `alc-build` / `alc-wake` skills). Bundled `mcp.json` registers `algocline` and `git-reader` MCP servers automatically when the plugin is enabled. Distributed under MIT OR Apache-2.0 (matches the crate license).
+- `.claude-plugin/marketplace.json` — Marketplace catalog so this repository can be registered as a Claude Code Plugin Marketplace source. Users can install bundled plugins with `/plugin marketplace add ynishi/algocline` followed by `/plugin install alc@algocline`.
+
+### Changed
+
+- README MCP register example simplified to the minimum form (`{"command": "alc"}`), with a one-line note that `env` is only needed when one of the documented variables is set.
+- Bundled `algocline` entry in `plugins/alc/mcp.json` aligned with the same minimum form.
+
+### Docs
+
+- Documented the `ALC_CARD_SINKS` environment variable in README (Card subscriber backends as a `|`-separated URI list; v1 only accepts `file:///absolute/path`; duplicate URIs are first-wins; malformed entries are logged and skipped). The variable has been implemented and tested in `algocline-engine` for a while but was missing from the public docs.
+
+### Notes
+
+- Patch bump (0.38.0 -> 0.38.1). The only crates.io-scoped change is the README docs addition for `ALC_CARD_SINKS`; binary / library APIs are unchanged. The `plugins/alc/` and `.claude-plugin/` additions are distributed via the Claude Code Plugin Marketplace and are not part of the crates.io publish set.
+
 ## [0.38.0] - 2026-05-21
 
 ### Changed

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-05-21
+
 ### Changed
 
 - Bumped bundled `algocline-swarm-frame` from `v0.3.0` to `v0.5.0` in `BUNDLED_SOURCES` (`src/init.rs`). Adds `swarm_aggregate_plugin` and Rich Verdict 2-layer separation. `alc init` / `alc update` will pull the new tag.

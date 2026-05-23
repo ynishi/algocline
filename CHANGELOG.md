@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.3] - 2026-05-23
+
+### Changed
+
+- `plugins/alc/agents/alc-coder.md` — added `### Spec Authoring Conventions` section after Driver Loop step 5, codifying two `mlua-lspec` runtime-shape regularities the static check cannot catch: top-of-file `lust` destructuring, and the `M.spec.entries` stub form for smoke / no-`alc.llm` packages. Includes the `lust-global-assumption` anti-pattern explaining the one guaranteed retry these omissions cause.
+- `plugins/alc/skills/alc-wake/SKILL.md` — Post-impl install procedure now branches by `/alc-build --location=` value. Global mode keeps the existing `cp → /tmp → git init → alc_pkg_install` synthetic-single-pkg path. Collection mode (new) covers (B-1) collection-local use via the 0.38.2 `alc_pkg_test project_root` fix without any install step, and (B-2) global registration via `alc_pkg_link` (in-tree dev) or `alc_pkg_install url=file://<collection_root>` (published-source semantics). Adds an explicit guard against forking the SoT by `cp`'ing to `/tmp`.
+
+### Notes
+
+- Patch bump (0.38.2 → 0.38.3). Plugin-side documentation (Agent / Skill body) only — no Rust source changes. Required because `plugins/alc/` ships as part of the Claude Code Plugin Marketplace catalog; the marketplace consumer view of this repo needs the doc updates surfaced at a tagged release.
+
 ## [0.38.2] - 2026-05-23
 
 ### Fixed

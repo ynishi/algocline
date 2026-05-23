@@ -355,11 +355,11 @@ impl AppService {
                 unreachable!("pkg must be Some: input_count==1 and code/code_file are None")
             };
             let init_path = self
-                .pkg_resolve_init_path(&pkg_name)
+                .pkg_resolve_init_path(&pkg_name, project_root.as_deref())
                 .map_err(|e| format!("pkg_test: {e}"))?
                 .ok_or_else(|| {
                     format!(
-                        "pkg_test: package '{pkg_name}' not found in alc.toml or ~/.algocline/packages/"
+                        "pkg_test: package '{pkg_name}' not found in <project_root>/<name>/, alc.local.toml, or ~/.algocline/packages/"
                     )
                 })?;
             let pkg_root = init_path

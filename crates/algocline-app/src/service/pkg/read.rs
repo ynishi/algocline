@@ -126,12 +126,40 @@ impl AppService {
 
     /// Resolve the `init.lua` path for a package.
     ///
+    /// Search order (priority high → low):
+    /// 1. Collection scope: `<project_root>/<name>/init.lua` (only when
+    ///    `project_root` is `Some`). Targets the `/alc-build
+    ///    --location=collection` layout where any repo with `alc.toml` at
+    ///    its root carries packages as flat `<root>/<pkg>/init.lua`.
+    /// 2. Variant scope: packages declared in the cwd-ancestor's
+    ///    `alc.local.toml`.
+    /// 3. Global scope: `~/.algocline/packages/<name>/init.lua`.
+    ///
     /// Returns `Ok(Some(init_lua_path))` when found.
     /// Returns `Ok(None)` when the package is not installed.
     /// Returns `Err` only for I/O errors or malformed `alc.local.toml`.
-    pub(crate) fn pkg_resolve_init_path(&self, name: &str) -> Result<Option<PathBuf>, String> {
-        // ── 1. Variant scope: alc.local.toml ──────────────────────────────
-        let resolved_root = self.resolve_root(None);
+    pub(crate) fn pkg_resolve_init_path(
+        &self,
+        name: &str,
+        project_root: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        // ── 1. Collection scope: <project_root>/<name>/init.lua ────────────
+        if let Some(pr) = project_root {
+            let collection_init_lua = PathBuf::from(pr).join(name).join("init.lua");
+            match std::fs::metadata(&collection_init_lua) {
+                Ok(_) => return Ok(Some(collection_init_lua)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "pkg_resolve_init_path: I/O error for {}: {e}",
+                        collection_init_lua.display()
+                    ));
+                }
+            }
+        }
+
+        // ── 2. Variant scope: alc.local.toml ──────────────────────────────
+        let resolved_root = self.resolve_root(project_root);
         if let Some(root) = resolved_root {
             match alc_toml::load_alc_local_toml(&root) {
                 Ok(Some(local)) => {
@@ -150,7 +178,7 @@ impl AppService {
             }
         }
 
-        // ── 2. Global scope: ~/.algocline/packages/<name>/init.lua ─────────
+        // ── 3. Global scope: ~/.algocline/packages/<name>/init.lua ─────────
         let global_init_lua: PathBuf = self
             .log_config
             .app_dir()
@@ -184,7 +212,7 @@ impl AppService {
             ));
         }
 
-        let init_lua_path = match self.pkg_resolve_init_path(name)? {
+        let init_lua_path = match self.pkg_resolve_init_path(name, None)? {
             Some(p) => p,
             None => return Ok(None),
         };

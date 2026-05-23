@@ -6434,6 +6434,65 @@ async fn test_pkg_test_auto_search_paths_resolves_alc_local_toml() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Regression: `alc_pkg_test pkg=<name> project_root=<collection_root>`
+/// must discover `<collection_root>/<name>/init.lua` when the collection root
+/// carries `alc.toml` but no `alc.local.toml`.
+///
+/// Targets the `/alc-build --location=collection` layout where any repo with
+/// `alc.toml` at its root holds packages as flat `<root>/<pkg>/init.lua`.
+/// Prior to the fix, `pkg_resolve_init_path` only walked
+/// `~/.algocline/packages/` and the cwd-ancestor's `alc.local.toml`, so the
+/// `project_root` argument was effectively ignored in `pkg=` mode.
+#[tokio::test]
+async fn test_pkg_test_pkg_mode_resolves_collection_root() {
+    let tmp_home = tempfile::tempdir().expect("tempdir alc_home");
+    let tmp_collection = tempfile::tempdir().expect("tempdir collection");
+
+    // Create the collection-root marker (alc.toml with [packages]) — note we
+    // do NOT create alc.local.toml; the fix must discover the package via
+    // the project_root + flat layout convention alone.
+    std::fs::write(
+        tmp_collection.path().join("alc.toml"),
+        "[hub]\nname = \"e2e-test-collection\"\n\n[packages]\n",
+    )
+    .expect("write alc.toml");
+
+    // Create <collection>/test_collection_pkg/init.lua and spec.
+    let pkg_dir = tmp_collection.path().join("test_collection_pkg");
+    let spec_dir = pkg_dir.join("spec");
+    std::fs::create_dir_all(&spec_dir).expect("create pkg dirs");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        "local M = {}\nM.meta = { name = 'test_collection_pkg', version = '0.0.1', description = 'e2e', category = 'test' }\nM.spec = { entries = {} }\nfunction M.run(ctx) return (ctx and ctx.input or '') .. ' ok' end\nreturn M\n",
+    )
+    .expect("write init.lua");
+    std::fs::write(
+        spec_dir.join("test_collection_pkg_spec.lua"),
+        "local describe, it, expect = lust.describe, lust.it, lust.expect\ndescribe('collection', function()\n    it('discovered', function() expect(1).to.equal(1) end)\nend)\n",
+    )
+    .expect("write spec");
+
+    let client = connect_with_alc_home(tmp_home.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_pkg_test",
+        json!({
+            "pkg": "test_collection_pkg",
+            "project_root": tmp_collection.path().to_str().expect("utf8 path"),
+        }),
+    )
+    .await;
+
+    // Pre-fix: this returned a "package not found" error.
+    assert_eq!(
+        resp["passed"], 1,
+        "expected passed=1 (package discovered via project_root), got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── alc.env ──────────────────────────────────────────────────────────────────
 
 /// T1 (happy path): inject env vars are accessible from Lua via `alc.env.KEY`.

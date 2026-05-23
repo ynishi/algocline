@@ -17,7 +17,20 @@ name undecided, or the pass conditions missing).
 
 ## Arguments
 
-`/alc-build "<design_para, <= 200 chars>"`
+`/alc-build [--location=<auto|bundled|global>] "<design_para, <= 200 chars>"`
+
+`--location` (optional, default `auto`) decides where the package is written:
+
+- `auto` (default) — if the current `cwd`'s git root contains `alc.toml`, treat
+  that git root as a bundled-collection root and write under it; otherwise
+  fall back to `~/.algocline/packages/` (global). This lets dogfooding from
+  inside `algocline-bundled-packages/` (or any other collection repo) "just
+  work" without an explicit flag.
+- `bundled` — force-write under `<cwd's git root>/<pkg>/`. Errors out if the
+  git root does not contain `alc.toml` (refuses to scatter pkg files into a
+  non-collection repo).
+- `global` — force-write under `~/.algocline/packages/<pkg>/` even when
+  invoked from inside a collection repo.
 
 Required elements of `design_para`:
 
@@ -64,18 +77,21 @@ arms as the pass condition."
 ## What It Does
 
 1. **Receive `design_para` in full** — no truncation or summarization.
-2. **Resolve the journal configuration** — call
+2. **Resolve `pkg_root` from `--location`** — decide where the package will
+   be written (see "Package root resolution" below). The caller (this Skill)
+   owns this decision; the Agent does not re-resolve.
+3. **Resolve the journal configuration** — call
    `mcp__algocline__alc_setting_resolve(target="journal")` once and let ALC
    core resolve env / toml / default to return `{path, pkg}` (the caller
    does not own env / toml parsing logic).
-3. **Assemble the kick prompt** — `design_para` + journal configuration
-   (`path` / `pkg`) + implementation-loop instructions (Write `init.lua` +
-   spec -> `alc_pkg_test` -> Edit on failure -> <= 3 retries) + return
-   contract (three sections: `### Result` / `### Artifacts` /
-   `### Key Observations`).
-4. **Spawn `@alc-coder` via the `Task` tool** — no other Agents
+4. **Assemble the kick prompt** — `design_para` + resolved `pkg_root` +
+   journal configuration (`path` / `pkg`) + implementation-loop instructions
+   (Write `init.lua` + spec -> `alc_pkg_test` -> Edit on failure -> <= 3
+   retries) + return contract (three sections: `### Result` / `### Artifacts`
+   / `### Key Observations`).
+5. **Spawn `@alc-coder` via the `Task` tool** — no other Agents
    (`impl-lead` / orch agents, etc.) may be called.
-5. Return the `result_summary` to the main thread and hand control back to
+6. Return the `result_summary` to the main thread and hand control back to
    the rendezvous where the User confirms, re-kicks, or injects a Delta.
 
 ### Scope
@@ -89,6 +105,27 @@ out of scope for this Skill** — after the coder finishes, **the main AI
 
 The standard post-impl install procedure run by the main AI is consolidated
 in the footer of `/alc-wake` -> Post-impl install (not repeated here).
+
+### Package Root Resolution
+
+The `pkg_root` (the parent directory that will contain `<pkg>/init.lua`) is
+decided by `--location` before the kick prompt is assembled:
+
+| `--location` | Resolution |
+|---|---|
+| `global` | `pkg_root = ~/.algocline/packages` (no further checks). |
+| `bundled` | `git_root = $(git rev-parse --show-toplevel)`; require `<git_root>/alc.toml` to exist, otherwise abort with an error (refusing to scatter pkg files into a non-collection repo). `pkg_root = <git_root>`. |
+| `auto` (default) | Try `git_root = $(git rev-parse --show-toplevel)`; if that succeeds AND `<git_root>/alc.toml` exists, use bundled (`pkg_root = <git_root>`). Otherwise fall back to global (`pkg_root = ~/.algocline/packages`). |
+
+Rationale: bundled-collection repos (e.g. `algocline-bundled-packages`)
+already carry `alc.toml` with a `[packages]` section at the repo root, so its
+mere presence is a reliable signal. The algocline source repo itself has no
+`alc.toml`, so dogfooding from inside it correctly falls through to global.
+
+The resolved `pkg_root` is embedded literally in the kick prompt as
+`Package root: <pkg_root>`. The coder MUST treat that line as the single
+source of truth for write paths — do not let the Agent re-resolve via cwd
+heuristics (Bash is not in its tool list anyway).
 
 ### `[setting.journal]` Config Schema
 
@@ -116,6 +153,11 @@ section to both paths.
 ## Do
 
 - Include `design_para` verbatim in the kick prompt.
+- Resolve `pkg_root` from `--location` (default `auto`) before assembling
+  the kick prompt; embed it as `Package root: <pkg_root>`.
+- For `--location=auto` and `--location=bundled`, run
+  `git rev-parse --show-toplevel` and (for bundled) `test -f <git_root>/alc.toml`
+  via Bash from the Skill body.
 - Immediately on startup, call `alc_setting_resolve(target="journal")` once
   to obtain `{path, pkg}` and embed it in the kick prompt.
 - Spawn `@alc-coder` via the `Task` tool (exactly one).
@@ -137,6 +179,13 @@ section to both paths.
 - **Do not offload journal configuration resolution to the Agent** (it is
   the caller's responsibility — `alc.toml` parsing finishes inside this
   Skill and the Agent simply receives and appends).
+- **Do not hard-code `~/.algocline/packages/` in the kick prompt** — the
+  write target must be passed through the resolved `Package root:` line so
+  bundled-collection dogfooding works. Locking the path defeats the whole
+  `--location` mechanism.
+- **Do not pass `--location=bundled` without verifying `<git_root>/alc.toml`
+  exists** — silently scattering pkg files into a non-collection repo is
+  an accident (refuse with an error instead).
 
 ## Anti-patterns
 
@@ -154,20 +203,36 @@ section to both paths.
 - `journal-resolve-self-parse` — parsing env / toml in the caller instead of
   using `alc_setting_resolve` (breaks unification on the generic ALC core
   backbone).
+- `location-hardcoded` — leaving `~/.algocline/packages/<pkg>/` literally in
+  the kick prompt instead of passing the resolved `Package root:` line
+  (breaks `--location=bundled` and `auto` detection).
+- `pkg-root-resolve-skip` — assembling the kick prompt without ever
+  resolving `pkg_root` from `--location` (forces the Agent to guess).
+- `bundled-without-alc-toml` — running `--location=bundled` from a git repo
+  whose root has no `alc.toml` (must abort, not scatter files).
 
 ## Driver Loop
 
-1. The User invokes `/alc-build "<design_para>"` literally.
-2. Extract `design_para`.
-3. **Call `alc_setting_resolve(target="journal")` once** to fix
+1. The User invokes `/alc-build [--location=<auto|bundled|global>] "<design_para>"`
+   literally.
+2. Extract `--location` (default `auto`) and `design_para`.
+3. **Resolve `pkg_root`** per the table in "Package Root Resolution":
+   - `global` → `pkg_root = ~/.algocline/packages`.
+   - `bundled` → `git_root = $(git rev-parse --show-toplevel)`; if
+     `<git_root>/alc.toml` is missing, abort with an error message and stop.
+     `pkg_root = <git_root>`.
+   - `auto` → try `git rev-parse --show-toplevel`; if it succeeds AND
+     `<git_root>/alc.toml` exists, `pkg_root = <git_root>`. Otherwise
+     `pkg_root = ~/.algocline/packages`.
+4. **Call `alc_setting_resolve(target="journal")` once** to fix
    `{path, pkg}` (env / toml / default resolution is completed inside ALC
    core).
-4. Assemble the kick prompt (template below; embed the journal
-   configuration).
-5. `Task(subagent_type="alc-coder", description="impl pkg from design_para", prompt=<kick prompt>)`
-6. Receive the `### Result / ### Artifacts / ### Key Observations`
+5. Assemble the kick prompt (template below; embed both `Package root:` and
+   the journal configuration).
+6. `Task(subagent_type="alc-coder", description="impl pkg from design_para", prompt=<kick prompt>)`
+7. Receive the `### Result / ### Artifacts / ### Key Observations`
    `result_summary` from the Agent.
-7. Present it to the main thread as-is and wait for the User's rendezvous
+8. Present it to the main thread as-is and wait for the User's rendezvous
    decision (confirm / re-kick / inject Delta).
 
 ### Kick Prompt Template
@@ -176,19 +241,23 @@ section to both paths.
 Design para:
 <full design_para>
 
+Package root: <resolved pkg_root, absolute path>
+# Write target is <Package root>/<pkg>/init.lua and <Package root>/<pkg>/spec/<pkg>_spec.lua.
+# Do NOT re-resolve via cwd or any other heuristic; this line is the single source of truth.
+
 Journal config:
 - shared path: <resolved journal_path, absolute path>
-- per-pkg: <true|false>   # when true, also additively append to <pkg_root>/journal.md
+- per-pkg: <true|false>   # when true, also additively append to <Package root>/<pkg>/journal.md
 
 Impl loop:
 1. Extract package name / implementation requirements / pass conditions from design_para.
-2. Write ~/.algocline/packages/<pkg>/init.lua and spec/<pkg>_spec.lua.
+2. Write <Package root>/<pkg>/init.lua and <Package root>/<pkg>/spec/<pkg>_spec.lua.
 3. Run mcp__algocline__alc_pkg_test.
 4. On failure, Edit and re-test up to three retries.
 5. On pass, return the result_summary under the contract below.
 6. Append `## [YYYY-MM-DD] coder — <test_summary>` per the journal config
    (shared path is required; when per-pkg=true, also append the same section
-   to <pkg_root>/journal.md).
+   to <Package root>/<pkg>/journal.md).
 
 Return contract (three required sections):
 ### Result

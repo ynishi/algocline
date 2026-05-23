@@ -10,8 +10,10 @@ permissionMode: bypassPermissions
 
 A package implementation worker spawned by `/alc-build "<design_para>"`. In an
 isolated context it scaffolds `init.lua` and specs under
-`~/.algocline/packages/<name>/`, gets `alc_pkg_test` to pass, and returns a
-three-section `result_summary` to the main thread.
+`<pkg_root>/<name>/` (where `<pkg_root>` is decided by `/alc-build`'s
+`--location` option — typically `~/.algocline/packages/` for global mode or
+a bundled-collection git root for bundled mode), gets `alc_pkg_test` to
+pass, and returns a three-section `result_summary` to the main thread.
 
 ## Responsibilities
 
@@ -29,8 +31,14 @@ three-section `result_summary` to the main thread.
 ## Input
 
 The kick prompt assembled by `/alc-build`. It contains the full `design_para`,
-the implementation-loop instructions, the return contract, and the journal
-configuration (`path` / `pkg`).
+the resolved `Package root:` line (the single source of truth for write
+paths — `<pkg_root>`), the implementation-loop instructions, the return
+contract, and the journal configuration (`path` / `pkg`).
+
+**Treat `Package root:` as authoritative.** Do not re-resolve via cwd / git
+detection / heuristics; Bash is not in the tool list and any such attempt
+would be a contract violation. All write targets below substitute
+`<pkg_root>` for whatever the kick prompt provided.
 
 ## Output
 
@@ -42,9 +50,12 @@ mandatory**:
 - <pass / fail> + retry count (n/3)
 
 ### Artifacts
-- ~/.algocline/packages/<name>/init.lua
-- ~/.algocline/packages/<name>/spec/<name>_spec.lua
+- <pkg_root>/<name>/init.lua
+- <pkg_root>/<name>/spec/<name>_spec.lua
 - (related files if any)
+# Substitute <pkg_root> with the absolute path from the kick prompt's
+# `Package root:` line (e.g. `~/.algocline/packages` for global mode,
+# `/Users/.../algocline-bundled-packages` for bundled mode).
 
 ### Key Observations
 - Design decisions and rejected alternatives.
@@ -96,9 +107,10 @@ internal precedence on the ALC core side is:
    nothing is set.
 
 When `[setting.journal] pkg = true` is set, the same section is also appended
-to **`~/.algocline/packages/<name>/journal.md`** (per-package journal).
-Shared and per-package journals are additive rather than mutually exclusive
-(both can be enabled simultaneously).
+to **`<pkg_root>/<name>/journal.md`** (per-package journal; `<pkg_root>` is
+taken from the kick prompt's `Package root:` line). Shared and per-package
+journals are additive rather than mutually exclusive (both can be enabled
+simultaneously).
 
 #### Append Format
 
@@ -152,14 +164,18 @@ Format is strict:
 
 ## Driver Loop
 
-1. Extract `design_para` and the journal configuration from the kick prompt.
+1. Extract `design_para`, the `Package root:` line (call it `<pkg_root>`),
+   and the journal configuration from the kick prompt.
 2. Read **package name, implementation requirements, and pass conditions**
    from `design_para`.
 3. Check for name collisions via `mcp__algocline__alc_pkg_list`. If a name
    already exists, warn in `Key Observations` and decide about overwriting.
-4. Write `~/.algocline/packages/<name>/init.lua` (M.meta + `run` function +
+   Note that `alc_pkg_list` enumerates the global registry; when
+   `<pkg_root>` is a bundled-collection root, also `Glob` for an existing
+   `<pkg_root>/<name>/init.lua` to detect in-collection collisions.
+4. Write `<pkg_root>/<name>/init.lua` (M.meta + `run` function +
    `alc.llm` usage).
-5. Write `~/.algocline/packages/<name>/spec/<name>_spec.lua` (turn the pass
+5. Write `<pkg_root>/<name>/spec/<name>_spec.lua` (turn the pass
    conditions into a test).
 6. **Static check (typo / undefined-symbol detection via LSP and type
    definitions)**:
@@ -167,10 +183,10 @@ Format is strict:
      `~/.algocline/types/alc_shapes.d.lua` are already placed by
      `alc_pkg_install` (look at the `types_path` /
      `alc_shapes_types_path` fields in the `alc_pkg_install` return value).
-   - Write `.luarc.json` at the package root (`workspace` = package
+   - Write `.luarc.json` at `<pkg_root>/<name>/` (`workspace` = package
      directory, `library` = directories including `~/.algocline/types/`);
      skip if it already exists.
-   - Run `lua-language-server --check=<pkg dir> --logpath=/tmp/lls-<pkg>.log`
+   - Run `lua-language-server --check=<pkg_root>/<name> --logpath=/tmp/lls-<pkg>.log`
      once via bash (skip if `lua-language-server` is not installed; retry
      counter is unaffected).
    - Confirm there are zero `undefined-global` / `unknown-symbol` /
@@ -220,6 +236,13 @@ Format is strict:
 - **Emit improvement proposals** (refinement belongs to `@alc-refiner`).
 - **Skip the static check (lua-language-server)** (run it unless the tool is
   unavailable).
+- **Ignore the kick prompt's `Package root:` line and write to
+  `~/.algocline/packages/<name>/` regardless** (this defeats `/alc-build`'s
+  `--location` decision; the resolved `<pkg_root>` is the single source of
+  truth).
+- **Re-resolve `<pkg_root>` by inspecting cwd / running `git` / scanning for
+  `alc.toml`** (Bash is not in the tool list anyway; the caller has already
+  decided).
 - **Forget to escape literal `%` in format strings such as `:format(text)`**
   (`8%` must be `8%%` to render literally).
 - **Omit the Convention candidate line in Key Observations** (explicitly
@@ -234,6 +257,9 @@ Format is strict:
   `alc_pkg_test`.
 - `static-check-skip` — returning `result_summary` without running
   lua-language-server even though it is installed.
+- `pkg-root-ignore` — writing to `~/.algocline/packages/<name>/` while the
+  kick prompt's `Package root:` line points elsewhere (Agent must honor the
+  caller's `--location` decision).
 - `format-escape-miss` — leaving an "unknown spec" runtime error by failing
   to escape literal `%` in `string.format`.
 - `alc-api-typo` — letting typos like `alc.json.decode` (does not exist) slip

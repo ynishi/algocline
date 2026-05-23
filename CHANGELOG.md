@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.2] - 2026-05-23
+
 ### Fixed
 
 - `alc_pkg_test` `pkg=<name>` mode now honors the `project_root` argument for package discovery. Previously the parameter only fed `auto_search_paths` (the `require()` resolution side) and was ignored when locating `<pkg>/init.lua` itself, so packages living in a user collection repo (`/alc-build --location=collection` layout: any repo with `alc.toml` at its root holding flat `<root>/<pkg>/` directories) could not be tested via `pkg=<name>` and required the `code_file=<absolute spec> search_paths=[<root>]` workaround. The new search order is `<project_root>/<name>/init.lua` → cwd-ancestor `alc.local.toml` (variant) → `~/.algocline/packages/<name>/init.lua` (global); existing global / variant paths are preserved unchanged. (Surfaced by the alc-coder dispatch verifying the `--location=collection` mechanism in `plugins/alc/`.)
+
+### Notes
+
+- Patch bump (0.38.1 → 0.38.2). Bug fix only; no API additions or removals. The `pkg_resolve_init_path` signature added an optional `project_root` parameter — this is a `pub(crate)` function so it is not a SemVer-visible change for crates.io consumers.
 
 ## [0.38.1] - 2026-05-21
 

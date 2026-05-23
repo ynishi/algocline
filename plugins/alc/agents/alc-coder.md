@@ -1,6 +1,6 @@
 ---
 name: alc-coder
-description: Isolated worker dedicated to algocline package implementation, spawned by /alc-build. Receives a design_para and a resolved `Package root:` line (either `~/.algocline/packages` for global mode, or any user-chosen collection root that carries `alc.toml` for bundled mode), writes init.lua + spec/ under <pkg_root>/<name>/, and loops implementation with up to three retries until alc_pkg_test passes. After completion, appends one section of pass/fail observations to the configured journal.
+description: Isolated worker dedicated to algocline package implementation, spawned by /alc-build. Receives a design_para and a resolved `Package root:` line (either `~/.algocline/packages` for global mode, or any user-chosen collection root that carries `alc.toml` for collection mode), writes init.lua + spec/ under <pkg_root>/<name>/, and loops implementation with up to three retries until alc_pkg_test passes. After completion, appends one section of pass/fail observations to the configured journal.
 model: sonnet
 tools: Write, Read, Edit, Glob, Grep, mcp__algocline__alc_pkg_test, mcp__algocline__alc_pkg_list, mcp__algocline__alc_pkg_doctor, mcp__algocline__alc_run, mcp__algocline__alc_pkg_scaffold, mcp__algocline__alc_hub_search, mcp__algocline__alc_hub_info
 permissionMode: bypassPermissions
@@ -13,7 +13,7 @@ isolated context it scaffolds `init.lua` and specs under
 `<pkg_root>/<name>/`. The `<pkg_root>` value is decided by `/alc-build`'s
 `--location` option and arrives via the kick prompt's `Package root:` line —
 typically `~/.algocline/packages/` for global mode, or **any user-chosen
-collection root that carries `alc.toml`** for bundled mode (the user's own
+collection root that carries `alc.toml`** for collection mode (the user's own
 project directory; not limited to any specific repo). The coder then gets
 `alc_pkg_test` to pass and returns a three-section `result_summary` to the
 main thread.
@@ -58,7 +58,7 @@ mandatory**:
 - (related files if any)
 # Substitute <pkg_root> with the absolute path from the kick prompt's
 # `Package root:` line — `~/.algocline/packages` for global mode, or any
-# user-chosen collection root that carries `alc.toml` for bundled mode.
+# user-chosen collection root that carries `alc.toml` for collection mode.
 
 ### Key Observations
 - Design decisions and rejected alternatives.
@@ -175,7 +175,7 @@ Format is strict:
 3. Check for name collisions via `mcp__algocline__alc_pkg_list`. If a name
    already exists, warn in `Key Observations` and decide about overwriting.
    Note that `alc_pkg_list` enumerates the global registry; when
-   `<pkg_root>` is a bundled-collection root, also `Glob` for an existing
+   `<pkg_root>` is a collection root, also `Glob` for an existing
    `<pkg_root>/<name>/init.lua` to detect in-collection collisions.
 4. Write `<pkg_root>/<name>/init.lua` (M.meta + `run` function +
    `alc.llm` usage).

@@ -29,7 +29,7 @@ the User to fill the gap, then resume.
    LLM, or an explicit "no `alc.llm` needed" declaration).
 3. **Pass conditions** are stated (what `alc_pkg_test` should confirm).
 4. **`--location` resolves unambiguously** for the current cwd (auto →
-   either git root with `alc.toml` or `~/.algocline/packages`; bundled →
+   either git root with `alc.toml` or `~/.algocline/packages`; collection →
    git root with `alc.toml` present; global → no check needed).
 
 Skipping this self-check and dispatching with a half-baked `design_para`
@@ -38,22 +38,28 @@ one self-review pass; the cost of skipping is a full coder retry loop.
 
 ## Arguments
 
-`/alc-build [--location=<auto|bundled|global>] "<design_para, <= 200 chars>"`
+`/alc-build [--location=<auto|collection|global>] "<design_para, <= 200 chars>"`
 
 `--location` (optional, default `auto`) decides where the package is written:
 
 - `auto` (default) — if the current `cwd`'s git root contains `alc.toml`,
-  treat that git root as a bundled-collection root and write under it;
+  treat that git root as a collection root and write under it;
   otherwise fall back to `~/.algocline/packages/` (global). This lets the
   user develop packages **inside their own arbitrary project directory** —
   any repo that carries `alc.toml` at its root is treated as a personal
-  collection. `algocline-bundled-packages` is just one such collection;
-  the same mechanism works for any user-owned repo.
-- `bundled` — force-write under `<cwd's git root>/<pkg>/`. Errors out if the
+  collection.
+- `collection` — force-write under `<cwd's git root>/<pkg>/`. Errors out if the
   git root does not contain `alc.toml` (refuses to scatter pkg files into a
   non-collection repo).
 - `global` — force-write under `~/.algocline/packages/<pkg>/` even when
   invoked from inside a collection repo.
+
+> **Reserved name**: `--location=bundled` is **reserved** for a future mode
+> targeting the official `algocline-bundled-packages` set (the canonical
+> packages shipped/bundled with algocline core itself). It is **not**
+> implemented now; do not use this enum value. User-owned collection repos
+> — even one that happens to be a fork of `algocline-bundled-packages` —
+> belong to `collection`, not `bundled`.
 
 Required elements of `design_para`:
 
@@ -137,17 +143,20 @@ decided by `--location` before the kick prompt is assembled:
 | `--location` | Resolution |
 |---|---|
 | `global` | `pkg_root = ~/.algocline/packages` (no further checks). |
-| `bundled` | `git_root = $(git rev-parse --show-toplevel)`; require `<git_root>/alc.toml` to exist, otherwise abort with an error (refusing to scatter pkg files into a non-collection repo). `pkg_root = <git_root>`. |
-| `auto` (default) | Try `git_root = $(git rev-parse --show-toplevel)`; if that succeeds AND `<git_root>/alc.toml` exists, use bundled (`pkg_root = <git_root>`). Otherwise fall back to global (`pkg_root = ~/.algocline/packages`). |
+| `collection` | `git_root = $(git rev-parse --show-toplevel)`; require `<git_root>/alc.toml` to exist, otherwise abort with an error (refusing to scatter pkg files into a non-collection repo). `pkg_root = <git_root>`. |
+| `auto` (default) | Try `git_root = $(git rev-parse --show-toplevel)`; if that succeeds AND `<git_root>/alc.toml` exists, use collection (`pkg_root = <git_root>`). Otherwise fall back to global (`pkg_root = ~/.algocline/packages`). |
 
 Rationale: the primary use case is **the user developing packages inside
 their own project directory**. Any repo with `alc.toml` + `[packages]` at
 the root is, by convention, a personal/team collection — its mere presence
-is a reliable signal. `algocline-bundled-packages` is one published example
-of such a collection, but the same auto-detection serves every user-owned
-collection repo equally. Repositories without `alc.toml` (including the
+is a reliable signal. Repositories without `alc.toml` (including the
 algocline source repo itself) correctly fall through to global, so running
 `/alc-build` from an unrelated directory never scatters pkg files.
+
+Note that the **official `algocline-bundled-packages` set** — the
+canonical packages shipped with algocline core — is a separate concept
+reserved for `--location=bundled` (not implemented yet; see the
+"Reserved name" note above).
 
 The resolved `pkg_root` is embedded literally in the kick prompt as
 `Package root: <pkg_root>`. The coder MUST treat that line as the single
@@ -182,8 +191,8 @@ section to both paths.
 - Include `design_para` verbatim in the kick prompt.
 - Resolve `pkg_root` from `--location` (default `auto`) before assembling
   the kick prompt; embed it as `Package root: <pkg_root>`.
-- For `--location=auto` and `--location=bundled`, run
-  `git rev-parse --show-toplevel` and (for bundled) `test -f <git_root>/alc.toml`
+- For `--location=auto` and `--location=collection`, run
+  `git rev-parse --show-toplevel` and (for collection) `test -f <git_root>/alc.toml`
   via Bash from the Skill body.
 - Immediately on startup, call `alc_setting_resolve(target="journal")` once
   to obtain `{path, pkg}` and embed it in the kick prompt.
@@ -212,9 +221,9 @@ section to both paths.
   Skill and the Agent simply receives and appends).
 - **Do not hard-code `~/.algocline/packages/` in the kick prompt** — the
   write target must be passed through the resolved `Package root:` line so
-  bundled-collection dogfooding works. Locking the path defeats the whole
+  collection dogfooding works. Locking the path defeats the whole
   `--location` mechanism.
-- **Do not pass `--location=bundled` without verifying `<git_root>/alc.toml`
+- **Do not pass `--location=collection` without verifying `<git_root>/alc.toml`
   exists** — silently scattering pkg files into a non-collection repo is
   an accident (refuse with an error instead).
 
@@ -237,22 +246,22 @@ section to both paths.
   backbone).
 - `location-hardcoded` — leaving `~/.algocline/packages/<pkg>/` literally in
   the kick prompt instead of passing the resolved `Package root:` line
-  (breaks `--location=bundled` and `auto` detection).
+  (breaks `--location=collection` and `auto` detection).
 - `pkg-root-resolve-skip` — assembling the kick prompt without ever
   resolving `pkg_root` from `--location` (forces the Agent to guess).
-- `bundled-without-alc-toml` — running `--location=bundled` from a git repo
+- `collection-without-alc-toml` — running `--location=collection` from a git repo
   whose root has no `alc.toml` (must abort, not scatter files).
 
 ## Driver Loop
 
 1. Entry: either the User invokes
-   `/alc-build [--location=<auto|bundled|global>] "<design_para>"`
+   `/alc-build [--location=<auto|collection|global>] "<design_para>"`
    literally, or the AI invokes on the User's behalf after the Maturity
    Self-check (above) passes.
 2. Extract `--location` (default `auto`) and `design_para`.
 3. **Resolve `pkg_root`** per the table in "Package Root Resolution":
    - `global` → `pkg_root = ~/.algocline/packages`.
-   - `bundled` → `git_root = $(git rev-parse --show-toplevel)`; if
+   - `collection` → `git_root = $(git rev-parse --show-toplevel)`; if
      `<git_root>/alc.toml` is missing, abort with an error message and stop.
      `pkg_root = <git_root>`.
    - `auto` → try `git rev-parse --show-toplevel`; if it succeeds AND

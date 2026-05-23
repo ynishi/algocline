@@ -1,19 +1,40 @@
 ---
 name: alc-build
-description: The single manual-trigger Skill that delegates algocline package implementation to @alc-coder. Run manually once the User has finalized design_para.
-disable-model-invocation: true
+description: Delegates algocline package implementation to @alc-coder. Invoke (either by the User typing `/alc-build "<design_para>"` directly, or by the AI invoking it on the User's behalf) only once design_para is mature — package name, alc.llm usage intent, and pass conditions are all decided.
 ---
 
 # /alc-build — algocline Package Implementation Kick
 
 Hands a `design_para` finalized through design dialogue to `@alc-coder` and
-lets it implement in an isolated context. **Started only via an explicit
-manual trigger from the User** (`disable-model-invocation: true`).
+lets it implement in an isolated context. Either the User invokes
+`/alc-build "<design_para>"` literally, or the AI invokes it on the User's
+behalf once the design conversation has matured (see "Maturity Self-check"
+below).
 
 A Skill to run only the moment dialogue on the main thread (User <-> AI) has
 matured and the design has been condensed into a single paragraph. Never
 trigger it in an intermediate state (when the design is vague, the package
 name undecided, or the pass conditions missing).
+
+### Maturity Self-check (AI-invoked path)
+
+When the AI is about to invoke `/alc-build` on behalf of the User (rather
+than the User typing it literally), the AI MUST verify all four of the
+following from the conversation context before assembling the kick prompt.
+If any item is missing, **do not invoke** — return one short question to
+the User to fill the gap, then resume.
+
+1. **Package name** is decided (snake_case, no collision concern raised).
+2. **`alc.llm` usage intent** is stated (which prompt / loop drives the
+   LLM, or an explicit "no `alc.llm` needed" declaration).
+3. **Pass conditions** are stated (what `alc_pkg_test` should confirm).
+4. **`--location` resolves unambiguously** for the current cwd (auto →
+   either git root with `alc.toml` or `~/.algocline/packages`; bundled →
+   git root with `alc.toml` present; global → no check needed).
+
+Skipping this self-check and dispatching with a half-baked `design_para`
+wastes coder tokens and produces an unusable pkg skeleton. The check costs
+one self-review pass; the cost of skipping is a full coder retry loop.
 
 ## Arguments
 
@@ -167,7 +188,10 @@ section to both paths.
 - Immediately on startup, call `alc_setting_resolve(target="journal")` once
   to obtain `{path, pkg}` and embed it in the kick prompt.
 - Spawn `@alc-coder` via the `Task` tool (exactly one).
-- Keep `disable-model-invocation: true` in the frontmatter.
+- Run the Maturity Self-check before invoking on the User's behalf
+  (`Package name / alc.llm intent / Pass conditions / --location` — all
+  four must be settled). If anything is missing, ask one question to the
+  User and wait, do not dispatch.
 - Expect the result to come back as three sections:
   `### Result` / `### Artifacts` / `### Key Observations`.
 
@@ -179,8 +203,9 @@ section to both paths.
   `impl-lead`, etc.).
 - Do not summarize or truncate `design_para` (it causes requirements to
   drop on the Agent side).
-- Do not remove `disable-model-invocation: true` (no turning it into an
-  auto-trigger).
+- **Do not invoke without the Maturity Self-check passing** (AI-invoked
+  path only — half-baked design_para wastes coder tokens and produces an
+  unusable skeleton).
 - Do not mix upstream setup scope (such as `alc init` deployment).
 - **Do not offload journal configuration resolution to the Agent** (it is
   the caller's responsibility — `alc.toml` parsing finishes inside this
@@ -196,8 +221,9 @@ section to both paths.
 ## Anti-patterns
 
 - `prompt-body-bloat` — mixing design-dialogue logic into the Skill body.
-- `disable-model-invocation-missing` — dropping the auto-trigger guard flag
-  from the frontmatter.
+- `maturity-check-skip` — invoking on the User's behalf without confirming
+  package name / `alc.llm` intent / pass conditions / `--location` are all
+  settled (dispatches a half-baked design_para and wastes coder tokens).
 - `design-para-truncation` — failing to include the full `design_para` in
   the kick prompt.
 - `wrong-agent-spawn` — spawning anything other than `@alc-coder`.
@@ -219,8 +245,10 @@ section to both paths.
 
 ## Driver Loop
 
-1. The User invokes `/alc-build [--location=<auto|bundled|global>] "<design_para>"`
-   literally.
+1. Entry: either the User invokes
+   `/alc-build [--location=<auto|bundled|global>] "<design_para>"`
+   literally, or the AI invokes on the User's behalf after the Maturity
+   Self-check (above) passes.
 2. Extract `--location` (default `auto`) and `design_para`.
 3. **Resolve `pkg_root`** per the table in "Package Root Resolution":
    - `global` → `pkg_root = ~/.algocline/packages`.

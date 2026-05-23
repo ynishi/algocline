@@ -280,7 +280,13 @@ section follows the `## [YYYY-MM-DD] <role> — <summary>` format.
      The coder is responsible up to implementation + spec pass; registry
      registration is an explicit step the main AI takes.
 
-     Standard procedure (collection layout + git init + alc_pkg_install):
+     Branch by `/alc-build --location=`:
+
+     A. **global mode** (`--location=auto` fell through to global, OR
+        `--location=global` explicit) — pkg lives at
+        `~/.algocline/packages/<NEW>/`. Standard procedure (synthetic
+        single-pkg collection + alc_pkg_install):
+
        1. mkdir -p /tmp/alc-install-<rand>/
        2. cp -r ~/.algocline/packages/<NEW> /tmp/alc-install-<rand>/
        3. cd /tmp/alc-install-<rand>/ && git init -q && git add . && \
@@ -289,6 +295,39 @@ section follows the `## [YYYY-MM-DD] <role> — <summary>` format.
        5. mcp__algocline__alc_pkg_doctor name=<NEW>   -> confirm healthy
        6. (optional) mcp__algocline__alc_hub_info pkg=<NEW>   -> confirm
           installed:true / source disclosed
+
+     B. **collection mode** (`--location=auto` detected `alc.toml` at
+        cwd's git root, OR `--location=collection` explicit) — pkg lives
+        at `<collection_root>/<NEW>/` and the collection root is already
+        a git repo with `alc.toml` + `[packages]`. The User's own project
+        directory is the SoT; do NOT cp to `/tmp` (that would fork the
+        SoT). Two install candidates depending on intent:
+
+        B-1. **collection-local use only** (the pkg is meant to be used
+             from within the collection repo, not globally registered).
+             0.38.2+ supports this via `alc_pkg_test pkg=<NEW>
+             project_root=<collection_root>` without any install step —
+             the test path discovers `<collection_root>/<NEW>/init.lua`
+             directly. Skip install entirely for collection-local use.
+
+        B-2. **global registration** (the pkg should appear in
+             `alc_pkg_list` and `~/.algocline/packages/`). Two paths:
+
+             a. `mcp__algocline__alc_pkg_link path=<collection_root>/<NEW>`
+                — symlink the collection pkg into the global registry.
+                Edits in the collection root reflect immediately;
+                preferred for in-tree dev.
+             b. `mcp__algocline__alc_pkg_install url=file://<collection_root>
+                force=true` — copy-install via the collection's
+                `[packages]` entries. Idempotent re-copy semantics; use
+                when the collection should ship as a published source.
+
+        Then: `mcp__algocline__alc_pkg_doctor name=<NEW>` to confirm
+        healthy.
+
+        **Do not** cp the pkg dir out of the collection root to `/tmp`
+        (= forks the SoT). The collection root itself is the install
+        source.
 
      Early detection of missed installs: when `alc_pkg_doctor` (full scan
      or with `name`) returns an `unregistered_pkg` bucket, that is the

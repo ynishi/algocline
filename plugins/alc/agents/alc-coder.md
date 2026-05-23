@@ -180,7 +180,8 @@ Format is strict:
 4. Write `<pkg_root>/<name>/init.lua` (M.meta + `run` function +
    `alc.llm` usage).
 5. Write `<pkg_root>/<name>/spec/<name>_spec.lua` (turn the pass
-   conditions into a test).
+   conditions into a test). Follow the **Spec Authoring Conventions** below
+   to avoid a guaranteed retry from `mlua-lspec` global-shape surprises.
 6. **Static check (typo / undefined-symbol detection via LSP and type
    definitions)**:
    - `~/.algocline/types/alc.d.lua` and
@@ -208,6 +209,44 @@ Format is strict:
 11. Append `## [YYYY-MM-DD] coder — <test_summary>` to the journal targets
     (shared / per-package) via Write (regardless of pass / fail).
 12. Close the context (no further dialogue with the main thread).
+
+### Spec Authoring Conventions
+
+Two regularities the `echo_pong` / `ping_back` dispatches surfaced when
+verifying `/alc-build --location=collection`. Get them right on the first
+Write to avoid a guaranteed retry — the static check (step 6) cannot catch
+either because both are runtime-shape concerns.
+
+1. **`mlua-lspec` does NOT inject `describe` / `it` / `expect` as bare
+   globals.** Destructure them from the `lust` global at the top of every
+   spec file:
+
+   ```lua
+   local describe, it, expect = lust.describe, lust.it, lust.expect
+   ```
+
+   Omitting this line yields an `attempt to call a nil value (global
+   'describe')` at runtime — the `echo_pong` dispatch took its sole retry
+   on exactly this. Static check passes because `describe` *is* a possible
+   global identifier; only `lust.describe` resolves.
+
+2. **`M.spec.entries` may be a stub for smoke / no-`alc.llm` packages.**
+   Full `T.shape` declarations are needed only when the package opts into
+   shape-checked I/O. For a smoke pkg, a commented stub is enough and
+   avoids pulling in the `alc_shapes` dependency:
+
+   ```lua
+   M.spec = {
+     entries = {
+       run = {
+         -- input: string
+       },
+     },
+   }
+   ```
+
+   Add full `T.shape` entries when the package's contract actually wants
+   them enforced; otherwise the stub form is the documented minimum.
 
 ## Do
 
@@ -261,6 +300,10 @@ Format is strict:
   `alc_pkg_test`.
 - `static-check-skip` — returning `result_summary` without running
   lua-language-server even though it is installed.
+- `lust-global-assumption` — writing a spec that calls `describe` /
+  `it` / `expect` as bare globals instead of destructuring them from
+  `lust`. Static check passes (they could be globals), but runtime fails
+  with `attempt to call a nil value`. Costs one guaranteed retry.
 - `pkg-root-ignore` — writing to `~/.algocline/packages/<name>/` while the
   kick prompt's `Package root:` line points elsewhere (Agent must honor the
   caller's `--location` decision).

@@ -21,11 +21,13 @@ name undecided, or the pass conditions missing).
 
 `--location` (optional, default `auto`) decides where the package is written:
 
-- `auto` (default) — if the current `cwd`'s git root contains `alc.toml`, treat
-  that git root as a bundled-collection root and write under it; otherwise
-  fall back to `~/.algocline/packages/` (global). This lets dogfooding from
-  inside `algocline-bundled-packages/` (or any other collection repo) "just
-  work" without an explicit flag.
+- `auto` (default) — if the current `cwd`'s git root contains `alc.toml`,
+  treat that git root as a bundled-collection root and write under it;
+  otherwise fall back to `~/.algocline/packages/` (global). This lets the
+  user develop packages **inside their own arbitrary project directory** —
+  any repo that carries `alc.toml` at its root is treated as a personal
+  collection. `algocline-bundled-packages` is just one such collection;
+  the same mechanism works for any user-owned repo.
 - `bundled` — force-write under `<cwd's git root>/<pkg>/`. Errors out if the
   git root does not contain `alc.toml` (refuses to scatter pkg files into a
   non-collection repo).
@@ -117,10 +119,14 @@ decided by `--location` before the kick prompt is assembled:
 | `bundled` | `git_root = $(git rev-parse --show-toplevel)`; require `<git_root>/alc.toml` to exist, otherwise abort with an error (refusing to scatter pkg files into a non-collection repo). `pkg_root = <git_root>`. |
 | `auto` (default) | Try `git_root = $(git rev-parse --show-toplevel)`; if that succeeds AND `<git_root>/alc.toml` exists, use bundled (`pkg_root = <git_root>`). Otherwise fall back to global (`pkg_root = ~/.algocline/packages`). |
 
-Rationale: bundled-collection repos (e.g. `algocline-bundled-packages`)
-already carry `alc.toml` with a `[packages]` section at the repo root, so its
-mere presence is a reliable signal. The algocline source repo itself has no
-`alc.toml`, so dogfooding from inside it correctly falls through to global.
+Rationale: the primary use case is **the user developing packages inside
+their own project directory**. Any repo with `alc.toml` + `[packages]` at
+the root is, by convention, a personal/team collection — its mere presence
+is a reliable signal. `algocline-bundled-packages` is one published example
+of such a collection, but the same auto-detection serves every user-owned
+collection repo equally. Repositories without `alc.toml` (including the
+algocline source repo itself) correctly fall through to global, so running
+`/alc-build` from an unrelated directory never scatters pkg files.
 
 The resolved `pkg_root` is embedded literally in the kick prompt as
 `Package root: <pkg_root>`. The coder MUST treat that line as the single

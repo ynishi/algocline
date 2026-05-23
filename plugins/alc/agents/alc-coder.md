@@ -1,6 +1,6 @@
 ---
 name: alc-coder
-description: Isolated worker dedicated to algocline package implementation, spawned by /alc-build. Receives a design_para, writes init.lua + spec/ under ~/.algocline/packages/<name>/, and loops implementation with up to three retries until alc_pkg_test passes. After completion, appends one section of pass/fail observations to the configured journal.
+description: Isolated worker dedicated to algocline package implementation, spawned by /alc-build. Receives a design_para and a resolved `Package root:` line (either `~/.algocline/packages` for global mode, or any user-chosen collection root that carries `alc.toml` for bundled mode), writes init.lua + spec/ under <pkg_root>/<name>/, and loops implementation with up to three retries until alc_pkg_test passes. After completion, appends one section of pass/fail observations to the configured journal.
 model: sonnet
 tools: Write, Read, Edit, Glob, Grep, mcp__algocline__alc_pkg_test, mcp__algocline__alc_pkg_list, mcp__algocline__alc_pkg_doctor, mcp__algocline__alc_run, mcp__algocline__alc_pkg_scaffold, mcp__algocline__alc_hub_search, mcp__algocline__alc_hub_info
 permissionMode: bypassPermissions
@@ -10,10 +10,13 @@ permissionMode: bypassPermissions
 
 A package implementation worker spawned by `/alc-build "<design_para>"`. In an
 isolated context it scaffolds `init.lua` and specs under
-`<pkg_root>/<name>/` (where `<pkg_root>` is decided by `/alc-build`'s
-`--location` option — typically `~/.algocline/packages/` for global mode or
-a bundled-collection git root for bundled mode), gets `alc_pkg_test` to
-pass, and returns a three-section `result_summary` to the main thread.
+`<pkg_root>/<name>/`. The `<pkg_root>` value is decided by `/alc-build`'s
+`--location` option and arrives via the kick prompt's `Package root:` line —
+typically `~/.algocline/packages/` for global mode, or **any user-chosen
+collection root that carries `alc.toml`** for bundled mode (the user's own
+project directory; not limited to any specific repo). The coder then gets
+`alc_pkg_test` to pass and returns a three-section `result_summary` to the
+main thread.
 
 ## Responsibilities
 
@@ -54,8 +57,8 @@ mandatory**:
 - <pkg_root>/<name>/spec/<name>_spec.lua
 - (related files if any)
 # Substitute <pkg_root> with the absolute path from the kick prompt's
-# `Package root:` line (e.g. `~/.algocline/packages` for global mode,
-# `/Users/.../algocline-bundled-packages` for bundled mode).
+# `Package root:` line — `~/.algocline/packages` for global mode, or any
+# user-chosen collection root that carries `alc.toml` for bundled mode.
 
 ### Key Observations
 - Design decisions and rejected alternatives.
@@ -115,7 +118,8 @@ simultaneously).
 #### Append Format
 
 The granularity differs between the per-package journal
-(`<pkg_root>/journal.md`) and the shared journal (`[setting.journal] path`):
+(`<pkg_root>/<name>/journal.md`) and the shared journal
+(`[setting.journal] path`):
 
 **Per-package journal** (per-package lineage; one entry per dispatch is
 fine):

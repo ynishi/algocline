@@ -15,10 +15,15 @@ ci: fmt-check clippy test check-invariants check-agent-index
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Check formatting
+# Check formatting (Rust)
 [group: 'agent']
 fmt-check:
     cargo fmt --all -- --check
+
+# Check formatting (Lua, stylua)
+[group: 'agent']
+lua-fmt-check:
+    stylua --check .
 
 # ─── Build ──────────────────────────────────────────────────────
 
@@ -59,10 +64,15 @@ snapshots:
 
 # ─── Format ─────────────────────────────────────────────────────
 
-# Auto-format all code
+# Auto-format all code (Rust)
 [group: 'agent']
 fmt:
     cargo fmt --all
+
+# Auto-format Lua code (stylua)
+[group: 'agent']
+lua-fmt:
+    stylua .
 
 # ─── Quality ────────────────────────────────────────────────────
 

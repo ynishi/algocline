@@ -41,7 +41,9 @@ local function peel(schema)
             optional = true
             schema = rawget(schema, "inner")
         elseif k == "described" then
-            if doc == "" then doc = rawget(schema, "doc") or "" end
+            if doc == "" then
+                doc = rawget(schema, "doc") or ""
+            end
             schema = rawget(schema, "inner")
         else
             break
@@ -81,9 +83,11 @@ function M.shape_type_string(schema)
     elseif k == "array_of" then
         return "array of " .. M.shape_type_string(rawget(peeled, "elem"))
     elseif k == "map_of" then
-        return string.format("map of %s to %s",
+        return string.format(
+            "map of %s to %s",
             M.shape_type_string(rawget(peeled, "key")),
-            M.shape_type_string(rawget(peeled, "val")))
+            M.shape_type_string(rawget(peeled, "val"))
+        )
     elseif k == "one_of" then
         local values = rawget(peeled, "values")
         local parts = {}
@@ -98,13 +102,14 @@ function M.shape_type_string(schema)
         return "one_of(" .. table.concat(parts, ", ") .. ")"
     elseif k == "shape" then
         local entries = S.fields(peeled)
-        if #entries == 0 then return "shape { }" end
+        if #entries == 0 then
+            return "shape { }"
+        end
         local parts = {}
         for i = 1, #entries do
             local e = entries[i]
             local mark = e.optional and "?" or ""
-            parts[i] = string.format(
-                "%s%s: %s", e.name, mark, M.shape_type_string(e.type))
+            parts[i] = string.format("%s%s: %s", e.name, mark, M.shape_type_string(e.type))
         end
         return "shape { " .. table.concat(parts, ", ") .. " }"
     elseif k == "discriminated" then
@@ -121,10 +126,11 @@ end
 --- `@`, `` ` ``) and forbid `: ` / ` #` anywhere. Emit a quoted scalar
 --- whenever any of these would break the plain form.
 local function yaml_scalar(s)
-    if s == "" then return '""' end
+    if s == "" then
+        return '""'
+    end
     local first = s:sub(1, 1)
-    local needs_quote =
-        first:match("[%-%?:,%[%]{}#&%*!|>'\"%%@`]") ~= nil
+    local needs_quote = first:match("[%-%?:,%[%]{}#&%*!|>'\"%%@`]") ~= nil
         or s:find(": ", 1, true) ~= nil
         or s:find(" #", 1, true) ~= nil
         or s:find("\n", 1, true) ~= nil
@@ -156,8 +162,7 @@ local function build_frontmatter(pkg_info)
     if id.description and id.description ~= "" then
         -- description is always quoted: it's human prose and likely to
         -- contain `:` (em dash phrasing, package references, etc.)
-        lines[#lines + 1] = string.format('description: "%s"',
-                                          escape_yaml_string(id.description))
+        lines[#lines + 1] = string.format('description: "%s"', escape_yaml_string(id.description))
     end
     lines[#lines + 1] = "source: " .. yaml_scalar(id.source_path)
     lines[#lines + 1] = "generated: gen_docs (V0)"
@@ -178,9 +183,7 @@ local function render_parameters_table(input_schema)
         local req = e.optional and "optional" or "**required**"
         local type_str = M.shape_type_string(e.type)
         local doc = escape_md_table_cell(e.doc or "")
-        lines[#lines + 1] = string.format(
-            "| `ctx.%s` | %s | %s | %s |",
-            e.name, type_str, req, doc)
+        lines[#lines + 1] = string.format("| `ctx.%s` | %s | %s | %s |", e.name, type_str, req, doc)
     end
     return table.concat(lines, "\n")
 end
@@ -244,15 +247,15 @@ local function render_result_section(result_schema)
         local opt = e.optional and "optional" or "—"
         local type_str = M.shape_type_string(e.type)
         local doc = escape_md_table_cell(e.doc or "")
-        lines[#lines + 1] = string.format(
-            "| `%s` | %s | %s | %s |",
-            e.name, type_str, opt, doc)
+        lines[#lines + 1] = string.format("| `%s` | %s | %s | %s |", e.name, type_str, opt, doc)
     end
     return table.concat(lines, "\n")
 end
 
 local function has_renderable_result(result_schema)
-    if result_schema == nil then return false end
+    if result_schema == nil then
+        return false
+    end
     local shape_peeled = resolve_shape(result_schema)
     return shape_peeled ~= nil
 end
@@ -339,13 +342,18 @@ end
 -- caching / content-addressed storage).
 
 local JSON_ESCAPES = {
-    ['"']  = '\\"',  ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f',
-    ['\n'] = '\\n',  ['\r'] = '\\r',  ['\t'] = '\\t',
+    ['"'] = '\\"',
+    ["\\"] = "\\\\",
+    ["\b"] = "\\b",
+    ["\f"] = "\\f",
+    ["\n"] = "\\n",
+    ["\r"] = "\\r",
+    ["\t"] = "\\t",
 }
 
 local function json_escape_string(s)
     local out = s:gsub('[%z\1-\31\\"]', function(c)
-        return JSON_ESCAPES[c] or string.format('\\u%04x', c:byte())
+        return JSON_ESCAPES[c] or string.format("\\u%04x", c:byte())
     end)
     return '"' .. out .. '"'
 end
@@ -353,16 +361,20 @@ end
 local function is_array(t)
     local n = 0
     for k, _ in pairs(t) do
-        if type(k) ~= "number" then return false end
+        if type(k) ~= "number" then
+            return false
+        end
         n = n + 1
     end
     for i = 1, n do
-        if t[i] == nil then return false end
+        if t[i] == nil then
+            return false
+        end
     end
     return n > 0, n
 end
 
-local json_encode_value  -- forward
+local json_encode_value -- forward
 
 local function json_encode_array(t, n)
     local parts = {}
@@ -448,13 +460,15 @@ local function type_to_json(schema)
     elseif k == "map_of" then
         return {
             kind = "map_of",
-            key  = type_to_json(rawget(peeled, "key")),
-            val  = type_to_json(rawget(peeled, "val")),
+            key = type_to_json(rawget(peeled, "key")),
+            val = type_to_json(rawget(peeled, "val")),
         }
     elseif k == "one_of" then
         local src = rawget(peeled, "values")
         local values = {}
-        for i = 1, #src do values[i] = src[i] end
+        for i = 1, #src do
+            values[i] = src[i]
+        end
         return { kind = "one_of", values = values }
     elseif k == "shape" then
         return { kind = "shape", shape = M.shape_to_json(peeled) }
@@ -483,23 +497,22 @@ end
 function M.shape_to_json(schema)
     local peeled = peel(schema)
     if rawget(peeled, "kind") ~= "shape" then
-        error("shape_to_json: expected kind='shape', got '"
-              .. tostring(rawget(peeled, "kind")) .. "'", 2)
+        error("shape_to_json: expected kind='shape', got '" .. tostring(rawget(peeled, "kind")) .. "'", 2)
     end
     local entries = S.fields(peeled)
     local fields = {}
     for i = 1, #entries do
         local e = entries[i]
         fields[i] = {
-            name     = e.name,
-            type     = type_to_json(e.type),
+            name = e.name,
+            type = type_to_json(e.type),
             optional = e.optional and true or false,
-            doc      = e.doc or "",
+            doc = e.doc or "",
         }
     end
     return {
         fields = fields,
-        open   = rawget(peeled, "open") and true or false,
+        open = rawget(peeled, "open") and true or false,
     }
 end
 
@@ -529,13 +542,13 @@ end
 --- The bytes are deterministic (keys sorted) so downstream hub_index
 --- caching can content-address the JSON.
 function M.hub_entry(pkg_info)
-    local id  = pkg_info.identity
+    local id = pkg_info.identity
     local shp = pkg_info.shape
     local entry = {
-        name         = id.name,
-        version      = id.version or "",
-        category     = id.category or "",
-        description  = id.description or "",
+        name = id.name,
+        version = id.version or "",
+        category = id.category or "",
+        description = id.description or "",
         narrative_md = M.narrative_md(pkg_info),
     }
     if shp.input ~= nil then
@@ -563,12 +576,14 @@ end
 -- Output bytes are deterministic (json_encode sorts object keys).
 
 local CONTEXT7_SCHEMA_URL = "https://context7.com/schema/context7.json"
-local CONTEXT7_FOLDERS    = { "docs/narrative" }
+local CONTEXT7_FOLDERS = { "docs/narrative" }
 
 --- Copy a list of strings (defensive — the caller's table is not mutated).
 local function copy_str_list(src)
     local out = {}
-    for i = 1, #src do out[i] = src[i] end
+    for i = 1, #src do
+        out[i] = src[i]
+    end
     return out
 end
 
@@ -581,9 +596,15 @@ local function copy_version_list(src, key)
     for i = 1, #src do
         local v = src[i]
         if type(v) ~= "table" or type(v[key]) ~= "string" or v[key] == "" then
-            error(string.format(
-                "context7_config: %s[%d] must be a table with a non-empty '%s' field",
-                key == "tag" and "previousVersions" or "branchVersions", i, key), 2)
+            error(
+                string.format(
+                    "context7_config: %s[%d] must be a table with a non-empty '%s' field",
+                    key == "tag" and "previousVersions" or "branchVersions",
+                    i,
+                    key
+                ),
+                2
+            )
         end
         out[i] = { [key] = v[key] }
     end
@@ -611,7 +632,7 @@ function M.context7_config(config)
     end
     local entry = {
         ["$schema"] = CONTEXT7_SCHEMA_URL,
-        folders     = copy_str_list(CONTEXT7_FOLDERS),
+        folders = copy_str_list(CONTEXT7_FOLDERS),
     }
     if type(config.projectTitle) == "string" and config.projectTitle ~= "" then
         entry.projectTitle = config.projectTitle
@@ -658,25 +679,27 @@ end
 -- Output bytes are deterministic (json_encode sorts object keys).
 
 local DEVIN_MAX_NOTE_CHARS = 10000
-local DEVIN_MAX_PAGES      = 30
-local DEVIN_MAX_NOTES      = 100
+local DEVIN_MAX_PAGES = 30
+local DEVIN_MAX_NOTES = 100
 
 local function validate_note(note, where, i)
-    if type(note) ~= "table" or type(note.content) ~= "string"
-        or note.content == "" then
-        error(string.format(
-            "devin_wiki: %s[%d] must be a table with a non-empty 'content' string",
-            where, i), 2)
+    if type(note) ~= "table" or type(note.content) ~= "string" or note.content == "" then
+        error(string.format("devin_wiki: %s[%d] must be a table with a non-empty 'content' string", where, i), 2)
     end
     if #note.content > DEVIN_MAX_NOTE_CHARS then
-        error(string.format(
-            "devin_wiki: %s[%d].content exceeds %d chars (%d)",
-            where, i, DEVIN_MAX_NOTE_CHARS, #note.content), 2)
+        error(
+            string.format(
+                "devin_wiki: %s[%d].content exceeds %d chars (%d)",
+                where,
+                i,
+                DEVIN_MAX_NOTE_CHARS,
+                #note.content
+            ),
+            2
+        )
     end
     if note.author ~= nil and type(note.author) ~= "string" then
-        error(string.format(
-            "devin_wiki: %s[%d].author must be a string when present",
-            where, i), 2)
+        error(string.format("devin_wiki: %s[%d].author must be a string when present", where, i), 2)
     end
 end
 
@@ -689,12 +712,17 @@ local function copy_note(note)
 end
 
 local function copy_page(page, i, total_notes_ref)
-    if type(page) ~= "table" or type(page.title) ~= "string"
-        or page.title == "" or type(page.purpose) ~= "string"
-        or page.purpose == "" then
-        error(string.format(
-            "devin_wiki: pages[%d] must be a table with non-empty " ..
-            "'title' and 'purpose' strings", i), 2)
+    if
+        type(page) ~= "table"
+        or type(page.title) ~= "string"
+        or page.title == ""
+        or type(page.purpose) ~= "string"
+        or page.purpose == ""
+    then
+        error(
+            string.format("devin_wiki: pages[%d] must be a table with non-empty " .. "'title' and 'purpose' strings", i),
+            2
+        )
     end
     local out = { title = page.title, purpose = page.purpose }
     if type(page.parent) == "string" and page.parent ~= "" then
@@ -702,13 +730,11 @@ local function copy_page(page, i, total_notes_ref)
     end
     if page.page_notes ~= nil then
         if type(page.page_notes) ~= "table" then
-            error(string.format(
-                "devin_wiki: pages[%d].page_notes must be an array", i), 2)
+            error(string.format("devin_wiki: pages[%d].page_notes must be an array", i), 2)
         end
         local notes = {}
         for j = 1, #page.page_notes do
-            validate_note(page.page_notes[j],
-                "pages[" .. i .. "].page_notes", j)
+            validate_note(page.page_notes[j], "pages[" .. i .. "].page_notes", j)
             notes[j] = copy_note(page.page_notes[j])
             total_notes_ref.n = total_notes_ref.n + 1
         end
@@ -756,18 +782,17 @@ function M.devin_wiki(config)
             error("devin_wiki: pages must be an array", 2)
         end
         if #config.pages > DEVIN_MAX_PAGES then
-            error(string.format(
-                "devin_wiki: pages exceeds max %d (%d provided)",
-                DEVIN_MAX_PAGES, #config.pages), 2)
+            error(string.format("devin_wiki: pages exceeds max %d (%d provided)", DEVIN_MAX_PAGES, #config.pages), 2)
         end
         local pages = {}
         local seen_titles = {}
         for i = 1, #config.pages do
             local p = copy_page(config.pages[i], i, total_notes)
             if seen_titles[p.title] then
-                error(string.format(
-                    "devin_wiki: pages[%d].title '%s' is duplicated " ..
-                    "(must be unique)", i, p.title), 2)
+                error(
+                    string.format("devin_wiki: pages[%d].title '%s' is duplicated " .. "(must be unique)", i, p.title),
+                    2
+                )
             end
             seen_titles[p.title] = true
             pages[i] = p
@@ -778,9 +803,7 @@ function M.devin_wiki(config)
     end
 
     if total_notes.n > DEVIN_MAX_NOTES then
-        error(string.format(
-            "devin_wiki: combined note count %d exceeds max %d",
-            total_notes.n, DEVIN_MAX_NOTES), 2)
+        error(string.format("devin_wiki: combined note count %d exceeds max %d", total_notes.n, DEVIN_MAX_NOTES), 2)
     end
 
     return json_encode(entry)
@@ -850,8 +873,7 @@ function M.llms_full_chunk(pkg_info, narrative_md)
     local body = narrative_md or M.narrative_md(pkg_info)
     body = strip_frontmatter(body)
     body = body:gsub("%s+$", "")
-    return string.format("<!-- ── %s.md ── -->\n\n%s\n\n---",
-        pkg_info.identity.name, body)
+    return string.format("<!-- ── %s.md ── -->\n\n%s\n\n---", pkg_info.identity.name, body)
 end
 
 --- Build the full llms.txt index from a list of PkgInfo.
@@ -862,19 +884,23 @@ end
 function M.llms_index(pkg_infos, opts)
     opts = opts or {}
     local header = opts.header or "# algocline"
-    local tagline = opts.tagline or
-        ("LLM amplification engine. Pure Lua strategies executed via " ..
-         "`alc.run(ctx)`; this index lists every installed strategy " ..
-         "package with a one-liner and a link to its full narrative.")
+    local tagline = opts.tagline
+        or (
+            "LLM amplification engine. Pure Lua strategies executed via "
+            .. "`alc.run(ctx)`; this index lists every installed strategy "
+            .. "package with a one-liner and a link to its full narrative."
+        )
 
     local lines = { header, "", "> " .. tagline, "" }
 
     local by_category = {}
-    local categories  = {}
+    local categories = {}
     for i = 1, #pkg_infos do
-        local p   = pkg_infos[i]
+        local p = pkg_infos[i]
         local cat = p.identity.category
-        if cat == nil or cat == "" then cat = "uncategorized" end
+        if cat == nil or cat == "" then
+            cat = "uncategorized"
+        end
         if not by_category[cat] then
             by_category[cat] = {}
             categories[#categories + 1] = cat
@@ -917,9 +943,11 @@ end
 function M.llms_full(entries, opts)
     opts = opts or {}
     local header = opts.header or "# algocline — full narrative index"
-    local tagline = opts.tagline or
-        ("Concatenation of every package narrative. Intended for bulk AI " ..
-         "context injection; for selective access see `llms.txt`.")
+    local tagline = opts.tagline
+        or (
+            "Concatenation of every package narrative. Intended for bulk AI "
+            .. "context injection; for selective access see `llms.txt`."
+        )
 
     local lines = { header, "", "> " .. tagline, "" }
 
@@ -931,13 +959,15 @@ function M.llms_full(entries, opts)
             normalized[i] = { name = e.identity.name, pkg_info = e }
         else
             normalized[i] = {
-                name         = e.name,
+                name = e.name,
                 narrative_md = e.narrative_md,
-                pkg_info     = e.pkg_info,
+                pkg_info = e.pkg_info,
             }
         end
     end
-    table.sort(normalized, function(a, b) return a.name < b.name end)
+    table.sort(normalized, function(a, b)
+        return a.name < b.name
+    end)
 
     for i = 1, #normalized do
         local e = normalized[i]
@@ -958,22 +988,22 @@ function M.llms_full(entries, opts)
 end
 
 M._internal = {
-    peel                     = peel,
-    build_frontmatter        = build_frontmatter,
-    render_parameters_table  = render_parameters_table,
-    render_toc               = render_toc,
-    escape_yaml_string       = escape_yaml_string,
-    escape_md_table_cell     = escape_md_table_cell,
-    yaml_scalar              = yaml_scalar,
-    json_encode              = json_encode,
-    type_to_json             = type_to_json,
-    strip_frontmatter        = strip_frontmatter,
-    LLMS_INDEX_DESC_MAX      = LLMS_INDEX_DESC_MAX,
-    CONTEXT7_SCHEMA_URL      = CONTEXT7_SCHEMA_URL,
-    CONTEXT7_FOLDERS         = CONTEXT7_FOLDERS,
-    DEVIN_MAX_NOTE_CHARS     = DEVIN_MAX_NOTE_CHARS,
-    DEVIN_MAX_PAGES          = DEVIN_MAX_PAGES,
-    DEVIN_MAX_NOTES          = DEVIN_MAX_NOTES,
+    peel = peel,
+    build_frontmatter = build_frontmatter,
+    render_parameters_table = render_parameters_table,
+    render_toc = render_toc,
+    escape_yaml_string = escape_yaml_string,
+    escape_md_table_cell = escape_md_table_cell,
+    yaml_scalar = yaml_scalar,
+    json_encode = json_encode,
+    type_to_json = type_to_json,
+    strip_frontmatter = strip_frontmatter,
+    LLMS_INDEX_DESC_MAX = LLMS_INDEX_DESC_MAX,
+    CONTEXT7_SCHEMA_URL = CONTEXT7_SCHEMA_URL,
+    CONTEXT7_FOLDERS = CONTEXT7_FOLDERS,
+    DEVIN_MAX_NOTE_CHARS = DEVIN_MAX_NOTE_CHARS,
+    DEVIN_MAX_PAGES = DEVIN_MAX_PAGES,
+    DEVIN_MAX_NOTES = DEVIN_MAX_NOTES,
 }
 
 return M

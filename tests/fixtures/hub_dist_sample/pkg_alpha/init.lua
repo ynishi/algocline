@@ -9,9 +9,9 @@ local T = S.T
 local M = {}
 
 M.meta = {
-    name        = "pkg_alpha",
-    version     = "0.1.0",
-    category    = "test",
+    name = "pkg_alpha",
+    version = "0.1.0",
+    category = "test",
     description = "ALPHA_SIGNAL_BOOLEAN_TABLE: boolean and table parameter fixture",
 }
 
@@ -19,7 +19,7 @@ M.spec = {
     entries = {
         run = {
             input = T.shape({
-                flag   = T.boolean:describe("Toggle flag (ALPHA_SIGNAL_BOOLEAN_TABLE)"),
+                flag = T.boolean:describe("Toggle flag (ALPHA_SIGNAL_BOOLEAN_TABLE)"),
                 params = T.table:describe("Arbitrary params table"),
             }, { open = true }),
             result = T.shape({

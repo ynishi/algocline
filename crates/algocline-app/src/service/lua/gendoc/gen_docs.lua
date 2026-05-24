@@ -57,8 +57,12 @@ end
 
 local function parse_argv(argv)
     local opts = {
-        lint = false, strict = false, lint_only = false,
-        hub = false, context7 = false, devin = false,
+        lint = false,
+        strict = false,
+        lint_only = false,
+        hub = false,
+        context7 = false,
+        devin = false,
         luacats = false,
         hub_index = nil,
     }
@@ -69,10 +73,10 @@ local function parse_argv(argv)
             opts.lint = true
         elseif a == "--strict" then
             opts.strict = true
-            opts.lint   = true
+            opts.lint = true
         elseif a == "--lint-only" then
             opts.lint_only = true
-            opts.lint      = true
+            opts.lint = true
         elseif a == "--hub" then
             opts.hub = true
         elseif a == "--context7" then
@@ -98,8 +102,7 @@ end
 local function write_file(path, content)
     local f, err = io.open(path, "w")
     if not f then
-        error(string.format("gen_docs: cannot write '%s': %s",
-                            path, tostring(err)))
+        error(string.format("gen_docs: cannot write '%s': %s", path, tostring(err)))
     end
     f:write(content)
     f:close()
@@ -117,21 +120,19 @@ end
 local function main(argv)
     local opts, positional = parse_argv(argv or {})
     local repo_root = positional[1] or "."
-    local out_dir   = positional[2] or (repo_root .. "/docs")
+    local out_dir = positional[2] or (repo_root .. "/docs")
     local hub_index = opts.hub_index or (repo_root .. "/hub_index.json")
 
     setup_package_path(repo_root)
 
-    local List        = require("tools.docs.list")
-    local Extract     = require("tools.docs.extract")
+    local List = require("tools.docs.list")
+    local Extract = require("tools.docs.extract")
     local Projections = require("tools.docs.projections")
-    local Lint        = opts.lint and require("tools.docs.lint") or nil
+    local Lint = opts.lint and require("tools.docs.lint") or nil
 
     local pkgs = List.list_pkgs(repo_root, hub_index)
     if #pkgs == 0 then
-        io.stderr:write(
-            "gen_docs: hub_index.json lists zero packages at "
-            .. hub_index .. "\n")
+        io.stderr:write("gen_docs: hub_index.json lists zero packages at " .. hub_index .. "\n")
         os.exit(1)
     end
 
@@ -143,28 +144,25 @@ local function main(argv)
         end
     end
 
-    local infos         = {}
-    local entries       = {}
-    local failures      = {}
-    local lint_errors   = 0
+    local infos = {}
+    local entries = {}
+    local failures = {}
+    local lint_errors = 0
     local lint_warnings = 0
 
     for i = 1, #pkgs do
         local p = pkgs[i]
-        local ok, info_or_err = pcall(
-            Extract.build_pkg_info, p.name, p.init_path, p.source_path)
+        local ok, info_or_err = pcall(Extract.build_pkg_info, p.name, p.init_path, p.source_path)
         if ok then
             local info = info_or_err
-            local md   = Projections.narrative_md(info)
+            local md = Projections.narrative_md(info)
             if not opts.lint_only then
                 write_file(string.format("%s/narrative/%s.md", out_dir, p.name), md)
                 if opts.hub then
-                    write_file(
-                        string.format("%s/hub/%s.json", out_dir, p.name),
-                        Projections.hub_entry(info))
+                    write_file(string.format("%s/hub/%s.json", out_dir, p.name), Projections.hub_entry(info))
                 end
             end
-            infos[#infos + 1]     = info
+            infos[#infos + 1] = info
             entries[#entries + 1] = { name = p.name, narrative_md = md }
 
             if Lint then
@@ -194,19 +192,17 @@ local function main(argv)
     end
 
     if not opts.lint_only then
-        write_file(out_dir .. "/llms.txt",      Projections.llms_index(infos))
+        write_file(out_dir .. "/llms.txt", Projections.llms_index(infos))
         write_file(out_dir .. "/llms-full.txt", Projections.llms_full(entries))
         if opts.context7 then
             local Context7Config = require("tools.docs.context7_config")
-            write_file(repo_root .. "/context7.json",
-                       Projections.context7_config(Context7Config))
+            write_file(repo_root .. "/context7.json", Projections.context7_config(Context7Config))
             io.stdout:write("  [ok]   context7.json (repo root)\n")
         end
         if opts.devin then
             local DevinConfig = require("tools.docs.devin_wiki_config")
             ensure_dir(repo_root .. "/.devin")
-            write_file(repo_root .. "/.devin/wiki.json",
-                       Projections.devin_wiki(DevinConfig))
+            write_file(repo_root .. "/.devin/wiki.json", Projections.devin_wiki(DevinConfig))
             io.stdout:write("  [ok]   .devin/wiki.json (repo root)\n")
         end
         if opts.luacats then
@@ -218,8 +214,7 @@ local function main(argv)
                 end
             end
             ensure_dir(repo_root .. "/types")
-            write_file(repo_root .. "/types/alc_shapes.d.lua",
-                       S.LuaCats.gen(shapes, "AlcResult"))
+            write_file(repo_root .. "/types/alc_shapes.d.lua", S.LuaCats.gen(shapes, "AlcResult"))
             io.stdout:write("  [ok]   types/alc_shapes.d.lua (repo root)\n")
 
             -- Per-pkg IF projection (Issue #1777032565):
@@ -235,29 +230,28 @@ local function main(argv)
             for i = 1, #infos do
                 local info = infos[i]
                 pkg_specs[#pkg_specs + 1] = {
-                    name   = info.identity.name,
-                    input  = info.shape.input,
+                    name = info.identity.name,
+                    input = info.shape.input,
                     result = info.shape.result,
                 }
             end
-            write_file(repo_root .. "/types/alc_pkgs.d.lua",
-                       S.LuaCats.gen_pkgs(pkg_specs))
+            write_file(repo_root .. "/types/alc_pkgs.d.lua", S.LuaCats.gen_pkgs(pkg_specs))
             io.stdout:write("  [ok]   types/alc_pkgs.d.lua (repo root)\n")
         end
     end
 
-    io.stdout:write(string.format(
-        "\ngen_docs: %d generated, %d failed",
-        #infos, #failures))
+    io.stdout:write(string.format("\ngen_docs: %d generated, %d failed", #infos, #failures))
     if Lint then
-        io.stdout:write(string.format(
-            ", lint: %d error(s) / %d warning(s)",
-            lint_errors, lint_warnings))
+        io.stdout:write(string.format(", lint: %d error(s) / %d warning(s)", lint_errors, lint_warnings))
     end
     io.stdout:write("\n")
 
-    if #failures > 0 then os.exit(1) end
-    if opts.strict and lint_errors > 0 then os.exit(2) end
+    if #failures > 0 then
+        os.exit(1)
+    end
+    if opts.strict and lint_errors > 0 then
+        os.exit(2)
+    end
 end
 
 main(arg)

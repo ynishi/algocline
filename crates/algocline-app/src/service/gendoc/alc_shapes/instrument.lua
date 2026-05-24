@@ -142,30 +142,29 @@ local M = {}
 ---@return function                             Replacement function with identical call signature.
 function M.instrument(mod, entry_name, spec)
     if type(mod) ~= "table" then
-        error("alc_shapes.instrument: mod must be a table (got "
-            .. type(mod) .. ")", 2)
+        error("alc_shapes.instrument: mod must be a table (got " .. type(mod) .. ")", 2)
     end
     if type(entry_name) ~= "string" or entry_name == "" then
         error("alc_shapes.instrument: entry_name must be a non-empty string", 2)
     end
     local orig = mod[entry_name]
     if type(orig) ~= "function" then
-        error(string.format(
-            "alc_shapes.instrument: mod[%q] is not a function (got %s); "
-            .. "call instrument AFTER the function is defined",
-            entry_name, type(orig)), 2)
+        error(
+            string.format(
+                "alc_shapes.instrument: mod[%q] is not a function (got %s); "
+                    .. "call instrument AFTER the function is defined",
+                entry_name,
+                type(orig)
+            ),
+            2
+        )
     end
     local meta = mod.meta
-    if type(meta) ~= "table"
-        or type(meta.name) ~= "string"
-        or meta.name == ""
-    then
-        error("alc_shapes.instrument: mod.meta.name (string) is required "
-            .. "for hint construction", 2)
+    if type(meta) ~= "table" or type(meta.name) ~= "string" or meta.name == "" then
+        error("alc_shapes.instrument: mod.meta.name (string) is required " .. "for hint construction", 2)
     end
     if spec ~= nil and type(spec) ~= "table" then
-        error("alc_shapes.instrument: spec must be a table or nil (got "
-            .. type(spec) .. ")", 2)
+        error("alc_shapes.instrument: spec must be a table or nil (got " .. type(spec) .. ")", 2)
     end
 
     -- Pull declared shapes from M.spec via spec_resolver (string keys
@@ -174,19 +173,23 @@ function M.instrument(mod, entry_name, spec)
     local resolved = spec_resolver.resolve(mod)
     local entry = resolved.entries[entry_name] or {}
 
-    local input_shape  = (spec and spec.input)  or entry.input
+    local input_shape = (spec and spec.input) or entry.input
     local result_shape = (spec and spec.result) or entry.result
-    local args_shapes  = (spec and spec.args)   or entry.args
+    local args_shapes = (spec and spec.args) or entry.args
 
     -- Mutual exclusion is already enforced by spec_resolver for the
     -- M.spec-declared form. Re-check here for the override form, where
     -- both fields can arrive through the `spec` argument directly.
     if args_shapes ~= nil and input_shape ~= nil then
-        error(string.format(
-            "alc_shapes.instrument: entry %q declares both `input` "
-                .. "(ctx-threading) and `args` (direct-args); these modes "
-                .. "are mutually exclusive",
-            entry_name), 2)
+        error(
+            string.format(
+                "alc_shapes.instrument: entry %q declares both `input` "
+                    .. "(ctx-threading) and `args` (direct-args); these modes "
+                    .. "are mutually exclusive",
+                entry_name
+            ),
+            2
+        )
     end
 
     local hint = meta.name .. "." .. entry_name
@@ -202,10 +205,7 @@ function M.instrument(mod, entry_name, spec)
                 for i = 1, n do
                     local sh = args_shapes[i]
                     if sh ~= nil then
-                        check.assert(
-                            (select(i, ...)),
-                            sh,
-                            hint .. ":arg" .. i)
+                        check.assert((select(i, ...)), sh, hint .. ":arg" .. i)
                     end
                 end
             end

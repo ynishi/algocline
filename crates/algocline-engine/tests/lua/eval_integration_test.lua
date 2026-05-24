@@ -11,9 +11,7 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- stands in for the app_dir root. Lua tests MUST NOT read HOME.
 local app_dir = os.getenv("ALC_TEST_APP_DIR") or ""
 local pkg_root = app_dir .. "/packages"
-package.path = pkg_root .. "/?.lua;"
-    .. pkg_root .. "/?/init.lua;"
-    .. package.path
+package.path = pkg_root .. "/?.lua;" .. pkg_root .. "/?/init.lua;" .. package.path
 
 -- ── 2. Mock std global (evalframe.std requires mlua-batteries) ──
 _G.std = {
@@ -23,27 +21,41 @@ _G.std = {
             local fn = load("return " .. str)
             if fn then
                 local ok, result = pcall(fn)
-                if ok then return result end
+                if ok then
+                    return result
+                end
             end
             error("json decode error")
         end,
         encode = function(val)
-            if val == nil then return "null" end
-            if type(val) == "string" then return '"' .. val .. '"' end
+            if val == nil then
+                return "null"
+            end
+            if type(val) == "string" then
+                return '"' .. val .. '"'
+            end
             if type(val) == "number" or type(val) == "boolean" then
                 return tostring(val)
             end
             -- Shallow table encoding (sufficient for tests)
-            if type(val) == "table" then return "{}" end
+            if type(val) == "table" then
+                return "{}"
+            end
             return tostring(val)
         end,
     },
     fs = {
-        read = function() return "" end,
-        is_file = function() return false end,
+        read = function()
+            return ""
+        end,
+        is_file = function()
+            return false
+        end,
     },
     time = {
-        now = function() return os.clock() end,
+        now = function()
+            return os.clock()
+        end,
     },
 }
 
@@ -53,7 +65,9 @@ alc = {}
 alc.log = function() end
 
 alc.json_encode = function(val)
-    if type(val) == "table" then return "{}" end
+    if type(val) == "table" then
+        return "{}"
+    end
     return tostring(val)
 end
 
@@ -61,7 +75,9 @@ alc.json_decode = function(str)
     local fn = load("return " .. str)
     if fn then
         local ok, result = pcall(fn)
-        if ok then return result end
+        if ok then
+            return result
+        end
     end
     error("json decode error")
 end
@@ -92,7 +108,9 @@ local state_store = {}
 alc.state = {
     get = function(key, default)
         local val = state_store[key]
-        if val == nil then return default end
+        if val == nil then
+            return default
+        end
         return val
     end,
     set = function(key, value)
@@ -101,8 +119,7 @@ alc.state = {
 }
 
 -- ── 4. Load prelude ──────────────────────────────────────────
-local prelude_path = os.getenv("PRELUDE_PATH")
-    or "crates/algocline-engine/src/prelude.lua"
+local prelude_path = os.getenv("PRELUDE_PATH") or "crates/algocline-engine/src/prelude.lua"
 dofile(prelude_path)
 
 -- ── 5. Register mock strategy ────────────────────────────────
@@ -111,10 +128,10 @@ dofile(prelude_path)
 package.loaded["mock_strategy"] = {
     run = function(ctx)
         local answers = {
-            ["2+2?"]               = "4",
+            ["2+2?"] = "4",
             ["Capital of France?"] = "Paris",
-            ["Color of sky?"]      = "blue",
-            ["Fail me"]            = "wrong",
+            ["Color of sky?"] = "blue",
+            ["Fail me"] = "wrong",
         }
         return { result = answers[ctx.task] or "unknown" }
     end,
@@ -131,7 +148,6 @@ end
 -- ═══════════════════════════════════════════════════════════════
 
 describe("alc.eval integration", function()
-
     -- ── Simple form: all pass ────────────────────────────────
     describe("simple form", function()
         it("evaluates exact_match — all pass", function()
@@ -195,10 +211,10 @@ describe("alc.eval integration", function()
     describe("full evalframe form", function()
         it("accepts ef.bind / ef.case in scenario", function()
             local report = alc.eval({
-                ef.bind { ef.graders.exact_match },
+                ef.bind({ ef.graders.exact_match }),
                 cases = {
-                    ef.case { input = "2+2?", expected = "4" },
-                    ef.case { input = "Color of sky?", expected = "blue" },
+                    ef.case({ input = "2+2?", expected = "4" }),
+                    ef.case({ input = "Color of sky?", expected = "blue" }),
                 },
             }, "mock_strategy")
 
@@ -208,10 +224,10 @@ describe("alc.eval integration", function()
 
         it("supports tags in full form", function()
             local report = alc.eval({
-                ef.bind { ef.graders.exact_match },
+                ef.bind({ ef.graders.exact_match }),
                 cases = {
-                    ef.case { input = "2+2?", expected = "4", tags = { "math" } },
-                    ef.case { input = "Capital of France?", expected = "Paris", tags = { "geo" } },
+                    ef.case({ input = "2+2?", expected = "4", tags = { "math" } }),
+                    ef.case({ input = "Capital of France?", expected = "Paris", tags = { "geo" } }),
                 },
             }, "mock_strategy")
 

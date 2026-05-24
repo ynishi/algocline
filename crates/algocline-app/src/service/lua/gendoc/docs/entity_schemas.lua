@@ -33,8 +33,16 @@ local M = {}
 -- (年単位で稀な保守コスト)。open=true により残りの structural body
 -- (prim/elem/fields/variants 等) は alc_shapes 側の invariant に委ねる。
 local ALC_SCHEMA_KINDS = {
-    "any", "array_of", "described", "discriminated", "map_of",
-    "one_of", "optional", "prim", "ref", "shape",
+    "any",
+    "array_of",
+    "described",
+    "discriminated",
+    "map_of",
+    "one_of",
+    "optional",
+    "prim",
+    "ref",
+    "shape",
 }
 
 local AlcSchema = T.shape({
@@ -42,28 +50,28 @@ local AlcSchema = T.shape({
 }, { open = true })
 
 M.Identity = T.shape({
-    name        = T.string,
-    version     = T.string,
-    category    = T.string,
+    name = T.string,
+    version = T.string,
+    category = T.string,
     description = T.string,
     source_path = T.string,
 }, { open = false })
 
 M.Section = T.shape({
-    level   = T.one_of({ 2, 3 }),
+    level = T.one_of({ 2, 3 }),
     heading = T.string,
-    anchor  = T.string,
+    anchor = T.string,
     body_md = T.string,
 }, { open = false })
 
 M.Narrative = T.shape({
-    title    = T.string,
-    summary  = T.string,
+    title = T.string,
+    summary = T.string,
     sections = T.array_of(T.ref("Section")),
 }, { open = false })
 
 M.Shape = T.shape({
-    input  = AlcSchema:is_optional(),
+    input = AlcSchema:is_optional(),
     result = AlcSchema:is_optional(),
 }, { open = false })
 
@@ -77,15 +85,15 @@ M.Shape = T.shape({
 -- and the downstream consumer (Resource path resolver / lint /
 -- gendoc) falls back to the convention path or warns as appropriate.
 M.Docs = T.shape({
-    narrative      = T.string:is_optional(),
+    narrative = T.string:is_optional(),
     schema_version = T.number:is_optional(),
 }, { open = false })
 
 M.PkgInfo = T.shape({
-    identity  = T.ref("Identity"),
+    identity = T.ref("Identity"),
     narrative = T.ref("Narrative"),
-    shape     = T.ref("Shape"),
-    docs      = T.ref("Docs"),
+    shape = T.ref("Shape"),
+    docs = T.ref("Docs"),
 }, { open = false })
 
 return M

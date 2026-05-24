@@ -9,9 +9,9 @@ local T = S.T
 local M = {}
 
 M.meta = {
-    name        = "pkg_beta",
-    version     = "0.1.0",
-    category    = "test",
+    name = "pkg_beta",
+    version = "0.1.0",
+    category = "test",
     description = "BETA_SIGNAL_INSTRUMENT_DESCRIBE: instrument and describe fixture",
 }
 

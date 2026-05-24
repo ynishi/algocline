@@ -9,10 +9,10 @@ local T = S.T
 local M = {}
 
 M.meta = {
-    name             = "pkg_alpha",
-    version          = "0.1.0",
-    category         = "test",
-    description      = "COMPAT_DECL_SIGNAL_ALPHA: compat declared in-range fixture",
+    name = "pkg_alpha",
+    version = "0.1.0",
+    category = "test",
+    description = "COMPAT_DECL_SIGNAL_ALPHA: compat declared in-range fixture",
     alc_shapes_compat = ">=0.25.0, <0.26",
 }
 

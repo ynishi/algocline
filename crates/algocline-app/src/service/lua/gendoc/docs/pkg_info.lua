@@ -37,19 +37,19 @@ local M = {}
 
 function M.make_section(level, heading, anchor, body_md)
     return {
-        level   = level,
+        level = level,
         heading = heading,
-        anchor  = anchor,
+        anchor = anchor,
         body_md = body_md,
     }
 end
 
 function M.make_pkg_info(identity, narrative, shape, docs)
     return {
-        identity  = identity,
+        identity = identity,
         narrative = narrative,
-        shape     = shape,
-        docs      = docs or { schema_version = nil },
+        shape = shape,
+        docs = docs or { schema_version = nil },
     }
 end
 

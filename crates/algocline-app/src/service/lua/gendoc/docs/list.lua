@@ -17,7 +17,9 @@ local M = {}
 
 local function read_file(path)
     local f, err = io.open(path, "r")
-    if not f then return nil, err end
+    if not f then
+        return nil, err
+    end
     local content = f:read("*a")
     f:close()
     return content
@@ -40,58 +42,69 @@ end
 function M.list_pkgs(repo_root, index_path)
     local content, err = read_file(index_path)
     if not content then
-        error(string.format(
-            "tools.docs.list: hub_index.json not found at '%s' (%s). "
-            .. "Run `alc_hub_reindex` (algocline MCP tool) first.",
-            index_path, tostring(err)), 0)
+        error(
+            string.format(
+                "tools.docs.list: hub_index.json not found at '%s' (%s). "
+                    .. "Run `alc_hub_reindex` (algocline MCP tool) first.",
+                index_path,
+                tostring(err)
+            ),
+            0
+        )
     end
 
     local ok, index = pcall(Json.decode, content)
     if not ok then
-        error(string.format(
-            "tools.docs.list: hub_index.json at '%s' is malformed: %s",
-            index_path, tostring(index)), 0)
+        error(string.format("tools.docs.list: hub_index.json at '%s' is malformed: %s", index_path, tostring(index)), 0)
     end
 
     if index.schema_version ~= "hub_index/v0" then
-        error(string.format(
-            "tools.docs.list: unsupported schema_version '%s' in '%s' "
-            .. "(expected 'hub_index/v0')",
-            tostring(index.schema_version), index_path), 0)
+        error(
+            string.format(
+                "tools.docs.list: unsupported schema_version '%s' in '%s' " .. "(expected 'hub_index/v0')",
+                tostring(index.schema_version),
+                index_path
+            ),
+            0
+        )
     end
 
     if type(index.packages) ~= "table" then
-        error(string.format(
-            "tools.docs.list: hub_index.json at '%s' has no "
-            .. "`packages` array",
-            index_path), 0)
+        error(string.format("tools.docs.list: hub_index.json at '%s' has no " .. "`packages` array", index_path), 0)
     end
 
     local pkgs = {}
     for _, entry in ipairs(index.packages) do
         if type(entry.name) ~= "string" or entry.name == "" then
-            error(string.format(
-                "tools.docs.list: hub_index.json entry has no `name` "
-                .. "(index '%s')",
-                index_path), 0)
+            error(
+                string.format("tools.docs.list: hub_index.json entry has no `name` " .. "(index '%s')", index_path),
+                0
+            )
         end
         local init_path = repo_root .. "/" .. entry.name .. "/init.lua"
         local probe = io.open(init_path, "r")
         if not probe then
-            error(string.format(
-                "tools.docs.list: hub_index.json lists pkg '%s' but "
-                .. "'%s' does not exist — run `alc_hub_reindex` to "
-                .. "refresh the index",
-                entry.name, init_path), 0)
+            error(
+                string.format(
+                    "tools.docs.list: hub_index.json lists pkg '%s' but "
+                        .. "'%s' does not exist — run `alc_hub_reindex` to "
+                        .. "refresh the index",
+                    entry.name,
+                    init_path
+                ),
+                0
+            )
         end
         probe:close()
         pkgs[#pkgs + 1] = {
-            name        = entry.name,
-            init_path   = init_path,
+            name = entry.name,
+            init_path = init_path,
             source_path = entry.name .. "/init.lua",
         }
     end
-    table.sort(pkgs, function(a, b) return a.name < b.name end)
+    table.sort(pkgs, function(a, b)
+        return a.name < b.name
+    end)
     return pkgs
 end
 

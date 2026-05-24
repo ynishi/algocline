@@ -31,7 +31,9 @@ local function default_registry()
 end
 
 -- Primitive type test (separate from schema kind).
-local function lua_type_of(v) return type(v) end
+local function lua_type_of(v)
+    return type(v)
+end
 
 -- Forward decls.
 local check_node
@@ -46,15 +48,15 @@ handlers.prim = function(value, schema, path)
     local expected = schema.prim
     local got = lua_type_of(value)
     if got ~= expected then
-        return false, string.format(
-            "shape violation at %s: expected %s, got %s",
-            path, expected, got)
+        return false, string.format("shape violation at %s: expected %s, got %s", path, expected, got)
     end
     return true
 end
 
 handlers.optional = function(value, schema, path, ctx)
-    if value == nil then return true end
+    if value == nil then
+        return true
+    end
     return check_node(value, schema.inner, path, ctx)
 end
 
@@ -64,25 +66,23 @@ end
 
 handlers.array_of = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format(
-            "shape violation at %s: expected table (array), got %s",
-            path, type(value))
+        return false, string.format("shape violation at %s: expected table (array), got %s", path, type(value))
     end
     -- iterate 1-based dense indices
     for i = 1, #value do
         local item = value[i]
         local sub_path = path .. "[" .. i .. "]"
         local ok, reason = check_node(item, schema.elem, sub_path, ctx)
-        if not ok then return false, reason end
+        if not ok then
+            return false, reason
+        end
     end
     return true
 end
 
 handlers.shape = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format(
-            "shape violation at %s: expected table, got %s",
-            path, type(value))
+        return false, string.format("shape violation at %s: expected table, got %s", path, type(value))
     end
     local fields = schema.fields
     -- Determinism: sort field names so first-fail reports the same
@@ -90,7 +90,9 @@ handlers.shape = function(value, schema, path, ctx)
     -- tableshape / Zod / Joi all leave this to implementation but we
     -- require reproducibility for CI + conformance tests.
     local names = {}
-    for name in pairs(fields) do names[#names + 1] = name end
+    for name in pairs(fields) do
+        names[#names + 1] = name
+    end
     table.sort(names)
     for i = 1, #names do
         local name = names[i]
@@ -98,7 +100,9 @@ handlers.shape = function(value, schema, path, ctx)
         local sub_path = (path == "$") and ("$." .. name) or (path .. "." .. name)
         local sub_val = value[name]
         local ok, reason = check_node(sub_val, sub_schema, sub_path, ctx)
-        if not ok then return false, reason end
+        if not ok then
+            return false, reason
+        end
     end
     -- strict mode: reject extra keys when open=false. Also sorted
     -- for deterministic error reporting (Q1).
@@ -113,8 +117,7 @@ handlers.shape = function(value, schema, path, ctx)
         if extra[1] ~= nil then
             local name = extra[1]
             local sub_path = (path == "$") and ("$." .. name) or (path .. "." .. name)
-            return false, string.format(
-                "shape violation at %s: unexpected field", sub_path)
+            return false, string.format("shape violation at %s: unexpected field", sub_path)
         end
     end
     return true
@@ -122,44 +125,51 @@ end
 
 handlers.discriminated = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format(
-            "shape violation at %s: expected table, got %s",
-            path, type(value))
+        return false, string.format("shape violation at %s: expected table, got %s", path, type(value))
     end
     local tag = schema.tag
     local tag_val = value[tag]
     if tag_val == nil then
-        return false, string.format(
-            "shape violation at %s: missing discriminant field '%s'",
-            path, tag)
+        return false, string.format("shape violation at %s: missing discriminant field '%s'", path, tag)
     end
     local variant = schema.variants[tag_val]
     if variant == nil then
         local keys = {}
-        for k in pairs(schema.variants) do keys[#keys + 1] = k end
+        for k in pairs(schema.variants) do
+            keys[#keys + 1] = k
+        end
         table.sort(keys)
         local parts = {}
-        for i = 1, #keys do parts[i] = string.format("%q", keys[i]) end
-        return false, string.format(
-            "shape violation at %s: discriminant '%s' = %q not in [%s]",
-            path, tag, tostring(tag_val), table.concat(parts, ", "))
+        for i = 1, #keys do
+            parts[i] = string.format("%q", keys[i])
+        end
+        return false,
+            string.format(
+                "shape violation at %s: discriminant '%s' = %q not in [%s]",
+                path,
+                tag,
+                tostring(tag_val),
+                table.concat(parts, ", ")
+            )
     end
     return handlers.shape(value, variant, path, ctx)
 end
 
 handlers.map_of = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format(
-            "shape violation at %s: expected table (map), got %s",
-            path, type(value))
+        return false, string.format("shape violation at %s: expected table (map), got %s", path, type(value))
     end
     for k, v in pairs(value) do
         local key_path = path .. "[key=" .. tostring(k) .. "]"
         local ok, reason = check_node(k, schema.key, key_path, ctx)
-        if not ok then return false, reason end
+        if not ok then
+            return false, reason
+        end
         local val_path = path .. "[" .. tostring(k) .. "]"
         ok, reason = check_node(v, schema.val, val_path, ctx)
-        if not ok then return false, reason end
+        if not ok then
+            return false, reason
+        end
     end
     return true
 end
@@ -171,10 +181,8 @@ handlers.ref = function(value, schema, path, ctx)
     local name = schema.name
     local registry = ctx.registry
     local resolved = rawget(registry, name)
-    if resolved == nil or type(resolved) ~= "table"
-            or rawget(resolved, "kind") == nil then
-        return false, string.format(
-            "shape violation at %s: unresolved ref '%s'", path, name)
+    if resolved == nil or type(resolved) ~= "table" or rawget(resolved, "kind") == nil then
+        return false, string.format("shape violation at %s: unresolved ref '%s'", path, name)
     end
     return check_node(value, resolved, path, ctx)
 end
@@ -182,7 +190,9 @@ end
 handlers.one_of = function(value, schema, path, _ctx)
     local vs = schema.values
     for i = 1, #vs do
-        if value == vs[i] then return true end
+        if value == vs[i] then
+            return true
+        end
     end
     local parts = {}
     for i = 1, #vs do
@@ -193,9 +203,13 @@ handlers.one_of = function(value, schema, path, _ctx)
             parts[i] = tostring(v)
         end
     end
-    return false, string.format(
-        "shape violation at %s: expected one of [%s], got %s",
-        path, table.concat(parts, ", "), tostring(value))
+    return false,
+        string.format(
+            "shape violation at %s: expected one of [%s], got %s",
+            path,
+            table.concat(parts, ", "),
+            tostring(value)
+        )
 end
 
 -- EE8 cycle guard: a recursive schema (e.g. linked-list `next = T.ref("listnode")`)
@@ -209,13 +223,19 @@ end
 local MAX_CHECK_DEPTH = 256
 
 check_node = function(value, schema, path, ctx)
-    if schema == nil then return true end
+    if schema == nil then
+        return true
+    end
     ctx.depth = (ctx.depth or 0) + 1
     if ctx.depth > MAX_CHECK_DEPTH then
-        error(string.format(
-            "alc_shapes.check: recursion depth exceeded at %s " ..
-            "(> %d; cycle in schema or value?)",
-            path, MAX_CHECK_DEPTH), 2)
+        error(
+            string.format(
+                "alc_shapes.check: recursion depth exceeded at %s " .. "(> %d; cycle in schema or value?)",
+                path,
+                MAX_CHECK_DEPTH
+            ),
+            2
+        )
     end
     local kind = rawget(schema, "kind")
     if kind == nil then
@@ -237,15 +257,18 @@ local function build_ctx(opts)
         return { registry = default_registry() }
     end
     if type(opts) ~= "table" then
-        error("alc_shapes.check: opts must be a table or nil (got "
-            .. type(opts) .. ")", 3)
+        error("alc_shapes.check: opts must be a table or nil (got " .. type(opts) .. ")", 3)
     end
     local registry = opts.registry
     if registry == nil then
         registry = default_registry()
     elseif type(registry) ~= "table" then
-        error("alc_shapes.check: opts.registry must be a plain table "
-            .. "of {name = schema} (closures NG); got " .. type(registry), 3)
+        error(
+            "alc_shapes.check: opts.registry must be a plain table "
+                .. "of {name = schema} (closures NG); got "
+                .. type(registry),
+            3
+        )
     end
     return { registry = registry }
 end
@@ -253,13 +276,17 @@ end
 --- Return (ok, reason). Never throws for normal schema violations.
 --- opts.registry: plain {name → schema} table (default: alc_shapes module).
 function M.check(value, schema, opts)
-    if schema == nil then return true end
+    if schema == nil then
+        return true
+    end
     local ctx = build_ctx(opts)
     return check_node(value, schema, "$", ctx)
 end
 
 local function compose_msg(reason, ctx_hint)
-    if ctx_hint == nil or ctx_hint == "" then return reason end
+    if ctx_hint == nil or ctx_hint == "" then
+        return reason
+    end
     return reason .. " (ctx: " .. tostring(ctx_hint) .. ")"
 end
 
@@ -280,15 +307,24 @@ end
 function M.assert(value, schema_or_name, ctx_hint, opts)
     local schema
     if schema_or_name == nil then
-        error("alc_shapes.assert: schema_or_name must not be nil. "
-            .. "Use S.check(v, nil) for silent pass, or pass a schema / "
-            .. "name / \"any\" explicitly.", 2)
+        error(
+            "alc_shapes.assert: schema_or_name must not be nil. "
+                .. "Use S.check(v, nil) for silent pass, or pass a schema / "
+                .. 'name / "any" explicitly.',
+            2
+        )
     elseif type(schema_or_name) == "string" then
-        if schema_or_name == "any" then return value end
+        if schema_or_name == "any" then
+            return value
+        end
         local registry = (opts and opts.registry) or default_registry()
         if type(registry) ~= "table" then
-            error("alc_shapes.assert: opts.registry must be a plain table "
-                .. "of {name = schema} (closures NG); got " .. type(registry), 2)
+            error(
+                "alc_shapes.assert: opts.registry must be a plain table "
+                    .. "of {name = schema} (closures NG); got "
+                    .. type(registry),
+                2
+            )
         end
         schema = rawget(registry, schema_or_name)
         if schema == nil or type(schema) ~= "table" or rawget(schema, "kind") == nil then
@@ -297,8 +333,7 @@ function M.assert(value, schema_or_name, ctx_hint, opts)
     elseif type(schema_or_name) == "table" then
         schema = schema_or_name
     else
-        error("alc_shapes.assert: schema_or_name must be nil, string, or table (got "
-            .. type(schema_or_name) .. ")", 2)
+        error("alc_shapes.assert: schema_or_name must be nil, string, or table (got " .. type(schema_or_name) .. ")", 2)
     end
     local ok, reason = M.check(value, schema, opts)
     if not ok then
@@ -309,7 +344,9 @@ end
 
 --- Dev-mode-only assert: no-op pass when ALC_SHAPE_CHECK != "1".
 function M.assert_dev(value, schema_or_name, ctx_hint, opts)
-    if not M.is_dev_mode() then return value end
+    if not M.is_dev_mode() then
+        return value
+    end
     return M.assert(value, schema_or_name, ctx_hint, opts)
 end
 
@@ -318,11 +355,11 @@ function M.is_dev_mode()
 end
 
 M._internal = {
-    handlers          = handlers,
-    check_node        = check_node,
-    compose_msg       = compose_msg,
-    build_ctx         = build_ctx,
-    default_registry  = default_registry,
+    handlers = handlers,
+    check_node = check_node,
+    compose_msg = compose_msg,
+    build_ctx = build_ctx,
+    default_registry = default_registry,
 }
 
 return M

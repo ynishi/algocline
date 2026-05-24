@@ -22,8 +22,8 @@
 ---
 ---   local resp = alc.cache("Analyze", { system = "expert", cache_skip = true })
 do
-    local _cache = {}      -- key -> value
-    local _order = {}      -- insertion order (array of keys)
+    local _cache = {} -- key -> value
+    local _order = {} -- insertion order (array of keys)
     local _hits = 0
     local _misses = 0
     local _max_entries = 256
@@ -37,8 +37,12 @@ do
         local key = opts.cache_key
         if not key then
             local sig = prompt
-            if opts.system then sig = sig .. "\0" .. opts.system end
-            if opts.max_tokens then sig = sig .. "\0" .. tostring(opts.max_tokens) end
+            if opts.system then
+                sig = sig .. "\0" .. opts.system
+            end
+            if opts.max_tokens then
+                sig = sig .. "\0" .. tostring(opts.max_tokens)
+            end
             key = alc.fingerprint(sig)
         end
 
@@ -177,7 +181,9 @@ end
 ---   local verified = alc.ground("claim", { system = "expert" })
 function alc.ground(claim, opts)
     local merged = {}
-    for k, v in pairs(opts or {}) do merged[k] = v end
+    for k, v in pairs(opts or {}) do
+        merged[k] = v
+    end
     merged.grounded = true
     return alc.llm(claim, merged)
 end
@@ -193,7 +199,9 @@ end
 ---   local answer = alc.specify("Which module?", { system = "concise" })
 function alc.specify(prompt, opts)
     local merged = {}
-    for k, v in pairs(opts or {}) do merged[k] = v end
+    for k, v in pairs(opts or {}) do
+        merged[k] = v
+    end
     merged.underspecified = true
     return alc.llm(prompt, merged)
 end
@@ -208,9 +216,15 @@ end
 function alc.parse_score(str, default)
     default = default or 5
     local n = tonumber(tostring(str):match("%d+"))
-    if n == nil then return default end
-    if n < 1 then return 1 end
-    if n > 10 then return 10 end
+    if n == nil then
+        return default
+    end
+    if n < 1 then
+        return 1
+    end
+    if n > 10 then
+        return 10
+    end
     return n
 end
 
@@ -225,7 +239,9 @@ end
 ---   alc.parse_number(response, "(%d+)%s+subtask")      -- 3
 ---   alc.parse_number("no numbers here")                -- nil
 function alc.parse_number(text, pattern)
-    if type(text) ~= "string" then return nil end
+    if type(text) ~= "string" then
+        return nil
+    end
     if pattern then
         local m = text:match(pattern)
         return tonumber(m)
@@ -243,25 +259,34 @@ end
 ---   local data = alc.json_extract(llm_response)
 ---   if data then process(data) end
 function alc.json_extract(raw)
-    if type(raw) ~= "string" then return nil end
+    if type(raw) ~= "string" then
+        return nil
+    end
     -- Direct parse
     local ok, result = pcall(alc.json_decode, raw)
-    if ok and type(result) == "table" then return result end
+    if ok and type(result) == "table" then
+        return result
+    end
     -- Markdown fences
-    local stripped = raw:match("```json%s*(.-)%s*```")
-        or raw:match("```%s*(.-)%s*```")
+    local stripped = raw:match("```json%s*(.-)%s*```") or raw:match("```%s*(.-)%s*```")
     if stripped then
         ok, result = pcall(alc.json_decode, stripped)
-        if ok and type(result) == "table" then return result end
+        if ok and type(result) == "table" then
+            return result
+        end
     end
     -- Balanced brace/bracket extraction (try all matches)
     for json_str in raw:gmatch("%b{}") do
         ok, result = pcall(alc.json_decode, json_str)
-        if ok and type(result) == "table" then return result end
+        if ok and type(result) == "table" then
+            return result
+        end
     end
     for json_str in raw:gmatch("%b[]") do
         ok, result = pcall(alc.json_decode, json_str)
-        if ok and type(result) == "table" then return result end
+        if ok and type(result) == "table" then
+            return result
+        end
     end
     return nil
 end
@@ -299,7 +324,9 @@ end
 ---   )
 function alc.llm_safe(prompt, opts, default)
     local ok, result = pcall(alc.llm, prompt, opts)
-    if ok then return result end
+    if ok then
+        return result
+    end
     alc.log("warn", "alc.llm_safe: " .. tostring(result))
     return default
 end
@@ -323,18 +350,25 @@ function alc.llm_json(prompt, opts)
     opts = opts or {}
     local raw = alc.llm(prompt, opts)
     local parsed = alc.json_extract(raw)
-    if parsed then return parsed, raw end
+    if parsed then
+        return parsed, raw
+    end
 
     alc.log("warn", "alc.llm_json: JSON parse failed, retrying")
     local retry_opts = {}
-    for k, v in pairs(opts) do retry_opts[k] = v end
+    for k, v in pairs(opts) do
+        retry_opts[k] = v
+    end
     retry_opts.system = "Output ONLY valid JSON. No markdown fences, no explanation."
 
     raw = alc.llm(
         "The previous response was not valid JSON.\n\n"
-            .. "Previous output:\n" .. raw .. "\n\n"
+            .. "Previous output:\n"
+            .. raw
+            .. "\n\n"
             .. "Fix the JSON and return ONLY valid JSON.\n\n"
-            .. "Original request:\n" .. prompt,
+            .. "Original request:\n"
+            .. prompt,
         retry_opts
     )
     parsed = alc.json_extract(raw)
@@ -376,11 +410,17 @@ end
 ---   end
 function alc.budget_check()
     local r = alc.budget_remaining()
-    if r == nil then return true end
+    if r == nil then
+        return true
+    end
     -- Use type() check: JSON null from serde becomes userdata in mlua,
     -- not Lua nil. Comparing userdata with number would error.
-    if type(r.llm_calls) == "number" and r.llm_calls <= 0 then return false end
-    if type(r.elapsed_ms) == "number" and r.elapsed_ms <= 0 then return false end
+    if type(r.llm_calls) == "number" and r.llm_calls <= 0 then
+        return false
+    end
+    if type(r.elapsed_ms) == "number" and r.elapsed_ms <= 0 then
+        return false
+    end
     return true
 end
 
@@ -407,7 +447,9 @@ end
 ---   -- ctx:      { exponents = { alpha = 2.0 } }
 ---   -- result:   { exponents = { alpha = 2.0, beta = 1.0 } }
 function alc.tuning(defaults, ctx, opts)
-    if type(defaults) ~= "table" then return defaults end
+    if type(defaults) ~= "table" then
+        return defaults
+    end
     opts = opts or {}
     local source = ctx or {}
     if opts.prefix then
@@ -415,8 +457,7 @@ function alc.tuning(defaults, ctx, opts)
         if type(ns) == "table" then
             source = ns
         elseif ns ~= nil then
-            alc.log("warn", "alc.tuning: prefix '" .. opts.prefix
-                .. "' exists but is not a table, ignoring")
+            alc.log("warn", "alc.tuning: prefix '" .. opts.prefix .. "' exists but is not a table, ignoring")
             source = {}
         end
     end
@@ -485,8 +526,12 @@ function alc.parallel(items, prompt_fn, opts)
         local p = prompt_fn(item, i)
         if type(p) == "string" then
             local entry = { prompt = p }
-            if opts.system then entry.system = opts.system end
-            if opts.max_tokens then entry.max_tokens = opts.max_tokens end
+            if opts.system then
+                entry.system = opts.system
+            end
+            if opts.max_tokens then
+                entry.max_tokens = opts.max_tokens
+            end
             batch[i] = entry
         elseif type(p) == "table" then
             if type(p.prompt) ~= "string" then
@@ -494,8 +539,7 @@ function alc.parallel(items, prompt_fn, opts)
             end
             batch[i] = p
         else
-            error("alc.parallel: prompt_fn must return string or table, got "
-                .. type(p) .. " at index " .. i, 2)
+            error("alc.parallel: prompt_fn must return string or table, got " .. type(p) .. " at index " .. i, 2)
         end
     end
 
@@ -566,7 +610,9 @@ function alc.pipe(strategies, ctx, opts)
 
     -- Shallow-copy ctx to avoid mutating the original
     local pipe_ctx = {}
-    for k, v in pairs(ctx) do pipe_ctx[k] = v end
+    for k, v in pairs(ctx) do
+        pipe_ctx[k] = v
+    end
     pipe_ctx.pipe_history = {}
 
     for i, entry in ipairs(strategies) do
@@ -662,7 +708,9 @@ end
 do
     -- Resolve grader shorthand ("exact_match") to evalframe grader function.
     local function resolve_grader(ef, g)
-        if type(g) == "function" then return g end
+        if type(g) == "function" then
+            return g
+        end
         if type(g) == "string" then
             local grader_fn = ef.graders[g]
             if not grader_fn then
@@ -752,7 +800,9 @@ do
     end
 
     function alc.eval(scenario, strategy, opts)
-        if not scenario then error("alc.eval: scenario is required") end
+        if not scenario then
+            error("alc.eval: scenario is required")
+        end
         if type(scenario) ~= "string" and type(scenario) ~= "table" then
             error("alc.eval: scenario must be a string or table")
         end

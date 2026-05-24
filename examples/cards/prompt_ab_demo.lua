@@ -23,16 +23,16 @@ local PKG = "prompt_ab_demo"
 -- ─── Trial matrix ────────────────────────────────────────────────
 -- Three prompt variants crossed with two temperatures = 6 Cards.
 local prompts = {
-    { name = "terse",    system = "Answer in one sentence." },
-    { name = "cot",      system = "Think step by step, then answer." },
-    { name = "persona",  system = "You are a careful expert. Answer precisely." },
+    { name = "terse", system = "Answer in one sentence." },
+    { name = "cot", system = "Think step by step, then answer." },
+    { name = "persona", system = "You are a careful expert. Answer precisely." },
 }
 local temperatures = { 0.0, 0.7 }
 
 -- Synthetic "accuracy" function — stands in for a real grader.
 local function synthetic_score(prompt_name, temperature)
     local base = ({ terse = 0.62, cot = 0.81, persona = 0.74 })[prompt_name]
-    local temp_penalty = temperature * 0.08  -- higher temp hurts exact-match
+    local temp_penalty = temperature * 0.08 -- higher temp hurts exact-match
     return math.max(0, math.min(1, base - temp_penalty))
 end
 

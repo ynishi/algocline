@@ -38,7 +38,7 @@
 --- both being set. `instrument` inspects `entry.args` to decide between
 --- ctx-threading wrapping and per-argument wrapping.
 
-local T     = require("alc_shapes.t")
+local T = require("alc_shapes.t")
 local check = require("alc_shapes.check")
 
 local M = {}
@@ -48,28 +48,34 @@ local function is_schema(v)
 end
 
 local function coerce_shape_ref(v)
-    if v == nil then return nil end
+    if v == nil then
+        return nil
+    end
     if type(v) == "string" then
         return T.ref(v)
     end
     if is_schema(v) then
         return v
     end
-    error(
-        "alc_shapes.spec_resolver: shape field must be string or schema, got "
-            .. type(v), 2)
+    error("alc_shapes.spec_resolver: shape field must be string or schema, got " .. type(v), 2)
 end
 
 -- Coerce a positional-args shape list. Each slot is either a shape
 -- (string or schema) or `nil` (skip validation at that position).
 -- Returns `nil` when the whole list is absent.
 local function coerce_args_list(v, entry_name)
-    if v == nil then return nil end
+    if v == nil then
+        return nil
+    end
     if type(v) ~= "table" then
-        error(string.format(
-            "alc_shapes.spec_resolver: spec.entries.%s.args must be an array "
-                .. "of shapes (got %s)",
-            tostring(entry_name), type(v)), 2)
+        error(
+            string.format(
+                "alc_shapes.spec_resolver: spec.entries.%s.args must be an array " .. "of shapes (got %s)",
+                tostring(entry_name),
+                type(v)
+            ),
+            2
+        )
     end
     local n = #v
     local out = {}
@@ -82,10 +88,15 @@ local function coerce_args_list(v, entry_name)
         elseif is_schema(slot) then
             out[i] = slot
         else
-            error(string.format(
-                "alc_shapes.spec_resolver: spec.entries.%s.args[%d] must be "
-                    .. "string / schema / nil (got %s)",
-                tostring(entry_name), i, type(slot)), 2)
+            error(
+                string.format(
+                    "alc_shapes.spec_resolver: spec.entries.%s.args[%d] must be " .. "string / schema / nil (got %s)",
+                    tostring(entry_name),
+                    i,
+                    type(slot)
+                ),
+                2
+            )
         end
     end
     return out
@@ -101,26 +112,28 @@ function M.resolve(pkg)
         local entries = {}
         for name, entry in pairs(spec.entries) do
             if type(entry) ~= "table" then
-                error(string.format(
-                    "alc_shapes.spec_resolver: spec.entries.%s must be a table",
-                    tostring(name)), 2)
+                error(string.format("alc_shapes.spec_resolver: spec.entries.%s must be a table", tostring(name)), 2)
             end
             if entry.input ~= nil and entry.args ~= nil then
-                error(string.format(
-                    "alc_shapes.spec_resolver: spec.entries.%s declares both "
-                        .. "`input` (ctx-threading) and `args` (direct-args); "
-                        .. "these modes are mutually exclusive",
-                    tostring(name)), 2)
+                error(
+                    string.format(
+                        "alc_shapes.spec_resolver: spec.entries.%s declares both "
+                            .. "`input` (ctx-threading) and `args` (direct-args); "
+                            .. "these modes are mutually exclusive",
+                        tostring(name)
+                    ),
+                    2
+                )
             end
             entries[name] = {
-                input  = coerce_shape_ref(entry.input),
+                input = coerce_shape_ref(entry.input),
                 result = coerce_shape_ref(entry.result),
-                args   = coerce_args_list(entry.args, name),
+                args = coerce_args_list(entry.args, name),
             }
         end
         return {
-            kind    = "typed",
-            origin  = "spec",
+            kind = "typed",
+            origin = "spec",
             entries = entries,
             compose = spec.compose,
             exports = spec.exports,
@@ -128,8 +141,8 @@ function M.resolve(pkg)
     end
 
     return {
-        kind    = "opaque",
-        origin  = "none",
+        kind = "opaque",
+        origin = "none",
         entries = {},
         compose = nil,
         exports = nil,
@@ -140,9 +153,7 @@ function M.run(pkg, ctx, entry_name)
     entry_name = entry_name or "run"
     local fn = rawget(pkg, entry_name)
     if type(fn) ~= "function" then
-        error(string.format(
-            "alc_shapes.spec_resolver.run: pkg has no function '%s'",
-            entry_name), 2)
+        error(string.format("alc_shapes.spec_resolver.run: pkg has no function '%s'", entry_name), 2)
     end
 
     local resolved = M.resolve(pkg)
@@ -176,16 +187,24 @@ end
 
 function M.is_passthrough(pkg, shape_name)
     local resolved = M.resolve(pkg)
-    if resolved.kind ~= "typed" then return false end
-    if not resolved.compose then return false end
+    if resolved.kind ~= "typed" then
+        return false
+    end
+    if not resolved.compose then
+        return false
+    end
     local pt = resolved.compose.passthrough
-    if pt == nil then return false end
+    if pt == nil then
+        return false
+    end
     if type(pt) == "string" then
         return pt == shape_name
     end
     if type(pt) == "table" then
         for _, n in ipairs(pt) do
-            if n == shape_name then return true end
+            if n == shape_name then
+                return true
+            end
         end
     end
     return false

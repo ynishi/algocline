@@ -9,9 +9,9 @@ local T = S.T
 local M = {}
 
 M.meta = {
-    name        = "pkg_alpha",
-    version     = "0.1.0",
-    category    = "test",
+    name = "pkg_alpha",
+    version = "0.1.0",
+    category = "test",
     description = "COMPAT_UNDECL_SIGNAL_ALPHA: compat undeclared fixture",
 }
 

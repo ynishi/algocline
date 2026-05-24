@@ -33,11 +33,11 @@ function combinators:describe(doc)
     return setmetatable({ kind = "described", inner = self, doc = doc }, schema_mt)
 end
 
-M.string  = setmetatable({ kind = "prim", prim = "string" },  schema_mt)
-M.number  = setmetatable({ kind = "prim", prim = "number" },  schema_mt)
+M.string = setmetatable({ kind = "prim", prim = "string" }, schema_mt)
+M.number = setmetatable({ kind = "prim", prim = "number" }, schema_mt)
 M.boolean = setmetatable({ kind = "prim", prim = "boolean" }, schema_mt)
-M.table   = setmetatable({ kind = "prim", prim = "table" },   schema_mt)
-M.any     = setmetatable({ kind = "any" },                    schema_mt)
+M.table = setmetatable({ kind = "prim", prim = "table" }, schema_mt)
+M.any = setmetatable({ kind = "any" }, schema_mt)
 
 --- T.shape(fields, opts) — named key set.
 ---
@@ -66,8 +66,7 @@ function M.shape(fields, opts)
             error("alc_shapes.t: shape field name must be string, got " .. type(name), 2)
         end
         if not is_schema(sub) then
-            error(string.format(
-                "alc_shapes.t: shape field '%s' must be a schema (table with kind)", name), 2)
+            error(string.format("alc_shapes.t: shape field '%s' must be a schema (table with kind)", name), 2)
         end
         copy[name] = sub
     end
@@ -105,11 +104,12 @@ function M.array_of(elem)
     end
     if rawget(probe, "kind") == "optional" then
         error(
-            "alc_shapes.t: array_of(optional(T)) is not allowed — " ..
-            "Lua's `#` cannot reliably validate arrays with nil holes. " ..
-            "Use array_of(T) (require dense) or model the nil-admission " ..
-            "at the enclosing field (e.g. T.array_of(T):is_optional()).",
-            2)
+            "alc_shapes.t: array_of(optional(T)) is not allowed — "
+                .. "Lua's `#` cannot reliably validate arrays with nil holes. "
+                .. "Use array_of(T) (require dense) or model the nil-admission "
+                .. "at the enclosing field (e.g. T.array_of(T):is_optional()).",
+            2
+        )
     end
     return setmetatable({ kind = "array_of", elem = elem }, schema_mt)
 end
@@ -119,7 +119,9 @@ function M.one_of(values)
         error("alc_shapes.t: one_of expects a values table as argument", 2)
     end
     local n = 0
-    for _ in pairs(values) do n = n + 1 end
+    for _ in pairs(values) do
+        n = n + 1
+    end
     if n == 0 then
         error("alc_shapes.t: one_of expects at least one value", 2)
     end
@@ -130,9 +132,10 @@ function M.one_of(values)
         end
         local t = type(v)
         if t ~= "string" and t ~= "number" and t ~= "boolean" then
-            error(string.format(
-                "alc_shapes.t: one_of values must be string/number/boolean, got %s at index %d",
-                t, i), 2)
+            error(
+                string.format("alc_shapes.t: one_of values must be string/number/boolean, got %s at index %d", t, i),
+                2
+            )
         end
     end
     -- C5: reject duplicate literals. `T.one_of({"a", "a"})` is almost
@@ -146,10 +149,14 @@ function M.one_of(values)
         local v = values[i]
         local key = type(v) .. ":" .. tostring(v)
         if seen[key] then
-            error(string.format(
-                "alc_shapes.t: one_of has duplicate value %s at index %d",
-                (type(v) == "string") and string.format("%q", v) or tostring(v),
-                i), 2)
+            error(
+                string.format(
+                    "alc_shapes.t: one_of has duplicate value %s at index %d",
+                    (type(v) == "string") and string.format("%q", v) or tostring(v),
+                    i
+                ),
+                2
+            )
         end
         seen[key] = true
         copy[i] = v
@@ -181,13 +188,10 @@ function M.discriminated(tag, variants)
             error("alc_shapes.t: discriminated variant key must be string, got " .. type(k), 2)
         end
         if not is_schema(v) or rawget(v, "kind") ~= "shape" then
-            error(string.format(
-                "alc_shapes.t: discriminated variant '%s' must be a shape schema", k), 2)
+            error(string.format("alc_shapes.t: discriminated variant '%s' must be a shape schema", k), 2)
         end
         if rawget(rawget(v, "fields"), tag) == nil then
-            error(string.format(
-                "alc_shapes.t: discriminated variant '%s' must declare the tag field '%s'",
-                k, tag), 2)
+            error(string.format("alc_shapes.t: discriminated variant '%s' must declare the tag field '%s'", k, tag), 2)
         end
         copy[k] = v
         count = count + 1
@@ -216,9 +220,9 @@ function M.map_of(key, val)
 end
 
 M._internal = {
-    schema_mt   = schema_mt,
+    schema_mt = schema_mt,
     combinators = combinators,
-    is_schema   = is_schema,
+    is_schema = is_schema,
 }
 
 return M

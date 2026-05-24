@@ -37,7 +37,9 @@ for i = 1, 3 do
     end
     local pass_count = 0
     for _, row in ipairs(per_case) do
-        if row.passed then pass_count = pass_count + 1 end
+        if row.passed then
+            pass_count = pass_count + 1
+        end
     end
 
     local result = alc.card.create({
@@ -103,7 +105,9 @@ local best_alias = "best_" .. PKG
 if #derived > 0 then
     local best = derived[1]
     for _, d in ipairs(derived) do
-        if d.ev > best.ev then best = d end
+        if d.ev > best.ev then
+            best = d
+        end
     end
     alc.card.alias_set(best_alias, best.card_id, { pkg = PKG })
 end

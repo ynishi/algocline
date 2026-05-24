@@ -23,8 +23,8 @@
 --- generation treats it as "no declared shape".
 
 local PI = require("tools.docs.pkg_info")
-local T  = require("alc_shapes.t")
-local S  = require("alc_shapes")
+local T = require("alc_shapes.t")
+local S = require("alc_shapes")
 local EntitySchemas = require("tools.docs.entity_schemas")
 local is_schema = T._internal.is_schema
 
@@ -35,8 +35,7 @@ local M = {}
 local function read_file(path)
     local f, err = io.open(path, "r")
     if not f then
-        error(string.format(
-            "tools.docs.extract: cannot open '%s': %s", path, tostring(err)), 2)
+        error(string.format("tools.docs.extract: cannot open '%s': %s", path, tostring(err)), 2)
     end
     local content = f:read("*a")
     f:close()
@@ -200,9 +199,8 @@ function M.split_sections(docstring)
             for j = lo, hi do
                 body_lines[#body_lines + 1] = cur_body[j]
             end
-            sections[#sections + 1] = PI.make_section(
-                cur_level, cur_heading, cur_anchor,
-                table.concat(body_lines, "\n"))
+            sections[#sections + 1] =
+                PI.make_section(cur_level, cur_heading, cur_anchor, table.concat(body_lines, "\n"))
         end
     end
 
@@ -212,16 +210,16 @@ function M.split_sections(docstring)
         local h3 = line:match("^### (.+)$")
         if h2 and not line:match("^### ") then
             flush()
-            cur_level   = 2
+            cur_level = 2
             cur_heading = h2
-            cur_anchor  = alloc_anchor(seen_anchors, M.slugify(h2))
-            cur_body    = {}
+            cur_anchor = alloc_anchor(seen_anchors, M.slugify(h2))
+            cur_body = {}
         elseif h3 then
             flush()
-            cur_level   = 3
+            cur_level = 3
             cur_heading = h3
-            cur_anchor  = alloc_anchor(seen_anchors, M.slugify(h3))
-            cur_body    = {}
+            cur_anchor = alloc_anchor(seen_anchors, M.slugify(h3))
+            cur_body = {}
         else
             cur_body[#cur_body + 1] = line
         end
@@ -242,18 +240,13 @@ function M.load_pkg(pkg_name)
     package.loaded[pkg_name] = nil
     local ok, mod = pcall(require, pkg_name)
     if not ok then
-        error(string.format(
-            "tools.docs.extract: failed to require('%s'): %s",
-            pkg_name, tostring(mod)), 2)
+        error(string.format("tools.docs.extract: failed to require('%s'): %s", pkg_name, tostring(mod)), 2)
     end
     if type(mod) ~= "table" then
-        error(string.format(
-            "tools.docs.extract: require('%s') did not return a table",
-            pkg_name), 2)
+        error(string.format("tools.docs.extract: require('%s') did not return a table", pkg_name), 2)
     end
     if type(mod.meta) ~= "table" then
-        error(string.format(
-            "tools.docs.extract: pkg '%s' has no M.meta table", pkg_name), 2)
+        error(string.format("tools.docs.extract: pkg '%s' has no M.meta table", pkg_name), 2)
     end
     return mod
 end
@@ -274,16 +267,16 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
     local meta = mod.meta
 
     local identity = {
-        name        = meta.name or pkg_name,
-        version     = meta.version or "",
-        category    = meta.category or "",
+        name = meta.name or pkg_name,
+        version = meta.version or "",
+        category = meta.category or "",
         description = meta.description or "",
         source_path = source_path,
     }
 
     local narrative = {
-        title    = title,
-        summary  = summary,
+        title = title,
+        summary = summary,
         sections = sections,
     }
 
@@ -292,7 +285,7 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
     -- String shortcuts in spec are normalized to T.ref(name), matching
     -- the spec_resolver coerce rule.
     local shape = {
-        input  = nil,
+        input = nil,
         result = nil,
     }
     local spec = mod.spec
@@ -305,10 +298,15 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
                 elseif is_schema(run.input) then
                     shape.input = run.input
                 else
-                    error(string.format(
-                        "tools.docs.extract: pkg '%s' spec.entries.run.input " ..
-                        "must be a string or an alc_shapes schema (got type '%s')",
-                        pkg_name, type(run.input)), 2)
+                    error(
+                        string.format(
+                            "tools.docs.extract: pkg '%s' spec.entries.run.input "
+                                .. "must be a string or an alc_shapes schema (got type '%s')",
+                            pkg_name,
+                            type(run.input)
+                        ),
+                        2
+                    )
                 end
             end
             if run.result ~= nil then
@@ -317,10 +315,15 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
                 elseif is_schema(run.result) then
                     shape.result = run.result
                 else
-                    error(string.format(
-                        "tools.docs.extract: pkg '%s' spec.entries.run.result " ..
-                        "must be a string or an alc_shapes schema (got type '%s')",
-                        pkg_name, type(run.result)), 2)
+                    error(
+                        string.format(
+                            "tools.docs.extract: pkg '%s' spec.entries.run.result "
+                                .. "must be a string or an alc_shapes schema (got type '%s')",
+                            pkg_name,
+                            type(run.result)
+                        ),
+                        2
+                    )
                 end
             end
         end
@@ -335,10 +338,14 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
     if type(mod_docs) == "table" then
         if mod_docs.schema_version ~= nil then
             if type(mod_docs.schema_version) ~= "number" then
-                error(string.format(
-                    "tools.docs.extract: pkg '%s' M.docs.schema_version " ..
-                    "must be a number (got type '%s')",
-                    pkg_name, type(mod_docs.schema_version)), 2)
+                error(
+                    string.format(
+                        "tools.docs.extract: pkg '%s' M.docs.schema_version " .. "must be a number (got type '%s')",
+                        pkg_name,
+                        type(mod_docs.schema_version)
+                    ),
+                    2
+                )
             end
             docs.schema_version = mod_docs.schema_version
         end
@@ -352,10 +359,10 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
 end
 
 M._internal = {
-    read_file     = read_file,
-    split_lines   = split_lines,
-    alloc_anchor  = alloc_anchor,
-    is_schema     = is_schema,
+    read_file = read_file,
+    split_lines = split_lines,
+    alloc_anchor = alloc_anchor,
+    is_schema = is_schema,
 }
 
 return M

@@ -17,7 +17,9 @@ local function unwrap(schema)
             optional = true
             schema = rawget(schema, "inner")
         elseif kind == "described" then
-            if doc == nil then doc = rawget(schema, "doc") end
+            if doc == nil then
+                doc = rawget(schema, "doc")
+            end
             schema = rawget(schema, "inner")
         else
             break
@@ -52,7 +54,9 @@ function M.fields(schema)
         local name = names[i]
         local inner, optional, doc = unwrap(fields_tbl[name])
         local entry = { name = name, type = inner, optional = optional }
-        if doc ~= nil then entry.doc = doc end
+        if doc ~= nil then
+            entry.doc = doc
+        end
         out[i] = entry
     end
     return out
@@ -73,17 +77,25 @@ function M.walk(schema, visitor)
         if kind == "shape" then
             local fields_tbl = rawget(node, "fields")
             local names = {}
-            for name in pairs(fields_tbl) do names[#names + 1] = name end
+            for name in pairs(fields_tbl) do
+                names[#names + 1] = name
+            end
             table.sort(names)
-            for i = 1, #names do visit(fields_tbl[names[i]]) end
+            for i = 1, #names do
+                visit(fields_tbl[names[i]])
+            end
         elseif kind == "array_of" then
             visit(rawget(node, "elem"))
         elseif kind == "discriminated" then
             local variants = rawget(node, "variants")
             local keys = {}
-            for k in pairs(variants) do keys[#keys + 1] = k end
+            for k in pairs(variants) do
+                keys[#keys + 1] = k
+            end
             table.sort(keys)
-            for i = 1, #keys do visit(variants[keys[i]]) end
+            for i = 1, #keys do
+                visit(variants[keys[i]])
+            end
         elseif kind == "map_of" then
             visit(rawget(node, "key"))
             visit(rawget(node, "val"))

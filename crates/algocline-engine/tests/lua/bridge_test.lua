@@ -19,11 +19,17 @@ alc = {}
 -- Mock alc.json_encode: Lua value -> JSON string
 -- Minimal implementation for environments without cjson/dkjson
 local function simple_json_encode(value)
-    if type(value) == "nil" then return "null" end
-    if type(value) == "boolean" then return tostring(value) end
-    if type(value) == "number" then return tostring(value) end
+    if type(value) == "nil" then
+        return "null"
+    end
+    if type(value) == "boolean" then
+        return tostring(value)
+    end
+    if type(value) == "number" then
+        return tostring(value)
+    end
     if type(value) == "string" then
-        return '"' .. value:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
+        return '"' .. value:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
     end
     if type(value) == "table" then
         -- Detect array vs object
@@ -31,7 +37,9 @@ local function simple_json_encode(value)
         local max_idx = 0
         for k, _ in pairs(value) do
             if type(k) == "number" and k == math.floor(k) and k > 0 then
-                if k > max_idx then max_idx = k end
+                if k > max_idx then
+                    max_idx = k
+                end
             else
                 is_array = false
                 break
@@ -56,13 +64,23 @@ end
 
 -- Mock alc.json_decode: JSON string -> Lua value (primitive types only)
 local function simple_json_decode(s)
-    if s == "null" then return nil end
-    if s == "true" then return true end
-    if s == "false" then return false end
+    if s == "null" then
+        return nil
+    end
+    if s == "true" then
+        return true
+    end
+    if s == "false" then
+        return false
+    end
     local num = tonumber(s)
-    if num then return num end
+    if num then
+        return num
+    end
     local str = s:match('^"(.*)"$')
-    if str then return str end
+    if str then
+        return str
+    end
     return s
 end
 
@@ -76,14 +94,18 @@ function alc.chunk(text, opts)
     local size = opts.size or 50
     local overlap = opts.overlap or 0
 
-    if size == 0 then return {} end
+    if size == 0 then
+        return {}
+    end
 
     if mode == "chars" then
         local chars = {}
         for c in text:gmatch(".") do
             chars[#chars + 1] = c
         end
-        if #chars == 0 then return {} end
+        if #chars == 0 then
+            return {}
+        end
         local step = (overlap < size) and (size - overlap) or 1
         local chunks = {}
         local i = 1
@@ -92,7 +114,9 @@ function alc.chunk(text, opts)
             local chunk = table.concat(chars, "", i, e)
             chunks[#chunks + 1] = chunk
             i = i + step
-            if e == #chars then break end
+            if e == #chars then
+                break
+            end
         end
         return chunks
     else
@@ -106,7 +130,9 @@ function alc.chunk(text, opts)
         if #lines > 0 and lines[#lines] == "" then
             table.remove(lines)
         end
-        if #lines == 0 then return {} end
+        if #lines == 0 then
+            return {}
+        end
         local step = (overlap < size) and (size - overlap) or 1
         local chunks = {}
         local i = 1
@@ -115,7 +141,9 @@ function alc.chunk(text, opts)
             local chunk = table.concat(lines, "\n", i, e)
             chunks[#chunks + 1] = chunk
             i = i + step
-            if e == #lines then break end
+            if e == #lines then
+                break
+            end
         end
         return chunks
     end
@@ -142,7 +170,7 @@ describe("alc.json_encode", function()
     end)
 
     it("encodes array", function()
-        local result = alc.json_encode({1, 2, 3})
+        local result = alc.json_encode({ 1, 2, 3 })
         expect(result).to.equal("[1,2,3]")
     end)
 
@@ -244,13 +272,14 @@ end)
 
 describe("chunk + map integration", function()
     -- Load prelude for alc.map/reduce
-    local prelude_path = os.getenv("PRELUDE_PATH")
-        or "crates/algocline-engine/src/prelude.lua"
+    local prelude_path = os.getenv("PRELUDE_PATH") or "crates/algocline-engine/src/prelude.lua"
     dofile(prelude_path)
 
     it("chunk then map over chunks", function()
         local chunks = alc.chunk("line1\nline2\nline3\nline4", { size = 2 })
-        local uppered = alc.map(chunks, function(c) return c:upper() end)
+        local uppered = alc.map(chunks, function(c)
+            return c:upper()
+        end)
         expect(#uppered).to.equal(2)
         expect(uppered[1]).to.equal("LINE1\nLINE2")
         expect(uppered[2]).to.equal("LINE3\nLINE4")
@@ -258,7 +287,9 @@ describe("chunk + map integration", function()
 
     it("chunk then reduce to concatenate", function()
         local chunks = alc.chunk("abc", { mode = "chars", size = 1 })
-        local result = alc.reduce(chunks, function(acc, c) return acc .. "-" .. c end)
+        local result = alc.reduce(chunks, function(acc, c)
+            return acc .. "-" .. c
+        end)
         expect(result).to.equal("a-b-c")
     end)
 end)

@@ -161,7 +161,10 @@ function M.instrument(mod, entry_name, spec)
     end
     local meta = mod.meta
     if type(meta) ~= "table" or type(meta.name) ~= "string" or meta.name == "" then
-        error("alc_shapes.instrument: mod.meta.name (string) is required " .. "for hint construction", 2)
+        error(
+            "alc_shapes.instrument: mod.meta.name (string) is required " .. "for hint construction",
+            2
+        )
     end
     if spec ~= nil and type(spec) ~= "table" then
         error("alc_shapes.instrument: spec must be a table or nil (got " .. type(spec) .. ")", 2)

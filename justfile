@@ -8,7 +8,7 @@ _default:
 
 # Run all checks (fmt, clippy, test, V0 invariants) — CI equivalent
 [group: 'agent']
-ci: fmt-check clippy test check-invariants check-agent-index
+ci: fmt-check lua-fmt-check clippy test check-invariants check-agent-index
 
 # Lint with clippy (warnings = errors)
 [group: 'agent']

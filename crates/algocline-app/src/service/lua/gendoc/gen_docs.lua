@@ -159,7 +159,10 @@ local function main(argv)
             if not opts.lint_only then
                 write_file(string.format("%s/narrative/%s.md", out_dir, p.name), md)
                 if opts.hub then
-                    write_file(string.format("%s/hub/%s.json", out_dir, p.name), Projections.hub_entry(info))
+                    write_file(
+                        string.format("%s/hub/%s.json", out_dir, p.name),
+                        Projections.hub_entry(info)
+                    )
                 end
             end
             infos[#infos + 1] = info
@@ -242,7 +245,9 @@ local function main(argv)
 
     io.stdout:write(string.format("\ngen_docs: %d generated, %d failed", #infos, #failures))
     if Lint then
-        io.stdout:write(string.format(", lint: %d error(s) / %d warning(s)", lint_errors, lint_warnings))
+        io.stdout:write(
+            string.format(", lint: %d error(s) / %d warning(s)", lint_errors, lint_warnings)
+        )
     end
     io.stdout:write("\n")
 

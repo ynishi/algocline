@@ -1,0 +1,14 @@
+# Lua paths excluded from stylua format / check.
+# See issue 1779242392-21453 for scope rationale.
+
+# Test spec sources (separate lint/test track)
+crates/algocline-engine/tests/lua/
+
+# Fixtures and educational sample BPs
+tests/fixtures/
+examples/cards/
+
+# Build / worktree / workspace
+target/
+workspace/
+.worktrees/

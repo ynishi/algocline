@@ -66,7 +66,13 @@ function M.shape(fields, opts)
             error("alc_shapes.t: shape field name must be string, got " .. type(name), 2)
         end
         if not is_schema(sub) then
-            error(string.format("alc_shapes.t: shape field '%s' must be a schema (table with kind)", name), 2)
+            error(
+                string.format(
+                    "alc_shapes.t: shape field '%s' must be a schema (table with kind)",
+                    name
+                ),
+                2
+            )
         end
         copy[name] = sub
     end
@@ -133,7 +139,11 @@ function M.one_of(values)
         local t = type(v)
         if t ~= "string" and t ~= "number" and t ~= "boolean" then
             error(
-                string.format("alc_shapes.t: one_of values must be string/number/boolean, got %s at index %d", t, i),
+                string.format(
+                    "alc_shapes.t: one_of values must be string/number/boolean, got %s at index %d",
+                    t,
+                    i
+                ),
                 2
             )
         end
@@ -188,10 +198,20 @@ function M.discriminated(tag, variants)
             error("alc_shapes.t: discriminated variant key must be string, got " .. type(k), 2)
         end
         if not is_schema(v) or rawget(v, "kind") ~= "shape" then
-            error(string.format("alc_shapes.t: discriminated variant '%s' must be a shape schema", k), 2)
+            error(
+                string.format("alc_shapes.t: discriminated variant '%s' must be a shape schema", k),
+                2
+            )
         end
         if rawget(rawget(v, "fields"), tag) == nil then
-            error(string.format("alc_shapes.t: discriminated variant '%s' must declare the tag field '%s'", k, tag), 2)
+            error(
+                string.format(
+                    "alc_shapes.t: discriminated variant '%s' must declare the tag field '%s'",
+                    k,
+                    tag
+                ),
+                2
+            )
         end
         copy[k] = v
         count = count + 1

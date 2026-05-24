@@ -48,7 +48,8 @@ handlers.prim = function(value, schema, path)
     local expected = schema.prim
     local got = lua_type_of(value)
     if got ~= expected then
-        return false, string.format("shape violation at %s: expected %s, got %s", path, expected, got)
+        return false,
+            string.format("shape violation at %s: expected %s, got %s", path, expected, got)
     end
     return true
 end
@@ -66,7 +67,12 @@ end
 
 handlers.array_of = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format("shape violation at %s: expected table (array), got %s", path, type(value))
+        return false,
+            string.format(
+                "shape violation at %s: expected table (array), got %s",
+                path,
+                type(value)
+            )
     end
     -- iterate 1-based dense indices
     for i = 1, #value do
@@ -82,7 +88,8 @@ end
 
 handlers.shape = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format("shape violation at %s: expected table, got %s", path, type(value))
+        return false,
+            string.format("shape violation at %s: expected table, got %s", path, type(value))
     end
     local fields = schema.fields
     -- Determinism: sort field names so first-fail reports the same
@@ -125,12 +132,14 @@ end
 
 handlers.discriminated = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format("shape violation at %s: expected table, got %s", path, type(value))
+        return false,
+            string.format("shape violation at %s: expected table, got %s", path, type(value))
     end
     local tag = schema.tag
     local tag_val = value[tag]
     if tag_val == nil then
-        return false, string.format("shape violation at %s: missing discriminant field '%s'", path, tag)
+        return false,
+            string.format("shape violation at %s: missing discriminant field '%s'", path, tag)
     end
     local variant = schema.variants[tag_val]
     if variant == nil then
@@ -157,7 +166,8 @@ end
 
 handlers.map_of = function(value, schema, path, ctx)
     if type(value) ~= "table" then
-        return false, string.format("shape violation at %s: expected table (map), got %s", path, type(value))
+        return false,
+            string.format("shape violation at %s: expected table (map), got %s", path, type(value))
     end
     for k, v in pairs(value) do
         local key_path = path .. "[key=" .. tostring(k) .. "]"
@@ -230,7 +240,8 @@ check_node = function(value, schema, path, ctx)
     if ctx.depth > MAX_CHECK_DEPTH then
         error(
             string.format(
-                "alc_shapes.check: recursion depth exceeded at %s " .. "(> %d; cycle in schema or value?)",
+                "alc_shapes.check: recursion depth exceeded at %s "
+                    .. "(> %d; cycle in schema or value?)",
                 path,
                 MAX_CHECK_DEPTH
             ),
@@ -333,7 +344,12 @@ function M.assert(value, schema_or_name, ctx_hint, opts)
     elseif type(schema_or_name) == "table" then
         schema = schema_or_name
     else
-        error("alc_shapes.assert: schema_or_name must be nil, string, or table (got " .. type(schema_or_name) .. ")", 2)
+        error(
+            "alc_shapes.assert: schema_or_name must be nil, string, or table (got "
+                .. type(schema_or_name)
+                .. ")",
+            2
+        )
     end
     local ok, reason = M.check(value, schema, opts)
     if not ok then

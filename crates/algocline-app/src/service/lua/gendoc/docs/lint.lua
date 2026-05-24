@@ -132,7 +132,11 @@ function M.check(pkg_info, docstring, pkg_dir)
         out[#out + 1] = {
             severity = "error",
             code = "E_NAME_MISMATCH",
-            msg = string.format("meta.name='%s' does not match pkg directory '%s'", id.name, pkg_dir),
+            msg = string.format(
+                "meta.name='%s' does not match pkg directory '%s'",
+                id.name,
+                pkg_dir
+            ),
         }
     end
 
@@ -169,7 +173,10 @@ function M.check(pkg_info, docstring, pkg_dir)
                 out[#out + 1] = {
                     severity = "warning",
                     code = "W_FAKE_LABEL",
-                    msg = string.format("line looks like a section label; promote to '## %s'", label),
+                    msg = string.format(
+                        "line looks like a section label; promote to '## %s'",
+                        label
+                    ),
                     line = i,
                 }
             end

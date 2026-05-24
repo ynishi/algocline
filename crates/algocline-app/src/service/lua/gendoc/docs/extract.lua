@@ -240,10 +240,20 @@ function M.load_pkg(pkg_name)
     package.loaded[pkg_name] = nil
     local ok, mod = pcall(require, pkg_name)
     if not ok then
-        error(string.format("tools.docs.extract: failed to require('%s'): %s", pkg_name, tostring(mod)), 2)
+        error(
+            string.format(
+                "tools.docs.extract: failed to require('%s'): %s",
+                pkg_name,
+                tostring(mod)
+            ),
+            2
+        )
     end
     if type(mod) ~= "table" then
-        error(string.format("tools.docs.extract: require('%s') did not return a table", pkg_name), 2)
+        error(
+            string.format("tools.docs.extract: require('%s') did not return a table", pkg_name),
+            2
+        )
     end
     if type(mod.meta) ~= "table" then
         error(string.format("tools.docs.extract: pkg '%s' has no M.meta table", pkg_name), 2)
@@ -340,7 +350,8 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
             if type(mod_docs.schema_version) ~= "number" then
                 error(
                     string.format(
-                        "tools.docs.extract: pkg '%s' M.docs.schema_version " .. "must be a number (got type '%s')",
+                        "tools.docs.extract: pkg '%s' M.docs.schema_version "
+                            .. "must be a number (got type '%s')",
                         pkg_name,
                         type(mod_docs.schema_version)
                     ),

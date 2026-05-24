@@ -497,7 +497,10 @@ end
 function M.shape_to_json(schema)
     local peeled = peel(schema)
     if rawget(peeled, "kind") ~= "shape" then
-        error("shape_to_json: expected kind='shape', got '" .. tostring(rawget(peeled, "kind")) .. "'", 2)
+        error(
+            "shape_to_json: expected kind='shape', got '" .. tostring(rawget(peeled, "kind")) .. "'",
+            2
+        )
     end
     local entries = S.fields(peeled)
     local fields = {}
@@ -684,7 +687,14 @@ local DEVIN_MAX_NOTES = 100
 
 local function validate_note(note, where, i)
     if type(note) ~= "table" or type(note.content) ~= "string" or note.content == "" then
-        error(string.format("devin_wiki: %s[%d] must be a table with a non-empty 'content' string", where, i), 2)
+        error(
+            string.format(
+                "devin_wiki: %s[%d] must be a table with a non-empty 'content' string",
+                where,
+                i
+            ),
+            2
+        )
     end
     if #note.content > DEVIN_MAX_NOTE_CHARS then
         error(
@@ -720,7 +730,11 @@ local function copy_page(page, i, total_notes_ref)
         or page.purpose == ""
     then
         error(
-            string.format("devin_wiki: pages[%d] must be a table with non-empty " .. "'title' and 'purpose' strings", i),
+            string.format(
+                "devin_wiki: pages[%d] must be a table with non-empty "
+                    .. "'title' and 'purpose' strings",
+                i
+            ),
             2
         )
     end
@@ -782,7 +796,14 @@ function M.devin_wiki(config)
             error("devin_wiki: pages must be an array", 2)
         end
         if #config.pages > DEVIN_MAX_PAGES then
-            error(string.format("devin_wiki: pages exceeds max %d (%d provided)", DEVIN_MAX_PAGES, #config.pages), 2)
+            error(
+                string.format(
+                    "devin_wiki: pages exceeds max %d (%d provided)",
+                    DEVIN_MAX_PAGES,
+                    #config.pages
+                ),
+                2
+            )
         end
         local pages = {}
         local seen_titles = {}
@@ -790,7 +811,11 @@ function M.devin_wiki(config)
             local p = copy_page(config.pages[i], i, total_notes)
             if seen_titles[p.title] then
                 error(
-                    string.format("devin_wiki: pages[%d].title '%s' is duplicated " .. "(must be unique)", i, p.title),
+                    string.format(
+                        "devin_wiki: pages[%d].title '%s' is duplicated " .. "(must be unique)",
+                        i,
+                        p.title
+                    ),
                     2
                 )
             end
@@ -803,7 +828,14 @@ function M.devin_wiki(config)
     end
 
     if total_notes.n > DEVIN_MAX_NOTES then
-        error(string.format("devin_wiki: combined note count %d exceeds max %d", total_notes.n, DEVIN_MAX_NOTES), 2)
+        error(
+            string.format(
+                "devin_wiki: combined note count %d exceeds max %d",
+                total_notes.n,
+                DEVIN_MAX_NOTES
+            ),
+            2
+        )
     end
 
     return json_encode(entry)

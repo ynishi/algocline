@@ -457,7 +457,10 @@ function alc.tuning(defaults, ctx, opts)
         if type(ns) == "table" then
             source = ns
         elseif ns ~= nil then
-            alc.log("warn", "alc.tuning: prefix '" .. opts.prefix .. "' exists but is not a table, ignoring")
+            alc.log(
+                "warn",
+                "alc.tuning: prefix '" .. opts.prefix .. "' exists but is not a table, ignoring"
+            )
             source = {}
         end
     end
@@ -539,7 +542,13 @@ function alc.parallel(items, prompt_fn, opts)
             end
             batch[i] = p
         else
-            error("alc.parallel: prompt_fn must return string or table, got " .. type(p) .. " at index " .. i, 2)
+            error(
+                "alc.parallel: prompt_fn must return string or table, got "
+                    .. type(p)
+                    .. " at index "
+                    .. i,
+                2
+            )
         end
     end
 

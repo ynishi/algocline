@@ -80,10 +80,12 @@ M.calibrated = T.shape({
 -- decision rule (Proposition 3). `card_id` is populated only when the
 -- caller opts into Card emission via ctx.auto_card = true.
 M.conformal_decided = T.shape({
-    action = T.one_of({ "commit", "escalate", "anomaly" }):describe("Three-way decision per Proposition 3"),
+    action = T.one_of({ "commit", "escalate", "anomaly" })
+        :describe("Three-way decision per Proposition 3"),
     selected = T.string:is_optional():describe("Committed label (nil when action != 'commit')"),
     prediction_set = T.array_of(T.string):describe("Labels y with P_social(y|x) >= tau"),
-    p_social = T.map_of(T.string, T.number):describe("Linear opinion pool output { [label] = prob }"),
+    p_social = T.map_of(T.string, T.number)
+        :describe("Linear opinion pool output { [label] = prob }"),
     coverage_level = T.number:describe("1 - alpha (finite-sample guarantee)"),
     q_hat = T.number:describe("Calibration quantile of nonconformity scores"),
     tau = T.number:describe("1 - q_hat (prediction-set threshold)"),
@@ -105,16 +107,21 @@ M.deliberated = T.shape({
             rationale = T.string,
             evidence = T.array_of(T.string),
         }, { open = true }):describe("Chosen option with rationale and cited evidence"),
-        residual_objections = T.array_of(T.string)
-            :describe("Objections not fully resolved (empty array allowed, nil禁止)"),
+        residual_objections = T.array_of(T.string):describe(
+            "Objections not fully resolved (empty array allowed, nil禁止)"
+        ),
         minority_report = T.array_of(T.shape({
             position = T.string,
             rationale = T.string,
             confidence = T.number,
-        }, { open = true })):describe("Dissenting positions with confidence (empty array allowed, nil禁止)"),
-        next_actions = T.array_of(T.string):describe("Concrete follow-up actions (empty array allowed, nil禁止)"),
-        reopen_triggers = T.array_of(T.string)
-            :describe("Conditions to reopen deliberation (empty array allowed, nil禁止)"),
+        }, { open = true })):describe(
+            "Dissenting positions with confidence (empty array allowed, nil禁止)"
+        ),
+        next_actions = T.array_of(T.string)
+            :describe("Concrete follow-up actions (empty array allowed, nil禁止)"),
+        reopen_triggers = T.array_of(T.string):describe(
+            "Conditions to reopen deliberation (empty array allowed, nil禁止)"
+        ),
     }, { open = true }):describe("5-component decision packet; all 5 fields MUST be non-nil"),
     workspace = T.shape({
         problem_view = T.string,
@@ -125,7 +132,8 @@ M.deliberated = T.shape({
         next_actions = T.array_of(T.string),
     }, { open = true }):describe("Shared workspace 6 fields after finalization"),
     history = T.array_of(T.table):describe("Per-stage typed-act log (14-act typed)"),
-    convergence = T.one_of({ "dominance", "no_blocking", "fallback" }):describe("How the session converged"),
+    convergence = T.one_of({ "dominance", "no_blocking", "fallback" })
+        :describe("How the session converged"),
     stats = T.shape({
         rounds_used = T.number,
         total_acts = T.number,
@@ -153,7 +161,8 @@ M.smc_sampled = T.shape({
     weights = T.array_of(T.number):describe("Final normalized weights (Σ ≈ 1)"),
     iterations = T.number:describe("K SMC rounds actually executed"),
     resample_count = T.number:describe("Number of iterations that triggered multinomial resample"),
-    ess_trace = T.array_of(T.number):describe("ESS recorded at the start of each iteration (length K)"),
+    ess_trace = T.array_of(T.number)
+        :describe("ESS recorded at the start of each iteration (length K)"),
     stats = T.shape({
         total_llm_calls = T.number:describe("alc.llm invocations issued by the pkg"),
         total_reward_calls = T.number:describe("reward_fn invocations (caller-provided)"),
@@ -278,7 +287,9 @@ M.funnel_ranked = T.shape({
     total_llm_calls = T.number,
     naive_baseline_calls = T.number:describe("Hypothetical full-pairwise call count"),
     naive_baseline_kind = T.string:describe("Baseline method identifier"),
-    savings_percent = T.number:is_optional():describe("LLM call savings vs baseline (nil on bypass)"),
+    savings_percent = T.number
+        :is_optional()
+        :describe("LLM call savings vs baseline (nil on bypass)"),
     warnings = T.array_of(T.shape({
         code = T.string:describe("Machine-readable warning identifier"),
         severity = T.one_of({ "warn", "critical" }),
@@ -392,12 +403,14 @@ local quick_vote_params = T.shape({
 M.quick_voted = T.shape({
     answer = T.string:describe("Leader answer from sample 1 (cleaned, not normalized)"),
     leader_norm = T.string:describe("Normalized leader key used for agreement tests"),
-    outcome = T.one_of({ "confirmed", "rejected", "truncated" })
-        :describe("Terminal state: confirmed=H1 accepted, rejected=H0 accepted, truncated=no verdict at max_n"),
+    outcome = T.one_of({ "confirmed", "rejected", "truncated" }):describe(
+        "Terminal state: confirmed=H1 accepted, rejected=H0 accepted, truncated=no verdict at max_n"
+    ),
     verdict = T.one_of({ "accept_h1", "accept_h0", "continue" })
         :describe("Underlying SPRT verdict from the final decide()"),
     n_samples = T.number:describe("Total samples drawn (1 leader + k agreement observations)"),
-    vote_counts = T.map_of(T.string, T.number):describe("{ [norm] = count } tally across all samples"),
+    vote_counts = T.map_of(T.string, T.number)
+        :describe("{ [norm] = count } tally across all samples"),
     samples = T.array_of(quick_vote_sample):describe("Per-sample reasoning + extracted answer"),
     sprt = quick_vote_sprt:describe("Final SPRT state snapshot"),
     params = quick_vote_params:describe("Echoed parameter values"),
@@ -431,7 +444,9 @@ M.deep_paneled = T.shape({
     needs_investigation = T.boolean:describe("True if meta-confidence below threshold"),
     unanimous = T.boolean:describe("All normalized votes identical"),
     diversity = T.table:is_optional():describe("{ n_distinct, distinctness, decomp_status }"),
-    decomp = T.table:is_optional():describe("ensemble_div.decompose output (nil if Stage 3b skipped)"),
+    decomp = T.table
+        :is_optional()
+        :describe("ensemble_div.decompose output (nil if Stage 3b skipped)"),
     total_llm_calls = T.number,
     abort_reason = T.string:is_optional():describe("Abort reason (nil when not aborted)"),
     stages = T.array_of(T.table):describe("Per-stage detail (heterogeneous)"),

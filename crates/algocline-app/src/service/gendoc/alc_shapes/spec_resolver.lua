@@ -70,7 +70,8 @@ local function coerce_args_list(v, entry_name)
     if type(v) ~= "table" then
         error(
             string.format(
-                "alc_shapes.spec_resolver: spec.entries.%s.args must be an array " .. "of shapes (got %s)",
+                "alc_shapes.spec_resolver: spec.entries.%s.args must be an array "
+                    .. "of shapes (got %s)",
                 tostring(entry_name),
                 type(v)
             ),
@@ -90,7 +91,8 @@ local function coerce_args_list(v, entry_name)
         else
             error(
                 string.format(
-                    "alc_shapes.spec_resolver: spec.entries.%s.args[%d] must be " .. "string / schema / nil (got %s)",
+                    "alc_shapes.spec_resolver: spec.entries.%s.args[%d] must be "
+                        .. "string / schema / nil (got %s)",
                     tostring(entry_name),
                     i,
                     type(slot)
@@ -112,7 +114,13 @@ function M.resolve(pkg)
         local entries = {}
         for name, entry in pairs(spec.entries) do
             if type(entry) ~= "table" then
-                error(string.format("alc_shapes.spec_resolver: spec.entries.%s must be a table", tostring(name)), 2)
+                error(
+                    string.format(
+                        "alc_shapes.spec_resolver: spec.entries.%s must be a table",
+                        tostring(name)
+                    ),
+                    2
+                )
             end
             if entry.input ~= nil and entry.args ~= nil then
                 error(
@@ -153,7 +161,10 @@ function M.run(pkg, ctx, entry_name)
     entry_name = entry_name or "run"
     local fn = rawget(pkg, entry_name)
     if type(fn) ~= "function" then
-        error(string.format("alc_shapes.spec_resolver.run: pkg has no function '%s'", entry_name), 2)
+        error(
+            string.format("alc_shapes.spec_resolver.run: pkg has no function '%s'", entry_name),
+            2
+        )
     end
 
     local resolved = M.resolve(pkg)

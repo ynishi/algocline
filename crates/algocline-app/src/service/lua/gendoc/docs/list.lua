@@ -55,13 +55,21 @@ function M.list_pkgs(repo_root, index_path)
 
     local ok, index = pcall(Json.decode, content)
     if not ok then
-        error(string.format("tools.docs.list: hub_index.json at '%s' is malformed: %s", index_path, tostring(index)), 0)
+        error(
+            string.format(
+                "tools.docs.list: hub_index.json at '%s' is malformed: %s",
+                index_path,
+                tostring(index)
+            ),
+            0
+        )
     end
 
     if index.schema_version ~= "hub_index/v0" then
         error(
             string.format(
-                "tools.docs.list: unsupported schema_version '%s' in '%s' " .. "(expected 'hub_index/v0')",
+                "tools.docs.list: unsupported schema_version '%s' in '%s' "
+                    .. "(expected 'hub_index/v0')",
                 tostring(index.schema_version),
                 index_path
             ),
@@ -70,14 +78,23 @@ function M.list_pkgs(repo_root, index_path)
     end
 
     if type(index.packages) ~= "table" then
-        error(string.format("tools.docs.list: hub_index.json at '%s' has no " .. "`packages` array", index_path), 0)
+        error(
+            string.format(
+                "tools.docs.list: hub_index.json at '%s' has no " .. "`packages` array",
+                index_path
+            ),
+            0
+        )
     end
 
     local pkgs = {}
     for _, entry in ipairs(index.packages) do
         if type(entry.name) ~= "string" or entry.name == "" then
             error(
-                string.format("tools.docs.list: hub_index.json entry has no `name` " .. "(index '%s')", index_path),
+                string.format(
+                    "tools.docs.list: hub_index.json entry has no `name` " .. "(index '%s')",
+                    index_path
+                ),
                 0
             )
         end

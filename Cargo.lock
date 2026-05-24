@@ -92,6 +92,7 @@ dependencies = [
  "fuzzy-parser",
  "mlua",
  "mlua-isle",
+ "mlua-lspec",
  "mlua-mathlib",
  "mlua-pkg",
  "proptest",

@@ -118,6 +118,14 @@ alc.state = {
     end,
 }
 
+-- Directory stub: prelude reads alc._dirs.scenarios when resolving named
+-- scenarios from disk (prelude.lua step 2b). The service layer normally
+-- injects this; for standalone Lua runs we derive it from ALC_TEST_APP_DIR
+-- so the spec never touches HOME directly.
+alc._dirs = {
+    scenarios = app_dir .. "/scenarios",
+}
+
 -- ── 4. Load prelude ──────────────────────────────────────────
 local prelude_path = os.getenv("PRELUDE_PATH") or "crates/algocline-engine/src/prelude.lua"
 dofile(prelude_path)
@@ -394,7 +402,7 @@ describe("alc.eval integration", function()
         end)
 
         it("resolves from direct file path", function()
-            local scenario_path = home .. "/.algocline/scenarios/math_basic.lua"
+            local scenario_path = app_dir .. "/scenarios/math_basic.lua"
             local report = alc.eval(scenario_path, "mock_strategy")
 
             expect(report.aggregated).to.exist()

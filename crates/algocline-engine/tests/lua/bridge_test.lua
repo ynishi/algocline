@@ -271,7 +271,24 @@ end)
 -- ─── alc.chunk + alc.map integration ───
 
 describe("chunk + map integration", function()
-    -- Load prelude for alc.map/reduce
+    -- Load prelude for alc.map/reduce. prelude.lua references alc.state
+    -- (used by alc.state.update), so a minimal stub must be installed
+    -- before dofile or evaluation fails with "attempt to index a nil
+    -- value (field 'state')". Mirror the stub from prelude_test.lua.
+    local state_store = {}
+    alc.state = {
+        get = function(key, default)
+            local val = state_store[key]
+            if val == nil then
+                return default
+            end
+            return val
+        end,
+        set = function(key, value)
+            state_store[key] = value
+        end,
+    }
+
     local prelude_path = os.getenv("PRELUDE_PATH") or "crates/algocline-engine/src/prelude.lua"
     dofile(prelude_path)
 

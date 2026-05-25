@@ -116,6 +116,30 @@ pub(crate) async fn build_cancel_info(
 }
 
 // ---------------------------------------------------------------------------
+// DriverContext
+// ---------------------------------------------------------------------------
+
+/// Shared resources held by [`driver_loop`] for the lifetime of a v2 session.
+///
+/// Grouping these five `Arc`/channel/token handles into a single struct keeps
+/// `driver_loop` reachable with two non-shared owned values (`exec_task`,
+/// `llm_rx`) and reduces caller churn when future shared fields are added.
+///
+/// # Drop order
+///
+/// Field declaration order MUST match the original flat-argument order of
+/// `driver_loop` (`state, bus_tx, cancel_token, resp_txs, last_active`) so
+/// that `Arc` reference-count releases and cancellation-token drops occur
+/// in the same sequence as before this refactor (see crux-card.md #2).
+pub(crate) struct DriverContext {
+    pub state: Arc<Mutex<ExecutionState>>,
+    pub bus_tx: broadcast::Sender<ProgressEvent>,
+    pub cancel_token: CancellationToken,
+    pub resp_txs: super::record::RespTxsMap,
+    pub last_active: Arc<AtomicI64>,
+}
+
+// ---------------------------------------------------------------------------
 // driver_loop
 // ---------------------------------------------------------------------------
 
@@ -127,42 +151,36 @@ pub(crate) async fn build_cancel_info(
 ///
 /// # Arguments
 ///
+/// - `ctx` — Shared resources for this session: `state`, `bus_tx`,
+///   `cancel_token`, `resp_txs`, and `last_active`.
 /// - `exec_task` — The Lua coroutine task from `Executor::start_session`.
 /// - `llm_rx` — Receiver for LLM requests emitted by `alc.llm()`.
-/// - `state` — Shared execution state (v2), updated at each transition.
-/// - `bus_tx` — Broadcast sender for `ProgressEvent`s.
-/// - `cancel_token` — Cooperative cancellation token (Crux R2).
-/// - `resp_txs` — Shared map used by `registry::resume()` to deliver responses.
 pub(crate) async fn driver_loop(
+    ctx: DriverContext,
     mut exec_task: AsyncTask,
     mut llm_rx: mpsc::Receiver<LlmRequest>,
-    state: Arc<Mutex<ExecutionState>>,
-    bus_tx: broadcast::Sender<ProgressEvent>,
-    cancel_token: CancellationToken,
-    resp_txs: super::record::RespTxsMap,
-    last_active: Arc<AtomicI64>,
 ) {
     // Record the wall-clock entry time so the GC can detect abandoned sessions.
     // Single writer (driver_loop); GC reads via Relaxed load — no happens-before
     // required for millisecond-precision idle tracking (legacy parity: Crux #3).
-    last_active.store(now_ms(), Ordering::Relaxed);
+    ctx.last_active.store(now_ms(), Ordering::Relaxed);
 
     // checkpoint A: before Lua chunk
     // Check cancellation before entering the main loop so that a pre-cancelled
     // token prevents any Lua execution from starting.
-    if cancel_token.is_cancelled() {
+    if ctx.cancel_token.is_cancelled() {
         let reason = CancelReason {
             code: CancelCode::User,
             detail: Some("cancelled before execution started (checkpoint A)".into()),
             requested_at: now_ms(),
         };
-        let info = build_cancel_info(&state, reason).await;
-        transition_state(&state, &bus_tx, ExecutionState::Cancelled(info)).await;
+        let info = build_cancel_info(&ctx.state, reason).await;
+        transition_state(&ctx.state, &ctx.bus_tx, ExecutionState::Cancelled(info)).await;
         return;
     }
 
     // Publish an initial Running tick so observers know the session started.
-    let _ = bus_tx.send(ProgressEvent::Tick {
+    let _ = ctx.bus_tx.send(ProgressEvent::Tick {
         phase: "running".into(),
         at: now_ms(),
     });
@@ -174,14 +192,14 @@ pub(crate) async fn driver_loop(
             // checkpoint D: long-IO tokio::select! with cancel
             // Highest-priority branch: if the token fires we cancel immediately
             // without waiting for exec_task or llm_rx.
-            _ = cancel_token.cancelled() => {
+            _ = ctx.cancel_token.cancelled() => {
                 let reason = CancelReason {
                     code: CancelCode::User,
                     detail: Some("cancelled at select! checkpoint D".into()),
                     requested_at: now_ms(),
                 };
-                let info = build_cancel_info(&state, reason).await;
-                transition_state(&state, &bus_tx, ExecutionState::Cancelled(info)).await;
+                let info = build_cancel_info(&ctx.state, reason).await;
+                transition_state(&ctx.state, &ctx.bus_tx, ExecutionState::Cancelled(info)).await;
                 break;
             }
 
@@ -196,7 +214,7 @@ pub(crate) async fn driver_loop(
                                     usage: None,
                                     finished_at: now_ms(),
                                 });
-                                transition_state(&state, &bus_tx, done).await;
+                                transition_state(&ctx.state, &ctx.bus_tx, done).await;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -207,7 +225,7 @@ pub(crate) async fn driver_loop(
                                     kind: FailureKind::EngineError,
                                     occurred_at: now_ms(),
                                 });
-                                transition_state(&state, &bus_tx, failed).await;
+                                transition_state(&ctx.state, &ctx.bus_tx, failed).await;
                             }
                         }
                     }
@@ -218,7 +236,7 @@ pub(crate) async fn driver_loop(
                             kind: FailureKind::LuaError,
                             occurred_at: now_ms(),
                         });
-                        transition_state(&state, &bus_tx, failed).await;
+                        transition_state(&ctx.state, &ctx.bus_tx, failed).await;
                     }
                 }
                 break;
@@ -228,14 +246,14 @@ pub(crate) async fn driver_loop(
             Some(req) = llm_rx.recv() => {
                 // checkpoint B: before pause publish
                 // If cancelled between exec_task yield and here, skip the pause.
-                if cancel_token.is_cancelled() {
+                if ctx.cancel_token.is_cancelled() {
                     let reason = CancelReason {
                         code: CancelCode::User,
                         detail: Some("cancelled before pause publish (checkpoint B)".into()),
                         requested_at: now_ms(),
                     };
-                    let info = build_cancel_info(&state, reason).await;
-                    transition_state(&state, &bus_tx, ExecutionState::Cancelled(info)).await;
+                    let info = build_cancel_info(&ctx.state, reason).await;
+                    transition_state(&ctx.state, &ctx.bus_tx, ExecutionState::Cancelled(info)).await;
 
                     // Respond to all queries with an error so the coroutine wakes
                     // and can exit cleanly (prevents a goroutine leak in mlua-isle).
@@ -268,7 +286,7 @@ pub(crate) async fn driver_loop(
 
                 // Store resp_txs before publishing the pause event.
                 {
-                    let mut txs = resp_txs.lock().await;
+                    let mut txs = ctx.resp_txs.lock().await;
                     for qr in req.queries {
                         txs.insert(qr.id, qr.resp_tx);
                     }
@@ -279,8 +297,8 @@ pub(crate) async fn driver_loop(
                     info: pause_info.clone(),
                     at: now_ms(),
                 };
-                transition_state(&state, &bus_tx, ExecutionState::Paused(pause_info)).await;
-                let _ = bus_tx.send(pause_event);
+                transition_state(&ctx.state, &ctx.bus_tx, ExecutionState::Paused(pause_info)).await;
+                let _ = ctx.bus_tx.send(pause_event);
 
                 // The loop continues — the next iteration will wait for either
                 // exec_task to produce a result (after resume delivers resp_txs)
@@ -364,16 +382,14 @@ mod tests {
         cancel_token.cancel();
 
         let resp_txs = Arc::new(Mutex::new(HashMap::new()));
-        driver_loop(
-            exec_task,
-            llm_rx,
-            state.clone(),
+        let ctx = DriverContext {
+            state: state.clone(),
             bus_tx,
             cancel_token,
             resp_txs,
-            Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        )
-        .await;
+            last_active: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        };
+        driver_loop(ctx, exec_task, llm_rx).await;
 
         let guard = state.lock().await;
         assert!(
@@ -420,16 +436,14 @@ mod tests {
         cancel_token.cancel();
 
         let resp_txs = Arc::new(Mutex::new(HashMap::new()));
-        driver_loop(
-            exec_task,
-            llm_rx,
-            state.clone(),
+        let ctx = DriverContext {
+            state: state.clone(),
             bus_tx,
             cancel_token,
             resp_txs,
-            Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        )
-        .await;
+            last_active: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        };
+        driver_loop(ctx, exec_task, llm_rx).await;
 
         let guard = state.lock().await;
         assert!(
@@ -588,16 +602,14 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let resp_txs = Arc::new(Mutex::new(HashMap::new()));
 
-        driver_loop(
-            exec_task,
-            llm_rx,
-            state.clone(),
+        let ctx = DriverContext {
+            state: state.clone(),
             bus_tx,
             cancel_token,
             resp_txs,
-            Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        )
-        .await;
+            last_active: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        };
+        driver_loop(ctx, exec_task, llm_rx).await;
 
         let guard = state.lock().await;
         assert!(

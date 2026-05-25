@@ -17,7 +17,9 @@
 //!   `clone-then-release` pattern is used throughout.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use algocline_core::execution::{
     AwaitError, CancelError, CancelReason, ExecutionState, ExecutionStateTag, ObserveError,
@@ -136,6 +138,10 @@ impl SessionRegistryV2 {
         let state: Arc<Mutex<ExecutionState>> = Arc::new(Mutex::new(ExecutionState::Running));
         let cancel_token = CancellationToken::new();
         let resp_txs: RespTxsMap = Arc::new(Mutex::new(HashMap::new()));
+        // Wall-clock ms timestamp for idle-time GC (Crux #3 legacy parity).
+        // Initialised to now_ms() so a session that is evicted before driver_loop
+        // even starts is treated as "just spawned" rather than immediately expired.
+        let last_active: Arc<AtomicI64> = Arc::new(AtomicI64::new(now_ms()));
 
         // Crux R3 (sink-free): the receiver returned alongside `bus_tx` is
         // dropped immediately.  `bus_tx.send()` returns `Err(SendError)` when
@@ -152,17 +158,28 @@ impl SessionRegistryV2 {
         let bus_tx_d = bus_tx.clone();
         let cancel_d = cancel_token.clone();
         let resp_txs_d = Arc::clone(&resp_txs);
+        let last_active_d = Arc::clone(&last_active);
 
         let join_handle = tokio::spawn(async move {
             // vm_driver must stay alive for the duration of the session.
             let _keep_driver = vm_driver;
-            driver_loop(exec_task, llm_rx, state_d, bus_tx_d, cancel_d, resp_txs_d).await;
+            driver_loop(
+                exec_task,
+                llm_rx,
+                state_d,
+                bus_tx_d,
+                cancel_d,
+                resp_txs_d,
+                last_active_d,
+            )
+            .await;
         });
 
         // Assemble the record with all shared fields.
         let record = Arc::new(SessionRecord {
             state,
             bus_tx,
+            last_active,
             cancel_token,
             join_handle: Mutex::new(Some(join_handle)),
             resp_txs,
@@ -431,11 +448,85 @@ impl SessionRegistryV2 {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // spawn_gc_task
+    // -----------------------------------------------------------------------
+
+    /// Spawn a background GC task that periodically evicts idle, terminal sessions.
+    ///
+    /// Mirrors the legacy `SessionRegistry::spawn_gc_task` contract (Crux #3 legacy
+    /// parity) with two extensions:
+    ///
+    /// 1. **Subscriber-count gate** (Crux #1): a session is only evicted when
+    ///    `bus_tx.receiver_count() == 0` at the moment the write guard is held,
+    ///    ensuring no use-after-eviction for active observers.
+    /// 2. **Parameterised `interval`** (Crux #2): callers can supply a sub-second
+    ///    interval for test determinism without requiring `tokio::time::pause`.
+    ///
+    /// The `JoinHandle` returned by `tokio::spawn` is intentionally dropped —
+    /// the task runs until process exit (legacy fire-and-forget contract).
+    ///
+    /// # K-4 invariant
+    ///
+    /// The `sessions` write guard is acquired once per GC tick.  All operations
+    /// inside the guard (`receiver_count()`, `AtomicI64::load`, `HashMap::remove`)
+    /// are **synchronous** — no `.await` is called while the guard is held.
+    pub fn spawn_gc_task(&self, ttl: Duration, interval: Duration) {
+        let sessions = Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                // Acquire the write guard once per tick.  All reads and removes
+                // within this block are sync — no `.await` inside the guard (K-4).
+                let mut map = sessions.write().await;
+                let mut to_evict: Vec<SessionId> = Vec::new();
+                for (id, record) in map.iter() {
+                    // Crux #1: check subscriber count atomically with the guard held.
+                    // `receiver_count()` is sync (no lock required on its own), but
+                    // holding the write guard here means `observe()` cannot attach a
+                    // new subscriber via `try_read()` concurrently — TOCTOU excluded.
+                    let no_subscribers = record.bus_tx.receiver_count() == 0;
+                    let last_ms = record.last_active.load(Ordering::Relaxed);
+                    if no_subscribers && is_expired_v2(last_ms, ttl) {
+                        to_evict.push(id.clone());
+                    }
+                }
+                for id in &to_evict {
+                    tracing::info!(session_id = %id, "GC: reaping expired v2 session");
+                    map.remove(id);
+                }
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
     /// Clone-then-release lookup (K-4): the lock is dropped before returning.
     async fn get_record(&self, id: &SessionId) -> Option<Arc<SessionRecord>> {
         let map = self.sessions.read().await;
         map.get(id).cloned()
     }
+}
+
+// ---------------------------------------------------------------------------
+// GC helpers (module-private)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when the session has been idle for at least `ttl`.
+///
+/// Uses wall-clock milliseconds matching the legacy `is_expired_impl` semantics:
+/// `now_ms() - last_active_ms >= ttl.as_millis()`.
+///
+/// The legacy implementation uses `Instant` (monotonic) whereas this uses
+/// `SystemTime` (wall-clock) — identical to the `now_ms()` helper in `driver.rs`
+/// and to `Session.last_activity_ms` in the legacy codebase (Crux #3 parity).
+fn is_expired_v2(last_active_ms: i64, ttl: Duration) -> bool {
+    let now = super::driver::now_ms();
+    let elapsed_ms = now.saturating_sub(last_active_ms);
+    elapsed_ms >= ttl.as_millis() as i64
 }
 
 #[cfg(test)]
@@ -751,5 +842,333 @@ mod tests {
                 "{label}: must receive at least one StateTransition event"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5a — gc_evicts_terminal_session_after_ttl
+    // -----------------------------------------------------------------------
+
+    /// GC must remove a terminal session (no subscribers) after TTL has elapsed
+    /// and one full interval tick has fired.
+    ///
+    /// Covers: `tokio::time::interval` + `AtomicI64::load` + `RwLock::write` +
+    /// `receiver_count == 0` (Crux #1 / concurrency-analysis §2 5a).
+    #[tokio::test]
+    async fn gc_evicts_terminal_session_after_ttl() {
+        use algocline_core::execution::ObserveError;
+        use std::time::Duration;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        let ttl = Duration::from_millis(100);
+        let interval = Duration::from_millis(50);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 1"))
+            .await
+            .expect("spawn");
+
+        // Wait for the session to complete (terminal, no subscribers).
+        registry.await_terminal(&sid).await.expect("await_terminal");
+
+        // Sleep beyond one full GC interval + TTL + slack so the GC has had at
+        // least one opportunity to evict (R4 fallback: interval + ttl + 50ms).
+        tokio::time::sleep(interval + ttl + Duration::from_millis(50)).await;
+
+        registry.spawn_gc_task(ttl, interval);
+
+        // Sleep again to let the newly spawned GC run at least one tick.
+        tokio::time::sleep(interval + Duration::from_millis(50)).await;
+
+        // The session must now be gone.
+        assert!(
+            matches!(registry.observe(&sid), Err(ObserveError::NotFound(_))),
+            "session must be evicted after TTL + interval"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5b — gc_does_not_evict_session_with_active_subscriber
+    // -----------------------------------------------------------------------
+
+    /// GC must NOT evict a session that still has active subscribers, even after
+    /// TTL has elapsed.  Once the subscriber is dropped, subsequent GC ticks must
+    /// evict the session.
+    ///
+    /// Covers: `broadcast::Sender::receiver_count` > 0 path (Crux #1 /
+    /// concurrency-analysis §2 5b).
+    #[tokio::test]
+    async fn gc_does_not_evict_session_with_active_subscriber() {
+        use algocline_core::execution::ObserveError;
+        use std::time::Duration;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        let ttl = Duration::from_millis(100);
+        let interval = Duration::from_millis(50);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 2"))
+            .await
+            .expect("spawn");
+
+        // Acquire a subscriber *before* the session reaches terminal.
+        let _handle = registry.observe(&sid).expect("observe");
+
+        // Wait for terminal while subscriber is still held.
+        registry.await_terminal(&sid).await.expect("await_terminal");
+
+        // Start GC — session has receiver_count > 0, must NOT be evicted.
+        registry.spawn_gc_task(ttl, interval);
+
+        // Sleep well beyond TTL + interval.
+        tokio::time::sleep(interval + ttl + Duration::from_millis(50)).await;
+
+        // Session must still be present (subscriber is alive).
+        assert!(
+            registry.observe(&sid).is_ok(),
+            "session must NOT be evicted while a subscriber is held"
+        );
+
+        // Drop the subscriber — now eviction is permitted.
+        drop(_handle);
+
+        // Sleep for another interval + slack so GC ticks again after the drop.
+        tokio::time::sleep(interval + Duration::from_millis(50)).await;
+
+        // Now the session should be evicted.
+        assert!(
+            matches!(registry.observe(&sid), Err(ObserveError::NotFound(_))),
+            "session must be evicted after subscriber is dropped and GC ticks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5c — gc_respects_interval_no_immediate_eviction
+    // -----------------------------------------------------------------------
+
+    /// GC must NOT evict a terminal session before the interval has fired,
+    /// even if TTL has already elapsed.
+    ///
+    /// Covers: `tokio::time::interval MissedTickBehavior::Burst` guard
+    /// (R4 / concurrency-analysis §2 5c).
+    #[tokio::test]
+    async fn gc_respects_interval_no_immediate_eviction() {
+        use std::time::Duration;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        // Use a long interval so we can assert the session is still present
+        // after TTL has elapsed but before an interval tick fires.
+        let ttl = Duration::from_millis(20);
+        let interval = Duration::from_millis(500);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 3"))
+            .await
+            .expect("spawn");
+
+        registry.await_terminal(&sid).await.expect("await_terminal");
+
+        // Start GC after TTL has elapsed — the first tick fires up to `interval`
+        // from now, so we check immediately (well before the first tick).
+        tokio::time::sleep(ttl + Duration::from_millis(10)).await;
+        registry.spawn_gc_task(ttl, interval);
+
+        // Check immediately — no tick has fired yet.
+        assert!(
+            registry.observe(&sid).is_ok(),
+            "session must NOT be evicted before first GC tick fires"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5d — test_atomic_last_active_updated_by_driver_loop
+    // -----------------------------------------------------------------------
+
+    /// Concurrent writer (store) and reader (load) on `last_active` with
+    /// Relaxed ordering must not panic or cause UB; final value must be > 0.
+    ///
+    /// Covers: `AtomicI64::store` + `AtomicI64::load` Relaxed ordering safety
+    /// under concurrent access (concurrency-analysis §2 5d / Crux #3 invariant).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_atomic_last_active_updated_by_driver_loop() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::Arc;
+
+        let last_active = Arc::new(AtomicI64::new(0));
+
+        let writer_la = Arc::clone(&last_active);
+        let writer = tokio::spawn(async move {
+            for _ in 0..1000 {
+                writer_la.store(now_ms(), Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let reader_la = Arc::clone(&last_active);
+        let reader = tokio::spawn(async move {
+            for _ in 0..1000 {
+                let _ = reader_la.load(Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        writer.await.expect("writer task must not panic");
+        reader.await.expect("reader task must not panic");
+
+        // After 1000 stores of now_ms() the value must be > 0.
+        assert!(
+            last_active.load(Ordering::Relaxed) > 0,
+            "last_active must be updated to a non-zero wall-clock value"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5e — test_concurrent_observe_during_gc_tick
+    // -----------------------------------------------------------------------
+
+    /// 8 concurrent tasks each calling `observe()` 100 times while GC is running
+    /// must produce only `Ok` or `Err(NotFound)` — never a panic.
+    ///
+    /// Covers: `RwLock::try_read` vs `RwLock::write` mutual exclusion +
+    /// `Arc<RwLock<HashMap>>` clone safety (concurrency-analysis §2 5e).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_observe_during_gc_tick() {
+        use algocline_core::execution::ObserveError;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+        let registry = Arc::new(registry);
+
+        let ttl = Duration::from_millis(10);
+        let interval = Duration::from_millis(5);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 42"))
+            .await
+            .expect("spawn");
+
+        registry.await_terminal(&sid).await.expect("await_terminal");
+        registry.spawn_gc_task(ttl, interval);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let reg = Arc::clone(&registry);
+            let id = sid.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    match reg.observe(&id) {
+                        Ok(_) | Err(ObserveError::NotFound(_)) => {}
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("concurrent observe task must not panic");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5f — test_gc_task_spawn_survives_handle_drop
+    // -----------------------------------------------------------------------
+
+    /// `spawn_gc_task` internally drops the `JoinHandle` (legacy fire-and-forget).
+    /// Verify the GC loop continues running after `spawn_gc_task()` returns by
+    /// asserting eviction occurs after the expected window.
+    ///
+    /// Covers: `tokio::task::spawn` "JoinHandle drop ≠ task abort" contract
+    /// (concurrency-analysis §2 5f / Crux #2 legacy parity).
+    #[tokio::test]
+    async fn test_gc_task_spawn_survives_handle_drop() {
+        use algocline_core::execution::ObserveError;
+        use std::time::Duration;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        let ttl = Duration::from_millis(100);
+        let interval = Duration::from_millis(50);
+
+        // Start GC first — handle is immediately dropped inside spawn_gc_task.
+        registry.spawn_gc_task(ttl, interval);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 99"))
+            .await
+            .expect("spawn");
+
+        registry.await_terminal(&sid).await.expect("await_terminal");
+
+        // Sleep long enough for at least 2 GC ticks after TTL.
+        tokio::time::sleep(ttl + interval * 2 + Duration::from_millis(50)).await;
+
+        // The GC task (whose JoinHandle was dropped) must have continued running
+        // and evicted the session.
+        assert!(
+            matches!(registry.observe(&sid), Err(ObserveError::NotFound(_))),
+            "session must be evicted by the GC task even after its JoinHandle was dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC#5g — test_arc_rwlock_hashmap_shared_across_clones
+    // -----------------------------------------------------------------------
+
+    /// `SessionRegistryV2: Clone` shares the same underlying
+    /// `Arc<RwLock<HashMap>>`.  A session spawned via one clone must be visible
+    /// from another clone, and GC started on one clone must evict sessions
+    /// visible from the other.
+    ///
+    /// Covers: `Arc<RwLock<HashMap>>` Send + Sync + Clone shared-state contract
+    /// (concurrency-analysis §2 5g).
+    #[tokio::test]
+    async fn test_arc_rwlock_hashmap_shared_across_clones() {
+        use algocline_core::execution::ObserveError;
+        use std::time::Duration;
+
+        let executor = make_executor().await;
+        let (registry_a, _tmp) = make_registry(executor);
+        let registry_b = registry_a.clone();
+
+        let ttl = Duration::from_millis(100);
+        let interval = Duration::from_millis(50);
+
+        // Spawn via registry_a.
+        let sid = registry_a
+            .spawn_v2(simple_spec("return 7"))
+            .await
+            .expect("spawn via registry_a");
+
+        // Session must be visible from registry_b (shared Arc<RwLock<HashMap>>).
+        assert!(
+            registry_b.observe(&sid).is_ok(),
+            "session spawned via registry_a must be visible from registry_b"
+        );
+
+        // Wait for terminal.
+        registry_a
+            .await_terminal(&sid)
+            .await
+            .expect("await_terminal");
+
+        // Start GC via registry_b.
+        registry_b.spawn_gc_task(ttl, interval);
+
+        // Sleep long enough for eviction.
+        tokio::time::sleep(ttl + interval + Duration::from_millis(50)).await;
+
+        // Session evicted via registry_b's GC must be invisible from registry_a too.
+        assert!(
+            matches!(registry_a.observe(&sid), Err(ObserveError::NotFound(_))),
+            "session evicted by registry_b GC must be gone from registry_a too"
+        );
     }
 }

@@ -9,6 +9,7 @@
 //! `JoinHandle::abort()` path exists (Crux R2).
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 use algocline_core::execution::{CancelInfo, ExecutionState};
@@ -62,6 +63,17 @@ pub struct SessionRecord {
     /// "`send` always returns `Ok`".  See `bus_tx_does_not_crash_caller_with_zero_observers`.
     pub(crate) bus_tx: broadcast::Sender<ProgressEvent>,
 
+    /// Wall-clock timestamp (Unix ms) of the last driver activity.
+    ///
+    /// Updated by `driver_loop` at entry (session-start wall-clock),
+    /// using `Ordering::Relaxed` (single writer = driver_loop, single reader = GC).
+    /// Matches the `Session.last_activity_ms: Arc<AtomicI64>` pattern in the
+    /// legacy `session.rs` (L297, L419) — legacy parity (Crux #3).
+    ///
+    /// The GC task reads this atomically while holding the `sessions` write lock to
+    /// determine whether a session has been idle long enough to be evicted.
+    pub(crate) last_active: Arc<AtomicI64>,
+
     /// Cooperative cancellation token.
     ///
     /// Calling `.cancel()` sets the internal flag; the driver loop observes it
@@ -109,11 +121,13 @@ impl SessionRecord {
         cancel_token: CancellationToken,
         join_handle: JoinHandle<()>,
         resp_txs: RespTxsMap,
+        last_active: Arc<AtomicI64>,
     ) -> Self {
         let (bus_tx, _) = broadcast::channel(bus_capacity);
         Self {
             state,
             bus_tx,
+            last_active,
             cancel_token,
             join_handle: Mutex::new(Some(join_handle)),
             resp_txs,
@@ -126,6 +140,7 @@ impl SessionRecord {
 mod tests {
     use super::*;
     use algocline_core::execution::ExecutionState;
+    use std::sync::atomic::AtomicI64;
     use tokio::task;
 
     #[tokio::test]
@@ -134,7 +149,15 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let handle = task::spawn(async {});
         let resp_txs: RespTxsMap = Arc::new(Mutex::new(HashMap::new()));
-        let record = SessionRecord::new(state.clone(), 256, cancel_token, handle, resp_txs);
+        let last_active = Arc::new(AtomicI64::new(0));
+        let record = SessionRecord::new(
+            state.clone(),
+            256,
+            cancel_token,
+            handle,
+            resp_txs,
+            last_active,
+        );
 
         let guard = record.state.lock().await;
         assert!(matches!(*guard, ExecutionState::Running));
@@ -154,7 +177,8 @@ mod tests {
         let cancel_token = CancellationToken::new();
         let handle = task::spawn(async {});
         let resp_txs: RespTxsMap = Arc::new(Mutex::new(HashMap::new()));
-        let record = SessionRecord::new(state, 256, cancel_token, handle, resp_txs);
+        let last_active = Arc::new(AtomicI64::new(0));
+        let record = SessionRecord::new(state, 256, cancel_token, handle, resp_txs, last_active);
 
         let event = ProgressEvent::StateTransition {
             from: ExecutionStateTag::Running,

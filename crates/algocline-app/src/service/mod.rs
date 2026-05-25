@@ -149,6 +149,12 @@ impl AppService {
             Arc::clone(&card_store),
             app_dir.scenarios_dir(),
         ));
+        // V2 GC: TTL = 3h (same as legacy), interval = 60s (same as legacy).
+        // Debt #4 resolution: wires GC for the v2 execution_registry.
+        execution_registry.spawn_gc_task(
+            std::time::Duration::from_secs(10800),
+            std::time::Duration::from_secs(60),
+        );
 
         // ─── Pool registry setup ───────────────────────────────────────────────
         // Paths: ~/.algocline/state/pool/{registry.json, registry.lock}

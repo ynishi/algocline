@@ -401,46 +401,76 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // observe_sink_free_when_no_subscribers  (Crux R3)
+    // observe_sink_free_when_no_subscribers  (Crux R3 + debt #3)
     // -----------------------------------------------------------------------
 
     /// Spawn a session without calling `observe()` first.  `await_terminal()` must
     /// complete normally (sink-free: 0 observers do not stall execution).
-    /// After terminal, `observe()` must either return a valid handle
-    /// (if session still in registry) or `ObserveError::NotFound` (if GC'd).
+    ///
+    /// After terminal and GC eviction, `observe()` must return **strictly**
+    /// `ObserveError::NotFound` (debt #3 resolution / Crux #2 TTL override for
+    /// test determinism).
+    ///
+    /// This test uses `SessionRegistryV2` directly (not `make_app_service`) so it
+    /// can inject a sub-second TTL and interval without waiting for the production
+    /// 3h TTL (R5 fallback: direct registry construction path).
     #[tokio::test]
     async fn observe_sink_free_when_no_subscribers() {
         use algocline_core::execution::ObserveError;
+        use std::sync::Arc;
+        use std::time::Duration;
 
-        let svc = make_app_service().await;
+        // Build a registry with per-test temp storage (does not touch ~/.algocline).
+        let executor = Arc::new(
+            algocline_engine::Executor::new(vec![])
+                .await
+                .expect("Executor::new"),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_store = Arc::new(algocline_engine::JsonFileStore::new(
+            tmp.path().join("state"),
+        ));
+        let card_store = Arc::new(algocline_engine::FileCardStore::new(
+            tmp.path().join("cards"),
+        ));
+        let scenarios_dir = tmp.path().join("scenarios");
+        let registry = algocline_engine::execution::SessionRegistryV2::new(
+            executor,
+            state_store,
+            card_store,
+            scenarios_dir,
+        );
 
-        let sid = svc
-            .spawn(simple_spec("return 1"))
+        let ttl = Duration::from_millis(100);
+        let interval = Duration::from_millis(50);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 1"))
             .await
             .expect("spawn must succeed");
 
-        // Do NOT observe — no subscribers at all.
-
-        let terminal =
-            tokio::time::timeout(std::time::Duration::from_secs(5), svc.await_terminal(&sid))
-                .await
-                .expect("await_terminal must not timeout even with 0 observers")
-                .expect("await_terminal must succeed");
+        // Do NOT observe — no subscribers at all (sink-free contract).
+        let terminal = tokio::time::timeout(Duration::from_secs(5), registry.await_terminal(&sid))
+            .await
+            .expect("await_terminal must not timeout even with 0 observers")
+            .expect("await_terminal must succeed");
 
         assert!(
             matches!(terminal, TerminalOutcome::Done(_)),
             "session must complete as Done, got: {terminal:?}"
         );
 
-        // After terminal, observe either returns a valid handle (session still alive)
-        // or NotFound (session GC'd) — both are acceptable per the spec.
-        match svc.observe(&sid) {
-            Ok(_handle) => {
-                // Session still in registry — valid.
-            }
-            Err(ObserveError::NotFound(_)) => {
-                // Session GC'd — also valid.
-            }
-        }
+        // Wire GC with sub-second TTL + interval for deterministic eviction.
+        registry.spawn_gc_task(ttl, interval);
+
+        // Sleep beyond interval + ttl + slack so at least one GC tick fires
+        // after TTL has elapsed (R4 guard: avoids false-positive from first tick).
+        tokio::time::sleep(interval + ttl + Duration::from_millis(50)).await;
+
+        // After eviction, observe must return NotFound strictly (debt #3).
+        assert!(
+            matches!(registry.observe(&sid), Err(ObserveError::NotFound(_))),
+            "observe() must return NotFound after GC evicts the terminal session"
+        );
     }
 }

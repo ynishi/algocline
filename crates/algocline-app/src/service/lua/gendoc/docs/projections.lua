@@ -358,6 +358,7 @@ local function json_escape_string(s)
     return '"' .. out .. '"'
 end
 
+---@return boolean, integer?
 local function is_array(t)
     local n = 0
     for k, _ in pairs(t) do
@@ -374,6 +375,7 @@ local function is_array(t)
     return n > 0, n
 end
 
+---@type fun(v: any): string
 local json_encode_value -- forward
 
 local function json_encode_array(t, n)
@@ -774,6 +776,7 @@ function M.devin_wiki(config)
         error("devin_wiki: expected a table", 2)
     end
     local entry = {}
+    ---@type { n: integer }
     local total_notes = { n = 0 }
 
     if config.repo_notes ~= nil then

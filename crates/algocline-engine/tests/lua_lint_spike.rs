@@ -52,8 +52,17 @@ fn make_vm() -> Lua {
         alc.json_decode = function() end
         alc.log = function() end
         alc.llm = function() end
+        alc.llm_batch = function() end
         alc.eval = function() end
         alc.time = function() return 0 end
+        alc.budget_remaining = function() return 0 end
+        alc.card = {
+            create = function() end,
+            get = function() end,
+            list = function() end,
+            find = function() end,
+            append = function() end,
+        }
         alc._dirs = { scenarios = "/dev/null" }
     "#;
     lua.load(setup)
@@ -116,6 +125,35 @@ fn collect_lua(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Map a shipped file's on-disk path to the chunk_name (virtual module
+/// path) that production-side `require()` actually uses, so emmylua's
+/// workspace-based require resolution can find sibling modules across
+/// lint() calls. Without this mapping, every `require("tools.docs.X")`
+/// yields `Cannot resolve module` even though runtime `package.preload`
+/// (`gendoc.rs:EMBEDDED_TOOL_PRELOADS`) injects them.
+fn chunk_name_for(file: &Path) -> String {
+    let s = file.to_string_lossy();
+    // alc_shapes/<name>.lua — `require("alc_shapes")` / `require("alc_shapes.X")`
+    if let Some(idx) = s.find("/gendoc/alc_shapes/") {
+        let rel = &s[idx + "/gendoc/".len()..]; // "alc_shapes/<name>.lua"
+        return format!("@{rel}");
+    }
+    // lua/gendoc/docs/<name>.lua — `require("tools.docs.X")`
+    if let Some(idx) = s.find("/lua/gendoc/docs/") {
+        let rel = &s[idx + "/lua/gendoc/".len()..]; // "docs/<name>.lua"
+        return format!("@tools/{rel}");
+    }
+    // lua/gendoc/gen_docs.lua — top-level driver, no sibling require target
+    if s.ends_with("/lua/gendoc/gen_docs.lua") {
+        return "@gen_docs.lua".to_string();
+    }
+    // prelude.lua — standalone
+    if s.ends_with("/prelude.lua") {
+        return "@prelude.lua".to_string();
+    }
+    format!("@{}", file.display())
+}
+
 #[test]
 #[ignore]
 fn spike_lint_shipped_lua() {
@@ -129,19 +167,30 @@ fn spike_lint_shipped_lua() {
     println!("VM: alc stubs + prelude.lua loaded");
     println!("Files: {}\n", files.len());
 
+    // Pass 1: inject every shipped file into the analysis workspace under
+    // its production module path. After this loop, emmylua knows every
+    // require target. Diagnostics from this pass are discarded because
+    // dependencies may not have been registered yet when each file was
+    // first linted.
+    let sources: Vec<(PathBuf, String, String)> = files
+        .iter()
+        .filter_map(|file| {
+            let code = fs::read_to_string(file).ok()?;
+            let chunk = chunk_name_for(file);
+            Some((file.clone(), chunk, code))
+        })
+        .collect();
+
+    for (_, chunk, code) in &sources {
+        let _ = engine.lint(code, chunk);
+    }
+
+    // Pass 2: re-lint and collect the now-stable diagnostics.
     let mut total_warnings = 0usize;
     let mut total_errors = 0usize;
 
-    for file in &files {
-        let code = match fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("SKIP  {} — read error: {e}", file.display());
-                continue;
-            }
-        };
-        let chunk = format!("@{}", file.display());
-        let result = engine.lint(&code, &chunk);
+    for (file, chunk, code) in &sources {
+        let result = engine.lint(code, chunk);
         total_warnings += result.warning_count;
         total_errors += result.error_count;
 

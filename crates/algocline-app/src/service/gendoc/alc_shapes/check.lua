@@ -36,6 +36,7 @@ local function lua_type_of(v)
 end
 
 -- Forward decls.
+---@type fun(value: any, schema: any, path: string, ctx: table): boolean, string?
 local check_node
 
 local handlers = {}

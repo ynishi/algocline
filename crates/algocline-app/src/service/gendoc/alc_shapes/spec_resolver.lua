@@ -104,6 +104,7 @@ local function coerce_args_list(v, entry_name)
     return out
 end
 
+---@return { kind: string, origin: string, entries: table<string, { input: any, result: any, args: any }>, compose: any, exports: any }
 function M.resolve(pkg)
     if type(pkg) ~= "table" then
         error("alc_shapes.spec_resolver.resolve: pkg must be a table", 2)

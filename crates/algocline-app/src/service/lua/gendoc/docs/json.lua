@@ -19,6 +19,7 @@ M.NULL = setmetatable({}, {
     end,
 })
 
+---@type fun(s: string, i: integer): any, integer
 local decode_value -- forward declaration
 
 local function skip_ws(s, i)

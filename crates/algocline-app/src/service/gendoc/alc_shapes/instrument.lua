@@ -138,7 +138,7 @@ local M = {}
 ---
 ---@param mod table                             Module being instrumented.
 ---@param entry_name string                     Entry function name, e.g. "run".
----@param spec? { input?: table|string|nil, result?: table|string|nil }
+---@param spec? { input?: table|string|nil, result?: table|string|nil, args?: any }
 ---@return function                             Replacement function with identical call signature.
 function M.instrument(mod, entry_name, spec)
     if type(mod) ~= "table" then
@@ -174,11 +174,11 @@ function M.instrument(mod, entry_name, spec)
     -- are coerced to T.ref here; `args` list slots are coerced the same
     -- way, matching the rest of the toolchain).
     local resolved = spec_resolver.resolve(mod)
-    local entry = resolved.entries[entry_name] or {}
+    local entry = resolved.entries[entry_name]
 
-    local input_shape = (spec and spec.input) or entry.input
-    local result_shape = (spec and spec.result) or entry.result
-    local args_shapes = (spec and spec.args) or entry.args
+    local input_shape = (spec and spec.input) or (entry and rawget(entry, "input"))
+    local result_shape = (spec and spec.result) or (entry and rawget(entry, "result"))
+    local args_shapes = (spec and spec.args) or (entry and rawget(entry, "args"))
 
     -- Mutual exclusion is already enforced by spec_resolver for the
     -- M.spec-declared form. Re-check here for the override form, where

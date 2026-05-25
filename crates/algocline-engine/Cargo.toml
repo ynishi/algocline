@@ -32,7 +32,7 @@ anyhow = "1"
 dirs = "6"
 
 [dev-dependencies]
-mlua-check = "0.2"
+mlua-check = "0.3"
 mlua-lspec = "0.3"
 proptest = "1"
 tempfile = { workspace = true }

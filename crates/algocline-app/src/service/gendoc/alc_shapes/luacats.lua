@@ -33,6 +33,7 @@ end
 --- Forward declaration: inline_shape_type and type_of are mutually recursive
 --- (array_of(shape(...)) threads array -> shape -> inline expansion -> type_of
 --- on each field).
+---@type fun(node: any, class_prefix: string?): string
 local type_of
 
 --- Detect a top-level `|` in a rendered LuaCATS type string, ignoring
@@ -279,8 +280,7 @@ function M.gen_pkgs(pkg_specs)
         -- in a shape if they want a typed surface.
     end
 
-    for i = 1, #sorted do
-        local spec = sorted[i]
+    for _, spec in ipairs(sorted) do
         local pkg_name = spec.name
         if type(pkg_name) == "string" and pkg_name ~= "" then
             emit("AlcPkgInput_" .. pkg_name, spec.input)
@@ -311,11 +311,15 @@ function M.gen(shapes_table, class_prefix)
     table.sort(names)
 
     local out = { "---@meta" }
-    for i = 1, #names do
-        local name = names[i]
-        local class_name = class_prefix .. pascal_case(name)
-        out[#out + 1] = ""
-        out[#out + 1] = M.class_for(class_name, shapes_table[name], class_prefix):gsub("\n$", "")
+    if shapes_table ~= nil then
+        for _, name in ipairs(names) do
+            local class_name = class_prefix .. pascal_case(name)
+            out[#out + 1] = ""
+            out[#out + 1] = M.class_for(class_name, shapes_table[name], class_prefix):gsub(
+                "\n$",
+                ""
+            )
+        end
     end
 
     return table.concat(out, "\n") .. "\n"

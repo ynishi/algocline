@@ -55,7 +55,18 @@ end
 
 -- ── argv parsing ──────────────────────────────────────────────────────
 
+---@class GenDocsOpts
+---@field lint boolean
+---@field strict boolean
+---@field lint_only boolean
+---@field hub boolean
+---@field context7 boolean
+---@field devin boolean
+---@field luacats boolean
+---@field hub_index string?
+
 local function parse_argv(argv)
+    ---@type GenDocsOpts
     local opts = {
         lint = false,
         strict = false,
@@ -150,8 +161,7 @@ local function main(argv)
     local lint_errors = 0
     local lint_warnings = 0
 
-    for i = 1, #pkgs do
-        local p = pkgs[i]
+    for _, p in ipairs(pkgs) do
         local ok, info_or_err = pcall(Extract.build_pkg_info, p.name, p.init_path, p.source_path)
         if ok then
             local info = info_or_err
@@ -198,11 +208,15 @@ local function main(argv)
         write_file(out_dir .. "/llms.txt", Projections.llms_index(infos))
         write_file(out_dir .. "/llms-full.txt", Projections.llms_full(entries))
         if opts.context7 then
+            -- Runtime-injected via Rust-side inject_config_preloads (gendoc.rs).
+            ---@diagnostic disable-next-line: unresolved-require
             local Context7Config = require("tools.docs.context7_config")
             write_file(repo_root .. "/context7.json", Projections.context7_config(Context7Config))
             io.stdout:write("  [ok]   context7.json (repo root)\n")
         end
         if opts.devin then
+            -- Runtime-injected via Rust-side inject_config_preloads (gendoc.rs).
+            ---@diagnostic disable-next-line: unresolved-require
             local DevinConfig = require("tools.docs.devin_wiki_config")
             ensure_dir(repo_root .. "/.devin")
             write_file(repo_root .. "/.devin/wiki.json", Projections.devin_wiki(DevinConfig))
@@ -230,8 +244,7 @@ local function main(argv)
             -- *registered* shapes — pkg-local IF types were previously
             -- invisible to LuaLS / LuaCATS consumers.
             local pkg_specs = {}
-            for i = 1, #infos do
-                local info = infos[i]
+            for _, info in ipairs(infos) do
                 pkg_specs[#pkg_specs + 1] = {
                     name = info.identity.name,
                     input = info.shape.input,

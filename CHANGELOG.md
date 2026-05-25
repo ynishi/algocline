@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- `crates/algocline-engine/src/bridge/fork.rs` — removed redundant `.into_iter()` call on `results` (a `Vec<Option<Result<...>>>`) in the `strategy_names.iter().zip(results.into_iter()).enumerate()` chain; `zip` accepts `impl IntoIterator` directly, so the explicit conversion was flagged as `clippy::useless_conversion`. Iteration order, item count, and `(name, result)` pairing are unchanged. Verified that `results` satisfies `IntoIterator` (not the `Iterator` trait itself) at the call site, confirming the implicit conversion path through `zip`'s bound produces identical item types.
+- `crates/algocline-engine/src/bridge/logging.rs` — removed a second `clippy::useless_conversion` warning found in the same audit pass.
+
 ### Added
 
 - `.github/workflows/ci.yml` — GitHub Actions CI workflow for all pushes and pull requests. Runs `just ci` (`fmt-check lua-fmt-check clippy test check-invariants check-agent-index`) on `ubuntu-latest` with `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2` for dependency caching, and stylua 2.3.1 pinned via `cargo install --locked --version 2.3.1 stylua`. On test failure, insta `.snap.new` files are uploaded as a GitHub Actions artifact (`if: failure()`) to aid snapshot regression diagnosis.

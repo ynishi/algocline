@@ -30,7 +30,7 @@ use algocline_core::QueryId;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::driver::{build_cancel_info, driver_loop, now_ms, transition_state};
+use super::driver::{build_cancel_info, driver_loop, now_ms, transition_state, DriverContext};
 use super::observer::BroadcastObserverHandle;
 use super::record::{RespTxsMap, SessionRecord};
 use crate::card::FileCardStore;
@@ -153,26 +153,19 @@ impl SessionRegistryV2 {
 
         let session_id = SessionId::generate();
 
-        // Clones for the driver_loop closure.
-        let state_d = Arc::clone(&state);
-        let bus_tx_d = bus_tx.clone();
-        let cancel_d = cancel_token.clone();
-        let resp_txs_d = Arc::clone(&resp_txs);
-        let last_active_d = Arc::clone(&last_active);
+        // Bundle shared resources for driver_loop.
+        let ctx = DriverContext {
+            state: Arc::clone(&state),
+            bus_tx: bus_tx.clone(),
+            cancel_token: cancel_token.clone(),
+            resp_txs: Arc::clone(&resp_txs),
+            last_active: Arc::clone(&last_active),
+        };
 
         let join_handle = tokio::spawn(async move {
             // vm_driver must stay alive for the duration of the session.
             let _keep_driver = vm_driver;
-            driver_loop(
-                exec_task,
-                llm_rx,
-                state_d,
-                bus_tx_d,
-                cancel_d,
-                resp_txs_d,
-                last_active_d,
-            )
-            .await;
+            driver_loop(ctx, exec_task, llm_rx).await;
         });
 
         // Assemble the record with all shared fields.

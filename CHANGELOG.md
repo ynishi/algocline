@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `.github/workflows/ci.yml` — GitHub Actions CI workflow for all pushes and pull requests. Runs `just ci` (`fmt-check lua-fmt-check clippy test check-invariants check-agent-index`) on `ubuntu-latest` with `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2` for dependency caching, and stylua 2.3.1 pinned via `cargo install --locked --version 2.3.1 stylua`. On test failure, insta `.snap.new` files are uploaded as a GitHub Actions artifact (`if: failure()`) to aid snapshot regression diagnosis.
+- `README.md` — CI status badge linking to the new `ci.yml` workflow.
+
 ## [0.38.3] - 2026-05-23
 
 ### Changed

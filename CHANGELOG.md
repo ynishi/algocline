@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   added `tracing::warn!(target = "session.observe", ...)` in the `try_read()` `Err` arm
   to surface lock contention as an observable log event. `NotFound` return is preserved
   (no breaking change). Resolves debt #1 (tracing-missing-on-err, Outline §1-2-6).
+- `crates/algocline-engine/src/execution/driver.rs` — introduced `pub(crate) struct DriverContext` to group the five shared `Arc`/token arguments of `driver_loop` (`state`, `bus_tx`, `cancel_token`, `resp_txs`, `last_active`). Field declaration order reproduces the original flat-argument drop order so that `Arc` reference-count sequencing is identical before and after the refactor (Crux: Arc ownership order preserved). `driver_loop` signature narrows from seven arguments to three (`ctx: DriverContext`, `exec_task`, `llm_rx`); the `mut`-owned `exec_task` and `llm_rx` remain flat to avoid borrow-split complexity inside the `select!` loop. All call sites in `driver.rs` updated to `ctx.*` field access (mechanical rename, no logic change).
+- `crates/algocline-engine/src/execution/registry.rs` — `spawn_v2()` Arc-clone block condensed into a single `DriverContext { ... }` constructor; `driver_loop` invocation updated to the three-argument form. No behaviour change; pure internal refactor with no public API surface affected (`DriverContext` is `pub(crate)`).
 
 ### Added
 

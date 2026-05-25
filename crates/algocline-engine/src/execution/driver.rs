@@ -16,6 +16,7 @@
 //!
 //! No `JoinHandle::abort()`, `process::exit`, or signal-kill path exists (Crux R2).
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -139,7 +140,13 @@ pub(crate) async fn driver_loop(
     bus_tx: broadcast::Sender<ProgressEvent>,
     cancel_token: CancellationToken,
     resp_txs: super::record::RespTxsMap,
+    last_active: Arc<AtomicI64>,
 ) {
+    // Record the wall-clock entry time so the GC can detect abandoned sessions.
+    // Single writer (driver_loop); GC reads via Relaxed load — no happens-before
+    // required for millisecond-precision idle tracking (legacy parity: Crux #3).
+    last_active.store(now_ms(), Ordering::Relaxed);
+
     // checkpoint A: before Lua chunk
     // Check cancellation before entering the main loop so that a pre-cancelled
     // token prevents any Lua execution from starting.
@@ -364,6 +371,7 @@ mod tests {
             bus_tx,
             cancel_token,
             resp_txs,
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
         )
         .await;
 
@@ -419,6 +427,7 @@ mod tests {
             bus_tx,
             cancel_token,
             resp_txs,
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
         )
         .await;
 
@@ -586,6 +595,7 @@ mod tests {
             bus_tx,
             cancel_token,
             resp_txs,
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
         )
         .await;
 

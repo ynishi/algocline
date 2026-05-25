@@ -1434,3 +1434,114 @@ async fn status_include_history_true_shows_conversation_history_for_paused_sessi
         "conversation_history must be absent when include_history=false; metrics: {metrics_false}"
     );
 }
+
+// ─── usage accumulation across multiple alc_continue calls (test (c)) ───
+
+/// Verifies that token usage accumulates across multiple `alc_continue` calls
+/// within the same `SessionId` (Crux 1: run-unit boundary spans resume).
+///
+/// Strategy calls `alc.llm` twice. Each `resume` provides host-reported usage.
+/// The final `Done.usage` must be the sum of both resume payloads.
+#[tokio::test]
+async fn usage_accumulates_across_multiple_resumes() {
+    use algocline_core::execution::{
+        ExecutionService, ExecutionState, ResumePayload, SessionSpec, SpecKind, TerminalOutcome,
+    };
+    use algocline_core::TokenUsage;
+
+    let app = make_status_test_app().await;
+
+    let sid = app
+        .spawn(SessionSpec {
+            kind: SpecKind::Run {
+                code: r#"local a = alc.llm("q1"); local b = alc.llm("q2"); return {a, b}"#
+                    .to_owned(),
+            },
+            project_root: None,
+            ctx: None,
+        })
+        .await
+        .expect("spawn must succeed");
+
+    // Wait for first Paused state and get the query_id.
+    let query_id_1 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let state = app.state(&sid).await.expect("state");
+            if let ExecutionState::Paused(info) = state {
+                if let Some(prompt) = info.prompts.first() {
+                    return prompt.query_id.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("must reach first Paused state within timeout");
+
+    // Resume first LLM call with usage.
+    app.resume(
+        &sid,
+        ResumePayload::Single {
+            query_id: query_id_1,
+            response: "answer1".into(),
+            usage: Some(TokenUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+            }),
+        },
+    )
+    .await
+    .expect("first resume must succeed");
+
+    // Wait for second Paused state and get the query_id.
+    let query_id_2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let state = app.state(&sid).await.expect("state");
+            if let ExecutionState::Paused(info) = state {
+                if let Some(prompt) = info.prompts.first() {
+                    return prompt.query_id.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("must reach second Paused state within timeout");
+
+    // Resume second LLM call with usage.
+    app.resume(
+        &sid,
+        ResumePayload::Single {
+            query_id: query_id_2,
+            response: "answer2".into(),
+            usage: Some(TokenUsage {
+                prompt_tokens: Some(20),
+                completion_tokens: Some(7),
+            }),
+        },
+    )
+    .await
+    .expect("second resume must succeed");
+
+    // Await terminal — must be Done.
+    let terminal =
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.await_terminal(&sid))
+            .await
+            .expect("await_terminal must not timeout")
+            .expect("await_terminal must succeed");
+
+    match terminal {
+        TerminalOutcome::Done(result) => {
+            assert_eq!(
+                result.usage,
+                Some(TokenUsage {
+                    prompt_tokens: Some(30),
+                    completion_tokens: Some(12),
+                }),
+                "Done.usage must accumulate across both resumes (Crux 1); got: {:?}",
+                result.usage
+            );
+        }
+        other => panic!("expected Done, got: {other:?}"),
+    }
+}

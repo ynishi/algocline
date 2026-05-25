@@ -117,7 +117,6 @@ pub struct SessionRecord {
     /// `Arc` drop is order-independent.
     ///
     /// Read path added in ST2 (`registry.resume` → `on_response_fed`).
-    #[allow(dead_code)]
     pub(crate) metrics: Arc<ExecutionMetrics>,
 }
 

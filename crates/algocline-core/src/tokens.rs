@@ -5,7 +5,7 @@
 /// When the host includes usage data in `alc_continue`, these counts
 /// replace the character-based estimates for that specific response,
 /// upgrading `TokenSource` from `Estimated` to `Provided`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     /// Prompt tokens consumed by this LLM call, as reported by the host.
     pub prompt_tokens: Option<u64>,

@@ -14,9 +14,13 @@
 //!   3. call `mlua_check::vm::register(&lua)` to harvest the SymbolTable,
 //!   4. lint each shipped Lua file and tally counts.
 //!
-//! Marked `#[ignore]` because the goal is evidence collection, not gating
-//! `cargo test`. Run with:
-//!   `cargo test -p algocline-engine --test lua_lint_spike -- --ignored --nocapture`
+//! Run with:
+//!   `cargo test -p algocline-engine --test lua_lint_spike -- --nocapture`
+//!
+//! Now gating: any diagnostic on shipped Lua fails CI (`just ci` → `just test`
+//! → `cargo test --workspace`). To intentionally suppress an over-eager
+//! mlua-check rule on a file, add `---@diagnostic disable: <rule>` at the top
+//! of that file rather than relaxing the assertion below.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,8 +159,7 @@ fn chunk_name_for(file: &Path) -> String {
 }
 
 #[test]
-#[ignore]
-fn spike_lint_shipped_lua() {
+fn shipped_lua_is_lint_clean() {
     let lua = make_vm();
     let engine = register(&lua).expect("register(&lua) must succeed");
 
@@ -220,5 +223,16 @@ fn spike_lint_shipped_lua() {
     println!(
         "\nTotal: {total_warnings} warnings / {total_errors} errors across {} files",
         files.len()
+    );
+
+    assert_eq!(
+        total_errors, 0,
+        "shipped Lua produced {total_errors} mlua-check errors; \
+         fix the source or add `---@diagnostic disable: <rule>` at the top of the offending file"
+    );
+    assert_eq!(
+        total_warnings, 0,
+        "shipped Lua produced {total_warnings} mlua-check warnings; \
+         fix the source or add `---@diagnostic disable: <rule>` at the top of the offending file"
     );
 }

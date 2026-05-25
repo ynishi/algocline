@@ -315,10 +315,8 @@ function M.gen(shapes_table, class_prefix)
         for _, name in ipairs(names) do
             local class_name = class_prefix .. pascal_case(name)
             out[#out + 1] = ""
-            out[#out + 1] = M.class_for(class_name, shapes_table[name], class_prefix):gsub(
-                "\n$",
-                ""
-            )
+            out[#out + 1] = M.class_for(class_name, shapes_table[name], class_prefix)
+                :gsub("\n$", "")
         end
     end
 

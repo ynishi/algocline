@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  INSTA_UPDATE: 'no'
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install stylua 2.3.1 (pinned)
+        run: cargo install --locked --version 2.3.1 stylua
+
+      - name: Run CI checks
+        run: just ci
+
+      - name: Upload insta snap.new on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: insta-snap-new
+          path: '**/*.snap.new'
+          if-no-files-found: ignore

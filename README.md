@@ -1,5 +1,7 @@
 # algocline
 
+[![CI](https://github.com/ynishi/algocline/actions/workflows/ci.yml/badge.svg)](https://github.com/ynishi/algocline/actions/workflows/ci.yml)
+
 **Research-grade reasoning for your LLM — as Pure Lua you can read, edit, and ship.**
 
 UCB1 exploration, self-reflection, multi-agent debate, chain-of-verification — each strategy is a single Lua file. Install with `cargo install`, customize anything, no framework lock-in.

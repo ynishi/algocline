@@ -349,9 +349,7 @@ pub(crate) fn register_fork(
 
                 // Build result table
                 let result_table = lua.create_table()?;
-                for (i, (name, result)) in
-                    strategy_names.iter().zip(results.into_iter()).enumerate()
-                {
+                for (i, (name, result)) in strategy_names.iter().zip(results).enumerate() {
                     let entry = lua.create_table()?;
                     entry.set("strategy", name.as_str())?;
                     match result {

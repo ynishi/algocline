@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 use algocline_core::execution::{CancelInfo, ExecutionState};
-use algocline_core::QueryId;
+use algocline_core::{ExecutionMetrics, QueryId};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -108,6 +108,16 @@ pub struct SessionRecord {
     /// `Some` once `cancel()` has been called; subsequent calls return `Ok(())`
     /// without overwriting this entry.
     pub(crate) first_cancel_info: Mutex<Option<CancelInfo>>,
+
+    /// Shared token-usage accumulator for this session.
+    ///
+    /// Cloned from the same `Arc` as `DriverContext.metrics` so that
+    /// `registry.resume` can call `on_response_fed` against the same
+    /// `SessionStatus` that `driver_loop` reads via `usage_aggregate()` at Done.
+    /// `Arc` drop is order-independent.
+    ///
+    /// Read path added in ST2 (`registry.resume` → `on_response_fed`).
+    pub(crate) metrics: Arc<ExecutionMetrics>,
 }
 
 impl SessionRecord {
@@ -122,6 +132,7 @@ impl SessionRecord {
         join_handle: JoinHandle<()>,
         resp_txs: RespTxsMap,
         last_active: Arc<AtomicI64>,
+        metrics: Arc<ExecutionMetrics>,
     ) -> Self {
         let (bus_tx, _) = broadcast::channel(bus_capacity);
         Self {
@@ -132,6 +143,7 @@ impl SessionRecord {
             join_handle: Mutex::new(Some(join_handle)),
             resp_txs,
             first_cancel_info: Mutex::new(None),
+            metrics,
         }
     }
 }
@@ -157,6 +169,7 @@ mod tests {
             handle,
             resp_txs,
             last_active,
+            Arc::new(algocline_core::ExecutionMetrics::new()),
         );
 
         let guard = record.state.lock().await;
@@ -178,7 +191,15 @@ mod tests {
         let handle = task::spawn(async {});
         let resp_txs: RespTxsMap = Arc::new(Mutex::new(HashMap::new()));
         let last_active = Arc::new(AtomicI64::new(0));
-        let record = SessionRecord::new(state, 256, cancel_token, handle, resp_txs, last_active);
+        let record = SessionRecord::new(
+            state,
+            256,
+            cancel_token,
+            handle,
+            resp_txs,
+            last_active,
+            Arc::new(algocline_core::ExecutionMetrics::new()),
+        );
 
         let event = ProgressEvent::StateTransition {
             from: ExecutionStateTag::Running,

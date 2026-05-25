@@ -130,7 +130,7 @@ impl AppService {
             .collect();
 
         // Sort by modification time descending (newest first), take limit
-        files.sort_by(|a, b| b.1.cmp(&a.1));
+        files.sort_by_key(|b| std::cmp::Reverse(b.1));
         files.truncate(limit);
 
         let mut sessions = Vec::new();

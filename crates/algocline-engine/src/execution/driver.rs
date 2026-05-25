@@ -24,7 +24,7 @@ use algocline_core::execution::{
     CancelCode, CancelInfo, CancelReason, ExecutionResult, ExecutionState, ExecutionStateTag,
     FailureInfo, FailureKind, PauseInfo, PauseKind, PausePrompt, ProgressEvent,
 };
-use algocline_core::ExecutionMetrics;
+use algocline_core::{ExecutionMetrics, ExecutionObserver, LlmQuery};
 use mlua_isle::AsyncTask;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -281,6 +281,20 @@ pub(crate) async fn driver_loop(
                     query_id: qr.id.as_str().to_owned(),
                     prompt: qr.prompt.clone(),
                 }).collect();
+
+                // Build observer query slice before req.queries is consumed below.
+                let queries_for_observer: Vec<LlmQuery> = req.queries.iter()
+                    .map(|qr| LlmQuery {
+                        id: qr.id.clone(),
+                        prompt: qr.prompt.clone(),
+                        system: qr.system.clone(),
+                        max_tokens: qr.max_tokens,
+                        grounded: qr.grounded,
+                        underspecified: qr.underspecified,
+                    })
+                    .collect();
+                ctx.metrics.create_observer().on_paused(&queries_for_observer);
+
                 let pause_info = PauseInfo {
                     kind,
                     prompts,

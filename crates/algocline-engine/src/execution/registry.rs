@@ -26,7 +26,7 @@ use algocline_core::execution::{
     ObserverHandle, PauseKind, ProgressEvent, ResumeError, ResumeOutcome, SessionId, SpawnError,
     StateError, TerminalOutcome,
 };
-use algocline_core::{ExecutionMetrics, QueryId};
+use algocline_core::{ExecutionMetrics, ExecutionObserver, QueryId, TokenUsage};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -255,25 +255,27 @@ impl SessionRegistryV2 {
             _ => return Err(ResumeError::NotPaused { actual_tag }),
         }
 
-        // Extract query responses from the payload.
-        let responses: Vec<(String, String)> = match payload {
+        // Extract query responses from the payload, preserving per-response usage.
+        let responses: Vec<(String, String, Option<TokenUsage>)> = match payload {
             ResumePayload::Single {
-                query_id, response, ..
-            } => vec![(query_id, response)],
+                query_id,
+                response,
+                usage,
+            } => vec![(query_id, response, usage)],
             ResumePayload::Batch(batch) => batch
                 .into_iter()
-                .map(|r| (r.query_id, r.response))
+                .map(|r| (r.query_id, r.response, r.usage))
                 .collect(),
         };
 
         // Deliver responses via the shared resp_txs map.
         {
             let mut txs = record.resp_txs.lock().await;
-            for (qid_str, response) in responses {
-                let qid = QueryId::parse(&qid_str);
+            for (qid_str, response, _usage) in &responses {
+                let qid = QueryId::parse(qid_str);
                 match txs.remove(&qid) {
                     Some(tx) => {
-                        if let Err(_e) = tx.send(Ok(response)) {
+                        if let Err(_e) = tx.send(Ok(response.clone())) {
                             tracing::debug!(
                                 "registry::resume: oneshot receiver already dropped for query {qid_str}"
                             );
@@ -284,6 +286,14 @@ impl SessionRegistryV2 {
                     }
                 }
             }
+        }
+
+        // Propagate per-response usage to the metrics observer (Crux 1: same Arc).
+        // Observer call is outside the txs lock scope to keep cancel/lock paths intact.
+        let observer = record.metrics.create_observer();
+        for (qid_str, response, usage) in &responses {
+            let qid = QueryId::parse(qid_str);
+            observer.on_response_fed(&qid, response, usage.as_ref());
         }
 
         // Transition state from Paused → Running.
@@ -1178,5 +1188,158 @@ mod tests {
             matches!(registry_a.observe(&sid), Err(ObserveError::NotFound(_))),
             "session evicted by registry_b GC must be gone from registry_a too"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // usage_aggregate_none_for_run_without_llm_calls (test (b))
+    // -----------------------------------------------------------------------
+
+    /// When no `alc.llm` call occurs, `Done.usage` must be `None`.
+    /// Verifies that the `on_paused` wiring does not falsely activate when no
+    /// LLM call occurs, and that `usage_aggregate()` gates on `llm_calls > 0`.
+    #[tokio::test]
+    async fn usage_aggregate_none_for_run_without_llm_calls() {
+        use algocline_core::execution::TerminalOutcome;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        let sid = registry
+            .spawn_v2(simple_spec("return 42"))
+            .await
+            .expect("spawn");
+
+        let outcome = registry.await_terminal(&sid).await.expect("await_terminal");
+        match outcome {
+            TerminalOutcome::Done(result) => {
+                assert_eq!(
+                    result.usage, None,
+                    "Done.usage must be None when no alc.llm call occurred"
+                );
+            }
+            other => panic!("expected Done, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // usage_aggregate_some_for_run_with_llm_call (test (a))
+    // -----------------------------------------------------------------------
+
+    /// When `alc.llm` is called and resumed with host-reported usage,
+    /// `Done.usage` must be `Some(TokenUsage { prompt_tokens: Some(10), completion_tokens: Some(5) })`.
+    /// Verifies both `on_paused` wiring and `on_response_fed` propagation.
+    #[tokio::test]
+    async fn usage_aggregate_some_for_run_with_llm_call() {
+        use algocline_core::execution::{ResumePayload, TerminalOutcome};
+        use algocline_core::TokenUsage;
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        let sid = registry
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .await
+            .expect("spawn");
+
+        // Wait for Paused state.
+        let mut retries = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if registry.state(&sid).await.expect("state").tag() == ExecutionStateTag::Paused {
+                break;
+            }
+            retries += 1;
+            assert!(retries < 500, "session did not reach Paused state");
+        }
+
+        // Resume with host-reported usage.
+        registry
+            .resume(
+                &sid,
+                ResumePayload::Single {
+                    query_id: "q-0".into(),
+                    response: "answer".into(),
+                    usage: Some(TokenUsage {
+                        prompt_tokens: Some(10),
+                        completion_tokens: Some(5),
+                    }),
+                },
+            )
+            .await
+            .expect("resume");
+
+        let outcome = registry.await_terminal(&sid).await.expect("await_terminal");
+        match outcome {
+            TerminalOutcome::Done(result) => {
+                assert_eq!(
+                    result.usage,
+                    Some(TokenUsage {
+                        prompt_tokens: Some(10),
+                        completion_tokens: Some(5),
+                    }),
+                    "Done.usage must reflect host-reported token counts"
+                );
+            }
+            other => panic!("expected Done, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // usage_aggregate_uses_estimates_when_usage_omitted (test (d))
+    // -----------------------------------------------------------------------
+
+    /// When `alc.llm` is called but resumed with `usage: None`, `Done.usage`
+    /// must be `Some` with non-zero estimated values (Estimated source from
+    /// prompt length heuristic in `MetricsObserver::on_paused`).
+    #[tokio::test]
+    async fn usage_aggregate_uses_estimates_when_usage_omitted() {
+        use algocline_core::execution::{ResumePayload, TerminalOutcome};
+
+        let executor = make_executor().await;
+        let (registry, _tmp) = make_registry(executor);
+
+        let sid = registry
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .await
+            .expect("spawn");
+
+        // Wait for Paused state.
+        let mut retries = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if registry.state(&sid).await.expect("state").tag() == ExecutionStateTag::Paused {
+                break;
+            }
+            retries += 1;
+            assert!(retries < 500, "session did not reach Paused state");
+        }
+
+        // Resume without host-reported usage (observer uses Estimated values).
+        registry
+            .resume(
+                &sid,
+                ResumePayload::Single {
+                    query_id: "q-0".into(),
+                    response: "answer".into(),
+                    usage: None,
+                },
+            )
+            .await
+            .expect("resume");
+
+        let outcome = registry.await_terminal(&sid).await.expect("await_terminal");
+        match outcome {
+            TerminalOutcome::Done(result) => {
+                let usage = result
+                    .usage
+                    .expect("Done.usage must be Some when alc.llm was called");
+                assert!(
+                    usage.prompt_tokens.unwrap_or(0) > 0
+                        || usage.completion_tokens.unwrap_or(0) > 0,
+                    "Done.usage must have non-zero estimated tokens, got: {usage:?}"
+                );
+            }
+            other => panic!("expected Done, got: {other:?}"),
+        }
     }
 }

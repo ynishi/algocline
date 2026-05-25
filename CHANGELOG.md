@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Internal
 
 - `crates/algocline-engine/src/bridge/fork.rs` — removed redundant `.into_iter()` call on `results` (a `Vec<Option<Result<...>>>`) in the `strategy_names.iter().zip(results.into_iter()).enumerate()` chain; `zip` accepts `impl IntoIterator` directly, so the explicit conversion was flagged as `clippy::useless_conversion`. Iteration order, item count, and `(name, result)` pairing are unchanged. Verified that `results` satisfies `IntoIterator` (not the `Iterator` trait itself) at the call site, confirming the implicit conversion path through `zip`'s bound produces identical item types.
-- `crates/algocline-engine/src/bridge/logging.rs` — removed a second `clippy::useless_conversion` warning found in the same audit pass.
+- `crates/algocline-app/src/service/logging.rs` — replaced `sort_by(|a, b| b.1.cmp(&a.1))` with `sort_by_key(|b| std::cmp::Reverse(b.1))` to clear a `clippy::unnecessary_sort_by` warning found in the same workspace-wide audit pass. Sort order (newest first) unchanged.
 
 ### Added
 

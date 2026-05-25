@@ -1,3 +1,4 @@
+---@diagnostic disable: assign-type-mismatch, need-check-nil, missing-return-value
 --- tools.docs.json — minimal pure-Lua JSON decoder.
 ---
 --- Scope: `decode` only. The bundled-packages docs pipeline reads

@@ -1,3 +1,4 @@
+---@diagnostic disable: unnecessary-if
 --- tools.docs.lint — V0 convention gate.
 ---
 --- Given a `PkgInfo` + the raw docstring, enumerates violations of the

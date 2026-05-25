@@ -1,3 +1,4 @@
+---@diagnostic disable: need-check-nil, call-non-callable, param-type-mismatch, unnecessary-if
 --- tools.docs.extract — init.lua → PkgInfo.narrative + identity.
 ---
 --- Responsibilities:

@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `crates/algocline-engine/src/bridge/fork.rs` — removed redundant `.into_iter()` call on `results` (a `Vec<Option<Result<...>>>`) in the `strategy_names.iter().zip(results.into_iter()).enumerate()` chain; `zip` accepts `impl IntoIterator` directly, so the explicit conversion was flagged as `clippy::useless_conversion`. Iteration order, item count, and `(name, result)` pairing are unchanged. Verified that `results` satisfies `IntoIterator` (not the `Iterator` trait itself) at the call site, confirming the implicit conversion path through `zip`'s bound produces identical item types.
 - `crates/algocline-app/src/service/logging.rs` — replaced `sort_by(|a, b| b.1.cmp(&a.1))` with `sort_by_key(|b| std::cmp::Reverse(b.1))` to clear a `clippy::unnecessary_sort_by` warning found in the same workspace-wide audit pass. Sort order (newest first) unchanged.
+- `crates/algocline-engine/src/execution/registry.rs` — `SessionRegistryV2::observe()`:
+  added `tracing::warn!(target = "session.observe", ...)` in the `try_read()` `Err` arm
+  to surface lock contention as an observable log event. `NotFound` return is preserved
+  (no breaking change). Resolves debt #1 (tracing-missing-on-err, Outline §1-2-6).
 
 ### Added
 

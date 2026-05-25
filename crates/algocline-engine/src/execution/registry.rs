@@ -378,7 +378,10 @@ impl SessionRegistryV2 {
     /// each receive the full event stream independently (Crux R3).
     ///
     /// # Errors
-    /// - [`ObserveError::NotFound`] — no session with the given id exists.
+    /// - [`ObserveError::NotFound`] — no session with the given id exists, **or**
+    ///   `try_read()` experienced lock contention (write lock held by `spawn`).
+    ///   The contention path emits `tracing::warn!(target = "session.observe", ...)`;
+    ///   callers cannot distinguish it from a true absent-session result.
     pub fn observe(&self, id: &SessionId) -> Result<Box<dyn ObserverHandle>, ObserveError> {
         // Non-blocking read; the write lock is only held very briefly during spawn.
         match self.sessions.try_read() {
@@ -388,7 +391,14 @@ impl SessionRegistryV2 {
                     .ok_or_else(|| ObserveError::NotFound(id.clone()))?;
                 Ok(Box::new(BroadcastObserverHandle::new(&record.bus_tx)))
             }
-            Err(_) => Err(ObserveError::NotFound(id.clone())),
+            Err(_) => {
+                tracing::warn!(
+                    target = "session.observe",
+                    session_id = %id,
+                    "try_read contention; surfacing as NotFound"
+                );
+                Err(ObserveError::NotFound(id.clone()))
+            }
         }
     }
 

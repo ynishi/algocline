@@ -26,7 +26,7 @@ use algocline_core::execution::{
     ObserverHandle, PauseKind, ProgressEvent, ResumeError, ResumeOutcome, SessionId, SpawnError,
     StateError, TerminalOutcome,
 };
-use algocline_core::QueryId;
+use algocline_core::{ExecutionMetrics, QueryId};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -132,7 +132,7 @@ impl SessionRegistryV2 {
             .await
             .map_err(SpawnError::Engine)?;
 
-        let (exec_task, llm_rx, vm_driver) = session.into_driver_parts();
+        let (exec_task, llm_rx, vm_driver, metrics) = session.into_driver_parts();
 
         // Build shared components — all constructed before spawning the task.
         let state: Arc<Mutex<ExecutionState>> = Arc::new(Mutex::new(ExecutionState::Running));
@@ -142,6 +142,9 @@ impl SessionRegistryV2 {
         // Initialised to now_ms() so a session that is evicted before driver_loop
         // even starts is treated as "just spawned" rather than immediately expired.
         let last_active: Arc<AtomicI64> = Arc::new(AtomicI64::new(now_ms()));
+        // Wrap metrics in Arc and clone into both DriverContext and SessionRecord
+        // so both can access the same SessionStatus accumulator (K-4 clone-then-release).
+        let metrics_arc: Arc<ExecutionMetrics> = Arc::new(metrics);
 
         // Crux R3 (sink-free): the receiver returned alongside `bus_tx` is
         // dropped immediately.  `bus_tx.send()` returns `Err(SendError)` when
@@ -160,6 +163,7 @@ impl SessionRegistryV2 {
             cancel_token: cancel_token.clone(),
             resp_txs: Arc::clone(&resp_txs),
             last_active: Arc::clone(&last_active),
+            metrics: Arc::clone(&metrics_arc),
         };
 
         let join_handle = tokio::spawn(async move {
@@ -177,6 +181,7 @@ impl SessionRegistryV2 {
             join_handle: Mutex::new(Some(join_handle)),
             resp_txs,
             first_cancel_info: Mutex::new(None),
+            metrics: metrics_arc,
         });
 
         // Insert into registry.

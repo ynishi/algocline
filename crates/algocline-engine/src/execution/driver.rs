@@ -24,6 +24,7 @@ use algocline_core::execution::{
     CancelCode, CancelInfo, CancelReason, ExecutionResult, ExecutionState, ExecutionStateTag,
     FailureInfo, FailureKind, PauseInfo, PauseKind, PausePrompt, ProgressEvent,
 };
+use algocline_core::ExecutionMetrics;
 use mlua_isle::AsyncTask;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -121,7 +122,7 @@ pub(crate) async fn build_cancel_info(
 
 /// Shared resources held by [`driver_loop`] for the lifetime of a v2 session.
 ///
-/// Grouping these five `Arc`/channel/token handles into a single struct keeps
+/// Grouping these six `Arc`/channel/token handles into a single struct keeps
 /// `driver_loop` reachable with two non-shared owned values (`exec_task`,
 /// `llm_rx`) and reduces caller churn when future shared fields are added.
 ///
@@ -131,12 +132,14 @@ pub(crate) async fn build_cancel_info(
 /// `driver_loop` (`state, bus_tx, cancel_token, resp_txs, last_active`) so
 /// that `Arc` reference-count releases and cancellation-token drops occur
 /// in the same sequence as before this refactor (see crux-card.md #2).
+/// `metrics` is appended last; `Arc` drop is order-independent.
 pub(crate) struct DriverContext {
     pub state: Arc<Mutex<ExecutionState>>,
     pub bus_tx: broadcast::Sender<ProgressEvent>,
     pub cancel_token: CancellationToken,
     pub resp_txs: super::record::RespTxsMap,
     pub last_active: Arc<AtomicI64>,
+    pub metrics: Arc<ExecutionMetrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +214,7 @@ pub(crate) async fn driver_loop(
                             Ok(v) => {
                                 let done = ExecutionState::Done(ExecutionResult {
                                     value: v,
-                                    usage: None,
+                                    usage: ctx.metrics.usage_aggregate(),
                                     finished_at: now_ms(),
                                 });
                                 transition_state(&ctx.state, &ctx.bus_tx, done).await;
@@ -375,7 +378,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (exec_task, llm_rx, _vm_driver) = session.into_driver_parts();
+        let (exec_task, llm_rx, _vm_driver, _metrics) = session.into_driver_parts();
         let (state, bus_tx, _rx) = make_state_and_bus();
         let cancel_token = CancellationToken::new();
         // Pre-cancel BEFORE spawning the driver_loop.
@@ -388,6 +391,7 @@ mod tests {
             cancel_token,
             resp_txs,
             last_active: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            metrics: Arc::new(algocline_core::ExecutionMetrics::new()),
         };
         driver_loop(ctx, exec_task, llm_rx).await;
 
@@ -429,7 +433,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (exec_task, llm_rx, _vm_driver) = session.into_driver_parts();
+        let (exec_task, llm_rx, _vm_driver, _metrics) = session.into_driver_parts();
         let (state, bus_tx, _rx) = make_state_and_bus();
         let cancel_token = CancellationToken::new();
         // Pre-cancel so checkpoint B fires when llm_rx delivers the request.
@@ -442,6 +446,7 @@ mod tests {
             cancel_token,
             resp_txs,
             last_active: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            metrics: Arc::new(algocline_core::ExecutionMetrics::new()),
         };
         driver_loop(ctx, exec_task, llm_rx).await;
 
@@ -597,7 +602,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (exec_task, llm_rx, _vm_driver) = session.into_driver_parts();
+        let (exec_task, llm_rx, _vm_driver, _metrics) = session.into_driver_parts();
         let (state, bus_tx, _rx) = make_state_and_bus();
         let cancel_token = CancellationToken::new();
         let resp_txs = Arc::new(Mutex::new(HashMap::new()));
@@ -608,6 +613,7 @@ mod tests {
             cancel_token,
             resp_txs,
             last_active: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            metrics: Arc::new(algocline_core::ExecutionMetrics::new()),
         };
         driver_loop(ctx, exec_task, llm_rx).await;
 

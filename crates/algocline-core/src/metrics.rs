@@ -418,6 +418,26 @@ impl ExecutionMetrics {
     pub fn stats_handle(&self) -> StatsHandle {
         StatsHandle::new(Arc::clone(&self.auto))
     }
+
+    /// Aggregate token usage for this execution.
+    ///
+    /// Returns `None` when no LLM calls have been observed (`llm_calls == 0`),
+    /// preserving the wire-shape invariant: `None` means "aggregation path did
+    /// not run" and `Some(TokenUsage{…})` means "at least one LLM call occurred"
+    /// (even when the host did not supply exact counts).
+    ///
+    /// Returns `None` on mutex poison (OOM-class failure; silent skip per existing
+    /// observation/recording policy — process unrecoverable in that case).
+    pub fn usage_aggregate(&self) -> Option<crate::TokenUsage> {
+        let m = self.auto.lock().ok()?;
+        if m.llm_calls == 0 {
+            return None;
+        }
+        Some(crate::TokenUsage {
+            prompt_tokens: Some(m.prompt_token_count().tokens),
+            completion_tokens: Some(m.response_token_count().tokens),
+        })
+    }
 }
 
 /// Read-only handle exposing auto-counted [`SessionStatus`] metrics to
@@ -1113,5 +1133,97 @@ mod tests {
         assert!(prompt_total > 0, "prompt_total must be positive");
         assert!(response_total > 0, "response_total must be positive");
         assert_eq!(total, prompt_total + response_total);
+    }
+
+    // -----------------------------------------------------------------------
+    // usage_aggregate tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn usage_aggregate_none_when_no_llm_calls() {
+        let metrics = ExecutionMetrics::new();
+        assert!(
+            metrics.usage_aggregate().is_none(),
+            "fresh metrics with no LLM calls must return None"
+        );
+    }
+
+    #[test]
+    fn usage_aggregate_some_when_llm_calls_recorded() {
+        use crate::TokenUsage;
+
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+
+        let queries = vec![LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "test".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+        }];
+        observer.on_paused(&queries);
+        observer.on_response_fed(
+            &QueryId::batch(0),
+            "ans",
+            Some(&TokenUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+            }),
+        );
+
+        let result = metrics.usage_aggregate();
+        assert!(
+            result.is_some(),
+            "usage_aggregate must return Some after LLM call"
+        );
+        let usage = result.unwrap();
+        assert_eq!(
+            usage.prompt_tokens,
+            Some(10),
+            "prompt_tokens must match provided value"
+        );
+        assert_eq!(
+            usage.completion_tokens,
+            Some(5),
+            "completion_tokens must match provided value"
+        );
+    }
+
+    #[test]
+    fn usage_aggregate_some_with_estimated_path() {
+        // on_paused + on_response_fed with no host-provided usage (estimated path).
+        // Even with no explicit TokenUsage from host, usage_aggregate returns Some
+        // because at least one LLM call occurred (llm_calls > 0).
+        let metrics = ExecutionMetrics::new();
+        let observer = metrics.create_observer();
+
+        let queries = vec![LlmQuery {
+            id: QueryId::single(),
+            prompt: "hello world".into(),
+            system: None,
+            max_tokens: 50,
+            grounded: false,
+            underspecified: false,
+        }];
+        observer.on_paused(&queries);
+        // No host-supplied usage — token counts are estimated from character counts.
+        observer.on_response_fed(&QueryId::single(), "response text", None);
+
+        let result = metrics.usage_aggregate();
+        assert!(
+            result.is_some(),
+            "usage_aggregate must return Some even when token counts are estimated"
+        );
+        let usage = result.unwrap();
+        assert!(
+            usage.prompt_tokens.is_some(),
+            "prompt_tokens must be Some (estimated)"
+        );
+        assert!(
+            usage.completion_tokens.is_some(),
+            "completion_tokens must be Some (estimated)"
+        );
     }
 }

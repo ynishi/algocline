@@ -1,6 +1,6 @@
 ---
 name: alc-coder
-description: Isolated worker dedicated to algocline package implementation, spawned by /alc-build. Receives a design_para and a resolved `Package root:` line (either `~/.algocline/packages` for global mode, or any user-chosen collection root that carries `alc.toml` for collection mode), writes init.lua + spec/ under <pkg_root>/<name>/, and loops implementation with up to three retries until alc_pkg_test passes. After completion, appends one section of pass/fail observations to the configured journal.
+description: Isolated worker dedicated to algocline package implementation, spawned by /alc-build. Receives a design_para and a resolved `Package root:` line (either `~/.algocline/packages` for global mode, or any user-chosen collection root that carries `alc.toml` for collection mode), writes init.lua + spec/ under <pkg_root>/<name>/, and loops implementation with up to three retries until alc_pkg_test passes. After completion, appends one section of pass/fail observations to the configured journal. Optional enrichment: reference_docs (conventions doc / same-category pkg paths to Read before impl), negative_examples (terms to avoid in docstrings).
 model: sonnet
 tools: Write, Read, Edit, Glob, Grep, mcp__algocline__alc_pkg_test, mcp__algocline__alc_pkg_list, mcp__algocline__alc_pkg_doctor, mcp__algocline__alc_run, mcp__algocline__alc_pkg_scaffold, mcp__algocline__alc_hub_search, mcp__algocline__alc_hub_info
 permissionMode: bypassPermissions
@@ -42,6 +42,23 @@ contract, and the journal configuration (`path` / `pkg`).
 detection / heuristics; Bash is not in the tool list and any such attempt
 would be a contract violation. All write targets below substitute
 `<pkg_root>` for whatever the kick prompt provided.
+
+### Optional Enrichment (caller provides if available)
+
+The following fields are optional. Callers include them when the context is
+available; the coder benefits from them but does not require them.
+
+- **`reference_docs`: `[path, ...]`** — Conventions docs or same-category
+  existing package paths that the coder should Read before implementation.
+  Examples: `docs/pkg-author-conventions.md`, `packages/abm/init.lua`.
+  When provided, the coder reads these in Step 0 (before writing init.lua)
+  and uses the extracted conventions (H2 section names, M.meta fields,
+  @type/@class usage, docstring style) as self-check constraints during
+  implementation.
+- **`negative_examples`: `[term, ...]`** — Terms or patterns that must NOT
+  appear in the output (docstrings, comments, variable names). Examples:
+  `["LogicPkg", "Component", "@class CivicPkg"]`. When provided, the coder
+  checks each Write against this list and removes matches before committing.
 
 ## Output
 
@@ -168,6 +185,12 @@ Format is strict:
 
 ## Driver Loop
 
+0. **Convention pre-load (optional enrichment)**: If `reference_docs` is
+   provided in the kick prompt, Read each path and extract conventions
+   (H2 section names, M.meta field usage, @type/@class patterns, docstring
+   style). If `negative_examples` is provided, register them as a blocklist
+   for self-check during Write steps. Skip this step when neither field is
+   present.
 1. Extract `design_para`, the `Package root:` line (call it `<pkg_root>`),
    and the journal configuration from the kick prompt.
 2. Read **package name, implementation requirements, and pass conditions**
@@ -340,3 +363,7 @@ either because both are runtime-shape concerns.
   coder must not exceed its dispatch granularity).
 - `full-journal-embed` — embedding the entire journal directly into the boot
   context (only excerpts are allowed).
+- `reference-docs-ignore` — `reference_docs` was provided but the coder
+  skipped Step 0 and wrote init.lua without reading conventions first.
+- `negative-examples-ignore` — `negative_examples` was provided but the
+  coder used blocked terms in docstrings or comments anyway.

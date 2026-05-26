@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "algocline"
-version = "0.38.4"
+version = "0.38.5"
 dependencies = [
  "algocline-app",
  "algocline-core",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-app"
-version = "0.38.4"
+version = "0.38.5"
 dependencies = [
  "algocline-core",
  "algocline-engine",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-core"
-version = "0.38.4"
+version = "0.38.5"
 dependencies = [
  "async-trait",
  "indexmap 2.14.0",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-engine"
-version = "0.38.4"
+version = "0.38.5"
 dependencies = [
  "algocline-core",
  "anyhow",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "algocline-mcp"
-version = "0.38.4"
+version = "0.38.5"
 dependencies = [
  "algocline-app",
  "algocline-core",

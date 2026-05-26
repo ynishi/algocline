@@ -962,10 +962,10 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
             .unwrap_or(&empty)
             .to_lowercase()
             .contains(&q)
-        || pkg.tags.as_ref().is_some_and(|tags| {
-            tags.iter()
-                .any(|tag| tag.to_lowercase().contains(&q))
-        })
+        || pkg
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.iter().any(|tag| tag.to_lowercase().contains(&q)))
 }
 
 // ─── Index generation (reindex) ───────────────────────────────

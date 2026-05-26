@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.5] - 2026-05-26
+
+### Added
+
+- `M.meta.tags` support: package authors can declare `M.meta.tags = {"tag1", "tag2"}` in `init.lua`. Tags are parsed during `alc_hub_reindex`, projected into `hub_index.json`, and searchable via `alc_hub_search` (case-insensitive substring match against tags).
+- `alc-coder` / `alc-refiner` agents now accept optional enrichment inputs (`reference_docs`, `negative_examples` for coder; `existing_tracker`, `reference_docs` for refiner) to provide richer context during package implementation and review.
+
+### Fixed
+
+- `alc-coder` agent now explicitly prohibits generating `LICENSE` files from LLM memory, preventing incorrect license text from being written into packages.
+- `alc_hub_search` tag projection: fixed field inclusion so that `M.meta.tags` values appear correctly in search results.
+
 ## [0.38.4] - 2026-05-26
 
 ### Added

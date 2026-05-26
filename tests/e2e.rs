@@ -2156,11 +2156,7 @@ async fn test_hub_search_matches_tags() {
         .expect("tagged_pkg must exist");
     let tags = entry.get("tags").and_then(|t| t.as_array());
     assert!(tags.is_some(), "tags field must be projected in full mode");
-    let tag_strs: Vec<&str> = tags
-        .unwrap()
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let tag_strs: Vec<&str> = tags.unwrap().iter().filter_map(|v| v.as_str()).collect();
     assert!(
         tag_strs.contains(&"swarm") && tag_strs.contains(&"primitive"),
         "tags must contain swarm and primitive, got: {tag_strs:?}"

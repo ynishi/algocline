@@ -49,6 +49,8 @@ pub struct PkgEntity {
     pub category: Option<String>,
     #[serde(default)]
     pub docstring: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 impl PkgEntity {
@@ -70,7 +72,7 @@ impl PkgEntity {
     ///   search.
     pub fn parse_from_init_lua(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
-        let (name, version, description, category) = parse_meta(&content)?;
+        let (name, version, description, category, tags) = parse_meta(&content)?;
         let docstring = extract_docstring_from(&content);
         Some(PkgEntity {
             name,
@@ -78,6 +80,7 @@ impl PkgEntity {
             description: option_from_str(description),
             category: option_from_str(category),
             docstring: option_from_str(docstring),
+            tags: if tags.is_empty() { None } else { Some(tags) },
         })
     }
 }
@@ -112,9 +115,9 @@ fn extract_docstring_from(content: &str) -> String {
 }
 
 /// Parse `M.meta = { ... }` out of `content`. Returns
-/// `(name, version, description, category)`. `None` if the block is
+/// `(name, version, description, category, tags)`. `None` if the block is
 /// missing, unparseable, or `name` is empty.
-fn parse_meta(content: &str) -> Option<(String, String, String, String)> {
+fn parse_meta(content: &str) -> Option<(String, String, String, String, Vec<String>)> {
     let head = content;
 
     // Find M.meta = { ... } block (with brace-depth tracking).
@@ -205,12 +208,68 @@ fn parse_meta(content: &str) -> Option<(String, String, String, String)> {
     if name.is_empty() {
         return None;
     }
+    let tags = extract_string_array(block, "tags");
     Some((
         name,
         extract("version"),
         extract("description"),
         extract("category"),
+        tags,
     ))
+}
+
+/// Extract a string array from a nested table like `tags = { "a", "b" }`.
+/// Returns an empty Vec if the field is absent or has no string elements.
+fn extract_string_array(block: &str, field: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = block[search_from..].find(field) {
+        let pos = search_from + rel;
+        let word_boundary = pos == 0 || {
+            let prev = block.as_bytes()[pos - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_')
+        };
+        if word_boundary {
+            let after = &block[pos + field.len()..];
+            if let Some(brace_start) = after.find('{') {
+                let inner_start = brace_start + 1;
+                let mut depth = 1;
+                let mut brace_end = None;
+                for (i, ch) in after[inner_start..].char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                brace_end = Some(inner_start + i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(end) = brace_end {
+                    let inner = &after[inner_start..end];
+                    let mut cursor = 0;
+                    while let Some(q_start) = inner[cursor..].find('"') {
+                        let lit_start = cursor + q_start + 1;
+                        if let Some(q_end) = inner[lit_start..].find('"') {
+                            let s = &inner[lit_start..lit_start + q_end];
+                            if !s.is_empty() {
+                                result.push(s.to_string());
+                            }
+                            cursor = lit_start + q_end + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        search_from = pos + field.len();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -249,7 +308,7 @@ return M
     }
 
     #[test]
-    fn parse_nested_table_skipped() {
+    fn parse_tags_from_nested_table() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_init_lua(
             tmp.path(),
@@ -267,6 +326,51 @@ return M
         let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
         assert_eq!(pkg.name, "nested_pkg");
         assert_eq!(pkg.description.as_deref(), Some("After nested"));
+        assert_eq!(
+            pkg.tags.as_deref(),
+            Some(vec!["a".to_string(), "b".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn parse_tags_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "no_tags_pkg",
+    description = "No tags",
+}
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.name, "no_tags_pkg");
+        assert!(pkg.tags.is_none());
+    }
+
+    #[test]
+    fn parse_tags_empty_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "empty_tags_pkg",
+    tags = {},
+    description = "Empty tags",
+}
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.name, "empty_tags_pkg");
+        assert!(pkg.tags.is_none());
     }
 
     #[test]
@@ -458,6 +562,7 @@ return M
             description: Some(String::new()),
             category: Some("meta".into()),
             docstring: None,
+            tags: None,
         };
         let json = serde_json::to_string(&pkg).unwrap();
         assert!(json.contains("\"version\":null"), "version null: {json}");

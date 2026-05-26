@@ -130,6 +130,7 @@ Each field below is tagged with one of three status labels. The same labels are 
 | `description`        | **Required**    | string | One-line tagline (≤ 80 char). Projected into `llms.txt` entry.                                                 |
 | `category`           | **Required**    | string | Grouping key for `llms.txt` and hub search.                                                                    |
 | `alc_shapes_compat`  | **Recommended** | string | SemVer range (e.g. `">=0.25.0, <0.26"`) declaring the pkg's compatible `alc_shapes` versions. Validated by `alc_hub_gendoc` against the bundled `alc_shapes` (range mismatch → error; absent → warning). Required for **Bundled** pkgs.    |
+| `tags`               | **Recommended** | table (string array) | Free-form classification tags (e.g. `{ "swarm", "primitive" }`). Indexed by `hub_index.json` and searchable via `alc_hub_search`. No enforced taxonomy; authors choose tags that help discovery. |
 
 (Lint codes: `E_META_MISSING_{NAME,VERSION,DESCRIPTION,CATEGORY}`,
 `W_META_LEGACY_M_VERSION` — see §5.)

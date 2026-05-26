@@ -921,6 +921,7 @@ fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, Strin
             description: None,
             category: None,
             docstring: None,
+            tags: None,
         });
         results.push(SearchResult {
             entity,
@@ -960,6 +961,10 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
             .unwrap_or(&empty)
             .to_lowercase()
             .contains(&q)
+        || pkg.tags.as_ref().is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag.to_lowercase().contains(&q))
+        })
 }
 
 // ─── Index generation (reindex) ───────────────────────────────
@@ -1644,6 +1649,7 @@ mod tests {
                     description: Some("from remote".into()),
                     category: Some("test".into()),
                     docstring: None,
+                    tags: None,
                 },
                 source: PackageSource::Unknown,
                 card_count: 0,
@@ -1665,6 +1671,7 @@ mod tests {
                 description: Some("Multi-level routing".into()),
                 category: Some("meta".into()),
                 docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
+                tags: None,
             },
             source: PackageSource::Unknown,
             installed: true,
@@ -1695,6 +1702,7 @@ mod tests {
                 description: Some("Multi-level routing".into()),
                 category: Some("reasoning".into()),
                 docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
+                tags: None,
             },
             source: PackageSource::Git {
                 url: "https://example.com/cascade".into(),
@@ -2330,6 +2338,7 @@ mod tests {
                         description: None,
                         category: None,
                         docstring: None,
+                        tags: None,
                     },
                     source: PackageSource::Unknown,
                     card_count: 0,

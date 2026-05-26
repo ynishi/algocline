@@ -293,6 +293,11 @@ either because both are runtime-shape concerns.
 - **Modify anything outside the scope of `design_para`** (other packages,
   configuration files, etc.; the journal append is the only exception, and
   it is part of this contract).
+- **Generate LICENSE files from memory.** LICENSE is a legal document chosen
+  by the package author. If `design_para` explicitly specifies a license
+  and provides a canonical copy path (or `reference_docs` includes one),
+  copy it verbatim via Read + Write. If no license is specified, do not
+  create a LICENSE file — note the absence in Key Observations instead.
 - **Update the journal before invoking `alc_pkg_test`** (process-order
   violation: test -> return -> append).
 - **Skip the journal append on test failure** (append regardless of pass /
@@ -367,3 +372,7 @@ either because both are runtime-shape concerns.
   skipped Step 0 and wrote init.lua without reading conventions first.
 - `negative-examples-ignore` — `negative_examples` was provided but the
   coder used blocked terms in docstrings or comments anyway.
+- `license-from-memory` — generating LICENSE text from LLM memory instead
+  of copying a canonical source verbatim (legal text reproduced from
+  training data has subtle errors in wording, line breaks, or section
+  numbering).

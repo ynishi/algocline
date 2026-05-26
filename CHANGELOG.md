@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.4] - 2026-05-26
+
 ### Added
 
 - `crates/algocline-app/src/service/lua/gendoc/docs/lint.lua` — new `W_META_LEGACY_M_VERSION` warning. When a pkg's `init.lua` defines a top-level `M.VERSION` field, `alc_hub_gendoc` now surfaces a non-blocking warning naming the canonical form (`M.meta.version` per `pkg-author-conventions.md` §2.1). The flag is collected by `extract.lua` (new `pkg_info.identity.legacy_m_version : boolean`) so lint emits regardless of whether `M.VERSION` and `M.meta.version` are kept in sync. Safe-to-remove when no external reference exists.
@@ -47,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `.github/workflows/ci.yml` — GitHub Actions CI workflow for all pushes and pull requests. Runs `just ci` (`fmt-check lua-fmt-check clippy test check-invariants check-agent-index`) on `ubuntu-latest` with `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2` for dependency caching, and stylua 2.3.1 pinned via `cargo install --locked --version 2.3.1 stylua`. On test failure, insta `.snap.new` files are uploaded as a GitHub Actions artifact (`if: failure()`) to aid snapshot regression diagnosis.
 - `README.md` — CI status badge linking to the new `ci.yml` workflow.
+
+### Notes
+
+- Patch bump (0.38.3 → 0.38.4). New `W_META_LEGACY_M_VERSION` lint warning is additive (no existing pkg emits an error from it). The `usage_aggregate()` addition on `ExecutionMetrics` is additive `pub fn`. `SessionRegistryV2::spawn_gc_task` is additive on a `pub` struct (`spec/usage` path was already public). The `DriverContext` refactor is `pub(crate)` only — no SemVer-visible surface change. CI workflow + Lua lint integration are repository infrastructure, not consumer-facing API.
 
 ## [0.38.3] - 2026-05-23
 

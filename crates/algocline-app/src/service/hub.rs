@@ -186,11 +186,12 @@ where
     S: serde::Serializer,
 {
     use serde::ser::SerializeMap;
-    let mut map = ser.serialize_map(Some(4))?;
+    let mut map = ser.serialize_map(Some(5))?;
     map.serialize_entry("name", &entity.name)?;
     map.serialize_entry("version", &entity.version)?;
     map.serialize_entry("description", &entity.description)?;
     map.serialize_entry("category", &entity.category)?;
+    map.serialize_entry("tags", &entity.tags)?;
     map.end()
 }
 

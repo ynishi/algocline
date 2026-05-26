@@ -107,6 +107,7 @@ pub(crate) const HUB_SEARCH_FULL: &[&str] = &[
     "card_count",
     "best_card",
     "docstring",
+    "tags",
 ];
 
 // ─── parse_sort ─────────────────────────────────────────────────────

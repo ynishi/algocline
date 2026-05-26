@@ -2098,6 +2098,124 @@ async fn test_hub_search_local_indices_merges_results() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// `alc_hub_search` must match packages by their `tags` field.
+///
+/// Writes a local hub_index.json with a package carrying tags, then
+/// searches by a tag value that does NOT appear in name/description/category.
+/// Verifies the package is found (proving tags are searched).
+#[tokio::test]
+async fn test_hub_search_matches_tags() {
+    let alc_home = tempfile::tempdir().expect("tempdir failed");
+    std::fs::create_dir_all(alc_home.path().join("packages")).expect("create packages dir failed");
+
+    let idx_dir = tempfile::tempdir().expect("tempdir for index failed");
+    let idx_path = idx_dir.path().join("hub_index.json");
+
+    let idx_json = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "2026-05-26T00:00:00Z",
+        "packages": [
+            {
+                "name": "tagged_pkg",
+                "version": "0.1.0",
+                "description": "A package with metadata",
+                "category": "testing",
+                "tags": ["swarm", "primitive"]
+            }
+        ]
+    });
+    std::fs::write(&idx_path, idx_json.to_string()).expect("write hub_index.json failed");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    // Search by a tag that is NOT in name/description/category.
+    let resp = call_json(
+        &client,
+        "alc_hub_search",
+        json!({
+            "query": "primitive",
+            "local_indices": [idx_path.to_str().expect("utf-8 path")],
+            "verbose": "full",
+        }),
+    )
+    .await;
+
+    let results = resp["results"].as_array().expect("results must be array");
+    let found = results
+        .iter()
+        .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("tagged_pkg"));
+    assert!(
+        found,
+        "expected tagged_pkg found via tag search, got: {resp}"
+    );
+
+    // Verify tags field is projected in full verbose.
+    let entry = results
+        .iter()
+        .find(|r| r.get("name").and_then(|v| v.as_str()) == Some("tagged_pkg"))
+        .expect("tagged_pkg must exist");
+    let tags = entry.get("tags").and_then(|t| t.as_array());
+    assert!(tags.is_some(), "tags field must be projected in full mode");
+    let tag_strs: Vec<&str> = tags
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        tag_strs.contains(&"swarm") && tag_strs.contains(&"primitive"),
+        "tags must contain swarm and primitive, got: {tag_strs:?}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `alc_hub_search` must NOT match a tag query against a package without tags.
+#[tokio::test]
+async fn test_hub_search_no_tags_does_not_match_tag_query() {
+    let alc_home = tempfile::tempdir().expect("tempdir failed");
+    std::fs::create_dir_all(alc_home.path().join("packages")).expect("create packages dir failed");
+
+    let idx_dir = tempfile::tempdir().expect("tempdir for index failed");
+    let idx_path = idx_dir.path().join("hub_index.json");
+
+    let idx_json = serde_json::json!({
+        "schema_version": "hub_index/v0",
+        "updated_at": "2026-05-26T00:00:00Z",
+        "packages": [
+            {
+                "name": "no_tags_pkg",
+                "version": "0.1.0",
+                "description": "Plain package",
+                "category": "testing"
+            }
+        ]
+    });
+    std::fs::write(&idx_path, idx_json.to_string()).expect("write hub_index.json failed");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let resp = call_json(
+        &client,
+        "alc_hub_search",
+        json!({
+            "query": "primitive",
+            "local_indices": [idx_path.to_str().expect("utf-8 path")],
+        }),
+    )
+    .await;
+
+    let results = resp["results"].as_array().expect("results must be array");
+    let found = results
+        .iter()
+        .any(|r| r.get("name").and_then(|v| v.as_str()) == Some("no_tags_pkg"));
+    assert!(
+        !found,
+        "no_tags_pkg should NOT match tag-only query, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 #[tokio::test]
 async fn test_alc_hub_dist_preset_publish_uses_alc_toml_override() {
     let client = connect().await;

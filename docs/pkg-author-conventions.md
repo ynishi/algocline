@@ -123,14 +123,27 @@ Each field below is tagged with one of three status labels. The same labels are 
 
 ### 2.1 `M.meta` — identity
 
-| Field         | Status       | Type   | Notes                                                          |
-|---------------|--------------|--------|----------------------------------------------------------------|
-| `name`        | **Required** | string | Must match the pkg directory name (lint: `E_NAME_MISMATCH`).   |
-| `version`     | **Required** | string | SemVer.                                                        |
-| `description` | **Required** | string | One-line tagline (≤ 80 char). Projected into `llms.txt` entry. |
-| `category`    | **Required** | string | Grouping key for `llms.txt` and hub search.                    |
+| Field                | Status          | Type   | Notes                                                                                                          |
+|----------------------|-----------------|--------|----------------------------------------------------------------------------------------------------------------|
+| `name`               | **Required**    | string | Must match the pkg directory name (lint: `E_NAME_MISMATCH`).                                                   |
+| `version`            | **Required**    | string | SemVer. **Top-level `M.VERSION` is legacy** and triggers `W_META_LEGACY_M_VERSION`; use `M.meta.version` only. |
+| `description`        | **Required**    | string | One-line tagline (≤ 80 char). Projected into `llms.txt` entry.                                                 |
+| `category`           | **Required**    | string | Grouping key for `llms.txt` and hub search.                                                                    |
+| `alc_shapes_compat`  | **Recommended** | string | SemVer range (e.g. `">=0.25.0, <0.26"`) declaring the pkg's compatible `alc_shapes` versions. Validated by `alc_hub_gendoc` against the bundled `alc_shapes` (range mismatch → error; absent → warning). Required for **Bundled** pkgs.    |
 
-(Lint codes: `E_META_MISSING_{NAME,VERSION,DESCRIPTION,CATEGORY}` — see §5.)
+(Lint codes: `E_META_MISSING_{NAME,VERSION,DESCRIPTION,CATEGORY}`,
+`W_META_LEGACY_M_VERSION` — see §5.)
+
+#### Notes on `alc_shapes_compat`
+
+`alc_shapes_compat` is the pkg's declaration of which `alc_shapes`
+versions it has been verified against. The gendoc pipeline extracts
+the literal `"..."` value from the `M.meta` table and validates it as
+a SemVer range; an unparseable range fails the build and a missing
+declaration emits a warning naming the current bundled `alc_shapes`
+version. Bundled pkgs should track the SemVer caret of the alc_shapes
+they ship against (e.g. `"^0.25"` while alc_shapes is on the 0.25.x
+line).
 
 ### 2.2 `M.spec` — runtime contract
 
@@ -524,6 +537,7 @@ The constructs below are forbidden in any docstring. Each is also covered in the
 | `W_DESCRIPTION_MULTILINE`    | warning         | active       | `M.meta.description` contains a newline                                                    |
 | `W_FAKE_LABEL`               | warning         | active       | `Usage:` / `Args:` style label — promote to `## Usage` etc.                                |
 | `W_EMPTY_NARRATIVE`          | warning         | active       | No abstract and no H2 sections                                                             |
+| `W_META_LEGACY_M_VERSION`    | warning         | active       | `M.VERSION` top-level field detected. Canonical form uses `M.meta.version` only (§2.1). Safe to remove if no external reference. |
 
 **Severity convention** (per `lint.lua`):
 

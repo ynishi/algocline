@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `crates/algocline-app/src/service/lua/gendoc/docs/lint.lua` — new `W_META_LEGACY_M_VERSION` warning. When a pkg's `init.lua` defines a top-level `M.VERSION` field, `alc_hub_gendoc` now surfaces a non-blocking warning naming the canonical form (`M.meta.version` per `pkg-author-conventions.md` §2.1). The flag is collected by `extract.lua` (new `pkg_info.identity.legacy_m_version : boolean`) so lint emits regardless of whether `M.VERSION` and `M.meta.version` are kept in sync. Safe-to-remove when no external reference exists.
+
+### Docs
+
+- `docs/pkg-author-conventions.md` §2.1 — added `alc_shapes_compat` to the `M.meta` table as a **Recommended** field, closing a long-standing doc / implementation drift. The field has been first-class in `gendoc.rs` since the alc_shapes compat era (extract + SemVer-range validate + bundled-alc_shapes range mismatch error + undeclared warning) and is included in the `pkg_scaffold` template; only the convention doc was missing it. A Notes paragraph documents the existing gendoc enforcement behaviour (range mismatch → error; absent → warning).
+- `docs/pkg-author-conventions.md` §5 — added `W_META_LEGACY_M_VERSION` row to the lint rules table.
+
 ### Internal
 
 - `crates/algocline-engine/src/execution/registry.rs` — added `SessionRegistryV2::spawn_gc_task(ttl: Duration, interval: Duration)`, mirroring the legacy `SessionRegistry::spawn_gc_task` eviction contract (Option A: legacy parity). The GC task runs at the given `interval`, holds a write lock for the full check-and-remove sequence, and evicts only sessions that are both (a) idle beyond `ttl` (wall-clock ms via the new `last_active` field) and (b) have zero live broadcast subscribers (`bus_tx.receiver_count() == 0`), making eviction safe under concurrent `observe()` calls (Crux: concurrent GC eviction safety).

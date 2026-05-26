@@ -27,6 +27,9 @@
 ---                          pre-V0 shape that should be promoted to H2.
 ---   W_EMPTY_NARRATIVE    : no summary AND no sections.
 ---   W_DESCRIPTION_MULTILINE: `meta.description` contains a newline.
+---   W_META_LEGACY_M_VERSION: `M.VERSION` top-level field detected; canonical
+---                          form uses `M.meta.version` only
+---                          (pkg-author-conventions.md §2.1).
 
 local M = {}
 
@@ -147,6 +150,17 @@ function M.check(pkg_info, docstring, pkg_dir)
             severity = "warning",
             code = "W_DESCRIPTION_MULTILINE",
             msg = "meta.description contains a newline (keep it single-line)",
+        }
+    end
+
+    -- legacy M.VERSION top-level field (canonical form uses M.meta.version only)
+    if id.legacy_m_version then
+        out[#out + 1] = {
+            severity = "warning",
+            code = "W_META_LEGACY_M_VERSION",
+            msg = "M.VERSION top-level field detected; canonical form uses "
+                .. "M.meta.version only (pkg-author-conventions.md §2.1). "
+                .. "Safe to remove if no external reference.",
         }
     end
 

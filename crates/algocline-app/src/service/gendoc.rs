@@ -1438,4 +1438,56 @@ return M
             "malformed label in error: {msg}"
         );
     }
+
+    /// Lint check: `W_META_LEGACY_M_VERSION` fires when `identity.legacy_m_version=true`
+    /// and stays silent when the flag is absent. Drives lint.lua directly through a
+    /// minimal Lua VM so the assertion does not depend on the gen_docs.lua pipeline.
+    fn run_lint(legacy: bool) -> String {
+        let lua = Lua::new();
+        lua.load(LUA_DOCS_LINT)
+            .set_name("lint.lua")
+            .eval::<Table>()
+            .map(|t| lua.globals().set("lint", t).unwrap())
+            .expect("load lint.lua");
+        let setup = format!(
+            r#"
+            local pkg_info = {{
+              identity = {{
+                name = "fake_pkg",
+                version = "0.1.0",
+                category = "test",
+                description = "fake",
+                source_path = "fake_pkg/init.lua",
+                legacy_m_version = {legacy_lua},
+              }},
+              narrative = {{ summary = "x", sections = {{ {{heading="X"}} }} }},
+              shape = {{ input = nil, result = nil }},
+            }}
+            local res = lint.check(pkg_info, "", "fake_pkg")
+            local codes = {{}}
+            for _, v in ipairs(res.violations) do codes[#codes+1] = v.code end
+            return table.concat(codes, ",")
+            "#,
+            legacy_lua = if legacy { "true" } else { "false" }
+        );
+        lua.load(&setup).eval::<String>().expect("run lint.check")
+    }
+
+    #[test]
+    fn lint_emits_w_meta_legacy_m_version_when_flag_set() {
+        let codes = run_lint(true);
+        assert!(
+            codes.split(',').any(|c| c == "W_META_LEGACY_M_VERSION"),
+            "expected W_META_LEGACY_M_VERSION in violations, got: {codes}"
+        );
+    }
+
+    #[test]
+    fn lint_silent_when_legacy_m_version_flag_absent() {
+        let codes = run_lint(false);
+        assert!(
+            !codes.split(',').any(|c| c == "W_META_LEGACY_M_VERSION"),
+            "did not expect W_META_LEGACY_M_VERSION when flag false, got: {codes}"
+        );
+    }
 }

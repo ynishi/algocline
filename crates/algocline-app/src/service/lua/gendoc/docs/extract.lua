@@ -283,6 +283,7 @@ function M.build_pkg_info(pkg_name, init_path, source_path)
         category = meta.category or "",
         description = meta.description or "",
         source_path = source_path,
+        legacy_m_version = mod.VERSION ~= nil,
     }
 
     local narrative = {

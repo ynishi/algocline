@@ -170,6 +170,57 @@ alc_run({
 
 An optional `alc.toml [env.allow]` allowlist filters which keys reach the Lua VM. Writes to `alc.env` always raise a runtime error — the snapshot is immutable for the lifetime of the run.
 
+## Ecosystem
+
+algocline is a single binary, but the strategies and tools around it form a distributed ecosystem of Git-hosted package collections.
+
+### Repository structure
+
+```
+algocline                         — Engine (Rust binary, MCP server)
+├── algocline-bundled-packages    — 15 core strategies (cot, reflect, ucb, panel, …)
+├── algocline-swarm-frame         — Multi-agent orchestration (swarm_frame + plugins)
+├── evalframe                     — Evaluation framework (graders, scenarios, Cards)
+└── alc plugin                    — Claude Code skills + agents for pkg development
+```
+
+Each collection is an independent Git repo with a `hub_index.json` catalog. `alc init` installs the bundled collections; third-party collections install the same way via `alc_pkg_install`.
+
+### Hub: decentralized package discovery
+
+There is no central registry. Each collection repo ships a `hub_index.json` that describes its packages. `alc_hub_search` queries across all cached indices.
+
+```
+alc_hub_search({ query: "reasoning" })   → matches from all registered sources
+alc_hub_info({ name: "reflect" })         → metadata, Cards, aliases, stats
+```
+
+### Author workflow
+
+Write a strategy, test it locally, publish it for anyone to install:
+
+```
+Develop:    alc_pkg_scaffold → write init.lua → alc_pkg_link → alc_pkg_test → iterate
+Distribute: alc_hub_reindex → alc_hub_dist → git push
+Consume:    alc_hub_search → alc_pkg_install({ url: "github.com/you/repo" }) → alc_advice
+```
+
+During development, `alc_pkg_link` symlinks a local directory as a package — no publishing needed to iterate. When ready, push to Git and anyone can install with one command.
+
+`alc_hub_dist` generates documentation in multiple projections from a single source:
+
+| Projection | Output |
+|---|---|
+| `hub` | Package catalog page |
+| `context7` | Context7-compatible doc |
+| `devin` | Devin-compatible doc |
+| `luacats` | LuaCats type definitions |
+| `narrative` | Human-readable narrative |
+| `llms` | LLM-optimized reference |
+| `lint` | Lint rule definitions |
+
+The `/alc-build` skill and `@alc-coder` agent can scaffold, implement, and test packages end-to-end — strategy authoring works from natural language to a published collection.
+
 ## Configuration
 
 algocline reads configuration from layered TOML files plus environment overrides.
@@ -597,10 +648,14 @@ alc_advice({ strategy: "my-strategy", task: "..." })
 
 ### Bundled packages
 
-Bundled packages are maintained across several Hub Collection repositories:
-[algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages) (core strategy packages),
-[algocline-swarm-frame](https://github.com/ynishi/algocline-swarm-frame) (swarm orchestration — `swarm_frame`, `swarm_frame_algocline`, `swarm_aggregate_plugin`).
-Install them via CLI:
+Bundled packages ship in two Hub Collection repositories (see [Ecosystem](#ecosystem) for the full picture):
+
+| Collection | Packages | Repo |
+|---|---|---|
+| [algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages) | 15 core strategies (cot, reflect, ucb, panel, …) | Core reasoning/selection/validation |
+| [algocline-swarm-frame](https://github.com/ynishi/algocline-swarm-frame) | swarm_frame, swarm_frame_algocline, swarm_aggregate_plugin | Multi-agent orchestration |
+
+Install via CLI:
 
 ```bash
 alc init            # Download and install all bundled packages
@@ -609,17 +664,11 @@ alc init --force    # Overwrite existing packages
 
 If you call `alc_advice` with a package that isn't installed, algocline **automatically downloads the bundled collection** from GitHub. But `alc init` upfront is recommended.
 
-To install or update via MCP:
+Install or update via MCP:
 
 ```
 alc_pkg_install({ url: "github.com/ynishi/algocline-bundled-packages" })
-alc_pkg_install({ url: "github.com/ynishi/algocline-bundled-packages", force: true })  # overwrite existing
-```
-
-For local development (installs from a local checkout, supports uncommitted changes):
-
-```
-alc_pkg_install({ url: "/path/to/algocline-bundled-packages" })
+alc_pkg_install({ url: "github.com/ynishi/algocline-bundled-packages", force: true })  # overwrite
 ```
 
 ### Installing third-party packages

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-05-28
+
 ### Added
 
 - `PkgType` enum (`"runnable"` | `"library"`) introduced in `algocline-core`. Package authors can declare `M.meta.type = "runnable"` or `M.meta.type = "library"` in `init.lua`. When `M.meta.type` is absent the type is auto-detected at runtime: the Lua VM path uses `type(pkg.run) == "function"` (canonical; used by `alc_pkg_list`, `alc_advice`, and `alc_eval`); the offline `build_index` / `alc_hub_reindex` path uses a Rust text-scan (`detect_has_run`) as a mirror. A package without `M.run` defaults to `Library`.

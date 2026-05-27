@@ -153,6 +153,19 @@ pub(crate) fn resolve_scenario_code(
     }
 }
 
+/// Lua snippet injected into `pkg_list` and `resolve_pkg_type_lua` to
+/// auto-detect the package type from `M.run` existence when `meta.type`
+/// is absent.
+///
+/// This is the **single source of truth** for the Lua-side auto-detect logic
+/// (crux: "Auto-detect single source"). Every runtime path that resolves
+/// package type (`pkg_list` via `eval_simple`, and `resolve_pkg_type_lua`
+/// in Subtask 2) must reference this const via `format!()` to prevent drift.
+///
+/// Assumes: `local meta = pkg.meta or { name = "..." }` and `local pkg = require(...)`
+/// are already in scope at the call site.
+pub const LUA_TYPE_AUTODETECT: &str = r#"if meta.type == nil then meta.type = type(pkg.run) == "function" and "runnable" or "library" end"#;
+
 /// Git URLs for auto-installation. All repos use the Collection layout
 /// (`<repo>/<name>/init.lua`) and must publish a `hub_index.json` at root.
 pub(super) const AUTO_INSTALL_SOURCES: &[&str] = &[

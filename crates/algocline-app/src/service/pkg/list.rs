@@ -11,7 +11,7 @@ use super::super::list_opts::{
 };
 use super::super::lockfile::{load_lockfile, lockfile_path};
 use super::super::manifest;
-use super::super::resolve::{is_system_package, packages_dir};
+use super::super::resolve::{is_system_package, packages_dir, LUA_TYPE_AUTODETECT};
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::super::{PkgListError, ServiceError};
@@ -423,7 +423,11 @@ impl AppService {
                     let code = format!(
                         r#"package.loaded["{name}"] = nil
 local pkg = require("{name}")
-return pkg.meta or {{ name = "{name}" }}"#
+local meta = pkg.meta or {{ name = "{name}" }}
+{LUA_TYPE_AUTODETECT}
+return meta"#,
+                        name = name,
+                        LUA_TYPE_AUTODETECT = LUA_TYPE_AUTODETECT,
                     );
                     match self.executor.eval_simple(code).await {
                         Ok(v) => (v, None),

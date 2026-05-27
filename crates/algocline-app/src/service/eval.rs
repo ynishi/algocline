@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use algocline_core::pkg::PkgType;
+
 use super::eval_store::{
     escape_for_lua_sq, evals_dir, extract_strategy_from_id, list_eval_history, save_compare_result,
     save_eval_result, splice_response_string,
@@ -72,6 +74,15 @@ impl AppService {
                         .into(),
                 );
             }
+        }
+
+        // Guard: reject library packages before start_and_tick (= any LLM call)
+        if let Some(PkgType::Library) = self.resolve_pkg_type_lua(strategy).await? {
+            return Err(format!(
+                "Package '{strategy}' is a library package (type = \"library\"). \
+                 Library packages cannot be evaluated as strategies. \
+                 Use a runnable package instead."
+            ));
         }
 
         let scenario_code =

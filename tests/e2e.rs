@@ -5590,6 +5590,95 @@ async fn test_alc_card_analyze_shape_violation() {
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── Library package type guard tests ────────────────────────────────────────
+
+/// `alc_advice` must reject a package whose type is "library" with an error
+/// message containing "library".
+///
+/// Validates Crux: Adviser library branch — the adviser must never fall through
+/// to the runnable execution path for a library-typed package.
+#[tokio::test]
+async fn test_alc_advice_rejects_library_package() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    let pkg_dir = alc_home.path().join("packages").join("test_lib_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "test_lib_pkg", version = "0.1.0", type = "library" }
+M.helpers = {}
+return M"#,
+    )
+    .expect("write init.lua");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_advice",
+            json!({ "strategy": "test_lib_pkg", "task": "test" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("library"),
+        "expected error mentioning 'library', got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `alc_eval` must reject a package whose type is "library" with an error
+/// message containing "library", and must do so before any LLM call is
+/// initiated.
+///
+/// Validates Crux: Eval type guard — the eval entry point must reject library
+/// packages with an explicit typed error before any LLM call is initiated.
+#[tokio::test]
+async fn test_alc_eval_rejects_library_package() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    let pkg_dir = alc_home.path().join("packages").join("test_lib_pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "test_lib_pkg", version = "0.1.0", type = "library" }
+M.helpers = {}
+return M"#,
+    )
+    .expect("write init.lua");
+    // evalframe is required by eval(); provide a minimal stub so the evalframe
+    // check passes and the library guard fires (not the evalframe-missing error).
+    let evalframe_dir = alc_home.path().join("packages").join("evalframe");
+    std::fs::create_dir_all(&evalframe_dir).expect("create evalframe dir");
+    std::fs::write(
+        evalframe_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "evalframe", version = "0.1.0", type = "runnable" }
+M.run = function(ctx) return {} end
+return M"#,
+    )
+    .expect("write evalframe init.lua");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_eval",
+            json!({ "strategy": "test_lib_pkg", "scenario": "return {cases={}}" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("library"),
+        "expected error mentioning 'library', got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 // ─── CLI dry-run tests (no MCP harness) ──────────────────────────────────────
 
 /// Resolve the path to the `alc` binary, mirroring the logic in `connect()`.

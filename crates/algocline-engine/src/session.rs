@@ -785,20 +785,13 @@ impl SessionRegistry {
 /// and unpredictability — the timestamp is a convenience prefix, not
 /// a security-critical component.
 fn gen_session_id() -> String {
+    use rand::RngExt;
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    // 8 random bytes → 16 hex chars of entropy
-    let random: u64 = {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let s = RandomState::new();
-        let mut h = s.build_hasher();
-        h.write_u128(ts);
-        h.finish()
-    };
+    let random: u64 = rand::rng().random();
     format!("s-{ts:x}-{random:016x}")
 }
 

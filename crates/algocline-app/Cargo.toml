@@ -35,6 +35,7 @@ mlua-lspec = "0.3"
 dotenvy = { workspace = true }
 semver = "1"
 anyhow = "1"
+rand = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

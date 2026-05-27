@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Session ID generation now uses `rand::rng()` (ChaCha12 CSPRNG) instead of `RandomState`-based hashing (`gen_session_id` in `algocline-engine` and `gen_pool_sid` in pool dispatch). The previous `RandomState` path provided no cryptographic randomness guarantee and derived entropy solely from the per-process ASLR seed.
+- App-layer session IDs (`alc-sess-*`) now include a `rand::rng().random::<u32>()` suffix in addition to the millisecond timestamp, eliminating guaranteed collisions for concurrent calls within the same millisecond.
+
 ## [0.38.6] - 2026-05-27
 
 ### Changed

@@ -78,7 +78,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use algocline_core::{AppDir, PkgEntity};
+use algocline_core::{AppDir, PkgEntity, PkgType};
 
 use super::list_opts::{
     apply_sort_by_value, matches_filter, parse_sort, project_fields, resolve_fields, ListOpts,
@@ -889,6 +889,7 @@ fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, Strin
         seen.insert(pkg_name.clone());
         let mut merged_entity = entry.entity.clone();
         merged_entity.docstring = docstring;
+        merged_entity.pkg_type = merged_entity.pkg_type.or(Some(PkgType::Runnable));
         results.push(SearchResult {
             entity: merged_entity,
             source: entry.source.clone(),
@@ -924,7 +925,7 @@ fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, Strin
             category: None,
             docstring: None,
             tags: None,
-            pkg_type: None,
+            pkg_type: Some(PkgType::Runnable),
         });
         results.push(SearchResult {
             entity,
@@ -1664,6 +1665,15 @@ mod tests {
         let results = merge(&app_dir, &remote).expect("merge over empty app_dir should succeed");
         // Should include remote_only + any locally installed packages
         assert!(results.iter().any(|r| r.entity.name == "remote_only"));
+        let remote_result = results
+            .iter()
+            .find(|r| r.entity.name == "remote_only")
+            .unwrap();
+        assert_eq!(
+            remote_result.entity.pkg_type,
+            Some(PkgType::Runnable),
+            "pre-type-system index entry must default to Runnable"
+        );
     }
 
     #[test]

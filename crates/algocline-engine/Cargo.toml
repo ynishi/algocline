@@ -30,6 +30,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 anyhow = "1"
 dirs = "6"
+rand = { workspace = true }
 
 [dev-dependencies]
 mlua-check = "0.3"

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Mutex;
 
-use algocline_core::AppDir;
+use algocline_core::{AppDir, PkgType};
 use serde::{Deserialize, Serialize};
 
 use super::source::PackageSource;
@@ -34,6 +34,9 @@ pub(crate) struct ManifestEntry {
     pub installed_at: String,
     /// ISO 8601 timestamp of last update (same as installed_at if never updated).
     pub updated_at: String,
+    /// Package type from `M.meta.type`. `None` for legacy entries without this field.
+    #[serde(default, rename = "type")]
+    pub pkg_type: Option<PkgType>,
 }
 
 /// Top-level manifest structure.
@@ -324,6 +327,7 @@ impl InstalledManifestStore for FsInstalledManifestStore {
                     source: source.clone(),
                     installed_at: now.clone(),
                     updated_at: now,
+                    pkg_type: None,
                 });
 
             self.save(&manifest)
@@ -355,6 +359,7 @@ impl InstalledManifestStore for FsInstalledManifestStore {
                         source: source.clone(),
                         installed_at: now.clone(),
                         updated_at: now.clone(),
+                        pkg_type: None,
                     });
             }
 
@@ -410,6 +415,7 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
                 source: source.clone(),
                 installed_at: now.clone(),
                 updated_at: now,
+                pkg_type: None,
             });
         Ok(())
     }
@@ -437,6 +443,7 @@ impl InstalledManifestStore for InMemoryInstalledManifestStore {
                     source: source.clone(),
                     installed_at: now.clone(),
                     updated_at: now.clone(),
+                    pkg_type: None,
                 });
         }
         Ok(())
@@ -626,6 +633,7 @@ mod tests {
                 },
                 installed_at: "2024-01-01T00:00:00Z".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
+                pkg_type: None,
             },
         );
 

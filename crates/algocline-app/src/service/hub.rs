@@ -186,12 +186,13 @@ where
     S: serde::Serializer,
 {
     use serde::ser::SerializeMap;
-    let mut map = ser.serialize_map(Some(5))?;
+    let mut map = ser.serialize_map(Some(6))?;
     map.serialize_entry("name", &entity.name)?;
     map.serialize_entry("version", &entity.version)?;
     map.serialize_entry("description", &entity.description)?;
     map.serialize_entry("category", &entity.category)?;
     map.serialize_entry("tags", &entity.tags)?;
+    map.serialize_entry("type", &entity.pkg_type)?;
     map.end()
 }
 
@@ -923,6 +924,7 @@ fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, Strin
             category: None,
             docstring: None,
             tags: None,
+            pkg_type: None,
         });
         results.push(SearchResult {
             entity,
@@ -1651,6 +1653,7 @@ mod tests {
                     category: Some("test".into()),
                     docstring: None,
                     tags: None,
+                    pkg_type: None,
                 },
                 source: PackageSource::Unknown,
                 card_count: 0,
@@ -1673,6 +1676,7 @@ mod tests {
                 category: Some("meta".into()),
                 docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
                 tags: None,
+                pkg_type: None,
             },
             source: PackageSource::Unknown,
             installed: true,
@@ -1704,6 +1708,7 @@ mod tests {
                 category: Some("reasoning".into()),
                 docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
                 tags: None,
+                pkg_type: None,
             },
             source: PackageSource::Git {
                 url: "https://example.com/cascade".into(),
@@ -2340,6 +2345,7 @@ mod tests {
                         category: None,
                         docstring: None,
                         tags: None,
+                        pkg_type: None,
                     },
                     source: PackageSource::Unknown,
                     card_count: 0,

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PkgType` enum (`"runnable"` | `"library"`) introduced in `algocline-core`. Package authors can declare `M.meta.type = "runnable"` or `M.meta.type = "library"` in `init.lua`. When `M.meta.type` is absent the type is auto-detected at runtime: the Lua VM path uses `type(pkg.run) == "function"` (canonical; used by `alc_pkg_list`, `alc_advice`, and `alc_eval`); the offline `build_index` / `alc_hub_reindex` path uses a Rust text-scan (`detect_has_run`) as a mirror. A package without `M.run` defaults to `Library`.
+- `pkg_type` field added to `PkgEntity` (serialized as `"type"` on the wire, `null` for legacy entries) and `ManifestEntry` (`installed.json`). Both are backward-compatible via `#[serde(default)]`.
+- `alc_pkg_list` now includes the `type` field in each package entry.
+- `alc_hub_reindex` / `alc_hub_search` now include the `type` field in `hub_index.json` entries and search results.
+- `alc_advice`: library packages (resolved `type = "library"`) are rejected before `M.run` is invoked. The error message names the package and suggests `alc_run` with custom import code as an alternative.
+- `alc_eval`: library packages are rejected before any LLM call is initiated. The error message names the package and suggests using a runnable package instead.
+- Lua auto-detect snippet (`LUA_TYPE_AUTODETECT` constant in `resolve.rs`) is the single shared source for the `type(pkg.run)` detection logic injected by all runtime paths, preventing per-path divergence.
+- `parse_meta` internal return type refactored from a 5-element tuple to a named `ParsedMeta` struct, making the parser self-documenting and future field additions non-breaking.
+
 ### Security
 
 - Session ID generation now uses `rand::rng()` (ChaCha12 CSPRNG) instead of `RandomState`-based hashing (`gen_session_id` in `algocline-engine` and `gen_pool_sid` in pool dispatch). The previous `RandomState` path provided no cryptographic randomness guarantee and derived entropy solely from the per-process ASLR seed.

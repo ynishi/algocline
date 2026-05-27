@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use algocline_core::pkg::PkgType;
 use algocline_core::QueryId;
 use algocline_engine::{FeedResult, VariantPkg};
 
@@ -327,6 +328,15 @@ impl AppService {
             }
         }
 
+        // Guard: reject library packages before make_require_code (= M.run invocation)
+        if let Some(PkgType::Library) = self.resolve_pkg_type_lua(strategy).await? {
+            return Err(format!(
+                "Package '{strategy}' is a library package (type = \"library\"). \
+                 Library packages provide reusable modules and do not have a run() entry point. \
+                 Use alc_run with custom code to import this library."
+            ));
+        }
+
         let code = make_require_code(strategy);
 
         let opts = opts.map(normalize_stringified_json_object);
@@ -354,6 +364,35 @@ impl AppService {
             "lib_path_warnings",
             &warnings,
         ))
+    }
+
+    /// Resolve the package type via Lua VM (`eval_simple`).
+    ///
+    /// Returns `Ok(Some(PkgType))` when type is determined, `Ok(None)` when
+    /// eval succeeds but the returned value cannot be parsed as a known type
+    /// (guard passthrough for legacy packages), `Err(String)` when `eval_simple`
+    /// fails (propagate to caller).
+    pub(crate) async fn resolve_pkg_type_lua(&self, name: &str) -> Result<Option<PkgType>, String> {
+        let auto = super::resolve::LUA_TYPE_AUTODETECT;
+        let code = format!(
+            r#"package.loaded["{name}"] = nil; local pkg = require("{name}"); local meta = pkg.meta or {{}}; if meta.type ~= nil then return meta.type end; {auto}; return meta.type"#,
+            name = name,
+            auto = auto,
+        );
+        let val = self.executor.eval_simple(code).await?;
+        let pkg_type = val.as_str().and_then(|s| match s.parse::<PkgType>() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(
+                    package = name,
+                    raw_type = s,
+                    error = %e,
+                    "unknown pkg type string; treating as legacy passthrough"
+                );
+                None
+            }
+        });
+        Ok(pkg_type)
     }
 
     /// Continue a paused execution — batch feed.

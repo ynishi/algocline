@@ -30,8 +30,50 @@
 //! absence.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+/// Package type discriminator: runnable (has `M.run`) or library (API surface only).
+///
+/// Used by the adviser and eval entry points to route packages correctly:
+/// - `Runnable` packages are executed via `M.run(ctx)`.
+/// - `Library` packages expose an API surface and must not be executed via `M.run`.
+///
+/// Wire format: `"runnable"` / `"library"` (lowercase via `#[serde(rename_all = "lowercase")]`).
+///
+/// Auto-detection: when `M.meta.type` is absent, the Lua VM path uses
+/// `type(pkg.run) == "function"` at runtime (canonical), while the offline
+/// `parse_from_init_lua` path uses `detect_has_run` (text-scan mirror).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PkgType {
+    /// Package has a `M.run(ctx)` entry point — can be executed via `alc_advice`.
+    Runnable,
+    /// Package exposes an API surface only — must not be invoked via `M.run`.
+    Library,
+}
+
+impl std::fmt::Display for PkgType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runnable => write!(f, "runnable"),
+            Self::Library => write!(f, "library"),
+        }
+    }
+}
+
+impl FromStr for PkgType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "runnable" => Ok(Self::Runnable),
+            "library" => Ok(Self::Library),
+            other => Err(format!("unknown package type: {other:?}")),
+        }
+    }
+}
 
 /// Canonical projection of a Lua package's `M.meta` block.
 ///
@@ -51,6 +93,10 @@ pub struct PkgEntity {
     pub docstring: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Package type (`"runnable"` or `"library"`). Serialized as `"type"` on
+    /// the wire. `None` means the type was not determined (legacy entries).
+    #[serde(default, rename = "type")]
+    pub pkg_type: Option<PkgType>,
 }
 
 impl PkgEntity {
@@ -72,15 +118,29 @@ impl PkgEntity {
     ///   search.
     pub fn parse_from_init_lua(path: &Path) -> Option<Self> {
         let content = std::fs::read_to_string(path).ok()?;
-        let (name, version, description, category, tags) = parse_meta(&content)?;
+        let parsed = parse_meta(&content)?;
         let docstring = extract_docstring_from(&content);
+        // Resolve type: use explicit M.meta.type if present; otherwise fall
+        // back to Rust text-scan (build_index / offline batch path).
+        let pkg_type = parsed.pkg_type.or_else(|| {
+            Some(if detect_has_run(&content) {
+                PkgType::Runnable
+            } else {
+                PkgType::Library
+            })
+        });
         Some(PkgEntity {
-            name,
-            version: option_from_str(version),
-            description: option_from_str(description),
-            category: option_from_str(category),
+            name: parsed.name,
+            version: option_from_str(parsed.version),
+            description: option_from_str(parsed.description),
+            category: option_from_str(parsed.category),
             docstring: option_from_str(docstring),
-            tags: if tags.is_empty() { None } else { Some(tags) },
+            tags: if parsed.tags.is_empty() {
+                None
+            } else {
+                Some(parsed.tags)
+            },
+            pkg_type,
         })
     }
 }
@@ -114,10 +174,42 @@ fn extract_docstring_from(content: &str) -> String {
     lines.join("\n")
 }
 
-/// Parse `M.meta = { ... }` out of `content`. Returns
-/// `(name, version, description, category, tags)`. `None` if the block is
+/// Intermediate result of parsing `M.meta = { ... }` from an `init.lua`.
+/// All fields are owned. `pkg_type` is `None` when the `type` key is absent
+/// or has an unrecognized value (caller applies auto-detect fallback).
+struct ParsedMeta {
+    name: String,
+    version: String,
+    description: String,
+    category: String,
+    tags: Vec<String>,
+    pkg_type: Option<PkgType>,
+}
+
+/// Detect whether the init.lua source declares `M.run`.
+///
+/// Used by `parse_from_init_lua` as the offline (non-VM) fallback for
+/// `build_index` when `M.meta.type` is absent. The Lua VM path (`pkg_list`,
+/// `resolve_pkg_type_lua`) uses `type(pkg.run) == "function"` at runtime and
+/// is the canonical source; this function is the Rust mirror for offline batch.
+///
+/// Comment exclusion: for each line, only the portion before the first `--`
+/// is considered, so `-- M.run = ...` or `-- function M.run(ctx)` do not
+/// trigger a match.
+fn detect_has_run(content: &str) -> bool {
+    for line in content.lines() {
+        // Strip inline comment suffix.
+        let effective = line.split("--").next().unwrap_or(line);
+        if effective.contains("M.run") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse `M.meta = { ... }` out of `content`. Returns `None` if the block is
 /// missing, unparseable, or `name` is empty.
-fn parse_meta(content: &str) -> Option<(String, String, String, String, Vec<String>)> {
+fn parse_meta(content: &str) -> Option<ParsedMeta> {
     let head = content;
 
     // Find M.meta = { ... } block (with brace-depth tracking).
@@ -209,13 +301,23 @@ fn parse_meta(content: &str) -> Option<(String, String, String, String, Vec<Stri
         return None;
     }
     let tags = extract_string_array(block, "tags");
-    Some((
+    // Parse `type` field; unrecognized values fall back to None (auto-detect).
+    let pkg_type = {
+        let raw = extract("type");
+        if raw.is_empty() {
+            None
+        } else {
+            raw.parse::<PkgType>().ok()
+        }
+    };
+    Some(ParsedMeta {
         name,
-        extract("version"),
-        extract("description"),
-        extract("category"),
+        version: extract("version"),
+        description: extract("description"),
+        category: extract("category"),
         tags,
-    ))
+        pkg_type,
+    })
 }
 
 /// Extract a string array from a nested table like `tags = { "a", "b" }`.
@@ -563,6 +665,7 @@ return M
             category: Some("meta".into()),
             docstring: None,
             tags: None,
+            pkg_type: None,
         };
         let json = serde_json::to_string(&pkg).unwrap();
         assert!(json.contains("\"version\":null"), "version null: {json}");
@@ -590,5 +693,154 @@ return M
         assert!(pkg.description.is_none());
         assert!(pkg.category.is_none());
         assert!(pkg.docstring.is_none());
+    }
+
+    // ─── PkgType / pkg_type field tests ──────────────────────────
+
+    #[test]
+    fn parse_type_from_meta() {
+        // Acceptance criterion 5: M.meta.type = "library" → PkgType::Library
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "lib_pkg",
+    type = "library",
+    version = "1.0.0",
+}
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.name, "lib_pkg");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
+    }
+
+    #[test]
+    fn parse_type_runnable_explicit() {
+        // Acceptance criterion 6: M.meta.type = "runnable" → PkgType::Runnable
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "run_pkg",
+    type = "runnable",
+}
+function M.run(ctx) end
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Runnable));
+    }
+
+    #[test]
+    fn auto_detect_type_from_m_run() {
+        // Acceptance criterion 7: no M.meta.type, but M.run is present → Runnable
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "auto_run_pkg",
+}
+function M.run(ctx)
+    return alc.llm("hello")
+end
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(
+            pkg.pkg_type,
+            Some(PkgType::Runnable),
+            "M.run present → Runnable"
+        );
+    }
+
+    #[test]
+    fn auto_detect_type_library_no_m_run() {
+        // Acceptance criterion 8: no M.meta.type, no M.run → Library
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "auto_lib_pkg",
+    description = "A pure library with no run entry point",
+}
+function M.create(opts)
+    return {}
+end
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Library), "no M.run → Library");
+    }
+
+    #[test]
+    fn detect_has_run_ignores_comments() {
+        // Acceptance criterion 9: M.run in a comment must not trigger detection.
+        assert!(
+            !detect_has_run("-- M.run = function(ctx) end\nlocal M = {}\n"),
+            "commented-out M.run should not be detected"
+        );
+        // But a real M.run assignment on the same line after a comment is still
+        // in the non-comment portion before '--', so it IS detected.
+        assert!(
+            detect_has_run("local M = {}\nM.run = function(ctx) end\n"),
+            "real M.run should be detected"
+        );
+        // Edge case: M.run after inline comment on same line — not detected
+        // because the effective portion before '--' does not contain M.run.
+        assert!(
+            !detect_has_run("local x = 1 -- M.run is described here\n"),
+            "M.run inside inline comment should not be detected"
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_with_pkg_type() {
+        // Acceptance criterion 10: PkgType::Library survives a JSON round-trip.
+        let pkg = PkgEntity {
+            name: "lib".into(),
+            version: Some("0.1.0".into()),
+            description: None,
+            category: None,
+            docstring: None,
+            tags: None,
+            pkg_type: Some(PkgType::Library),
+        };
+        let json = serde_json::to_string(&pkg).unwrap();
+        assert!(
+            json.contains("\"type\":\"library\""),
+            "wire key must be 'type': {json}"
+        );
+        let back: PkgEntity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pkg_type, Some(PkgType::Library));
+        assert_eq!(back, pkg);
+    }
+
+    #[test]
+    fn serde_deserialize_missing_pkg_type() {
+        // Acceptance criterion 11: JSON without "type" key → pkg_type = None
+        let json = r#"{"name":"legacy_pkg","version":"1.0.0"}"#;
+        let pkg: PkgEntity = serde_json::from_str(json).unwrap();
+        assert_eq!(pkg.name, "legacy_pkg");
+        assert!(
+            pkg.pkg_type.is_none(),
+            "missing 'type' key must deserialize as None"
+        );
     }
 }

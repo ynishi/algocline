@@ -134,6 +134,10 @@ lines).
   findings).
 - **Skip the package existence check** (always confirm with `alc_pkg_list`
   before invoking an advice-level LLM call).
+- **Call `alc_advice` on a library package** (`alc_pkg_list` `type` field =
+  `"library"`). Library packages have no `M.run` entry point and `alc_advice`
+  rejects them with a typed error. Check the `type` field via `alc_pkg_list`
+  or `alc_hub_search` before calling `alc_advice`.
 - **Emit plans or decisions on your own initiative** (only investigation
   results and candidate options; decisions belong to the main thread).
 - **Write anywhere other than the journal target** (the Write tool is for
@@ -152,6 +156,14 @@ lines).
   `Read` the full content first, concatenate at the end, and write back the
   whole file; losing existing sections is an append-only violation).
 
+## Package Type Awareness
+
+Packages have a `type` field: `"runnable"` (has `M.run`, executable via
+`alc_advice`) or `"library"` (no `M.run`, provides reusable modules). When
+investigating a package, check `alc_pkg_list` or `alc_hub_search` for the
+`type` field. For library packages, report their API surface (exported keys
+and usage patterns) instead of attempting `alc_advice`.
+
 ## Anti-patterns
 
 - `conversation-continuation` — continuing the conversation after returning
@@ -161,6 +173,8 @@ lines).
 - `unbounded-output` — `result_summary` exceeds 80 lines.
 - `pkg-existence-skip` — running advice without checking existence via
   `alc_pkg_list`.
+- `library-advice-attempt` — calling `alc_advice` on a library package
+  (`type = "library"`) without checking the `type` field first.
 - `plan-emission` — the adviser emits plans or decisions of its own (decisions
   belong to the main thread).
 - `journal-append-before-invoke` — updating the journal before the

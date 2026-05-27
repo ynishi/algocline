@@ -201,7 +201,11 @@ Format is strict:
    `<pkg_root>` is a collection root, also `Glob` for an existing
    `<pkg_root>/<name>/init.lua` to detect in-collection collisions.
 4. Write `<pkg_root>/<name>/init.lua` (M.meta + `run` function +
-   `alc.llm` usage).
+   `alc.llm` usage). **Library packages**: if `design_para` specifies a
+   library (no `run()` entry point), omit `M.run` and add
+   `M.meta.type = "library"` explicitly. Library packages export reusable
+   modules (constructors, helpers, submodules) and are rejected by
+   `alc_advice` / `alc_eval` at runtime.
 5. Write `<pkg_root>/<name>/spec/<name>_spec.lua` (turn the pass
    conditions into a test). Follow the **Spec Authoring Conventions** below
    to avoid a guaranteed retry from `mlua-lspec` global-shape surprises.

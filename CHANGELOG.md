@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.6] - 2026-05-27
+
+### Changed
+
+- Bump `BUNDLED_SOURCES` tag for `algocline-swarm-frame` from v0.5.0 to v0.7.0 (5 spike examples + test infrastructure)
+
 ## [0.38.5] - 2026-05-26
 
 ### Added

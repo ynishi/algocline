@@ -329,6 +329,8 @@ Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
 
 Layer 0/1 are always available. Layer 2 packages are installed via `alc init` or `alc_pkg_install` from [algocline-bundled-packages](https://github.com/ynishi/algocline-bundled-packages) and loaded via `require()`.
 
+Packages declare their kind via `M.meta.type = "runnable"` (has `M.run(ctx)`, usable with `alc_advice`) or `M.meta.type = "library"` (exposes reusable functions, loaded via `require()` from other packages). When `M.meta.type` is absent the type is auto-detected from whether `M.run` exists. `alc_advice` and `alc_eval` reject library packages with an explicit error.
+
 ### Crate structure
 
 ```
@@ -364,7 +366,7 @@ alc_continue({ session_id, response })
 | `alc_v2_state` | (v2) Return the current `ExecutionStateV2` snapshot for a session (read-only) |
 | `alc_v2_resume` | (v2) Resume a paused session with a `Single` or `Batch` `ResumePayload` |
 | `alc_v2_cancel` | (v2) Cancel a session with `CancelCode::User`; idempotent on already-terminal sessions |
-| `alc_advice` | Apply an installed package by name |
+| `alc_advice` | Apply an installed package by name. Returns a typed error for library packages (`type = "library"`); use `alc_run` with `require()` to call library APIs directly |
 | `alc_card_analyze` | Run a Card analyzer pkg over a single Card. Loads the Card body and its `samples.jsonl` sidecar host-side and dispatches them to `require(pkg).run(ctx)` (default `pkg = "card_analysis"`). Returns a typed result `{ pattern, suggested_change, confidence }` validated by the host before the MCP response is constructed — freeform pkg output is rejected with a typed error |
 | `alc_pkg_link` | Link a local directory as a project-local package via symlink. Records path in `alc.lock` |
 | `alc_pkg_unlink` | Remove a symlink created by `alc_pkg_link` (rejects real directories) |
@@ -376,7 +378,7 @@ alc_continue({ session_id, response })
 | `alc_init` | Initialize a project — creates `alc.toml` in the project root if absent |
 | `alc_update` | Update packages declared in `alc.toml` by re-installing from their recorded sources |
 | `alc_migrate` | Migrate a legacy `alc.lock` to the new `alc.toml` + `alc.lock` schema |
-| `alc_eval` | Evaluate a strategy against a scenario (cases + graders) |
+| `alc_eval` | Evaluate a strategy against a scenario (cases + graders). Returns a typed error for library packages |
 | `alc_eval_history` | List past eval results, filter by strategy |
 | `alc_eval_detail` | View a specific eval result in full detail |
 | `alc_eval_compare` | Compare two eval results with Welch's t-test |

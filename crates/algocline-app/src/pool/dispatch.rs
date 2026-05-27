@@ -131,8 +131,7 @@ async fn spawn_worker(pool_dir: &Path, sid: &str) -> Result<(u32, PathBuf), Pool
 /// Uses timestamp + random bytes, matching the approach in
 /// `algocline-engine::session::gen_session_id`.
 fn gen_pool_sid() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
+    use rand::RngExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // Timestamp prefix for rough ordering.  `unwrap_or_default` is
@@ -144,12 +143,7 @@ fn gen_pool_sid() -> String {
         .unwrap_or_default()
         .as_nanos();
 
-    let random: u64 = {
-        let s = RandomState::new();
-        let mut h = s.build_hasher();
-        h.write_u128(ts);
-        h.finish()
-    };
+    let random: u64 = rand::rng().random();
     format!("p-{ts:x}-{random:016x}")
 }
 

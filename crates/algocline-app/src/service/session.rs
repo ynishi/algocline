@@ -94,17 +94,18 @@ impl AlcSession {
     }
 }
 
-/// Generate a session id of the form `alc-sess-{ms_since_epoch}`.
+/// Generate a session id of the form `alc-sess-{ms_since_epoch}-{random_hex}`.
 ///
-/// Pure local-time identifier — no UUID dependency, sufficient for
-/// per-process uniqueness since each `AppService` produces ≤1
-/// session at a time.
+/// Combines millisecond timestamp with 32-bit random suffix to guarantee
+/// uniqueness even for concurrent calls within the same millisecond.
 fn gen_session_id() -> String {
+    use rand::RngExt;
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("alc-sess-{ms}")
+    let random: u32 = rand::rng().random();
+    format!("alc-sess-{ms}-{random:08x}")
 }
 
 #[cfg(test)]

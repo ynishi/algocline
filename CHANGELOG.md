@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lua auto-detect snippet (`LUA_TYPE_AUTODETECT` constant in `resolve.rs`) is the single shared source for the `type(pkg.run)` detection logic injected by all runtime paths, preventing per-path divergence.
 - `parse_meta` internal return type refactored from a 5-element tuple to a named `ParsedMeta` struct, making the parser self-documenting and future field additions non-breaking.
 
+### Fixed
+
+- `alc_hub_search`: pre-type-system `hub_index.json` entries (no `"type"` field) no longer produce `"type": null` in search results. `merge()` in `hub.rs` now defaults a missing `pkg_type` to `PkgType::Runnable` on both the remote-index path and the local-only fallback path. Packages with an explicit `"type"` value are unaffected. (backward compat fix: `hub.rs` `merge()`)
+
 ### Security
 
 - Session ID generation now uses `rand::rng()` (ChaCha12 CSPRNG) instead of `RandomState`-based hashing (`gen_session_id` in `algocline-engine` and `gen_pool_sid` in pool dispatch). The previous `RandomState` path provided no cryptographic randomness guarantee and derived entropy solely from the per-process ASLR seed.

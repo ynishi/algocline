@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use algocline_core::pkg::PkgType;
+use algocline_core::pkg::{PkgType, TypeSource};
 use algocline_core::QueryId;
 use algocline_engine::{FeedResult, VariantPkg};
 
@@ -329,7 +329,7 @@ impl AppService {
         }
 
         // Guard: reject library packages before make_require_code (= M.run invocation)
-        if let Some(PkgType::Library) = self.resolve_pkg_type_lua(strategy).await? {
+        if let Some((PkgType::Library, _)) = self.resolve_pkg_type_lua(strategy).await? {
             return Err(format!(
                 "Package '{strategy}' is a library package (type = \"library\"). \
                  Library packages provide reusable modules and do not have a run() entry point. \
@@ -366,33 +366,61 @@ impl AppService {
         ))
     }
 
-    /// Resolve the package type via Lua VM (`eval_simple`).
+    /// Resolve the package type and provenance via Lua VM (`eval_simple`).
     ///
-    /// Returns `Ok(Some(PkgType))` when type is determined, `Ok(None)` when
-    /// eval succeeds but the returned value cannot be parsed as a known type
-    /// (guard passthrough for legacy packages), `Err(String)` when `eval_simple`
-    /// fails (propagate to caller).
-    pub(crate) async fn resolve_pkg_type_lua(&self, name: &str) -> Result<Option<PkgType>, String> {
+    /// # Returns
+    ///
+    /// - `Ok(Some((PkgType, TypeSource)))` — type and provenance both parsed
+    ///   successfully.
+    /// - `Ok(None)` — eval succeeded but either the `type` or `type_source`
+    ///   field could not be parsed (unknown value or absent field); the caller
+    ///   treats this as a legacy passthrough and does not apply the library
+    ///   guard.
+    /// - `Err(String)` — `eval_simple` failed; propagated to the caller.
+    ///
+    /// # Provenance
+    ///
+    /// The Lua snippet (`LUA_TYPE_AUTODETECT`) sets `meta.type_source` to one
+    /// of `"explicit"` / `"auto_detected_runnable"` / `"auto_detected_library"`
+    /// before control returns to Rust, so both fields are always populated when
+    /// the snippet runs without error.
+    pub(crate) async fn resolve_pkg_type_lua(
+        &self,
+        name: &str,
+    ) -> Result<Option<(PkgType, TypeSource)>, String> {
         let auto = super::resolve::LUA_TYPE_AUTODETECT;
         let code = format!(
-            r#"package.loaded["{name}"] = nil; local pkg = require("{name}"); local meta = pkg.meta or {{}}; if meta.type ~= nil then return meta.type end; {auto}; return meta.type"#,
+            r#"package.loaded["{name}"] = nil; local pkg = require("{name}"); local meta = pkg.meta or {{}}; {auto}; return {{ type = meta.type, type_source = meta.type_source }}"#,
             name = name,
             auto = auto,
         );
         let val = self.executor.eval_simple(code).await?;
-        let pkg_type = val.as_str().and_then(|s| match s.parse::<PkgType>() {
-            Ok(t) => Some(t),
-            Err(e) => {
-                tracing::warn!(
-                    package = name,
-                    raw_type = s,
-                    error = %e,
-                    "unknown pkg type string; treating as legacy passthrough"
-                );
-                None
+        let result = val.as_object().and_then(|obj| {
+            let pkg_type =
+                obj.get("type")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| match s.parse::<PkgType>() {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            tracing::warn!(
+                                package = name,
+                                raw_type = s,
+                                error = %e,
+                                "unknown pkg type string; treating as legacy passthrough"
+                            );
+                            None
+                        }
+                    });
+            let type_source = obj
+                .get("type_source")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<TypeSource>().ok());
+            match (pkg_type, type_source) {
+                (Some(t), Some(src)) => Some((t, src)),
+                _ => None,
             }
         });
-        Ok(pkg_type)
+        Ok(result)
     }
 
     /// Continue a paused execution — batch feed.
@@ -1203,6 +1231,121 @@ mod tests {
         assert!(
             msg.contains("dotenv"),
             "error must mention dotenv, got: {msg}"
+        );
+    }
+
+    // ── resolve_pkg_type_lua unit tests (ST2) ───────────────────────────────
+
+    use algocline_core::pkg::{PkgType, TypeSource};
+
+    /// Build a temporary package directory with the given `init.lua` content
+    /// and return the parent directory (the one to pass as a lib_path to
+    /// `Executor::new`).
+    fn make_temp_pkg(parent: &std::path::Path, pkg_name: &str, init_lua: &str) -> PathBuf {
+        let pkg_dir = parent.join(pkg_name);
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        std::fs::write(pkg_dir.join("init.lua"), init_lua).expect("write init.lua");
+        parent.to_path_buf()
+    }
+
+    /// Build a minimal `AppService` whose executor can `require` packages from
+    /// `pkg_root` (the parent directory that contains `<pkg_name>/init.lua`).
+    async fn make_svc_with_pkg_root(pkg_root: PathBuf) -> AppService {
+        let executor = Arc::new(
+            algocline_engine::Executor::new(vec![pkg_root])
+                .await
+                .expect("executor"),
+        );
+        // `AppConfig::default()` (test-only) creates a fresh leaked tempdir and
+        // sets log_enabled = false — suitable for unit tests.
+        let log_config = super::super::config::AppConfig::default();
+        AppService::new(executor, log_config, vec![])
+    }
+
+    /// T1 (property): explicit `M.meta.type = "library"` → `Some((Library, Explicit))`.
+    ///
+    /// When a package declares its type via `meta.type`, the Lua snippet sets
+    /// `meta.type_source = "explicit"` (the `else` branch of `LUA_TYPE_AUTODETECT`).
+    /// Both fields must round-trip through `resolve_pkg_type_lua` as a tuple.
+    #[tokio::test]
+    async fn resolve_pkg_type_lua_returns_explicit_for_meta_type() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let pkg_root = make_temp_pkg(
+            tmp.path(),
+            "explicit_lib",
+            r#"local M = {}
+M.meta = { name = "explicit_lib", type = "library" }
+return M
+"#,
+        );
+        let svc = make_svc_with_pkg_root(pkg_root).await;
+        let result = svc
+            .resolve_pkg_type_lua("explicit_lib")
+            .await
+            .expect("eval must succeed");
+        assert_eq!(
+            result,
+            Some((PkgType::Library, TypeSource::Explicit)),
+            "explicit meta.type = library must produce (Library, Explicit)"
+        );
+    }
+
+    /// T2 (boundary): `M.run` defined + no `meta.type` → `Some((Runnable, AutoDetectedRunnable))`.
+    ///
+    /// When `meta.type` is absent and `pkg.run` is a function, the snippet
+    /// sets `meta.type = "runnable"` and `meta.type_source = "auto_detected_runnable"`.
+    #[tokio::test]
+    async fn resolve_pkg_type_lua_returns_auto_runnable() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let pkg_root = make_temp_pkg(
+            tmp.path(),
+            "auto_runnable",
+            r#"local M = {}
+M.meta = { name = "auto_runnable" }
+M.run = function(ctx) return "ok" end
+return M
+"#,
+        );
+        let svc = make_svc_with_pkg_root(pkg_root).await;
+        let result = svc
+            .resolve_pkg_type_lua("auto_runnable")
+            .await
+            .expect("eval must succeed");
+        assert_eq!(
+            result,
+            Some((PkgType::Runnable, TypeSource::AutoDetectedRunnable)),
+            "M.run present + no meta.type must produce (Runnable, AutoDetectedRunnable)"
+        );
+    }
+
+    /// T3 (error path): no `M.run` + no `meta.type` → `Some((Library, AutoDetectedLibrary))`.
+    ///
+    /// When `meta.type` is absent and `pkg.run` is not a function, the snippet
+    /// sets `meta.type = "library"` and `meta.type_source = "auto_detected_library"`.
+    /// This is the warn-eligible case — the crux constraint requires this specific
+    /// `TypeSource` variant so `alc_pkg_doctor` / `alc_pkg_list` can fire the
+    /// unmarked-library warning only for `AutoDetectedLibrary`, not for `None`.
+    #[tokio::test]
+    async fn resolve_pkg_type_lua_returns_auto_library() {
+        let tmp = tempfile::tempdir().expect("test tempdir");
+        let pkg_root = make_temp_pkg(
+            tmp.path(),
+            "auto_library",
+            r#"local M = {}
+M.meta = { name = "auto_library" }
+-- no M.run defined
+return M
+"#,
+        );
+        let svc = make_svc_with_pkg_root(pkg_root).await;
+        let result = svc
+            .resolve_pkg_type_lua("auto_library")
+            .await
+            .expect("eval must succeed");
+        assert_eq!(
+            result,
+            Some((PkgType::Library, TypeSource::AutoDetectedLibrary)),
+            "no M.run + no meta.type must produce (Library, AutoDetectedLibrary)"
         );
     }
 }

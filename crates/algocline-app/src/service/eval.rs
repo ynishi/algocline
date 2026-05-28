@@ -77,7 +77,7 @@ impl AppService {
         }
 
         // Guard: reject library packages before start_and_tick (= any LLM call)
-        if let Some(PkgType::Library) = self.resolve_pkg_type_lua(strategy).await? {
+        if let Some((PkgType::Library, _)) = self.resolve_pkg_type_lua(strategy).await? {
             return Err(format!(
                 "Package '{strategy}' is a library package (type = \"library\"). \
                  Library packages cannot be evaluated as strategies. \

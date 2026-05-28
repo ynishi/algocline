@@ -155,16 +155,27 @@ pub(crate) fn resolve_scenario_code(
 
 /// Lua snippet injected into `pkg_list` and `resolve_pkg_type_lua` to
 /// auto-detect the package type from `M.run` existence when `meta.type`
-/// is absent.
+/// is absent, and to record the provenance of the type determination via
+/// `meta.type_source`.
 ///
 /// This is the **single source of truth** for the Lua-side auto-detect logic
-/// (crux: "Auto-detect single source"). Every runtime path that resolves
-/// package type (`pkg_list` via `eval_simple`, and `resolve_pkg_type_lua`
-/// in Subtask 2) must reference this const via `format!()` to prevent drift.
+/// and provenance tracking (Path B coverage for the `type_source` field).
+/// Every runtime path that resolves package type (`pkg_list` via `eval_simple`,
+/// and `resolve_pkg_type_lua`) must reference this const via `format!()` to
+/// prevent drift between the two paths.
+///
+/// The wire strings `"explicit"`, `"auto_detected_runnable"`, and
+/// `"auto_detected_library"` match the `TypeSource` enum's
+/// `#[serde(rename_all = "snake_case")]` output exactly.
 ///
 /// Assumes: `local meta = pkg.meta or { name = "..." }` and `local pkg = require(...)`
 /// are already in scope at the call site.
-pub const LUA_TYPE_AUTODETECT: &str = r#"if meta.type == nil then meta.type = type(pkg.run) == "function" and "runnable" or "library" end"#;
+pub const LUA_TYPE_AUTODETECT: &str = r#"if meta.type == nil then
+  meta.type = type(pkg.run) == "function" and "runnable" or "library"
+  meta.type_source = "auto_detected_" .. meta.type
+else
+  meta.type_source = "explicit"
+end"#;
 
 /// Git URLs for auto-installation. All repos use the Collection layout
 /// (`<repo>/<name>/init.lua`) and must publish a `hub_index.json` at root.

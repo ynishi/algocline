@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `alc_pkg_doctor`: alive symlinks under `~/.algocline/packages/` that are not registered in `installed.json`, `alc.toml`, or `alc.local.toml` are now reported (additive entries into `unmarked_library` or `unregistered_pkg`; JSON shape unchanged).
+- `alc_pkg_doctor`: alive-symlink `type_source` detection now uses the same `eval_simple` + `LUA_TYPE_AUTODETECT` runtime path as `alc_pkg_list`, eliminating a static-parse divergence that caused 5 auto-detected library packages to be misclassified as `unregistered_pkg` instead of `unmarked_library`.
 
 ## [0.39.0] - 2026-05-28
 

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-05-29
+
 ### Added
 
 - `alc-adviser` agent: Design Consultation mode. When the query expresses a build intent ("I want to build ...", "How should I combine ..."), the adviser switches from lookup mode to design consultation, searching existing packages as building blocks, finding reference implementations, and returning a `### Design Proposal` with architecture sketch and package combination suggestions. No Rust changes required — the mode uses existing MCP tools (`alc_pkg_list`, `alc_hub_search`, `alc_hub_info`).

@@ -57,6 +57,7 @@ pub(crate) const PKG_LIST_SUMMARY: &[&str] = &[
     "active",
     "resolved_source_path",
     "resolved_source_kind",
+    "warnings",
 ];
 
 /// `alc_pkg_list` verbose=full preset (summary + extended fields).
@@ -68,6 +69,7 @@ pub(crate) const PKG_LIST_FULL: &[&str] = &[
     "active",
     "resolved_source_path",
     "resolved_source_kind",
+    "warnings",
     "install_source",
     "installed_at",
     "updated_at",

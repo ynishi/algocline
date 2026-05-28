@@ -79,8 +79,6 @@ pub(super) fn symlink_dangling_suggestion(name: &str) -> String {
 /// Routing bucket for alive-symlink entries detected by
 /// `collect_alive_unregistered_symlinks`. The JSON shape is built by
 /// `run_alive_unregistered_symlink_pass` in `doctor.rs`.
-// Used by doctor.rs run_alive_unregistered_symlink_pass (Subtask 2).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum AliveBucket {
     /// `type_source == "auto_detected_library"` from the Lua VM eval —
@@ -713,8 +711,6 @@ impl AppService {
     /// other than `NotFound`). `NotFound` is treated as empty (no packages installed)
     /// and returns `Ok(vec![])`. Individual entry stat or eval failures emit a
     /// `tracing::warn!` and continue. `canonicalize` failure returns `Err`.
-    // Used by doctor.rs run_alive_unregistered_symlink_pass (Subtask 2).
-    #[allow(dead_code)]
     pub(super) async fn collect_alive_unregistered_symlinks(
         &self,
         pkg_dir: &Path,
@@ -825,9 +821,7 @@ return meta"#,
                     .await
                 {
                     Ok(meta) => {
-                        if meta
-                            .get("type_source")
-                            .and_then(|v| v.as_str())
+                        if meta.get("type_source").and_then(|v| v.as_str())
                             == Some("auto_detected_library")
                         {
                             AliveBucket::UnmarkedLibrary

@@ -57,8 +57,7 @@ use super::super::resolve::packages_dir;
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::repair::{
-    collect_alive_unregistered_symlinks, collect_path_missing,
-    collect_unattached_dangling_symlinks, collect_unregistered_pkg_dirs,
+    collect_path_missing, collect_unattached_dangling_symlinks, collect_unregistered_pkg_dirs,
     symlink_dangling_suggestion, AliveBucket, ProjectPathSource,
 };
 
@@ -799,73 +798,88 @@ fn run_unregistered_pkg_pass(
     Ok(())
 }
 
-/// Walk `pkg_dir` for **alive symlinks** (target exists, `init.lua` present) that
-/// are not registered in any authoritative source, then push entries into
-/// `buckets.unmarked_library` (when `type_source` is `AutoDetectedLibrary`) or
-/// `buckets.unregistered_pkg` (all other cases, including parse failures).
-///
-/// # Parameters
-///
-/// * `pkg_dir` — `~/.algocline/packages/` root
-/// * `registered` — set of package names from installed.json + alc.toml + alc.local.toml
-/// * `registered_paths` — canonicalized paths from path-dep entries to suppress
-///   false positives (crux constraint: canonical path comparison)
-/// * `target_filter` — when `Some(name)`, restrict to that single package
-/// * `buckets` — accumulator; entries are pushed into `buckets.unmarked_library`
-///   or `buckets.unregistered_pkg` depending on `type_source`
-///
-/// # Errors
-///
-/// Propagates `Err(String)` from `collect_alive_unregistered_symlinks` when
-/// `pkg_dir` exists but cannot be read.
-fn run_alive_unregistered_symlink_pass(
-    pkg_dir: &Path,
-    registered: &HashSet<String>,
-    registered_paths: &[PathBuf],
-    target_filter: Option<&str>,
-    buckets: &mut DoctorBuckets,
-) -> Result<(), String> {
-    let found =
-        collect_alive_unregistered_symlinks(pkg_dir, registered, registered_paths, target_filter)?;
-    for (name, bucket) in found {
-        match bucket {
-            AliveBucket::UnmarkedLibrary => {
-                buckets.unmarked_library.push(serde_json::json!({
-                    "name": name,
-                    "kind": "unmarked_library",
-                    "suggestion": UNMARKED_LIBRARY_SUGGESTION,
-                }));
-            }
-            AliveBucket::Unregistered => {
-                let abs_path = pkg_dir.join(&name).display().to_string();
-                let suggestion = serde_json::json!([
-                    format!(
-                        "If this pkg was scaffolded outside `alc_pkg_scaffold` and you want it installed: \
-                        `alc_pkg_install --force {abs_path}` (re-copy + register in installed.json)"
-                    ),
-                    format!(
-                        "If you are actively iterating on this pkg in-tree: \
-                        `alc_pkg_link {abs_path}` (symlink-based, no copy)"
-                    ),
-                    format!("If this dir is stale/abandoned: `rm -rf {abs_path}` to clean it up"),
-                    "Note: source is unknown — git URL cannot be inferred from the bare directory. \
-                    Re-record via one of the above."
-                        .to_string(),
-                ]);
-                buckets.unregistered_pkg.push(serde_json::json!({
-                    "name": name,
-                    "kind": "unregistered_pkg",
-                    "source": "unknown",
-                    "reason": format!(
-                        "alive symlink with init.lua exists but is not registered in \
-                        installed.json, alc.toml, or alc.local.toml: <symlink path: '{abs_path}'>"
-                    ),
-                    "suggestion": suggestion,
-                }));
+impl AppService {
+    /// Walk `pkg_dir` for **alive symlinks** (target exists, `init.lua` present) that
+    /// are not registered in any authoritative source, then push entries into
+    /// `buckets.unmarked_library` (when `type_source` is `AutoDetectedLibrary`) or
+    /// `buckets.unregistered_pkg` (all other cases, including parse failures).
+    ///
+    /// # Arguments
+    ///
+    /// * `pkg_dir` — `~/.algocline/packages/` root
+    /// * `registered` — set of package names from installed.json + alc.toml + alc.local.toml
+    /// * `registered_paths` — canonicalized paths from path-dep entries to suppress
+    ///   false positives (crux constraint: canonical path comparison)
+    /// * `target_filter` — when `Some(name)`, restrict to that single package
+    /// * `buckets` — accumulator; entries are pushed into `buckets.unmarked_library`
+    ///   or `buckets.unregistered_pkg` depending on `type_source`
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after all alive symlinks have been classified and appended to
+    /// the appropriate bucket.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `Err(String)` from `collect_alive_unregistered_symlinks` when
+    /// `pkg_dir` exists but cannot be read. Per-package eval failures are logged
+    /// via `tracing::warn!` and fall through to `Unregistered` (no propagation).
+    async fn run_alive_unregistered_symlink_pass(
+        &self,
+        pkg_dir: &Path,
+        registered: &HashSet<String>,
+        registered_paths: &[PathBuf],
+        target_filter: Option<&str>,
+        buckets: &mut DoctorBuckets,
+    ) -> Result<(), String> {
+        let found = self
+            .collect_alive_unregistered_symlinks(
+                pkg_dir,
+                registered,
+                registered_paths,
+                target_filter,
+            )
+            .await?;
+        for (name, bucket) in found {
+            match bucket {
+                AliveBucket::UnmarkedLibrary => {
+                    buckets.unmarked_library.push(serde_json::json!({
+                        "name": name,
+                        "kind": "unmarked_library",
+                        "suggestion": UNMARKED_LIBRARY_SUGGESTION,
+                    }));
+                }
+                AliveBucket::Unregistered => {
+                    let abs_path = pkg_dir.join(&name).display().to_string();
+                    let suggestion = serde_json::json!([
+                        format!(
+                            "If this pkg was scaffolded outside `alc_pkg_scaffold` and you want it installed: \
+                            `alc_pkg_install --force {abs_path}` (re-copy + register in installed.json)"
+                        ),
+                        format!(
+                            "If you are actively iterating on this pkg in-tree: \
+                            `alc_pkg_link {abs_path}` (symlink-based, no copy)"
+                        ),
+                        format!("If this dir is stale/abandoned: `rm -rf {abs_path}` to clean it up"),
+                        "Note: source is unknown — git URL cannot be inferred from the bare directory. \
+                        Re-record via one of the above."
+                            .to_string(),
+                    ]);
+                    buckets.unregistered_pkg.push(serde_json::json!({
+                        "name": name,
+                        "kind": "unregistered_pkg",
+                        "source": "unknown",
+                        "reason": format!(
+                            "alive symlink with init.lua exists but is not registered in \
+                            installed.json, alc.toml, or alc.local.toml: <symlink path: '{abs_path}'>"
+                        ),
+                        "suggestion": suggestion,
+                    }));
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 impl AppService {
@@ -979,13 +993,14 @@ impl AppService {
             target_filter,
             &mut buckets,
         )?;
-        run_alive_unregistered_symlink_pass(
+        self.run_alive_unregistered_symlink_pass(
             &pkg_dir,
             &registered,
             &registered_paths,
             target_filter,
             &mut buckets,
-        )?;
+        )
+        .await?;
         if target_filter.is_none() {
             run_stale_cache_pass(&app_dir.hub_cache_dir(), &mut buckets)?;
             if let Some(ref root) = resolved_root {
@@ -1009,6 +1024,8 @@ impl AppService {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    use crate::service::test_support::make_app_service_at;
 
     /// Build a minimal `ManifestEntry` with a `PackageSource::Path`.
     /// Takes a legacy path string so the existing tests keep reading
@@ -1937,15 +1954,19 @@ return {}
     /// contains an `init.lua` with no explicit `M.meta.type` (AutoDetectedLibrary)
     /// and is not registered in any source is pushed to `buckets.unmarked_library`.
     #[cfg(unix)]
-    #[test]
-    fn run_alive_unregistered_symlink_pass_unmarked_library() {
+    #[tokio::test]
+    async fn run_alive_unregistered_symlink_pass_unmarked_library() {
         let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path();
+        let root = tmp.path().to_path_buf();
+
+        // fixture: root/packages/mylib → root/real_lib
+        let pkg_dir = root.join("packages");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
 
         // Real package directory (symlink target).
-        let real = tmp.path().join("real_lib");
+        let real = root.join("real_lib");
         std::fs::create_dir(&real).unwrap();
-        // No M.meta.type, no M.run → parse_from_init_lua sets AutoDetectedLibrary.
+        // No M.meta.type, no M.run → eval_simple classifies as auto_detected_library.
         std::fs::write(
             real.join("init.lua"),
             "local M = {}\nM.meta = { name = \"mylib\", version = \"0.1.0\" }\nreturn M",
@@ -1956,17 +1977,20 @@ return {}
         let link = pkg_dir.join("mylib");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
+        let app_service = make_app_service_at(root).await;
         let registered = HashSet::new();
         let registered_paths: Vec<PathBuf> = vec![];
         let mut buckets = DoctorBuckets::default();
-        run_alive_unregistered_symlink_pass(
-            pkg_dir,
-            &registered,
-            &registered_paths,
-            None,
-            &mut buckets,
-        )
-        .expect("pass ok");
+        app_service
+            .run_alive_unregistered_symlink_pass(
+                &pkg_dir,
+                &registered,
+                &registered_paths,
+                None,
+                &mut buckets,
+            )
+            .await
+            .expect("pass ok");
 
         assert_eq!(
             buckets.unmarked_library.len(),
@@ -1993,15 +2017,19 @@ return {}
     /// AutoDetectedLibrary) and is not registered is pushed to
     /// `buckets.unregistered_pkg`.
     #[cfg(unix)]
-    #[test]
-    fn run_alive_unregistered_symlink_pass_unregistered_pkg() {
+    #[tokio::test]
+    async fn run_alive_unregistered_symlink_pass_unregistered_pkg() {
         let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path();
+        let root = tmp.path().to_path_buf();
+
+        // fixture: root/packages/myrunnable → root/real_runnable
+        let pkg_dir = root.join("packages");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
 
         // Real package directory (symlink target).
-        let real = tmp.path().join("real_runnable");
+        let real = root.join("real_runnable");
         std::fs::create_dir(&real).unwrap();
-        // M.run present → parse_from_init_lua sets AutoDetectedRunnable (not library).
+        // M.run present → eval_simple classifies as auto_detected_runnable (not library).
         std::fs::write(
             real.join("init.lua"),
             "local M = {}\n\
@@ -2015,17 +2043,20 @@ return {}
         let link = pkg_dir.join("myrunnable");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
+        let app_service = make_app_service_at(root).await;
         let registered = HashSet::new();
         let registered_paths: Vec<PathBuf> = vec![];
         let mut buckets = DoctorBuckets::default();
-        run_alive_unregistered_symlink_pass(
-            pkg_dir,
-            &registered,
-            &registered_paths,
-            None,
-            &mut buckets,
-        )
-        .expect("pass ok");
+        app_service
+            .run_alive_unregistered_symlink_pass(
+                &pkg_dir,
+                &registered,
+                &registered_paths,
+                None,
+                &mut buckets,
+            )
+            .await
+            .expect("pass ok");
 
         assert_eq!(
             buckets.unregistered_pkg.len(),

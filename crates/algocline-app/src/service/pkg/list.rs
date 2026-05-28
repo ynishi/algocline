@@ -15,6 +15,7 @@ use super::super::resolve::{is_system_package, packages_dir, LUA_TYPE_AUTODETECT
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::super::{PkgListError, ServiceError};
+use super::doctor::UNMARKED_LIBRARY_SUGGESTION;
 
 // ─── Intermediate DTO for pkg_list ───────────────────────────────
 
@@ -96,6 +97,15 @@ struct PackageListEntry {
     /// Canonical absolute paths of same-name packages that are shadowed by
     /// this (active) entry. Only present when overrides exist.
     override_paths: Option<Vec<String>>,
+    /// Actionable suggestion strings for the caller.
+    ///
+    /// Currently populated only for global packages (Scope::Global) when
+    /// `meta.type_source` is `"auto_detected_library"` — encouraging the author
+    /// to add an explicit `M.meta.type = "library"` declaration.
+    ///
+    /// Crux constraint: `None` (legacy packages without `type_source`) must
+    /// never produce a warnings entry. Only `AutoDetectedLibrary` triggers this.
+    warnings: Option<Vec<String>>,
 }
 
 impl PackageListEntry {
@@ -173,6 +183,13 @@ impl PackageListEntry {
         }
         if let Some(broken) = self.broken {
             map.insert("broken".to_string(), serde_json::Value::Bool(broken));
+        }
+        // warnings is host-authoritative: insert before meta merge so Lua
+        // pkg.meta cannot shadow or override this field.
+        if let Some(warns) = self.warnings {
+            if !warns.is_empty() {
+                map.insert("warnings".to_string(), serde_json::json!(warns));
+            }
         }
 
         // Merge meta fields (Lua pkg.meta) into the top-level object.
@@ -515,6 +532,7 @@ return meta"#,
                     (rsp, Some(kind))
                 };
 
+                let warnings = derive_warnings_from_meta(&meta);
                 entries.push(PackageListEntry {
                     name,
                     scope: Scope::Global,
@@ -535,6 +553,7 @@ return meta"#,
                     resolved_source_path,
                     resolved_source_kind,
                     override_paths: None,
+                    warnings,
                 });
             }
         }
@@ -749,6 +768,8 @@ fn collect_variant_entries(
             resolved_source_path: rsp,
             resolved_source_kind: Some(ResolvedSourceKind::Variant),
             override_paths: None,
+            // Variant entries do not go through eval_simple — type_source is unknown.
+            warnings: None,
         });
     }
 
@@ -785,6 +806,8 @@ fn make_project_entry(
         resolved_source_path,
         resolved_source_kind,
         override_paths: None,
+        // Project entries do not go through eval_simple — type_source is unknown.
+        warnings: None,
     }
 }
 
@@ -823,6 +846,37 @@ fn collect_path_entries_from_lock(
     }
 }
 
+// ─── Warnings derivation ─────────────────────────────────────────
+
+/// Derive the `warnings` field for a package list entry from its evaluated
+/// `meta` JSON.
+///
+/// # Arguments
+///
+/// * `meta` — the JSON value returned by `eval_simple` for this package (the
+///   full `meta` table). Must already have `type_source` populated by the
+///   `LUA_TYPE_AUTODETECT` snippet.
+///
+/// # Returns
+///
+/// `Some(vec![suggestion])` when `meta.type_source` is
+/// `"auto_detected_library"`. `None` in all other cases — including when
+/// `type_source` is absent (legacy/backward-compat entries).
+///
+/// # Crux constraint
+///
+/// Only `"auto_detected_library"` triggers this function; `None` (absent key)
+/// and all other values (e.g. `"explicit"`, `"auto_detected_runnable"`) return
+/// `None` to satisfy the "Warn gate excludes None/legacy entries" constraint.
+fn derive_warnings_from_meta(meta: &serde_json::Value) -> Option<Vec<String>> {
+    let ts = meta.get("type_source").and_then(|v| v.as_str())?;
+    if ts == "auto_detected_library" {
+        Some(vec![UNMARKED_LIBRARY_SUGGESTION.to_string()])
+    } else {
+        None
+    }
+}
+
 // ─── Path resolution ─────────────────────────────────────────────
 
 /// Canonicalize `candidate` and return the canonical absolute path string,
@@ -845,4 +899,204 @@ fn is_safe_pkg_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── derive_warnings_from_meta ──────────────────────────────────────
+
+    /// T1 (property test): `type_source = "auto_detected_library"` in meta
+    /// produces a warnings vec containing the canonical UNMARKED_LIBRARY_SUGGESTION.
+    #[test]
+    fn entry_emits_warnings_for_auto_detected_library() {
+        let meta = serde_json::json!({
+            "name": "mylib",
+            "type": "library",
+            "type_source": "auto_detected_library",
+        });
+        let result = derive_warnings_from_meta(&meta);
+        let warns = result.expect("expected Some(warnings) for auto_detected_library");
+        assert_eq!(warns.len(), 1, "must have exactly one warning: {warns:?}");
+        assert_eq!(
+            warns[0], UNMARKED_LIBRARY_SUGGESTION,
+            "warning must match canonical UNMARKED_LIBRARY_SUGGESTION"
+        );
+        assert!(
+            warns[0].contains("M.meta.type"),
+            "warning must mention M.meta.type: {}",
+            warns[0]
+        );
+    }
+
+    /// T2 (boundary): explicit type_source (`"explicit"`) and auto-detected
+    /// runnable (`"auto_detected_runnable"`) must produce `None` warnings.
+    #[test]
+    fn entry_no_warnings_for_explicit_or_runnable() {
+        // Explicit declaration — type_source = "explicit".
+        let meta_explicit = serde_json::json!({
+            "name": "explicitpkg",
+            "type": "library",
+            "type_source": "explicit",
+        });
+        assert!(
+            derive_warnings_from_meta(&meta_explicit).is_none(),
+            "explicit type_source must produce no warnings"
+        );
+
+        // Auto-detected runnable — type_source = "auto_detected_runnable".
+        let meta_runnable = serde_json::json!({
+            "name": "runnablepkg",
+            "type": "runnable",
+            "type_source": "auto_detected_runnable",
+        });
+        assert!(
+            derive_warnings_from_meta(&meta_runnable).is_none(),
+            "auto_detected_runnable must produce no warnings"
+        );
+    }
+
+    /// T3 (crux constraint — None/legacy): a meta object without `type_source`
+    /// key (legacy package, backward-compat entry) must produce `None` warnings.
+    /// This verifies the "Warn gate excludes None/legacy entries" constraint.
+    #[test]
+    fn entry_no_warnings_for_missing_type_source() {
+        // No type_source key at all (legacy package).
+        let meta_legacy = serde_json::json!({
+            "name": "legacypkg",
+            "version": "0.1.0",
+        });
+        assert!(
+            derive_warnings_from_meta(&meta_legacy).is_none(),
+            "absent type_source must produce no warnings (legacy compat)"
+        );
+
+        // Explicitly null type_source (degenerate case).
+        let meta_null = serde_json::json!({
+            "name": "nullpkg",
+            "type_source": null,
+        });
+        assert!(
+            derive_warnings_from_meta(&meta_null).is_none(),
+            "null type_source must produce no warnings"
+        );
+    }
+
+    // ─── into_json warnings field ────────────────────────────────────────
+
+    /// T4 (property): `PackageListEntry` with warnings `Some(["msg"])` emits
+    /// `"warnings": ["msg"]` in the JSON output, positioned before meta merge.
+    #[test]
+    fn into_json_emits_warnings_field_when_present() {
+        let entry = PackageListEntry {
+            name: "testpkg".to_string(),
+            scope: Scope::Global,
+            source_type: None,
+            path: None,
+            source: None,
+            active: true,
+            version: None,
+            installed_at: None,
+            updated_at: None,
+            install_source: None,
+            overrides: None,
+            meta: serde_json::json!({"type_source": "auto_detected_library"}),
+            error: None,
+            linked: None,
+            link_target: None,
+            broken: None,
+            resolved_source_path: None,
+            resolved_source_kind: None,
+            override_paths: None,
+            warnings: Some(vec!["my suggestion".to_string()]),
+        };
+        let json = entry.into_json();
+        let obj = json.as_object().expect("expected JSON object");
+        let warns = obj.get("warnings").expect("warnings key must be present");
+        assert!(warns.is_array(), "warnings must be a JSON array: {warns}");
+        assert_eq!(warns[0], "my suggestion");
+    }
+
+    /// T5 (boundary): `PackageListEntry` with `warnings: None` must not emit
+    /// a `"warnings"` key in the JSON output.
+    #[test]
+    fn into_json_omits_warnings_field_when_none() {
+        let entry = PackageListEntry {
+            name: "testpkg2".to_string(),
+            scope: Scope::Global,
+            source_type: None,
+            path: None,
+            source: None,
+            active: true,
+            version: None,
+            installed_at: None,
+            updated_at: None,
+            install_source: None,
+            overrides: None,
+            meta: serde_json::json!({"type_source": "explicit"}),
+            error: None,
+            linked: None,
+            link_target: None,
+            broken: None,
+            resolved_source_path: None,
+            resolved_source_kind: None,
+            override_paths: None,
+            warnings: None,
+        };
+        let json = entry.into_json();
+        let obj = json.as_object().expect("expected JSON object");
+        assert!(
+            !obj.contains_key("warnings"),
+            "warnings key must not be present when warnings is None"
+        );
+    }
+
+    /// T6 (crux constraint): meta with `type_source = "auto_detected_library"`
+    /// does NOT masquerade through meta merge to override the host-authoritative
+    /// `warnings` field — host warnings are inserted before meta merge.
+    #[test]
+    fn into_json_host_warnings_not_overridden_by_meta() {
+        // Simulate a meta that includes a "warnings" key (Lua pkg.meta.warnings).
+        // The host-authoritative warnings must win.
+        let entry = PackageListEntry {
+            name: "testpkg3".to_string(),
+            scope: Scope::Global,
+            source_type: None,
+            path: None,
+            source: None,
+            active: true,
+            version: None,
+            installed_at: None,
+            updated_at: None,
+            install_source: None,
+            overrides: None,
+            meta: serde_json::json!({
+                "type_source": "auto_detected_library",
+                "warnings": ["lua-side warning that must not win"],
+            }),
+            error: None,
+            linked: None,
+            link_target: None,
+            broken: None,
+            resolved_source_path: None,
+            resolved_source_kind: None,
+            override_paths: None,
+            warnings: Some(vec![UNMARKED_LIBRARY_SUGGESTION.to_string()]),
+        };
+        let json = entry.into_json();
+        let obj = json.as_object().expect("expected JSON object");
+        let warns = obj.get("warnings").expect("warnings key must be present");
+        let warns_arr = warns.as_array().expect("warnings must be array");
+        // Host-authoritative warnings must be in the output, not the Lua-side one.
+        assert_eq!(
+            warns_arr.len(),
+            1,
+            "must have exactly one warning: {warns_arr:?}"
+        );
+        assert_eq!(
+            warns_arr[0], UNMARKED_LIBRARY_SUGGESTION,
+            "host warnings must win over Lua meta.warnings"
+        );
+    }
 }

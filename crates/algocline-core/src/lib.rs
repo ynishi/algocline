@@ -20,7 +20,7 @@ pub use custom::{CustomMetrics, CustomMetricsHandle};
 pub use engine_api::{EngineApi, QueryResponse};
 pub use metrics::{ExecutionMetrics, MetricsObserver, StatsHandle};
 pub use observer::ExecutionObserver;
-pub use pkg::{PkgEntity, PkgType};
+pub use pkg::{PkgEntity, PkgType, TypeSource};
 pub use progress::{ProgressHandle, ProgressInfo};
 pub use query::{LlmQuery, QueryId};
 pub use recent_log::{LogEntry, LogSink};

@@ -7260,3 +7260,150 @@ async fn test_alc_setting_resolve_rejects_invalid_target_name() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_pkg_doctor / alc_pkg_list — unmarked_library + warnings ──────────────
+
+/// T1: auto-detected library package (no `M.run`, no `M.meta.type`) is flagged
+/// in the `unmarked_library` bucket with the expected name, kind, and suggestion.
+///
+/// Exercises the Lua VM path (Path B: `LUA_TYPE_AUTODETECT` via `eval_simple`)
+/// through the full MCP wire layer.
+///
+/// Crux constraint: `AutoDetectedLibrary` type_source must produce an
+/// `unmarked_library` entry in the doctor response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pkg_doctor_detects_unmarked_library() {
+    let alc_home = tempfile::tempdir().unwrap();
+    pre_install_pkg(
+        alc_home.path(),
+        "auto_lib_pkg_unmarked",
+        &[(
+            "init.lua",
+            concat!(
+                "local M = {}\n",
+                "M.meta = { name = \"auto_lib_pkg_unmarked\", version = \"0.1.0\" }\n",
+                // No M.run → auto-detected library via both Path A (Rust parser) and
+                // Path B (LUA_TYPE_AUTODETECT). Double-quoted strings required for
+                // parse_from_init_lua (Path A).
+                "return M\n",
+            ),
+        )],
+    );
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
+
+    let unmarked = result["unmarked_library"]
+        .as_array()
+        .expect("unmarked_library must be an array");
+    let entry = unmarked
+        .iter()
+        .find(|e| e["name"] == "auto_lib_pkg_unmarked")
+        .unwrap_or_else(|| {
+            panic!("auto_lib_pkg_unmarked not found in unmarked_library, got: {result}")
+        });
+    assert_eq!(
+        entry["kind"], "unmarked_library",
+        "kind must be unmarked_library, got: {entry}"
+    );
+    assert!(
+        entry["suggestion"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Add M.meta.type = \"library\""),
+        "suggestion must contain 'Add M.meta.type = \"library\"', got: {entry}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T2 (negative / crux): a package with `M.meta.type = "library"` explicitly set
+/// must NOT appear in the `unmarked_library` bucket.
+///
+/// Crux constraint (Warn gate excludes None/legacy entries): only
+/// `AutoDetectedLibrary` triggers the warning; `Explicit` must not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pkg_doctor_explicit_library_no_unmarked() {
+    let alc_home = tempfile::tempdir().unwrap();
+    pre_install_pkg(
+        alc_home.path(),
+        "explicit_lib_pkg_e2e",
+        &[(
+            "init.lua",
+            concat!(
+                "local M = {}\n",
+                // Explicit type declaration — parse_from_init_lua (Path A) sets
+                // type_source = Explicit. Double-quoted strings required for the
+                // Rust static parser.
+                "M.meta = { name = \"explicit_lib_pkg_e2e\", version = \"0.1.0\", type = \"library\" }\n",
+                "return M\n",
+            ),
+        )],
+    );
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
+
+    let unmarked = result["unmarked_library"]
+        .as_array()
+        .expect("unmarked_library must be an array");
+    assert!(
+        unmarked.iter().all(|e| e["name"] != "explicit_lib_pkg_e2e"),
+        "explicit_lib_pkg_e2e must NOT appear in unmarked_library, got: {result}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T3: auto-detected library package appears in `alc_pkg_list` with a `warnings`
+/// array containing the suggestion to add explicit `M.meta.type = "library"`.
+///
+/// Exercises the Lua VM path (Path B) through the pkg_list MCP wire layer.
+///
+/// Crux constraint: `AutoDetectedLibrary` must populate `warnings` in the list
+/// entry; Explicit / None entries must not have a `warnings` field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pkg_list_emits_warnings_for_auto_library() {
+    let alc_home = tempfile::tempdir().unwrap();
+    pre_install_pkg(
+        alc_home.path(),
+        "auto_lib_pkg_warnings",
+        &[(
+            "init.lua",
+            concat!(
+                "local M = {}\n",
+                // Double-quoted strings required for parse_from_init_lua (Path A).
+                "M.meta = { name = \"auto_lib_pkg_warnings\", version = \"0.1.0\" }\n",
+                // No M.run → auto-detected library (Path B via LUA_TYPE_AUTODETECT)
+                "return M\n",
+            ),
+        )],
+    );
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    // limit=0 disables the default 50-item cap. Without it, packages from
+    // ~/.algocline/packages (installed_at=None) sort before our fixture
+    // package (installed_at="2026-01-01") in the -active,-installed_at
+    // descending order (nulls sort first in desc), potentially truncating it.
+    let result = call_json(&client, "alc_pkg_list", serde_json::json!({ "limit": 0 })).await;
+
+    let packages = result["packages"]
+        .as_array()
+        .expect("packages must be an array");
+    let entry = packages
+        .iter()
+        .find(|p| p["name"] == "auto_lib_pkg_warnings")
+        .unwrap_or_else(|| panic!("auto_lib_pkg_warnings not found in packages, got: {result}"));
+    let warnings = entry["warnings"].as_array().unwrap_or_else(|| {
+        panic!("warnings must be an array for auto-detected library, got entry: {entry}")
+    });
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or("")
+            .contains("Add M.meta.type = \"library\"")),
+        "warnings must contain suggestion to add M.meta.type = \"library\", got: {entry}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

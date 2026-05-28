@@ -926,6 +926,7 @@ fn merge(app_dir: &AppDir, remote: &HubIndex) -> Result<Vec<SearchResult>, Strin
             docstring: None,
             tags: None,
             pkg_type: Some(PkgType::Runnable),
+            type_source: None,
         });
         results.push(SearchResult {
             entity,
@@ -1655,6 +1656,7 @@ mod tests {
                     docstring: None,
                     tags: None,
                     pkg_type: None,
+                    type_source: None,
                 },
                 source: PackageSource::Unknown,
                 card_count: 0,
@@ -1687,6 +1689,7 @@ mod tests {
                 docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
                 tags: None,
                 pkg_type: None,
+                type_source: None,
             },
             source: PackageSource::Unknown,
             installed: true,
@@ -1719,6 +1722,7 @@ mod tests {
                 docstring: Some("Based on FrugalGPT. Uses Thompson Sampling.".into()),
                 tags: None,
                 pkg_type: None,
+                type_source: None,
             },
             source: PackageSource::Git {
                 url: "https://example.com/cascade".into(),
@@ -2356,6 +2360,7 @@ mod tests {
                         docstring: None,
                         tags: None,
                         pkg_type: None,
+                        type_source: None,
                     },
                     source: PackageSource::Unknown,
                     card_count: 0,

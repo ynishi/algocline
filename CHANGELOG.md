@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `alc-adviser` agent: Design Consultation mode. When the query expresses a build intent ("I want to build ...", "How should I combine ..."), the adviser switches from lookup mode to design consultation, searching existing packages as building blocks, finding reference implementations, and returning a `### Design Proposal` with architecture sketch and package combination suggestions. No Rust changes required — the mode uses existing MCP tools (`alc_pkg_list`, `alc_hub_search`, `alc_hub_info`).
+- `PkgEntity` now carries a `type_source` field (`"explicit"` | `"auto_detected_runnable"` | `"auto_detected_library"`) recording the provenance of `pkg_type`. Backward-compatible via `#[serde(default)]`; legacy entries deserialize as `None`. Path A (`parse_from_init_lua`) and Path B (`LUA_TYPE_AUTODETECT` Lua snippet) both populate `type_source` independently.
+- `alc_pkg_doctor`: new `unmarked_library` diagnostic bucket (11 total). Flags packages auto-detected as libraries (no `M.run`, no `M.meta.type`) and suggests adding `M.meta.type = "library"` for explicit declaration. Packages with `M.meta.type` explicitly set are unaffected; legacy entries without `type_source` are never flagged.
+- `alc_pkg_list`: each package entry now includes an optional `warnings` array. When a package is auto-detected as a library, the entry carries a suggestion to declare `M.meta.type = "library"` explicitly. Field is omitted for entries without warnings.
 
 ## [0.39.0] - 2026-05-28
 

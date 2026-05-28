@@ -7407,3 +7407,71 @@ async fn e2e_pkg_list_emits_warnings_for_auto_library() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// T1 (alive-symlink path): a package installed as an alive symlink under
+/// `~/.algocline/packages/` that is NOT registered in `installed.json`,
+/// `alc.toml`, or `alc.local.toml` must appear in the `unmarked_library`
+/// bucket when the package is auto-detected as a library (no `M.run`, no
+/// `M.meta.type`).
+///
+/// Crux constraint §1: each symlink is evaluated individually via
+/// `fs::metadata` (following the link); alive symlinks are never silently
+/// dropped by the `!meta.is_dir()` guard in `collect_unregistered_pkg_dirs`.
+/// Crux constraint §2: `parse_from_init_lua` is called per candidate;
+/// `AutoDetectedLibrary` routes to `unmarked_library`.
+/// Crux constraint §3: only existing bucket fields receive additive entries;
+/// no new top-level keys are asserted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pkg_doctor_detects_unmarked_library_for_alive_symlink() {
+    let alc_home = tempfile::tempdir().unwrap();
+    // Second tempdir for the symlink target — must outlive the MCP client call.
+    let target_dir = tempfile::tempdir().unwrap();
+
+    // Write init.lua into the real target dir (auto-detected library: no M.run, no M.meta.type).
+    std::fs::write(
+        target_dir.path().join("init.lua"),
+        concat!(
+            "local M = {}\n",
+            "M.meta = { name = \"alive_symlink_unmarked\", version = \"0.1.0\" }\n",
+            "return M\n",
+        ),
+    )
+    .expect("write init.lua");
+
+    // Create packages/ dir before symlinking (nested dir needs create_dir_all).
+    let packages_dir = alc_home.path().join("packages");
+    std::fs::create_dir_all(&packages_dir).expect("create packages dir");
+
+    // Symlink: packages/alive_symlink_unmarked -> target_dir.
+    // Argument order: symlink(original, link) — first arg is the real path.
+    let link_path = packages_dir.join("alive_symlink_unmarked");
+    std::os::unix::fs::symlink(target_dir.path(), &link_path).expect("create symlink");
+    // DO NOT create installed.json — intentionally absent (the coverage-gap scenario).
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
+
+    let unmarked = result["unmarked_library"]
+        .as_array()
+        .expect("unmarked_library must be an array");
+    let entry = unmarked
+        .iter()
+        .find(|e| e["name"] == "alive_symlink_unmarked")
+        .unwrap_or_else(|| {
+            panic!("alive_symlink_unmarked not found in unmarked_library, got: {result}")
+        });
+    assert_eq!(
+        entry["kind"], "unmarked_library",
+        "kind must be unmarked_library, got: {entry}"
+    );
+    assert!(
+        entry["suggestion"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Add M.meta.type = \"library\""),
+        "suggestion must contain 'Add M.meta.type = \"library\"', got: {entry}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

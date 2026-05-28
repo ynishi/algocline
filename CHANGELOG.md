@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `alc_pkg_doctor`: new `unmarked_library` diagnostic bucket (11 total). Flags packages auto-detected as libraries (no `M.run`, no `M.meta.type`) and suggests adding `M.meta.type = "library"` for explicit declaration. Packages with `M.meta.type` explicitly set are unaffected; legacy entries without `type_source` are never flagged.
 - `alc_pkg_list`: each package entry now includes an optional `warnings` array. When a package is auto-detected as a library, the entry carries a suggestion to declare `M.meta.type = "library"` explicitly. Field is omitted for entries without warnings.
 
+### Fixed
+
+- `alc_pkg_doctor`: alive symlinks under `~/.algocline/packages/` that are not registered in `installed.json`, `alc.toml`, or `alc.local.toml` are now reported (additive entries into `unmarked_library` or `unregistered_pkg`; JSON shape unchanged).
+
 ## [0.39.0] - 2026-05-28
 
 ### Added

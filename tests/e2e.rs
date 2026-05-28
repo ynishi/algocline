@@ -7475,3 +7475,65 @@ async fn e2e_pkg_doctor_detects_unmarked_library_for_alive_symlink() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// Verify that 5 known packages (alc_shapes / crdt_doc / ddd / lshape / swarm_frame)
+/// placed as alive symlinks with minimal auto-detected library init.lua all appear in
+/// the `unmarked_library` bucket returned by `alc_pkg_doctor`.
+///
+/// Each fixture has `M.meta` (no `M.run`, no `M.meta.type`) so that the runtime
+/// `eval_simple + LUA_TYPE_AUTODETECT` path classifies them as `auto_detected_library`
+/// which maps to `unmarked_library` in the doctor output.
+///
+/// Crux constraint: detection must go through `eval_simple` (not `parse_from_init_lua`).
+/// This test exercises that unified path end-to-end for 5 previously-misclassified packages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pkg_doctor_unmarked_library_5_known_packages() {
+    let alc_home = tempfile::tempdir().unwrap();
+    // Shared target root; each package gets its own subdir here.
+    // Must outlive the MCP client call (drop order: last declared = first dropped).
+    let target_root = tempfile::tempdir().unwrap();
+
+    let packages = ["alc_shapes", "crdt_doc", "ddd", "lshape", "swarm_frame"];
+
+    let packages_dir = alc_home.path().join("packages");
+    std::fs::create_dir_all(&packages_dir).expect("create packages dir");
+
+    // For each package: create real dir + init.lua, then symlink from packages_dir.
+    for pkg in &packages {
+        let real_dir = target_root.path().join(pkg);
+        std::fs::create_dir_all(&real_dir).unwrap_or_else(|e| panic!("create dir for {pkg}: {e}"));
+        std::fs::write(
+            real_dir.join("init.lua"),
+            format!(
+                "local M = {{}}\nM.meta = {{ name = \"{pkg}\", version = \"0.1.0\" }}\nreturn M\n"
+            ),
+        )
+        .unwrap_or_else(|e| panic!("write init.lua for {pkg}: {e}"));
+
+        let link_path = packages_dir.join(pkg);
+        std::os::unix::fs::symlink(&real_dir, &link_path)
+            .unwrap_or_else(|e| panic!("create symlink for {pkg}: {e}"));
+        // DO NOT create installed.json — intentionally absent (alive unregistered symlink scenario).
+    }
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
+
+    let unmarked = result["unmarked_library"]
+        .as_array()
+        .expect("unmarked_library must be an array");
+
+    for pkg in &packages {
+        let entry = unmarked
+            .iter()
+            .find(|e| e["name"] == *pkg)
+            .unwrap_or_else(|| panic!("{pkg} not found in unmarked_library, got: {result}"));
+        assert_eq!(
+            entry["kind"], "unmarked_library",
+            "kind must be unmarked_library for {pkg}, got: {entry}"
+        );
+    }
+
+    client.cancel().await.expect("cancel failed");
+}

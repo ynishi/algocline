@@ -75,6 +75,43 @@ impl FromStr for PkgType {
     }
 }
 
+/// Records how `pkg_type` was determined for a package.
+///
+/// This is stored alongside `PkgType` in `PkgEntity.type_source` so
+/// downstream consumers (`alc_pkg_doctor`, `alc_pkg_list`) can distinguish
+/// packages that were auto-detected as libraries from packages that
+/// explicitly declared their type — and emit a targeted suggestion in the
+/// former case.
+///
+/// Wire format: `"explicit"` / `"auto_detected_runnable"` /
+/// `"auto_detected_library"` (snake_case via `#[serde(rename_all = "snake_case")]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeSource {
+    /// `M.meta.type` was present in the package source — type is authoritative.
+    Explicit,
+    /// `M.meta.type` was absent; the package was classified as `runnable`
+    /// because `M.run` is defined (offline Rust path or Lua VM detection).
+    AutoDetectedRunnable,
+    /// `M.meta.type` was absent; the package was classified as `library`
+    /// because no `M.run` was found. Consider adding `M.meta.type = "library"`
+    /// to make this explicit.
+    AutoDetectedLibrary,
+}
+
+impl FromStr for TypeSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "explicit" => Ok(Self::Explicit),
+            "auto_detected_runnable" => Ok(Self::AutoDetectedRunnable),
+            "auto_detected_library" => Ok(Self::AutoDetectedLibrary),
+            other => Err(format!("unknown type_source: {other:?}")),
+        }
+    }
+}
+
 /// Canonical projection of a Lua package's `M.meta` block.
 ///
 /// `name` is required (= hub-index inclusion gate). Other fields are
@@ -97,6 +134,11 @@ pub struct PkgEntity {
     /// the wire. `None` means the type was not determined (legacy entries).
     #[serde(default, rename = "type")]
     pub pkg_type: Option<PkgType>,
+    /// Records how `pkg_type` was determined. `None` for legacy entries that
+    /// pre-date provenance tracking (`#[serde(default)]` ensures backward
+    /// compatibility with existing `hub_index.json` consumers).
+    #[serde(default)]
+    pub type_source: Option<TypeSource>,
 }
 
 impl PkgEntity {
@@ -120,15 +162,25 @@ impl PkgEntity {
         let content = std::fs::read_to_string(path).ok()?;
         let parsed = parse_meta(&content)?;
         let docstring = extract_docstring_from(&content);
-        // Resolve type: use explicit M.meta.type if present; otherwise fall
-        // back to Rust text-scan (build_index / offline batch path).
-        let pkg_type = parsed.pkg_type.or_else(|| {
-            Some(if detect_has_run(&content) {
-                PkgType::Runnable
-            } else {
-                PkgType::Library
-            })
-        });
+        // Resolve type and provenance: explicit M.meta.type wins; otherwise
+        // fall back to Rust text-scan (build_index / offline batch path) and
+        // record that the type was auto-detected.
+        let (pkg_type, type_source) = match parsed.pkg_type {
+            Some(t) => (Some(t), Some(TypeSource::Explicit)),
+            None => {
+                if detect_has_run(&content) {
+                    (
+                        Some(PkgType::Runnable),
+                        Some(TypeSource::AutoDetectedRunnable),
+                    )
+                } else {
+                    (
+                        Some(PkgType::Library),
+                        Some(TypeSource::AutoDetectedLibrary),
+                    )
+                }
+            }
+        };
         Some(PkgEntity {
             name: parsed.name,
             version: option_from_str(parsed.version),
@@ -141,6 +193,7 @@ impl PkgEntity {
                 Some(parsed.tags)
             },
             pkg_type,
+            type_source,
         })
     }
 }
@@ -666,6 +719,7 @@ return M
             docstring: None,
             tags: None,
             pkg_type: None,
+            type_source: None,
         };
         let json = serde_json::to_string(&pkg).unwrap();
         assert!(json.contains("\"version\":null"), "version null: {json}");
@@ -821,6 +875,7 @@ return M
             docstring: None,
             tags: None,
             pkg_type: Some(PkgType::Library),
+            type_source: None,
         };
         let json = serde_json::to_string(&pkg).unwrap();
         assert!(
@@ -841,6 +896,133 @@ return M
         assert!(
             pkg.pkg_type.is_none(),
             "missing 'type' key must deserialize as None"
+        );
+    }
+
+    // ─── TypeSource / type_source provenance tests ───────────────
+
+    #[test]
+    fn parse_explicit_type_sets_source_explicit() {
+        // Acceptance criterion: M.meta.type = "library" explicit → type_source == Explicit
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "explicit_lib",
+    type = "library",
+    version = "1.0.0",
+}
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
+        assert_eq!(
+            pkg.type_source,
+            Some(TypeSource::Explicit),
+            "explicit M.meta.type must yield TypeSource::Explicit"
+        );
+    }
+
+    #[test]
+    fn parse_auto_detect_runnable_sets_source() {
+        // Acceptance criterion: type absent + M.run present → AutoDetectedRunnable
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "auto_run",
+    version = "0.1.0",
+}
+function M.run(ctx)
+    return alc.llm("hello")
+end
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Runnable));
+        assert_eq!(
+            pkg.type_source,
+            Some(TypeSource::AutoDetectedRunnable),
+            "M.run present without explicit type must yield AutoDetectedRunnable"
+        );
+    }
+
+    #[test]
+    fn parse_auto_detect_library_sets_source() {
+        // Acceptance criterion: type absent + no M.run → AutoDetectedLibrary
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "auto_lib",
+    description = "A pure library",
+}
+function M.create(opts)
+    return {}
+end
+return M
+"#,
+        );
+
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
+        assert_eq!(
+            pkg.type_source,
+            Some(TypeSource::AutoDetectedLibrary),
+            "no M.run and no explicit type must yield AutoDetectedLibrary"
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_with_type_source() {
+        // Acceptance criterion: TypeSource::AutoDetectedLibrary JSON round-trip
+        // → wire string "auto_detected_library"
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_init_lua(
+            tmp.path(),
+            r#"
+local M = {}
+M.meta = {
+    name = "rt_lib",
+}
+return M
+"#,
+        );
+        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
+        assert_eq!(pkg.type_source, Some(TypeSource::AutoDetectedLibrary));
+
+        let json = serde_json::to_string(&pkg).unwrap();
+        assert!(
+            json.contains("\"type_source\":\"auto_detected_library\""),
+            "wire string must be 'auto_detected_library': {json}"
+        );
+
+        let back: PkgEntity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.type_source, Some(TypeSource::AutoDetectedLibrary));
+        assert_eq!(back, pkg);
+    }
+
+    #[test]
+    fn serde_deserialize_missing_type_source_is_none() {
+        // Acceptance criterion: JSON without "type_source" key → type_source == None
+        // (backward compat for legacy hub_index.json entries)
+        let json = r#"{"name":"legacy_no_source","type":"library"}"#;
+        let pkg: PkgEntity = serde_json::from_str(json).unwrap();
+        assert_eq!(pkg.name, "legacy_no_source");
+        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
+        assert!(
+            pkg.type_source.is_none(),
+            "missing 'type_source' key must deserialize as None (legacy compat)"
         );
     }
 }

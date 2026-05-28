@@ -15,12 +15,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use algocline_core::{PkgEntity, TypeSource};
-
 use super::super::alc_toml::{self, PackageDep};
 use super::super::lockfile::load_lockfile;
 use super::super::manifest::{load_manifest, ManifestEntry};
-use super::super::resolve::packages_dir;
+use super::super::resolve::{packages_dir, LUA_TYPE_AUTODETECT};
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::install::InstallSource;
@@ -81,15 +79,14 @@ pub(super) fn symlink_dangling_suggestion(name: &str) -> String {
 /// Routing bucket for alive-symlink entries detected by
 /// `collect_alive_unregistered_symlinks`. The JSON shape is built by
 /// `run_alive_unregistered_symlink_pass` in `doctor.rs`.
-// Used by doctor.rs run_alive_unregistered_symlink_pass (Subtask 2).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum AliveBucket {
-    /// `type_source == AutoDetectedLibrary` — no explicit `M.meta.type` in
-    /// init.lua; routes to the `unmarked_library` doctor bucket.
+    /// `type_source == "auto_detected_library"` from the Lua VM eval —
+    /// no explicit `M.meta.type` in init.lua; routes to the `unmarked_library`
+    /// doctor bucket.
     UnmarkedLibrary,
-    /// All other entries (explicit type, auto-detected runnable, or
-    /// `parse_from_init_lua` returned `None`) — routes to `unregistered_pkg`.
+    /// All other entries (explicit type, auto-detected runnable, eval failure,
+    /// or type_source absent) — routes to `unregistered_pkg`.
     Unregistered,
 }
 
@@ -660,152 +657,196 @@ pub(super) fn collect_unregistered_pkg_dirs(
     Ok(entries)
 }
 
-/// Walk `pkg_dir` and collect **alive symlinks** that contain `init.lua` at the
-/// resolved target but are not registered in any of the three authoritative
-/// sources: `installed.json` (manifest), `alc.toml [packages]`, or
-/// `alc.local.toml [packages]`.
+/// Returns `true` iff `name` is safe to interpolate into a Lua `require()` call.
 ///
-/// Unlike `collect_unregistered_pkg_dirs` (physical dirs only) and
-/// `collect_unattached_dangling_symlinks` (dangling symlinks only), this
-/// helper exclusively handles alive symlinks — those where the link target
-/// exists and is reachable via `path.try_exists()`.
-///
-/// Each qualifying entry is classified into an [`AliveBucket`] by inspecting
-/// the `type_source` field via [`PkgEntity::parse_from_init_lua`]:
-///
-/// - `TypeSource::AutoDetectedLibrary` → [`AliveBucket::UnmarkedLibrary`]
-/// - All other values (Explicit, AutoDetectedRunnable) and `None` →
-///   [`AliveBucket::Unregistered`]
-///
-/// JSON shape construction is deferred to `run_alive_unregistered_symlink_pass`
-/// in `doctor.rs`; this function is detection-only.
-///
-/// # Arguments
-///
-/// * `pkg_dir` — `~/.algocline/packages/` (or the path under test)
-/// * `registered` — set of package names known to any registration source
-/// * `registered_paths` — canonicalized absolute paths declared in
-///   `[packages.x] path = "..."` entries from alc.toml / alc.local.toml; used
-///   to skip false positives where a path-dep symlink resolves to a registered dir
-/// * `target_filter` — when `Some(name)`, restrict output to that single name
-///
-/// # Returns
-///
-/// A `Vec<(String, AliveBucket)>` of `(pkg_name, bucket)` pairs on success.
-///
-/// # Errors
-///
-/// Returns `Err(String)` if `pkg_dir` exists but cannot be read (any `io::Error`
-/// other than `NotFound`). `NotFound` is treated as empty (no packages installed)
-/// and returns `Ok(vec![])`. Individual entry stat failures emit a `tracing::warn!`
-/// and continue. `canonicalize` failure returns `Err` (same as the dir helper).
-// Used by doctor.rs run_alive_unregistered_symlink_pass (Subtask 2).
-#[allow(dead_code)]
-pub(super) fn collect_alive_unregistered_symlinks(
-    pkg_dir: &Path,
-    registered: &HashSet<String>,
-    registered_paths: &[PathBuf],
-    target_filter: Option<&str>,
-) -> Result<Vec<(String, AliveBucket)>, String> {
-    let read = match std::fs::read_dir(pkg_dir) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // packages_dir absent == empty, not an error (file absent === empty).
-            return Ok(vec![]);
-        }
-        Err(e) => {
-            return Err(format!(
-                "pkg: failed to read packages_dir at {}: {e}",
-                pkg_dir.display()
-            ));
-        }
-    };
+/// Accepts ASCII alphanumerics, `_` and `-`. Empty strings are rejected.
+/// Mirrors the implementation in `list.rs` (which also allows `-` for hyphenated
+/// package names such as `crdt-doc`).
+fn is_safe_pkg_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
 
-    let mut entries = Vec::new();
-
-    for dir_entry_result in read {
-        let dir_entry = match dir_entry_result {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    "pkg: skipping unreadable entry in {}: {e}",
-                    pkg_dir.display()
-                );
-                continue;
+impl AppService {
+    /// Walk `pkg_dir` and collect **alive symlinks** that contain `init.lua` at the
+    /// resolved target but are not registered in any of the three authoritative
+    /// sources: `installed.json` (manifest), `alc.toml [packages]`, or
+    /// `alc.local.toml [packages]`.
+    ///
+    /// Unlike `collect_unregistered_pkg_dirs` (physical dirs only) and
+    /// `collect_unattached_dangling_symlinks` (dangling symlinks only), this
+    /// helper exclusively handles alive symlinks — those where the link target
+    /// exists and is reachable via `path.try_exists()`.
+    ///
+    /// Each qualifying entry is classified into an [`AliveBucket`] by executing
+    /// the `LUA_TYPE_AUTODETECT` snippet via `eval_simple_with_paths` — the same
+    /// runtime path used by `pkg_list`. The `type_source` field in the returned
+    /// meta determines the bucket:
+    ///
+    /// - `"auto_detected_library"` → [`AliveBucket::UnmarkedLibrary`]
+    /// - All other values (explicit, auto_detected_runnable, eval failure, or
+    ///   absent) → [`AliveBucket::Unregistered`]
+    ///
+    /// JSON shape construction is deferred to `run_alive_unregistered_symlink_pass`
+    /// in `doctor.rs`; this method is detection-only.
+    ///
+    /// # Arguments
+    ///
+    /// * `pkg_dir` — `~/.algocline/packages/` (or the path under test)
+    /// * `registered` — set of package names known to any registration source
+    /// * `registered_paths` — canonicalized absolute paths declared in
+    ///   `[packages.x] path = "..."` entries from alc.toml / alc.local.toml; used
+    ///   to skip false positives where a path-dep symlink resolves to a registered dir
+    /// * `target_filter` — when `Some(name)`, restrict output to that single name
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<(String, AliveBucket)>` of `(pkg_name, bucket)` pairs on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` if `pkg_dir` exists but cannot be read (any `io::Error`
+    /// other than `NotFound`). `NotFound` is treated as empty (no packages installed)
+    /// and returns `Ok(vec![])`. Individual entry stat or eval failures emit a
+    /// `tracing::warn!` and continue. `canonicalize` failure returns `Err`.
+    pub(super) async fn collect_alive_unregistered_symlinks(
+        &self,
+        pkg_dir: &Path,
+        registered: &HashSet<String>,
+        registered_paths: &[PathBuf],
+        target_filter: Option<&str>,
+    ) -> Result<Vec<(String, AliveBucket)>, String> {
+        let read = match std::fs::read_dir(pkg_dir) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // packages_dir absent == empty, not an error (file absent === empty).
+                return Ok(vec![]);
             }
-        };
-
-        let path = dir_entry.path();
-        let pkg_name = dir_entry.file_name().to_string_lossy().to_string();
-
-        // When a specific target is requested, skip all others.
-        if let Some(target) = target_filter {
-            if target != pkg_name.as_str() {
-                continue;
-            }
-        }
-
-        // Skip if name is already in one of the three registration sources.
-        if registered.contains(&pkg_name) {
-            continue;
-        }
-
-        // Only symlinks qualify for this pass (crux §1: individual evaluation).
-        let meta = match path.symlink_metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("pkg: cannot stat {}: {e}", path.display());
-                continue;
-            }
-        };
-        if !meta.file_type().is_symlink() {
-            // Physical dirs are handled by collect_unregistered_pkg_dirs; skip here.
-            continue;
-        }
-
-        // Only alive symlinks — dangling ones belong to collect_unattached_dangling_symlinks.
-        // `try_exists` follows the link: true iff target is reachable (crux §1).
-        let target_exists = path.try_exists().unwrap_or(false);
-        if !target_exists {
-            continue;
-        }
-
-        // Link target must have an init.lua (follow through symlink via std::fs::exists).
-        if !path.join("init.lua").exists() {
-            continue;
-        }
-
-        // Canonical path comparison: skip if any alc.toml / alc.local.toml
-        // path entry resolves to the same physical directory (false-positive guard).
-        // `canonicalize` follows the symlink and returns the link target's absolute path.
-        let canonical_pkg_path = match path.canonicalize() {
-            Ok(c) => c,
             Err(e) => {
                 return Err(format!(
-                    "pkg: failed to canonicalize symlink target {}: {e}",
-                    path.display()
+                    "pkg: failed to read packages_dir at {}: {e}",
+                    pkg_dir.display()
                 ));
             }
         };
-        if registered_paths.contains(&canonical_pkg_path) {
-            continue;
+
+        let mut entries = Vec::new();
+
+        for dir_entry_result in read {
+            let dir_entry = match dir_entry_result {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        "pkg: skipping unreadable entry in {}: {e}",
+                        pkg_dir.display()
+                    );
+                    continue;
+                }
+            };
+
+            let path = dir_entry.path();
+            let pkg_name = dir_entry.file_name().to_string_lossy().to_string();
+
+            // When a specific target is requested, skip all others.
+            if let Some(target) = target_filter {
+                if target != pkg_name.as_str() {
+                    continue;
+                }
+            }
+
+            // Skip if name is already in one of the three registration sources.
+            if registered.contains(&pkg_name) {
+                continue;
+            }
+
+            // Only symlinks qualify for this pass.
+            let meta = match path.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("pkg: cannot stat {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if !meta.file_type().is_symlink() {
+                // Physical dirs are handled by collect_unregistered_pkg_dirs; skip here.
+                continue;
+            }
+
+            // Only alive symlinks — dangling ones belong to collect_unattached_dangling_symlinks.
+            // `try_exists` follows the link: true iff target is reachable.
+            let target_exists = path.try_exists().unwrap_or(false);
+            if !target_exists {
+                continue;
+            }
+
+            // Link target must have an init.lua (follow through symlink via std::fs::exists).
+            if !path.join("init.lua").exists() {
+                continue;
+            }
+
+            // Canonical path comparison: skip if any alc.toml / alc.local.toml
+            // path entry resolves to the same physical directory (false-positive guard).
+            // `canonicalize` follows the symlink and returns the link target's absolute path.
+            let canonical_pkg_path = match path.canonicalize() {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(format!(
+                        "pkg: failed to canonicalize symlink target {}: {e}",
+                        path.display()
+                    ));
+                }
+            };
+            if registered_paths.contains(&canonical_pkg_path) {
+                continue;
+            }
+
+            // Classify via eval_simple + LUA_TYPE_AUTODETECT — same runtime path as
+            // pkg_list. pkg_dir is passed as an extra lib path so require() resolves
+            // the package in both production (~/.algocline/packages/) and tests.
+            let bucket = if is_safe_pkg_name(&pkg_name) {
+                let code = format!(
+                    r#"package.loaded["{pkg_name}"] = nil
+local pkg = require("{pkg_name}")
+local meta = pkg.meta or {{ name = "{pkg_name}" }}
+{LUA_TYPE_AUTODETECT}
+return meta"#,
+                    pkg_name = pkg_name,
+                    LUA_TYPE_AUTODETECT = LUA_TYPE_AUTODETECT,
+                );
+                match self
+                    .executor
+                    .eval_simple_with_paths(code, vec![pkg_dir.to_path_buf()], vec![])
+                    .await
+                {
+                    Ok(meta) => {
+                        if meta.get("type_source").and_then(|v| v.as_str())
+                            == Some("auto_detected_library")
+                        {
+                            AliveBucket::UnmarkedLibrary
+                        } else {
+                            AliveBucket::Unregistered
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "pkg: alive-symlink type_source eval failed for {pkg_name}: {e}"
+                        );
+                        AliveBucket::Unregistered
+                    }
+                }
+            } else {
+                // Unsafe name cannot be interpolated into require() — skip eval,
+                // fall back to Unregistered.
+                AliveBucket::Unregistered
+            };
+
+            entries.push((pkg_name, bucket));
         }
 
-        // Classify via type_source (crux §2: must call parse_from_init_lua per entry).
-        let init_lua = path.join("init.lua");
-        let bucket = match PkgEntity::parse_from_init_lua(&init_lua) {
-            Some(entity) if entity.type_source == Some(TypeSource::AutoDetectedLibrary) => {
-                AliveBucket::UnmarkedLibrary
-            }
-            // None (unreadable / no M.meta.name) and all other TypeSource variants
-            // → Unregistered (crux §2: never collapse to a single bucket).
-            _ => AliveBucket::Unregistered,
-        };
-
-        entries.push((pkg_name, bucket));
+        Ok(entries)
     }
-
-    Ok(entries)
 }
 
 #[cfg(test)]
@@ -814,12 +855,13 @@ mod tests {
 
     #[cfg(unix)]
     mod alive_symlink_tests {
+        use super::super::super::super::test_support::make_app_service_at;
         use super::*;
         use std::os::unix::fs::symlink as unix_symlink;
 
         /// Write a minimal init.lua with `M.meta.name` but no explicit type and no
-        /// `alc.run()` call — `parse_from_init_lua` will classify this as
-        /// `TypeSource::AutoDetectedLibrary`.
+        /// `M.run` function — `LUA_TYPE_AUTODETECT` will classify this as
+        /// `type_source = "auto_detected_library"`.
         fn write_auto_library_init_lua(pkg_dir: &std::path::Path, pkg_name: &str) {
             let pkg = pkg_dir.join(pkg_name);
             std::fs::create_dir_all(&pkg).expect("create pkg dir");
@@ -831,7 +873,8 @@ mod tests {
         }
 
         /// Write an init.lua with an explicit `M.meta.type = "library"` — this
-        /// gives `TypeSource::Explicit`, so the entry must go to `Unregistered`.
+        /// gives `type_source = "explicit"` via `LUA_TYPE_AUTODETECT`, so the
+        /// entry must go to `Unregistered`.
         fn write_explicit_type_init_lua(pkg_dir: &std::path::Path, pkg_name: &str) {
             let pkg = pkg_dir.join(pkg_name);
             std::fs::create_dir_all(&pkg).expect("create pkg dir");
@@ -845,8 +888,8 @@ mod tests {
         }
 
         /// (a) A dangling symlink (target directory absent) must be excluded.
-        #[test]
-        fn dangling_symlink_excluded() {
+        #[tokio::test]
+        async fn dangling_symlink_excluded() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let pkg_dir = tmp.path().join("packages");
             std::fs::create_dir_all(&pkg_dir).expect("create packages dir");
@@ -856,11 +899,13 @@ mod tests {
             unix_symlink(tmp.path().join("does_not_exist"), &link)
                 .expect("create dangling symlink");
 
+            let svc = make_app_service_at(tmp.path().to_path_buf()).await;
             let registered = HashSet::new();
             let registered_paths: Vec<PathBuf> = vec![];
-            let result =
-                collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
-                    .expect("helper should not error");
+            let result = svc
+                .collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
+                .await
+                .expect("helper should not error");
 
             assert!(
                 result.is_empty(),
@@ -868,10 +913,11 @@ mod tests {
             );
         }
 
-        /// (b) An alive symlink + unregistered + init.lua with AutoDetectedLibrary
-        /// (no explicit type, no alc.run) → `AliveBucket::UnmarkedLibrary`.
-        #[test]
-        fn alive_unregistered_auto_library_routes_to_unmarked_library() {
+        /// (b) An alive symlink + unregistered + init.lua with no explicit type and no
+        /// run function → `LUA_TYPE_AUTODETECT` sets type_source = "auto_detected_library"
+        /// → `AliveBucket::UnmarkedLibrary`.
+        #[tokio::test]
+        async fn alive_unregistered_auto_library_routes_to_unmarked_library() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let real_pkgs = tmp.path().join("real");
             let pkg_dir = tmp.path().join("packages");
@@ -884,11 +930,13 @@ mod tests {
             unix_symlink(real_pkgs.join("my_lib"), pkg_dir.join("my_lib"))
                 .expect("create alive symlink");
 
+            let svc = make_app_service_at(tmp.path().to_path_buf()).await;
             let registered = HashSet::new();
             let registered_paths: Vec<PathBuf> = vec![];
-            let result =
-                collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
-                    .expect("helper should not error");
+            let result = svc
+                .collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
+                .await
+                .expect("helper should not error");
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].0, "my_lib");
@@ -896,10 +944,10 @@ mod tests {
         }
 
         /// (c) An alive symlink + unregistered + init.lua with explicit
-        /// `M.meta.type = "library"` → `AliveBucket::Unregistered` (Explicit
-        /// type_source is not AutoDetectedLibrary).
-        #[test]
-        fn alive_unregistered_explicit_type_routes_to_unregistered() {
+        /// `M.meta.type = "library"` → `type_source = "explicit"` via
+        /// `LUA_TYPE_AUTODETECT` → `AliveBucket::Unregistered`.
+        #[tokio::test]
+        async fn alive_unregistered_explicit_type_routes_to_unregistered() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let real_pkgs = tmp.path().join("real");
             let pkg_dir = tmp.path().join("packages");
@@ -910,11 +958,13 @@ mod tests {
             unix_symlink(real_pkgs.join("explicit_lib"), pkg_dir.join("explicit_lib"))
                 .expect("create alive symlink");
 
+            let svc = make_app_service_at(tmp.path().to_path_buf()).await;
             let registered = HashSet::new();
             let registered_paths: Vec<PathBuf> = vec![];
-            let result =
-                collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
-                    .expect("helper should not error");
+            let result = svc
+                .collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
+                .await
+                .expect("helper should not error");
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].0, "explicit_lib");
@@ -922,8 +972,8 @@ mod tests {
         }
 
         /// (d) An alive symlink whose name appears in `registered` must be skipped.
-        #[test]
-        fn alive_registered_pkg_excluded() {
+        #[tokio::test]
+        async fn alive_registered_pkg_excluded() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let real_pkgs = tmp.path().join("real");
             let pkg_dir = tmp.path().join("packages");
@@ -934,12 +984,14 @@ mod tests {
             unix_symlink(real_pkgs.join("known_pkg"), pkg_dir.join("known_pkg"))
                 .expect("create alive symlink");
 
+            let svc = make_app_service_at(tmp.path().to_path_buf()).await;
             let mut registered = HashSet::new();
             registered.insert("known_pkg".to_string());
             let registered_paths: Vec<PathBuf> = vec![];
-            let result =
-                collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
-                    .expect("helper should not error");
+            let result = svc
+                .collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
+                .await
+                .expect("helper should not error");
 
             assert!(
                 result.is_empty(),
@@ -948,8 +1000,8 @@ mod tests {
         }
 
         /// (e) target_filter restricts output to the named package only.
-        #[test]
-        fn target_filter_restricts_output() {
+        #[tokio::test]
+        async fn target_filter_restricts_output() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let real_pkgs = tmp.path().join("real");
             let pkg_dir = tmp.path().join("packages");
@@ -963,15 +1015,18 @@ mod tests {
             unix_symlink(real_pkgs.join("lib_b"), pkg_dir.join("lib_b"))
                 .expect("create symlink lib_b");
 
+            let svc = make_app_service_at(tmp.path().to_path_buf()).await;
             let registered = HashSet::new();
             let registered_paths: Vec<PathBuf> = vec![];
-            let result = collect_alive_unregistered_symlinks(
-                &pkg_dir,
-                &registered,
-                &registered_paths,
-                Some("lib_a"),
-            )
-            .expect("helper should not error");
+            let result = svc
+                .collect_alive_unregistered_symlinks(
+                    &pkg_dir,
+                    &registered,
+                    &registered_paths,
+                    Some("lib_a"),
+                )
+                .await
+                .expect("helper should not error");
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].0, "lib_a");
@@ -979,8 +1034,8 @@ mod tests {
 
         /// (f) An entry whose canonicalized path appears in `registered_paths`
         /// must be skipped (path-dep false-positive guard).
-        #[test]
-        fn registered_path_dep_excluded() {
+        #[tokio::test]
+        async fn registered_path_dep_excluded() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let real_pkgs = tmp.path().join("real");
             let pkg_dir = tmp.path().join("packages");
@@ -994,11 +1049,13 @@ mod tests {
             // Canonicalize the real dir to simulate what registered_paths contains.
             let canonical = real_dir.canonicalize().expect("canonicalize real dir");
 
+            let svc = make_app_service_at(tmp.path().to_path_buf()).await;
             let registered = HashSet::new();
             let registered_paths = vec![canonical];
-            let result =
-                collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
-                    .expect("helper should not error");
+            let result = svc
+                .collect_alive_unregistered_symlinks(&pkg_dir, &registered, &registered_paths, None)
+                .await
+                .expect("helper should not error");
 
             assert!(
                 result.is_empty(),

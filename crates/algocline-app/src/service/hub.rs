@@ -1085,7 +1085,7 @@ return meta"#,
                 // source_dir mode: pkg is not in ~/.algocline, pass the pkg
                 // directory as an extra lib path so require() resolves.
                 executor
-                    .eval_simple_with_paths(code, vec![entry.path()], vec![])
+                    .eval_simple_with_paths(code, vec![pkg_dir.clone()], vec![])
                     .await
             } else {
                 executor.eval_simple(code).await

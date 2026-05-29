@@ -381,9 +381,9 @@ impl AppService {
     /// # Provenance
     ///
     /// The Lua snippet (`LUA_TYPE_AUTODETECT`) sets `meta.type_source` to one
-    /// of `"explicit"` / `"auto_detected_runnable"` / `"auto_detected_library"`
-    /// before control returns to Rust, so both fields are always populated when
-    /// the snippet runs without error.
+    /// of `"auto_detected_runnable"` / `"auto_detected_library"` before control
+    /// returns to Rust, so both fields are always populated when the snippet
+    /// runs without error.
     pub(crate) async fn resolve_pkg_type_lua(
         &self,
         name: &str,
@@ -1262,35 +1262,7 @@ mod tests {
         AppService::new(executor, log_config, vec![])
     }
 
-    /// T1 (property): explicit `M.meta.type = "library"` → `Some((Library, Explicit))`.
-    ///
-    /// When a package declares its type via `meta.type`, the Lua snippet sets
-    /// `meta.type_source = "explicit"` (the `else` branch of `LUA_TYPE_AUTODETECT`).
-    /// Both fields must round-trip through `resolve_pkg_type_lua` as a tuple.
-    #[tokio::test]
-    async fn resolve_pkg_type_lua_returns_explicit_for_meta_type() {
-        let tmp = tempfile::tempdir().expect("test tempdir");
-        let pkg_root = make_temp_pkg(
-            tmp.path(),
-            "explicit_lib",
-            r#"local M = {}
-M.meta = { name = "explicit_lib", type = "library" }
-return M
-"#,
-        );
-        let svc = make_svc_with_pkg_root(pkg_root).await;
-        let result = svc
-            .resolve_pkg_type_lua("explicit_lib")
-            .await
-            .expect("eval must succeed");
-        assert_eq!(
-            result,
-            Some((PkgType::Library, TypeSource::Explicit)),
-            "explicit meta.type = library must produce (Library, Explicit)"
-        );
-    }
-
-    /// T2 (boundary): `M.run` defined + no `meta.type` → `Some((Runnable, AutoDetectedRunnable))`.
+    /// T1 (boundary): `M.run` defined + no `meta.type` → `Some((Runnable, AutoDetectedRunnable))`.
     ///
     /// When `meta.type` is absent and `pkg.run` is a function, the snippet
     /// sets `meta.type = "runnable"` and `meta.type_source = "auto_detected_runnable"`.

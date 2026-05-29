@@ -35,7 +35,7 @@ impl AppService {
     /// `{source_dir}/hub_index.json`); the remaining arguments are
     /// forwarded to `hub_gendoc` unchanged.
     #[allow(clippy::too_many_arguments)]
-    pub fn hub_dist(
+    pub async fn hub_dist(
         &self,
         source_dir: &str,
         output_path: Option<&str>,
@@ -70,6 +70,7 @@ impl AppService {
         // not invoked when reindex cannot produce a fresh index.
         let reindex_json = self
             .hub_reindex(output_path, Some(source_dir))
+            .await
             .map_err(|e| format!("dist: reindex failed: {e}"))?;
 
         // Step 2: gendoc. On failure, surface the reindex JSON so the

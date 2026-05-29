@@ -48,7 +48,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use algocline_core::{PkgEntity, TypeSource};
+use algocline_core::PkgEntity;
 use tracing::warn;
 
 use super::super::alc_toml::{load_alc_local_toml, load_alc_toml, PackageDep};
@@ -60,15 +60,6 @@ use super::repair::{
     collect_path_missing, collect_unattached_dangling_symlinks, collect_unregistered_pkg_dirs,
     symlink_dangling_suggestion, AliveBucket, ProjectPathSource,
 };
-
-/// Suggestion text emitted for packages whose `type_source` is
-/// `AutoDetectedLibrary`. Shared between [`DoctorOutcome::UnmarkedLibrary`]
-/// (doctor pass) and [`super::list`] (pkg_list warnings field) to keep the
-/// user-facing message consistent from a single source.
-pub(super) const UNMARKED_LIBRARY_SUGGESTION: &str =
-    "Add M.meta.type = \"library\" to declare this package as a library \
-     (auto-detect classifies it as such, but explicit declaration is recommended \
-     for clarity and tooling).";
 
 /// Same TTL discipline as `hub::CACHE_TTL_SECS` (hub.rs:96).
 /// Both consts must be kept in sync; if you change one, change the other.
@@ -96,10 +87,6 @@ enum DoctorOutcome {
     /// Package directory exists and has a `spec/` directory, but contains
     /// zero `*_spec.lua` files (opt-in: pkgs without `spec/` are skipped).
     SpecMissing { reason: String, suggestion: String },
-    /// Package directory exists and `init.lua` is valid, but `type_source`
-    /// is `AutoDetectedLibrary` — the package was auto-classified as a library
-    /// rather than having an explicit `M.meta.type = "library"` declaration.
-    UnmarkedLibrary { suggestion: String },
 }
 
 /// Accumulator for the JSON output buckets.
@@ -121,14 +108,6 @@ struct DoctorBuckets {
     /// Unlike all other buckets, entries here carry `suggestion: array<string>`
     /// (Clippy-style multi-line) instead of `suggestion: string`.
     unregistered_pkg: Vec<serde_json::Value>,
-    /// Packages whose `type_source` is `AutoDetectedLibrary` — they were
-    /// classified as a library by auto-detection but lack an explicit
-    /// `M.meta.type = "library"` declaration. A suggestion is emitted to
-    /// encourage explicit declaration for clarity and tooling.
-    ///
-    /// Crux constraint: only fires when `type_source == AutoDetectedLibrary`;
-    /// `None` (legacy / missing field) never triggers this bucket.
-    unmarked_library: Vec<serde_json::Value>,
 }
 
 impl DoctorBuckets {
@@ -143,7 +122,6 @@ impl DoctorBuckets {
             || !self.spec_missing.is_empty()
             || !self.stale_cache.is_empty()
             || !self.unregistered_pkg.is_empty()
-            || !self.unmarked_library.is_empty()
     }
 
     fn into_json(self) -> String {
@@ -160,7 +138,6 @@ impl DoctorBuckets {
             "spec_missing": self.spec_missing,
             "stale_cache": self.stale_cache,
             "symlink_dangling": self.symlink_dangling,
-            "unmarked_library": self.unmarked_library,
             "unregistered_pkg": self.unregistered_pkg,
         })
         .to_string()
@@ -318,13 +295,6 @@ fn push_doctor_outcome(name: &str, outcome: DoctorOutcome, buckets: &mut DoctorB
                 "suggestion": suggestion,
             }))
         }
-        DoctorOutcome::UnmarkedLibrary { suggestion } => {
-            buckets.unmarked_library.push(serde_json::json!({
-                "name": name,
-                "kind": "unmarked_library",
-                "suggestion": suggestion,
-            }))
-        }
     }
 }
 
@@ -438,19 +408,10 @@ fn check_spec_missing(name: &str, dest: &Path) -> Result<Option<DoctorOutcome>, 
 ///
 /// After confirming the package directory is reachable, performs three
 /// sequential best-effort checks: missing submodule files, missing meta,
-/// and missing spec. A final check detects auto-classified library packages
-/// that lack an explicit `M.meta.type = "library"` declaration
-/// ([`DoctorOutcome::UnmarkedLibrary`]).
+/// and missing spec.
 ///
 /// `parse_from_init_lua` is called once and reused across all meta-dependent
 /// checks to avoid redundant I/O.
-///
-/// # Crux constraint
-///
-/// The `UnmarkedLibrary` outcome fires **only** when
-/// `entity.type_source == Some(TypeSource::AutoDetectedLibrary)`.
-/// Packages with `type_source == None` (legacy / absent field) are never
-/// flagged to avoid false-positive warnings on pre-existing entries.
 fn classify_installed(
     name: &str,
     entry: &ManifestEntry,
@@ -502,14 +463,9 @@ fn classify_installed(
             });
         }
         // entity is Some here (is_none() returned early above).
-        if let Some(entity) = entity {
+        if entity.is_some() {
             if let Some(sm) = check_spec_missing(name, &dest)? {
                 return Ok(sm);
-            }
-            if entity.type_source == Some(TypeSource::AutoDetectedLibrary) {
-                return Ok(DoctorOutcome::UnmarkedLibrary {
-                    suggestion: UNMARKED_LIBRARY_SUGGESTION.to_string(),
-                });
             }
         }
         return Ok(DoctorOutcome::Healthy);
@@ -534,14 +490,9 @@ fn classify_installed(
             });
         }
         // entity is Some here (is_none() returned early above).
-        if let Some(entity) = entity {
+        if entity.is_some() {
             if let Some(sm) = check_spec_missing(name, &dest)? {
                 return Ok(sm);
-            }
-            if entity.type_source == Some(TypeSource::AutoDetectedLibrary) {
-                return Ok(DoctorOutcome::UnmarkedLibrary {
-                    suggestion: UNMARKED_LIBRARY_SUGGESTION.to_string(),
-                });
             }
         }
         return Ok(DoctorOutcome::Healthy);
@@ -801,8 +752,7 @@ fn run_unregistered_pkg_pass(
 impl AppService {
     /// Walk `pkg_dir` for **alive symlinks** (target exists, `init.lua` present) that
     /// are not registered in any authoritative source, then push entries into
-    /// `buckets.unmarked_library` (when `type_source` is `AutoDetectedLibrary`) or
-    /// `buckets.unregistered_pkg` (all other cases, including parse failures).
+    /// `buckets.unregistered_pkg`.
     ///
     /// # Arguments
     ///
@@ -811,8 +761,7 @@ impl AppService {
     /// * `registered_paths` — canonicalized paths from path-dep entries to suppress
     ///   false positives (crux constraint: canonical path comparison)
     /// * `target_filter` — when `Some(name)`, restrict to that single package
-    /// * `buckets` — accumulator; entries are pushed into `buckets.unmarked_library`
-    ///   or `buckets.unregistered_pkg` depending on `type_source`
+    /// * `buckets` — accumulator; entries are pushed into `buckets.unregistered_pkg`
     ///
     /// # Returns
     ///
@@ -842,13 +791,6 @@ impl AppService {
             .await?;
         for (name, bucket) in found {
             match bucket {
-                AliveBucket::UnmarkedLibrary => {
-                    buckets.unmarked_library.push(serde_json::json!({
-                        "name": name,
-                        "kind": "unmarked_library",
-                        "suggestion": UNMARKED_LIBRARY_SUGGESTION,
-                    }));
-                }
                 AliveBucket::Unregistered => {
                     let abs_path = pkg_dir.join(&name).display().to_string();
                     let suggestion = serde_json::json!([
@@ -887,6 +829,10 @@ impl AppService {
     /// with ten arrays (`healthy`, `incomplete_pkg`, `installed_missing`,
     /// `missing_hub_index`, `missing_meta`, `path_missing`, `spec_missing`,
     /// `stale_cache`, `symlink_dangling`, `unregistered_pkg`).
+    ///
+    /// The `unmarked_library` bucket was removed in v0.40.0 — packages are
+    /// no longer expected to declare an explicit `M.meta.type`; type detection
+    /// is solely handled via VM eval at run/eval time.
     ///
     /// `name` restricts the report to a single package; `None` inspects every
     /// known package. `project_root` is only consulted for the
@@ -1048,12 +994,10 @@ mod tests {
         let pkg_dir = tmp.path();
         let dest = pkg_dir.join("p");
         std::fs::create_dir(&dest).unwrap();
-        // init.lua with valid M.meta and explicit type so UnmarkedLibrary does not fire.
-        // Explicit `type = "library"` is required since ST3; packages without it are
-        // classified as UnmarkedLibrary rather than Healthy.
+        // init.lua with valid M.meta — no explicit type needed; UnmarkedLibrary is gone.
         std::fs::write(
             dest.join("init.lua"),
-            "local M = {} M.meta = { name = \"p\", version = \"0.1.0\", type = \"library\" } return M",
+            "local M = {} M.meta = { name = \"p\", version = \"0.1.0\" } return M",
         )
         .unwrap();
 
@@ -1114,11 +1058,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let real_target = tmp.path().join("real_target_dir");
         std::fs::create_dir(&real_target).unwrap();
-        // init.lua with valid M.meta and explicit type so UnmarkedLibrary does not fire.
-        // Explicit `type = "library"` is required since ST3.
+        // init.lua with valid M.meta — no explicit type needed; UnmarkedLibrary is gone.
         std::fs::write(
             real_target.join("init.lua"),
-            "local M = {} M.meta = { name = \"q\", version = \"0.1.0\", type = \"library\" } return M",
+            "local M = {} M.meta = { name = \"q\", version = \"0.1.0\" } return M",
         )
         .unwrap();
 
@@ -1131,16 +1074,16 @@ mod tests {
     }
 
     #[test]
-    fn buckets_into_json_emits_all_eleven_keys() {
+    fn buckets_into_json_emits_all_ten_keys() {
         // NOTE: `serde_json` without the `preserve_order` feature emits JSON
         // object keys in alphabetical order, matching `pkg_repair`'s actual
         // behavior. The spec's "fixed order" requirement is satisfied by
-        // always emitting these eleven top-level keys; consumers parse as a
+        // always emitting these ten top-level keys; consumers parse as a
         // Map rather than relying on textual key order.
         //
         // Note: `narrative_issues` bucket removed in #1778221491-39903.
         // Note: `unregistered_pkg` bucket added (physical dir without manifest entry).
-        // Note: `unmarked_library` bucket added (auto-detected library without explicit type).
+        // Note: `unmarked_library` bucket removed — type detection is VM eval only.
         let mut b = DoctorBuckets::default();
         b.healthy.push(serde_json::json!({"name": "h"}));
         b.installed_missing
@@ -1166,11 +1109,6 @@ mod tests {
             "reason": "physical dir with init.lua exists but is not registered",
             "suggestion": ["install", "link", "rm -rf", "note: unknown source"],
         }));
-        b.unmarked_library.push(serde_json::json!({
-            "name": "ul",
-            "kind": "unmarked_library",
-            "suggestion": UNMARKED_LIBRARY_SUGGESTION,
-        }));
 
         let out = b.into_json();
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
@@ -1185,8 +1123,11 @@ mod tests {
         assert!(obj.contains_key("spec_missing"));
         assert!(obj.contains_key("stale_cache"));
         assert!(obj.contains_key("unregistered_pkg"));
-        assert!(obj.contains_key("unmarked_library"));
-        assert_eq!(obj.len(), 11, "exactly eleven top-level buckets: {out}");
+        assert!(
+            !obj.contains_key("unmarked_library"),
+            "unmarked_library must not be emitted"
+        );
+        assert_eq!(obj.len(), 10, "exactly ten top-level buckets: {out}");
 
         assert_eq!(obj["healthy"][0]["name"], "h");
         assert_eq!(obj["installed_missing"][0]["name"], "i");
@@ -1203,13 +1144,6 @@ mod tests {
         assert!(
             obj["unregistered_pkg"][0]["suggestion"].is_array(),
             "unregistered_pkg suggestion must be an array"
-        );
-        assert_eq!(obj["unmarked_library"][0]["name"], "ul");
-        assert_eq!(obj["unmarked_library"][0]["kind"], "unmarked_library");
-        // suggestion must be a string.
-        assert!(
-            obj["unmarked_library"][0]["suggestion"].is_string(),
-            "unmarked_library suggestion must be a string"
         );
     }
 
@@ -1250,10 +1184,6 @@ mod tests {
 
         let mut b = DoctorBuckets::default();
         b.stale_cache.push(serde_json::json!({}));
-        assert!(b.any_matched());
-
-        let mut b = DoctorBuckets::default();
-        b.unmarked_library.push(serde_json::json!({}));
         assert!(b.any_matched());
     }
 
@@ -1449,9 +1379,7 @@ mod tests {
     }
 
     /// T3 (no false positive): a complete init.lua with a valid `M.meta.name`
-    /// and explicit `M.meta.type` must not trigger `MissingMeta` or `UnmarkedLibrary`.
-    /// Since ST3, packages without explicit type are classified as `UnmarkedLibrary`
-    /// rather than `Healthy`; the fixture must declare `type = "library"` explicitly.
+    /// must not trigger `MissingMeta`. No explicit `M.meta.type` needed.
     #[test]
     fn classify_installed_no_missing_meta_when_init_lua_complete() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1460,7 +1388,7 @@ mod tests {
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(
             dest.join("init.lua"),
-            "local M = {} M.meta = { name = \"mypkg\", version = \"0.1.0\", type = \"library\" } return M",
+            "local M = {} M.meta = { name = \"mypkg\", version = \"0.1.0\" } return M",
         )
         .unwrap();
 
@@ -1807,10 +1735,8 @@ return {}
 
     #[test]
     fn classify_installed_healthy_when_all_subs_present() {
-        // classify_installed should return Healthy when all required subs exist,
-        // M.meta is declared with explicit type in init.lua.
-        // Since ST3, packages without explicit type are classified as UnmarkedLibrary;
-        // the fixture declares `type = "library"` explicitly.
+        // classify_installed should return Healthy when all required subs exist
+        // and M.meta is declared — no explicit type needed; UnmarkedLibrary is gone.
         let tmp = tempfile::tempdir().unwrap();
         let pkg_dir = tmp.path();
         let dest = pkg_dir.join("mypkg");
@@ -1818,7 +1744,7 @@ return {}
         std::fs::write(
             dest.join("init.lua"),
             "local M = {}\n\
-             M.meta = { name = \"mypkg\", version = \"0.1.0\", type = \"library\" }\n\
+             M.meta = { name = \"mypkg\", version = \"0.1.0\" }\n\
              local x = require(\"mypkg.sub\")\n\
              return M",
         )
@@ -1833,214 +1759,35 @@ return {}
         );
     }
 
-    // ── UnmarkedLibrary detection ─────────────────────────────────────────
-
-    /// T1 (property test): an auto-detected library package (no explicit
-    /// `M.meta.type` in init.lua, no `M.run` function) is classified as
-    /// `UnmarkedLibrary` with the standard suggestion string.
-    ///
-    /// Crux constraint: type_source == AutoDetectedLibrary triggers the warning.
-    #[test]
-    fn classify_installed_detects_auto_library() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path();
-        let dest = pkg_dir.join("mylib");
-        std::fs::create_dir(&dest).unwrap();
-        // init.lua: no M.meta.type, no M.run → parse_from_init_lua sets
-        // type_source = AutoDetectedLibrary.
-        std::fs::write(
-            dest.join("init.lua"),
-            "local M = {}\n\
-             M.meta = { name = \"mylib\", version = \"0.1.0\" }\n\
-             return M",
-        )
-        .unwrap();
-
-        let outcome =
-            classify_installed("mylib", &mk_entry("/src/mylib"), pkg_dir).expect("classify ok");
-        match outcome {
-            DoctorOutcome::UnmarkedLibrary { suggestion } => {
-                assert!(
-                    suggestion.contains("M.meta.type"),
-                    "suggestion must mention M.meta.type: {suggestion}"
-                );
-                assert_eq!(
-                    suggestion, UNMARKED_LIBRARY_SUGGESTION,
-                    "suggestion must match the canonical UNMARKED_LIBRARY_SUGGESTION const"
-                );
-            }
-            _ => panic!("expected UnmarkedLibrary, got {outcome:?}"),
-        }
-    }
-
-    /// T2 (boundary / crux constraint): a package with an explicit
-    /// `M.meta.type = "library"` declaration (type_source = Explicit) must
-    /// **not** trigger UnmarkedLibrary — it is classified as Healthy.
-    #[test]
-    fn classify_installed_explicit_library_does_not_warn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path();
-        let dest = pkg_dir.join("explicitlib");
-        std::fs::create_dir(&dest).unwrap();
-        // Explicit M.meta.type = "library" → parse_from_init_lua sets
-        // type_source = Explicit (not AutoDetectedLibrary).
-        std::fs::write(
-            dest.join("init.lua"),
-            "local M = {}\n\
-             M.meta = { name = \"explicitlib\", version = \"0.1.0\", type = \"library\" }\n\
-             return M",
-        )
-        .unwrap();
-
-        let outcome = classify_installed("explicitlib", &mk_entry("/src/explicitlib"), pkg_dir)
-            .expect("classify ok");
-        assert!(
-            matches!(outcome, DoctorOutcome::Healthy),
-            "explicit library must be Healthy, got {outcome:?}"
-        );
-    }
-
-    /// T3 (boundary): a package with an `M.run` function (auto-detected
-    /// runnable, type_source = AutoDetectedRunnable) must **not** trigger
-    /// UnmarkedLibrary.
-    #[test]
-    fn classify_installed_runnable_does_not_warn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path();
-        let dest = pkg_dir.join("myrunnable");
-        std::fs::create_dir(&dest).unwrap();
-        // M.run present → parse_from_init_lua sets type_source = AutoDetectedRunnable.
-        std::fs::write(
-            dest.join("init.lua"),
-            "local M = {}\n\
-             M.meta = { name = \"myrunnable\", version = \"0.1.0\" }\n\
-             function M.run(ctx) return {} end\n\
-             return M",
-        )
-        .unwrap();
-
-        let outcome = classify_installed("myrunnable", &mk_entry("/src/myrunnable"), pkg_dir)
-            .expect("classify ok");
-        assert!(
-            matches!(outcome, DoctorOutcome::Healthy),
-            "runnable pkg must be Healthy (not UnmarkedLibrary), got {outcome:?}"
-        );
-    }
-
-    /// T4 (crux constraint — None legacy): a package whose init.lua lacks
-    /// `M.meta` entirely (type_source = None) must **not** trigger
-    /// UnmarkedLibrary. It is classified as MissingMeta instead.
-    #[test]
-    fn classify_installed_none_type_source_does_not_trigger_warn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path();
-        let dest = pkg_dir.join("legacypkg");
-        std::fs::create_dir(&dest).unwrap();
-        // init.lua has no M.meta → parse_from_init_lua returns None.
-        std::fs::write(dest.join("init.lua"), "local M = {} return M").unwrap();
-
-        let outcome = classify_installed("legacypkg", &mk_entry("/src/legacypkg"), pkg_dir)
-            .expect("classify ok");
-        // Must be MissingMeta, never UnmarkedLibrary — None type_source is excluded.
-        assert!(
-            matches!(outcome, DoctorOutcome::MissingMeta { .. }),
-            "None type_source must not trigger UnmarkedLibrary; expected MissingMeta, got {outcome:?}"
-        );
-    }
-
     // ── run_alive_unregistered_symlink_pass ───────────────────────────────
 
-    /// T-alive-1 (crux constraint §1 + §2): an alive symlink whose target
-    /// contains an `init.lua` with no explicit `M.meta.type` (AutoDetectedLibrary)
-    /// and is not registered in any source is pushed to `buckets.unmarked_library`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_alive_unregistered_symlink_pass_unmarked_library() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-
-        // fixture: root/packages/mylib → root/real_lib
-        let pkg_dir = root.join("packages");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-
-        // Real package directory (symlink target).
-        let real = root.join("real_lib");
-        std::fs::create_dir(&real).unwrap();
-        // No M.meta.type, no M.run → eval_simple classifies as auto_detected_library.
-        std::fs::write(
-            real.join("init.lua"),
-            "local M = {}\nM.meta = { name = \"mylib\", version = \"0.1.0\" }\nreturn M",
-        )
-        .unwrap();
-
-        // Alive symlink: packages/mylib → real_lib.
-        let link = pkg_dir.join("mylib");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let app_service = make_app_service_at(root).await;
-        let registered = HashSet::new();
-        let registered_paths: Vec<PathBuf> = vec![];
-        let mut buckets = DoctorBuckets::default();
-        app_service
-            .run_alive_unregistered_symlink_pass(
-                &pkg_dir,
-                &registered,
-                &registered_paths,
-                None,
-                &mut buckets,
-            )
-            .await
-            .expect("pass ok");
-
-        assert_eq!(
-            buckets.unmarked_library.len(),
-            1,
-            "expected 1 unmarked_library entry, got {:?}",
-            buckets.unmarked_library
-        );
-        assert_eq!(buckets.unregistered_pkg.len(), 0);
-        let entry = &buckets.unmarked_library[0];
-        assert_eq!(entry["name"], "mylib");
-        assert_eq!(entry["kind"], "unmarked_library");
-        assert!(
-            entry["suggestion"]
-                .as_str()
-                .unwrap_or("")
-                .contains("M.meta.type"),
-            "suggestion must mention M.meta.type: {:?}",
-            entry["suggestion"]
-        );
-    }
-
-    /// T-alive-2 (crux constraint §1 + §2): an alive symlink whose target
-    /// contains an `init.lua` with explicit `M.meta.type = "library"` (not
-    /// AutoDetectedLibrary) and is not registered is pushed to
-    /// `buckets.unregistered_pkg`.
+    /// T-alive-1: an alive symlink whose target contains an `init.lua` and is
+    /// not registered in any source is pushed to `buckets.unregistered_pkg`.
+    /// UnmarkedLibrary bucket is gone — all alive unregistered symlinks route
+    /// to unregistered_pkg regardless of type (library or runnable).
     #[cfg(unix)]
     #[tokio::test]
     async fn run_alive_unregistered_symlink_pass_unregistered_pkg() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
 
-        // fixture: root/packages/myrunnable → root/real_runnable
+        // fixture: root/packages/mypkg → root/real_pkg
         let pkg_dir = root.join("packages");
         std::fs::create_dir_all(&pkg_dir).unwrap();
 
         // Real package directory (symlink target).
-        let real = root.join("real_runnable");
+        let real = root.join("real_pkg");
         std::fs::create_dir(&real).unwrap();
-        // M.run present → eval_simple classifies as auto_detected_runnable (not library).
         std::fs::write(
             real.join("init.lua"),
             "local M = {}\n\
-             M.meta = { name = \"myrunnable\", version = \"0.1.0\" }\n\
-             function M.run(ctx) return {} end\n\
+             M.meta = { name = \"mypkg\", version = \"0.1.0\" }\n\
              return M",
         )
         .unwrap();
 
-        // Alive symlink: packages/myrunnable → real_runnable.
-        let link = pkg_dir.join("myrunnable");
+        // Alive symlink: packages/mypkg → real_pkg.
+        let link = pkg_dir.join("mypkg");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let app_service = make_app_service_at(root).await;
@@ -2064,9 +1811,8 @@ return {}
             "expected 1 unregistered_pkg entry, got {:?}",
             buckets.unregistered_pkg
         );
-        assert_eq!(buckets.unmarked_library.len(), 0);
         let entry = &buckets.unregistered_pkg[0];
-        assert_eq!(entry["name"], "myrunnable");
+        assert_eq!(entry["name"], "mypkg");
         assert_eq!(entry["kind"], "unregistered_pkg");
         assert_eq!(entry["source"], "unknown");
         assert!(

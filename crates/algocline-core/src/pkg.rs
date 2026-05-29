@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 /// Wire format: `"runnable"` / `"library"` (lowercase via `#[serde(rename_all = "lowercase")]`).
 ///
 /// Auto-detection: when `M.meta.type` is absent, the Lua VM path uses
-/// `type(pkg.run) == "function"` at runtime (canonical), while the offline
-/// `parse_from_init_lua` path uses `detect_has_run` (text-scan mirror).
+/// `type(pkg.run) == "function"` at runtime (canonical). Type is set via
+/// VM eval (`LUA_TYPE_AUTODETECT`) and attached to the entity by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PkgType {
@@ -78,24 +78,20 @@ impl FromStr for PkgType {
 /// Records how `pkg_type` was determined for a package.
 ///
 /// This is stored alongside `PkgType` in `PkgEntity.type_source` so
-/// downstream consumers (`alc_pkg_doctor`, `alc_pkg_list`) can distinguish
-/// packages that were auto-detected as libraries from packages that
-/// explicitly declared their type — and emit a targeted suggestion in the
-/// former case.
+/// downstream consumers (`alc_pkg_list`) can inspect the provenance of the
+/// type determination.
 ///
-/// Wire format: `"explicit"` / `"auto_detected_runnable"` /
-/// `"auto_detected_library"` (snake_case via `#[serde(rename_all = "snake_case")]`).
+/// Wire format: `"auto_detected_runnable"` / `"auto_detected_library"`
+/// (snake_case via `#[serde(rename_all = "snake_case")]`).
+/// Type is always determined by VM eval (`LUA_TYPE_AUTODETECT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeSource {
-    /// `M.meta.type` was present in the package source — type is authoritative.
-    Explicit,
     /// `M.meta.type` was absent; the package was classified as `runnable`
-    /// because `M.run` is defined (offline Rust path or Lua VM detection).
+    /// because `M.run` is defined (Lua VM detection via `LUA_TYPE_AUTODETECT`).
     AutoDetectedRunnable,
     /// `M.meta.type` was absent; the package was classified as `library`
-    /// because no `M.run` was found. Consider adding `M.meta.type = "library"`
-    /// to make this explicit.
+    /// because no `M.run` was found (Lua VM detection via `LUA_TYPE_AUTODETECT`).
     AutoDetectedLibrary,
 }
 
@@ -104,7 +100,6 @@ impl FromStr for TypeSource {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "explicit" => Ok(Self::Explicit),
             "auto_detected_runnable" => Ok(Self::AutoDetectedRunnable),
             "auto_detected_library" => Ok(Self::AutoDetectedLibrary),
             other => Err(format!("unknown type_source: {other:?}")),
@@ -162,25 +157,11 @@ impl PkgEntity {
         let content = std::fs::read_to_string(path).ok()?;
         let parsed = parse_meta(&content)?;
         let docstring = extract_docstring_from(&content);
-        // Resolve type and provenance: explicit M.meta.type wins; otherwise
-        // fall back to Rust text-scan (build_index / offline batch path) and
-        // record that the type was auto-detected.
-        let (pkg_type, type_source) = match parsed.pkg_type {
-            Some(t) => (Some(t), Some(TypeSource::Explicit)),
-            None => {
-                if detect_has_run(&content) {
-                    (
-                        Some(PkgType::Runnable),
-                        Some(TypeSource::AutoDetectedRunnable),
-                    )
-                } else {
-                    (
-                        Some(PkgType::Library),
-                        Some(TypeSource::AutoDetectedLibrary),
-                    )
-                }
-            }
-        };
+        // Type and provenance are set by VM eval (LUA_TYPE_AUTODETECT) at the
+        // call site (build_index). This function handles name/meta extraction
+        // and the silent-exclude gate only.
+        let pkg_type: Option<PkgType> = None;
+        let type_source: Option<TypeSource> = None;
         Some(PkgEntity {
             name: parsed.name,
             version: option_from_str(parsed.version),
@@ -228,36 +209,14 @@ fn extract_docstring_from(content: &str) -> String {
 }
 
 /// Intermediate result of parsing `M.meta = { ... }` from an `init.lua`.
-/// All fields are owned. `pkg_type` is `None` when the `type` key is absent
-/// or has an unrecognized value (caller applies auto-detect fallback).
+/// All fields are owned. `type` is not extracted here; type is determined
+/// by VM eval (`LUA_TYPE_AUTODETECT`) at the call site.
 struct ParsedMeta {
     name: String,
     version: String,
     description: String,
     category: String,
     tags: Vec<String>,
-    pkg_type: Option<PkgType>,
-}
-
-/// Detect whether the init.lua source declares `M.run`.
-///
-/// Used by `parse_from_init_lua` as the offline (non-VM) fallback for
-/// `build_index` when `M.meta.type` is absent. The Lua VM path (`pkg_list`,
-/// `resolve_pkg_type_lua`) uses `type(pkg.run) == "function"` at runtime and
-/// is the canonical source; this function is the Rust mirror for offline batch.
-///
-/// Comment exclusion: for each line, only the portion before the first `--`
-/// is considered, so `-- M.run = ...` or `-- function M.run(ctx)` do not
-/// trigger a match.
-fn detect_has_run(content: &str) -> bool {
-    for line in content.lines() {
-        // Strip inline comment suffix.
-        let effective = line.split("--").next().unwrap_or(line);
-        if effective.contains("M.run") {
-            return true;
-        }
-    }
-    false
 }
 
 /// Parse `M.meta = { ... }` out of `content`. Returns `None` if the block is
@@ -354,22 +313,12 @@ fn parse_meta(content: &str) -> Option<ParsedMeta> {
         return None;
     }
     let tags = extract_string_array(block, "tags");
-    // Parse `type` field; unrecognized values fall back to None (auto-detect).
-    let pkg_type = {
-        let raw = extract("type");
-        if raw.is_empty() {
-            None
-        } else {
-            raw.parse::<PkgType>().ok()
-        }
-    };
     Some(ParsedMeta {
         name,
         version: extract("version"),
         description: extract("description"),
         category: extract("category"),
         tags,
-        pkg_type,
     })
 }
 
@@ -752,38 +701,17 @@ return M
     // ─── PkgType / pkg_type field tests ──────────────────────────
 
     #[test]
-    fn parse_type_from_meta() {
-        // Acceptance criterion 5: M.meta.type = "library" → PkgType::Library
+    fn parse_from_init_lua_pkg_type_is_none() {
+        // parse_from_init_lua no longer extracts type; pkg_type is always None.
+        // Type is determined by VM eval (LUA_TYPE_AUTODETECT) at the call site.
         let tmp = tempfile::tempdir().unwrap();
         let path = write_init_lua(
             tmp.path(),
             r#"
 local M = {}
 M.meta = {
-    name = "lib_pkg",
-    type = "library",
+    name = "any_pkg",
     version = "1.0.0",
-}
-return M
-"#,
-        );
-
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.name, "lib_pkg");
-        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
-    }
-
-    #[test]
-    fn parse_type_runnable_explicit() {
-        // Acceptance criterion 6: M.meta.type = "runnable" → PkgType::Runnable
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "run_pkg",
-    type = "runnable",
 }
 function M.run(ctx) end
 return M
@@ -791,76 +719,14 @@ return M
         );
 
         let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.pkg_type, Some(PkgType::Runnable));
-    }
-
-    #[test]
-    fn auto_detect_type_from_m_run() {
-        // Acceptance criterion 7: no M.meta.type, but M.run is present → Runnable
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "auto_run_pkg",
-}
-function M.run(ctx)
-    return alc.llm("hello")
-end
-return M
-"#,
-        );
-
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(
-            pkg.pkg_type,
-            Some(PkgType::Runnable),
-            "M.run present → Runnable"
-        );
-    }
-
-    #[test]
-    fn auto_detect_type_library_no_m_run() {
-        // Acceptance criterion 8: no M.meta.type, no M.run → Library
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "auto_lib_pkg",
-    description = "A pure library with no run entry point",
-}
-function M.create(opts)
-    return {}
-end
-return M
-"#,
-        );
-
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.pkg_type, Some(PkgType::Library), "no M.run → Library");
-    }
-
-    #[test]
-    fn detect_has_run_ignores_comments() {
-        // Acceptance criterion 9: M.run in a comment must not trigger detection.
+        assert_eq!(pkg.name, "any_pkg");
         assert!(
-            !detect_has_run("-- M.run = function(ctx) end\nlocal M = {}\n"),
-            "commented-out M.run should not be detected"
+            pkg.pkg_type.is_none(),
+            "parse_from_init_lua must not set pkg_type"
         );
-        // But a real M.run assignment on the same line after a comment is still
-        // in the non-comment portion before '--', so it IS detected.
         assert!(
-            detect_has_run("local M = {}\nM.run = function(ctx) end\n"),
-            "real M.run should be detected"
-        );
-        // Edge case: M.run after inline comment on same line — not detected
-        // because the effective portion before '--' does not contain M.run.
-        assert!(
-            !detect_has_run("local x = 1 -- M.run is described here\n"),
-            "M.run inside inline comment should not be detected"
+            pkg.type_source.is_none(),
+            "parse_from_init_lua must not set type_source"
         );
     }
 
@@ -902,105 +768,18 @@ return M
     // ─── TypeSource / type_source provenance tests ───────────────
 
     #[test]
-    fn parse_explicit_type_sets_source_explicit() {
-        // Acceptance criterion: M.meta.type = "library" explicit → type_source == Explicit
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "explicit_lib",
-    type = "library",
-    version = "1.0.0",
-}
-return M
-"#,
-        );
-
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
-        assert_eq!(
-            pkg.type_source,
-            Some(TypeSource::Explicit),
-            "explicit M.meta.type must yield TypeSource::Explicit"
-        );
-    }
-
-    #[test]
-    fn parse_auto_detect_runnable_sets_source() {
-        // Acceptance criterion: type absent + M.run present → AutoDetectedRunnable
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "auto_run",
-    version = "0.1.0",
-}
-function M.run(ctx)
-    return alc.llm("hello")
-end
-return M
-"#,
-        );
-
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.pkg_type, Some(PkgType::Runnable));
-        assert_eq!(
-            pkg.type_source,
-            Some(TypeSource::AutoDetectedRunnable),
-            "M.run present without explicit type must yield AutoDetectedRunnable"
-        );
-    }
-
-    #[test]
-    fn parse_auto_detect_library_sets_source() {
-        // Acceptance criterion: type absent + no M.run → AutoDetectedLibrary
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "auto_lib",
-    description = "A pure library",
-}
-function M.create(opts)
-    return {}
-end
-return M
-"#,
-        );
-
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.pkg_type, Some(PkgType::Library));
-        assert_eq!(
-            pkg.type_source,
-            Some(TypeSource::AutoDetectedLibrary),
-            "no M.run and no explicit type must yield AutoDetectedLibrary"
-        );
-    }
-
-    #[test]
     fn serde_round_trip_with_type_source() {
-        // Acceptance criterion: TypeSource::AutoDetectedLibrary JSON round-trip
-        // → wire string "auto_detected_library"
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_init_lua(
-            tmp.path(),
-            r#"
-local M = {}
-M.meta = {
-    name = "rt_lib",
-}
-return M
-"#,
-        );
-        let pkg = PkgEntity::parse_from_init_lua(&path).expect("should parse");
-        assert_eq!(pkg.type_source, Some(TypeSource::AutoDetectedLibrary));
-
+        // TypeSource::AutoDetectedLibrary JSON round-trip → wire string "auto_detected_library"
+        let pkg = PkgEntity {
+            name: "rt_lib".into(),
+            version: None,
+            description: None,
+            category: None,
+            docstring: None,
+            tags: None,
+            pkg_type: Some(PkgType::Library),
+            type_source: Some(TypeSource::AutoDetectedLibrary),
+        };
         let json = serde_json::to_string(&pkg).unwrap();
         assert!(
             json.contains("\"type_source\":\"auto_detected_library\""),

@@ -85,7 +85,7 @@ use super::list_opts::{
     HUB_SEARCH_FULL, HUB_SEARCH_SUMMARY,
 };
 use super::manifest;
-use super::resolve::AUTO_INSTALL_SOURCES;
+use super::resolve::{AUTO_INSTALL_SOURCES, LUA_TYPE_AUTODETECT};
 use super::source::PackageSource;
 use super::AppService;
 use super::HubRegistriesError;
@@ -94,6 +94,16 @@ use super::HubRegistriesError;
 
 /// Cache TTL in seconds (1 hour).
 const CACHE_TTL_SECS: u64 = 3600;
+
+/// Guard against names that cannot be safely interpolated into a Lua `require()`
+/// call. Only ASCII alphanumerics, underscores, and hyphens are allowed.
+/// Mirrors the same check in `pkg/list.rs`, `pkg/repair.rs`, etc.
+fn is_safe_pkg_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
 
 /// HTTP request timeout (30 seconds).
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -988,7 +998,11 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
 ///
 /// When `source_dir` is `None`, scans `~/.algocline/packages/` and
 /// enriches entries with manifest source and local card counts.
-fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> Result<HubIndex, String> {
+async fn build_index(
+    app_dir: &AppDir,
+    source_dir: Option<&std::path::Path>,
+    executor: &std::sync::Arc<algocline_engine::Executor>,
+) -> Result<HubIndex, String> {
     let empty = || HubIndex {
         schema_version: "hub_index/v0".into(),
         updated_at: super::manifest::now_iso8601(),
@@ -1048,8 +1062,46 @@ fn build_index(app_dir: &AppDir, source_dir: Option<&std::path::Path>) -> Result
         // (e.g. `alc_shapes/`, a type DSL library) are dropped from the index
         // rather than falling through with a placeholder name — that would
         // pollute hub_search.
-        let Some(entity) = PkgEntity::parse_from_init_lua(&init_lua) else {
+        let Some(mut entity) = PkgEntity::parse_from_init_lua(&init_lua) else {
             continue;
+        };
+
+        // Resolve pkg_type via VM eval (LUA_TYPE_AUTODETECT) — single source of
+        // truth for type detection. Unsafe names cannot be interpolated into
+        // require() so they degrade to pkg_type: None. eval failures also degrade
+        // to None (best-effort: hub index is a display mirror, not the gate that
+        // rejects library pkgs at run/eval time).
+        entity.pkg_type = if is_safe_pkg_name(&dir_name) {
+            let code = format!(
+                r#"package.loaded["{name}"] = nil
+local pkg = require("{name}")
+local meta = pkg.meta or {{ name = "{name}" }}
+{LUA_TYPE_AUTODETECT}
+return meta"#,
+                name = dir_name,
+                LUA_TYPE_AUTODETECT = LUA_TYPE_AUTODETECT,
+            );
+            let eval_result = if source_dir.is_some() {
+                // source_dir mode: pkg is not in ~/.algocline, pass the pkg
+                // directory as an extra lib path so require() resolves.
+                executor
+                    .eval_simple_with_paths(code, vec![entry.path()], vec![])
+                    .await
+            } else {
+                executor.eval_simple(code).await
+            };
+            match eval_result {
+                Ok(meta) => meta
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<algocline_core::PkgType>().ok()),
+                Err(e) => {
+                    tracing::warn!("hub: build_index VM eval failed for {dir_name}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         // Use manifest source only for local-state mode. When the manifest
@@ -1089,7 +1141,7 @@ impl AppService {
     ///
     /// Writes the index to `output_path` (for CI / publishing).
     /// Does NOT touch the remote search cache.
-    pub fn hub_reindex(
+    pub async fn hub_reindex(
         &self,
         output_path: Option<&str>,
         source_dir: Option<&str>,
@@ -1101,7 +1153,7 @@ impl AppService {
             }
         }
         let app_dir = self.log_config.app_dir();
-        let index = build_index(&app_dir, src)?;
+        let index = build_index(&app_dir, src, &self.executor).await?;
 
         let written_path = if let Some(path) = output_path {
             let json = serde_json::to_string_pretty(&index)

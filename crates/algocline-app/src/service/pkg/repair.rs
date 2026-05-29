@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use super::super::alc_toml::{self, PackageDep};
 use super::super::lockfile::load_lockfile;
 use super::super::manifest::{load_manifest, ManifestEntry};
-use super::super::resolve::{packages_dir, LUA_TYPE_AUTODETECT};
+use super::super::resolve::packages_dir;
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::install::InstallSource;
@@ -81,12 +81,8 @@ pub(super) fn symlink_dangling_suggestion(name: &str) -> String {
 /// `run_alive_unregistered_symlink_pass` in `doctor.rs`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum AliveBucket {
-    /// `type_source == "auto_detected_library"` from the Lua VM eval —
-    /// no explicit `M.meta.type` in init.lua; routes to the `unmarked_library`
-    /// doctor bucket.
-    UnmarkedLibrary,
-    /// All other entries (explicit type, auto-detected runnable, eval failure,
-    /// or type_source absent) — routes to `unregistered_pkg`.
+    /// All alive unregistered symlinks — routes to `unregistered_pkg`.
+    /// The `unmarked_library` bucket was removed; all entries use this variant.
     Unregistered,
 }
 
@@ -659,16 +655,6 @@ pub(super) fn collect_unregistered_pkg_dirs(
 
 /// Returns `true` iff `name` is safe to interpolate into a Lua `require()` call.
 ///
-/// Accepts ASCII alphanumerics, `_` and `-`. Empty strings are rejected.
-/// Mirrors the implementation in `list.rs` (which also allows `-` for hyphenated
-/// package names such as `crdt-doc`).
-fn is_safe_pkg_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 impl AppService {
     /// Walk `pkg_dir` and collect **alive symlinks** that contain `init.lua` at the
     /// resolved target but are not registered in any of the three authoritative
@@ -680,14 +666,9 @@ impl AppService {
     /// helper exclusively handles alive symlinks — those where the link target
     /// exists and is reachable via `path.try_exists()`.
     ///
-    /// Each qualifying entry is classified into an [`AliveBucket`] by executing
-    /// the `LUA_TYPE_AUTODETECT` snippet via `eval_simple_with_paths` — the same
-    /// runtime path used by `pkg_list`. The `type_source` field in the returned
-    /// meta determines the bucket:
-    ///
-    /// - `"auto_detected_library"` → [`AliveBucket::UnmarkedLibrary`]
-    /// - All other values (explicit, auto_detected_runnable, eval failure, or
-    ///   absent) → [`AliveBucket::Unregistered`]
+    /// Each qualifying entry is classified as [`AliveBucket::Unregistered`].
+    /// The `UnmarkedLibrary` variant was removed — type detection is no longer
+    /// performed here; all alive unregistered symlinks route to `unregistered_pkg`.
     ///
     /// JSON shape construction is deferred to `run_alive_unregistered_symlink_pass`
     /// in `doctor.rs`; this method is detection-only.
@@ -802,47 +783,10 @@ impl AppService {
                 continue;
             }
 
-            // Classify via eval_simple + LUA_TYPE_AUTODETECT — same runtime path as
-            // pkg_list. pkg_dir is passed as an extra lib path so require() resolves
-            // the package in both production (~/.algocline/packages/) and tests.
-            let bucket = if is_safe_pkg_name(&pkg_name) {
-                let code = format!(
-                    r#"package.loaded["{pkg_name}"] = nil
-local pkg = require("{pkg_name}")
-local meta = pkg.meta or {{ name = "{pkg_name}" }}
-{LUA_TYPE_AUTODETECT}
-return meta"#,
-                    pkg_name = pkg_name,
-                    LUA_TYPE_AUTODETECT = LUA_TYPE_AUTODETECT,
-                );
-                match self
-                    .executor
-                    .eval_simple_with_paths(code, vec![pkg_dir.to_path_buf()], vec![])
-                    .await
-                {
-                    Ok(meta) => {
-                        if meta.get("type_source").and_then(|v| v.as_str())
-                            == Some("auto_detected_library")
-                        {
-                            AliveBucket::UnmarkedLibrary
-                        } else {
-                            AliveBucket::Unregistered
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "pkg: alive-symlink type_source eval failed for {pkg_name}: {e}"
-                        );
-                        AliveBucket::Unregistered
-                    }
-                }
-            } else {
-                // Unsafe name cannot be interpolated into require() — skip eval,
-                // fall back to Unregistered.
-                AliveBucket::Unregistered
-            };
-
-            entries.push((pkg_name, bucket));
+            // All alive unregistered symlinks route to Unregistered — the
+            // UnmarkedLibrary bucket is removed; type classification is no
+            // longer performed here.
+            entries.push((pkg_name, AliveBucket::Unregistered));
         }
 
         Ok(entries)
@@ -860,8 +804,7 @@ mod tests {
         use std::os::unix::fs::symlink as unix_symlink;
 
         /// Write a minimal init.lua with `M.meta.name` but no explicit type and no
-        /// `M.run` function — `LUA_TYPE_AUTODETECT` will classify this as
-        /// `type_source = "auto_detected_library"`.
+        /// `M.run` function — a library-style package fixture.
         fn write_auto_library_init_lua(pkg_dir: &std::path::Path, pkg_name: &str) {
             let pkg = pkg_dir.join(pkg_name);
             std::fs::create_dir_all(&pkg).expect("create pkg dir");
@@ -872,9 +815,8 @@ mod tests {
             .expect("write init.lua");
         }
 
-        /// Write an init.lua with an explicit `M.meta.type = "library"` — this
-        /// gives `type_source = "explicit"` via `LUA_TYPE_AUTODETECT`, so the
-        /// entry must go to `Unregistered`.
+        /// Write an init.lua with an explicit `M.meta.type = "library"` — an
+        /// explicit-type package fixture; routes to `Unregistered`.
         fn write_explicit_type_init_lua(pkg_dir: &std::path::Path, pkg_name: &str) {
             let pkg = pkg_dir.join(pkg_name);
             std::fs::create_dir_all(&pkg).expect("create pkg dir");
@@ -913,17 +855,17 @@ mod tests {
             );
         }
 
-        /// (b) An alive symlink + unregistered + init.lua with no explicit type and no
-        /// run function → `LUA_TYPE_AUTODETECT` sets type_source = "auto_detected_library"
-        /// → `AliveBucket::UnmarkedLibrary`.
+        /// (b) An alive symlink + unregistered → always `AliveBucket::Unregistered`.
+        /// The UnmarkedLibrary variant is removed; type detection is no longer
+        /// performed in collect_alive_unregistered_symlinks.
         #[tokio::test]
-        async fn alive_unregistered_auto_library_routes_to_unmarked_library() {
+        async fn alive_unregistered_is_always_unregistered() {
             let tmp = tempfile::tempdir().expect("create tempdir");
             let real_pkgs = tmp.path().join("real");
             let pkg_dir = tmp.path().join("packages");
             std::fs::create_dir_all(&pkg_dir).expect("create packages dir");
 
-            // Real pkg directory (link target).
+            // Real pkg directory (link target) — no explicit type, no M.run.
             write_auto_library_init_lua(&real_pkgs, "my_lib");
 
             // Alive symlink in packages/ pointing at real/my_lib.
@@ -940,12 +882,10 @@ mod tests {
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].0, "my_lib");
-            assert_eq!(result[0].1, AliveBucket::UnmarkedLibrary);
+            assert_eq!(result[0].1, AliveBucket::Unregistered);
         }
 
-        /// (c) An alive symlink + unregistered + init.lua with explicit
-        /// `M.meta.type = "library"` → `type_source = "explicit"` via
-        /// `LUA_TYPE_AUTODETECT` → `AliveBucket::Unregistered`.
+        /// (c) An alive symlink + unregistered + explicit type → `AliveBucket::Unregistered`.
         #[tokio::test]
         async fn alive_unregistered_explicit_type_routes_to_unregistered() {
             let tmp = tempfile::tempdir().expect("create tempdir");

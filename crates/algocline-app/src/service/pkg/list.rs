@@ -15,7 +15,13 @@ use super::super::resolve::{is_system_package, packages_dir, LUA_TYPE_AUTODETECT
 use super::super::source::PackageSource;
 use super::super::AppService;
 use super::super::{PkgListError, ServiceError};
-use super::doctor::UNMARKED_LIBRARY_SUGGESTION;
+// Informational note shown in pkg_list warnings when a package is
+// auto-classified as a library by LUA_TYPE_AUTODETECT (no M.run found).
+// Explicit M.meta.type declarations were removed in v0.40.0 — type is
+// now determined solely by VM eval.
+const UNMARKED_LIBRARY_SUGGESTION: &str =
+    "This package has no M.run function and is auto-classified as a library \
+     by VM eval (LUA_TYPE_AUTODETECT). No explicit M.meta.type declaration is needed.";
 
 // ─── Intermediate DTO for pkg_list ───────────────────────────────
 
@@ -859,15 +865,15 @@ fn collect_path_entries_from_lock(
 ///
 /// # Returns
 ///
-/// `Some(vec![suggestion])` when `meta.type_source` is
-/// `"auto_detected_library"`. `None` in all other cases — including when
-/// `type_source` is absent (legacy/backward-compat entries).
-///
-/// # Crux constraint
+/// `Some(vec![note])` when `meta.type_source` is `"auto_detected_library"`.
+/// `None` in all other cases — including when `type_source` is absent
+/// (legacy/backward-compat entries).
 ///
 /// Only `"auto_detected_library"` triggers this function; `None` (absent key)
-/// and all other values (e.g. `"explicit"`, `"auto_detected_runnable"`) return
-/// `None` to satisfy the "Warn gate excludes None/legacy entries" constraint.
+/// and `"auto_detected_runnable"` return `None`.
+///
+/// Note: explicit `M.meta.type` declarations were removed in v0.40.0.
+/// Type is now determined solely by VM eval (LUA_TYPE_AUTODETECT).
 fn derive_warnings_from_meta(meta: &serde_json::Value) -> Option<Vec<String>> {
     let ts = meta.get("type_source").and_then(|v| v.as_str())?;
     if ts == "auto_detected_library" {
@@ -930,19 +936,19 @@ mod tests {
         );
     }
 
-    /// T2 (boundary): explicit type_source (`"explicit"`) and auto-detected
-    /// runnable (`"auto_detected_runnable"`) must produce `None` warnings.
+    /// T2 (boundary): unknown type_source values and auto-detected runnable
+    /// (`"auto_detected_runnable"`) must produce `None` warnings.
     #[test]
-    fn entry_no_warnings_for_explicit_or_runnable() {
-        // Explicit declaration — type_source = "explicit".
+    fn entry_no_warnings_for_unknown_or_runnable() {
+        // Unknown / legacy type_source — should not warn.
         let meta_explicit = serde_json::json!({
-            "name": "explicitpkg",
+            "name": "legacypkg",
             "type": "library",
-            "type_source": "explicit",
+            "type_source": "unknown_value",
         });
         assert!(
             derive_warnings_from_meta(&meta_explicit).is_none(),
-            "explicit type_source must produce no warnings"
+            "unknown type_source must produce no warnings"
         );
 
         // Auto-detected runnable — type_source = "auto_detected_runnable".
@@ -1034,7 +1040,7 @@ mod tests {
             updated_at: None,
             install_source: None,
             overrides: None,
-            meta: serde_json::json!({"type_source": "explicit"}),
+            meta: serde_json::json!({"type_source": "auto_detected_runnable"}),
             error: None,
             linked: None,
             link_target: None,

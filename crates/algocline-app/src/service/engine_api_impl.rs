@@ -396,12 +396,8 @@ impl EngineApi for AppService {
         output_path: Option<String>,
         source_dir: Option<String>,
     ) -> Result<String, String> {
-        let svc = self.clone();
-        tokio::task::spawn_blocking(move || {
-            AppService::hub_reindex(&svc, output_path.as_deref(), source_dir.as_deref())
-        })
-        .await
-        .map_err(|e| format!("hub_reindex task panicked: {e}"))?
+        self.hub_reindex(output_path.as_deref(), source_dir.as_deref())
+            .await
     }
 
     async fn hub_gendoc(
@@ -438,22 +434,17 @@ impl EngineApi for AppService {
         config_path: Option<String>,
         lint_strict: Option<bool>,
     ) -> Result<String, String> {
-        let svc = self.clone();
-        tokio::task::spawn_blocking(move || {
-            AppService::hub_dist(
-                &svc,
-                &source_dir,
-                output_path.as_deref(),
-                out_dir.as_deref(),
-                preset.as_deref(),
-                project_root.as_deref(),
-                projections.as_deref(),
-                config_path.as_deref(),
-                lint_strict,
-            )
-        })
+        self.hub_dist(
+            &source_dir,
+            output_path.as_deref(),
+            out_dir.as_deref(),
+            preset.as_deref(),
+            project_root.as_deref(),
+            projections.as_deref(),
+            config_path.as_deref(),
+            lint_strict,
+        )
         .await
-        .map_err(|e| format!("hub_dist task panicked: {e}"))?
     }
 
     async fn hub_info(&self, pkg: String) -> Result<String, String> {

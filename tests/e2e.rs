@@ -7261,279 +7261,83 @@ async fn test_alc_setting_resolve_rejects_invalid_target_name() {
     client.cancel().await.expect("cancel failed");
 }
 
-// ─── alc_pkg_doctor / alc_pkg_list — unmarked_library + warnings ──────────────
+// ─── alc_pkg_list / alc_advice — VM eval type detection ─────────────────────
 
-/// T1: auto-detected library package (no `M.run`, no `M.meta.type`) is flagged
-/// in the `unmarked_library` bucket with the expected name, kind, and suggestion.
-///
-/// Exercises the Lua VM path (Path B: `LUA_TYPE_AUTODETECT` via `eval_simple`)
-/// through the full MCP wire layer.
-///
-/// Crux constraint: `AutoDetectedLibrary` type_source must produce an
-/// `unmarked_library` entry in the doctor response.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_pkg_doctor_detects_unmarked_library() {
+/// Verify that a package with `M.run` is auto-detected as runnable via
+/// VM eval (`LUA_TYPE_AUTODETECT`). The package must appear in `alc_pkg_list`
+/// with `type = "runnable"` and no warnings.
+#[tokio::test]
+async fn e2e_vm_eval_detects_runnable_package() {
     let alc_home = tempfile::tempdir().unwrap();
     pre_install_pkg(
         alc_home.path(),
-        "auto_lib_pkg_unmarked",
+        "vm_eval_runnable_pkg",
         &[(
             "init.lua",
             concat!(
                 "local M = {}\n",
-                "M.meta = { name = \"auto_lib_pkg_unmarked\", version = \"0.1.0\" }\n",
-                // No M.run → auto-detected library via both Path A (Rust parser) and
-                // Path B (LUA_TYPE_AUTODETECT). Double-quoted strings required for
-                // parse_from_init_lua (Path A).
+                "M.meta = { name = \"vm_eval_runnable_pkg\", version = \"0.1.0\" }\n",
+                "function M.run(ctx) return {} end\n",
                 "return M\n",
             ),
         )],
     );
     let client = connect_with_alc_home(alc_home.path()).await;
 
-    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
-
-    let unmarked = result["unmarked_library"]
-        .as_array()
-        .expect("unmarked_library must be an array");
-    let entry = unmarked
-        .iter()
-        .find(|e| e["name"] == "auto_lib_pkg_unmarked")
-        .unwrap_or_else(|| {
-            panic!("auto_lib_pkg_unmarked not found in unmarked_library, got: {result}")
-        });
-    assert_eq!(
-        entry["kind"], "unmarked_library",
-        "kind must be unmarked_library, got: {entry}"
-    );
-    assert!(
-        entry["suggestion"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Add M.meta.type = \"library\""),
-        "suggestion must contain 'Add M.meta.type = \"library\"', got: {entry}"
-    );
-
-    client.cancel().await.expect("cancel failed");
-}
-
-/// T2 (negative / crux): a package with `M.meta.type = "library"` explicitly set
-/// must NOT appear in the `unmarked_library` bucket.
-///
-/// Crux constraint (Warn gate excludes None/legacy entries): only
-/// `AutoDetectedLibrary` triggers the warning; `Explicit` must not.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_pkg_doctor_explicit_library_no_unmarked() {
-    let alc_home = tempfile::tempdir().unwrap();
-    pre_install_pkg(
-        alc_home.path(),
-        "explicit_lib_pkg_e2e",
-        &[(
-            "init.lua",
-            concat!(
-                "local M = {}\n",
-                // Explicit type declaration — parse_from_init_lua (Path A) sets
-                // type_source = Explicit. Double-quoted strings required for the
-                // Rust static parser.
-                "M.meta = { name = \"explicit_lib_pkg_e2e\", version = \"0.1.0\", type = \"library\" }\n",
-                "return M\n",
-            ),
-        )],
-    );
-    let client = connect_with_alc_home(alc_home.path()).await;
-
-    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
-
-    let unmarked = result["unmarked_library"]
-        .as_array()
-        .expect("unmarked_library must be an array");
-    assert!(
-        unmarked.iter().all(|e| e["name"] != "explicit_lib_pkg_e2e"),
-        "explicit_lib_pkg_e2e must NOT appear in unmarked_library, got: {result}"
-    );
-
-    client.cancel().await.expect("cancel failed");
-}
-
-/// T3: auto-detected library package appears in `alc_pkg_list` with a `warnings`
-/// array containing the suggestion to add explicit `M.meta.type = "library"`.
-///
-/// Exercises the Lua VM path (Path B) through the pkg_list MCP wire layer.
-///
-/// Crux constraint: `AutoDetectedLibrary` must populate `warnings` in the list
-/// entry; Explicit / None entries must not have a `warnings` field.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_pkg_list_emits_warnings_for_auto_library() {
-    let alc_home = tempfile::tempdir().unwrap();
-    pre_install_pkg(
-        alc_home.path(),
-        "auto_lib_pkg_warnings",
-        &[(
-            "init.lua",
-            concat!(
-                "local M = {}\n",
-                // Double-quoted strings required for parse_from_init_lua (Path A).
-                "M.meta = { name = \"auto_lib_pkg_warnings\", version = \"0.1.0\" }\n",
-                // No M.run → auto-detected library (Path B via LUA_TYPE_AUTODETECT)
-                "return M\n",
-            ),
-        )],
-    );
-    let client = connect_with_alc_home(alc_home.path()).await;
-
-    // limit=0 disables the default 50-item cap. Without it, packages from
-    // ~/.algocline/packages (installed_at=None) sort before our fixture
-    // package (installed_at="2026-01-01") in the -active,-installed_at
-    // descending order (nulls sort first in desc), potentially truncating it.
-    let result = call_json(&client, "alc_pkg_list", serde_json::json!({ "limit": 0 })).await;
-
+    let result = call_json(
+        &client,
+        "alc_pkg_list",
+        serde_json::json!({ "limit": 0, "fields": ["name", "type"] }),
+    )
+    .await;
     let packages = result["packages"]
         .as_array()
         .expect("packages must be an array");
     let entry = packages
         .iter()
-        .find(|p| p["name"] == "auto_lib_pkg_warnings")
-        .unwrap_or_else(|| panic!("auto_lib_pkg_warnings not found in packages, got: {result}"));
-    let warnings = entry["warnings"].as_array().unwrap_or_else(|| {
-        panic!("warnings must be an array for auto-detected library, got entry: {entry}")
-    });
-    assert!(
-        warnings.iter().any(|w| w
-            .as_str()
-            .unwrap_or("")
-            .contains("Add M.meta.type = \"library\"")),
-        "warnings must contain suggestion to add M.meta.type = \"library\", got: {entry}"
-    );
-
-    client.cancel().await.expect("cancel failed");
-}
-
-/// T1 (alive-symlink path): a package installed as an alive symlink under
-/// `~/.algocline/packages/` that is NOT registered in `installed.json`,
-/// `alc.toml`, or `alc.local.toml` must appear in the `unmarked_library`
-/// bucket when the package is auto-detected as a library (no `M.run`, no
-/// `M.meta.type`).
-///
-/// Crux constraint §1: each symlink is evaluated individually via
-/// `fs::metadata` (following the link); alive symlinks are never silently
-/// dropped by the `!meta.is_dir()` guard in `collect_unregistered_pkg_dirs`.
-/// Crux constraint §2: `parse_from_init_lua` is called per candidate;
-/// `AutoDetectedLibrary` routes to `unmarked_library`.
-/// Crux constraint §3: only existing bucket fields receive additive entries;
-/// no new top-level keys are asserted here.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_pkg_doctor_detects_unmarked_library_for_alive_symlink() {
-    let alc_home = tempfile::tempdir().unwrap();
-    // Second tempdir for the symlink target — must outlive the MCP client call.
-    let target_dir = tempfile::tempdir().unwrap();
-
-    // Write init.lua into the real target dir (auto-detected library: no M.run, no M.meta.type).
-    std::fs::write(
-        target_dir.path().join("init.lua"),
-        concat!(
-            "local M = {}\n",
-            "M.meta = { name = \"alive_symlink_unmarked\", version = \"0.1.0\" }\n",
-            "return M\n",
-        ),
-    )
-    .expect("write init.lua");
-
-    // Create packages/ dir before symlinking (nested dir needs create_dir_all).
-    let packages_dir = alc_home.path().join("packages");
-    std::fs::create_dir_all(&packages_dir).expect("create packages dir");
-
-    // Symlink: packages/alive_symlink_unmarked -> target_dir.
-    // Argument order: symlink(original, link) — first arg is the real path.
-    let link_path = packages_dir.join("alive_symlink_unmarked");
-    std::os::unix::fs::symlink(target_dir.path(), &link_path).expect("create symlink");
-    // DO NOT create installed.json — intentionally absent (the coverage-gap scenario).
-
-    let client = connect_with_alc_home(alc_home.path()).await;
-
-    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
-
-    let unmarked = result["unmarked_library"]
-        .as_array()
-        .expect("unmarked_library must be an array");
-    let entry = unmarked
-        .iter()
-        .find(|e| e["name"] == "alive_symlink_unmarked")
-        .unwrap_or_else(|| {
-            panic!("alive_symlink_unmarked not found in unmarked_library, got: {result}")
-        });
+        .find(|p| p["name"] == "vm_eval_runnable_pkg")
+        .unwrap_or_else(|| panic!("vm_eval_runnable_pkg not found, got: {result}"));
     assert_eq!(
-        entry["kind"], "unmarked_library",
-        "kind must be unmarked_library, got: {entry}"
-    );
-    assert!(
-        entry["suggestion"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Add M.meta.type = \"library\""),
-        "suggestion must contain 'Add M.meta.type = \"library\"', got: {entry}"
+        entry["type"], "runnable",
+        "M.run defined => type must be 'runnable', got: {entry}"
     );
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// Verify that 5 known packages (alc_shapes / crdt_doc / ddd / lshape / swarm_frame)
-/// placed as alive symlinks with minimal auto-detected library init.lua all appear in
-/// the `unmarked_library` bucket returned by `alc_pkg_doctor`.
-///
-/// Each fixture has `M.meta` (no `M.run`, no `M.meta.type`) so that the runtime
-/// `eval_simple + LUA_TYPE_AUTODETECT` path classifies them as `auto_detected_library`
-/// which maps to `unmarked_library` in the doctor output.
-///
-/// Crux constraint: detection must go through `eval_simple` (not `parse_from_init_lua`).
-/// This test exercises that unified path end-to-end for 5 previously-misclassified packages.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn e2e_pkg_doctor_unmarked_library_5_known_packages() {
+/// Verify that a library package (no `M.run`, auto-detected) is rejected by
+/// `alc_advice` with a typed error naming the package.
+#[tokio::test]
+async fn e2e_vm_eval_library_rejected_by_alc_advice() {
     let alc_home = tempfile::tempdir().unwrap();
-    // Shared target root; each package gets its own subdir here.
-    // Must outlive the MCP client call (drop order: last declared = first dropped).
-    let target_root = tempfile::tempdir().unwrap();
-
-    let packages = ["alc_shapes", "crdt_doc", "ddd", "lshape", "swarm_frame"];
-
-    let packages_dir = alc_home.path().join("packages");
-    std::fs::create_dir_all(&packages_dir).expect("create packages dir");
-
-    // For each package: create real dir + init.lua, then symlink from packages_dir.
-    for pkg in &packages {
-        let real_dir = target_root.path().join(pkg);
-        std::fs::create_dir_all(&real_dir).unwrap_or_else(|e| panic!("create dir for {pkg}: {e}"));
-        std::fs::write(
-            real_dir.join("init.lua"),
-            format!(
-                "local M = {{}}\nM.meta = {{ name = \"{pkg}\", version = \"0.1.0\" }}\nreturn M\n"
+    pre_install_pkg(
+        alc_home.path(),
+        "vm_eval_library_reject",
+        &[(
+            "init.lua",
+            concat!(
+                "local M = {}\n",
+                "M.meta = { name = \"vm_eval_library_reject\", version = \"0.1.0\" }\n",
+                // No M.run => auto-detected library via LUA_TYPE_AUTODETECT.
+                "return M\n",
             ),
-        )
-        .unwrap_or_else(|e| panic!("write init.lua for {pkg}: {e}"));
-
-        let link_path = packages_dir.join(pkg);
-        std::os::unix::fs::symlink(&real_dir, &link_path)
-            .unwrap_or_else(|e| panic!("create symlink for {pkg}: {e}"));
-        // DO NOT create installed.json — intentionally absent (alive unregistered symlink scenario).
-    }
-
+        )],
+    );
     let client = connect_with_alc_home(alc_home.path()).await;
 
-    let result = call_json(&client, "alc_pkg_doctor", serde_json::json!({})).await;
+    let result = client
+        .call_tool(call_params(
+            "alc_advice",
+            serde_json::json!({ "strategy": "vm_eval_library_reject", "task": "test" }),
+        ))
+        .await
+        .expect("call_tool must not fail at transport level");
 
-    let unmarked = result["unmarked_library"]
-        .as_array()
-        .expect("unmarked_library must be an array");
-
-    for pkg in &packages {
-        let entry = unmarked
-            .iter()
-            .find(|e| e["name"] == *pkg)
-            .unwrap_or_else(|| panic!("{pkg} not found in unmarked_library, got: {result}"));
-        assert_eq!(
-            entry["kind"], "unmarked_library",
-            "kind must be unmarked_library for {pkg}, got: {entry}"
-        );
-    }
+    let text = extract_text(&result);
+    assert!(
+        text.contains("library") || text.contains("vm_eval_library_reject"),
+        "error message must name the pkg or mention 'library', got: {text}"
+    );
 
     client.cancel().await.expect("cancel failed");
 }

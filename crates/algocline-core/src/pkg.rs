@@ -132,8 +132,26 @@ pub struct PkgEntity {
     /// Records how `pkg_type` was determined. `None` for legacy entries that
     /// pre-date provenance tracking (`#[serde(default)]` ensures backward
     /// compatibility with existing `hub_index.json` consumers).
-    #[serde(default)]
+    ///
+    /// Uses a lenient deserializer so that legacy JSON with `"type_source":
+    /// "explicit"` (a v0.40.0-only addition now removed) degrades to `None`
+    /// instead of erroring.
+    #[serde(default, deserialize_with = "deserialize_type_source_lenient")]
     pub type_source: Option<TypeSource>,
+}
+
+/// Lenient deserializer for `PkgEntity.type_source`.
+///
+/// Converts unknown variant strings (e.g. legacy `"explicit"`) to `None`
+/// instead of returning a deserialization error. Known variants
+/// (`"auto_detected_runnable"` / `"auto_detected_library"`) are returned as
+/// `Some(TypeSource)`.
+fn deserialize_type_source_lenient<'de, D>(d: D) -> Result<Option<TypeSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(d)?;
+    Ok(s.and_then(|v| TypeSource::from_str(&v).ok()))
 }
 
 impl PkgEntity {
@@ -803,5 +821,24 @@ return M
             pkg.type_source.is_none(),
             "missing 'type_source' key must deserialize as None (legacy compat)"
         );
+    }
+
+    #[test]
+    fn serde_deserialize_explicit_type_source_degrades_to_none() {
+        // Risk 1: legacy hub_index.json with "type_source": "explicit" must not error.
+        let json = r#"{"name":"legacy_explicit","type_source":"explicit"}"#;
+        let pkg: PkgEntity = serde_json::from_str(json).expect("must not error on unknown variant");
+        assert!(
+            pkg.type_source.is_none(),
+            "\"explicit\" must degrade to None, got: {:?}",
+            pkg.type_source
+        );
+    }
+
+    #[test]
+    fn serde_deserialize_known_type_source_parses_correctly() {
+        let json = r#"{"name":"lib_auto","type_source":"auto_detected_library"}"#;
+        let pkg: PkgEntity = serde_json::from_str(json).expect("must not error");
+        assert_eq!(pkg.type_source, Some(TypeSource::AutoDetectedLibrary));
     }
 }

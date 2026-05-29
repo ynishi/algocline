@@ -131,7 +131,6 @@ Each field below is tagged with one of three status labels. The same labels are 
 | `category`           | **Required**    | string | Grouping key for `llms.txt` and hub search.                                                                    |
 | `alc_shapes_compat`  | **Recommended** | string | SemVer range (e.g. `">=0.25.0, <0.26"`) declaring the pkg's compatible `alc_shapes` versions. Validated by `alc_hub_gendoc` against the bundled `alc_shapes` (range mismatch → error; absent → warning). Required for **Bundled** pkgs.    |
 | `tags`               | **Recommended** | table (string array) | Free-form classification tags (e.g. `{ "swarm", "primitive" }`). Indexed by `hub_index.json` and searchable via `alc_hub_search`. No enforced taxonomy; authors choose tags that help discovery. |
-| `type`               | Optional        | string (`"runnable"` \| `"library"`) | Package kind. `"runnable"` — has `M.run(ctx)` and can be invoked via `alc_advice`/`alc_eval`. `"library"` — exposes a reusable API surface; `alc_advice`/`alc_eval` reject it with a typed error. When absent, the type is auto-detected at runtime from `type(pkg.run) == "function"`. |
 
 (Lint codes: `E_META_MISSING_{NAME,VERSION,DESCRIPTION,CATEGORY}`,
 `W_META_LEGACY_M_VERSION` — see §5.)

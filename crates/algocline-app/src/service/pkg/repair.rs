@@ -653,8 +653,6 @@ pub(super) fn collect_unregistered_pkg_dirs(
     Ok(entries)
 }
 
-/// Returns `true` iff `name` is safe to interpolate into a Lua `require()` call.
-///
 impl AppService {
     /// Walk `pkg_dir` and collect **alive symlinks** that contain `init.lua` at the
     /// resolved target but are not registered in any of the three authoritative

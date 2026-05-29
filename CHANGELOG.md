@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `alc_pkg_doctor`: alive symlinks under `~/.algocline/packages/` that are not registered in `installed.json`, `alc.toml`, or `alc.local.toml` are now reported (additive entries into `unmarked_library` or `unregistered_pkg`; JSON shape unchanged).
 - `alc_pkg_doctor`: alive-symlink `type_source` detection now uses the same `eval_simple` + `LUA_TYPE_AUTODETECT` runtime path as `alc_pkg_list`, eliminating a static-parse divergence that caused 5 auto-detected library packages to be misclassified as `unregistered_pkg` instead of `unmarked_library`.
 
+### Changed — **BREAKING**: removed explicit M.meta.type declaration
+
+- `M.meta.type` explicit declaration is removed (bug fix: Lua strategy packages have no bin/lib distinction). Package type is now always auto-detected from `type(pkg.run) == "function"` via VM eval.
+- `alc_pkg_doctor` no longer emits the `unmarked_library` bucket (the explicit-type suggestion is obsolete). v0.40.0-only addition; 0 packages used the feature.
+- `TypeSource::Explicit` variant removed (breaking for Rust API consumers / trait implementors only; wire `"explicit"` in legacy hub_index.json deserializes to `null` gracefully). v0.40.0-only addition; 0 packages used explicit type.
+- `alc_pkg_list`: `warnings` field with explicit-type suggestion removed.
+- hub `build_index` now derives type via VM eval (single source of truth) instead of text scan.
+
 ## [0.39.0] - 2026-05-28
 
 ### Added

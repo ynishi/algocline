@@ -17,7 +17,7 @@ use super::super::AppService;
 use super::super::{PkgListError, ServiceError};
 // Informational note shown in pkg_list warnings when a package is
 // auto-classified as a library by LUA_TYPE_AUTODETECT (no M.run found).
-// Explicit M.meta.type declarations were removed in v0.40.0 — type is
+// Explicit M.meta.type declarations were removed in v0.41.0 — type is
 // now determined solely by VM eval.
 const UNMARKED_LIBRARY_SUGGESTION: &str =
     "This package has no M.run function and is auto-classified as a library \
@@ -872,7 +872,7 @@ fn collect_path_entries_from_lock(
 /// Only `"auto_detected_library"` triggers this function; `None` (absent key)
 /// and `"auto_detected_runnable"` return `None`.
 ///
-/// Note: explicit `M.meta.type` declarations were removed in v0.40.0.
+/// Note: explicit `M.meta.type` declarations were removed in v0.41.0.
 /// Type is now determined solely by VM eval (LUA_TYPE_AUTODETECT).
 fn derive_warnings_from_meta(meta: &serde_json::Value) -> Option<Vec<String>> {
     let ts = meta.get("type_source").and_then(|v| v.as_str())?;

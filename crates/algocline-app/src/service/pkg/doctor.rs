@@ -830,7 +830,7 @@ impl AppService {
     /// `missing_hub_index`, `missing_meta`, `path_missing`, `spec_missing`,
     /// `stale_cache`, `symlink_dangling`, `unregistered_pkg`).
     ///
-    /// The `unmarked_library` bucket was removed in v0.40.0 — packages are
+    /// The `unmarked_library` bucket was removed in v0.41.0 — packages are
     /// no longer expected to declare an explicit `M.meta.type`; type detection
     /// is solely handled via VM eval at run/eval time.
     ///

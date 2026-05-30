@@ -249,6 +249,87 @@ function alc.parse_number(text, pattern)
     return tonumber(text:match("%-?%d+%.?%d*"))
 end
 
+--- alc.fmt(fmt, ...) -> string
+--- Safe string.format drop-in.
+--- - Integer specs (%d %i %u %o %x %X %c) with non-integer float args use
+---   half-away-from-zero rounding (1.5 -> 2, -1.5 -> -2).
+--- - NaN / +Inf / -Inf args to integer specs rewrite the spec to %s and
+---   substitute "NaN" / "Inf" / "-Inf".
+--- - String args to integer specs are re-coerced via tonumber.
+--- - %s + nil falls back to "<nil>".
+--- - All other specs (%s %f %.Nf %q %g %e %g etc) are byte-for-byte identical
+---   to string.format.
+---
+--- Edge cases: nil fmt is treated as "". Underflow (more specs than args)
+--- propagates the native string.format error (we do not swallow).
+---
+--- Usage:
+---   alc.fmt("%d", 1.5)              -- "2"
+---   alc.fmt("revenue=$%d", 1234.5)  -- "revenue=$1235"
+---   alc.fmt("%s", nil)              -- "<nil>"
+---   alc.fmt("%d", 0/0)              -- "NaN"
+function alc.fmt(fmt, ...)
+    local args = { ... }
+    local n = select("#", ...)
+    local i = 0
+    local out = (fmt or ""):gsub("%%[%-%+ #0]*%d*%.?%d*[diouxXcsqfeEgGpP%%]", function(spec)
+        if spec == "%%" then
+            return "%%"
+        end
+        i = i + 1
+        if i > n then
+            return spec
+        end
+        local v = args[i]
+        local conv = spec:sub(-1)
+        if
+            conv == "d"
+            or conv == "i"
+            or conv == "u"
+            or conv == "o"
+            or conv == "x"
+            or conv == "X"
+            or conv == "c"
+        then
+            if type(v) == "string" then
+                v = tonumber(v) or v
+            end
+            if type(v) == "number" then
+                if v ~= v then
+                    args[i] = "NaN"
+                    return spec:sub(1, -2) .. "s"
+                elseif v == math.huge then
+                    args[i] = "Inf"
+                    return spec:sub(1, -2) .. "s"
+                elseif v == -math.huge then
+                    args[i] = "-Inf"
+                    return spec:sub(1, -2) .. "s"
+                end
+                if v % 1 ~= 0 then
+                    args[i] = v >= 0 and math.floor(v + 0.5) or math.ceil(v - 0.5)
+                else
+                    args[i] = v
+                end
+            end
+        elseif conv == "s" then
+            if v == nil then
+                args[i] = "<nil>"
+            end
+        end
+        return spec
+    end)
+    return string.format(out, table.unpack(args, 1, n))
+end
+
+--- alc.log_fmt(level, fmt, ...) -> nil
+--- Thin wrapper: equivalent to alc.log(level, alc.fmt(fmt, ...)).
+---
+--- Usage:
+---   alc.log_fmt("info", "score=%d", 7.5)   -- logs "score=8"
+function alc.log_fmt(level, fmt, ...)
+    return alc.log(level, alc.fmt(fmt, ...))
+end
+
 --- alc.json_extract(raw) -> table | nil
 --- Extract JSON object or array from LLM output.
 --- Handles raw JSON, markdown fences (```json ... ```), and

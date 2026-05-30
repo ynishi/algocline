@@ -909,3 +909,62 @@ describe("alc.eval", function()
         expect(tostring(err):find("scenario must be a string or table") ~= nil).to.equal(true)
     end)
 end)
+
+-- ── alc.fmt ──────────────────────────────────────────────────
+describe("alc.fmt", function()
+    it("rounds positive half away from zero (%d, 1.5)", function()
+        expect(alc.fmt("%d", 1.5)).to.equal("2")
+    end)
+
+    it("rounds negative half away from zero (%d, -1.5)", function()
+        expect(alc.fmt("%d", -1.5)).to.equal("-2")
+    end)
+
+    it("rounds multiple args in a compound format", function()
+        expect(alc.fmt("revenue=$%d users=%d", 1234.5, 10)).to.equal("revenue=$1235 users=10")
+    end)
+
+    it("rewrites NaN to literal string", function()
+        expect(alc.fmt("%d", 0 / 0)).to.equal("NaN")
+    end)
+
+    it("rewrites +Inf to literal string", function()
+        expect(alc.fmt("%d", math.huge)).to.equal("Inf")
+    end)
+
+    it("preserves width/zero-pad flags after rounding (%05d, 1.7)", function()
+        expect(alc.fmt("%05d", 1.7)).to.equal("00002")
+    end)
+
+    it("preserves left-justify flag after rounding (%-5d|, 1.5)", function()
+        expect(alc.fmt("%-5d|", 1.5)).to.equal("2    |")
+    end)
+
+    it("coerces string arg to number for %d", function()
+        expect(alc.fmt("%d", "42")).to.equal("42")
+    end)
+
+    it("substitutes <nil> for %s + nil", function()
+        expect(alc.fmt("%s", nil)).to.equal("<nil>")
+    end)
+
+    it("passes through float specs unchanged (%.2f)", function()
+        expect(alc.fmt("%.2f", 3.14159)).to.equal("3.14")
+    end)
+
+    it("propagates underflow as error (fewer args than specs)", function()
+        local ok = pcall(alc.fmt, "%d %s", 1.5)
+        expect(ok).to.equal(false)
+    end)
+end)
+
+-- ── alc.log_fmt ──────────────────────────────────────────────
+describe("alc.log_fmt", function()
+    it("logs formatted message via alc.log", function()
+        local before = #log_entries
+        alc.log_fmt("info", "score=%d", 7.5)
+        expect(#log_entries).to.equal(before + 1)
+        expect(log_entries[#log_entries].level).to.equal("info")
+        expect(log_entries[#log_entries].msg).to.equal("score=8")
+    end)
+end)

@@ -357,6 +357,21 @@ function alc.parse_score(str, default) end
 ---@return number|nil value Extracted number or nil
 function alc.parse_number(text, pattern) end
 
+--- Safe string.format drop-in. Integer specs (%d %i %u %o %x %X %c) with
+--- non-integer float args use half-away-from-zero rounding. NaN/+Inf/-Inf
+--- args to integer specs rewrite the spec to %s and substitute "NaN"/"Inf"/"-Inf".
+--- %s + nil falls back to "<nil>". Other specs are identical to string.format.
+---@param fmt string Format string
+---@param ... any Arguments
+---@return string formatted
+function alc.fmt(fmt, ...) end
+
+--- Format and log. Equivalent to alc.log(level, alc.fmt(fmt, ...)).
+---@param level "error"|"warn"|"info"|"debug" Log level
+---@param fmt string Format string
+---@param ... any Arguments
+function alc.log_fmt(level, fmt, ...) end
+
 -- JSON ---
 
 --- Extract JSON object or array from LLM output (3-stage fallback).

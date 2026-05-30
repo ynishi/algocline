@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alc.fmt(fmt, ...)` and `alc.log_fmt(level, fmt, ...)` Layer 1 prelude combinators: safe `string.format` drop-ins for LLM-derived metrics. Integer specs apply half-away-from-zero rounding (`1.5 -> 2`, `-1.5 -> -2`), NaN/+Inf/-Inf are rewritten to `%s` with `"NaN"`/`"Inf"`/`"-Inf"` substitutions, string-shaped numbers re-coerce via `tonumber`, and `%s` + `nil` falls back to `"<nil>"`. Other specs (`%s %f %.Nf %q %g` ...) pass through identically. Additive, non-breaking.
+
 ## [0.41.0] - 2026-05-29
 
 ### Changed — **BREAKING**: removed explicit M.meta.type declaration

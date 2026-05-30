@@ -940,3 +940,9 @@ be aware that other packages in the same Collection may have a runtime
 
 The full list of bundled sources and their pinned tags is in
 `src/init.rs::BUNDLED_SOURCES`.
+
+**LLM-derived metrics formatting.** Use `alc.fmt` / `alc.log_fmt` instead of raw
+`string.format` when interpolating numeric values that may originate from an LLM
+(float, NaN/Inf, or string-shaped numbers). The native `string.format("%d", 1.5)`
+truncates toward zero and `string.format("%d", 0/0)` raises; `alc.fmt` rounds
+half-away-from-zero and substitutes safe string literals.

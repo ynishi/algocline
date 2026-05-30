@@ -194,6 +194,38 @@ alc.log("info", "Processing chunk 3 of 10")
 alc.log("debug", "Score: " .. tostring(score))
 ```
 
+### Formatting
+
+#### `alc.fmt(fmt, ...) -> string`
+
+Safe `string.format` drop-in. Defensive on LLM-derived numeric arguments.
+
+- Integer specs (`%d %i %u %o %x %X %c`) with non-integer float args use
+  half-away-from-zero rounding (`1.5 -> 2`, `-1.5 -> -2`).
+- `NaN`, `+Inf`, `-Inf` args to integer specs rewrite the spec to `%s` and
+  substitute the literal strings `"NaN"`, `"Inf"`, `"-Inf"`.
+- String args to integer specs are re-coerced via `tonumber`.
+- `%s` + `nil` falls back to `"<nil>"`.
+- All other specs (`%s %f %.Nf %q %g %e` ...) are byte-for-byte identical to
+  `string.format`.
+
+```lua
+alc.fmt("%d", 1.5)                          -- "2"
+alc.fmt("revenue=$%d users=%d", 1234.5, 10) -- "revenue=$1235 users=10"
+alc.fmt("%d", 0 / 0)                        -- "NaN"
+alc.fmt("%s", nil)                          -- "<nil>"
+alc.fmt("%.2f", 3.14159)                    -- "3.14"
+```
+
+#### `alc.log_fmt(level, fmt, ...)`
+
+Thin wrapper. Equivalent to `alc.log(level, alc.fmt(fmt, ...))`.
+
+```lua
+alc.log_fmt("info", "score=%d users=%d", 7.5, 10)
+-- logs "score=8 users=10" at level info
+```
+
 ### State
 
 Persistent key-value store. Namespace-scoped (via `ctx._ns`, default: `"default"`). Values are serialized as JSON.

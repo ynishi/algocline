@@ -49,7 +49,7 @@ const BUNDLED_SOURCES: &[BundledSource] = &[
     },
     BundledSource {
         url: "https://github.com/ynishi/algocline-swarm-frame",
-        tag: "v0.7.0",
+        tag: "v0.8.0",
     },
 ];
 

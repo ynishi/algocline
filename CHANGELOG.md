@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-05-31
+
 ### Added
 
 - `alc.fmt(fmt, ...)` and `alc.log_fmt(level, fmt, ...)` Layer 1 prelude combinators: safe `string.format` drop-ins for LLM-derived metrics. Integer specs apply half-away-from-zero rounding (`1.5 -> 2`, `-1.5 -> -2`), NaN/+Inf/-Inf are rewritten to `%s` with `"NaN"`/`"Inf"`/`"-Inf"` substitutions, string-shaped numbers re-coerce via `tonumber`, and `%s` + `nil` falls back to `"<nil>"`. Other specs (`%s %f %.Nf %q %g` ...) pass through identically. Additive, non-breaking.
+
+### Changed
+
+- Bundled packages: `algocline-swarm-frame` bumped from `v0.7.0` to `v0.8.0`. The collection now ships three packages: `swarm_aggregate_plugin` 0.1.0 (new — bridges dmad / moa / reconcile aggregate algorithms onto `swarm_frame_algocline.make_dispatcher`), `swarm_frame` 0.8.0 (artifact_store + 4-method backend + summarize on top of v0.7.0), and `swarm_frame_algocline` 0.2.0 (Token & Prompt round-trip primitive with format mode + resolve_task_dir). Run `alc update` to pick up the new collection.
 
 ## [0.41.0] - 2026-05-29
 

@@ -1803,6 +1803,18 @@ mod tests {
             !obj.contains_key("docstring_matched"),
             "docstring_matched=None must be omitted"
         );
+        // `type` field must be present in serialized output even when
+        // pkg_type=None (custom serializer at L205 always emits the key).
+        // Backward-compat: callers parse "type" to distinguish runnable vs
+        // library packages.
+        assert!(
+            obj.contains_key("type"),
+            "type key must always be present in serialized output"
+        );
+        assert!(
+            obj.get("type").map(|v| v.is_null()).unwrap_or(false),
+            "type must be null when pkg_type=None"
+        );
     }
 
     #[test]

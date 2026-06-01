@@ -218,10 +218,10 @@ local agg_a = result_a.result and result_a.result.aggregated
 local agg_b = result_b.result and result_b.result.aggregated
 
 if not agg_a or not agg_a.scores then
-  error("No aggregated scores in {eval_id_a}")
+  error("No aggregated scores in {eval_id_a_escaped}")
 end
 if not agg_b or not agg_b.scores then
-  error("No aggregated scores in {eval_id_b}")
+  error("No aggregated scores in {eval_id_b_escaped}")
 end
 
 local welch = stats.welch_t(agg_a.scores, agg_b.scores)
@@ -262,7 +262,7 @@ end
 
 return {{
   a = {{
-    eval_id = "{eval_id_a}",
+    eval_id = "{eval_id_a_escaped}",
     strategy = strategy_a,
     scores = agg_a.scores,
     pass_rate = agg_a.pass_rate,
@@ -270,7 +270,7 @@ return {{
     ci_95 = agg_a.ci_95,
   }},
   b = {{
-    eval_id = "{eval_id_b}",
+    eval_id = "{eval_id_b_escaped}",
     strategy = strategy_b,
     scores = agg_b.scores,
     pass_rate = agg_b.pass_rate,
@@ -292,11 +292,17 @@ return {{
 "#,
             result_a_escaped = escape_for_lua_sq(&result_a),
             result_b_escaped = escape_for_lua_sq(&result_b),
-            eval_id_a = eval_id_a,
-            eval_id_b = eval_id_b,
+            // Security: eval_id_a / eval_id_b arrive as MCP tool arguments
+            // (caller-supplied String), so they MUST be escaped before being
+            // embedded in the Lua string literals at L221, L224, L265, L273.
+            // strategy_a/b_fallback are substrings of the eval_ids, so the same
+            // escape applies. Without this, a crafted eval_id containing `'`
+            // or `\` can break out of the Lua string and inject arbitrary code.
+            eval_id_a_escaped = escape_for_lua_sq(eval_id_a),
+            eval_id_b_escaped = escape_for_lua_sq(eval_id_b),
             std_shim = STD_SHIM,
-            strategy_a_fallback = extract_strategy_from_id(eval_id_a).unwrap_or("A"),
-            strategy_b_fallback = extract_strategy_from_id(eval_id_b).unwrap_or("B"),
+            strategy_a_fallback = escape_for_lua_sq(extract_strategy_from_id(eval_id_a).unwrap_or("A")),
+            strategy_b_fallback = escape_for_lua_sq(extract_strategy_from_id(eval_id_b).unwrap_or("B")),
         );
 
         let ctx = serde_json::Value::Null;

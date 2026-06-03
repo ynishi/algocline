@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bundled packages: `algocline-swarm-frame` bumped from `v0.8.0` to `v0.9.0`. v0.9.0 adds control-flow combinators on top of v0.8.0: `swarm_frame.sequence` (ordered Handler list with short-circuit on non-DONE), `swarm_frame.loop` (bounded iteration with predicate exit), `swarm_frame.branch` (single-shot conditional dispatch), and `swarm_frame.verdict_loop` (retry-on-FAIL gate). `combinator_demo` 0.1.0 ships as a new example package (minimal `verdict_loop` driver). lshape schemas `SwarmFrame.{SequenceOpts, LoopOpts, BranchOpts, VerdictLoopOpts, Handler}` are registered in `default_registry`. Mechanism/policy split: the Engine owns iteration / short-circuit / `cp_state` idempotent persistence; `parser` / `cond` / `fix` remain the caller's domain. Additive, non-breaking. Run `alc update` to pick up the new collection.
+
 ## [0.41.1] - 2026-05-31
 
 ### Added

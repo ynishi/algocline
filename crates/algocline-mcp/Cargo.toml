@@ -17,7 +17,7 @@ algocline-app = { workspace = true }
 algocline-core = { workspace = true }
 tokio = { workspace = true }
 
-rmcp = { version = "1.7", features = ["server", "transport-io"] }
+rmcp = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

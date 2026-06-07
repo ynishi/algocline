@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.2] - 2026-06-07
+
 ### Added
 
 - `alc_pkg_test` sandbox now mirrors the full `alc.*` primitive surface that `alc_run` exposes (stateless helpers like `alc.json_encode`, `alc.fingerprint`, `alc.fuzzy.*` are callable directly from specs; stateful helpers `alc.state.*` / `alc.card.*` are backed by a per-VM in-memory tempdir). A Pure-Lua mock layer adds `with_alc(overrides, fn)` for scoped overrides, `alc_mock.install/restore` for `before_each` setup, and `alc.spy(name, default_fn?)` for call observation. External-I/O entries (`alc.llm`, `alc.llm_batch`, `alc.fork`) are present as stubs that error with a `mock required: alc.<name>` message until `with_alc` overrides them. The invariant `production primitive surface ⊆ test sandbox primitive surface` is enforced at test time by `crates/algocline-engine/tests/bridge_sandbox_parity.rs`. Fixes the asymmetry that forced packages to embed inline pure-Lua JSON encoders to keep spec tests passing. New public exports on `algocline-engine`: `bridge` module is now `pub`, with `bridge::install_for_pkg_test(&Lua) -> LuaResult<()>` and `bridge::PRELUDE` available to crate consumers. Additive, non-breaking. See [docs/lua-stdlib.md §Test Sandbox](docs/lua-stdlib.md) for spec-author API. (Issue 7dc77cc7)

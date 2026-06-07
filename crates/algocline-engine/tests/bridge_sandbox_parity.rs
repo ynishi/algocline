@@ -49,9 +49,7 @@ fn production_vm() -> (Lua, tempfile::TempDir) {
 
     let alc_table = lua.create_table().expect("create alc table");
     bridge::register(&lua, &alc_table, config).expect("production register");
-    lua.globals()
-        .set("alc", alc_table)
-        .expect("set alc global");
+    lua.globals().set("alc", alc_table).expect("set alc global");
     lua.load(bridge::PRELUDE)
         .set_name("@alc_prelude")
         .exec()

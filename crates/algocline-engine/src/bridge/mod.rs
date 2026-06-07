@@ -195,12 +195,14 @@ pub fn install_for_pkg_test(lua: &Lua) -> LuaResult<()> {
 }
 
 fn install_external_io_stub(lua: &Lua, alc_table: &LuaTable, name: &'static str) -> LuaResult<()> {
-    let stub = lua.create_function(move |_, _: mlua::Variadic<LuaValue>| -> LuaResult<LuaValue> {
-        Err(LuaError::external(format!(
-            "mock required: alc.{name} — wrap the call in `with_alc({{ {name} = fn }}, fn)` \
+    let stub = lua.create_function(
+        move |_, _: mlua::Variadic<LuaValue>| -> LuaResult<LuaValue> {
+            Err(LuaError::external(format!(
+                "mock required: alc.{name} — wrap the call in `with_alc({{ {name} = fn }}, fn)` \
              inside your spec (alc_pkg_test sandbox stubs external I/O by design)"
-        )))
-    })?;
+            )))
+        },
+    )?;
     alc_table.set(name, stub)?;
     Ok(())
 }

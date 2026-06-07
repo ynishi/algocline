@@ -589,8 +589,8 @@ fn run_pkg_test_in_sandbox(
         .exec()
         .map_err(|e| format!("Test execution error: {e}"))?;
 
-    let summary = framework::collect_results(&lua)
-        .map_err(|e| format!("Failed to collect results: {e}"))?;
+    let summary =
+        framework::collect_results(&lua).map_err(|e| format!("Failed to collect results: {e}"))?;
 
     Ok(summary)
 }

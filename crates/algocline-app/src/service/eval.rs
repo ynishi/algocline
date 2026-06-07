@@ -301,8 +301,10 @@ return {{
             eval_id_a_escaped = escape_for_lua_sq(eval_id_a),
             eval_id_b_escaped = escape_for_lua_sq(eval_id_b),
             std_shim = STD_SHIM,
-            strategy_a_fallback = escape_for_lua_sq(extract_strategy_from_id(eval_id_a).unwrap_or("A")),
-            strategy_b_fallback = escape_for_lua_sq(extract_strategy_from_id(eval_id_b).unwrap_or("B")),
+            strategy_a_fallback =
+                escape_for_lua_sq(extract_strategy_from_id(eval_id_a).unwrap_or("A")),
+            strategy_b_fallback =
+                escape_for_lua_sq(extract_strategy_from_id(eval_id_b).unwrap_or("B")),
         );
 
         let ctx = serde_json::Value::Null;

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alc_pkg_test` sandbox now mirrors the full `alc.*` primitive surface that `alc_run` exposes (stateless helpers like `alc.json_encode`, `alc.fingerprint`, `alc.fuzzy.*` are callable directly from specs; stateful helpers `alc.state.*` / `alc.card.*` are backed by a per-VM in-memory tempdir). A Pure-Lua mock layer adds `with_alc(overrides, fn)` for scoped overrides, `alc_mock.install/restore` for `before_each` setup, and `alc.spy(name, default_fn?)` for call observation. External-I/O entries (`alc.llm`, `alc.llm_batch`, `alc.fork`) are present as stubs that error with a `mock required: alc.<name>` message until `with_alc` overrides them. The invariant `production primitive surface ⊆ test sandbox primitive surface` is enforced at test time by `crates/algocline-engine/tests/bridge_sandbox_parity.rs`. Fixes the asymmetry that forced packages to embed inline pure-Lua JSON encoders to keep spec tests passing. New public exports on `algocline-engine`: `bridge` module is now `pub`, with `bridge::install_for_pkg_test(&Lua) -> LuaResult<()>` and `bridge::PRELUDE` available to crate consumers. Additive, non-breaking. See [docs/lua-stdlib.md §Test Sandbox](docs/lua-stdlib.md) for spec-author API. (Issue 7dc77cc7)
+
 ### Changed
 
 - Bundled packages: `algocline-swarm-frame` bumped from `v0.8.0` to `v0.9.0`. v0.9.0 adds control-flow combinators on top of v0.8.0: `swarm_frame.sequence` (ordered Handler list with short-circuit on non-DONE), `swarm_frame.loop` (bounded iteration with predicate exit), `swarm_frame.branch` (single-shot conditional dispatch), and `swarm_frame.verdict_loop` (retry-on-FAIL gate). `combinator_demo` 0.1.0 ships as a new example package (minimal `verdict_loop` driver). lshape schemas `SwarmFrame.{SequenceOpts, LoopOpts, BranchOpts, VerdictLoopOpts, Handler}` are registered in `default_registry`. Mechanism/policy split: the Engine owns iteration / short-circuit / `cp_state` idempotent persistence; `parser` / `cond` / `fix` remain the caller's domain. Additive, non-breaking. Run `alc update` to pick up the new collection.

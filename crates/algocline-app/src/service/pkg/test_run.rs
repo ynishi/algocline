@@ -22,8 +22,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlua::Lua;
-use mlua_lspec::framework;
+use algocline_engine::bridge as engine_bridge;
+use mlua::{Lua, Value as LuaValue, Variadic};
+use mlua_lspec::{doubles, framework};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -524,6 +525,76 @@ async fn run_inline(code: String, search_paths: Vec<String>) -> Result<String, S
 ///
 /// # Errors
 ///
+/// Run a single Lua spec inside an `alc_pkg_test` sandbox VM.
+///
+/// Equivalent to [`mlua_lspec::framework::run_tests`], but the VM is
+/// pre-loaded with the full `alc.*` primitive surface via
+/// [`algocline_engine::bridge::install_for_pkg_test`] plus the Pure-Lua
+/// mock layer (`with_alc` / `alc_mock` / `alc.spy`).  This guarantees
+/// `production primitive surface ⊆ test sandbox primitive surface`, so
+/// specs can call `alc.json_encode` etc. without inline workarounds
+/// (fix for issue 7dc77cc7 — alc_run / alc_pkg_test VM狭広逆転).
+///
+/// # Errors
+///
+/// Returns the same `String` error shape as `framework::run_tests` for
+/// per-spec crashes (registration / search-path / load / collect-results).
+fn run_pkg_test_in_sandbox(
+    code: &str,
+    chunk_name: &str,
+    search_paths: &[&str],
+) -> Result<mlua_lspec::TestSummary, String> {
+    let lua = Lua::new();
+
+    engine_bridge::install_for_pkg_test(&lua)
+        .map_err(|e| format!("Failed to install alc.* sandbox: {e}"))?;
+    framework::register(&lua).map_err(|e| format!("Failed to register test framework: {e}"))?;
+    doubles::register(&lua).map_err(|e| format!("Failed to register test doubles: {e}"))?;
+
+    // Prepend search paths (mirrors mlua_lspec::framework::prepend_search_paths,
+    // which is private).
+    if !search_paths.is_empty() {
+        let package: mlua::Table = lua
+            .globals()
+            .get("package")
+            .map_err(|e| format!("Failed to get package table: {e}"))?;
+        let current: String = package
+            .get("path")
+            .map_err(|e| format!("Failed to get package.path: {e}"))?;
+        let mut prefix = String::new();
+        for dir in search_paths {
+            let dir = dir.trim_end_matches('/');
+            prefix.push_str(dir);
+            prefix.push_str("/?.lua;");
+            prefix.push_str(dir);
+            prefix.push_str("/?/init.lua;");
+        }
+        prefix.push_str(&current);
+        package
+            .set("path", prefix)
+            .map_err(|e| format!("Failed to set package.path: {e}"))?;
+    }
+
+    // Suppress lust's print() output so stdio MCP transports stay clean.
+    lua.globals()
+        .set(
+            "print",
+            lua.create_function(|_, _: Variadic<LuaValue>| Ok(()))
+                .map_err(|e| format!("Failed to override print: {e}"))?,
+        )
+        .map_err(|e| format!("Failed to override print: {e}"))?;
+
+    lua.load(code)
+        .set_name(chunk_name)
+        .exec()
+        .map_err(|e| format!("Test execution error: {e}"))?;
+
+    let summary = framework::collect_results(&lua)
+        .map_err(|e| format!("Failed to collect results: {e}"))?;
+
+    Ok(summary)
+}
+
 /// Returns `Err` when the task panics.
 async fn run_single_spec(
     code: String,
@@ -533,14 +604,14 @@ async fn run_single_spec(
     let total_start = Instant::now();
 
     let (spec_file_entry, agg_passed, agg_failed) = tokio::task::spawn_blocking(move || {
-        // mlua::Lua is !Send — construct inside the blocking task.
-        let lua = Lua::new();
+        // mlua::Lua is constructed per-spec inside `run_pkg_test_in_sandbox`
+        // (which installs `alc.*` + the mock layer).  No external VM here.
 
         let search_refs: Vec<&str> = search_paths.iter().map(|s| s.as_str()).collect();
         let spec_start = Instant::now();
 
         let (tests_json, passed, failed) =
-            match framework::run_tests(&code, &chunk_name, &search_refs) {
+            match run_pkg_test_in_sandbox(&code, &chunk_name, &search_refs) {
                 Ok(summary) => {
                     let tests: Vec<Value> = summary
                         .tests
@@ -581,9 +652,6 @@ async fn run_single_spec(
             "duration_ms": spec_duration_ms,
             "tests": tests_json
         });
-
-        // Keep lua alive until here to avoid premature Drop.
-        drop(lua);
 
         (spec_entry, passed, failed)
     })
@@ -656,12 +724,11 @@ async fn run_pkg_specs(
             let chunk_name = format!("@{path_str}");
             let search_refs: Vec<&str> = search_paths.iter().map(|s| s.as_str()).collect();
 
-            // mlua::Lua is !Send — construct fresh per spec file.
-            let lua = Lua::new();
+            // mlua::Lua is constructed per-spec inside `run_pkg_test_in_sandbox`.
             let spec_start = Instant::now();
 
             let (tests_json, passed, failed) =
-                match framework::run_tests(&code, &chunk_name, &search_refs) {
+                match run_pkg_test_in_sandbox(&code, &chunk_name, &search_refs) {
                     Ok(summary) => {
                         let tests: Vec<Value> = summary
                             .tests
@@ -705,9 +772,6 @@ async fn run_pkg_specs(
 
             total_passed += passed;
             total_failed += failed;
-
-            // Keep lua alive until end of this iteration, then drop.
-            drop(lua);
         }
 
         (entries, total_passed, total_failed)

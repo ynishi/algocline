@@ -11,8 +11,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use algocline_core::{BudgetHandle, CustomMetricsHandle, LogSink, ProgressHandle, StatsHandle};
+use algocline_core::{
+    BudgetHandle, CustomMetricsHandle, ExecutionMetrics, LogSink, ProgressHandle, StatsHandle,
+};
 use mlua::prelude::*;
+use tempfile::TempDir;
 
 mod data;
 mod fork;
@@ -26,7 +29,7 @@ use crate::state::JsonFileStore;
 use crate::variant_pkg::VariantPkg;
 
 /// Layer 1 prelude (also used by fork to setup child VMs).
-pub(crate) const PRELUDE: &str = include_str!("../prelude.lua");
+pub const PRELUDE: &str = include_str!("../prelude.lua");
 
 /// All handles needed by Layer 0 runtime primitives.
 ///
@@ -118,6 +121,87 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
 fn register_math(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     let math_table = mlua_mathlib::module(lua)?;
     alc_table.set("math", math_table)?;
+    Ok(())
+}
+
+/// Embedded mock layer (`with_alc` / `alc_mock` / `alc.spy`) installed
+/// on top of the standard `alc.*` surface in `install_for_pkg_test`.
+pub(crate) const MOCK_LAYER: &str = include_str!("mock.lua");
+
+/// Install the production `alc.*` primitive surface plus the mock layer
+/// on `lua` for use by the `alc_pkg_test` sandbox.
+///
+/// Spec authors get:
+/// * the full `alc.*` surface that `alc_run` exposes (stateless helpers
+///   like `alc.json_encode`, `alc.fingerprint`, `alc.parse_number`,
+///   `alc.fuzzy.*`, plus stateful helpers backed by in-memory
+///   per-VM tempdirs for `alc.state.*` and `alc.card.*`);
+/// * `alc.llm` / `alc.llm_batch` / `alc.fork` as stubs that error out
+///   when called without a `with_alc({ llm = … }, …)` override;
+/// * a Pure-Lua mock layer (`with_alc(overrides, fn)`,
+///   `alc_mock.install/restore`, `alc.spy(name, default_fn?)`).
+///
+/// **Invariant** (enforced by `tests/bridge_sandbox_parity.rs`):
+/// `production primitive surface ⊆ test sandbox primitive surface`.
+/// Every key reachable on `_G.alc` after a successful production
+/// [`register`] call is also reachable after `install_for_pkg_test`.
+///
+/// The per-VM tempdir backing `state_store` / `card_store` is held on
+/// the Lua VM via `set_app_data` and dropped together with the VM.
+pub fn install_for_pkg_test(lua: &Lua) -> LuaResult<()> {
+    let metrics = ExecutionMetrics::new();
+    let tmp = TempDir::new()
+        .map_err(|e| LuaError::external(format!("install_for_pkg_test: tempdir: {e}")))?;
+    let root = tmp.path().to_path_buf();
+    // Tie tempdir lifetime to the Lua VM so it is cleaned up when the VM is dropped.
+    lua.set_app_data::<TempDir>(tmp);
+
+    let config = BridgeConfig {
+        llm_tx: None,
+        ns: "default".into(),
+        custom_metrics: metrics.custom_metrics_handle(),
+        stats: metrics.stats_handle(),
+        budget: metrics.budget_handle(),
+        progress: metrics.progress_handle(),
+        lib_paths: vec![],
+        variant_pkgs: vec![],
+        state_store: std::sync::Arc::new(crate::state::JsonFileStore::new(root.join("state"))),
+        card_store: std::sync::Arc::new(crate::card::FileCardStore::new(root.join("cards"))),
+        scenarios_dir: root.join("scenarios"),
+        log_sink: None,
+    };
+
+    let alc_table = lua.create_table()?;
+    register(lua, &alc_table, config)?;
+
+    // Stateful / external I/O entries that production-only registers when
+    // `llm_tx` is `Some`.  Install stubs so spec authors must mock them
+    // explicitly via `with_alc({ llm = ... }, fn)` — calling the unmocked
+    // entry surfaces a clear error instead of `attempt to call a nil value`.
+    install_external_io_stub(lua, &alc_table, "llm")?;
+    install_external_io_stub(lua, &alc_table, "llm_batch")?;
+    install_external_io_stub(lua, &alc_table, "fork")?;
+
+    lua.globals().set("alc", alc_table)?;
+    lua.load(PRELUDE)
+        .set_name("@alc_prelude")
+        .exec()
+        .map_err(|e| LuaError::external(format!("install_for_pkg_test: prelude: {e}")))?;
+    lua.load(MOCK_LAYER)
+        .set_name("@bridge_mock")
+        .exec()
+        .map_err(|e| LuaError::external(format!("install_for_pkg_test: mock layer: {e}")))?;
+    Ok(())
+}
+
+fn install_external_io_stub(lua: &Lua, alc_table: &LuaTable, name: &'static str) -> LuaResult<()> {
+    let stub = lua.create_function(move |_, _: mlua::Variadic<LuaValue>| -> LuaResult<LuaValue> {
+        Err(LuaError::external(format!(
+            "mock required: alc.{name} — wrap the call in `with_alc({{ {name} = fn }}, fn)` \
+             inside your spec (alc_pkg_test sandbox stubs external I/O by design)"
+        )))
+    })?;
+    alc_table.set(name, stub)?;
     Ok(())
 }
 

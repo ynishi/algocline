@@ -1410,3 +1410,89 @@ Sample `n` elements with replacement from `tbl`.
 ```lua
 local samples = alc.math.sample_with_replacement(rng, {"a","b","c"}, 5)
 ```
+
+---
+
+## Test Sandbox (`alc_pkg_test`) — Mock API
+
+When a package spec is executed via the `alc_pkg_test` MCP tool, the VM is
+preloaded with the full `alc.*` primitive surface (so specs can call
+`alc.json_encode`, `alc.fingerprint`, `alc.fuzzy.*`, etc. directly) and a
+Pure-Lua mock layer that lets spec authors swap external-I/O entries
+(`alc.llm`, `alc.llm_batch`, `alc.fork`) without monkey-patching.
+
+The invariant enforced at test time is
+`production primitive surface ⊆ test sandbox primitive surface`: every
+`alc.*` key reachable inside a live `alc_run` session is also reachable
+inside an `alc_pkg_test` spec. The regression guard lives in
+`crates/algocline-engine/tests/bridge_sandbox_parity.rs`.
+
+### `with_alc(overrides, fn) -> any`
+
+Scoped override. Replaces the listed `alc.*` entries for the duration of
+`fn()`, then restores the previous values — even when `fn()` raises.
+
+```lua
+it("classifies pass when llm returns true", function()
+  with_alc({
+    llm = function(prompt) return "true" end,
+    cache_get = function(_) return nil end,
+  }, function()
+    expect(my_pkg.classify("ok")).to.equal(true)
+  end)
+end)
+```
+
+Nested `with_alc` calls form a LIFO stack: an inner restore returns to
+the immediately enclosing override, not to the original value.
+
+### `alc_mock.install(overrides)` / `alc_mock.restore()`
+
+Persistent override for `before_each` / `after_each` setup. Each
+`install` pushes one frame onto the same restore stack as `with_alc`;
+`restore()` pops the most-recent frame.
+
+```lua
+describe("my_pkg", function()
+  before_each(function()
+    alc_mock.install({ llm = function() return "stub" end })
+  end)
+  after_each(alc_mock.restore)
+  -- ... tests that call my_pkg, which itself calls alc.llm ...
+end)
+```
+
+`alc_mock.restore_all()` drops every pushed frame (teardown safety net).
+
+### `alc.spy(name, default_fn?) -> handle`
+
+Wrap an `alc.*` entry with an observable proxy. The proxy still calls
+`default_fn` (or the previous entry if `default_fn` is `nil`) on
+invocation, while recording each call on the returned handle.
+
+```lua
+local llm_spy = alc.spy("llm", function(p) return "ok" end)
+my_pkg.run("task")
+expect(llm_spy.call_count).to.equal(3)
+expect(llm_spy.calls[1].args[1]).to.match("task")
+llm_spy:reset()  -- clears call_count and calls
+```
+
+The spy is pushed onto the same restore stack as `with_alc` /
+`alc_mock.install`, so spies installed inside a `with_alc` body are
+automatically torn down when the body exits.
+
+### External-I/O Stubs
+
+`alc.llm`, `alc.llm_batch`, and `alc.fork` are present in the sandbox
+but, by default, raise a "mock required" error when called:
+
+```
+mock required: alc.llm — wrap the call in `with_alc({ llm = fn }, fn)`
+inside your spec (alc_pkg_test sandbox stubs external I/O by design)
+```
+
+Specs that exercise these code paths must wrap their assertions in
+`with_alc({ llm = ... }, fn)` (or `alc_mock.install({ llm = ... })`).
+This is enforced by design — `alc_pkg_test` runs in an offline sandbox
+with no LLM channel or fork executor wired up.

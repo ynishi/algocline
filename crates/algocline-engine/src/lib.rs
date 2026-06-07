@@ -1,4 +1,4 @@
-mod bridge;
+pub mod bridge;
 pub mod card;
 pub mod execution;
 mod executor;

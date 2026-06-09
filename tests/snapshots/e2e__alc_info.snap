@@ -22,5 +22,5 @@ expression: redacted
     "sources": {}
   },
   "tracing": "file + stderr",
-  "version": "0.41.2"
+  "version": "0.41.3"
 }

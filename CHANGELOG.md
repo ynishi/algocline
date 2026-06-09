@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.3] - 2026-06-09
+
+### Changed
+
+- Bundled packages: `algocline-swarm-frame` bumped from `v0.9.0` to `v0.10.0`. Run `alc update` to pick up the new collection.
+
 ## [0.41.2] - 2026-06-07
 
 ### Added

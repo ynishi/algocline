@@ -4,3 +4,10 @@ workspace
 .mcp.json
 .claude
 .ryo
+*.db*
+*.sqlite*
+.env*
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist

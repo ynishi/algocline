@@ -1,9 +1,30 @@
 ---
 source: tests/e2e.rs
-assertion_line: 126
+assertion_line: 236
 expression: redacted
 ---
 {
+  "gh_credentials": {
+    "gh_auth": {
+      "available": true,
+      "error": null,
+      "logged_in": true
+    },
+    "git_config": {
+      "complete": true,
+      "user_email": "<GIT_USER_EMAIL>",
+      "user_name": "<GIT_USER_NAME>"
+    },
+    "origin_remote": {
+      "error": "<REDACTED>",
+      "present": false,
+      "url": null
+    },
+    "ssh_keys": {
+      "any_present": true,
+      "found": ["<REDACTED>"]
+    }
+  },
   "log_dir": {
     "resolved": "<HOME>/.algocline/logs",
     "source": "~/.algocline/logs"

@@ -208,6 +208,14 @@ impl AppService {
             info["packages_dir"] = serde_json::json!(packages.display().to_string());
         }
 
+        // GitHub push-credential diagnostics — always present, subprocess
+        // failures are absorbed into per-field error strings so info() never
+        // short-circuits on a missing gh/git binary.
+        // Uses std::process::Command (sync) because info() is a sync fn.
+        let gh_report = crate::service::gh_credentials::diagnose(self.log_config.app_dir().root());
+        info["gh_credentials"] = serde_json::to_value(&gh_report)
+            .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
+
         // Settings — resolve all [setting.*] layers in one call.
         // resolve_setting is synchronous; info() is also synchronous, so no
         // spawn_blocking is needed.

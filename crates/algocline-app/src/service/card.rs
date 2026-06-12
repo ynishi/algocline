@@ -583,11 +583,7 @@ impl AppService {
         }
 
         // 10. hub_reindex — failure absorbed into reindex_status (not bubbled as Err)
-        let staging_path_str = staging.path().to_string_lossy().to_string();
-        let reindex_status = match self
-            .hub_reindex(None, Some(staging_path_str.as_str()))
-            .await
-        {
+        let reindex_status = match self.hub_reindex(None, None).await {
             Ok(out) => ReindexStatus {
                 ok: true,
                 output: Some(out),

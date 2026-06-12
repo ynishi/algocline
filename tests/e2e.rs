@@ -7671,6 +7671,10 @@ return M"#,
         !text.contains("not found after installing bundled collection"),
         "variant-linked strategy should not produce a not-found error, got: {text}"
     );
+    assert!(
+        text.contains("variant-ok"),
+        "variant-linked strategy should execute and return variant-ok marker, got: {text}"
+    );
 
     client.cancel().await.expect("cancel failed");
 }

@@ -334,7 +334,7 @@ impl AppService {
         }
 
         // Guard: reject library packages before make_require_code (= M.run invocation)
-        if let Some((PkgType::Library, _)) = self.resolve_pkg_type_lua(strategy).await? {
+        if let Some((PkgType::Library, _)) = self.resolve_pkg_type_lua(strategy, &variants).await? {
             return Err(format!(
                 "Package '{strategy}' is a library package (type = \"library\"). \
                  Library packages provide reusable modules and do not have a run() entry point. \
@@ -370,27 +370,37 @@ impl AppService {
         ))
     }
 
-    /// Resolve the package type and provenance via Lua VM (`eval_simple`).
+    /// Resolve the package type and provenance via a dedicated Lua VM.
+    ///
+    /// Runs `LUA_TYPE_AUTODETECT` in a VM that has variant-scope packages
+    /// registered so that packages linked via `alc.local.toml` are reachable.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The package name to probe (used in `require`).
+    /// * `variants` - Variant-scope packages to register into the VM. Pass
+    ///   `&[]` when the caller has no variant context (e.g. the `eval` path).
     ///
     /// # Returns
     ///
     /// - `Ok(Some((PkgType, TypeSource)))` — type and provenance both parsed
     ///   successfully.
     /// - `Ok(None)` — eval succeeded but either the `type` or `type_source`
-    ///   field could not be parsed (unknown value or absent field); the caller
-    ///   treats this as a legacy passthrough and does not apply the library
-    ///   guard.
-    /// - `Err(String)` — `eval_simple` failed; propagated to the caller.
+    ///   field could not be parsed; the caller treats this as a legacy
+    ///   passthrough and does not apply the library guard.
+    /// - `Err(String)` — the Lua VM returned an error; propagated to the
+    ///   caller.
     ///
     /// # Provenance
     ///
     /// The Lua snippet (`LUA_TYPE_AUTODETECT`) sets `meta.type_source` to one
-    /// of `"auto_detected_runnable"` / `"auto_detected_library"` before control
-    /// returns to Rust, so both fields are always populated when the snippet
-    /// runs without error.
+    /// of `"auto_detected_runnable"` / `"auto_detected_library"` before
+    /// control returns to Rust, so both fields are always populated when the
+    /// snippet runs without error.
     pub(crate) async fn resolve_pkg_type_lua(
         &self,
         name: &str,
+        variants: &[VariantPkg],
     ) -> Result<Option<(PkgType, TypeSource)>, String> {
         let auto = super::resolve::LUA_TYPE_AUTODETECT;
         let code = format!(
@@ -398,7 +408,10 @@ impl AppService {
             name = name,
             auto = auto,
         );
-        let val = self.executor.eval_simple(code).await?;
+        let val = self
+            .executor
+            .eval_simple_with_paths(code, vec![], variants.to_vec())
+            .await?;
         let result = val.as_object().and_then(|obj| {
             let pkg_type =
                 obj.get("type")
@@ -1284,7 +1297,7 @@ return M
         );
         let svc = make_svc_with_pkg_root(pkg_root).await;
         let result = svc
-            .resolve_pkg_type_lua("auto_runnable")
+            .resolve_pkg_type_lua("auto_runnable", &[])
             .await
             .expect("eval must succeed");
         assert_eq!(
@@ -1315,7 +1328,7 @@ return M
         );
         let svc = make_svc_with_pkg_root(pkg_root).await;
         let result = svc
-            .resolve_pkg_type_lua("auto_library")
+            .resolve_pkg_type_lua("auto_library", &[])
             .await
             .expect("eval must succeed");
         assert_eq!(

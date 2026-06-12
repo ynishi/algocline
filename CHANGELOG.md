@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `alc_advice`: resolve variant-scope linked packages from `alc.local.toml` before
   the global-tier install check, allowing worktree-scoped strategies to be applied
   without manual `alc_pkg_install` (#2).
+- alc_advice: propagate variants slice into resolve_pkg_type_lua library guard so variant-scope linked packages pass the type-detect Lua VM (#2).
 
 ### Security
 

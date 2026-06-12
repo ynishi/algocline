@@ -151,9 +151,37 @@ package-style (file / path / Set, etc.), the per-package append is skipped.
    related files for identifier targets). Use `journal_excerpt` as additional
    read-only context if present. If `reference_docs` is provided, Read each
    path for additional context.
+2b. **Substrate Cross-Check** (Read/Write only — no MCP tools; substrate API
+    surface is loaded via direct Read of `~/.algocline/packages/<sub>/init.lua`,
+    not via MCP tools; (a-0) canonical list retrieval also uses Read, not MCP):
+    - **(a-0) Read canonical primitive list**: Execute
+      `Read(plugins/alc/skills/alc-wake/SKILL.md)` and extract the §Swarm
+      framework table (package names + Key API list). **This explicit Read is
+      mandatory** — Claude Code Skills are injected only into the main thread;
+      Task-tool-spawned Agent contexts do not receive auto-injection, so the
+      canonical list must be retrieved via disk Read every time.
+      - Failure literal: `### Refiner Proposal\n- BLOCKED: alc-wake SKILL.md not loadable from plugins/alc/skills/alc-wake/SKILL.md`
+    - **(a) Pre-load workspace substrate**: Read `alc.toml` and extract the
+      `[packages]` section. Cross-reference against the (a-0) canonical list
+      to enumerate substrate packages actually in use for this workspace.
+      - Failure literal: `### Refiner Proposal\n- BLOCKED: workspace alc.toml has no substrate packages`
+    - **(b) Load API surface (Read-only path)**: For each in-use substrate,
+      Read `~/.algocline/packages/<sub>/init.lua` directly and extract
+      `M.meta` + public functions. Do **not** use `alc_pkg_list`,
+      `alc_hub_search`, or any other MCP tool — refiner is Read/Write only.
+      - Failure literal: `### Refiner Proposal\n- BLOCKED: substrate <name> not loadable from <path>`
+    - **(c) Paired emit**: For every proposed change, append either a literal
+      substrate primitive path (e.g., `swarm_frame.frame.register`) extracted
+      from the (a-0) canonical list, or the literal phrase `no primitive applies`.
+      Unpaired proposed changes are not permitted; discard and rewrite before
+      emitting.
+    - **(d) Fail-closed**: On any BLOCKED condition above, emit the BLOCKED
+      literal and halt this turn immediately. Do not proceed to step 3. Do not
+      silently skip.
 3. Build an improvement proposal as a bullet list (one-to-one pairing of
    concrete observation -> proposed change; best-practice-based improvement
-   ideas aimed at the target).
+   ideas aimed at the target). Every proposed change must carry a substrate
+   primitive path or `no primitive applies` from step 2b(c).
 4. **Dedup check (optional enrichment)**: If `existing_tracker` is provided,
    compare each improvement candidate against tracker entries by
    title/excerpt overlap. Skip candidates that are already tracked, or
@@ -196,6 +224,28 @@ package-style (file / path / Set, etc.), the per-package append is skipped.
 - **Overwrite the journal by truncation** (when calling `Write`, always
   `Read` the full content first, concatenate at the end, and write back the
   whole file; losing existing sections is an append-only violation).
+- **Silent skip on alc-wake SKILL.md Read failure** — if step 2b (a-0)
+  `Read(plugins/alc/skills/alc-wake/SKILL.md)` fails, emit
+  `### Refiner Proposal\n- BLOCKED: alc-wake SKILL.md not loadable from plugins/alc/skills/alc-wake/SKILL.md`
+  and halt; do not proceed to build a proposal.
+- **Silent skip on substrate Read failure or pkg disk absence** — if step 2b
+  (b) Read of `~/.algocline/packages/<sub>/init.lua` fails, emit
+  `### Refiner Proposal\n- BLOCKED: substrate <name> not loadable from <path>`
+  and halt; do not substitute with assumptions.
+- **Emit proposed changes without paired primitive path or `no primitive applies`**
+  — every proposed change must carry either a literal substrate primitive path
+  (e.g., `swarm_frame.frame.register`) or the exact phrase `no primitive applies`;
+  discard and rewrite before emitting any unpaired proposed change.
+- **Use MCP tools in step 2b** — refiner is Read/Write only; `alc_pkg_list`,
+  `alc_hub_search`, and all other MCP tools are prohibited in the cross-check
+  step; use only direct `Read` of substrate package files.
+- **Hardcode primitive names in the Agent prompt** — primitive names must be
+  retrieved at runtime by executing `Read(plugins/alc/skills/alc-wake/SKILL.md)`
+  in step 2b (a-0) and extracting from the §Swarm framework table; do not
+  embed primitive names as static text in the Agent definition.
+- **Skip step 2b (a-0) Read of alc-wake SKILL.md** — this Read is mandatory
+  every time step 2b executes; prose references or static inline tables are
+  not acceptable substitutes.
 
 ## Anti-patterns
 
@@ -216,3 +266,68 @@ package-style (file / path / Set, etc.), the per-package append is skipped.
 - `dedup-skip` — proposing improvements that overlap with entries in
   `existing_tracker` without checking (the tracker was provided but the
   refiner ignored it and proposed duplicate work).
+- `unpaired-gap-finding` — emitting a proposed change without a paired
+  substrate primitive path (e.g., `swarm_frame.frame.register`) or the
+  explicit phrase `no primitive applies`; unpaired proposals cause downstream
+  re-invention of existing primitives.
+- `alc-wake-read-skip` — skipping step 2b (a-0) and either hardcoding
+  primitive names inline or referencing `alc-wake/SKILL.md` only in prose
+  without actually executing `Read(plugins/alc/skills/alc-wake/SKILL.md)`;
+  spawned Agent contexts do not receive Skill auto-injection, so the Read is
+  mandatory.
+- `substrate-disk-read-skip` — proceeding with cross-check without Reading
+  `alc.toml` or `~/.algocline/packages/<sub>/init.lua`; emitting substrate
+  findings based on assumption rather than disk-verified API surface.
+- `primitive-name-hardcode` — embedding primitive names (e.g., `flow.State`,
+  `swarm_frame.frame.register`) as static text in the Agent definition rather
+  than extracting them at runtime from `plugins/alc/skills/alc-wake/SKILL.md`
+  §Swarm framework; causes drift when alc-wake is updated.
+- `verbose-cross-check-dump` — writing cross-check results with more than one
+  line per finding; the 80-line output cap applies to the combined proposal +
+  journal append; keep cross-check findings compact (one line per proposed
+  change).
+
+## Regression Sample
+
+**Target**: `pipeline_new`
+
+**Before (cross-check absent — `unpaired-gap-finding` anti-pattern)**:
+
+```
+### Refiner Proposal (target: pipeline_new)
+
+- observation: state hand-off entry point is absent in pipeline_new
+  -> proposed change: introduce a new state.json schema with fields
+     { run_id, phase, payload } to carry state between pipeline stages
+```
+
+No substrate primitive cross-check was performed. The proposal re-invents
+state primitives that already exist in the bundled substrate.
+
+**After (cross-check applied — step 2b executed)**:
+
+Step 2b execution trace:
+- (a-0) `Read(plugins/alc/skills/alc-wake/SKILL.md)` → extracted §Swarm
+  framework table: `flow` (`flow.llm_bound`, `flow.state_save`, `flow.State`),
+  `swarm_frame` (`frame.init`, `frame.register`, `frame.run_linear`,
+  `frame.State`), `swarm_frame_algocline` (`adapter.make_dispatcher`), etc.
+- (a) Read `alc.toml` → `[packages]` lists `swarm_frame`, `flow`
+- (b) Read `~/.algocline/packages/flow/init.lua` → confirmed `flow.State`,
+  `flow.state_new` public API; Read `~/.algocline/packages/swarm_frame/init.lua`
+  → confirmed `frame.register({ state = ... })` signature
+
+```
+### Refiner Proposal (target: pipeline_new)
+
+- observation: state hand-off entry point is absent in pipeline_new
+  -> proposed change: use `flow.state_new` to create a State object and pass
+     it to `swarm_frame.frame.register({ state = ... })` for hand-off between
+     pipeline stages — primitive applies: flow.state_new,
+     swarm_frame.frame.register / no new schema needed
+```
+
+Cross-check result: existing primitives cover the gap; downstream
+re-invention is prevented. See `plugins/alc/agents/alc-adviser.md
+§Substrate Cross-Check` for the adviser-side procedure (MCP-augmented path)
+and `docs/pkg-author-conventions.md §Substrate dependency` for authoring
+guidance when packaging substrate-dependent code.

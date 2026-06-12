@@ -389,6 +389,15 @@ impl EngineApi for AppService {
         AppService::card_analyze(self, card_id, pkg).await
     }
 
+    async fn card_publish(
+        &self,
+        card_id: &str,
+        target_repo: &str,
+        commit_message: Option<&str>,
+    ) -> Result<String, String> {
+        AppService::card_publish(self, card_id, target_repo, commit_message).await
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     async fn hub_reindex(
@@ -621,7 +630,10 @@ impl EngineApi for AppService {
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {
-        AppService::info(self)
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || AppService::info(&svc))
+            .await
+            .unwrap_or_else(|e| format!("{{\"error\": \"info: task panicked: {e}\"}}"))
     }
 
     // ─── Pool management ─────────────────────────────────────

@@ -476,6 +476,26 @@ pub trait EngineApi: Send + Sync {
         Err("card_analyze: not implemented by this EngineApi impl".into())
     }
 
+    /// Publish a Card to a hub repository.
+    ///
+    /// Runs: git clone target_repo to staging → copy card files → git add →
+    /// git commit → git push → hub_reindex.
+    ///
+    /// Credential prerequisite: SSH key or `gh auth login` must be
+    /// configured on the host; returns a typed `CardPublishError::MissingCredentials`
+    /// with actionable guidance if push fails due to authentication.
+    ///
+    /// Push success and reindex failure are surfaced as independent fields:
+    /// a successful push is never rolled back when only reindex fails.
+    async fn card_publish(
+        &self,
+        _card_id: &str,
+        _target_repo: &str,
+        _commit_message: Option<&str>,
+    ) -> Result<String, String> {
+        Err("card_publish: not implemented by this EngineApi impl".into())
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     /// Rebuild hub index from a packages directory.

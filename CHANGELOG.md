@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alc_card_publish`: New MCP tool that publishes a Card to a hub repository — runs `git clone` of `target_repo` to a staging dir, copies the Card files in, runs `git add` / `commit` / `push origin HEAD`, then calls `alc_hub_reindex`. Inputs: `card_id`, `target_repo` (URL: http/https/file/git@/ssh; pkg slug reserved for future versions), `commit_message` (optional; defaults to `"publish card {card_id}"`). Outputs: `{ published_url, commit_hash, reindex_status: { ok, output?, error? } }`. Push failures due to missing credentials return a typed `CardPublishError::MissingCredentials` with guidance text derived from the host's actual state (gh auth status, SSH key presence, git config user.{name,email}, origin remote). Push success and reindex failure are surfaced as independent fields — a successful push is never rolled back when only reindex fails. E2E tests in `tests/e2e.rs` cover (a) happy path, (b) push failure as typed error, (c) reindex failure isolated. (Issue #1)
+- `alc_info`: Response now includes a `gh_credentials` field with per-component status — `gh_auth` (gh CLI availability + logged-in flag), `ssh_keys` (presence of `~/.ssh/id_*` candidates), `git_config` (user.name / user.email), and `origin_remote` (current project's origin remote URL). The same diagnostic helper backs the `alc_card_publish` credential error message so guidance text is grounded in actual host state rather than a generic hint. Additive, non-breaking.
+
 ## [0.41.3] - 2026-06-09
 
 ### Changed

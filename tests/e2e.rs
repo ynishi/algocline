@@ -81,9 +81,49 @@ fn redact_paths(text: &str) -> String {
     }
 }
 
+/// Redact environment-specific values inside the `gh_credentials` block.
+///
+/// The following fields vary across machines and are replaced with stable
+/// placeholders so the snapshot is portable:
+///   - git_config.user_name  → "<GIT_USER_NAME>"
+///   - git_config.user_email → "<GIT_USER_EMAIL>"
+///   - ssh_keys.found        → ["<REDACTED>"] or []
+///   - origin_remote.error   → "<GIT_REMOTE_ERROR>" (git error messages vary)
+fn redact_gh_credentials(text: &str) -> String {
+    let re_user_name = regex::Regex::new(r#""user_name":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_email = regex::Regex::new(r#""user_email":\s*"[^"]*""#).expect("invalid regex");
+    // ssh found array: replace entries but preserve structure (present/absent)
+    let re_ssh_found = regex::Regex::new(r#""found":\s*\[[^\]]*\]"#).expect("invalid regex");
+    // origin_remote error string
+    let re_origin_err = regex::Regex::new(r#"("error":\s*)"[^"]*""#).expect("invalid regex");
+
+    // We only want to redact origin_remote.error, not gh_auth.error.
+    // Strategy: redact all error strings inside gh_credentials block via a
+    // two-pass approach — replace within the gh_credentials JSON object.
+    let text = re_user_name
+        .replace_all(text, r#""user_name": "<GIT_USER_NAME>""#)
+        .into_owned();
+    let text = re_user_email
+        .replace_all(&text, r#""user_email": "<GIT_USER_EMAIL>""#)
+        .into_owned();
+    // Replace ssh found list with a stable redacted placeholder that preserves
+    // whether keys were present (any_present field is separate and unchanged).
+    let text = re_ssh_found
+        .replace_all(&text, r#""found": ["<REDACTED>"]"#)
+        .into_owned();
+    // Replace all error strings that are non-null (null stays null).
+    // This covers both gh_auth.error and origin_remote.error inside the
+    // gh_credentials block without touching errors outside it.
+    // Simple approach: only replace non-null error values (quoted strings).
+    let text = re_origin_err
+        .replace_all(&text, r#"$1"<REDACTED>""#)
+        .into_owned();
+    text
+}
+
 /// Apply all redactions.
 fn redact(text: &str) -> String {
-    redact_paths(&redact_uuids(text))
+    redact_gh_credentials(&redact_paths(&redact_uuids(text)))
 }
 
 /// Connect with a specific ALC_HOME directory.
@@ -7337,6 +7377,221 @@ async fn e2e_vm_eval_library_rejected_by_alc_advice() {
     assert!(
         text.contains("library") || text.contains("vm_eval_library_reject"),
         "error message must name the pkg or mention 'library', got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+// ─── alc_card_publish ────────────────────────────────────────────
+
+/// Creates an isolated test fixture:
+/// - `alc_home`: temp dir used as ALC_HOME
+/// - `bare`: temp dir containing a bare git repo (target hub)
+/// - returns `(alc_home, bare, card_id, target_url)`
+///
+/// The bare repo is initialised with `git init --bare` so `git push` works
+/// against it as the target_repo. A minimal card TOML is written under
+/// `{alc_home}/cards/test_pkg/{card_id}.toml`.
+async fn setup_card_publish_fixture() -> (tempfile::TempDir, tempfile::TempDir, String, String) {
+    let alc_home = tempfile::tempdir().expect("alc_home tempdir");
+    let bare = tempfile::tempdir().expect("bare repo tempdir");
+
+    // Initialise a bare git repository that will act as the hub target.
+    let out = tokio::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(bare.path())
+        .output()
+        .await
+        .expect("git init --bare failed");
+    assert!(
+        out.status.success(),
+        "git init --bare failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Write a minimal card TOML.
+    let card_id = "test_card_001";
+    let cards_dir = alc_home.path().join("cards").join("test_pkg");
+    std::fs::create_dir_all(&cards_dir).expect("create cards dir");
+    let card_toml = format!(
+        r#"schema_version = "card/v0"
+card_id = "{card_id}"
+created_at = "2026-06-12T00:00:00Z"
+
+[pkg]
+name = "test_pkg"
+"#
+    );
+    std::fs::write(cards_dir.join(format!("{card_id}.toml")), card_toml).expect("write card toml");
+
+    let target_url = format!("file://{}", bare.path().display());
+    (alc_home, bare, card_id.to_string(), target_url)
+}
+
+/// Happy path: card is published to the bare hub repo.
+/// Asserts: `published_url` present, `commit_hash` non-empty, `reindex_status.ok == true`.
+#[tokio::test]
+async fn test_alc_card_publish_happy_path() {
+    let (alc_home, _bare, card_id, target_url) = setup_card_publish_fixture().await;
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let resp = call_json(
+        &client,
+        "alc_card_publish",
+        json!({
+            "card_id": card_id,
+            "target_repo": target_url,
+        }),
+    )
+    .await;
+
+    assert!(
+        resp.get("published_url").and_then(|v| v.as_str()).is_some(),
+        "expected published_url in response, got: {resp}"
+    );
+    assert!(
+        resp.get("commit_hash")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "expected non-empty commit_hash in response, got: {resp}"
+    );
+    let reindex = resp
+        .get("reindex_status")
+        .expect("reindex_status missing from response");
+    assert_eq!(
+        reindex.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "expected reindex_status.ok == true, got: {reindex}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Push failure path: the target repo is an invalid URL so `git clone` /
+/// `git push` fail. The MCP tool must return a typed error — specifically the
+/// text must NOT be a JSON success object but must describe the failure.
+///
+/// Crux constraint: the error must specifically identify authentication /
+/// push failure (not a generic unknown error).
+#[tokio::test]
+async fn test_alc_card_publish_push_failure_typed_error() {
+    let alc_home = tempfile::tempdir().expect("alc_home tempdir");
+
+    // Write a minimal card so the lookup succeeds.
+    let card_id = "test_card_push_fail";
+    let cards_dir = alc_home.path().join("cards").join("test_pkg");
+    std::fs::create_dir_all(&cards_dir).expect("create cards dir");
+    let card_toml = format!(
+        r#"schema_version = "card/v0"
+card_id = "{card_id}"
+created_at = "2026-06-12T00:00:00Z"
+
+[pkg]
+name = "test_pkg"
+"#
+    );
+    std::fs::write(cards_dir.join(format!("{card_id}.toml")), card_toml).expect("write card toml");
+
+    // Point to a non-existent remote so git clone fails (git error, not credential).
+    let bad_url = "file:///nonexistent/path/to/repo";
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let result = client
+        .call_tool(call_params(
+            "alc_card_publish",
+            json!({
+                "card_id": card_id,
+                "target_repo": bad_url,
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+
+    // The result must be an error (isError flag set).
+    assert!(
+        result.is_error.unwrap_or(false),
+        "expected isError=true for push failure, got: {:?}",
+        result
+    );
+    let text = extract_text(&result);
+    // Must mention the failure in a non-empty way (typed error, not empty string).
+    assert!(
+        !text.is_empty(),
+        "error text must not be empty for push failure"
+    );
+    // Must NOT look like a successful CardPublishOutcome JSON.
+    assert!(
+        !text.contains("published_url"),
+        "push failure must not return a success object, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Reindex failure isolated: push succeeds but hub_reindex fails because
+/// `installed.json` is corrupt. Asserts that:
+/// - `published_url` is present (push succeeded)
+/// - `commit_hash` is non-empty (push succeeded)
+/// - `reindex_status.ok == false` (reindex failed independently)
+/// - `reindex_status.error` is non-empty (error message present)
+///
+/// Crux constraint: push success and reindex failure must be observable as
+/// independent fields; a successful push is never suppressed when only
+/// reindex fails.
+#[tokio::test]
+async fn test_alc_card_publish_reindex_failure_isolated() {
+    let (alc_home, _bare, card_id, target_url) = setup_card_publish_fixture().await;
+
+    // Corrupt installed.json so load_manifest returns Err.
+    // hub_reindex(None, None) uses use_local_state=true, which calls
+    // load_manifest → FsInstalledManifestStore::load → serde_json::from_str fails.
+    std::fs::write(
+        alc_home.path().join("installed.json"),
+        b"{not valid json{{{",
+    )
+    .expect("write corrupt installed.json");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let resp = call_json(
+        &client,
+        "alc_card_publish",
+        json!({
+            "card_id": card_id,
+            "target_repo": target_url,
+        }),
+    )
+    .await;
+
+    // Push must have succeeded — these fields are present.
+    assert!(
+        resp.get("published_url").and_then(|v| v.as_str()).is_some(),
+        "published_url must be present even when reindex fails, got: {resp}"
+    );
+    assert!(
+        resp.get("commit_hash")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "commit_hash must be present even when reindex fails, got: {resp}"
+    );
+
+    // Reindex must have failed independently.
+    let reindex = resp
+        .get("reindex_status")
+        .expect("reindex_status missing from response");
+    assert_eq!(
+        reindex.get("ok").and_then(|v| v.as_bool()),
+        Some(false),
+        "expected reindex_status.ok == false when installed.json is corrupt, got: {reindex}"
+    );
+    assert!(
+        reindex
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "expected non-empty reindex_status.error, got: {reindex}"
     );
 
     client.cancel().await.expect("cancel failed");

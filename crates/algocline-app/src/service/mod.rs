@@ -12,6 +12,7 @@ mod eval;
 mod eval_store;
 mod execution_service_impl;
 pub(crate) mod gendoc;
+pub(crate) mod gh_credentials;
 mod hub;
 pub mod hub_dist_preset;
 mod init;

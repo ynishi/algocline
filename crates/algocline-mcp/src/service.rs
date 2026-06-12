@@ -698,6 +698,18 @@ pub struct CardInstallParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardPublishParams {
+    /// Card ID to publish.
+    pub card_id: String,
+    /// Destination hub repo (URL: http/https/file/git@/ssh).
+    /// pkg slug resolution is reserved for future versions.
+    pub target_repo: String,
+    /// Optional commit message. Defaults to "publish card {card_id}".
+    #[serde(default)]
+    pub commit_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgScaffoldParams {
     /// Package name (snake_case recommended).
     ///
@@ -1866,6 +1878,47 @@ impl AlcService {
         self.app.card_install(params.url).await
     }
 
+    /// Publish a Card to a hub repository (git clone → copy → add → commit → push → reindex).
+    ///
+    /// Inputs:
+    ///   - card_id: Card to publish
+    ///   - target_repo: URL (http/https/file/git@/ssh). pkg slug is reserved for future versions.
+    ///   - commit_message: optional; defaults to "publish card {card_id}".
+    ///
+    /// Outputs (JSON):
+    ///   {
+    ///     "published_url": "...",
+    ///     "commit_hash": "...",
+    ///     "reindex_status": { "ok": true | false, "output": "...?", "error": "...?" }
+    ///   }
+    ///
+    /// Credential prerequisite: SSH key or `gh auth login` must be configured on the host.
+    /// Push failures due to authentication return a typed `MissingCredentials` error with
+    /// guidance referencing `alc_info.gh_credentials` (project-level diagnostic).
+    ///
+    /// Push success and reindex failure are surfaced as independent fields: a successful
+    /// push is never rolled back when only the reindex step fails.
+    #[tool(
+        name = "alc_card_publish",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true,
+        )
+    )]
+    async fn card_publish(
+        &self,
+        Parameters(params): Parameters<CardPublishParams>,
+    ) -> Result<String, String> {
+        self.app
+            .card_publish(
+                &params.card_id,
+                &params.target_repo,
+                params.commit_message.as_deref(),
+            )
+            .await
+    }
+
     // ─── Hub ────────────────────────────────────────────────────
 
     /// Show detailed information for a single package.
@@ -2298,6 +2351,7 @@ impl ServerHandler for AlcService {
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true). Supports the same `where` DSL as alc_card_find.\n\
                  - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\
+                 - alc_card_publish: Publish a Card to a hub repository — runs git add → commit → push to target_repo, then calls alc_hub_reindex. Requires gh auth login or SSH key configured on the host; missing credentials return a typed error with guidance. Push success is independent from reindex outcome (reindex failures do not roll back the push).\n\
                  - alc_card_sink_backfill: Backfill one subscriber (ALC_CARD_SINKS URI) with every Card already in the primary store. Drift-safe: existing Cards on the sink are skipped, never overwritten. Supports dry_run.\n\
                  - alc_card_analyze: Run a Card analyzer pkg over a single Card. Host loads the Card body + samples sidecar and dispatches them to `require(pkg).run(ctx)` (default pkg=`card_analysis`). Sister tool to `alc_advice`: advice runs a generic strategy over a free-form task; card_analyze runs an analyzer over a Card. Returns the pkg's `ctx.result` shape (typically `{ pattern, suggested_change, confidence }`).\n\n\
                  Hub:\n\
@@ -2307,7 +2361,7 @@ impl ServerHandler for AlcService {
                  - alc_hub_gendoc: Generate human-readable documentation artifacts (narrative/{pkg}.md, llms.txt, llms-full.txt, optional hub/context7/devin projections) from a hub_index.json. Runs the embedded gen_docs Lua pipeline.\n\
                  - alc_hub_dist: Facade that runs alc_hub_reindex followed by alc_hub_gendoc and returns a composed `{ reindex, gendoc, preset_catalog_version, preset? }` response (optional `preset` expands into primitive gendoc args; `preset_catalog_version` is always included for observability). Fails fast on reindex error; surfaces reindex result in the error text on gendoc failure.\n\n\
                  Diagnostics:\n\
-                 - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version)."
+                 - alc_info: Show server configuration and diagnostic info (log dir, tracing mode, version, GitHub push-credential diagnostic — gh auth status, SSH key presence, git config user.{name,email}, origin remote)."
                 .into(),
         );
         info

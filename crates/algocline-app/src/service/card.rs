@@ -481,12 +481,28 @@ impl AppService {
             })?
             .to_string();
 
-        run_git_command(&["clone", "--depth", "1", target_repo, &staging_str], None)
-            .await
-            .map_err(|(stderr, _)| CardPublishError::GitCommand {
-                cmd: "clone".into(),
-                stderr,
-            })?;
+        if let Err((stderr, is_credential)) =
+            run_git_command(&["clone", "--depth", "1", target_repo, &staging_str], None).await
+        {
+            if is_credential {
+                let app_dir_path = self.log_config.app_dir().root().to_owned();
+                let report = tokio::task::spawn_blocking(move || {
+                    crate::service::gh_credentials::diagnose(&app_dir_path)
+                })
+                .await
+                .map_err(|e| CardPublishError::GitCommand {
+                    cmd: "spawn_blocking(diagnose)".into(),
+                    stderr: e.to_string(),
+                })?;
+                let guidance = crate::service::gh_credentials::build_guidance(&report);
+                return Err(CardPublishError::MissingCredentials { guidance });
+            } else {
+                return Err(CardPublishError::GitCommand {
+                    cmd: "clone".into(),
+                    stderr,
+                });
+            }
+        }
 
         // 5. Copy card files into staging/cards/{pkg}/
         let dest_dir = staging.path().join("cards").join(&pkg_name);

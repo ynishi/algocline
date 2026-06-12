@@ -389,6 +389,15 @@ impl EngineApi for AppService {
         AppService::card_analyze(self, card_id, pkg).await
     }
 
+    async fn card_publish(
+        &self,
+        card_id: &str,
+        target_repo: &str,
+        commit_message: Option<&str>,
+    ) -> Result<String, String> {
+        AppService::card_publish(self, card_id, target_repo, commit_message).await
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     async fn hub_reindex(

@@ -12,6 +12,7 @@ use std::path::Path;
 use algocline_engine::card;
 use serde::{Deserialize, Serialize};
 
+use super::error::CardPublishError;
 use super::hub;
 use super::AppService;
 
@@ -414,5 +415,328 @@ impl AppService {
 
         serde_json::to_string(&envelope)
             .map_err(|e| format!("card_analyze: failed to serialize response: {e}"))
+    }
+
+    /// Publish a Card to a hub repository.
+    ///
+    /// Validates `target_repo` as a URL, clones it to a staging directory,
+    /// copies the card files, commits, and pushes.  On push success, calls
+    /// `hub_reindex` and returns the outcome as a JSON string including
+    /// `published_url`, `commit_hash`, and `reindex_status`.
+    ///
+    /// Push failures due to credential issues return a typed
+    /// `CardPublishError::MissingCredentials` with actionable guidance.
+    /// Reindex failures are reported in the response JSON, not as errors,
+    /// so a successful push is never rolled back.
+    pub async fn card_publish(
+        &self,
+        card_id: &str,
+        target_repo: &str,
+        commit_message: Option<&str>,
+    ) -> Result<String, String> {
+        self.card_publish_inner(card_id, target_repo, commit_message)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn card_publish_inner(
+        &self,
+        card_id: &str,
+        target_repo: &str,
+        commit_message: Option<&str>,
+    ) -> Result<String, CardPublishError> {
+        // 1. Validate target_repo is a URL (pkg slug not yet supported)
+        if !is_supported_target(target_repo) {
+            return Err(CardPublishError::InvalidTarget(format!(
+                "{target_repo} — must be a URL (http/https/file/git@/ssh). \
+                pkg slug resolution is not yet supported; see issue #1.",
+            )));
+        }
+
+        // 2. Resolve card from store
+        let card_value = self
+            .card_store
+            .get(card_id)
+            .map_err(|e| CardPublishError::GitCommand {
+                cmd: "card_store.get".into(),
+                stderr: e,
+            })?
+            .ok_or_else(|| CardPublishError::CardNotFound(card_id.to_string()))?;
+
+        // 3. Extract pkg name from card value
+        let pkg_name = card_value
+            .get("pkg")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // 4. Clone target_repo to staging
+        let staging = tempfile::tempdir()?;
+        let staging_str = staging
+            .path()
+            .to_str()
+            .ok_or_else(|| {
+                CardPublishError::InvalidTarget("staging path is not valid UTF-8".into())
+            })?
+            .to_string();
+
+        if let Err((stderr, is_credential)) =
+            run_git_command(&["clone", "--depth", "1", target_repo, &staging_str], None).await
+        {
+            if is_credential {
+                let app_dir_path = self.log_config.app_dir().root().to_owned();
+                let report = tokio::task::spawn_blocking(move || {
+                    crate::service::gh_credentials::diagnose(&app_dir_path)
+                })
+                .await
+                .map_err(|e| CardPublishError::GitCommand {
+                    cmd: "spawn_blocking(diagnose)".into(),
+                    stderr: e.to_string(),
+                })?;
+                let guidance = crate::service::gh_credentials::build_guidance(&report);
+                return Err(CardPublishError::MissingCredentials { guidance });
+            } else {
+                return Err(CardPublishError::GitCommand {
+                    cmd: "clone".into(),
+                    stderr,
+                });
+            }
+        }
+
+        // 5. Copy card files into staging/cards/{pkg}/
+        let dest_dir = staging.path().join("cards").join(&pkg_name);
+        std::fs::create_dir_all(&dest_dir)?;
+
+        // Collect card files: {card_id}.toml and optionally {card_id}.samples.jsonl
+        // card_store.root() is already the cards dir (e.g. ~/.algocline/cards)
+        let cards_root = self.card_store.root().join(&pkg_name);
+        let card_toml = cards_root.join(format!("{card_id}.toml"));
+        let card_samples = cards_root.join(format!("{card_id}.samples.jsonl"));
+
+        if card_toml.exists() {
+            std::fs::copy(&card_toml, dest_dir.join(format!("{card_id}.toml")))?;
+        } else {
+            return Err(CardPublishError::CardNotFound(card_id.to_string()));
+        }
+        if card_samples.exists() {
+            std::fs::copy(
+                &card_samples,
+                dest_dir.join(format!("{card_id}.samples.jsonl")),
+            )?;
+        }
+
+        // 6. git add
+        run_git_command(&["add", "."], Some(staging.path()))
+            .await
+            .map_err(|(stderr, _)| CardPublishError::GitCommand {
+                cmd: "add".into(),
+                stderr,
+            })?;
+
+        // 7. git commit
+        let msg = commit_message
+            .map(String::from)
+            .unwrap_or_else(|| format!("publish card {card_id}"));
+        run_git_command(&["commit", "-m", &msg], Some(staging.path()))
+            .await
+            .map_err(|(stderr, _)| CardPublishError::GitCommand {
+                cmd: "commit".into(),
+                stderr,
+            })?;
+
+        // 8. git rev-parse HEAD — get commit hash
+        let commit_hash = run_git_output(&["rev-parse", "HEAD"], Some(staging.path()))
+            .await
+            .map_err(|stderr| CardPublishError::GitCommand {
+                cmd: "rev-parse HEAD".into(),
+                stderr,
+            })?
+            .trim()
+            .to_string();
+
+        // 9. git push — detect credential failures here.
+        //    diagnose() uses sync std::process::Command internally (logging.rs
+        //    compatibility), so wrap in spawn_blocking to avoid blocking the
+        //    tokio worker thread.
+        if let Err((stderr, is_credential)) =
+            run_git_command(&["push", "origin", "HEAD"], Some(staging.path())).await
+        {
+            if is_credential {
+                let app_dir_path = self.log_config.app_dir().root().to_owned();
+                let report = tokio::task::spawn_blocking(move || {
+                    crate::service::gh_credentials::diagnose(&app_dir_path)
+                })
+                .await
+                .map_err(|e| CardPublishError::GitCommand {
+                    cmd: "spawn_blocking(diagnose)".into(),
+                    stderr: e.to_string(),
+                })?;
+                let guidance = crate::service::gh_credentials::build_guidance(&report);
+                return Err(CardPublishError::MissingCredentials { guidance });
+            } else {
+                return Err(CardPublishError::GitCommand {
+                    cmd: "push".into(),
+                    stderr,
+                });
+            }
+        }
+
+        // 10. hub_reindex — failure absorbed into reindex_status (not bubbled as Err)
+        let staging_path_str = staging.path().to_string_lossy().to_string();
+        let reindex_status = match self
+            .hub_reindex(None, Some(staging_path_str.as_str()))
+            .await
+        {
+            Ok(out) => ReindexStatus {
+                ok: true,
+                output: Some(out),
+                error: None,
+            },
+            Err(e) => ReindexStatus {
+                ok: false,
+                output: None,
+                error: Some(e),
+            },
+        };
+
+        // 11. Build response
+        let outcome = CardPublishOutcome {
+            published_url: target_repo.to_string(),
+            commit_hash,
+            reindex_status,
+        };
+        serde_json::to_string(&outcome).map_err(|e| CardPublishError::GitCommand {
+            cmd: "serialize response".into(),
+            stderr: e.to_string(),
+        })
+    }
+}
+
+// ─── Private response types ───────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct CardPublishOutcome {
+    published_url: String,
+    commit_hash: String,
+    reindex_status: ReindexStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct ReindexStatus {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+// ─── Private helpers ──────────────────────────────────────────────
+
+/// Returns `true` when `target_repo` starts with a recognized URL scheme.
+fn is_supported_target(target_repo: &str) -> bool {
+    target_repo.starts_with("http://")
+        || target_repo.starts_with("https://")
+        || target_repo.starts_with("file://")
+        || target_repo.starts_with("git@")
+        || target_repo.starts_with("ssh://")
+}
+
+/// Returns `true` when `stderr` matches known credential-failure patterns.
+fn detect_credential_error(stderr: &str) -> bool {
+    let patterns = [
+        "Permission denied (publickey)",
+        "Authentication failed",
+        "remote: Permission to",
+        "could not read Username",
+        "terminal prompts disabled",
+        "gh auth login",
+    ];
+    patterns.iter().any(|p| stderr.contains(p))
+}
+
+/// Run a git command optionally in a working directory.
+///
+/// Returns `Ok(())` on success.
+/// Returns `Err((stderr, is_credential_error))` on failure.
+async fn run_git_command(args: &[&str], cwd: Option<&Path>) -> Result<(), (String, bool)> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = cmd.output().await.map_err(|e| (e.to_string(), false))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let is_cred = detect_credential_error(&stderr);
+        Err((stderr, is_cred))
+    }
+}
+
+/// Run a git command in a working directory and capture stdout.
+///
+/// Returns `Ok(stdout)` on success, `Err(stderr)` on failure.
+async fn run_git_output(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = cmd.output().await.map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_credential_error_matches_publickey_denied() {
+        assert!(detect_credential_error(
+            "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository."
+        ));
+    }
+
+    #[test]
+    fn detect_credential_error_matches_authentication_failed() {
+        assert!(detect_credential_error(
+            "remote: Authentication failed for 'https://github.com/user/repo.git'"
+        ));
+    }
+
+    #[test]
+    fn detect_credential_error_returns_false_for_unrelated_stderr() {
+        assert!(!detect_credential_error(
+            "fatal: pathspec 'cards/cot/foo.toml' did not match any files known to git"
+        ));
+    }
+
+    #[test]
+    fn is_supported_target_accepts_https() {
+        assert!(is_supported_target("https://github.com/user/repo.git"));
+    }
+
+    #[test]
+    fn is_supported_target_accepts_git_at() {
+        assert!(is_supported_target("git@github.com:user/repo.git"));
+    }
+
+    #[test]
+    fn is_supported_target_accepts_file_url() {
+        assert!(is_supported_target("file:///tmp/bare-repo"));
+    }
+
+    #[test]
+    fn is_supported_target_rejects_bare_slug() {
+        assert!(!is_supported_target("cot"));
+        assert!(!is_supported_target("my-pkg"));
     }
 }

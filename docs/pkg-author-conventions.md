@@ -946,3 +946,15 @@ The full list of bundled sources and their pinned tags is in
 (float, NaN/Inf, or string-shaped numbers). The native `string.format("%d", 1.5)`
 truncates toward zero and `string.format("%d", 0/0)` raises; `alc.fmt` rounds
 half-away-from-zero and substitutes safe string literals.
+
+**Authoring packages that depend on bundled substrate.** When a package
+design requires state hand-off, flow control, or frame orchestration, check
+whether the bundled substrate already provides the primitive before proposing
+a new abstraction. The canonical substrate list is in
+`plugins/alc/skills/alc-wake/SKILL.md §Swarm framework` (packages: `flow`,
+`swarm_frame`, `swarm_frame_algocline`, `plugin_run_card`, `alc.state`).
+During design consultation, `@alc-adviser` cross-references these primitives
+and pairs every gap finding with a literal primitive path (e.g.,
+`flow.state_save`, `swarm_frame.frame.register`) or the explicit phrase
+`no primitive applies`. See `plugins/alc/agents/alc-adviser.md §Substrate Cross-Check`
+(step 3b) for the full procedure.

@@ -194,6 +194,22 @@ lines).
 - **Overwrite the journal by truncation** (when calling `Write`, always
   `Read` the full content first, concatenate at the end, and write back the
   whole file; losing existing sections is an append-only violation).
+- **Skip step 3b(a-0) alc-wake SKILL.md Read** — silent skip is forbidden.
+  If `Read(plugins/alc/skills/alc-wake/SKILL.md)` fails, you must emit
+  `### Substrate Cross-Check\n- BLOCKED: alc-wake SKILL.md not loadable from plugins/alc/skills/alc-wake/SKILL.md`
+  and halt; do not proceed to Compose without completing the substrate
+  cross-check.
+- **Skip substrate Read in step 3b(b)** — if a substrate package init.lua
+  is unreadable, emit `### Substrate Cross-Check\n- BLOCKED: substrate <name> not loadable from <path>`
+  and halt; never silently continue to Compose.
+- **Emit unpaired gap findings** — every gap finding must be annotated with
+  either a literal substrate primitive path or the phrase `no primitive applies`.
+  A gap finding with no annotation must be discarded and rewritten before
+  emission.
+- **Hardcode substrate primitive names in this prompt** — the canonical list
+  lives in `plugins/alc/skills/alc-wake/SKILL.md §Swarm framework`. Always
+  retrieve it via `Read` in step 3b(a-0); do not copy primitive names directly
+  into this Agent definition (drift source).
 
 ## Package Type Awareness
 
@@ -224,8 +240,61 @@ The query contains build-intent signals: "build" / "create" / "作りたい" /
 3. **Find reference implementations** — Read/Grep existing complex packages
    (e.g., `coding_orch`, `conglo`, `review_and_investigate`) that use similar
    combination patterns.
+3b. **Substrate Cross-Check** — before composing the proposal, cross-reference
+    the workspace's bundled substrate primitives so every gap finding is paired
+    with an existing primitive path or an explicit `no primitive applies` note.
+    Follow the five sub-phases below in order:
+
+    **(a-0) Load canonical primitive list (mandatory first action)**
+    Execute `Read(plugins/alc/skills/alc-wake/SKILL.md)` and extract the
+    §Swarm framework table (package name + role + Key API columns). This disk
+    Read is required because Skill files are injected only into the main-thread
+    context and are **not** auto-injected into spawned Agent contexts. Do not
+    hardcode primitive names in this prompt — always retrieve them at runtime
+    from the SKILL.md source. If this Read fails, emit:
+    ```
+    ### Substrate Cross-Check
+    - BLOCKED: alc-wake SKILL.md not loadable from plugins/alc/skills/alc-wake/SKILL.md
+    ```
+    and halt; skip all remaining sub-phases and the Compose step.
+
+    **(a) Pre-load workspace substrate list**
+    Read the workspace `alc.toml` (or `alc.local.toml`) `[packages]` section
+    and cross-reference against the canonical list from (a-0) to identify which
+    substrate packages are in use. If `alc.toml` is absent or `[packages]` is
+    empty, emit:
+    ```
+    ### Substrate Cross-Check
+    - BLOCKED: workspace alc.toml has no substrate packages
+    ```
+    and halt.
+
+    **(b) Load each substrate API surface**
+    For each in-use substrate package, use `alc_pkg_list` and if needed
+    `Read(~/.algocline/packages/<pkg>/init.lua)` to extract `M.meta` and the
+    public function names. If a substrate Read fails, emit:
+    ```
+    ### Substrate Cross-Check
+    - BLOCKED: substrate <name> not loadable from <path>
+    ```
+    and halt.
+
+    **(c) Paired emit**
+    For every gap finding in the proposal, pair it with either a literal
+    substrate primitive path (e.g., `flow.state_save`, `swarm_frame.frame.register`)
+    drawn from the (a-0) + (b) surface, or the explicit phrase `no primitive applies`
+    when no existing primitive covers the gap. Unpaired gap findings are
+    forbidden — if a finding has no primitive annotation it must be discarded
+    and rewritten.
+
+    **(d) Fail-closed**
+    Emit the `### Gap Findings` block only after completing (a-0) through (c).
+    If any sub-phase halts with `BLOCKED:`, omit the gap findings block entirely
+    and return only the `BLOCKED:` line.
+
 4. **Compose proposal** — assemble the `### Design Proposal` output with
-   architecture sketch, building block list, and reference pointer.
+   architecture sketch, building block list, and reference pointer. Each gap
+   finding in the proposal must carry the primitive annotation from step 3b(c).
 
 ### Constraints
 
@@ -267,3 +336,67 @@ The query contains build-intent signals: "build" / "create" / "作りたい" /
   proposes structure).
 - `phantom-package` — listing a non-existent package name in the building
   blocks without marking it `(new)`.
+- `unpaired-gap-finding` — emitting a gap finding in the Design Proposal
+  without pairing it with a substrate primitive path or the explicit phrase
+  `no primitive applies` (step 3b(c) violation; discard and rewrite).
+- `alc-wake-read-skip` — skipping `Read(plugins/alc/skills/alc-wake/SKILL.md)`
+  in step 3b(a-0) and proceeding directly to Compose or relying on in-context
+  knowledge of primitive names (runtime dead reference; always disk-Read).
+- `substrate-read-skip` — silently skipping step 3b(b) when a substrate
+  init.lua is absent; the correct behavior is `BLOCKED:` halt, not silent
+  continuation.
+- `primitive-name-hardcode` — copying substrate primitive names (e.g.,
+  `flow.state_save`, `swarm_frame.frame.register`) directly into this Agent
+  definition instead of retrieving them at runtime via step 3b(a-0) (creates
+  a drift source that diverges from alc-wake §Swarm framework over time).
+- `verbose-api-dump` — pasting the full `init.lua` API surface or raw JSON
+  from `alc_pkg_list` into the output; cross-check results must be one line
+  per gap finding (80-line output cap applies).
+
+## Regression Sample
+
+The following before/after illustrates what substrate cross-check prevents.
+
+### Before (cross-check absent — pipeline_new accident)
+
+The adviser emitted a gap finding without consulting the substrate:
+
+```
+### Design Proposal
+
+**Building blocks**:
+- state.json schema (new) — hand-off state between pipeline steps
+```
+
+No substrate primitive was consulted. The downstream agent re-invented
+`state.json` schema from scratch, duplicating what `flow.state_save` and
+`swarm_frame.frame.register` already provide.
+
+### After (cross-check applied)
+
+With step 3b active the adviser first executes
+`Read(plugins/alc/skills/alc-wake/SKILL.md)`, extracts the §Swarm framework
+table at runtime, reads the workspace `alc.toml [packages]`, and then loads
+each substrate's API surface. The same gap finding is now paired:
+
+```
+### Substrate Cross-Check
+
+- gap: hand-off state between pipeline steps
+  primitive: flow.state_save (snapshot current State), swarm_frame.frame.register({ state = ... }) (register frame with state for next step)
+
+### Design Proposal
+
+**Building blocks**:
+- flow (library) — use flow.state_save for State snapshot
+- swarm_frame (library) — use frame.register to hand off state to next step
+```
+
+If neither primitive applied, the correct annotation would be:
+
+```
+- gap: <description>
+  primitive: no primitive applies
+```
+
+This paired form prevents downstream re-invention of existing primitives.

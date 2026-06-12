@@ -7596,3 +7596,119 @@ async fn test_alc_card_publish_reindex_failure_isolated() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_advice variant-scope resolution regression tests ─────────────────────
+
+/// `alc_advice` must resolve a strategy package that is linked via
+/// `alc.local.toml` (scope = variant) without returning a not-found error,
+/// even when the package is absent from the global `~/.algocline/packages/`
+/// tier.
+///
+/// Validates Crux: variant tier lookup hoist before install check — the
+/// `resolve_variant_pkgs` result must short-circuit the `is_package_installed`
+/// guard so variant-linked strategies are applied without requiring
+/// `alc_pkg_install`.
+#[tokio::test]
+async fn test_alc_advice_resolves_variant_scope_package() {
+    // Use a fresh alc_home so the global packages tier is empty (no bundled
+    // packages installed there), ensuring the only way to resolve the strategy
+    // is through the variant tier.
+    let alc_home = tempfile::tempdir().expect("tempdir alc_home");
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    // Create a temp project root with alc.toml so resolve_project_root succeeds.
+    let project_tmp = tempfile::tempdir().expect("tempdir project");
+    let project_root = project_tmp.path();
+    std::fs::write(project_root.join("alc.toml"), "[packages]\n").expect("write alc.toml");
+
+    // Create the strategy package outside the project root (typical worktree layout).
+    // Package must have a valid M.run entry point so the advice() execution path
+    // proceeds past the library guard and start_and_tick without early error.
+    let pkg_src = project_tmp.path().join("variant_strategy_src");
+    let pkg_dir = pkg_src.join("e2e_variant_strategy");
+    std::fs::create_dir_all(&pkg_dir).expect("mkdir pkg_dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "e2e_variant_strategy", version = "0.1.0", type = "runnable" }
+M.run = function(ctx) return { answer = "variant-ok" } end
+return M"#,
+    )
+    .expect("write init.lua");
+
+    // Link the collection directory as variant scope → writes alc.local.toml.
+    let link_resp = call_json(
+        &client,
+        "alc_pkg_link",
+        json!({
+            "path": pkg_src.to_string_lossy(),
+            "scope": "variant",
+            "project_root": project_root.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert!(
+        link_resp.get("error").is_none(),
+        "alc_pkg_link should succeed, got: {link_resp}"
+    );
+
+    // Call alc_advice with the variant-linked strategy.
+    // The package is absent from the global tier, so without the variant hoist
+    // the old code would return a not-found error.
+    let result = client
+        .call_tool(call_params(
+            "alc_advice",
+            json!({
+                "strategy": "e2e_variant_strategy",
+                "task": "ping",
+                "project_root": project_root.to_string_lossy(),
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        !text.contains("not found after installing bundled collection"),
+        "variant-linked strategy should not produce a not-found error, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `alc_advice` must return the existing not-found error when the requested
+/// strategy is absent from all three tiers: variant (`alc.local.toml`),
+/// global (`~/.algocline/packages/`), and the auto-installed bundled
+/// collection.
+///
+/// Validates Crux: E2E regression coverage for both resolution paths — the
+/// not-found path must remain intact after the variant-hoist fix.
+#[tokio::test]
+async fn test_alc_advice_returns_not_found_when_all_tiers_absent() {
+    // Fresh alc_home with empty packages tier.
+    let alc_home = tempfile::tempdir().expect("tempdir alc_home");
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    // Project root with alc.toml but no alc.local.toml (variant tier empty).
+    let project_tmp = tempfile::tempdir().expect("tempdir project");
+    let project_root = project_tmp.path();
+    std::fs::write(project_root.join("alc.toml"), "[packages]\n").expect("write alc.toml");
+
+    // Use a strategy name that cannot exist in any bundled collection.
+    let result = client
+        .call_tool(call_params(
+            "alc_advice",
+            json!({
+                "strategy": "nonexistent_pkg_xyz_e2e",
+                "project_root": project_root.to_string_lossy(),
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("not found after installing bundled collection"),
+        "expected not-found error when all tiers lack the package, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

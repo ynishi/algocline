@@ -316,9 +316,14 @@ impl AppService {
         opts: Option<serde_json::Value>,
         project_root: Option<String>,
     ) -> Result<String, String> {
-        // Auto-install bundled packages if the requested strategy is missing
+        // Hoist variant-scope resolution before install check so alc.local.toml linked
+        // packages short-circuit auto_install / not-found error.
         let app_dir = self.log_config.app_dir();
-        if !is_package_installed(&app_dir, strategy) {
+        let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
+        let strategy_in_variant = variants.iter().any(|v| v.name == strategy);
+
+        // Auto-install bundled packages if the requested strategy is missing in all tiers
+        if !strategy_in_variant && !is_package_installed(&app_dir, strategy) {
             self.auto_install_bundled_packages().await?;
             if !is_package_installed(&app_dir, strategy) {
                 return Err(format!(
@@ -350,7 +355,6 @@ impl AppService {
         let ctx = serde_json::Value::Object(ctx_map);
 
         let (extra, extra_warnings) = self.resolve_extra_lib_paths(project_root.as_deref());
-        let (variants, variant_warnings) = self.resolve_variant_pkgs(project_root.as_deref());
         let mut warnings: Vec<String> = extra_warnings;
         warnings.extend(variant_warnings);
         // advice() does not accept ctx.env; pass an empty map so AlcEnv is

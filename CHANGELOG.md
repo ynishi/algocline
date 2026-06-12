@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.42.1] - 2026-06-12
+
+### Security
+
+- `alc_card_publish`: Derive pkg name from the on-disk locator instead of the Card TOML body to prevent CWE-22 path traversal. A malicious Card with `pkg.name = "../arbitrary"` (landable via `card_install`) could previously escape the staging tempdir on `create_dir_all` and read outside the card store root on `fs::copy`. The body-side `pkg.name` is now intentionally ignored; `pkg_name` is derived from `CardStore::find_card_locator(card_id).parent().file_name()` and passed through the canonical `algocline_engine::card::validate_name` guard. The silent `"unknown"` fallback is also removed.
+
 ## [0.42.0] - 2026-06-12
 
 ### Added

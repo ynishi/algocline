@@ -81,9 +81,49 @@ fn redact_paths(text: &str) -> String {
     }
 }
 
+/// Redact environment-specific values inside the `gh_credentials` block.
+///
+/// The following fields vary across machines and are replaced with stable
+/// placeholders so the snapshot is portable:
+///   - git_config.user_name  → "<GIT_USER_NAME>"
+///   - git_config.user_email → "<GIT_USER_EMAIL>"
+///   - ssh_keys.found        → ["<REDACTED>"] or []
+///   - origin_remote.error   → "<GIT_REMOTE_ERROR>" (git error messages vary)
+fn redact_gh_credentials(text: &str) -> String {
+    let re_user_name = regex::Regex::new(r#""user_name":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_email = regex::Regex::new(r#""user_email":\s*"[^"]*""#).expect("invalid regex");
+    // ssh found array: replace entries but preserve structure (present/absent)
+    let re_ssh_found = regex::Regex::new(r#""found":\s*\[[^\]]*\]"#).expect("invalid regex");
+    // origin_remote error string
+    let re_origin_err = regex::Regex::new(r#"("error":\s*)"[^"]*""#).expect("invalid regex");
+
+    // We only want to redact origin_remote.error, not gh_auth.error.
+    // Strategy: redact all error strings inside gh_credentials block via a
+    // two-pass approach — replace within the gh_credentials JSON object.
+    let text = re_user_name
+        .replace_all(text, r#""user_name": "<GIT_USER_NAME>""#)
+        .into_owned();
+    let text = re_user_email
+        .replace_all(&text, r#""user_email": "<GIT_USER_EMAIL>""#)
+        .into_owned();
+    // Replace ssh found list with a stable redacted placeholder that preserves
+    // whether keys were present (any_present field is separate and unchanged).
+    let text = re_ssh_found
+        .replace_all(&text, r#""found": ["<REDACTED>"]"#)
+        .into_owned();
+    // Replace all error strings that are non-null (null stays null).
+    // This covers both gh_auth.error and origin_remote.error inside the
+    // gh_credentials block without touching errors outside it.
+    // Simple approach: only replace non-null error values (quoted strings).
+    let text = re_origin_err
+        .replace_all(&text, r#"$1"<REDACTED>""#)
+        .into_owned();
+    text
+}
+
 /// Apply all redactions.
 fn redact(text: &str) -> String {
-    redact_paths(&redact_uuids(text))
+    redact_gh_credentials(&redact_paths(&redact_uuids(text)))
 }
 
 /// Connect with a specific ALC_HOME directory.

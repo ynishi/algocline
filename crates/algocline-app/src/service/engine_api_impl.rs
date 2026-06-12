@@ -621,7 +621,10 @@ impl EngineApi for AppService {
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {
-        AppService::info(self)
+        let svc = self.clone();
+        tokio::task::spawn_blocking(move || AppService::info(&svc))
+            .await
+            .unwrap_or_else(|e| format!("{{\"error\": \"info: task panicked: {e}\"}}"))
     }
 
     // ─── Pool management ─────────────────────────────────────

@@ -193,7 +193,7 @@ pub trait CardStore: Send + Sync {
     ) -> Result<(Vec<String>, Vec<String>), String>;
 }
 
-fn validate_name(name: &str, kind: &str) -> Result<(), String> {
+pub fn validate_name(name: &str, kind: &str) -> Result<(), String> {
     if name.is_empty()
         || name.contains('/')
         || name.contains('\\')

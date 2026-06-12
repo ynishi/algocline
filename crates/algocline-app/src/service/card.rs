@@ -10,6 +10,7 @@
 use std::path::Path;
 
 use algocline_engine::card;
+use algocline_engine::card::CardStore;
 use serde::{Deserialize, Serialize};
 
 use super::error::CardPublishError;
@@ -463,13 +464,31 @@ impl AppService {
             })?
             .ok_or_else(|| CardPublishError::CardNotFound(card_id.to_string()))?;
 
-        // 3. Extract pkg name from card value
-        let pkg_name = card_value
-            .get("pkg")
-            .and_then(|v| v.get("name"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // 3. Derive pkg name from on-disk locator (canonical authority,
+        //    eliminates body-vs-directory split + "unknown" fallback).
+        //    validate_name double-protects against any historical drift.
+        let _ = card_value; // body-side name intentionally ignored for security
+        let locator = self
+            .card_store
+            .find_card_locator(card_id)
+            .map_err(|e| CardPublishError::GitCommand {
+                cmd: "card_store.find_card_locator".into(),
+                stderr: e,
+            })?
+            .ok_or_else(|| CardPublishError::CardNotFound(card_id.to_string()))?;
+        let pkg_name = locator
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                CardPublishError::InvalidTarget(format!(
+                    "card {card_id} locator has no parent pkg directory: {}",
+                    locator.display()
+                ))
+            })?
+            .to_string();
+        algocline_engine::card::validate_name(&pkg_name, "pkg")
+            .map_err(CardPublishError::InvalidTarget)?;
 
         // 4. Clone target_repo to staging
         let staging = tempfile::tempdir()?;

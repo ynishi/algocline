@@ -38,6 +38,9 @@ want one.
 - [docs/mcp-resources.md](mcp-resources.md) — MCP resource catalog exposed by
   the server
 - [docs/lua-stdlib.md](lua-stdlib.md) — `alc.*` Lua stdlib API reference
+- [docs/state-management.md](state-management.md) — state primitive 2-layer
+  split: Alc MCP namespace-generic CRUD + swarm-package domain methods;
+  inherits 0.37.0 rollback constraints
 
 ## Package Authoring
 

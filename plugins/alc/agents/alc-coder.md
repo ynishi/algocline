@@ -215,6 +215,15 @@ Format is strict:
      `~/.algocline/types/alc_shapes.d.lua` are already placed by
      `alc_pkg_install` (look at the `types_path` /
      `alc_shapes_types_path` fields in the `alc_pkg_install` return value).
+   - Write `.stylua.toml` at `<pkg_root>/<name>/` with the algocline
+     default content (skip if it already exists):
+
+     ```toml
+     column_width = 100
+     indent_type = "Spaces"
+     indent_width = 4
+     ```
+
    - Write `.luarc.json` at `<pkg_root>/<name>/` (`workspace` = package
      directory, `library` = directories including `~/.algocline/types/`);
      skip if it already exists.

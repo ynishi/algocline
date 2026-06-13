@@ -91,7 +91,7 @@ service layer).
 |---|---|---|---|
 | `alc_state_list` | `{ namespace: String }` | `{ keys: [string] }` (sorted, excludes `.bak` / `.tmp`) | `read_only_hint=true`, `idempotent_hint=true`, `open_world_hint=false` |
 | `alc_state_show` | `{ namespace: String, key: String }` | parsed state JSON (`{ data: {…}, identity?: {…}, _token_value?: … }` — opaque object preserved as-is) | `read_only_hint=true`, `idempotent_hint=true`; typed `NOT_FOUND` for unknown `key` |
-| `alc_state_reset` | `{ namespace: String, key: String, steps?: [string], fields?: [string] }` | `{ ok: bool, backup_path: string, steps_removed: [string], fields_removed: [string] }` | `read_only_hint=false`, `idempotent_hint=true` (atomic rename + set-difference semantics) |
+| `alc_state_reset` | `{ namespace: String, key: String, steps?: [string], fields?: [string] }` | `{ ok: bool, backup_path: string, steps_removed: usize, steps_input: [string], fields_removed: usize, fields_input: [string] }` | `read_only_hint=false`, `idempotent_hint=true` (atomic rename + set-difference semantics) |
 
 `alc_state_reset` semantics:
 
@@ -145,9 +145,12 @@ rollback rationale.
    carries `namespace: String`; no `OrchState`, no `CodingState`, no
    `DispatchKey` types are added to `algocline-core` / `-engine` / `-app` /
    `-mcp`.
-2. **No new `EngineApi` trait methods.** The implementation lives as inherent
-   methods on `JsonFileStore`. The service layer (`AppService` in
-   `algocline-app`) holds an `Arc<JsonFileStore>` and dispatches directly.
+2. **`algocline-core` may add `EngineApi` trait methods if their signatures are
+   namespace-generic (`String` / `Option<Vec<String>>` / `serde_json::Value`-shaped)
+   — application-specific types are forbidden.** The implementation lives as inherent
+   methods on `JsonFileStore`; trait method additions follow the same
+   namespace-generic rule and are permitted under the same precedent as the
+   0.23.0 / 0.24.0 BREAKING additions.
 3. **The existing `alc.state.*` Lua method surface is preserved unchanged.**
    The MCP tools added here are an additive wire surface, not a replacement.
 4. **No silent state mutation.** Every write goes through the existing atomic
@@ -156,6 +159,8 @@ rollback rationale.
 5. **Errors propagate.** Service-layer code uses `?` to propagate
    `StateError` (and its `From` conversions) to the MCP boundary. No
    `tracing::warn!`-and-drop in any new path.
+
+(2026-06-13 update: constraint #2 narrowed from "no new trait methods" to "no application-term leak in trait method signatures". The 0.37.0 rollback rationale targeted type-name leak, not trait surface expansion.)
 
 ## Swarm package layer — pattern
 

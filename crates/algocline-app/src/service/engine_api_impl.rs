@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use algocline_core::{EngineApi, QueryResponse};
+use algocline_engine::state::{ResetReport, StateError};
 use async_trait::async_trait;
 
 use crate::pool::{registry::with_registry_lock, PoolError, PoolRegistry};
@@ -627,6 +629,73 @@ impl EngineApi for AppService {
         .map_err(|e| format!("setting_resolve: task panicked: {e}"))?
     }
 
+    // ─── State management ────────────────────────────────────
+
+    async fn state_list(&self, namespace: String) -> Result<String, String> {
+        let store = Arc::clone(&self.state_store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .list_dispatched(&namespace)
+                .map_err(AppService::state_err_to_wire)
+                .and_then(|keys| {
+                    // Wire shape: { "keys": [string] } per docs/state-management.md L92.
+                    // TODO(ST2): verify this shape via real rmcp stdio in tests/e2e.rs
+                    // (test_alc_state_list_* happy path should assert parsed["keys"].is_array()).
+                    serde_json::to_string(&serde_json::json!({"keys": keys}))
+                        .map_err(|e| format!("state_list: serialize: {e}"))
+                })
+        })
+        .await
+        .map_err(|e| format!("state_list: task panicked: {e}"))?
+    }
+
+    async fn state_show(&self, namespace: String, key: String) -> Result<String, String> {
+        let store = Arc::clone(&self.state_store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .show_dispatched(&namespace, &key)
+                .map_err(AppService::state_err_to_wire)
+                .and_then(|value| {
+                    serde_json::to_string(&value).map_err(|e| format!("state_show: serialize: {e}"))
+                })
+        })
+        .await
+        .map_err(|e| format!("state_show: task panicked: {e}"))?
+    }
+
+    async fn state_reset(
+        &self,
+        namespace: String,
+        key: String,
+        steps: Option<Vec<String>>,
+        fields: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        let store = Arc::clone(&self.state_store);
+        // Clone input slices before moving into closure so we can echo them in the response.
+        let steps_input: Vec<String> = steps.clone().unwrap_or_default();
+        let fields_input: Vec<String> = fields.clone().unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            let steps_slice: Vec<String> = steps.unwrap_or_default();
+            let fields_slice: Vec<String> = fields.unwrap_or_default();
+            store
+                .reset_dispatched_with_backup(&namespace, &key, &steps_slice, &fields_slice)
+                .map_err(AppService::state_err_to_wire)
+                .and_then(|report: ResetReport| {
+                    let v = serde_json::json!({
+                        "ok": true,
+                        "backup_path": report.backup_path.to_string_lossy(),
+                        "steps_removed": report.steps_removed,
+                        "steps_input": steps_input,
+                        "fields_removed": report.fields_removed,
+                        "fields_input": fields_input,
+                    });
+                    serde_json::to_string(&v).map_err(|e| format!("state_reset: serialize: {e}"))
+                })
+        })
+        .await
+        .map_err(|e| format!("state_reset: task panicked: {e}"))?
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {
@@ -648,6 +717,53 @@ impl EngineApi for AppService {
 
     async fn pool_stop(&self, sid: Option<String>) -> Result<String, String> {
         AppService::pool_stop_impl(self, sid).await
+    }
+}
+
+// ─── State management inherent helpers ───────────────────────────────────────
+
+impl AppService {
+    /// Convert a [`StateError`] into a typed wire error JSON string.
+    ///
+    /// Each variant maps to a distinct `"error"` code so callers can distinguish
+    /// `NOT_FOUND` from generic I/O errors at the wire level.
+    ///
+    /// # Arguments
+    /// - `e` — the engine-layer error to convert.
+    ///
+    /// # Returns
+    /// A JSON string `{"error":"<CODE>",...}`. Falls back to an INTERNAL error JSON
+    /// string if serialization itself fails (should never occur for string-only values).
+    fn state_err_to_wire(e: StateError) -> String {
+        let v = match e {
+            StateError::KeyNotFound { namespace, key } => {
+                serde_json::json!({"error": "NOT_FOUND", "namespace": namespace, "key": key})
+            }
+            StateError::UnsafeSegment { which, value } => {
+                serde_json::json!({"error": "UNSAFE_SEGMENT", "which": which, "value": value})
+            }
+            StateError::IoBackup(io_err) => {
+                serde_json::json!({"error": "IO_BACKUP", "message": io_err.to_string()})
+            }
+            StateError::IoRead(io_err) => {
+                serde_json::json!({"error": "IO_READ", "message": io_err.to_string()})
+            }
+            StateError::IoWrite(io_err) => {
+                serde_json::json!({"error": "IO_WRITE", "message": io_err.to_string()})
+            }
+            StateError::Serde(serde_err) => {
+                serde_json::json!({"error": "SERDE", "message": serde_err.to_string()})
+            }
+            StateError::ShapeInvalid { reason } => {
+                serde_json::json!({"error": "SHAPE_INVALID", "reason": reason})
+            }
+        };
+        serde_json::to_string(&v).unwrap_or_else(|e| {
+            // justification: the json! macro above only contains string values, so
+            // to_string() cannot fail under normal conditions. The unwrap_or_else
+            // is a purely defensive fallback.
+            format!("{{\"error\":\"INTERNAL\",\"message\":\"serialize failed: {e}\"}}")
+        })
     }
 }
 

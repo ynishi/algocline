@@ -77,6 +77,37 @@ pub struct SettingResolveParams {
     pub target: Option<String>,
 }
 
+/// Parameters for `alc_state_list`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StateListParams {
+    /// Namespace to list state keys for (e.g. `"orch"`).
+    pub namespace: String,
+}
+
+/// Parameters for `alc_state_show`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StateShowParams {
+    /// Namespace of the state file (e.g. `"orch"`).
+    pub namespace: String,
+    /// Key identifying the state file (e.g. a task id).
+    pub key: String,
+}
+
+/// Parameters for `alc_state_reset`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StateResetParams {
+    /// Namespace of the state file (e.g. `"orch"`).
+    pub namespace: String,
+    /// Key identifying the state file (e.g. a task id).
+    pub key: String,
+    /// Step names to remove from `data.completed_steps`. When omitted, no steps are removed.
+    #[serde(default)]
+    pub steps: Option<Vec<String>>,
+    /// Top-level field names to remove from `data`. When omitted, no fields are removed.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+}
+
 /// Host-reported token usage for an LLM call (MCP schema).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpTokenUsage {
@@ -2162,6 +2193,91 @@ impl AlcService {
         Parameters(params): Parameters<SettingResolveParams>,
     ) -> Result<String, String> {
         self.app.setting_resolve(params.target).await
+    }
+
+    /// List all state keys within a namespace.
+    ///
+    /// Returns a JSON array of key strings (e.g. `["task-abc", "task-def"]`).
+    /// Returns an empty array when the namespace directory does not exist.
+    ///
+    /// # Parameters
+    /// - `namespace`: The state namespace to list (e.g. `"orch"`).
+    ///
+    /// # Errors
+    /// - `{"error":"UNSAFE_SEGMENT","which":"...","value":"..."}` — unsafe path segment detected.
+    /// - `{"error":"IO_READ","message":"..."}` — I/O error reading the namespace directory.
+    #[tool(
+        name = "alc_state_list",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn state_list(
+        &self,
+        Parameters(params): Parameters<StateListParams>,
+    ) -> Result<String, String> {
+        self.app.state_list(params.namespace).await
+    }
+
+    /// Show the full JSON content of a state file.
+    ///
+    /// Returns the raw JSON value stored at `namespace/key`.
+    ///
+    /// # Parameters
+    /// - `namespace`: The state namespace (e.g. `"orch"`).
+    /// - `key`: The state key / task id (e.g. `"my-task"`).
+    ///
+    /// # Errors
+    /// - `{"error":"NOT_FOUND","namespace":"...","key":"..."}` — state file does not exist.
+    /// - `{"error":"UNSAFE_SEGMENT","which":"...","value":"..."}` — unsafe path segment detected.
+    /// - `{"error":"IO_READ","message":"..."}` — I/O error reading the file.
+    /// - `{"error":"SERDE","message":"..."}` — JSON deserialization error.
+    #[tool(
+        name = "alc_state_show",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn state_show(
+        &self,
+        Parameters(params): Parameters<StateShowParams>,
+    ) -> Result<String, String> {
+        self.app.state_show(params.namespace, params.key).await
+    }
+
+    /// Reset (partially delete) fields or completed steps from a state file.
+    ///
+    /// Creates an atomic backup of the file before mutation. When both `steps` and
+    /// `fields` are omitted the operation is a no-op (returns counts of 0).
+    ///
+    /// # Parameters
+    /// - `namespace`: The state namespace (e.g. `"orch"`).
+    /// - `key`: The state key / task id (e.g. `"my-task"`).
+    /// - `steps`: Step names to remove from `data.completed_steps`. Omit to skip.
+    /// - `fields`: Top-level field names to remove from `data`. Omit to skip.
+    ///
+    /// # Returns
+    /// `{"ok":true,"backup_path":"...","steps_removed":<usize>,"steps_input":[...],"fields_removed":<usize>,"fields_input":[...]}`
+    ///
+    /// # Errors
+    /// - `{"error":"NOT_FOUND","namespace":"...","key":"..."}` — state file does not exist.
+    /// - `{"error":"UNSAFE_SEGMENT","which":"...","value":"..."}` — unsafe path segment detected.
+    /// - `{"error":"IO_BACKUP","message":"..."}` — I/O error creating backup file.
+    /// - `{"error":"IO_READ","message":"..."}` — I/O error reading state file.
+    /// - `{"error":"IO_WRITE","message":"..."}` — I/O error writing updated state file.
+    /// - `{"error":"SERDE","message":"..."}` — JSON deserialization/serialization error.
+    /// - `{"error":"SHAPE_INVALID","reason":"..."}` — state file has unexpected JSON shape.
+    #[tool(
+        name = "alc_state_reset",
+        annotations(
+            read_only_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn state_reset(
+        &self,
+        Parameters(params): Parameters<StateResetParams>,
+    ) -> Result<String, String> {
+        self.app
+            .state_reset(params.namespace, params.key, params.steps, params.fields)
+            .await
     }
 
     // ─── V2 execution tools ───────────────────────────────────────

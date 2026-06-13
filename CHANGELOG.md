@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.44.0] - 2026-06-14
+
+### Added
+
 - `alc_state_delete` MCP tool: delete a state key in a namespace with atomic `.bak` backup; returns `{"ok":true,"existed":<bool>}` where `existed` signals prior key presence (idempotent: second call returns `existed:false` without error).
 - `alc_state_list` MCP tool: list state keys in a namespace (returns `{"keys":[...]}`, sorted alphabetically, `.bak`/`.tmp` excluded).
 - `alc_state_reset` MCP tool: reset `completed_steps` entries and data fields in an orch state file, creating an atomic `.bak` backup.

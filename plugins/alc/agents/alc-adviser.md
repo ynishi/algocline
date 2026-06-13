@@ -98,23 +98,27 @@ Existing packages are listed by name; proposed new packages are marked
 
 ### Journal Append
 
-After the query completes, append **one H2 section via Write** to the
-configured journal target (order: `alc_run` / lookup invocation -> return
-result -> append journal).
+After the query completes, append **one H2 section** to the configured journal
+target (order: `alc_run` / lookup invocation -> return result -> append
+journal).
 
-**Append procedure (Write tool, never truncate)**:
+**Append procedure (append-only Tool / Recipe — never use Write after full Read)**:
 
-1. `Read` the full content of the journal target (no `offset` / `limit`; read
-   the whole file, concatenating with multiple `Read` calls if needed).
-2. Concatenate the new H2 section markdown at the end (after the last line and
-   a blank line).
-3. `Write` the **concatenated full content** back to the journal target path.
+Use an append-only path such as an `lds recipe` (e.g.,
+`mcp__lds__recipe_run(recipe="journal-append", ...)`) or
+`Bash(printf ... >> path)` enclosed in a recipe. Do **not** use the `Write`
+tool after a full-file `Read` — that pattern caused the 2026-06-10 incident
+(issue `94f692ef`) where the alc-adviser lost ~950 lines of journal.md via
+Read-full → Write truncation.
 
-Because the Write tool overwrites by default, writing only the new section
-would erase every existing section. The mandatory SOP is therefore Read full
-content -> concat -> Write the whole file (`base/rules/journal.md` core rule
-"append only / no delete", traced to the 2026-05-19 incident where eight
-sections of `notes.md` were lost).
+The `Write` tool overwrites the file by default; writing only the new section
+or reconstructing from a full Read both risk silent truncation. The mandatory
+SOP is therefore append-only Tool / Recipe per
+`sets/base/rules/journal.md §Adviser/Agent write 規律` (which also
+prohibits full-file Read for files exceeding 100 lines).
+
+Note: frontmatter `tools:` entry for `Write` removal and physical append-only
+Tool wiring are tracked in a separate issue (out of scope for this fix).
 
 #### Journal Target Resolution
 
@@ -191,9 +195,11 @@ lines).
 - **Skip the `### Query Result` reply to the main thread** (finishing with
   only the journal append is an output-contract violation; both steps are
   mandatory).
-- **Overwrite the journal by truncation** (when calling `Write`, always
-  `Read` the full content first, concatenate at the end, and write back the
-  whole file; losing existing sections is an append-only violation).
+- **Overwrite the journal by truncation** — never use `Read` full content
+  → concat → `Write` whole file to append; use an append-only Tool / Recipe
+  (e.g. lds recipe / `Bash(printf >> path)`) per
+  `sets/base/rules/journal.md §Adviser/Agent write 規律` (`journal-truncate-write`
+  anti-pattern; incident `94f692ef`, 2026-06-10).
 - **Skip step 3b(a-0) alc-wake SKILL.md Read** — silent skip is forbidden.
   If `Read(plugins/alc/skills/alc-wake/SKILL.md)` fails, you must emit
   `### Substrate Cross-Check\n- BLOCKED: alc-wake SKILL.md not loadable from plugins/alc/skills/alc-wake/SKILL.md`
@@ -328,9 +334,12 @@ The query contains build-intent signals: "build" / "create" / "作りたい" /
 - `query-result-omit` — skipping the `### Query Result` reply to the main
   thread and finishing with only the journal append (output-contract
   violation).
-- `journal-truncate-write` — overwriting the journal with Write without
-  reading it first and dropping existing sections (append-only violation; the
-  SOP is Read full -> concat -> Write whole file).
+- `journal-truncate-write` — never use Read full → concat → Write to append
+  to journal.md; the correct SOP is append-only Tool / Recipe (e.g. lds
+  recipe / Bash(printf >> path) / dedicated MCP tool) per
+  `sets/base/rules/journal.md §Adviser/Agent write 規律`; Read full →
+  concat → Write is structurally prohibited (incident `94f692ef`,
+  2026-06-10).
 - `design-scaffold-leak` — scaffolding or writing `init.lua` during design
   consultation (implementation belongs to `@alc-coder`; the adviser only
   proposes structure).

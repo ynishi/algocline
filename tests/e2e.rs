@@ -8017,3 +8017,183 @@ async fn test_alc_state_reset_not_found() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// T1 (happy path): alc_state_set writes a value and the file can be read back via
+/// alc_state_show, confirming full round-trip through the MCP wire.
+///
+/// # Setup
+/// Empty alc_home; no pre-existing state file.
+///
+/// # Assertions
+/// - `ok == true`
+/// - A subsequent `alc_state_show` returns the written value under `data.score`.
+#[tokio::test]
+async fn test_alc_state_set_happy_path() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    let key = "set-task";
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let v = call_json(
+        &client,
+        "alc_state_set",
+        json!({"namespace": ns, "key": key, "value": {"data": {"score": 42}}}),
+    )
+    .await;
+    assert_eq!(v["ok"].as_bool(), Some(true), "expected ok=true, got: {v}");
+
+    // Round-trip: show must surface the written value.
+    let shown = call_json(
+        &client,
+        "alc_state_show",
+        json!({"namespace": ns, "key": key}),
+    )
+    .await;
+    assert_eq!(
+        shown["data"]["score"].as_u64(),
+        Some(42),
+        "expected data.score=42 after set, got: {shown}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T3 (error path — wrong param type): alc_state_set returns an error when
+/// `namespace` is passed as a number instead of a string.
+///
+/// rmcp may surface the schema failure as a JSON-RPC error (Err from call_tool)
+/// or as a tool-level error.  Both are acceptable; the call must not succeed silently.
+///
+/// # Assertions
+/// The call either returns `Err(_)` (JSON-RPC level) or an Ok whose text does not
+/// contain `"ok":true`.
+#[tokio::test]
+async fn test_alc_state_set_wrong_namespace_type_errors() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_state_set",
+            json!({"namespace": 42, "key": "k", "value": {"x": 1}}),
+        ))
+        .await;
+
+    match outcome {
+        Err(_) => {
+            // JSON-RPC protocol error — schema validation caught by rmcp.
+        }
+        Ok(result) => {
+            let text = extract_text(&result);
+            let parsed: Option<serde_json::Value> = serde_json::from_str(text).ok();
+            assert!(
+                parsed.as_ref().and_then(|v| v.get("ok")).is_none(),
+                "alc_state_set with wrong namespace type must not return ok=true, got: {text}"
+            );
+        }
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T1 (happy path — crux §2 existed-flag): alc_state_delete returns
+/// `{"ok":true,"existed":true}` when the key exists, and
+/// `{"ok":true,"existed":false}` on a second call (idempotent).
+///
+/// # Setup
+/// Creates a fixture state file at `state/orch/del-task.json`.
+///
+/// # Assertions
+/// - First call: `ok == true`, `existed == true`
+/// - Second call (idempotent): `ok == true`, `existed == false`
+#[tokio::test]
+async fn test_alc_state_delete_happy_path() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    let key = "del-task";
+    let ns_dir = alc_home.path().join("state").join(ns);
+    std::fs::create_dir_all(&ns_dir).expect("create state ns dir");
+    let fixture =
+        serde_json::json!({"_token_value": "tok", "data": {}, "identity": {"task_id": key}});
+    // Safety: serde_json::to_string on a plain Value never fails.
+    std::fs::write(
+        ns_dir.join(format!("{key}.json")),
+        serde_json::to_string(&fixture).unwrap(),
+    )
+    .expect("write fixture");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    // First delete — key exists.
+    let v1 = call_json(
+        &client,
+        "alc_state_delete",
+        json!({"namespace": ns, "key": key}),
+    )
+    .await;
+    assert_eq!(
+        v1["ok"].as_bool(),
+        Some(true),
+        "expected ok=true, got: {v1}"
+    );
+    assert_eq!(
+        v1["existed"].as_bool(),
+        Some(true),
+        "expected existed=true on first delete, got: {v1}"
+    );
+
+    // Second delete — key no longer exists (idempotent).
+    let v2 = call_json(
+        &client,
+        "alc_state_delete",
+        json!({"namespace": ns, "key": key}),
+    )
+    .await;
+    assert_eq!(
+        v2["ok"].as_bool(),
+        Some(true),
+        "expected ok=true, got: {v2}"
+    );
+    assert_eq!(
+        v2["existed"].as_bool(),
+        Some(false),
+        "expected existed=false on second delete, got: {v2}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T3 (error path — unsafe segment): alc_state_delete returns a typed
+/// UNSAFE_SEGMENT error when the key contains a path traversal component.
+///
+/// # Assertions
+/// - `err["error"] == "UNSAFE_SEGMENT"`
+/// - `err["which"] == "key"`
+#[tokio::test]
+async fn test_alc_state_delete_unsafe_segment() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_state_delete",
+            json!({"namespace": "orch", "key": "../escape"}),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    let err: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("typed error must be JSON: {e}\nraw: {text}"));
+    assert_eq!(
+        err["error"].as_str(),
+        Some("UNSAFE_SEGMENT"),
+        "expected UNSAFE_SEGMENT error code, got: {err}"
+    );
+    assert_eq!(
+        err["which"].as_str(),
+        Some("key"),
+        "expected which=key, got: {err}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

@@ -15,10 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-The three `alc_state_*` tools are implemented as thin wires over inherent methods on `JsonFileStore`,
-deliberately staying within the 0.37.0 rollback boundary: all parameters use namespace-generic `String`
-arguments (no `OrchState`, `CodingState`, `DispatchKey`, or other application-domain type), and no
-new `EngineApi` trait method is added (the handlers are inherent `async fn` on `AppService`).
+The `alc_state_*` tools (Phase A: list/show/reset; Phase B: set/delete) follow the 0.37.0 rollback
+boundary: all parameters use namespace-generic `String` / `serde_json::Value` arguments
+(no `OrchState`, `CodingState`, `DispatchKey`, or other application-domain type). Phase B adds
+`state_set` and `state_delete` to the `EngineApi` trait with namespace-generic signatures, which
+is permitted under the same precedent as the 0.23.0 / 0.24.0 BREAKING additions
+(see `docs/state-management.md` §Rollback constraint #2 update).
 
 ### Changed
 

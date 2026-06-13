@@ -1371,6 +1371,25 @@ mod tests {
                 async fn setting_resolve(&self, _target: Option<String>) -> Result<String, String> {
                     Err($err.into())
                 }
+                async fn state_list(&self, _namespace: String) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn state_show(
+                    &self,
+                    _namespace: String,
+                    _key: String,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn state_reset(
+                    &self,
+                    _namespace: String,
+                    _key: String,
+                    _steps: Option<Vec<String>>,
+                    _fields: Option<Vec<String>>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
             }
         };
     }
@@ -2037,6 +2056,21 @@ mod tests {
         async fn setting_resolve(&self, _target: Option<String>) -> Result<String, String> {
             Err("not configured".into())
         }
+        async fn state_list(&self, _namespace: String) -> Result<String, String> {
+            Err("not configured".into())
+        }
+        async fn state_show(&self, _namespace: String, _key: String) -> Result<String, String> {
+            Err("not configured".into())
+        }
+        async fn state_reset(
+            &self,
+            _namespace: String,
+            _key: String,
+            _steps: Option<Vec<String>>,
+            _fields: Option<Vec<String>>,
+        ) -> Result<String, String> {
+            Err("not configured".into())
+        }
     }
 
     fn make_fake_catalog(engine: FakeEngine) -> (ResourceCatalog, tempfile::TempDir) {
@@ -2375,6 +2409,21 @@ mod tests {
                 Err("noop".into())
             }
             async fn setting_resolve(&self, _target: Option<String>) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn state_list(&self, _namespace: String) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn state_show(&self, _namespace: String, _key: String) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn state_reset(
+                &self,
+                _namespace: String,
+                _key: String,
+                _steps: Option<Vec<String>>,
+                _fields: Option<Vec<String>>,
+            ) -> Result<String, String> {
                 Err("noop".into())
             }
         }

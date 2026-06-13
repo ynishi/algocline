@@ -689,6 +689,61 @@ pub trait EngineApi: Send + Sync {
     /// ```
     async fn setting_resolve(&self, target: Option<String>) -> Result<String, String>;
 
+    // ─── State management ────────────────────────────────────
+
+    /// List all state keys within a namespace.
+    ///
+    /// Returns a JSON array of key strings. Returns an empty array when the
+    /// namespace directory does not exist (not an error).
+    ///
+    /// # Arguments
+    /// - `namespace` — state namespace to list (e.g. `"orch"`).
+    ///
+    /// # Returns
+    /// `Ok(JSON-array-string)` on success.
+    ///
+    /// # Errors
+    /// Structured JSON error string: `{"error":"<CODE>",...}` where CODE is one of
+    /// `UNSAFE_SEGMENT`, `IO_READ`.
+    async fn state_list(&self, namespace: String) -> Result<String, String>;
+
+    /// Show the full JSON content of a state file.
+    ///
+    /// # Arguments
+    /// - `namespace` — state namespace (e.g. `"orch"`).
+    /// - `key` — state key / task id.
+    ///
+    /// # Returns
+    /// `Ok(JSON-value-string)` on success.
+    ///
+    /// # Errors
+    /// Structured JSON error string: `{"error":"<CODE>",...}` where CODE is one of
+    /// `NOT_FOUND`, `UNSAFE_SEGMENT`, `IO_READ`, `SERDE`.
+    async fn state_show(&self, namespace: String, key: String) -> Result<String, String>;
+
+    /// Reset (partially delete) fields or completed steps from a state file.
+    ///
+    /// # Arguments
+    /// - `namespace` — state namespace (e.g. `"orch"`).
+    /// - `key` — state key / task id.
+    /// - `steps` — step names to remove from `data.completed_steps`. `None` means no steps removed.
+    /// - `fields` — top-level field names to remove from `data`. `None` means no fields removed.
+    ///
+    /// # Returns
+    /// `Ok(JSON-object-string)` with shape
+    /// `{"ok":true,"backup_path":"...","steps_removed":<usize>,"steps_input":[...],"fields_removed":<usize>,"fields_input":[...]}`.
+    ///
+    /// # Errors
+    /// Structured JSON error string: `{"error":"<CODE>",...}` where CODE is one of
+    /// `NOT_FOUND`, `UNSAFE_SEGMENT`, `IO_BACKUP`, `IO_READ`, `IO_WRITE`, `SERDE`, `SHAPE_INVALID`.
+    async fn state_reset(
+        &self,
+        namespace: String,
+        key: String,
+        steps: Option<Vec<String>>,
+        fields: Option<Vec<String>>,
+    ) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

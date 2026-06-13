@@ -399,6 +399,9 @@ alc_continue({ session_id, response })
 | `alc_pool_ensure` | Ensure a pool worker subprocess is running for a session; spawns one if absent. Returns `{sid, sock, pid, status}` |
 | `alc_pool_status` | List active pool sessions with PID, socket path, and version. Also runs GC to evict stale entries and persists the updated registry |
 | `alc_pool_stop` | Send SIGTERM to a named session's pool worker and remove its registry entry |
+| `alc_state_list` | List state file keys under a namespace (returns `{"keys":[...]}`, sorted alphabetically, `.bak`/`.tmp` excluded). Read-only and idempotent; returns an empty list when the namespace directory is absent |
+| `alc_state_show` | Return the full JSON content of a state file identified by `namespace` and `key`. Returns a typed `{"error":"NOT_FOUND",...}` error distinguishable from I/O errors when the key does not exist |
+| `alc_state_reset` | Atomically reset `completed_steps` entries and/or data fields in a state file. Creates a `.bak` backup before mutating; the operation is idempotent (a second call with the same inputs is a no-op). Accepts `steps` and `fields` arrays specifying which entries to remove |
 
 ## MCP Resources
 

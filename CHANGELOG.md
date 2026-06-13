@@ -9,18 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc_state_delete` MCP tool: delete a state key in a namespace with atomic `.bak` backup; returns `{"ok":true,"existed":<bool>}` where `existed` signals prior key presence (idempotent: second call returns `existed:false` without error).
 - `alc_state_list` MCP tool: list state keys in a namespace (returns `{"keys":[...]}`, sorted alphabetically, `.bak`/`.tmp` excluded).
 - `alc_state_reset` MCP tool: reset `completed_steps` entries and data fields in an orch state file, creating an atomic `.bak` backup.
+- `alc_state_set` MCP tool: write or overwrite a state key in a namespace with atomic `.bak` backup on overwrite; returns `{"ok":true}`.
 - `alc_state_show` MCP tool: return the full JSON content of a state file by namespace and key.
 
 ### Notes
 
-The `alc_state_*` tools (Phase A: list/show/reset; Phase B: set/delete) follow the 0.37.0 rollback
-boundary: all parameters use namespace-generic `String` / `serde_json::Value` arguments
-(no `OrchState`, `CodingState`, `DispatchKey`, or other application-domain type). Phase B adds
-`state_set` and `state_delete` to the `EngineApi` trait with namespace-generic signatures, which
-is permitted under the same precedent as the 0.23.0 / 0.24.0 BREAKING additions
-(see `docs/state-management.md` §Rollback constraint #2 update).
+The `alc_state_*` tools (Phase A: list/show/reset, landed in merge commit `15e58bf`; Phase B:
+set/delete) follow the 0.37.0 rollback boundary: all parameters use namespace-generic `String` /
+`serde_json::Value` arguments (no `OrchState`, `CodingState`, `DispatchKey`, or other
+application-domain type). Phase B adds `state_set` and `state_delete` to the `EngineApi` trait
+with namespace-generic signatures. This is permitted under the 2026-06-13 narrowed constraint
+update to `docs/state-management.md` (L148–163): constraint #2 was narrowed from "no new
+`EngineApi` trait methods" to "no application-term leak in trait method signatures". The
+`state_set(namespace: String, key: String, value: serde_json::Value)` and
+`state_delete(namespace: String, key: String)` signatures contain only primitive types — the same
+precedent as the 0.23.0 / 0.24.0 BREAKING additions.
 
 ### Changed
 

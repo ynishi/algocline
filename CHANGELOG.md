@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc_state_list` MCP tool: list state keys in a namespace (returns `{"keys":[...]}`, sorted alphabetically, `.bak`/`.tmp` excluded).
+- `alc_state_reset` MCP tool: reset `completed_steps` entries and data fields in an orch state file, creating an atomic `.bak` backup.
+- `alc_state_show` MCP tool: return the full JSON content of a state file by namespace and key.
+
+### Notes
+
+The three `alc_state_*` tools are implemented as thin wires over inherent methods on `JsonFileStore`,
+deliberately staying within the 0.37.0 rollback boundary: all parameters use namespace-generic `String`
+arguments (no `OrchState`, `CodingState`, `DispatchKey`, or other application-domain type), and no
+new `EngineApi` trait method is added (the handlers are inherent `async fn` on `AppService`).
+
 ### Changed
 
 ### Deprecated

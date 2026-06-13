@@ -744,6 +744,48 @@ pub trait EngineApi: Send + Sync {
         fields: Option<Vec<String>>,
     ) -> Result<String, String>;
 
+    /// Write or overwrite a value in the dispatched-layout state store.
+    ///
+    /// The namespace and key must be path-safe segments (ASCII alphanumeric,
+    /// `_`, `-`, `.`; no `..` or empty).  On overwrite, a `.bak` file is
+    /// created atomically before the mutation (Crux §3).
+    ///
+    /// # Arguments
+    /// * `namespace` — subdirectory (state namespace), e.g. `"orch"`
+    /// * `key` — file stem, e.g. `"my-task-id"`
+    /// * `value` — JSON value to store
+    ///
+    /// # Returns
+    /// JSON string `{"ok":true}` on success.
+    ///
+    /// # Errors
+    /// Structured JSON error string: `{"error":"<CODE>",...}` where CODE is one of
+    /// `UNSAFE_SEGMENT`, `IO_BACKUP`, `IO_WRITE`.
+    async fn state_set(
+        &self,
+        namespace: String,
+        key: String,
+        value: serde_json::Value,
+    ) -> Result<String, String>;
+
+    /// Delete a value from the dispatched-layout state store.
+    ///
+    /// Returns `{"ok":true,"existed":false}` if the key was absent (idempotent
+    /// no-op).  Returns `{"ok":true,"existed":true}` after copying a `.bak` and
+    /// removing the file (Crux §3 atomicity contract).
+    ///
+    /// # Arguments
+    /// * `namespace` — subdirectory (state namespace), e.g. `"orch"`
+    /// * `key` — file stem, e.g. `"my-task-id"`
+    ///
+    /// # Returns
+    /// JSON string `{"ok":true,"existed":<bool>}` on success.
+    ///
+    /// # Errors
+    /// Structured JSON error string: `{"error":"<CODE>",...}` where CODE is one of
+    /// `UNSAFE_SEGMENT`, `IO_BACKUP`, `IO_WRITE`.
+    async fn state_delete(&self, namespace: String, key: String) -> Result<String, String>;
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     /// Show server configuration and diagnostic info.

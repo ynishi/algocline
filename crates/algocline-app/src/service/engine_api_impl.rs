@@ -696,6 +696,38 @@ impl EngineApi for AppService {
         .map_err(|e| format!("state_reset: task panicked: {e}"))?
     }
 
+    async fn state_set(
+        &self,
+        namespace: String,
+        key: String,
+        value: serde_json::Value,
+    ) -> Result<String, String> {
+        let store = Arc::clone(&self.state_store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .set_dispatched(&namespace, &key, &value)
+                .map_err(AppService::state_err_to_wire)
+                .map(|_| r#"{"ok":true}"#.to_string())
+        })
+        .await
+        .map_err(|e| format!("state_set: task panicked: {e}"))?
+    }
+
+    async fn state_delete(&self, namespace: String, key: String) -> Result<String, String> {
+        let store = Arc::clone(&self.state_store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .delete_dispatched(&namespace, &key)
+                .map_err(AppService::state_err_to_wire)
+                .and_then(|existed| {
+                    serde_json::to_string(&serde_json::json!({"ok": true, "existed": existed}))
+                        .map_err(|e| format!("state_delete: serialize: {e}"))
+                })
+        })
+        .await
+        .map_err(|e| format!("state_delete: task panicked: {e}"))?
+    }
+
     // ─── Diagnostics ─────────────────────────────────────────
 
     async fn info(&self) -> String {

@@ -19,6 +19,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.43.0] - 2026-06-13
+
+### Added
+
+- `alc-adviser` agent: substrate cross-check step (3b) — before composing a
+  design proposal, the adviser reads `plugins/alc/skills/alc-wake/SKILL.md`
+  for the canonical Swarm framework primitive list, the workspace `alc.toml`
+  / `alc.local.toml` `[packages]` section, and each in-use substrate's
+  `init.lua` from `~/.algocline/packages/<sub>/`. Every gap finding emitted
+  in `### Design Proposal` is now paired with either a literal substrate
+  primitive path or the explicit phrase `no primitive applies`, preventing
+  downstream re-invention of existing primitives (e.g., state persistence,
+  dispatcher routing, verdict-loop gating) (GH #3).
+- `alc-refiner` agent: substrate cross-check step (2b) — analogous to the
+  adviser cross-check but Read/Write only (no MCP tools). Refiner proposals
+  now carry a paired substrate primitive path or `no primitive applies` per
+  proposed change, with `### Refiner Proposal` blocked on any of (a-0) Skill
+  Read / (a) workspace `alc.toml` Read / (b) substrate `init.lua` Read
+  failures (GH #3).
+- `alc-coder` agent scaffold: `.stylua.toml` write step — the coder now
+  writes a default `.stylua.toml` (`column_width = 100`,
+  `indent_type = "Spaces"`, `indent_width = 4`) at `<pkg_root>/<name>/`
+  during package scaffold, idempotent on existing files. Aligns scaffold
+  output with the algocline-wide Lua formatter convention (GH #5).
+
+### Fixed
+
+- `alc-adviser` / `alc-refiner` agents: journal append SOP no longer
+  recommends the `Read` full content → `Write` whole file pattern.
+  Documentation now points to append-only Tool / Recipe paths (e.g.,
+  `mcp__lds__recipe_run(recipe="journal-append", ...)` or
+  `Bash(printf ... >> path)` enclosed in a recipe). Prevents recurrence of
+  the 2026-06-10 incident (`94f692ef`) in which ~950 lines of `journal.md`
+  were lost via Read-full → Write truncation. Frontmatter `tools:` entry
+  removal and physical append-only Tool wiring are tracked separately.
+
 ## [0.42.2] - 2026-06-12
 
 ### Fixed

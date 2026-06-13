@@ -108,6 +108,26 @@ pub struct StateResetParams {
     pub fields: Option<Vec<String>>,
 }
 
+/// Parameters for `alc_state_set`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StateSetParams {
+    /// Namespace of the state file (e.g. `"orch"`).
+    pub namespace: String,
+    /// Key identifying the state file (e.g. a task id).
+    pub key: String,
+    /// JSON value to store.
+    pub value: serde_json::Value,
+}
+
+/// Parameters for `alc_state_delete`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StateDeleteParams {
+    /// Namespace of the state file (e.g. `"orch"`).
+    pub namespace: String,
+    /// Key identifying the state file (e.g. a task id).
+    pub key: String,
+}
+
 /// Host-reported token usage for an LLM call (MCP schema).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpTokenUsage {
@@ -2278,6 +2298,74 @@ impl AlcService {
         self.app
             .state_reset(params.namespace, params.key, params.steps, params.fields)
             .await
+    }
+
+    /// Write or overwrite a value in the dispatched-layout state store.
+    ///
+    /// On overwrite, a `.bak` file is created atomically before the mutation.
+    /// Both namespace and key must be path-safe segments (ASCII alphanumeric,
+    /// `_`, `-`, `.`; no `..` or empty).
+    ///
+    /// # Parameters
+    /// * `namespace` — subdirectory (state namespace), e.g. `"orch"`
+    /// * `key` — file stem, e.g. `"my-task-id"`
+    /// * `value` — JSON value to store
+    ///
+    /// # Returns
+    /// `{"ok": true}` on success.
+    ///
+    /// # Errors
+    /// `UNSAFE_SEGMENT` — namespace or key contains unsafe characters.
+    /// `IO_BACKUP` — failed to create `.bak` file before overwrite.
+    /// `IO_WRITE` — failed to write or atomically rename the state file.
+    #[tool(
+        name = "alc_state_set",
+        annotations(
+            read_only_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn state_set(
+        &self,
+        Parameters(params): Parameters<StateSetParams>,
+    ) -> Result<String, String> {
+        self.app
+            .state_set(params.namespace, params.key, params.value)
+            .await
+    }
+
+    /// Delete a value from the dispatched-layout state store.
+    ///
+    /// Returns `{"ok": true, "existed": true}` when the key was present and
+    /// deleted, or `{"ok": true, "existed": false}` when the key was already
+    /// absent (idempotent no-op).  A `.bak` file is created atomically before
+    /// deletion when the key exists.
+    ///
+    /// # Parameters
+    /// * `namespace` — subdirectory (state namespace), e.g. `"orch"`
+    /// * `key` — file stem, e.g. `"my-task-id"`
+    ///
+    /// # Returns
+    /// `{"ok": true, "existed": <bool>}` where `existed` signals prior key existence.
+    ///
+    /// # Errors
+    /// `UNSAFE_SEGMENT` — namespace or key contains unsafe characters.
+    /// `IO_BACKUP` — failed to create `.bak` file before deletion.
+    /// `IO_WRITE` — failed to remove the state file.
+    #[tool(
+        name = "alc_state_delete",
+        annotations(
+            read_only_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn state_delete(
+        &self,
+        Parameters(params): Parameters<StateDeleteParams>,
+    ) -> Result<String, String> {
+        self.app.state_delete(params.namespace, params.key).await
     }
 
     // ─── V2 execution tools ───────────────────────────────────────

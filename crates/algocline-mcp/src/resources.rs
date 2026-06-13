@@ -1390,6 +1390,21 @@ mod tests {
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
+                async fn state_set(
+                    &self,
+                    _namespace: String,
+                    _key: String,
+                    _value: serde_json::Value,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn state_delete(
+                    &self,
+                    _namespace: String,
+                    _key: String,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
             }
         };
     }
@@ -2071,6 +2086,17 @@ mod tests {
         ) -> Result<String, String> {
             Err("not configured".into())
         }
+        async fn state_set(
+            &self,
+            _namespace: String,
+            _key: String,
+            _value: serde_json::Value,
+        ) -> Result<String, String> {
+            Err("not configured".into())
+        }
+        async fn state_delete(&self, _namespace: String, _key: String) -> Result<String, String> {
+            Err("not configured".into())
+        }
     }
 
     fn make_fake_catalog(engine: FakeEngine) -> (ResourceCatalog, tempfile::TempDir) {
@@ -2423,6 +2449,21 @@ mod tests {
                 _key: String,
                 _steps: Option<Vec<String>>,
                 _fields: Option<Vec<String>>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn state_set(
+                &self,
+                _namespace: String,
+                _key: String,
+                _value: serde_json::Value,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn state_delete(
+                &self,
+                _namespace: String,
+                _key: String,
             ) -> Result<String, String> {
                 Err("noop".into())
             }

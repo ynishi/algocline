@@ -468,6 +468,94 @@ impl JsonFileStore {
         Ok(value)
     }
 
+    /// Write or overwrite a state file in the dispatched layout.
+    ///
+    /// For a new path (file does not exist), writes directly without creating a
+    /// `.bak` file (no prior state to back up).  For an existing path (overwrite),
+    /// copies the live file to `{key}.json.bak` **before** the mutation so the
+    /// original is always recoverable on crash (Crux §3 atomicity contract).
+    ///
+    /// # Arguments
+    /// * `ns` — namespace (subdirectory name); must pass [`is_safe_segment`]
+    /// * `key` — file stem; must pass [`is_safe_segment`]
+    /// * `value` — JSON value to write
+    ///
+    /// # Errors
+    /// * [`StateError::UnsafeSegment`] — segment validation failed
+    /// * [`StateError::IoBackup`] — `.bak` copy failed (overwrite path only)
+    /// * [`StateError::IoWrite`] — tmp write or atomic rename failed
+    pub fn set_dispatched(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), StateError> {
+        if !is_safe_segment(ns) {
+            return Err(StateError::UnsafeSegment {
+                which: "namespace",
+                value: ns.to_string(),
+            });
+        }
+        if !is_safe_segment(key) {
+            return Err(StateError::UnsafeSegment {
+                which: "key",
+                value: key.to_string(),
+            });
+        }
+        let target = self.root.join(ns).join(format!("{key}.json"));
+        if !target.exists() {
+            // New path: no prior state, write directly (no .bak needed).
+            return self
+                .save_dispatched(&target, value)
+                .map_err(|s| StateError::IoWrite(std::io::Error::other(s)));
+        }
+        // Overwrite path: copy .bak BEFORE mutation (Crux §3: backup before any mutation).
+        let target_bak = target.with_extension("json.bak");
+        fs::copy(&target, &target_bak).map_err(StateError::IoBackup)?;
+        self.save_dispatched(&target, value)
+            .map_err(|s| StateError::IoWrite(std::io::Error::other(s)))
+    }
+
+    /// Delete a state file in the dispatched layout.
+    ///
+    /// Returns `Ok(false)` if the file does not exist (idempotent no-op; no
+    /// `.bak` is created because there is no mutation).  Returns `Ok(true)`
+    /// after copying the live file to `{key}.json.bak` and then removing it
+    /// (Crux §3 atomicity contract: backup before any mutation).
+    ///
+    /// # Arguments
+    /// * `ns` — namespace (subdirectory name); must pass [`is_safe_segment`]
+    /// * `key` — file stem; must pass [`is_safe_segment`]
+    ///
+    /// # Errors
+    /// * [`StateError::UnsafeSegment`] — segment validation failed
+    /// * [`StateError::IoBackup`] — `.bak` copy failed
+    /// * [`StateError::IoWrite`] — `remove_file` failed
+    pub fn delete_dispatched(&self, ns: &str, key: &str) -> Result<bool, StateError> {
+        if !is_safe_segment(ns) {
+            return Err(StateError::UnsafeSegment {
+                which: "namespace",
+                value: ns.to_string(),
+            });
+        }
+        if !is_safe_segment(key) {
+            return Err(StateError::UnsafeSegment {
+                which: "key",
+                value: key.to_string(),
+            });
+        }
+        let target = self.root.join(ns).join(format!("{key}.json"));
+        if !target.exists() {
+            // Key absent: no mutation, idempotent no-op (Crux §2: Ok(false) path).
+            return Ok(false);
+        }
+        // Key present: copy .bak BEFORE removal (Crux §3: backup before any mutation).
+        let target_bak = target.with_extension("json.bak");
+        fs::copy(&target, &target_bak).map_err(StateError::IoBackup)?;
+        fs::remove_file(&target).map_err(StateError::IoWrite)?;
+        Ok(true)
+    }
+
     /// Atomically reset a dispatched-layout state file with a backup.
     ///
     /// Performs the following sequence in order (Crux atomicity contract):

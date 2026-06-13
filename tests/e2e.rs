@@ -7716,3 +7716,304 @@ async fn test_alc_advice_returns_not_found_when_all_tiers_absent() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_state_* E2E tests ────────────────────────────────────────
+
+/// T1 (happy path): alc_state_list returns the key for a written fixture file.
+///
+/// # Setup
+/// Creates a fresh ALC_HOME with one state file at `state/orch/test-task.json`.
+///
+/// # Assertions
+/// The `keys` array in the response contains the expected key.
+#[tokio::test]
+async fn test_alc_state_list_happy_path() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    let key = "test-task";
+    let ns_dir = alc_home.path().join("state").join(ns);
+    std::fs::create_dir_all(&ns_dir).expect("create state ns dir");
+    let fixture = serde_json::json!({
+        "_token_value": "test-token",
+        "data": {
+            "completed_steps": ["step_a", "step_b", "step_c"],
+            "field_x": "value_x",
+            "field_y": "value_y"
+        },
+        "identity": {"task_id": "test-task"}
+    });
+    // Safety: serde_json::to_string on a plain Value never fails.
+    std::fs::write(
+        ns_dir.join(format!("{key}.json")),
+        serde_json::to_string(&fixture).unwrap(),
+    )
+    .expect("write fixture");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let v = call_json(&client, "alc_state_list", json!({"namespace": ns})).await;
+    let keys = v["keys"]
+        .as_array()
+        .expect("response must have a 'keys' array");
+    assert!(
+        keys.iter().any(|k| k.as_str() == Some(key)),
+        "expected key '{key}' in keys array, got: {keys:?}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T2 (edge case — unsafe segment): alc_state_list returns a typed UNSAFE_SEGMENT
+/// error when the namespace contains a path traversal component.
+///
+/// No fixture file is needed — the engine rejects the argument before any
+/// filesystem access. Invoked via real rmcp stdio (no mock).
+///
+/// # Assertions
+/// - `err["error"] == "UNSAFE_SEGMENT"`
+/// - `err["which"] == "namespace"`
+/// - `err["value"] == "../escape"`
+#[tokio::test]
+async fn test_alc_state_list_unsafe_segment() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let client = connect_with_alc_home(alc_home.path()).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_state_list",
+            json!({"namespace": "../escape"}),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    let err: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("typed error must be JSON: {e}\nraw: {text}"));
+    assert_eq!(
+        err["error"].as_str(),
+        Some("UNSAFE_SEGMENT"),
+        "expected UNSAFE_SEGMENT error code, got: {err}"
+    );
+    assert_eq!(
+        err["which"].as_str(),
+        Some("namespace"),
+        "expected which=namespace, got: {err}"
+    );
+    assert_eq!(
+        err["value"].as_str(),
+        Some("../escape"),
+        "expected value=../escape, got: {err}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T1 (happy path): alc_state_show returns the full JSON content of a fixture file.
+///
+/// # Setup
+/// Creates a fixture state file at `state/orch/test-task.json`.
+///
+/// # Assertions
+/// The response contains the fixture's `_token_value` and `identity.task_id`.
+#[tokio::test]
+async fn test_alc_state_show_happy_path() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    let key = "test-task";
+    let ns_dir = alc_home.path().join("state").join(ns);
+    std::fs::create_dir_all(&ns_dir).expect("create state ns dir");
+    let fixture = serde_json::json!({
+        "_token_value": "test-token",
+        "data": {
+            "completed_steps": ["step_a", "step_b", "step_c"],
+            "field_x": "value_x",
+            "field_y": "value_y"
+        },
+        "identity": {"task_id": "test-task"}
+    });
+    // Safety: serde_json::to_string on a plain Value never fails.
+    std::fs::write(
+        ns_dir.join(format!("{key}.json")),
+        serde_json::to_string(&fixture).unwrap(),
+    )
+    .expect("write fixture");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let v = call_json(
+        &client,
+        "alc_state_show",
+        json!({"namespace": ns, "key": key}),
+    )
+    .await;
+    assert_eq!(
+        v["_token_value"].as_str(),
+        Some("test-token"),
+        "expected _token_value=test-token, got: {v}"
+    );
+    assert_eq!(
+        v["identity"]["task_id"].as_str(),
+        Some("test-task"),
+        "expected identity.task_id=test-task, got: {v}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T3 (error path — crux §2 honored): alc_state_show returns a typed NOT_FOUND
+/// error when queried with an unknown key via real rmcp stdio.
+///
+/// The namespace directory exists but contains no file for the queried key,
+/// causing a `KeyNotFound` error in the engine which is propagated as the
+/// typed code `"NOT_FOUND"` in the MCP response.
+///
+/// # Assertions
+/// `json["error"].as_str() == Some("NOT_FOUND")` — typed code field, not exit code.
+#[tokio::test]
+async fn test_alc_state_show_not_found() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    // Create the namespace directory but write no file — produces KeyNotFound.
+    std::fs::create_dir_all(alc_home.path().join("state").join(ns)).expect("create state ns dir");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let result = client
+        .call_tool(call_params(
+            "alc_state_show",
+            json!({"namespace": ns, "key": "nonexistent"}),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    let err_json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("typed error must be JSON: {e}\nraw: {text}"));
+    assert_eq!(
+        err_json["error"].as_str(),
+        Some("NOT_FOUND"),
+        "expected NOT_FOUND typed code, got: {err_json}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T1 (happy path): alc_state_reset removes specified steps and fields, returns
+/// counts, input echoes, and a backup path. The `.bak` file must exist on disk.
+///
+/// # Setup
+/// Creates a fixture with 3 completed_steps and 2 data fields.
+/// Resets steps=["step_a","step_b"] and fields=["field_x"].
+///
+/// # Assertions
+/// - `ok == true`
+/// - `steps_removed == 2`, `fields_removed == 1`
+/// - `steps_input == ["step_a","step_b"]`, `fields_input == ["field_x"]`
+/// - `backup_path` ends with `.json.bak` and the file exists on disk
+#[tokio::test]
+async fn test_alc_state_reset_happy_path() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    let key = "test-task";
+    let ns_dir = alc_home.path().join("state").join(ns);
+    std::fs::create_dir_all(&ns_dir).expect("create state ns dir");
+    let fixture = serde_json::json!({
+        "_token_value": "test-token",
+        "data": {
+            "completed_steps": ["step_a", "step_b", "step_c"],
+            "field_x": "value_x",
+            "field_y": "value_y"
+        },
+        "identity": {"task_id": "test-task"}
+    });
+    // Safety: serde_json::to_string on a plain Value never fails.
+    std::fs::write(
+        ns_dir.join(format!("{key}.json")),
+        serde_json::to_string(&fixture).unwrap(),
+    )
+    .expect("write fixture");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let v = call_json(
+        &client,
+        "alc_state_reset",
+        json!({
+            "namespace": ns,
+            "key": key,
+            "steps": ["step_a", "step_b"],
+            "fields": ["field_x"]
+        }),
+    )
+    .await;
+
+    assert_eq!(v["ok"].as_bool(), Some(true), "expected ok=true, got: {v}");
+    assert_eq!(
+        v["steps_removed"].as_u64(),
+        Some(2),
+        "expected steps_removed=2, got: {v}"
+    );
+    assert_eq!(
+        v["fields_removed"].as_u64(),
+        Some(1),
+        "expected fields_removed=1, got: {v}"
+    );
+    assert_eq!(
+        v["steps_input"],
+        json!(["step_a", "step_b"]),
+        "expected steps_input=[step_a,step_b], got: {v}"
+    );
+    assert_eq!(
+        v["fields_input"],
+        json!(["field_x"]),
+        "expected fields_input=[field_x], got: {v}"
+    );
+    let bak = v["backup_path"]
+        .as_str()
+        .expect("backup_path must be a string");
+    assert!(
+        bak.ends_with(".json.bak"),
+        "backup_path must end with .json.bak, got: {bak}"
+    );
+    assert!(
+        std::path::Path::new(bak).exists(),
+        ".bak file must exist on disk: {bak}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// T3 (error path — crux §2 honored): alc_state_reset returns a typed NOT_FOUND
+/// error when the key does not exist, via real rmcp stdio.
+///
+/// The namespace directory exists but contains no file for the queried key,
+/// causing a `KeyNotFound` error in the engine which is propagated as the
+/// typed code `"NOT_FOUND"` in the MCP response.
+///
+/// # Assertions
+/// `json["error"].as_str() == Some("NOT_FOUND")` — typed code field, not exit code.
+#[tokio::test]
+async fn test_alc_state_reset_not_found() {
+    let alc_home = tempfile::TempDir::new().expect("tempdir");
+    let ns = "orch";
+    // Create the namespace directory but write no file — produces KeyNotFound.
+    std::fs::create_dir_all(alc_home.path().join("state").join(ns)).expect("create state ns dir");
+
+    let client = connect_with_alc_home(alc_home.path()).await;
+    let result = client
+        .call_tool(call_params(
+            "alc_state_reset",
+            json!({
+                "namespace": ns,
+                "key": "nonexistent",
+                "steps": [],
+                "fields": []
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    let err_json: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("typed error must be JSON: {e}\nraw: {text}"));
+    assert_eq!(
+        err_json["error"].as_str(),
+        Some("NOT_FOUND"),
+        "expected NOT_FOUND typed code, got: {err_json}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

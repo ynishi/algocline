@@ -250,6 +250,25 @@ pub(super) fn register_state(
         },
     )?;
 
+    // alc.state.set_dispatched(namespace, key, value) -> nil  (explicit-namespace set)
+    let store_set_dispatched = Arc::clone(&state_store);
+    let set_dispatched = lua.create_function(
+        move |lua, (namespace, key, value): (String, String, LuaValue)| {
+            let json: serde_json::Value = lua.from_value(value)?;
+            store_set_dispatched
+                .set_dispatched(&namespace, &key, &json)
+                .map_err(LuaError::external)
+        },
+    )?;
+
+    // alc.state.delete_dispatched(namespace, key) -> bool  (explicit-namespace delete, existed flag)
+    let store_delete_dispatched = Arc::clone(&state_store);
+    let delete_dispatched = lua.create_function(move |_, (namespace, key): (String, String)| {
+        store_delete_dispatched
+            .delete_dispatched(&namespace, &key)
+            .map_err(LuaError::external)
+    })?;
+
     state_table.set("get", get)?;
     state_table.set("set", set)?;
     state_table.set("keys", keys)?;
@@ -260,6 +279,8 @@ pub(super) fn register_state(
     state_table.set("list", list)?;
     state_table.set("show", show)?;
     state_table.set("reset", reset)?;
+    state_table.set("set_dispatched", set_dispatched)?;
+    state_table.set("delete_dispatched", delete_dispatched)?;
 
     alc_table.set("state", state_table)?;
     Ok(())

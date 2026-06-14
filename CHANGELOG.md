@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.44.1] - 2026-06-14
+
+### Changed
+
+- Bundled packages: `algocline-swarm-frame` bumped from `v0.10.0` to `v0.11.0`. v0.11.0 adds the new `swarm_state_method` v0.1.0 package (Phase C of the state-primitive 2-layer split — see `docs/state-management.md`); `hub_index.json` grows from 5 to 6 entries. v0.10.0 backfill: CHANGELOG entries for the already-shipped `verdict_loop_plugin` v0.1.0 and `swarm_frame_algocline` v0.2.0 → v0.3.0 step lifecycle + ctx.dispatch additions. Run `alc update` to pick up the new collection.
+
 ## [0.44.0] - 2026-06-14
 
 ### Added

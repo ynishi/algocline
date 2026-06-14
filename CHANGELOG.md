@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+## [0.45.0] - 2026-06-14
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Internal
+
 - Internal: extract `pool_*_impl` inherent methods + co-located tests from `service/engine_api_impl.rs` into new `service/pool.rs` (mechanical move, no behavior change). GH Issue #7.
 
 ## [0.44.1] - 2026-06-14

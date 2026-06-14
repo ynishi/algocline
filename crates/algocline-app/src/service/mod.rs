@@ -27,6 +27,7 @@ mod pkg;
 mod pkg_link;
 mod pkg_scaffold;
 mod pkg_unlink;
+mod pool;
 pub(crate) mod project;
 pub mod resolve;
 mod run;

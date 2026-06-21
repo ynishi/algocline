@@ -9,23 +9,43 @@ use mlua::{LuaSerdeExt, SerializeOptions};
 use crate::card::{self, FileCardStore};
 use crate::state::{JsonFileStore, StateStore};
 
+/// Converts a `serde_json::Value` to a Lua value with JSON null surfacing as
+/// Lua nil (not the mlua default lightuserdata sentinel).
+///
+/// All `bridge::data` accessors that expose serde JSON to Lua funnel through
+/// this helper so the null-handling contract is uniform across `alc.json_decode`,
+/// `alc.state.*`, `alc.card.*`, `alc.stats.*`, and similar bridge surfaces.
+/// JSON `null` always decodes to Lua `nil`, preventing `if obj.x then ...`
+/// truthy checks from passing through nullable fields and crashing downstream
+/// operations (e.g. `io.open(value)`).
+///
+/// See issues db041966 (originating fix for `alc.json_decode`) and ff6372af
+/// (sweep that unified all 16 callsites within `bridge/data.rs`).
+///
+/// Generic over `T: serde::Serialize` so the same contract applies to
+/// `serde_json::Value` callers (which can carry `Value::Null`) and to typed
+/// structs that may contain `Option<_>` fields (e.g. `SinkBackfillReport`).
+/// Plain types without any nullable shape (`Vec<String>`, etc.) are still
+/// safe to funnel through this helper — the option toggles only affect
+/// `None` / `()` paths.
+fn to_lua_value<T: serde::Serialize + ?Sized>(lua: &Lua, value: &T) -> LuaResult<LuaValue> {
+    let options = SerializeOptions::new()
+        .serialize_none_to_null(false)
+        .serialize_unit_to_null(false);
+    lua.to_value_with(value, options)
+}
+
 pub(super) fn register_json(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     let encode = lua.create_function(|lua, value: LuaValue| {
         let json: serde_json::Value = lua.from_value(value)?;
         serde_json::to_string(&json).map_err(LuaError::external)
     })?;
 
-    // JSON null must surface as Lua nil (not the mlua default lightuserdata
-    // sentinel) so that downstream `if value then ...` truthy checks behave as
-    // expected. mlua's default `to_value` serializes `serde_json::Value::Null`
-    // via `serialize_none_to_null` / `serialize_unit_to_null` into a
-    // lightuserdata sentinel; disabling both produces `LuaValue::Nil` instead.
-    let decode_options = SerializeOptions::new()
-        .serialize_none_to_null(false)
-        .serialize_unit_to_null(false);
-    let decode = lua.create_function(move |lua, s: String| {
+    // alc.json_decode funnels through `to_lua_value` for the canonical
+    // JSON null -> Lua nil contract. See issue db041966.
+    let decode = lua.create_function(|lua, s: String| {
         let value: serde_json::Value = serde_json::from_str(&s).map_err(LuaError::external)?;
-        lua.to_value_with(&value, decode_options)
+        to_lua_value(lua, &value)
     })?;
 
     alc_table.set("json_encode", encode)?;
@@ -154,7 +174,7 @@ pub(super) fn register_state(
             move |lua, (key, default): (String, Option<LuaValue>)| match store_get
                 .get(&ns_get, &key)
             {
-                Ok(Some(v)) => lua.to_value(&v),
+                Ok(Some(v)) => to_lua_value(lua, &v),
                 Ok(None) => Ok(default.unwrap_or(LuaValue::Nil)),
                 Err(e) => Err(LuaError::external(e)),
             },
@@ -175,7 +195,7 @@ pub(super) fn register_state(
     let store_keys = Arc::clone(&state_store);
     let keys = lua.create_function(move |lua, ()| {
         let k = store_keys.keys(&ns_keys).map_err(LuaError::external)?;
-        lua.to_value(&k)
+        to_lua_value(lua, &k)
     })?;
 
     // alc.state.delete(key)
@@ -219,7 +239,7 @@ pub(super) fn register_state(
         let keys = store_list
             .list_dispatched(&namespace)
             .map_err(LuaError::external)?;
-        lua.to_value(&keys)
+        to_lua_value(lua, &keys)
     })?;
 
     // alc.state.show(namespace, key) -> table
@@ -228,7 +248,7 @@ pub(super) fn register_state(
         let v = store_show
             .show_dispatched(&namespace, &key)
             .map_err(LuaError::external)?;
-        lua.to_value(&v)
+        to_lua_value(lua, &v)
     })?;
 
     // alc.state.reset(namespace, key, opts?) -> { ok, backup_path, steps_removed, fields_removed }
@@ -359,7 +379,7 @@ pub(super) fn register_card(
     // alc.card.get(card_id) -> table | nil
     let store_get = Arc::clone(&card_store);
     let get = lua.create_function(move |lua, card_id: String| match store_get.get(&card_id) {
-        Ok(Some(v)) => lua.to_value(&v),
+        Ok(Some(v)) => to_lua_value(lua, &v),
         Ok(None) => Ok(LuaValue::Nil),
         Err(e) => Err(LuaError::external(e)),
     })?;
@@ -374,7 +394,7 @@ pub(super) fn register_card(
         let rows = store_list
             .list(pkg.as_deref())
             .map_err(LuaError::external)?;
-        lua.to_value(&card::summaries_to_json(&rows))
+        to_lua_value(lua, &card::summaries_to_json(&rows))
     })?;
 
     // alc.card.append(card_id, fields) -> merged_card
@@ -384,14 +404,14 @@ pub(super) fn register_card(
         let merged = store_append
             .append(&card_id, json)
             .map_err(LuaError::external)?;
-        lua.to_value(&merged)
+        to_lua_value(lua, &merged)
     })?;
 
     // alc.card.get_by_alias(name) -> table | nil
     let store_gba = Arc::clone(&card_store);
     let get_by_alias = lua.create_function(move |lua, name: String| {
         match store_gba.get_by_alias(&name).map_err(LuaError::external)? {
-            Some(v) => lua.to_value(&v),
+            Some(v) => to_lua_value(lua, &v),
             None => Ok(LuaValue::Nil),
         }
     })?;
@@ -415,7 +435,7 @@ pub(super) fn register_card(
                 serde_json::Value::Array(mut v) if !v.is_empty() => v.remove(0),
                 other => other,
             };
-            lua.to_value(&first)
+            to_lua_value(lua, &first)
         },
     )?;
 
@@ -429,7 +449,7 @@ pub(super) fn register_card(
         let rows = store_alist
             .alias_list(pkg.as_deref())
             .map_err(LuaError::external)?;
-        lua.to_value(&card::aliases_to_json(&rows))
+        to_lua_value(lua, &card::aliases_to_json(&rows))
     })?;
 
     // alc.card.find(query?) -> [summary]
@@ -470,7 +490,7 @@ pub(super) fn register_card(
             None => card::FindQuery::default(),
         };
         let rows = store_find.find(q).map_err(LuaError::external)?;
-        lua.to_value(&card::summaries_to_json(&rows))
+        to_lua_value(lua, &card::summaries_to_json(&rows))
     })?;
 
     // alc.card.write_samples(card_id, samples) -> { path, count }
@@ -526,7 +546,7 @@ pub(super) fn register_card(
             let rows = store_rs
                 .read_samples(&card_id, q)
                 .map_err(LuaError::external)?;
-            lua.to_value(&serde_json::Value::Array(rows))
+            to_lua_value(lua, &serde_json::Value::Array(rows))
         })?;
 
     // alc.card.sink_backfill({ sink, dry_run }) -> report
@@ -540,7 +560,7 @@ pub(super) fn register_card(
         let report = store_sb
             .card_sink_backfill(&sink, dry_run.unwrap_or(false))
             .map_err(LuaError::external)?;
-        lua.to_value(&report)
+        to_lua_value(lua, &report)
     })?;
 
     // alc.card.lineage(query) -> { root, nodes, edges, truncated }
@@ -570,7 +590,7 @@ pub(super) fn register_card(
             relation_filter,
         };
         match store_lin.lineage(q).map_err(LuaError::external)? {
-            Some(res) => lua.to_value(&card::lineage_to_json(&res)),
+            Some(res) => to_lua_value(lua, &card::lineage_to_json(&res)),
             None => Ok(LuaValue::Nil),
         }
     })?;
@@ -623,7 +643,7 @@ pub(super) fn register_stats(
     // alc.stats.get(key)
     let cm_get = custom_metrics;
     let get = lua.create_function(move |lua, key: String| match cm_get.get(&key) {
-        Some(v) => lua.to_value(&v),
+        Some(v) => to_lua_value(lua, &v),
         None => Ok(LuaValue::Nil),
     })?;
 
@@ -891,6 +911,52 @@ mod tests {
             .eval()
             .unwrap();
         assert!(result.is_nil());
+    }
+
+    /// Sibling regression for the `to_lua_value` helper sweep (issue ff6372af):
+    /// when state stores a value containing a JSON null field, retrieval must
+    /// surface that field as Lua nil (not the mlua lightuserdata sentinel) so
+    /// that `if v.x then ...` truthy checks behave correctly. Verifies the
+    /// helper's null-handling contract via the `alc.state.get` call path,
+    /// representative of the other accessors that funnel through the same
+    /// helper (`alc.card.*`, `alc.stats.*`, etc.).
+    #[test]
+    fn state_get_object_with_null_field_yields_lua_nil() {
+        let ns = "_test_bridge_state_null_field";
+
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        crate::bridge::register(&lua, &t, test_config_with_ns(ns)).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Set state to an object containing a null field via JSON decode round-trip.
+        lua.load(r#"alc.state.set("obj", alc.json_decode('{"x": null, "y": 1}'))"#)
+            .exec()
+            .unwrap();
+
+        // Retrieved object's `x` field must be Lua nil (not lightuserdata sentinel).
+        let x_truthy: bool = lua
+            .load(r#"local v = alc.state.get("obj"); return v.x ~= nil"#)
+            .eval()
+            .unwrap();
+        assert!(
+            !x_truthy,
+            "state.get returned object's null field must be Lua nil (truthy check must skip)"
+        );
+
+        // type() of the null field must be "nil", not "userdata" (sentinel).
+        let x_type: String = lua
+            .load(r#"local v = alc.state.get("obj"); return type(v.x)"#)
+            .eval()
+            .unwrap();
+        assert_eq!(
+            x_type, "nil",
+            "type() of state.get'd null field must be 'nil', not 'userdata'"
+        );
+
+        // Sibling field `y` should still surface as the original value.
+        let y: i64 = lua.load(r#"return alc.state.get("obj").y"#).eval().unwrap();
+        assert_eq!(y, 1, "Non-null sibling field must round-trip unchanged");
     }
 
     #[test]

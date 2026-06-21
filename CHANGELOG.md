@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+## [0.44.4] - 2026-06-21
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- `bridge::data` sentinel sweep: all 15 sibling `lua.to_value(&...)` callsites within `crates/algocline-engine/src/bridge/data.rs` (`alc.state.*`, `alc.card.*`, `alc.stats.*`, `alc.alias.*`, etc.) are now funneled through a new internal `to_lua_value` helper that disables `serialize_none_to_null` / `serialize_unit_to_null`. Previously these callsites used mlua's default `to_value`, which surfaces `serde_json::Value::Null` (and `Option::None`-shaped values inside typed structs) as a lightuserdata sentinel — the same root cause that v0.44.3 fixed for `alc.json_decode`. Downstream `if v.x then ...` truthy checks on nullable fields retrieved via `alc.state.get` etc. now skip the branch as expected. `alc.json_decode` is also re-routed through the same helper for a single SoT. Resolves issue ff6372af (sibling of db041966).
+
+### Security
+
+### Internal
+
 ## [0.44.3] - 2026-06-21
 
 ### Added

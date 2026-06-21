@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+## [0.44.3] - 2026-06-21
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- `alc.json_decode`: JSON `null` now decodes to Lua `nil` instead of an mlua lightuserdata sentinel. Previously `if obj.x then ...` truthy checks would proceed for nullable fields and downstream operations (e.g. `io.open(value)`) would crash when receiving the sentinel. Array elements decoded from `null` are now nil at that index; `#arr` is preserved at the original JSON length (mlua/Lua 5.4 array part semantics). Consumers iterating with `for i = 1, #arr do ... if arr[i] then` remain safe; `ipairs()` stops at the first nil hole as per standard Lua semantics. Aligns implementation with the existing `bridge_test.lua` API contract (`alc.json_decode("null") == nil`). Resolves issue db041966.
+
+### Security
+
+### Internal
+
 ## [0.44.2] - 2026-06-14
 
 ### Added

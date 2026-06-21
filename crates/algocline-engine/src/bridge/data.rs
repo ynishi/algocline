@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use algocline_core::{CustomMetricsHandle, LogEntry, LogSink, StatsHandle};
 use mlua::prelude::*;
-use mlua::LuaSerdeExt;
+use mlua::{LuaSerdeExt, SerializeOptions};
 
 use crate::card::{self, FileCardStore};
 use crate::state::{JsonFileStore, StateStore};
@@ -15,9 +15,17 @@ pub(super) fn register_json(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
         serde_json::to_string(&json).map_err(LuaError::external)
     })?;
 
-    let decode = lua.create_function(|lua, s: String| {
+    // JSON null must surface as Lua nil (not the mlua default lightuserdata
+    // sentinel) so that downstream `if value then ...` truthy checks behave as
+    // expected. mlua's default `to_value` serializes `serde_json::Value::Null`
+    // via `serialize_none_to_null` / `serialize_unit_to_null` into a
+    // lightuserdata sentinel; disabling both produces `LuaValue::Nil` instead.
+    let decode_options = SerializeOptions::new()
+        .serialize_none_to_null(false)
+        .serialize_unit_to_null(false);
+    let decode = lua.create_function(move |lua, s: String| {
         let value: serde_json::Value = serde_json::from_str(&s).map_err(LuaError::external)?;
-        lua.to_value(&value)
+        lua.to_value_with(&value, decode_options)
     })?;
 
     alc_table.set("json_encode", encode)?;
@@ -773,6 +781,85 @@ mod tests {
         assert_eq!(parsed["a"], 1);
         assert_eq!(parsed["b"], "two");
         assert_eq!(parsed["c"], true);
+    }
+
+    /// Regression: JSON `null` must decode to Lua `nil` (not an mlua
+    /// lightuserdata sentinel that bypasses `if value then ...` truthy checks).
+    /// Covers top-level null, nullable object fields, and array elements.
+    /// See issue db041966.
+    #[test]
+    fn json_decode_null_yields_lua_nil() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        crate::bridge::register(&lua, &t, test_config()).unwrap();
+        lua.globals().set("alc", t).unwrap();
+
+        // Top-level null: must be Lua nil so `if v then ...` skips the branch.
+        let top_level_truthy: bool = lua
+            .load(r#"local v = alc.json_decode("null"); return v ~= nil"#)
+            .eval()
+            .unwrap();
+        assert!(
+            !top_level_truthy,
+            "alc.json_decode(\"null\") should return Lua nil"
+        );
+
+        // Object field null: `obj.x` must be nil; `if obj.x then ...` skips.
+        let field_truthy: bool = lua
+            .load(
+                r#"
+                local obj = alc.json_decode('{"x": null, "y": 1}')
+                return obj.x ~= nil
+            "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(
+            !field_truthy,
+            "Object field decoded from JSON null should be Lua nil"
+        );
+
+        // Object field null: type must be "nil", not "userdata" (sentinel).
+        let field_type: String = lua
+            .load(r#"return type(alc.json_decode('{"x": null}').x)"#)
+            .eval()
+            .unwrap();
+        assert_eq!(
+            field_type, "nil",
+            "type() of null-decoded field must be 'nil', not 'userdata'"
+        );
+
+        // Array element null: observe how the table is shaped. Document the
+        // resulting `#arr` length so consumers can rely on a stable contract.
+        let arr_len: i64 = lua
+            .load(r#"return #alc.json_decode('[1, null, 3]')"#)
+            .eval()
+            .unwrap();
+        // mlua/Lua 5.4 length: nil holes inside the array part do not
+        // truncate `#arr`; it returns the original JSON array length (3 for
+        // `[1, null, 3]`). Indexed access still yields nil at the hole.
+        // Consumers iterating with `for i = 1, #arr do ... if arr[i] then` are
+        // safe; `ipairs()` will stop at the first nil. Document the contract
+        // here so downstream packages can rely on it.
+        assert_eq!(
+            arr_len, 3,
+            "JSON array length is preserved across null elements (mlua/Lua 5.4 array part)"
+        );
+
+        // Array element null: explicit indexed access surfaces nil for the
+        // hole and the original values at the surrounding indices.
+        let (a, b, c): (Option<i64>, Option<i64>, Option<i64>) = lua
+            .load(
+                r#"
+                local arr = alc.json_decode('[1, null, 3]')
+                return arr[1], arr[2], arr[3]
+            "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(a, Some(1));
+        assert_eq!(b, None, "Array element decoded from JSON null must be nil");
+        assert_eq!(c, Some(3));
     }
 
     #[test]

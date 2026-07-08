@@ -1,0 +1,12 @@
+{
+  "name": "alc-maint",
+  "version": "0.1.0",
+  "description": "algocline core maintenance set (bundled-sync agent + maint-wake skill). For maintainers working inside the algocline repository checkout — not needed by algocline users.",
+  "author": {
+    "name": "Yutaka Nishimura"
+  },
+  "homepage": "https://github.com/ynishi/algocline",
+  "repository": "https://github.com/ynishi/algocline",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["algocline", "maintenance", "release", "bundled-packages"]
+}

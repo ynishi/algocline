@@ -130,6 +130,11 @@ The plugin bundles:
 
 See [`plugins/alc/README.md`](plugins/alc/README.md) for details.
 
+A second plugin, `alc-maint`, carries maintainer-only tooling (bundled source
+tag sync, maintenance session primer) for working on the algocline repository
+itself — algocline users do not need it. See
+[`plugins/alc-maint/README.md`](plugins/alc-maint/README.md).
+
 ### 4. Use
 
 Call algocline tools from your MCP host. The host LLM calls these tools on your behalf:

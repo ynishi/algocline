@@ -14,6 +14,16 @@
       "homepage": "https://github.com/ynishi/algocline",
       "repository": "https://github.com/ynishi/algocline",
       "keywords": ["algocline", "lua", "llm", "agents", "package-development"]
+    },
+    {
+      "name": "alc-maint",
+      "source": "./plugins/alc-maint",
+      "description": "algocline core maintenance set (bundled-sync agent + maint-wake skill). Maintainer-only — for working on the algocline repository itself.",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "homepage": "https://github.com/ynishi/algocline",
+      "repository": "https://github.com/ynishi/algocline",
+      "keywords": ["algocline", "maintenance", "release", "bundled-packages"]
     }
   ]
 }

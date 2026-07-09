@@ -243,6 +243,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "r", None);
@@ -275,6 +276,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "r", None);
@@ -303,6 +305,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "reply", None);
@@ -330,6 +333,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "r", None);
@@ -374,6 +378,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&q);
 

@@ -267,6 +267,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }
     }
 
@@ -508,6 +509,7 @@ mod proptests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }
     }
 

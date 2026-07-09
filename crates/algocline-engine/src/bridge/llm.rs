@@ -11,6 +11,7 @@ use crate::llm_bridge::{LlmRequest, QueryRequest};
 /// Lua usage:
 ///   local response = alc.llm("What is 2+2?")
 ///   local response = alc.llm("Explain X", { system = "You are an expert.", max_tokens = 500 })
+///   local response = alc.llm(prompt, { cache_breakpoint = "context" })
 pub(super) fn register_llm(
     lua: &Lua,
     alc_table: &LuaTable,
@@ -35,6 +36,9 @@ pub(super) fn register_llm(
                 .as_ref()
                 .and_then(|o| o.get::<bool>("underspecified").ok())
                 .unwrap_or(false);
+            let cache_breakpoint = opts
+                .as_ref()
+                .and_then(|o| o.get::<String>("cache_breakpoint").ok());
 
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
@@ -46,6 +50,7 @@ pub(super) fn register_llm(
                     max_tokens,
                     grounded,
                     underspecified,
+                    cache_breakpoint,
                     resp_tx,
                 }],
             })
@@ -106,6 +111,16 @@ pub(super) fn register_llm_batch(
                 let max_tokens: u32 = item.get::<u32>("max_tokens").unwrap_or(1024);
                 let grounded: bool = item.get::<bool>("grounded").unwrap_or(false);
                 let underspecified: bool = item.get::<bool>("underspecified").unwrap_or(false);
+                let cache_breakpoint: Option<String> = item
+                    .get::<LuaValue>("cache_breakpoint")
+                    .ok()
+                    .and_then(|v| {
+                        if let LuaValue::String(s) = v {
+                            Some(s.to_str().ok()?.to_string())
+                        } else {
+                            None
+                        }
+                    });
 
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                 resp_rxs.push(resp_rx);
@@ -117,6 +132,7 @@ pub(super) fn register_llm_batch(
                     max_tokens,
                     grounded,
                     underspecified,
+                    cache_breakpoint,
                     resp_tx,
                 });
             }

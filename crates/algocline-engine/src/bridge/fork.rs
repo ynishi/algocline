@@ -42,6 +42,7 @@ struct ForkQuery {
     max_tokens: u32,
     grounded: bool,
     underspecified: bool,
+    cache_breakpoint: Option<String>,
     child_resp_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
 
@@ -243,6 +244,7 @@ pub(crate) fn register_fork(
                                             max_tokens: qr.max_tokens,
                                             grounded: qr.grounded,
                                             underspecified: qr.underspecified,
+                                            cache_breakpoint: qr.cache_breakpoint,
                                             child_resp_tx: qr.resp_tx,
                                         }
                                     }).collect();
@@ -310,6 +312,7 @@ pub(crate) fn register_fork(
                                         max_tokens: fq.max_tokens,
                                         grounded: fq.grounded,
                                         underspecified: fq.underspecified,
+                                        cache_breakpoint: fq.cache_breakpoint,
                                         resp_tx: parent_resp_tx,
                                     });
                                 }

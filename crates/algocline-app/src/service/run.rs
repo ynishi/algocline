@@ -745,6 +745,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         metrics
     }

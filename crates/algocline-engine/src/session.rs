@@ -75,6 +75,9 @@ impl FeedResult {
                     if q.underspecified {
                         obj["underspecified"] = json!(true);
                     }
+                    if let Some(cb) = &q.cache_breakpoint {
+                        obj["cache_breakpoint"] = json!(cb);
+                    }
                     obj
                 } else {
                     let qs: Vec<_> = queries
@@ -91,6 +94,9 @@ impl FeedResult {
                             }
                             if q.underspecified {
                                 obj["underspecified"] = json!(true);
+                            }
+                            if let Some(cb) = &q.cache_breakpoint {
+                                obj["cache_breakpoint"] = json!(cb);
                             }
                             obj
                         })
@@ -147,6 +153,8 @@ pub struct PendingFilter {
     #[serde(default)]
     pub underspecified: bool,
     #[serde(default)]
+    pub cache_breakpoint: bool,
+    #[serde(default)]
     pub prompt: PromptProjection,
 }
 
@@ -201,6 +209,7 @@ impl PendingFilter {
             system: true,
             grounded: true,
             underspecified: true,
+            cache_breakpoint: true,
             prompt: PromptProjection::Full,
         }
     }
@@ -255,6 +264,15 @@ fn project_query(q: &LlmQuery, f: &PendingFilter) -> serde_json::Value {
     }
     if f.underspecified {
         obj.insert("underspecified".into(), q.underspecified.into());
+    }
+    if f.cache_breakpoint {
+        obj.insert(
+            "cache_breakpoint".into(),
+            match &q.cache_breakpoint {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            },
+        );
     }
     match &f.prompt {
         PromptProjection::Off => {}
@@ -372,6 +390,7 @@ impl Session {
                     max_tokens: qr.max_tokens,
                     grounded: qr.grounded,
                     underspecified: qr.underspecified,
+                    cache_breakpoint: qr.cache_breakpoint.clone(),
                 }).collect();
 
                 for qr in req.queries {
@@ -809,6 +828,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }
     }
 
@@ -831,6 +851,7 @@ mod tests {
             max_tokens: 50,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -865,6 +886,7 @@ mod tests {
             max_tokens: 200,
             grounded: true,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -887,6 +909,7 @@ mod tests {
             max_tokens: 200,
             grounded: false,
             underspecified: true,
+            cache_breakpoint: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -913,6 +936,7 @@ mod tests {
             max_tokens: 100,
             grounded: true,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let normal_query = LlmQuery {
             id: QueryId::batch(1),
@@ -921,6 +945,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let result = FeedResult::Paused {
             queries: vec![grounded_query, normal_query],
@@ -939,6 +964,95 @@ mod tests {
     }
 
     #[test]
+    fn to_json_paused_single_query_cache_breakpoint() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "cached user turn".into(),
+            system: Some("shared system prompt".into()),
+            max_tokens: 512,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: Some("context".into()),
+        };
+        let result = FeedResult::Paused {
+            queries: vec![query],
+        };
+        let json = result.to_json("s-cache");
+
+        assert_eq!(json["status"], "needs_response");
+        assert_eq!(
+            json["cache_breakpoint"], "context",
+            "cache_breakpoint must appear verbatim in single-query MCP JSON"
+        );
+        assert!(
+            json.get("grounded").is_none(),
+            "grounded must be absent when false"
+        );
+        assert!(
+            json.get("underspecified").is_none(),
+            "underspecified must be absent when false"
+        );
+    }
+
+    #[test]
+    fn to_json_paused_single_query_no_cache_breakpoint_absent() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "uncached".into(),
+            system: None,
+            max_tokens: 128,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![query],
+        };
+        let json = result.to_json("s-nocache");
+
+        assert!(
+            json.get("cache_breakpoint").is_none(),
+            "cache_breakpoint key must be absent when None"
+        );
+    }
+
+    #[test]
+    fn to_json_paused_multiple_queries_mixed_cache_breakpoint() {
+        let cached_query = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "cached".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: Some("prompt".into()),
+        };
+        let normal_query = LlmQuery {
+            id: QueryId::batch(1),
+            prompt: "uncached".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![cached_query, normal_query],
+        };
+        let json = result.to_json("s-batch-cache");
+
+        let qs = json["queries"].as_array().expect("queries should be array");
+        assert_eq!(
+            qs[0]["cache_breakpoint"], "prompt",
+            "cached query must forward cache_breakpoint verbatim"
+        );
+        assert!(
+            qs[1].get("cache_breakpoint").is_none(),
+            "uncached query must omit cache_breakpoint key"
+        );
+    }
+
+    #[test]
     fn to_json_paused_multiple_queries_mixed_underspecified() {
         let underspec_query = LlmQuery {
             id: QueryId::batch(0),
@@ -947,6 +1061,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: true,
+            cache_breakpoint: None,
         };
         let normal_query = LlmQuery {
             id: QueryId::batch(1),
@@ -955,6 +1070,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let result = FeedResult::Paused {
             queries: vec![underspec_query, normal_query],
@@ -981,6 +1097,7 @@ mod tests {
             max_tokens: 1024,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -1231,6 +1348,7 @@ mod tests {
             max_tokens: 100,
             grounded: true,
             underspecified: true,
+            cache_breakpoint: None,
         };
         let v = project_query(&q, &PendingFilter::preset_full());
         assert_eq!(v["query_id"], "q-0");
@@ -1251,6 +1369,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let v = project_query(&q, &PendingFilter::preset_preview_with(5));
         assert_eq!(v["prompt_preview"], "abcde");
@@ -1270,6 +1389,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let v = project_query(&q, &PendingFilter::preset_preview_with(3));
         let preview = v["prompt_preview"].as_str().expect("str");
@@ -1286,6 +1406,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let v = project_query(&q, &PendingFilter::preset_preview_with(100));
         assert_eq!(v["prompt_preview"], "abc");
@@ -1300,6 +1421,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let filter = PendingFilter {
             system: true,

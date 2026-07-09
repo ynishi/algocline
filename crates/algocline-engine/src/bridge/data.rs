@@ -1156,6 +1156,7 @@ mod tests {
             max_tokens: 0,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
 
         // Lua side now sees the increment.
@@ -1174,6 +1175,7 @@ mod tests {
                 max_tokens: 0,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             },
             LlmQuery {
                 id: QueryId::parse("q-2"),
@@ -1182,6 +1184,7 @@ mod tests {
                 max_tokens: 0,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             },
         ]);
 

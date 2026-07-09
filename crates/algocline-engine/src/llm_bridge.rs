@@ -26,6 +26,9 @@ pub struct QueryRequest {
     /// When true, the prompt's preconditions depend on intent/goal definitions
     /// outside the current context that the LLM cannot infer.
     pub underspecified: bool,
+    /// Optional opaque prompt-cache breakpoint hint forwarded to the host
+    /// via paused-session JSON. See `algocline_core::LlmQuery::cache_breakpoint`.
+    pub cache_breakpoint: Option<String>,
     /// Channel to send the response back to the yielded Lua coroutine.
     pub resp_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
 }

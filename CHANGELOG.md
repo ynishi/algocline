@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.llm(prompt, { cache_breakpoint = "..." })` and `alc.llm_batch({ { prompt = ..., cache_breakpoint = "..." } })` accept an optional opaque `cache_breakpoint` hint string. The engine forwards it verbatim on the paused-session JSON as the top-level `cache_breakpoint` field (single-query) or as a per-query `cache_breakpoint` field inside `queries[]` (batch). Absent when not set. The MCP host is responsible for mapping it to the provider-specific prompt-cache API (e.g. Anthropic `cache_control` blocks). Hosts that do not implement prompt caching MUST ignore the field. `LlmQuery::cache_breakpoint` in `algocline-core` is `Option<String>` with `skip_serializing_if = "Option::is_none"` so JSON shape stays additive. `PendingFilter::cache_breakpoint` (bool) controls projection into `Snapshot::pending`; enabled by `PendingFilter::preset_full()`.
+
 ### Changed
 
 - Bump bundled source algocline-bundled-packages v0.24.0 → v0.29.1

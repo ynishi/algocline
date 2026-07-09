@@ -643,6 +643,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
 
         observer.on_paused(&queries);
@@ -670,6 +671,7 @@ mod tests {
                 max_tokens: 100,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             },
             LlmQuery {
                 id: QueryId::batch(1),
@@ -678,6 +680,7 @@ mod tests {
                 max_tokens: 100,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             },
         ];
 
@@ -706,6 +709,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
 
         // Round 1
@@ -744,6 +748,7 @@ mod tests {
             max_tokens: 50,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
 
         observer.on_paused(&queries);
@@ -770,6 +775,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "r", None);
         observer.on_resumed();
@@ -792,6 +798,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer1", None);
         observer.on_resumed();
@@ -804,6 +811,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer2", None);
         observer.on_resumed();
@@ -835,6 +843,7 @@ mod tests {
                 max_tokens: 50,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             },
             LlmQuery {
                 id: QueryId::batch(1),
@@ -843,6 +852,7 @@ mod tests {
                 max_tokens: 50,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             },
         ];
 
@@ -920,6 +930,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
 
         observer.on_response_fed(&QueryId::single(), "response", None);
@@ -970,6 +981,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
 
         // Snapshot without completing the response — last entry has response=None
@@ -1004,6 +1016,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer", None);
 
@@ -1029,6 +1042,7 @@ mod tests {
             max_tokens: 50,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "world", None);
         observer.on_resumed();
@@ -1072,6 +1086,7 @@ mod tests {
                 max_tokens: 10,
                 grounded: false,
                 underspecified: false,
+                cache_breakpoint: None,
             }]);
             observer.on_response_fed(&QueryId::single(), &format!("resp-{i}"), None);
             observer.on_resumed();
@@ -1116,6 +1131,7 @@ mod tests {
             max_tokens: 50,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }]);
         observer.on_response_fed(&QueryId::single(), &"y".repeat(50), None);
         observer.on_resumed();
@@ -1162,6 +1178,7 @@ mod tests {
             max_tokens: 100,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&queries);
         observer.on_response_fed(
@@ -1206,6 +1223,7 @@ mod tests {
             max_tokens: 50,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&queries);
         // No host-supplied usage — token counts are estimated from character counts.

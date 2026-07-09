@@ -211,6 +211,7 @@ mod tests {
             max_tokens: 50,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
         observer.on_paused(&queries);
         observer.on_response_fed(&QueryId::single(), "4", None); // 1 ASCII → ceil(1/4) = 1
@@ -239,6 +240,7 @@ mod tests {
             max_tokens: 10,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         }];
 
         // 3 rounds

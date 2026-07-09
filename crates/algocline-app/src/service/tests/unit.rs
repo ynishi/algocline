@@ -244,6 +244,7 @@ fn write_transcript_log_creates_meta_file() {
         max_tokens: 100,
         grounded: false,
         underspecified: false,
+        cache_breakpoint: None,
     }]);
     observer.on_response_fed(&algocline_core::QueryId::single(), "4", None);
     observer.on_resumed();
@@ -298,6 +299,7 @@ fn write_transcript_log_strategy_none() {
         max_tokens: 100,
         grounded: false,
         underspecified: false,
+        cache_breakpoint: None,
     }]);
     observer.on_response_fed(&algocline_core::QueryId::single(), "world", None);
     observer.on_resumed();
@@ -390,6 +392,7 @@ fn write_transcript_log_disabled_is_noop() {
         max_tokens: 10,
         grounded: false,
         underspecified: false,
+        cache_breakpoint: None,
     }]);
     observer.on_response_fed(&algocline_core::QueryId::single(), "r", None);
     observer.on_resumed();
@@ -474,6 +477,7 @@ fn write_transcript_log_truncates_long_prompt() {
         max_tokens: 10,
         grounded: false,
         underspecified: false,
+        cache_breakpoint: None,
     }]);
     observer.on_response_fed(&algocline_core::QueryId::single(), "r", None);
     observer.on_resumed();
@@ -1092,6 +1096,7 @@ fn write_transcript_log_noop_when_log_dir_none() {
         max_tokens: 10,
         grounded: false,
         underspecified: false,
+        cache_breakpoint: None,
     }]);
     observer.on_response_fed(&algocline_core::QueryId::single(), "r", None);
     observer.on_resumed();

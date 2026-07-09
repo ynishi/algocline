@@ -66,6 +66,7 @@ Call the Host LLM. The Lua coroutine yields until the host responds.
 | `opts.max_tokens` | integer | no | Max tokens (default: 1024) |
 | `opts.grounded` | boolean | no | Request grounded response (default: false) |
 | `opts.underspecified` | boolean | no | Signal underspecified prompt (default: false) |
+| `opts.cache_breakpoint` | string | no | Opaque prompt-cache hint forwarded to the host (e.g. `"context"` / `"prompt"`). Host is responsible for mapping to provider-specific cache API (Anthropic `cache_control` etc.). Hosts without prompt-cache support ignore the field. |
 
 **Returns:** string (LLM response)
 
@@ -75,6 +76,16 @@ local response = alc.llm("Explain X", {
     system = "You are an expert.",
     max_tokens = 500,
 })
+
+-- Prompt cache hint: repeated calls with the same system prompt benefit
+-- from Anthropic prompt cache (5-min TTL). The engine is opaque about the
+-- value; the host does the mapping.
+for i = 1, 5 do
+    alc.llm(prompts[i], {
+        system = shared_system_prompt,
+        cache_breakpoint = "context",
+    })
+end
 ```
 
 #### `alc.llm_batch(items) -> string[]`
@@ -91,6 +102,7 @@ Send multiple LLM calls as a single batch. All queries are dispatched concurrent
 | `items[i].max_tokens` | integer | no | Max tokens (default: 1024) |
 | `items[i].grounded` | boolean | no | Request grounded response |
 | `items[i].underspecified` | boolean | no | Signal underspecified prompt |
+| `items[i].cache_breakpoint` | string | no | Opaque prompt-cache hint (see `alc.llm`) |
 
 **Returns:** string[] (responses in same order as input)
 

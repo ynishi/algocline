@@ -58,6 +58,21 @@ pub struct LlmQuery {
     /// delegated agent, etc.).
     #[serde(default, skip_serializing_if = "is_false")]
     pub underspecified: bool,
+    /// Optional opaque hint to the host on where to place a prompt-cache
+    /// boundary (e.g. Anthropic `cache_control` block). The engine does not
+    /// interpret the value — it forwards it verbatim on the paused-session
+    /// JSON so the host can map it to the provider-specific cache API.
+    ///
+    /// Recommended values (host-defined; engine is opaque):
+    /// - `"context"` — cache everything up to and including the system prompt
+    ///   / long shared context so that repeated calls (panel / moa / ucb) hit
+    ///   the cache
+    /// - `"prompt"` — cache the full prompt including user turn
+    ///
+    /// Absent when not set; hosts that do not implement prompt caching MUST
+    /// ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_breakpoint: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -134,6 +149,7 @@ mod tests {
             max_tokens: 1024,
             grounded: false,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert!(
@@ -144,6 +160,10 @@ mod tests {
             json.get("underspecified").is_none(),
             "underspecified key must be absent when false (skip_serializing_if)"
         );
+        assert!(
+            json.get("cache_breakpoint").is_none(),
+            "cache_breakpoint key must be absent when None (skip_serializing_if)"
+        );
         let restored: LlmQuery = serde_json::from_value(json).unwrap();
         assert_eq!(restored.id, query.id);
         assert_eq!(restored.prompt, query.prompt);
@@ -151,6 +171,7 @@ mod tests {
         assert_eq!(restored.max_tokens, query.max_tokens);
         assert!(!restored.grounded);
         assert!(!restored.underspecified);
+        assert!(restored.cache_breakpoint.is_none());
     }
 
     #[test]
@@ -162,6 +183,7 @@ mod tests {
             max_tokens: 200,
             grounded: true,
             underspecified: false,
+            cache_breakpoint: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(
@@ -189,6 +211,10 @@ mod tests {
             !query.underspecified,
             "underspecified must default to false when key absent"
         );
+        assert!(
+            query.cache_breakpoint.is_none(),
+            "cache_breakpoint must default to None when key absent"
+        );
     }
 
     #[test]
@@ -200,6 +226,7 @@ mod tests {
             max_tokens: 200,
             grounded: false,
             underspecified: true,
+            cache_breakpoint: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(
@@ -224,6 +251,7 @@ mod tests {
             max_tokens: 300,
             grounded: true,
             underspecified: true,
+            cache_breakpoint: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(json["grounded"], true);
@@ -231,6 +259,30 @@ mod tests {
         let restored: LlmQuery = serde_json::from_value(json).unwrap();
         assert!(restored.grounded);
         assert!(restored.underspecified);
+    }
+
+    #[test]
+    fn llm_query_cache_breakpoint_serde() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "cached prompt".into(),
+            system: Some("shared system".into()),
+            max_tokens: 512,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: Some("context".into()),
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(
+            json["cache_breakpoint"], "context",
+            "cache_breakpoint must be forwarded verbatim when set"
+        );
+        assert!(
+            json.get("grounded").is_none(),
+            "grounded must be absent when false"
+        );
+        let restored: LlmQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.cache_breakpoint.as_deref(), Some("context"));
     }
 }
 

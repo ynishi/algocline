@@ -37,6 +37,18 @@ commit, publish) stays on the main thread with the maintainer's go sign.
   untagged sources pinned to each repo's default branch, used by the MCP
   `pkg_install` auto-resolution path. Not touched during a bundled bump.
 
+### Collection layout is a load-bearing assumption
+
+`BUNDLED_SOURCES` consumes the **Collection layout**: the repo root at the
+tag must contain at least one top-level `<pkg>/init.lua`. An upstream tag
+that reads "additive" in its CHANGELOG summary can still remove that layout
+(e.g. moving all bundled packages out to a downstream repo). When that
+happens, `alc update` fails with `No packages found in <tmp>. Expected
+subdirectories with init.lua.`, and the bump has to be reverted.
+`@alc-bundled-sync` gates `mode: apply` on a `git ls-tree` check per
+drifted source; when in doubt, dispatch `detect` first and inspect the
+Layout row of the Notes section before authorising `apply`.
+
 ### Reflection SOP (what makes an edit take effect)
 
 - **Rust code** (including `src/init.rs` tag bumps): `cargo install --path .`

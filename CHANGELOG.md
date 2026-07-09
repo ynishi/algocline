@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bump bundled source algocline-bundled-packages v0.24.0 → v0.29.1
+
 ### Deprecated
 
 ### Removed

@@ -8197,3 +8197,63 @@ async fn test_alc_state_delete_unsafe_segment() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_trace_query / alc_trace_diff ────────────────────────────
+//
+// The MCP server binds to the caller's `~/.algocline/` root, so we
+// cannot cheaply seed a Card store with a `.trace` sample from these
+// tests without contaminating the user's home dir. The e2e coverage
+// here proves the wire path (params → tool → JSON) and the typed
+// error surface; the query/diff semantics themselves are exercised
+// by the unit tests in `crates/algocline-app/src/service/trace.rs`.
+
+#[tokio::test]
+async fn test_alc_trace_query_wire_shape() {
+    let client = connect().await;
+
+    // Query with a bogus pkg filter that will not match anything;
+    // proves the params → tool → JSON round-trip and Array response
+    // shape without seeding real trace data.
+    let resp = call_json(
+        &client,
+        "alc_trace_query",
+        json!({"pkg": "__does_not_exist__", "limit": 1}),
+    )
+    .await;
+
+    assert!(
+        resp.is_array(),
+        "alc_trace_query must return a JSON array, got: {resp}"
+    );
+    assert_eq!(
+        resp.as_array().map(|v| v.len()),
+        Some(0),
+        "unknown pkg filter must return an empty array"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+#[tokio::test]
+async fn test_alc_trace_diff_missing_card_typed_error() {
+    let client = connect().await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_trace_diff",
+            json!({
+                "a_card_id": "__missing_card_a__",
+                "b_card_id": "__missing_card_b__",
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("__missing_card_a__") || text.contains("not found"),
+        "expected typed error mentioning the missing card, got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

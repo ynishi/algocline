@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `alc.llm(prompt, { cache_breakpoint = "..." })` and `alc.llm_batch({ { prompt = ..., cache_breakpoint = "..." } })` accept an optional opaque `cache_breakpoint` hint string. The engine forwards it verbatim on the paused-session JSON as the top-level `cache_breakpoint` field (single-query) or as a per-query `cache_breakpoint` field inside `queries[]` (batch). Absent when not set. The MCP host is responsible for mapping it to the provider-specific prompt-cache API (e.g. Anthropic `cache_control` blocks). Hosts that do not implement prompt caching MUST ignore the field. `LlmQuery::cache_breakpoint` in `algocline-core` is `Option<String>` with `skip_serializing_if = "Option::is_none"` so JSON shape stays additive. `PendingFilter::cache_breakpoint` (bool) controls projection into `Snapshot::pending`; enabled by `PendingFilter::preset_full()`.
+- Two new MCP tools for `recipe_trace` observability:
+  - `alc_trace_query`: scan every Card sample sidecar for rows carrying a `.trace` object (produced by the bundled `recipe_trace` pkg via `M.card_row(...)`) and return matches. Filters: `pkg`, `min_calls` / `max_calls` (over `.trace.total_calls`), `min_ms` / `max_ms` (over `.trace.total_trace_ms`), `completed`; page with `offset` + `limit`. Rows without `.trace.total_calls` are silently skipped without consuming `offset` so paging is stable across mixed-trace Card stores. Response is a JSON array of `{ card_id, pkg, sample_index, trace: {total_calls, total_trace_ms, completed}, case? }`.
+  - `alc_trace_diff`: compare two individual trace rows. Params: `{a_card_id, a_sample_index?, b_card_id, b_sample_index?}` (missing indices default to 0). Response includes raw `a_trace` / `b_trace` triples plus a `delta` object with `calls_delta`, `ms_delta`, and `ms_per_call_delta` (all `b - a` semantics). Typed errors for missing card, out-of-range sample index, and rows without a `.trace` object.
+
+  Both tools are read-only and re-use the existing `FileCardStore` — no new persistence layer is introduced. `EngineApi::trace_query` and `trace_diff` are defined with default `Err(...)` impls so downstream `EngineApi` impls that do not care about traces continue to compile unchanged.
 
 ### Changed
 

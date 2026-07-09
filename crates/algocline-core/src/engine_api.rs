@@ -496,6 +496,54 @@ pub trait EngineApi: Send + Sync {
         Err("card_publish: not implemented by this EngineApi impl".into())
     }
 
+    // ─── Trace (recipe_trace observability) ──────────────────
+
+    /// Scan every Card sample sidecar for rows carrying a `.trace`
+    /// object (produced by the bundled `recipe_trace` pkg via
+    /// `M.card_row(result, case, opts)`) and return an array of hits
+    /// after filter + paging.
+    ///
+    /// Filters:
+    /// - `pkg`: restrict enumeration to one Card `pkg`
+    /// - `min_calls` / `max_calls`: inclusive bounds on `.trace.total_calls`
+    /// - `min_ms` / `max_ms`: inclusive bounds on `.trace.total_trace_ms`
+    /// - `completed`: match `.trace.completed` exactly
+    /// - `offset` / `limit`: page the post-filter stream
+    ///
+    /// Rows without a `.trace.total_calls` field are treated as
+    /// untraced and skipped (do not consume `offset`).
+    #[allow(clippy::too_many_arguments)]
+    async fn trace_query(
+        &self,
+        _pkg: Option<String>,
+        _min_calls: Option<u64>,
+        _max_calls: Option<u64>,
+        _min_ms: Option<f64>,
+        _max_ms: Option<f64>,
+        _completed: Option<bool>,
+        _offset: Option<usize>,
+        _limit: Option<usize>,
+    ) -> Result<String, String> {
+        Err("trace_query: not implemented by this EngineApi impl".into())
+    }
+
+    /// Return a compact delta report comparing two individual trace rows
+    /// (recipe_trace-produced Card samples).
+    ///
+    /// A missing `sample_index` defaults to `0`.  Response shape includes
+    /// both raw `a_trace` / `b_trace` triples and a `delta` object with
+    /// `calls_delta`, `ms_delta`, and `ms_per_call_delta` (`b - a`
+    /// semantics).
+    async fn trace_diff(
+        &self,
+        _a_card_id: &str,
+        _a_sample_index: Option<usize>,
+        _b_card_id: &str,
+        _b_sample_index: Option<usize>,
+    ) -> Result<String, String> {
+        Err("trace_diff: not implemented by this EngineApi impl".into())
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     /// Rebuild hub index from a packages directory.

@@ -705,6 +705,45 @@ pub struct CardSamplesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TraceQueryParams {
+    /// Restrict enumeration to a single Card `pkg`.
+    pub pkg: Option<String>,
+    /// Minimum inclusive number of traced LLM calls
+    /// (`.trace.total_calls >= min_calls`).
+    pub min_calls: Option<u64>,
+    /// Maximum inclusive number of traced LLM calls
+    /// (`.trace.total_calls <= max_calls`).
+    pub max_calls: Option<u64>,
+    /// Minimum inclusive total trace duration in ms
+    /// (`.trace.total_trace_ms >= min_ms`).
+    pub min_ms: Option<f64>,
+    /// Maximum inclusive total trace duration in ms
+    /// (`.trace.total_trace_ms <= max_ms`).
+    pub max_ms: Option<f64>,
+    /// When set, restricts rows to those whose `.trace.completed`
+    /// boolean matches. Omit to accept both completed and interrupted
+    /// traces.
+    pub completed: Option<bool>,
+    /// Skip this many matched rows (applied after filtering, before
+    /// `limit`). Default 0.
+    pub offset: Option<usize>,
+    /// Maximum number of rows to return. Omit for no upper bound.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TraceDiffParams {
+    /// Card id of side A.
+    pub a_card_id: String,
+    /// Sample index of side A. Defaults to 0.
+    pub a_sample_index: Option<usize>,
+    /// Card id of side B.
+    pub b_card_id: String,
+    /// Sample index of side B. Defaults to 0.
+    pub b_sample_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardLineageParams {
     /// Card ID to start the walk from.
     pub card_id: String,
@@ -1970,6 +2009,100 @@ impl AlcService {
             .await
     }
 
+    // ─── Trace (recipe_trace observability) ─────────────────────
+
+    /// Scan every Card sample sidecar for rows carrying a `.trace`
+    /// object (produced by the bundled `recipe_trace` pkg via its
+    /// `M.card_row(...)` helper) and return matching hits after
+    /// filter + paging.
+    ///
+    /// Response shape:
+    /// ```jsonc
+    /// [
+    ///   {
+    ///     "card_id":      "...",
+    ///     "pkg":          "...",
+    ///     "sample_index": <n>,
+    ///     "trace": {
+    ///       "total_calls":    <u64>,
+    ///       "total_trace_ms": <f64>,
+    ///       "completed":      <bool>
+    ///     },
+    ///     "case": <optional passthrough of the sample's `.case` value>
+    ///   },
+    ///   ...
+    /// ]
+    /// ```
+    ///
+    /// Rows without a `.trace.total_calls` field are treated as
+    /// untraced and skipped without consuming `offset`, so paging is
+    /// stable across a Card store that mixes traced and untraced
+    /// samples. Sister tool to `alc_trace_diff` for pairwise
+    /// comparison.
+    #[tool(
+        name = "alc_trace_query",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn trace_query(
+        &self,
+        Parameters(params): Parameters<TraceQueryParams>,
+    ) -> Result<String, String> {
+        self.app
+            .trace_query(
+                params.pkg,
+                params.min_calls,
+                params.max_calls,
+                params.min_ms,
+                params.max_ms,
+                params.completed,
+                params.offset,
+                params.limit,
+            )
+            .await
+    }
+
+    /// Return a compact delta report comparing two recipe_trace-produced
+    /// Card samples.
+    ///
+    /// A missing `sample_index` defaults to `0`. Response shape:
+    /// ```jsonc
+    /// {
+    ///   "a_ref":   { "card_id": "...", "sample_index": <n> },
+    ///   "b_ref":   { "card_id": "...", "sample_index": <n> },
+    ///   "a_trace": { "total_calls": ..., "total_trace_ms": ..., "completed": ... },
+    ///   "b_trace": { "total_calls": ..., "total_trace_ms": ..., "completed": ... },
+    ///   "delta": {
+    ///     "calls_delta":       <b.total_calls - a.total_calls>,
+    ///     "ms_delta":          <b.total_trace_ms - a.total_trace_ms>,
+    ///     "ms_per_call_delta": <b.avg - a.avg>,
+    ///     "completed_a":       <bool>,
+    ///     "completed_b":       <bool>
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Errors surface as typed strings:
+    /// - Card id not found → `"card '<id>' not found"`
+    /// - Sample index out of range → `"card '<id>' sample index <n> out of range (len=<len>)"`
+    /// - Row exists but has no `.trace` object → `"card '<id>' sample <n> has no trace"`
+    #[tool(
+        name = "alc_trace_diff",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn trace_diff(
+        &self,
+        Parameters(params): Parameters<TraceDiffParams>,
+    ) -> Result<String, String> {
+        self.app
+            .trace_diff(
+                &params.a_card_id,
+                params.a_sample_index,
+                &params.b_card_id,
+                params.b_sample_index,
+            )
+            .await
+    }
+
     // ─── Hub ────────────────────────────────────────────────────
 
     /// Show detailed information for a single package.
@@ -2558,6 +2691,9 @@ impl ServerHandler for AlcService {
                  - alc_card_publish: Publish a Card to a hub repository — runs git add → commit → push to target_repo, then calls alc_hub_reindex. Requires gh auth login or SSH key configured on the host; missing credentials return a typed error with guidance. Push success is independent from reindex outcome (reindex failures do not roll back the push).\n\
                  - alc_card_sink_backfill: Backfill one subscriber (ALC_CARD_SINKS URI) with every Card already in the primary store. Drift-safe: existing Cards on the sink are skipped, never overwritten. Supports dry_run.\n\
                  - alc_card_analyze: Run a Card analyzer pkg over a single Card. Host loads the Card body + samples sidecar and dispatches them to `require(pkg).run(ctx)` (default pkg=`card_analysis`). Sister tool to `alc_advice`: advice runs a generic strategy over a free-form task; card_analyze runs an analyzer over a Card. Returns the pkg's `ctx.result` shape (typically `{ pattern, suggested_change, confidence }`).\n\n\
+                 Trace (recipe_trace observability):\n\
+                 - alc_trace_query: Scan every Card sample sidecar for rows carrying a `.trace` object (produced by the bundled `recipe_trace` pkg via `M.card_row(...)`). Filter by pkg / min_calls / max_calls / min_ms / max_ms / completed; page with offset + limit. Rows without `.trace.total_calls` are silently skipped without consuming offset.\n\
+                 - alc_trace_diff: Compare two traced Card samples side by side. Returns raw `a_trace` / `b_trace` triples plus a `delta` object with `calls_delta`, `ms_delta`, and `ms_per_call_delta` (all `b - a` semantics). Missing `sample_index` defaults to 0.\n\n\
                  Hub:\n\
                  - alc_hub_search: Search packages across remote Hub indices (auto-discovered from installed sources + collection URL) + local state. Shows installed/uninstalled packages with descriptions and categories. Use source URL with alc_pkg_install to install.\n\
                  - alc_hub_info: Show detailed information for a single package — metadata, all Cards, aliases, and stats (card count, eval count, best pass rate).\n\

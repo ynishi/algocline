@@ -35,6 +35,7 @@ mod scenario;
 pub(crate) mod session;
 pub(crate) mod source;
 mod status;
+mod trace;
 mod transcript;
 mod update;
 

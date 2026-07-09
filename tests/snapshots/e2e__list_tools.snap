@@ -58,6 +58,8 @@ expression: names
   "alc_state_show",
   "alc_stats",
   "alc_status",
+  "alc_trace_diff",
+  "alc_trace_query",
   "alc_update",
   "alc_v2_cancel",
   "alc_v2_resume",

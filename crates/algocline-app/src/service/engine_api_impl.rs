@@ -398,6 +398,42 @@ impl EngineApi for AppService {
         AppService::card_publish(self, card_id, target_repo, commit_message).await
     }
 
+    // ─── Trace (recipe_trace observability) ──────────────────
+
+    async fn trace_query(
+        &self,
+        pkg: Option<String>,
+        min_calls: Option<u64>,
+        max_calls: Option<u64>,
+        min_ms: Option<f64>,
+        max_ms: Option<f64>,
+        completed: Option<bool>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<String, String> {
+        AppService::trace_query(
+            self,
+            pkg.as_deref(),
+            min_calls,
+            max_calls,
+            min_ms,
+            max_ms,
+            completed,
+            offset,
+            limit,
+        )
+    }
+
+    async fn trace_diff(
+        &self,
+        a_card_id: &str,
+        a_sample_index: Option<usize>,
+        b_card_id: &str,
+        b_sample_index: Option<usize>,
+    ) -> Result<String, String> {
+        AppService::trace_diff(self, a_card_id, a_sample_index, b_card_id, b_sample_index)
+    }
+
     // ─── Hub ─────────────────────────────────────────────────
 
     async fn hub_reindex(

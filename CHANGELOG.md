@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Bump bundled source algocline-bundled-packages v0.24.0 → v0.29.1
+- Bump `fuzzy-parser` dependency 0.1 → 0.3 in `algocline-engine`. The `distance` module (`similarity`, `Algorithm::JaroWinkler`) used by `alc.match_enum` / `alc.match_bool` bridge functions is unchanged; v0.3 adds `extract` / `repair` / `import` modules that are not yet surfaced through the Lua bridge.
 
 ### Deprecated
 

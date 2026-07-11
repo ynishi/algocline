@@ -931,9 +931,9 @@ dependencies = [
 
 [[package]]
 name = "fuzzy-parser"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f76a3c3a1bfb60924fded82f72b5e71d375ffc48e9a2f4dc2ae226b89e4a8f89"
+checksum = "2682d0bdf477b862a4a8afe0f9c5007d3e656117a933d52ca1047b5ce59818bd"
 dependencies = [
  "serde",
  "serde_json",

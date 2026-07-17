@@ -18,6 +18,7 @@ use mlua::prelude::*;
 use tempfile::TempDir;
 
 mod data;
+mod evalframe;
 mod fork;
 mod fuzzy;
 mod llm;
@@ -70,6 +71,7 @@ pub struct BridgeConfig {
 }
 
 pub use data::register_env;
+pub use evalframe::register_evalframe;
 
 /// Register all Layer 0 runtime primitives onto the given table.
 pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaResult<()> {
@@ -183,6 +185,8 @@ pub fn install_for_pkg_test(lua: &Lua) -> LuaResult<()> {
     install_external_io_stub(lua, &alc_table, "fork")?;
 
     lua.globals().set("alc", alc_table)?;
+    evalframe::register_evalframe(lua)
+        .map_err(|e| LuaError::external(format!("install_for_pkg_test: register_evalframe: {e}")))?;
     lua.load(PRELUDE)
         .set_name("@alc_prelude")
         .exec()

@@ -242,6 +242,12 @@ impl Executor {
                 bridge::register(lua, &alc_table, bridge_config)?;
                 lua.globals().set("alc", alc_table)?;
 
+                // Register vendored evalframe (std shim + package.preload) so
+                // `require("evalframe")` from the prelude or user code succeeds
+                // without depending on ~/.algocline/packages/evalframe/.
+                bridge::register_evalframe(lua)
+                    .map_err(|e| IsleError::Lua(format!("register_evalframe failed: {e}")))?;
+
                 let ctx_value = lua.to_value(&lua_ctx)?;
                 lua.globals().set("ctx", ctx_value)?;
 
@@ -352,6 +358,10 @@ impl Executor {
                 bridge::register_env(lua, &alc_table, env_map)
                     .map_err(|e| IsleError::Lua(e.to_string()))?;
                 lua.globals().set("alc", alc_table)?;
+
+                // Register vendored evalframe (std shim + package.preload).
+                bridge::register_evalframe(lua)
+                    .map_err(|e| IsleError::Lua(format!("register_evalframe failed: {e}")))?;
 
                 let ctx_value = lua.to_value(&lua_ctx)?;
                 lua.globals().set("ctx", ctx_value)?;

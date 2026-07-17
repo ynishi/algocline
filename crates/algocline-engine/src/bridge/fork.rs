@@ -14,7 +14,7 @@ use mlua::LuaSerdeExt;
 use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use mlua_pkg::Registry;
 
-use super::{register, register_env, BridgeConfig, PRELUDE};
+use super::{register, register_env, register_evalframe, BridgeConfig, PRELUDE};
 use crate::card::FileCardStore;
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 use crate::resolver_factory::make_resolver;
@@ -188,6 +188,14 @@ pub(crate) fn register_fork(
                                     .map_err(|e| mlua_isle::IsleError::Lua(e.to_string()))?;
                             }
                             child_lua.globals().set("alc", alc_table)?;
+
+                            // Register vendored evalframe on the child VM so
+                            // `require("evalframe")` works after fork.
+                            register_evalframe(child_lua).map_err(|e| {
+                                mlua_isle::IsleError::Lua(format!(
+                                    "register_evalframe failed: {e}"
+                                ))
+                            })?;
 
                             let ctx_value = child_lua.to_value(&child_ctx)?;
                             child_lua.globals().set("ctx", ctx_value)?;

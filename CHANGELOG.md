@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Vendored evalframe v0.4.0 into `algocline-engine`, enabling `alc.eval(...)`
+  calls from user Lua code (via `alc_run`) without requiring
+  `~/.algocline/packages/evalframe/` to be installed. The vendored modules
+  are registered on `package.preload` at session VM init (including fork
+  children and the `alc_pkg_test` sandbox) alongside the `std` global shim
+  that evalframe expects. MCP `alc_eval` tool behavior is unchanged.
 - LLM-as-Judge graders are now reachable from `alc.eval` simple form via the
   grader names `llm_rubric`, `llm_yes_no`, and `llm_factuality`. Each name
   auto-wires the matching evalframe scorer (`linear_1_5` for rubric /

@@ -5860,6 +5860,42 @@ async fn test_alc_eval_llm_rubric_grader_pause_carries_role() {
     client.cancel().await.expect("cancel failed");
 }
 
+/// Vendored evalframe (issue ebb3b16a): Lua-side `alc.eval()` — invoked from
+/// user Lua source via `alc_run` — reaches the LLM-as-Judge grader without
+/// requiring `~/.algocline/packages/evalframe/` to be installed. Prior to
+/// vendoring, this path failed at `require("evalframe")` because the `std`
+/// global shim was only injected on the MCP `alc_eval` wrapper. This test
+/// verifies that the vendored `bridge::register_evalframe` covers the
+/// Lua-side entry point as well: the very first pause must be the judge
+/// call carrying `role = "grader"`.
+#[tokio::test]
+async fn test_alc_eval_llm_rubric_grader_pause_via_lua_side() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    write_echo_strategy(alc_home.path());
+    let client = connect_with_alc_home(alc_home.path()).await;
+    install_real_collection(&client).await;
+
+    let lua_code = r#"
+local scenario = {
+    cases = { { input = "2+2", expected = "4" } },
+    graders = { "llm_rubric" },
+}
+return alc.eval(scenario, "echo_strat")
+"#;
+
+    let resp = call_json(&client, "alc_run", json!({ "code": lua_code })).await;
+    assert_eq!(
+        resp["status"], "needs_response",
+        "Lua-side alc.eval with llm_rubric grader must pause for judge, got: {resp}"
+    );
+    assert_eq!(
+        resp["role"], "grader",
+        "Lua-side judge pause must carry role=grader, got: {resp}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Write a minimal runnable strategy package that echoes the input without
 /// calling the LLM. Used by the LLM-judge eval tests so the strategy path
 /// contributes no pauses (the only pause is the judge grader).

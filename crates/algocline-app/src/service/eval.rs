@@ -12,34 +12,6 @@ use super::resolve::{is_package_installed, resolve_scenario_code};
 use super::run::normalize_stringified_json_object;
 use super::AppService;
 
-/// Lua shim that bridges algocline's `alc.*` primitives to the `std` global
-/// expected by evalframe.std. Injected once before any evalframe code runs.
-const STD_SHIM: &str = r#"
-std = {
-  json = {
-    decode = alc.json_decode,
-    encode = alc.json_encode,
-  },
-  fs = {
-    read = function(path)
-      local f, err = io.open(path, "r")
-      if not f then error("std.fs.read: " .. (err or path), 2) end
-      local content = f:read("*a")
-      f:close()
-      return content
-    end,
-    is_file = function(path)
-      local f = io.open(path, "r")
-      if f then f:close(); return true end
-      return false
-    end,
-  },
-  time = {
-    now = alc.time,
-  },
-}
-"#;
-
 impl AppService {
     /// Run an evalframe evaluation suite via `alc.eval()`.
     ///
@@ -98,12 +70,12 @@ impl AppService {
         let auto_card_lua = if auto_card { "true" } else { "false" };
 
         // Delegate to alc.eval() in prelude.
-        // The shim injects `std` for evalframe, then the scenario code is
-        // evaluated into a table and passed to alc.eval() along with opts.
+        // The `std` global is injected by bridge::register_evalframe at session
+        // VM init (crates/algocline-engine/src/bridge/evalframe.rs), so the
+        // wrapped source only needs to evaluate the scenario table and hand it
+        // off to alc.eval().
         let wrapped = format!(
-            r#"{std_shim}
-
-local scenario = (function()
+            r#"local scenario = (function()
 {scenario_code}
 end)()
 
@@ -112,7 +84,6 @@ return alc.eval(scenario, "{strategy}", {{
   auto_card = {auto_card_lua},
 }})
 "#,
-            std_shim = STD_SHIM,
         );
 
         let ctx = serde_json::Value::Null;
@@ -207,9 +178,7 @@ return alc.eval(scenario, "{strategy}", {{
         // Build Lua snippet that uses evalframe's stats module
         // to compute welch_t from the persisted aggregated scores.
         let lua_code = format!(
-            r#"{std_shim}
-
-local stats = require("evalframe.eval.stats")
+            r#"local stats = require("evalframe.eval.stats")
 
 local result_a = alc.json_decode('{result_a_escaped}')
 local result_b = alc.json_decode('{result_b_escaped}')
@@ -300,7 +269,6 @@ return {{
             // or `\` can break out of the Lua string and inject arbitrary code.
             eval_id_a_escaped = escape_for_lua_sq(eval_id_a),
             eval_id_b_escaped = escape_for_lua_sq(eval_id_b),
-            std_shim = STD_SHIM,
             strategy_a_fallback =
                 escape_for_lua_sq(extract_strategy_from_id(eval_id_a).unwrap_or("A")),
             strategy_b_fallback =

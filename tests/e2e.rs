@@ -5896,6 +5896,91 @@ return alc.eval(scenario, "echo_strat")
     client.cancel().await.expect("cancel failed");
 }
 
+/// Per-case rubric override: when a case carries `rubric = "..."`, the
+/// llm_rubric grader must format the judge prompt with the case-level
+/// rubric text rather than the DEFAULT_RUBRIC. The rubric field is
+/// stashed into `case.context._alc_rubric` by `resolve_cases` so
+/// vendored evalframe stays verbatim, and the custom llm_rubric grader
+/// in prelude reads that stashed value at grade time.
+#[tokio::test]
+async fn test_alc_eval_per_case_rubric_override_appears_in_judge_prompt() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    write_echo_strategy(alc_home.path());
+    let client = connect_with_alc_home(alc_home.path()).await;
+    install_real_collection(&client).await;
+
+    let lua_code = r#"
+local scenario = {
+    graders = { "llm_rubric" },
+    cases = {
+        {
+            input = "capital of Japan?",
+            expected = "Tokyo",
+            rubric = "GRADE STRICTLY on geographic-answer precision only.",
+        },
+    },
+}
+return alc.eval(scenario, "echo_strat")
+"#;
+
+    let resp = call_json(&client, "alc_run", json!({ "code": lua_code })).await;
+    assert_eq!(
+        resp["status"], "needs_response",
+        "per-case rubric override eval must pause for the judge, got: {resp}"
+    );
+    assert_eq!(
+        resp["role"], "grader",
+        "per-case rubric judge pause must carry role=grader, got: {resp}"
+    );
+    let prompt = resp["prompt"].as_str().expect("prompt is string");
+    assert!(
+        prompt.contains("GRADE STRICTLY on geographic-answer precision only."),
+        "judge prompt must embed the per-case rubric text, got: {prompt}"
+    );
+    assert!(
+        !prompt.contains("Factual accuracy"),
+        "per-case override must displace the DEFAULT_RUBRIC axes, but the \
+         default 'Factual accuracy' axis appeared in the prompt: {prompt}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Default rubric fallback: when a case does not carry `rubric`, the
+/// llm_rubric grader must fall back to the DEFAULT_RUBRIC (Boost Bench
+/// v3 axes). Complements the override test above so the fallback
+/// contract stays regression-proof.
+#[tokio::test]
+async fn test_alc_eval_llm_rubric_falls_back_to_default_rubric_when_case_has_no_override() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    write_echo_strategy(alc_home.path());
+    let client = connect_with_alc_home(alc_home.path()).await;
+    install_real_collection(&client).await;
+
+    let lua_code = r#"
+local scenario = {
+    graders = { "llm_rubric" },
+    cases = { { input = "capital of Japan?", expected = "Tokyo" } },
+}
+return alc.eval(scenario, "echo_strat")
+"#;
+
+    let resp = call_json(&client, "alc_run", json!({ "code": lua_code })).await;
+    assert_eq!(resp["status"], "needs_response");
+    assert_eq!(resp["role"], "grader");
+    let prompt = resp["prompt"].as_str().expect("prompt is string");
+    assert!(
+        prompt.contains("Factual accuracy"),
+        "fallback judge prompt must embed the DEFAULT_RUBRIC axes, got: {prompt}"
+    );
+    assert!(
+        prompt.contains("Frontier reach"),
+        "fallback judge prompt must embed the DEFAULT_RUBRIC axes, got: {prompt}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
 /// Write a minimal runnable strategy package that echoes the input without
 /// calling the LLM. Used by the LLM-judge eval tests so the strategy path
 /// contributes no pauses (the only pause is the judge grader).

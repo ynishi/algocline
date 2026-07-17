@@ -160,6 +160,13 @@ pub struct PendingFilter {
     pub underspecified: bool,
     #[serde(default)]
     pub cache_breakpoint: bool,
+    /// Route tag carried by `alc.llm(prompt, { role = "..." })`. Currently
+    /// used by `llm_rubric` / `llm_yes_no` / `llm_factuality` graders to
+    /// mark judge invocations with `role = "grader"`, so external observers
+    /// can distinguish judge pauses from strategy pauses without inspecting
+    /// the prompt body.
+    #[serde(default)]
+    pub role: bool,
     #[serde(default)]
     pub prompt: PromptProjection,
 }
@@ -198,10 +205,15 @@ impl PendingFilter {
 
     /// Preset: meta + first `chars` chars of the prompt. Lets callers
     /// flow a config-resolved length (e.g. env var) into the preset.
+    ///
+    /// `role` is included so that `alc_status(pending_filter="preview")`
+    /// can distinguish judge pauses (`role="grader"`) from strategy
+    /// pauses without paying for the full prompt body.
     pub fn preset_preview_with(chars: usize) -> Self {
         Self {
             query_id: true,
             max_tokens: true,
+            role: true,
             prompt: PromptProjection::Preview { chars },
             ..Self::default()
         }
@@ -216,6 +228,7 @@ impl PendingFilter {
             grounded: true,
             underspecified: true,
             cache_breakpoint: true,
+            role: true,
             prompt: PromptProjection::Full,
         }
     }
@@ -275,6 +288,15 @@ fn project_query(q: &LlmQuery, f: &PendingFilter) -> serde_json::Value {
         obj.insert(
             "cache_breakpoint".into(),
             match &q.cache_breakpoint {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if f.role {
+        obj.insert(
+            "role".into(),
+            match &q.role {
                 Some(s) => serde_json::Value::String(s.clone()),
                 None => serde_json::Value::Null,
             },
@@ -1348,6 +1370,10 @@ mod tests {
         assert!(!f.grounded);
         assert!(!f.underspecified);
         assert!(
+            !f.role,
+            "meta preset must not project role (query_id + max_tokens only)"
+        );
+        assert!(
             matches!(f.prompt, PromptProjection::Off),
             "meta preset must not project prompt content"
         );
@@ -1358,6 +1384,10 @@ mod tests {
         let f = PendingFilter::preset_preview();
         assert!(f.query_id);
         assert!(f.max_tokens);
+        assert!(
+            f.role,
+            "preview preset must project role so judge pauses are distinguishable from strategy pauses"
+        );
         match f.prompt {
             PromptProjection::Preview { chars } => {
                 assert_eq!(chars, DEFAULT_PROMPT_PREVIEW_CHARS);
@@ -1383,7 +1413,48 @@ mod tests {
         assert!(f.system);
         assert!(f.grounded);
         assert!(f.underspecified);
+        assert!(f.role);
         assert!(matches!(f.prompt, PromptProjection::Full));
+    }
+
+    #[test]
+    fn project_query_role_projection_grader() {
+        let mut q = make_query(0);
+        q.role = Some("grader".into());
+        let f = PendingFilter {
+            role: true,
+            ..PendingFilter::default()
+        };
+        let v = project_query(&q, &f);
+        assert_eq!(v["role"], "grader");
+    }
+
+    #[test]
+    fn project_query_role_projection_absent_when_flag_off() {
+        let mut q = make_query(0);
+        q.role = Some("grader".into());
+        let f = PendingFilter::preset_meta();
+        let v = project_query(&q, &f);
+        let obj = v.as_object().expect("object");
+        assert!(
+            obj.get("role").is_none(),
+            "meta preset must not project role even when the query carries one"
+        );
+    }
+
+    #[test]
+    fn project_query_role_projection_null_when_query_role_absent() {
+        let q = make_query(0);
+        // q.role = None (default from make_query)
+        let f = PendingFilter {
+            role: true,
+            ..PendingFilter::default()
+        };
+        let v = project_query(&q, &f);
+        assert!(
+            v["role"].is_null(),
+            "role field must be null when the query carries no role tag"
+        );
     }
 
     #[test]

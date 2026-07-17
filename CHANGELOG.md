@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.eval` simple form now accepts a per-case `rubric` field that
+  overrides the default `llm_rubric` grader rubric for that case only.
+  Cases without `rubric` continue to use the built-in three-axis default
+  (factual accuracy / frontier reach / depth of reasoning), so existing
+  scenarios are unaffected. The override is stored on `case.context`
+  under the reserved key `_alc_rubric`; the vendored evalframe source
+  remains verbatim.
+- `alc_status` pending-query projection now exposes an optional `role`
+  field. It is included by the `preview` and `full` presets so callers
+  can distinguish judge pauses (`role = "grader"`) from strategy pauses
+  without paying for the full prompt body. Custom `pending_filter`
+  objects opt in via `{ "role": true }`; the `meta` preset stays minimal
+  and does not project `role`.
 - Vendored evalframe v0.4.0 into `algocline-engine`, enabling `alc.eval(...)`
   calls from user Lua code (via `alc_run`) without requiring
   `~/.algocline/packages/evalframe/` to be installed. The vendored modules

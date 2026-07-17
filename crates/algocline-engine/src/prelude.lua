@@ -821,6 +821,66 @@ do
         end
     end
 
+    -- Build a per-case llm_rubric grader that reads `case.context._alc_rubric`
+    -- (stashed by resolve_cases from `case.rubric`) and falls back to
+    -- DEFAULT_RUBRIC when the case does not override it. Mirrors the
+    -- prompt template and rating extraction from vendored
+    -- evalframe/presets/llm_graders.lua M.rubric so behavior is symmetric
+    -- with the upstream factory. Kept in prelude so vendored evalframe
+    -- stays verbatim.
+    local function build_llm_rubric_grader(ef, judge_provider)
+        local scale_min, scale_max = 1, 5
+        return ef.grader("llm_rubric")({
+            check = function(resp, case)
+                local rubric = (case.context and case.context._alc_rubric)
+                    or DEFAULT_RUBRIC
+                local prompt = string.format(
+                    [[You are an evaluation judge. Grade the following response.
+
+<input>
+%s
+</input>
+
+<response>
+%s
+</response>
+
+RUBRIC: %s
+
+Rate the response on a scale of %d to %d.
+Reply with ONLY a single number, nothing else.]],
+                    case.input,
+                    resp.text or "",
+                    rubric,
+                    scale_min,
+                    scale_max
+                )
+                -- Direct provider call (no pcall) so the coroutine yield
+                -- from alc.llm propagates through the grader boundary,
+                -- matching evalframe.providers.algocline discipline.
+                local text = judge_provider(prompt)
+                if type(text) == "table" then
+                    if text.error then
+                        return nil, text.error
+                    end
+                    text = text.text or ""
+                end
+                if type(text) ~= "string" then
+                    return nil, "judge returned non-string"
+                end
+                local rating = tonumber(text:match("(%d+%.?%d*)"))
+                if not rating then
+                    return nil,
+                        string.format(
+                            "judge did not return a number: %s",
+                            text:sub(1, 100)
+                        )
+                end
+                return math.max(scale_min, math.min(scale_max, rating))
+            end,
+        })
+    end
+
     -- Resolve a grader shorthand to an evalframe Binding (grader + scorer).
     --
     -- Deterministic grader names ("exact_match") and raw functions bind with
@@ -834,8 +894,12 @@ do
         if type(g) == "string" then
             if g == "llm_rubric" then
                 -- rubric judge returns a 1-5 rating → linear_1_5 → [0,1].
+                -- Uses a per-case-aware grader so `case.rubric` overrides
+                -- the default; the vendored evalframe factory stays
+                -- available for callers that want a fixed rubric via
+                -- the full `ef.bind` form.
                 return ef.bind({
-                    ef.llm_graders.rubric(DEFAULT_RUBRIC, { provider = judge_provider }),
+                    build_llm_rubric_grader(ef, judge_provider),
                     ef.scorers.linear_1_5,
                 })
             elseif g == "llm_yes_no" then
@@ -861,13 +925,38 @@ do
     end
 
     -- Wrap simple {input, expected} tables as ef.case if needed.
+    --
+    -- Case-level extension fields (`rubric`) that evalframe's `ef.case`
+    -- constructor would drop are stashed into `context._alc_*` keys so
+    -- they survive the wrap and remain reachable from grader `check`
+    -- callbacks via the standard `case.context` field. Vendored
+    -- evalframe source is not modified — the extension is fully local
+    -- to alc.eval.
     local function resolve_cases(ef, raw_cases)
         local cases = {}
         for i, c in ipairs(raw_cases) do
             if type(c) == "table" and ef.case.is_case(c) then
                 cases[i] = c
             elseif type(c) == "table" and c.input then
-                cases[i] = ef.case(c)
+                local wrapped = c
+                if c.rubric ~= nil then
+                    -- Defensive shallow copy so the caller's table is not mutated,
+                    -- then migrate `rubric` into `context._alc_rubric`.
+                    wrapped = {}
+                    for k, v in pairs(c) do
+                        wrapped[k] = v
+                    end
+                    local ctx = {}
+                    if type(c.context) == "table" then
+                        for k, v in pairs(c.context) do
+                            ctx[k] = v
+                        end
+                    end
+                    ctx._alc_rubric = c.rubric
+                    wrapped.context = ctx
+                    wrapped.rubric = nil
+                end
+                cases[i] = ef.case(wrapped)
             else
                 error("alc.eval: case #" .. i .. " must have an 'input' field")
             end

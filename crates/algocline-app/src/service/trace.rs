@@ -284,9 +284,7 @@ impl AppService {
         let total_calls = trace
             .get("total_calls")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                format!("card '{card_id}' sample {idx} trace missing total_calls")
-            })?;
+            .ok_or_else(|| format!("card '{card_id}' sample {idx} trace missing total_calls"))?;
         let total_trace_ms = trace
             .get("total_trace_ms")
             .and_then(|v| v.as_f64())

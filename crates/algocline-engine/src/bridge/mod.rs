@@ -185,8 +185,9 @@ pub fn install_for_pkg_test(lua: &Lua) -> LuaResult<()> {
     install_external_io_stub(lua, &alc_table, "fork")?;
 
     lua.globals().set("alc", alc_table)?;
-    evalframe::register_evalframe(lua)
-        .map_err(|e| LuaError::external(format!("install_for_pkg_test: register_evalframe: {e}")))?;
+    evalframe::register_evalframe(lua).map_err(|e| {
+        LuaError::external(format!("install_for_pkg_test: register_evalframe: {e}"))
+    })?;
     lua.load(PRELUDE)
         .set_name("@alc_prelude")
         .exec()

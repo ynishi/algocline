@@ -192,9 +192,7 @@ pub(crate) fn register_fork(
                             // Register vendored evalframe on the child VM so
                             // `require("evalframe")` works after fork.
                             register_evalframe(child_lua).map_err(|e| {
-                                mlua_isle::IsleError::Lua(format!(
-                                    "register_evalframe failed: {e}"
-                                ))
+                                mlua_isle::IsleError::Lua(format!("register_evalframe failed: {e}"))
                             })?;
 
                             let ctx_value = child_lua.to_value(&child_ctx)?;

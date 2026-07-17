@@ -166,11 +166,8 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        alc.set(
-            "time",
-            lua.create_function(|_, ()| Ok(0.0_f64)).unwrap(),
-        )
-        .unwrap();
+        alc.set("time", lua.create_function(|_, ()| Ok(0.0_f64)).unwrap())
+            .unwrap();
         alc.set(
             "llm",
             lua.create_function(|_, _: LuaValue| Ok("stub".to_string()))
@@ -203,10 +200,7 @@ mod tests {
 
         register_evalframe(&lua).unwrap();
         // require("evalframe") should succeed and return a table with expected fields.
-        let ef: LuaTable = lua
-            .load(r#"return require("evalframe")"#)
-            .eval()
-            .unwrap();
+        let ef: LuaTable = lua.load(r#"return require("evalframe")"#).eval().unwrap();
         let _suite: LuaValue = ef.get("suite").unwrap();
         let _providers: LuaTable = ef.get("providers").unwrap();
         let _llm_graders: LuaTable = ef.get("llm_graders").unwrap();

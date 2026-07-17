@@ -15,6 +15,7 @@ are injected into the main thread as load-only Skill prose at all times.
 | Agent (adviser) | `@alc-adviser` | Single-turn lookup, pre-impl plan check, and advice. Planning and decisions stay on the main thread (client-decide pattern) |
 | Agent (coder) | `@alc-coder` | Writes `init.lua` and specs into `~/.algocline/packages/<name>/` and iterates up to three retries until `alc_pkg_test` passes. Appends a journal entry on completion |
 | Agent (refiner) | `@alc-refiner` | Reads a journal excerpt and returns a single-turn improvement proposal for the target, then appends an entry to the journal |
+| Agent (eval) | `@alc-eval` | Paused-session runner for measurement / AnyModel routing. Answers each pending `alc.llm` query as the LLM itself (the caller-picked `model` at dispatch is the model under test), loops via `alc_continue` until completion, and appends one journal entry (skippable with `journal: off`) |
 
 ## Usage
 
@@ -57,8 +58,8 @@ Resolution is a single `mcp__algocline__alc_setting_resolve(target="journal")`
 call (the generic ALC core backbone `[setting.<x>]`). The internal precedence is
 `${ALC_SETTING_JOURNAL_PATH}` env -> `[setting.journal] path` -> default
 (`${XDG_STATE_HOME:-~/.local/state}/algocline/journal.md`). The write owners are
-only the adviser, coder, and refiner; `/alc-wake` and the main thread are
-read-only. See `/alc-wake` -> Journal Backbone for details.
+only the adviser, coder, refiner, and eval agents; `/alc-wake` and the main
+thread are read-only. See `/alc-wake` -> Journal Backbone for details.
 
 ## Install
 

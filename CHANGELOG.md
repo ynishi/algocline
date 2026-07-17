@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `@alc-eval` agent (`plugins/alc/agents/alc-eval.md`): paused-session runner
+  for measurement / AnyModel routing. Answers each pending `alc.llm` query
+  as the LLM itself — the model chosen at dispatch time via the Agent tool
+  `model` parameter is the model under test — feeds answers via
+  `alc_continue` (batch feed preferred), and loops until the session
+  completes / errors / hits `max_rounds` / or a query falls outside pure
+  text generation (`escalated`). Return contract is one block
+  (`### Session` / `### Result` / `### Observations`) with `model:` echoed
+  from the caller-passed label (never guessed) and no fabricated `usage`
+  attached to `alc_continue`. Journal append defaults on and is skippable
+  with `journal: off`; append uses an append-only recipe path (never the
+  Read-full → Write pattern that caused the 2026-06-10 incident
+  `94f692ef`). Enables per-model boost measurement without any engine
+  change by pairing the runner with `alc_eval` scenarios and picking the
+  runner's `model` per experiment (e.g. sonnet vs opus). Smoke-verified
+  across three runs (verify_select × sonnet / opus + refine_loop ×
+  sonnet, all `completed` with `pass@1 1.00`) plus one post-restart
+  dispatch under the registered name `alc:alc-eval`.
+- `/alc-wake` skill body: the Worker query paths section now documents
+  `@alc-eval` alongside `@alc-adviser` / `@alc-refiner` / `/alc-build`,
+  and the Responsibility split table lists the four Agent workers.
+- `plugins/alc/README.md`: Components table adds an Agent (eval) row for
+  `@alc-eval`; the Journal Backbone note updated to cite all four write
+  owners (adviser / coder / refiner / eval).
+- Root `README.md`: plugin bundle description enumerates the four
+  agents (`@alc-adviser` / `@alc-coder` / `@alc-refiner` / `@alc-eval`).
+
 ### Changed
 
 ### Deprecated

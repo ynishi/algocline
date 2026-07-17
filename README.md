@@ -126,7 +126,7 @@ The plugin bundles:
 
 - `algocline` and `git-reader` MCP server entries (no manual `mcp.json` edit needed),
 - the `/alc-wake` and `/alc-build` skills,
-- the `@alc-adviser` / `@alc-coder` / `@alc-refiner` agents for algocline package development.
+- the `@alc-adviser` / `@alc-coder` / `@alc-refiner` / `@alc-eval` agents for algocline package development and boost measurement.
 
 See [`plugins/alc/README.md`](plugins/alc/README.md) for details.
 

@@ -211,7 +211,7 @@ section follows the `## [YYYY-MM-DD] <role> — <summary>` format.
 | Layer | Role |
 |---|---|
 | **Skill (`/alc-wake` / `/alc-build`)** | User-triggered context loads and Agent kicks. Runs directly on the main thread. |
-| **Agent worker (`@alc-adviser` / `@alc-coder` / `@alc-refiner`)** | Handles heavy lookups, implementation, and refinement observation in an isolated context. Returns results in one turn. |
+| **Agent worker (`@alc-adviser` / `@alc-coder` / `@alc-refiner` / `@alc-eval`)** | Handles heavy lookups, implementation, refinement observation, and paused-session measurement in an isolated context. Returns results in one turn. |
 | **`alc` CLI** | Operational commands such as publish / install. Not invoked by AI. |
 | **algocline MCP** | Runtime operations (`alc_run` / `alc_continue` / pkg / card / hub / scenario tools). |
 
@@ -273,6 +273,22 @@ section follows the `## [YYYY-MM-DD] <role> — <summary>` format.
      -> User literal trigger -> spawns @alc-coder -> returns a three-section
         result_summary and appends `## [date] coder — <test_summary>` to
         the journal.
+
+   Paused-session runner (measurement / AnyModel routing; not a production
+   runner — the runner's own model is the model under test):
+     @alc-eval { session_id: "s-...", model: "<sonnet|opus|...>",
+                 pending_queries?: [...], journal?: "off" | {path,pkg},
+                 max_rounds?: 10, answer_style?: "<constraints>" }
+     -> The caller starts execution via alc_run / alc_advice / alc_eval;
+        when it pauses with status="needs_response", dispatch @alc-eval
+        with the session_id. The runner answers each pending query as
+        the LLM itself, feeds via alc_continue (batch feed preferred),
+        and loops until completed / error / max_rounds / escalated.
+     -> Returns one block (### Session / ### Result / ### Observations)
+        with `model:` echoed from the caller-passed label, and appends
+        `## [date] alc-eval — <session_id> ...` to the journal unless
+        `journal: off` was passed. Never fabricates `usage` on
+        alc_continue calls (runner cannot introspect its own tokens).
 
    Post-impl install (explicit, by the main AI, after coder completion):
      ALC core separation: scaffold = skeleton generation / install =
@@ -422,8 +438,8 @@ finish.
 
 ## DoNot
 
-- **Do not spawn `@alc-adviser` / `@alc-coder` / `@alc-refiner` or any
-  other Agent** (load-only contract).
+- **Do not spawn `@alc-adviser` / `@alc-coder` / `@alc-refiner` /
+  `@alc-eval` or any other Agent** (load-only contract).
 - **Do not append to the journal target** (wake is read-only; journal
   appends are the role of adviser / coder / refiner).
 - **Do not inject the entire journal into the main thread** (tail-N

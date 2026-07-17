@@ -1,0 +1,25 @@
+[package]
+name = "algocline-nn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "algocline neural-network bridge — thin candle wrapper exposing alc.nn to Lua"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# CPU only. Metal / CUDA / accelerate / mkl features are intentionally NOT
+# enabled — the L1 spike isolates the base candle link path from
+# backend-specific link interference (mlua vendored coexists in this
+# workspace). Metal is a carry (later step). candle-core / candle-nn are
+# released in lockstep; keep their minor versions equal.
+candle-core = "0.11"
+candle-nn = "0.11"
+# Must match the engine's mlua (0.11, lua54, vendored, send) so a single mlua
+# links in the `--features nn` engine build. The `send` feature requires
+# UserData to be Send — candle `Tensor` is Arc-backed and Send + Sync.
+mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"] }

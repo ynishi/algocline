@@ -113,6 +113,8 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     data::register_stats(lua, alc_table, config.custom_metrics, config.stats)?;
     register_time(lua, alc_table)?;
     register_math(lua, alc_table)?;
+    #[cfg(feature = "nn")]
+    register_nn(lua, alc_table)?;
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
     llm::register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {
@@ -138,6 +140,18 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
 fn register_math(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
     let math_table = mlua_mathlib::module(lua)?;
     alc_table.set("math", math_table)?;
+    Ok(())
+}
+
+/// Register `alc.nn` — thin candle wrapper (feature `nn`, default off).
+///
+/// Only compiled when the `nn` feature is enabled, so the default build never
+/// links candle. Mirrors [`register_math`]: delegate table construction to the
+/// dedicated bridge crate and set it as `alc.nn`.
+#[cfg(feature = "nn")]
+fn register_nn(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+    let nn_table = algocline_nn::module(lua)?;
+    alc_table.set("nn", nn_table)?;
     Ok(())
 }
 

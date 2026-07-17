@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- LLM-as-Judge graders are now reachable from `alc.eval` simple form via the
+  grader names `llm_rubric`, `llm_yes_no`, and `llm_factuality`. Each name
+  auto-wires the matching evalframe scorer (`linear_1_5` for rubric /
+  factuality, `bool` for yes/no) and a judge provider built on `alc.llm`;
+  `llm_rubric` uses a default three-axis rubric (factual accuracy / frontier
+  reach / depth of reasoning) when no rubric is supplied. Judge calls set an
+  optional `role = "grader"` on `alc.llm`, which is forwarded verbatim on the
+  `needs_response` payload (additive — the field is absent when unset) so a
+  host can route grading calls to a different model than the strategy under
+  test. The evalframe package itself is unchanged; the provider is built in the
+  prelude.
+- `alc.llm(prompt, opts)` and `alc.llm_batch` items accept an optional
+  `role` string. When set it is forwarded verbatim on the paused-session
+  `needs_response` JSON (additive; unknown keys are ignored for forward
+  compatibility). Existing single-argument `alc.llm(prompt)` calls are
+  unaffected.
 - `@alc-eval` agent (`plugins/alc/agents/alc-eval.md`): paused-session runner
   for measurement / AnyModel routing. Answers each pending `alc.llm` query
   as the LLM itself — the model chosen at dispatch time via the Agent tool

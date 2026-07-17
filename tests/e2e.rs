@@ -5719,6 +5719,177 @@ return M"#,
     client.cancel().await.expect("cancel failed");
 }
 
+// ─── LLM judge role wiring (issue 12770ca6) ──────────────────────────────────
+
+/// ST1/ST3.1: `alc.llm(prompt, { role = "grader" })` propagates `role` onto
+/// the `needs_response` payload, and the session resumes cleanly via
+/// `alc_continue`.
+#[tokio::test]
+async fn test_alc_llm_role_propagates_to_needs_response() {
+    let client = connect().await;
+
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": "return alc.llm('grade this', { role = 'grader' })" }),
+    )
+    .await;
+
+    assert_eq!(resp["status"], "needs_response");
+    assert_eq!(
+        resp["role"], "grader",
+        "role must appear verbatim on needs_response, got: {resp}"
+    );
+
+    let session_id = resp["session_id"].as_str().expect("session_id").to_string();
+    let resp_cont = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "5" }),
+    )
+    .await;
+    assert_eq!(
+        resp_cont["status"], "completed",
+        "session must complete after alc_continue, got: {resp_cont}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// ST3.2 (backward compat): a plain `alc.llm(prompt)` call must NOT add a
+/// `role` field to the `needs_response` payload (additive contract).
+#[tokio::test]
+async fn test_alc_llm_no_role_absent_from_needs_response() {
+    let client = connect().await;
+
+    let resp = call_json(
+        &client,
+        "alc_run",
+        json!({ "code": "return alc.llm('no role here')" }),
+    )
+    .await;
+
+    assert_eq!(resp["status"], "needs_response");
+    assert!(
+        resp.get("role").is_none(),
+        "role key must be absent when not set, got: {resp}"
+    );
+
+    let session_id = resp["session_id"].as_str().expect("session_id").to_string();
+    let _ = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "ok" }),
+    )
+    .await;
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// ST3.3 (error path): an unknown grader name in `alc_eval` simple form must
+/// surface a typed error naming the grader. Uses a runnable echo strategy
+/// (no LLM calls) so the error fires deterministically at suite-build time.
+#[tokio::test]
+async fn test_alc_eval_unknown_grader_typed_error() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    write_echo_strategy(alc_home.path());
+    let client = connect_with_alc_home(alc_home.path()).await;
+    install_real_collection(&client).await;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_eval",
+            json!({
+                "strategy": "echo_strat",
+                "scenario": r#"return { cases = { { input = "2+2", expected = "4" } }, graders = { "llm_nope" } }"#,
+            }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("unknown grader") && text.contains("llm_nope"),
+        "expected typed unknown-grader error naming 'llm_nope', got: {text}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// ST3.4: `alc_eval` simple form with `graders = { "llm_rubric" }` reaches the
+/// LLM-as-Judge grader. Because the echo strategy makes no LLM calls, the very
+/// first pause is the judge call, which must carry `role = "grader"`. Feeding a
+/// numeric rating resumes the suite to completion.
+#[tokio::test]
+async fn test_alc_eval_llm_rubric_grader_pause_carries_role() {
+    let alc_home = tempfile::tempdir().expect("tempdir");
+    write_echo_strategy(alc_home.path());
+    let client = connect_with_alc_home(alc_home.path()).await;
+    install_real_collection(&client).await;
+
+    let resp = call_json(
+        &client,
+        "alc_eval",
+        json!({
+            "strategy": "echo_strat",
+            "scenario": r#"return { cases = { { input = "2+2", expected = "4" } }, graders = { "llm_rubric" } }"#,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        resp["status"], "needs_response",
+        "llm_rubric grader must pause for the judge call, got: {resp}"
+    );
+    assert_eq!(
+        resp["role"], "grader",
+        "judge pause must carry role=grader, got: {resp}"
+    );
+
+    let session_id = resp["session_id"].as_str().expect("session_id").to_string();
+    let resp_cont = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "5" }),
+    )
+    .await;
+    assert_eq!(
+        resp_cont["status"], "completed",
+        "eval must complete after feeding the judge rating, got: {resp_cont}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Write a minimal runnable strategy package that echoes the input without
+/// calling the LLM. Used by the LLM-judge eval tests so the strategy path
+/// contributes no pauses (the only pause is the judge grader).
+fn write_echo_strategy(alc_home: &std::path::Path) {
+    let pkg_dir = alc_home.join("packages").join("echo_strat");
+    std::fs::create_dir_all(&pkg_dir).expect("create echo_strat dir");
+    std::fs::write(
+        pkg_dir.join("init.lua"),
+        r#"local M = {}
+M.meta = { name = "echo_strat", version = "0.1.0", type = "runnable" }
+M.run = function(ctx) return { result = ctx.task or "" } end
+return M"#,
+    )
+    .expect("write echo_strat init.lua");
+}
+
+/// Install the real bundled package collection (for `evalframe`) from the
+/// user's `~/.algocline/packages` collection root into the isolated ALC_HOME.
+/// Mirrors the setup used by the card-analysis LLM-path e2e test.
+async fn install_real_collection(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>) {
+    let packages_dir =
+        std::path::PathBuf::from(std::env::var("HOME").expect("HOME")).join(".algocline/packages");
+    call_json(
+        client,
+        "alc_pkg_install",
+        json!({ "url": packages_dir.to_string_lossy().as_ref() }),
+    )
+    .await;
+}
+
 // ─── CLI dry-run tests (no MCP harness) ──────────────────────────────────────
 
 /// Resolve the path to the `alc` binary, mirroring the logic in `connect()`.

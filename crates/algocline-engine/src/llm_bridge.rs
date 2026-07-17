@@ -29,6 +29,10 @@ pub struct QueryRequest {
     /// Optional opaque prompt-cache breakpoint hint forwarded to the host
     /// via paused-session JSON. See `algocline_core::LlmQuery::cache_breakpoint`.
     pub cache_breakpoint: Option<String>,
+    /// Optional role hint identifying the caller context of this query
+    /// (e.g. `"grader"` for an LLM-as-Judge grader). Forwarded verbatim on
+    /// the paused-session JSON. See `algocline_core::LlmQuery::role`.
+    pub role: Option<String>,
     /// Channel to send the response back to the yielded Lua coroutine.
     pub resp_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
 }

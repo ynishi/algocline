@@ -1157,6 +1157,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
 
         // Lua side now sees the increment.
@@ -1176,6 +1177,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             },
             LlmQuery {
                 id: QueryId::parse("q-2"),
@@ -1185,6 +1187,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             },
         ]);
 

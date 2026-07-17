@@ -212,6 +212,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&queries);
         observer.on_response_fed(&QueryId::single(), "4", None); // 1 ASCII → ceil(1/4) = 1
@@ -241,6 +242,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
 
         // 3 rounds

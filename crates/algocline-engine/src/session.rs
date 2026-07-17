@@ -78,6 +78,9 @@ impl FeedResult {
                     if let Some(cb) = &q.cache_breakpoint {
                         obj["cache_breakpoint"] = json!(cb);
                     }
+                    if let Some(role) = &q.role {
+                        obj["role"] = json!(role);
+                    }
                     obj
                 } else {
                     let qs: Vec<_> = queries
@@ -97,6 +100,9 @@ impl FeedResult {
                             }
                             if let Some(cb) = &q.cache_breakpoint {
                                 obj["cache_breakpoint"] = json!(cb);
+                            }
+                            if let Some(role) = &q.role {
+                                obj["role"] = json!(role);
                             }
                             obj
                         })
@@ -391,6 +397,7 @@ impl Session {
                     grounded: qr.grounded,
                     underspecified: qr.underspecified,
                     cache_breakpoint: qr.cache_breakpoint.clone(),
+                    role: qr.role.clone(),
                 }).collect();
 
                 for qr in req.queries {
@@ -829,6 +836,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }
     }
 
@@ -852,6 +860,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -887,6 +896,7 @@ mod tests {
             grounded: true,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -910,6 +920,7 @@ mod tests {
             grounded: false,
             underspecified: true,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -937,6 +948,7 @@ mod tests {
             grounded: true,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let normal_query = LlmQuery {
             id: QueryId::batch(1),
@@ -946,6 +958,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![grounded_query, normal_query],
@@ -973,6 +986,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: Some("context".into()),
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -1004,6 +1018,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -1017,6 +1032,91 @@ mod tests {
     }
 
     #[test]
+    fn to_json_paused_single_query_role() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "grade this answer".into(),
+            system: None,
+            max_tokens: 256,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+            role: Some("grader".into()),
+        };
+        let result = FeedResult::Paused {
+            queries: vec![query],
+        };
+        let json = result.to_json("s-role");
+
+        assert_eq!(json["status"], "needs_response");
+        assert_eq!(
+            json["role"], "grader",
+            "role must appear verbatim in single-query MCP JSON"
+        );
+    }
+
+    #[test]
+    fn to_json_paused_single_query_no_role_absent() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "no role".into(),
+            system: None,
+            max_tokens: 64,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+            role: None,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![query],
+        };
+        let json = result.to_json("s-norole");
+
+        assert!(
+            json.get("role").is_none(),
+            "role key must be absent when None"
+        );
+    }
+
+    #[test]
+    fn to_json_paused_multiple_queries_mixed_role() {
+        let judge_query = LlmQuery {
+            id: QueryId::batch(0),
+            prompt: "grade".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+            role: Some("grader".into()),
+        };
+        let normal_query = LlmQuery {
+            id: QueryId::batch(1),
+            prompt: "generate".into(),
+            system: None,
+            max_tokens: 100,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+            role: None,
+        };
+        let result = FeedResult::Paused {
+            queries: vec![judge_query, normal_query],
+        };
+        let json = result.to_json("s-batch-role");
+
+        let qs = json["queries"].as_array().expect("queries should be array");
+        assert_eq!(
+            qs[0]["role"], "grader",
+            "grader query must forward role verbatim"
+        );
+        assert!(
+            qs[1].get("role").is_none(),
+            "non-role query must omit role key"
+        );
+    }
+
+    #[test]
     fn to_json_paused_multiple_queries_mixed_cache_breakpoint() {
         let cached_query = LlmQuery {
             id: QueryId::batch(0),
@@ -1026,6 +1126,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: Some("prompt".into()),
+            role: None,
         };
         let normal_query = LlmQuery {
             id: QueryId::batch(1),
@@ -1035,6 +1136,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![cached_query, normal_query],
@@ -1062,6 +1164,7 @@ mod tests {
             grounded: false,
             underspecified: true,
             cache_breakpoint: None,
+            role: None,
         };
         let normal_query = LlmQuery {
             id: QueryId::batch(1),
@@ -1071,6 +1174,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![underspec_query, normal_query],
@@ -1098,6 +1202,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let result = FeedResult::Paused {
             queries: vec![query],
@@ -1349,6 +1454,7 @@ mod tests {
             grounded: true,
             underspecified: true,
             cache_breakpoint: None,
+            role: None,
         };
         let v = project_query(&q, &PendingFilter::preset_full());
         assert_eq!(v["query_id"], "q-0");
@@ -1370,6 +1476,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let v = project_query(&q, &PendingFilter::preset_preview_with(5));
         assert_eq!(v["prompt_preview"], "abcde");
@@ -1390,6 +1497,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let v = project_query(&q, &PendingFilter::preset_preview_with(3));
         let preview = v["prompt_preview"].as_str().expect("str");
@@ -1407,6 +1515,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let v = project_query(&q, &PendingFilter::preset_preview_with(100));
         assert_eq!(v["prompt_preview"], "abc");
@@ -1422,6 +1531,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let filter = PendingFilter {
             system: true,

@@ -39,6 +39,9 @@ pub(super) fn register_llm(
             let cache_breakpoint = opts
                 .as_ref()
                 .and_then(|o| o.get::<String>("cache_breakpoint").ok());
+            // Optional role hint (e.g. "grader"). Additive: absent when not set.
+            // Other opts keys are ignored for forward compatibility.
+            let role = opts.as_ref().and_then(|o| o.get::<String>("role").ok());
 
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
@@ -51,6 +54,7 @@ pub(super) fn register_llm(
                     grounded,
                     underspecified,
                     cache_breakpoint,
+                    role,
                     resp_tx,
                 }],
             })
@@ -111,16 +115,22 @@ pub(super) fn register_llm_batch(
                 let max_tokens: u32 = item.get::<u32>("max_tokens").unwrap_or(1024);
                 let grounded: bool = item.get::<bool>("grounded").unwrap_or(false);
                 let underspecified: bool = item.get::<bool>("underspecified").unwrap_or(false);
-                let cache_breakpoint: Option<String> = item
-                    .get::<LuaValue>("cache_breakpoint")
-                    .ok()
-                    .and_then(|v| {
+                let cache_breakpoint: Option<String> =
+                    item.get::<LuaValue>("cache_breakpoint").ok().and_then(|v| {
                         if let LuaValue::String(s) = v {
                             Some(s.to_str().ok()?.to_string())
                         } else {
                             None
                         }
                     });
+                // Optional role hint per item (additive, forward-compat).
+                let role: Option<String> = item.get::<LuaValue>("role").ok().and_then(|v| {
+                    if let LuaValue::String(s) = v {
+                        Some(s.to_str().ok()?.to_string())
+                    } else {
+                        None
+                    }
+                });
 
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                 resp_rxs.push(resp_rx);
@@ -133,6 +143,7 @@ pub(super) fn register_llm_batch(
                     grounded,
                     underspecified,
                     cache_breakpoint,
+                    role,
                     resp_tx,
                 });
             }

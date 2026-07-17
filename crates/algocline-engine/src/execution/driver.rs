@@ -292,6 +292,7 @@ pub(crate) async fn driver_loop(
                         grounded: qr.grounded,
                         underspecified: qr.underspecified,
                         cache_breakpoint: qr.cache_breakpoint.clone(),
+                        role: qr.role.clone(),
                     })
                     .collect();
                 ctx.metrics.create_observer().on_paused(&queries_for_observer);

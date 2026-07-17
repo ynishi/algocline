@@ -796,17 +796,66 @@ end
 ---
 --- Returns: evalframe report table (aggregated, failures, results, summary)
 do
-    -- Resolve grader shorthand ("exact_match") to evalframe grader function.
-    local function resolve_grader(ef, g)
+    -- Default rubric for the `llm_rubric` judge (Boost Bench v3 axes).
+    -- Criteria are specific and behavioral (no vague catch-alls); the judge
+    -- reads them and returns a single overall 1-5 rating.
+    local DEFAULT_RUBRIC = [[Grade the response against these three criteria, then give ONE overall rating:
+1. Factual accuracy — every claim is correct and free of fabrication; no unsupported, outdated, or misleading statements.
+2. Frontier reach — the answer reflects the current state of the art of the topic rather than introductory or obsolete content.
+3. Depth of reasoning — the response explains why, works through trade-offs and edge cases, instead of only stating conclusions.]]
+
+    -- Default question for the `llm_yes_no` judge (specific, behavioral).
+    local DEFAULT_YES_NO_QUESTION =
+        "Does the response correctly and completely answer the question posed in the input?"
+
+    -- LLM-as-Judge provider. Calls alc.llm directly with role="grader".
+    --
+    -- NOT wrapped in pcall on purpose: the yield must propagate through the
+    -- coroutine boundary so the host observes the judge pause as a distinct
+    -- needs_response (same rationale as evalframe providers/algocline.lua).
+    -- The role field lets the host route the grading call to a different
+    -- model than the strategy under test (judge != subject cardinal rule).
+    local function make_judge_provider()
+        return function(p)
+            return alc.llm(p, { role = "grader" })
+        end
+    end
+
+    -- Resolve a grader shorthand to an evalframe Binding (grader + scorer).
+    --
+    -- Deterministic grader names ("exact_match") and raw functions bind with
+    -- the default bool scorer. LLM-as-Judge names (`llm_rubric` /
+    -- `llm_yes_no` / `llm_factuality`) auto-wire the matching scorer and a
+    -- judge provider so they are usable directly from alc.eval simple form.
+    local function resolve_grader(ef, g, judge_provider)
         if type(g) == "function" then
-            return g
+            return ef.bind({ g })
         end
         if type(g) == "string" then
+            if g == "llm_rubric" then
+                -- rubric judge returns a 1-5 rating → linear_1_5 → [0,1].
+                return ef.bind({
+                    ef.llm_graders.rubric(DEFAULT_RUBRIC, { provider = judge_provider }),
+                    ef.scorers.linear_1_5,
+                })
+            elseif g == "llm_yes_no" then
+                -- yes/no judge returns a boolean → bool scorer → {0,1}.
+                return ef.bind({
+                    ef.llm_graders.yes_no(DEFAULT_YES_NO_QUESTION, { provider = judge_provider }),
+                    ef.scorers.bool,
+                })
+            elseif g == "llm_factuality" then
+                -- factuality judge returns a 1-5 rating → linear_1_5 → [0,1].
+                return ef.bind({
+                    ef.llm_graders.factuality({ provider = judge_provider }),
+                    ef.scorers.linear_1_5,
+                })
+            end
             local grader_fn = ef.graders[g]
             if not grader_fn then
                 error("alc.eval: unknown grader '" .. g .. "'")
             end
-            return grader_fn
+            return ef.bind({ grader_fn })
         end
         error("alc.eval: grader must be a string name or function, got " .. type(g))
     end
@@ -854,11 +903,15 @@ do
             return suite_spec
         end
 
-        -- Simple form: resolve graders → bindings, cases → ef.case
+        -- Simple form: resolve graders → bindings, cases → ef.case.
+        -- resolve_grader returns a full Binding (grader + scorer) so LLM
+        -- judges can attach the correct scorer; deterministic graders bind
+        -- with the default bool scorer.
         local grader_names = spec.graders or { "exact_match" }
+        local judge_provider = make_judge_provider()
         local suite_spec = { provider = resolved_provider }
         for i, g in ipairs(grader_names) do
-            suite_spec[i] = ef.bind({ resolve_grader(ef, g) })
+            suite_spec[i] = resolve_grader(ef, g, judge_provider)
         end
         suite_spec.cases = resolve_cases(ef, spec.cases or {})
         return suite_spec

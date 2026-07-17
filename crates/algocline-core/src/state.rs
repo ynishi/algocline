@@ -268,6 +268,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }
     }
 
@@ -510,6 +511,7 @@ mod proptests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }
     }
 

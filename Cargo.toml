@@ -10,6 +10,8 @@ license = "MIT OR Apache-2.0"
 authors = ["Yutaka Nishimura"]
 repository = "https://github.com/ynishi/algocline"
 homepage = "https://github.com/ynishi/algocline"
+documentation = "https://docs.rs/algocline"
+description = "LLM amplification engine — MCP server with Lua scripting"
 keywords = ["llm", "mcp", "lua", "reasoning", "ai"]
 categories = ["development-tools", "science"]
 
@@ -39,7 +41,7 @@ name = "algocline"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "LLM amplification engine — MCP server with Lua scripting"
+description.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -644,6 +644,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
 
         observer.on_paused(&queries);
@@ -672,6 +673,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             },
             LlmQuery {
                 id: QueryId::batch(1),
@@ -681,6 +683,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             },
         ];
 
@@ -710,6 +713,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
 
         // Round 1
@@ -749,6 +753,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
 
         observer.on_paused(&queries);
@@ -776,6 +781,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "r", None);
         observer.on_resumed();
@@ -799,6 +805,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer1", None);
         observer.on_resumed();
@@ -812,6 +819,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer2", None);
         observer.on_resumed();
@@ -844,6 +852,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             },
             LlmQuery {
                 id: QueryId::batch(1),
@@ -853,6 +862,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             },
         ];
 
@@ -931,6 +941,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
 
         observer.on_response_fed(&QueryId::single(), "response", None);
@@ -982,6 +993,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
 
         // Snapshot without completing the response — last entry has response=None
@@ -1017,6 +1029,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "answer", None);
 
@@ -1043,6 +1056,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         observer.on_response_fed(&QueryId::single(), "world", None);
         observer.on_resumed();
@@ -1087,6 +1101,7 @@ mod tests {
                 grounded: false,
                 underspecified: false,
                 cache_breakpoint: None,
+                role: None,
             }]);
             observer.on_response_fed(&QueryId::single(), &format!("resp-{i}"), None);
             observer.on_resumed();
@@ -1132,6 +1147,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         observer.on_response_fed(&QueryId::single(), &"y".repeat(50), None);
         observer.on_resumed();
@@ -1179,6 +1195,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&queries);
         observer.on_response_fed(
@@ -1224,6 +1241,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&queries);
         // No host-supplied usage — token counts are estimated from character counts.

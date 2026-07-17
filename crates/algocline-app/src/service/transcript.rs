@@ -145,6 +145,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }]);
         metrics
     }

@@ -73,6 +73,18 @@ pub struct LlmQuery {
     /// ignore the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_breakpoint: Option<String>,
+    /// Optional role hint identifying the caller context of this query.
+    ///
+    /// Set to `"grader"` by the LLM-as-Judge grader wiring (see
+    /// `alc.eval`) so the host can distinguish a judge/grading call from
+    /// the default strategy call and route it to a different model (named
+    /// model role + default fallback). The engine does not interpret the
+    /// value — it forwards it verbatim on the paused-session JSON.
+    ///
+    /// Absent when not set; hosts that do not implement role-based routing
+    /// MUST ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -150,6 +162,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert!(
@@ -184,6 +197,7 @@ mod tests {
             grounded: true,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(
@@ -227,6 +241,7 @@ mod tests {
             grounded: false,
             underspecified: true,
             cache_breakpoint: None,
+            role: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(
@@ -252,6 +267,7 @@ mod tests {
             grounded: true,
             underspecified: true,
             cache_breakpoint: None,
+            role: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(json["grounded"], true);
@@ -271,6 +287,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: Some("context".into()),
+            role: None,
         };
         let json = serde_json::to_value(&query).unwrap();
         assert_eq!(
@@ -283,6 +300,48 @@ mod tests {
         );
         let restored: LlmQuery = serde_json::from_value(json).unwrap();
         assert_eq!(restored.cache_breakpoint.as_deref(), Some("context"));
+    }
+
+    #[test]
+    fn llm_query_role_serde() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "grade this".into(),
+            system: None,
+            max_tokens: 256,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+            role: Some("grader".into()),
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(
+            json["role"], "grader",
+            "role must be forwarded verbatim when set"
+        );
+        let restored: LlmQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.role.as_deref(), Some("grader"));
+    }
+
+    #[test]
+    fn llm_query_role_absent_when_none() {
+        let query = LlmQuery {
+            id: QueryId::single(),
+            prompt: "no role".into(),
+            system: None,
+            max_tokens: 128,
+            grounded: false,
+            underspecified: false,
+            cache_breakpoint: None,
+            role: None,
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert!(
+            json.get("role").is_none(),
+            "role key must be absent when None (skip_serializing_if)"
+        );
+        let restored: LlmQuery = serde_json::from_value(json).unwrap();
+        assert!(restored.role.is_none());
     }
 }
 

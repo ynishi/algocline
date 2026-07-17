@@ -244,6 +244,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "r", None);
@@ -277,6 +278,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "r", None);
@@ -306,6 +308,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "reply", None);
@@ -334,6 +337,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&q);
         observer.on_response_fed(&QueryId::single(), "r", None);
@@ -379,6 +383,7 @@ mod tests {
             grounded: false,
             underspecified: false,
             cache_breakpoint: None,
+            role: None,
         }];
         observer.on_paused(&q);
 

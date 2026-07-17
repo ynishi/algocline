@@ -313,6 +313,8 @@ pub(crate) fn register_fork(
                                         grounded: fq.grounded,
                                         underspecified: fq.underspecified,
                                         cache_breakpoint: fq.cache_breakpoint,
+                                        // Fork children do not carry a judge role in v1.
+                                        role: None,
                                         resp_tx: parent_resp_tx,
                                     });
                                 }

@@ -147,6 +147,8 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "mlua",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

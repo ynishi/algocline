@@ -23,3 +23,8 @@ candle-nn = "0.11"
 # links in the `--features nn` engine build. The `send` feature requires
 # UserData to be Send — candle `Tensor` is Arc-backed and Send + Sync.
 mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"] }
+# Card metadata schema (`card.rs`) — Serialize/Deserialize helpers for the
+# `[metadata.nn]` block written by the engine bridge and populated by
+# downstream training subtasks.
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -27,6 +27,8 @@
 
 #![warn(missing_docs)]
 
+pub mod card;
+
 use candle_core::{Device, Tensor};
 
 /// Link-gate probe used by the Step 1 spike.

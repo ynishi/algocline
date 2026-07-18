@@ -27,7 +27,10 @@
 
 #![warn(missing_docs)]
 
+pub mod arch;
 pub mod card;
+pub mod tokenizer;
+pub mod train;
 
 use candle_core::{Device, Tensor};
 

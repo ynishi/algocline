@@ -12,11 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-# CPU only. Metal / CUDA / accelerate / mkl features are intentionally NOT
-# enabled — the L1 spike isolates the base candle link path from
-# backend-specific link interference (mlua vendored coexists in this
-# workspace). Metal is a carry (later step). candle-core / candle-nn are
-# released in lockstep; keep their minor versions equal.
+# CPU by default. The optional `nn-cuda` feature turns on candle's CUDA
+# backend; on a CUDA-less dev host that feature only compiles behind an
+# `nvcc` toolchain (see subtask-2.md §Done Criteria). candle-core /
+# candle-nn are released in lockstep; keep their minor versions equal.
 candle-core = "0.11"
 candle-nn = "0.11"
 # Must match the engine's mlua (0.11, lua54, vendored, send) so a single mlua
@@ -28,3 +27,17 @@ mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"]
 # downstream training subtasks.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# ST2: HuggingFace tokenizer + hub download for pre-trained tokenizer and
+# base-weight fetch (design §6.3 / §12 Q2 / §12 Q5). `hf-hub` uses the
+# blocking sync client to keep the bridge path Runtime-free.
+tokenizers = "0.19"
+hf-hub = "0.3"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+# Enable candle's CUDA backend for training on RunPod A40 / A100 hosts.
+# CPU builds keep this off (`candle-core` without `cuda`). On dev hosts
+# without an `nvcc` toolchain this feature does not compile — that is
+# expected; verification runs on the CUDA-enabled tier.
+nn-cuda = ["candle-core/cuda"]

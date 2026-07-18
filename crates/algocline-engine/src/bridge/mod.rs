@@ -131,7 +131,12 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     #[cfg(feature = "nn")]
     register_nn(lua, alc_table, config.nn_dir.clone())?;
     #[cfg(feature = "nn")]
-    nn_card::register_nn_card(lua, alc_table, Arc::clone(&config.card_store))?;
+    nn_card::register_nn_card(
+        lua,
+        alc_table,
+        Arc::clone(&config.card_store),
+        config.nn_dir.clone(),
+    )?;
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
     llm::register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {

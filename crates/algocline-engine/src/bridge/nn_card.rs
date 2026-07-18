@@ -19,7 +19,7 @@
 //!    `FileCardStore::create` (Card TOML). A mismatch surfaces as a
 //!    Lua error rather than silent divergence.
 //! 2. Store write failures propagate loudly (`?` / `LuaError::external`)
-//!    per algocline `.claude/CLAUDE.md §Service 層の Error 伝播規律` —
+//!    per the crate's Service-layer error-propagation discipline —
 //!    no `warn!` / `let _ = ...` / `.ok()` swallowing.
 //! 3. `register` is idempotent — re-registering the same `model_name`
 //!    overwrites the existing entry via `NnModelRegistry`'s underlying
@@ -27,14 +27,21 @@
 //! 4. `load` returns an error (never partial state) when the Card's
 //!    `metadata.nn.candle.bundle_ref` cannot be resolved on disk.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use algocline_nn::arch::{Gpt2Config, Gpt2Model};
 use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage};
+use algocline_nn::tokenizer::HfTokenizer;
+use algocline_nn::train::{
+    Batch, Dataset, DatasetOpts, JsonlDataset, ParquetDataset, TokenizedDataset,
+};
+use candle_core::{DType, Device};
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 use serde_json::{json, Value as Json};
 
-use crate::card::FileCardStore;
+use crate::card::{FileCardStore, SamplesQuery};
 
 /// Pkg name under which nn Cards are stored
 /// (`<cards_root>/alc_nn/<card_id>.toml`).
@@ -50,8 +57,11 @@ pub(super) fn register_nn_card(
     lua: &Lua,
     alc_table: &LuaTable,
     card_store: Arc<FileCardStore>,
+    nn_dir: PathBuf,
 ) -> LuaResult<()> {
     let nn_table: LuaTable = alc_table.get("nn")?;
+    register_preset_ns(lua, &nn_table, nn_dir.clone())?;
+    register_data_ns(lua, &nn_table, Arc::clone(&card_store), nn_dir)?;
     let card_ns = lua.create_table()?;
 
     let save_store = Arc::clone(&card_store);
@@ -354,4 +364,378 @@ fn alc_nn_fn(lua: &Lua, key: &str) -> LuaResult<LuaFunction> {
     nn.get::<LuaFunction>(key).map_err(|e| {
         LuaError::external(format!("alc.nn.card: `alc.nn.{key}` missing: {e}"))
     })
+}
+
+// ─── alc.nn.preset ────────────────────────────────────────────────
+
+/// Opaque handle exposed to Lua for a constructed GPT-2 model.
+///
+/// Wrapped in `Arc<Mutex<...>>` so `#[cfg(feature = "nn")]` builds can
+/// keep sending the handle across `mlua`'s `send`-required boundary.
+/// A later trainer follow-up replaces the `Option` with a mutable
+/// trainer wrap; this stage only needs read access for shape
+/// assertions from Lua.
+pub(super) struct Gpt2Handle {
+    // A later trainer follow-up consumes this via `Gpt2Handle::model()`
+    // for the training-loop wiring. This stage exposes only shape
+    // accessors from Lua, so the field is deliberately unread today.
+    #[allow(dead_code)]
+    inner: Arc<Mutex<Gpt2Model>>,
+    variant: String,
+    layers: usize,
+    heads: usize,
+    dim: usize,
+    ctx: usize,
+    vocab: usize,
+    device: String,
+    dtype: String,
+    pretrained: bool,
+}
+
+impl mlua::UserData for Gpt2Handle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("variant", |_, this, ()| Ok(this.variant.clone()));
+        methods.add_method("layers", |_, this, ()| Ok(this.layers));
+        methods.add_method("heads", |_, this, ()| Ok(this.heads));
+        methods.add_method("dim", |_, this, ()| Ok(this.dim));
+        methods.add_method("ctx", |_, this, ()| Ok(this.ctx));
+        methods.add_method("vocab", |_, this, ()| Ok(this.vocab));
+        methods.add_method("device", |_, this, ()| Ok(this.device.clone()));
+        methods.add_method("dtype", |_, this, ()| Ok(this.dtype.clone()));
+        methods.add_method("pretrained", |_, this, ()| Ok(this.pretrained));
+        methods.add_method("forward_shape", |_, this, (batch, seq): (usize, usize)| {
+            Ok(vec![batch, seq, this.vocab])
+        });
+    }
+}
+
+/// Access the underlying model. Consumed by the trainer follow-up's
+/// wiring.
+///
+/// This stage does not exercise this method (real forward runs
+/// through the nn crate's `Gpt2Model::forward` directly), so it stays
+/// unused until the trainer entry (`alc.nn.trainer.full_ft`) lands.
+impl Gpt2Handle {
+    #[allow(dead_code)]
+    pub(super) fn model(&self) -> Arc<Mutex<Gpt2Model>> {
+        Arc::clone(&self.inner)
+    }
+}
+
+fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
+    let preset = lua.create_table()?;
+
+    let gpt2 = lua.create_function(
+        move |_lua, (variant, opts): (String, Option<LuaTable>)| -> LuaResult<Gpt2Handle> {
+            build_gpt2_handle(&variant, opts.as_ref(), &nn_dir)
+        },
+    )?;
+    preset.set("gpt2", gpt2)?;
+    nn_table.set("preset", preset)?;
+    Ok(())
+}
+
+fn build_gpt2_handle(
+    variant: &str,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+) -> LuaResult<Gpt2Handle> {
+    let mut cfg = Gpt2Config::from_variant(variant).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.preset.gpt2: unknown variant '{variant}' (expected 'medium' or 'large')"
+        ))
+    })?;
+
+    let device_str = opts
+        .and_then(|t| t.get::<Option<String>>("device").ok().flatten())
+        .unwrap_or_else(|| "cpu".to_string());
+    let dtype_str = opts
+        .and_then(|t| t.get::<Option<String>>("dtype").ok().flatten())
+        .unwrap_or_else(|| {
+            // Design §6.1 default: bf16 on CUDA, f32 on CPU.
+            if device_str.starts_with("cuda") {
+                "bf16".to_string()
+            } else {
+                "f32".to_string()
+            }
+        });
+    let pretrained = opts
+        .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
+        .unwrap_or(true);
+
+    cfg.device = parse_device(&device_str)?;
+    cfg.dtype = parse_dtype(&dtype_str)?;
+
+    // Guard the "bf16 on CPU" combo: error early rather than let
+    // candle emit an obscure kernel error downstream.
+    if matches!(cfg.device, Device::Cpu) && matches!(cfg.dtype, DType::BF16) {
+        return Err(LuaError::external(
+            "alc.nn.preset.gpt2: bf16 dtype requires a CUDA device (use dtype='f32' on CPU)"
+                .to_string(),
+        ));
+    }
+
+    let model = if pretrained {
+        let cache_dir = nn_dir.to_path_buf();
+        Gpt2Model::from_pretrained(variant, &cfg, &cache_dir)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?
+    } else {
+        let varmap = candle_nn::VarMap::new();
+        let vs = candle_nn::VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        Gpt2Model::new(&cfg, vs)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?
+    };
+
+    Ok(Gpt2Handle {
+        inner: Arc::new(Mutex::new(model)),
+        variant: variant.to_string(),
+        layers: cfg.layers,
+        heads: cfg.heads,
+        dim: cfg.dim,
+        ctx: cfg.ctx,
+        vocab: cfg.vocab,
+        device: device_str,
+        dtype: dtype_str,
+        pretrained,
+    })
+}
+
+fn parse_device(s: &str) -> LuaResult<Device> {
+    if s == "cpu" {
+        return Ok(Device::Cpu);
+    }
+    if let Some(rest) = s.strip_prefix("cuda:") {
+        let ord: usize = rest.parse().map_err(|e| {
+            LuaError::external(format!(
+                "alc.nn.preset.gpt2: invalid cuda ordinal '{rest}': {e}"
+            ))
+        })?;
+        return Device::new_cuda(ord).map_err(|e| {
+            LuaError::external(format!(
+                "alc.nn.preset.gpt2: cuda:{ord} unavailable: {e}"
+            ))
+        });
+    }
+    if s == "cuda" {
+        return Device::new_cuda(0).map_err(|e| {
+            LuaError::external(format!("alc.nn.preset.gpt2: cuda unavailable: {e}"))
+        });
+    }
+    Err(LuaError::external(format!(
+        "alc.nn.preset.gpt2: unknown device '{s}' (expected 'cpu', 'cuda', or 'cuda:N')"
+    )))
+}
+
+fn parse_dtype(s: &str) -> LuaResult<DType> {
+    match s {
+        "f32" | "fp32" => Ok(DType::F32),
+        "bf16" => Ok(DType::BF16),
+        "f16" | "fp16" => Ok(DType::F16),
+        other => Err(LuaError::external(format!(
+            "alc.nn.preset.gpt2: unknown dtype '{other}' (expected 'f32', 'bf16', or 'f16')"
+        ))),
+    }
+}
+
+// ─── alc.nn.data ──────────────────────────────────────────────────
+
+/// Lua userdata handle around a `Box<dyn Dataset>`.
+///
+/// The `Send` bound is satisfied by wrapping the `Box` in a `Mutex` so
+/// mlua's `send` feature accepts the type across VM boundaries. The
+/// trainer follow-up pulls batches out of this handle inside the
+/// training loop.
+pub(super) struct DatasetHandle {
+    inner: Mutex<Box<dyn Dataset + Send>>,
+    source: String,
+    batch_size: usize,
+    ctx_len: usize,
+}
+
+impl mlua::UserData for DatasetHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("source", |_, this, ()| Ok(this.source.clone()));
+        methods.add_method("batch_size", |_, this, ()| Ok(this.batch_size));
+        methods.add_method("ctx_len", |_, this, ()| Ok(this.ctx_len));
+        methods.add_method("len_hint", |_, this, ()| {
+            let ds = this.inner.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.data: dataset lock poisoned: {e}"))
+            })?;
+            Ok(ds.len_hint())
+        });
+        methods.add_method_mut("next_batch", |lua, this, ()| -> LuaResult<Option<LuaTable>> {
+            let mut ds = this.inner.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.data: dataset lock poisoned: {e}"))
+            })?;
+            match ds
+                .next_batch()
+                .map_err(|e| LuaError::external(format!("alc.nn.data.next_batch: {e}")))?
+            {
+                Some(batch) => Ok(Some(batch_to_lua(lua, batch)?)),
+                None => Ok(None),
+            }
+        });
+    }
+}
+
+fn batch_to_lua(lua: &Lua, batch: Batch) -> LuaResult<LuaTable> {
+    let out = lua.create_table()?;
+    let rows = lua.create_table()?;
+    for (i, row) in batch.input_ids.into_iter().enumerate() {
+        let arr = lua.create_table()?;
+        for (j, id) in row.into_iter().enumerate() {
+            arr.set(j + 1, id)?;
+        }
+        rows.set(i + 1, arr)?;
+    }
+    out.set("input_ids", rows)?;
+    out.set("is_last", batch.is_last)?;
+    Ok(out)
+}
+
+fn register_data_ns(
+    lua: &Lua,
+    nn_table: &LuaTable,
+    card_store: Arc<FileCardStore>,
+    nn_dir: PathBuf,
+) -> LuaResult<()> {
+    let data = lua.create_table()?;
+
+    // jsonl(path, opts) — streams a JSONL file, tokenizing each row.
+    let jsonl_tok_dir = nn_dir.join("tokenizers");
+    let jsonl = lua.create_function(
+        move |_lua, (path, opts): (String, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
+            let dopts = extract_dataset_opts(opts.as_ref())?;
+            let tokenizer_name = opts
+                .as_ref()
+                .and_then(|t| t.get::<Option<String>>("tokenizer").ok().flatten())
+                .unwrap_or_else(|| "gpt2".to_string());
+            let tok = HfTokenizer::load_cached(&tokenizer_name, &jsonl_tok_dir)
+                .map_err(|e| LuaError::external(format!("alc.nn.data.jsonl: {e}")))?;
+            let ds = JsonlDataset::new(std::path::Path::new(&path), dopts.clone(), tok)
+                .map_err(|e| LuaError::external(format!("alc.nn.data.jsonl: {e}")))?;
+            Ok(DatasetHandle {
+                inner: Mutex::new(Box::new(ds)),
+                source: format!("jsonl:{path}"),
+                batch_size: dopts.batch_size,
+                ctx_len: dopts.ctx_len,
+            })
+        },
+    )?;
+    data.set("jsonl", jsonl)?;
+
+    // parquet(path, opts) — scaffold only; iteration surfaces
+    // NotImplemented until a later stage wires the reader.
+    let parquet = lua.create_function(
+        move |_lua, (path, opts): (String, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
+            let dopts = extract_dataset_opts(opts.as_ref())?;
+            let ds = ParquetDataset::new(std::path::Path::new(&path), dopts.clone());
+            Ok(DatasetHandle {
+                inner: Mutex::new(Box::new(ds)),
+                source: format!("parquet:{path}"),
+                batch_size: dopts.batch_size,
+                ctx_len: dopts.ctx_len,
+            })
+        },
+    )?;
+    data.set("parquet", parquet)?;
+
+    // from_card(card_id, opts) — read Card samples via
+    // FileCardStore (invariant #5), tokenize `prompt` / `response`
+    // pairs, and build an in-memory `TokenizedDataset`.
+    let from_card_store = Arc::clone(&card_store);
+    let from_card_tok_dir = nn_dir.join("tokenizers");
+    let from_card = lua.create_function(
+        move |_lua,
+              (card_id, opts): (String, Option<LuaTable>)|
+              -> LuaResult<DatasetHandle> {
+            let dopts = extract_dataset_opts(opts.as_ref())?;
+            let tokenizer_name = opts
+                .as_ref()
+                .and_then(|t| t.get::<Option<String>>("tokenizer").ok().flatten())
+                .unwrap_or_else(|| "gpt2".to_string());
+            let tok = HfTokenizer::load_cached(&tokenizer_name, &from_card_tok_dir)
+                .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?;
+
+            let samples = from_card_store
+                .read_samples(&card_id, SamplesQuery::default())
+                .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?;
+
+            // Tokenize "prompt\nresponse" per sample. Empty rows are
+            // skipped so an in-progress teacher log without complete
+            // pairs still yields a usable dataset.
+            let mut rows: Vec<Vec<u32>> = Vec::with_capacity(samples.len());
+            for (idx, sample) in samples.into_iter().enumerate() {
+                let prompt = sample
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let response = sample
+                    .get("response")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let text = if !prompt.is_empty() && !response.is_empty() {
+                    format!("{prompt}\n{response}")
+                } else if !prompt.is_empty() {
+                    prompt.to_string()
+                } else if !response.is_empty() {
+                    response.to_string()
+                } else {
+                    continue;
+                };
+                let ids = tok.encode(&text).map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn.data.from_card: sample {idx}: {e}"
+                    ))
+                })?;
+                if !ids.is_empty() {
+                    rows.push(ids);
+                }
+            }
+
+            let ds = TokenizedDataset::new(rows, dopts.clone());
+            Ok(DatasetHandle {
+                inner: Mutex::new(Box::new(ds)),
+                source: format!("card:{card_id}"),
+                batch_size: dopts.batch_size,
+                ctx_len: dopts.ctx_len,
+            })
+        },
+    )?;
+    data.set("from_card", from_card)?;
+
+    nn_table.set("data", data)?;
+    Ok(())
+}
+
+fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
+    let mut d = DatasetOpts::default();
+    if let Some(t) = opts {
+        if let Some(v) = t.get::<Option<usize>>("batch_size")? {
+            d.batch_size = v;
+        }
+        if let Some(v) = t.get::<Option<usize>>("ctx_len")? {
+            d.ctx_len = v;
+        }
+        if let Some(v) = t.get::<Option<bool>>("shuffle")? {
+            d.shuffle = v;
+        }
+        if let Some(v) = t.get::<Option<u32>>("pad_id")? {
+            d.pad_id = v;
+        }
+        if let Some(v) = t.get::<Option<String>>("text_field")? {
+            d.text_field = v;
+        }
+    }
+    if d.batch_size == 0 {
+        return Err(LuaError::external(
+            "alc.nn.data: batch_size must be >= 1".to_string(),
+        ));
+    }
+    if d.ctx_len == 0 {
+        return Err(LuaError::external(
+            "alc.nn.data: ctx_len must be >= 1".to_string(),
+        ));
+    }
+    Ok(d)
 }

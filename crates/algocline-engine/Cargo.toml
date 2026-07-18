@@ -19,6 +19,13 @@ algocline-core = { workspace = true }
 # the default MCP build never links candle (keeps it light).
 algocline-nn = { path = "../algocline-nn", version = "0.45.0", optional = true }
 
+# Candle re-exports named by bridge/nn_card.rs (DType / Device / VarMap
+# / VarBuilder). Gated on the same `nn` feature so the default MCP
+# build does not pull candle in; only enabled when the nn bridge is
+# compiled.
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+
 mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"] }
 mlua-isle = { version = "0.4", features = ["tokio"] }
 mlua-mathlib = "0.3"
@@ -46,4 +53,4 @@ proptest = "1"
 test-support = []
 # Opt-in neural-network bridge (`alc.nn`). Default off: the default build does
 # not link candle. Enable with `--features nn`.
-nn = ["dep:algocline-nn"]
+nn = ["dep:algocline-nn", "dep:candle-core", "dep:candle-nn"]

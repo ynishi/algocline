@@ -1,0 +1,500 @@
+//! GPT-2 architecture builder.
+//!
+//! Implements the two variants shipped in Phase 1 (design §6.1):
+//!
+//! - `gpt2-medium` — 24 layers, 16 heads, 1024 dim, 1024 ctx, 50257 vocab
+//! - `gpt2-large`  — 36 layers, 20 heads, 1280 dim, 1024 ctx, 50257 vocab
+//!
+//! Architecture components (nanoGPT / HuggingFace `openai-community/gpt2`
+//! reference layout):
+//!
+//! - `wte` — token embedding (`vocab × dim`)
+//! - `wpe` — learned positional embedding (`ctx × dim`)
+//! - `h.<i>.ln_1` / `ln_2` — pre-LayerNorm (dim)
+//! - `h.<i>.attn.c_attn` — fused Q/K/V projection (`dim → 3·dim`)
+//! - `h.<i>.attn.c_proj` — attention output projection (`dim → dim`)
+//! - `h.<i>.mlp.c_fc` / `mlp.c_proj` — 4× expansion MLP with GELU
+//! - `ln_f` — final LayerNorm (dim)
+//! - LM head weights are tied to `wte` (shared matrix)
+//!
+//! Forward output shape is `[batch, seq, vocab]` per subtask invariant
+//! #1. Attention uses a causal (lower-triangular) mask.
+
+use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
+use candle_nn::{embedding, layer_norm, linear, ops, Embedding, LayerNorm, Linear, Module, VarBuilder};
+
+/// Immutable configuration for a GPT-2 preset.
+#[derive(Debug, Clone)]
+pub struct Gpt2Config {
+    /// Number of transformer blocks.
+    pub layers: usize,
+    /// Number of attention heads. `dim` must be divisible by `heads`.
+    pub heads: usize,
+    /// Model hidden size.
+    pub dim: usize,
+    /// Maximum context length (positional embedding size).
+    pub ctx: usize,
+    /// Vocabulary size (matches the tokenizer, 50257 for GPT-2).
+    pub vocab: usize,
+    /// Weight precision.
+    pub dtype: DType,
+    /// Device the parameters live on.
+    pub device: Device,
+    /// LayerNorm epsilon (HuggingFace GPT-2 default = 1e-5).
+    pub eps: f64,
+}
+
+impl Gpt2Config {
+    /// `gpt2-medium` preset (355M params).
+    pub fn medium() -> Self {
+        Self {
+            layers: 24,
+            heads: 16,
+            dim: 1024,
+            ctx: 1024,
+            vocab: 50257,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        }
+    }
+
+    /// `gpt2-large` preset (774M params).
+    pub fn large() -> Self {
+        Self {
+            layers: 36,
+            heads: 20,
+            dim: 1280,
+            ctx: 1024,
+            vocab: 50257,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        }
+    }
+
+    /// Resolve a variant name (`"medium"` or `"large"`) to the matching
+    /// preset. Returns `None` for unknown names.
+    pub fn from_variant(variant: &str) -> Option<Self> {
+        match variant {
+            "medium" | "gpt2-medium" => Some(Self::medium()),
+            "large" | "gpt2-large" => Some(Self::large()),
+            _ => None,
+        }
+    }
+
+    /// HuggingFace repository id for warm-start weight download
+    /// (design §12 Q5). Returns `None` for a config not built from a
+    /// standard preset.
+    pub fn hf_repo(&self) -> Option<&'static str> {
+        match (self.layers, self.heads, self.dim) {
+            (24, 16, 1024) => Some("openai-community/gpt2-medium"),
+            (36, 20, 1280) => Some("openai-community/gpt2-large"),
+            _ => None,
+        }
+    }
+}
+
+/// A single GPT-2 transformer block.
+///
+/// Pre-LN topology (LN → Attention → residual → LN → MLP → residual)
+/// matches nanoGPT and HF GPT-2.
+struct Block {
+    ln_1: LayerNorm,
+    c_attn: Linear,
+    c_proj: Linear,
+    ln_2: LayerNorm,
+    mlp_c_fc: Linear,
+    mlp_c_proj: Linear,
+    heads: usize,
+    head_dim: usize,
+}
+
+impl Block {
+    fn new(cfg: &Gpt2Config, vs: VarBuilder) -> CandleResult<Self> {
+        let head_dim = cfg.dim / cfg.heads;
+        let ln_1 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_1"))?;
+        let attn_vs = vs.pp("attn");
+        let c_attn = linear(cfg.dim, 3 * cfg.dim, attn_vs.pp("c_attn"))?;
+        let c_proj = linear(cfg.dim, cfg.dim, attn_vs.pp("c_proj"))?;
+        let ln_2 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_2"))?;
+        let mlp_vs = vs.pp("mlp");
+        let mlp_c_fc = linear(cfg.dim, 4 * cfg.dim, mlp_vs.pp("c_fc"))?;
+        let mlp_c_proj = linear(4 * cfg.dim, cfg.dim, mlp_vs.pp("c_proj"))?;
+        Ok(Self {
+            ln_1,
+            c_attn,
+            c_proj,
+            ln_2,
+            mlp_c_fc,
+            mlp_c_proj,
+            heads: cfg.heads,
+            head_dim,
+        })
+    }
+
+    fn attention(&self, x: &Tensor, mask: &Tensor) -> CandleResult<Tensor> {
+        // x: [B, T, D]
+        let (b, t, _d) = x.dims3()?;
+        let qkv = self.c_attn.forward(x)?; // [B, T, 3D]
+        let qkv = qkv.reshape((b, t, 3, self.heads, self.head_dim))?;
+        // Split into Q/K/V — each [B, T, H, Dh]. Then transpose to [B, H, T, Dh].
+        let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?;
+        let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
+        let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
+
+        // Scaled dot-product: [B, H, T, T].
+        let scale = (self.head_dim as f64).sqrt();
+        let mut scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        scores = (scores / scale)?;
+
+        // Causal mask: keep positions j <= i.
+        let mask = mask.i((..t, ..t))?; // [T, T]
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
+            .to_dtype(scores.dtype())?
+            .broadcast_as(scores.shape())?;
+        let mask4 = mask
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .broadcast_as(scores.shape())?;
+        scores = mask4.where_cond(&scores, &neg_inf)?;
+        let probs = ops::softmax_last_dim(&scores)?;
+
+        // [B, H, T, Dh] then merge back to [B, T, D].
+        let ctx = probs.matmul(&v)?;
+        let ctx = ctx
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, t, self.heads * self.head_dim))?;
+        self.c_proj.forward(&ctx)
+    }
+
+    fn mlp(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let h = self.mlp_c_fc.forward(x)?;
+        // GELU (approximate variant matches HF GPT-2). `gelu` is the
+        // exact form; both are within 1e-3 for our purposes.
+        let h = h.gelu()?;
+        self.mlp_c_proj.forward(&h)
+    }
+
+    fn forward(&self, x: &Tensor, mask: &Tensor) -> CandleResult<Tensor> {
+        let n = self.ln_1.forward(x)?;
+        let a = self.attention(&n, mask)?;
+        let x = (x + a)?;
+        let n = self.ln_2.forward(&x)?;
+        let m = self.mlp(&n)?;
+        x + m
+    }
+}
+
+/// GPT-2 forward-only model.
+///
+/// Constructed via [`Gpt2Model::new`] (random init from a [`VarBuilder`])
+/// or [`Gpt2Model::from_pretrained`] (HuggingFace warm-start, design
+/// §12 Q5). Training loops live in a follow-up stage; this stage
+/// ships the forward path only.
+pub struct Gpt2Model {
+    wte: Embedding,
+    wpe: Embedding,
+    blocks: Vec<Block>,
+    ln_f: LayerNorm,
+    /// Cached causal mask (`1.0` below the diagonal, `0.0` above) sized
+    /// to [`Gpt2Config::ctx`] so per-forward mask allocation is avoided.
+    causal_mask: Tensor,
+    cfg: Gpt2Config,
+}
+
+impl Gpt2Model {
+    /// Build a fresh GPT-2 model (random parameters) from a
+    /// [`VarBuilder`]. Weight naming matches the HF `openai-community/gpt2*`
+    /// convention so a subsequent [`Gpt2Model::from_pretrained`] can
+    /// load into the same shape.
+    pub fn new(cfg: &Gpt2Config, vs: VarBuilder) -> CandleResult<Self> {
+        if !cfg.dim.is_multiple_of(cfg.heads) {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2: dim {} must be divisible by heads {}",
+                cfg.dim, cfg.heads
+            )));
+        }
+        let wte = embedding(cfg.vocab, cfg.dim, vs.pp("wte"))?;
+        let wpe = embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?;
+        let h_vs = vs.pp("h");
+        let mut blocks = Vec::with_capacity(cfg.layers);
+        for i in 0..cfg.layers {
+            blocks.push(Block::new(cfg, h_vs.pp(i.to_string()))?);
+        }
+        let ln_f = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_f"))?;
+        let causal_mask = build_causal_mask(cfg.ctx, &cfg.device, cfg.dtype)?;
+        Ok(Self {
+            wte,
+            wpe,
+            blocks,
+            ln_f,
+            causal_mask,
+            cfg: cfg.clone(),
+        })
+    }
+
+    /// Return the configuration this model was built from.
+    pub fn config(&self) -> &Gpt2Config {
+        &self.cfg
+    }
+
+    /// Load pretrained GPT-2 weights from HuggingFace on first use and
+    /// cache the safetensors bundle at `cache_dir/base/<preset>.safetensors`.
+    ///
+    /// The config selects the HF repo via [`Gpt2Config::hf_repo`]; a
+    /// custom config that is not one of the shipped presets returns an
+    /// error rather than downloading a mismatched bundle.
+    ///
+    /// # Errors
+    ///
+    /// Fails on: unknown preset (no HF repo), network / cache IO error,
+    /// safetensors parse error, or a weight-name mismatch between the
+    /// downloaded bundle and the model shape.
+    pub fn from_pretrained(
+        variant: &str,
+        cfg: &Gpt2Config,
+        cache_dir: &std::path::Path,
+    ) -> Result<Self, PretrainedError> {
+        let repo = cfg
+            .hf_repo()
+            .ok_or_else(|| PretrainedError::UnknownPreset(variant.to_string()))?;
+
+        // Cache dir: `<cache_dir>/base/<repo-basename>.safetensors`.
+        let base_dir = cache_dir.join("base");
+        std::fs::create_dir_all(&base_dir)
+            .map_err(|e| PretrainedError::CacheIo(format!("mkdir {:?}: {e}", base_dir)))?;
+        let repo_leaf = repo.rsplit('/').next().unwrap_or(repo);
+        let cache_path = base_dir.join(format!("{repo_leaf}.safetensors"));
+
+        if !cache_path.exists() {
+            tracing::info!(
+                target: "algocline_nn::arch::gpt2",
+                repo,
+                cache = %cache_path.display(),
+                "downloading gpt-2 pretrained weights"
+            );
+            let api = hf_hub::api::sync::Api::new()
+                .map_err(|e| PretrainedError::HubApi(e.to_string()))?;
+            let downloaded = api
+                .model(repo.to_string())
+                .get("model.safetensors")
+                .map_err(|e| PretrainedError::Download(e.to_string()))?;
+            std::fs::copy(&downloaded, &cache_path).map_err(|e| {
+                PretrainedError::CacheIo(format!(
+                    "copy {:?} -> {:?}: {e}",
+                    downloaded, cache_path
+                ))
+            })?;
+        }
+
+        // Load through candle's mmap-safetensors VarBuilder.
+        // SAFETY: candle exposes this constructor as unsafe because the
+        // caller must ensure the mmap-backed file is not concurrently
+        // truncated. The cache path is only written once above under a
+        // first-use guard; subsequent readers hold the mmap for the
+        // lifetime of this call.
+        let vs = unsafe {
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&cache_path),
+                cfg.dtype,
+                &cfg.device,
+            )
+            .map_err(|e| PretrainedError::Load(e.to_string()))?
+        };
+        Self::new(cfg, vs).map_err(|e| PretrainedError::Load(e.to_string()))
+    }
+
+    /// Forward pass. Input `xs` is `[batch, seq]` of `u32` token ids;
+    /// output is `[batch, seq, vocab]` — the raw logits (softmax is left
+    /// to the training loss / sampling caller).
+    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let (b, t) = xs.dims2()?;
+        if t > self.cfg.ctx {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: seq {t} exceeds ctx {}",
+                self.cfg.ctx
+            )));
+        }
+        let tok_emb = self.wte.forward(xs)?; // [B, T, D]
+        let pos_ids = Tensor::arange(0u32, t as u32, xs.device())?; // [T]
+        let pos_emb = self.wpe.forward(&pos_ids)?; // [T, D]
+        let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(tok_emb.shape())?;
+        let mut h = (tok_emb + pos_emb)?;
+        for block in &self.blocks {
+            h = block.forward(&h, &self.causal_mask)?;
+        }
+        let h = self.ln_f.forward(&h)?; // [B, T, D]
+        // Tied LM head: logits = h @ wte.weight^T.
+        let w = self.wte.embeddings(); // [V, D]
+        let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
+        debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
+        Ok(logits)
+    }
+}
+
+/// Errors from [`Gpt2Model::from_pretrained`].
+///
+/// Explicit variants so the caller (Lua bridge) can surface an
+/// actionable error string per the crate's Service-layer
+/// error-propagation discipline — no silent fallback.
+#[derive(Debug, thiserror::Error)]
+pub enum PretrainedError {
+    /// Requested variant has no known HuggingFace mapping.
+    #[error("unknown pretrained preset: {0}")]
+    UnknownPreset(String),
+    /// hf-hub client construction failure.
+    #[error("hf-hub api: {0}")]
+    HubApi(String),
+    /// Weight download failure.
+    #[error("hf-hub download: {0}")]
+    Download(String),
+    /// Local cache IO failure.
+    #[error("cache io: {0}")]
+    CacheIo(String),
+    /// safetensors / candle loading failure.
+    #[error("load: {0}")]
+    Load(String),
+}
+
+/// Build a causal (lower-triangular) mask `[ctx, ctx]` where valid
+/// (kept) positions are `1` and masked-out are `0`.
+///
+/// Returned as `u8` because candle's `Tensor::where_cond` only accepts
+/// unsigned-integer condition tensors; the attention path never uses
+/// the mask as a numeric multiplier (it drives `where_cond` between
+/// the scaled scores and `-inf`), so the concrete `dtype` of the model
+/// weights is irrelevant here.
+fn build_causal_mask(ctx: usize, device: &Device, _dtype: DType) -> CandleResult<Tensor> {
+    let mut data = vec![0u8; ctx * ctx];
+    for i in 0..ctx {
+        for j in 0..=i {
+            data[i * ctx + j] = 1;
+        }
+    }
+    Tensor::from_vec(data, (ctx, ctx), device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    #[test]
+    fn medium_preset_shape() {
+        let cfg = Gpt2Config::medium();
+        assert_eq!(cfg.layers, 24);
+        assert_eq!(cfg.heads, 16);
+        assert_eq!(cfg.dim, 1024);
+        assert_eq!(cfg.ctx, 1024);
+        assert_eq!(cfg.vocab, 50257);
+        assert_eq!(cfg.hf_repo(), Some("openai-community/gpt2-medium"));
+    }
+
+    #[test]
+    fn large_preset_shape() {
+        let cfg = Gpt2Config::large();
+        assert_eq!(cfg.layers, 36);
+        assert_eq!(cfg.heads, 20);
+        assert_eq!(cfg.dim, 1280);
+        assert_eq!(cfg.hf_repo(), Some("openai-community/gpt2-large"));
+    }
+
+    #[test]
+    fn from_variant_recognizes_aliases() {
+        assert!(Gpt2Config::from_variant("medium").is_some());
+        assert!(Gpt2Config::from_variant("gpt2-medium").is_some());
+        assert!(Gpt2Config::from_variant("large").is_some());
+        assert!(Gpt2Config::from_variant("gpt2-large").is_some());
+        assert!(Gpt2Config::from_variant("small").is_none());
+    }
+
+    #[test]
+    fn rejects_dim_not_divisible_by_heads() {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 3, // 8 % 3 != 0
+            dim: 8,
+            ctx: 4,
+            vocab: 10,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let msg = match Gpt2Model::new(&cfg, vs) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("divisible"));
+    }
+
+    /// Tiny (2-layer, 2-head, vocab 32) forward on CPU. Confirms the
+    /// exact `[batch, seq, vocab]` output shape (subtask invariant #1).
+    #[test]
+    fn tiny_forward_shape() {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: 8,
+            vocab: 32,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, 32]);
+    }
+
+    #[test]
+    fn tiny_forward_batch_shape() {
+        let cfg = Gpt2Config {
+            layers: 1,
+            heads: 2,
+            dim: 8,
+            ctx: 4,
+            vocab: 16,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let ids =
+            Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 8], (2, 4), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[2, 4, 16]);
+    }
+
+    #[test]
+    fn forward_rejects_seq_over_ctx() {
+        let cfg = Gpt2Config {
+            layers: 1,
+            heads: 2,
+            dim: 8,
+            ctx: 4,
+            vocab: 16,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        // seq = 5 > ctx = 4
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+        let msg = match model.forward(&ids) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("exceeds ctx"));
+    }
+}

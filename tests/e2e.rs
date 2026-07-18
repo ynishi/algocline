@@ -8549,3 +8549,187 @@ async fn test_alc_trace_diff_missing_card_typed_error() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── [setting.card].run gate — MCP boundary E2E (Phase 1-H1) ──────
+//
+// Phase 1-B integration tests exercised the gate inside the engine crate
+// (`bridge::data::register_card` with a hand-rolled Lua VM); Phase 1-C
+// pinned the `load_full` round-trip at the store level.  Phase 1-H1
+// pins the full MCP-boundary path:
+//
+//   rmcp client
+//     → `alc_v2_run` MCP tool
+//       → `ExecutionService::spawn` → `service::setting::resolve_setting`
+//         (env `ALC_SETTING_CARD_RUN` → `BridgeConfig.card_run_enabled`)
+//         → `alc.card.create` Lua bridge → `FileCardStore` → TOML file
+//   rmcp client → `alc_v2_state` (poll until "done") → `result.value`
+//   rmcp client → `alc_card_get` MCP tool → JSON → `run` field access.
+//
+// The v2 path is required: the legacy `alc_run` path in
+// `service::run::start_and_tick` hard-codes `card_run_enabled = false`
+// (see the "Legacy start_and_tick paths … do not resolve the Phase 1-B
+// gate" comment at the call site) — only `alc_v2_run` (via
+// `ExecutionService::spawn`) resolves the setting from env/project/global.
+//
+// `ALC_HOME` is set to a fresh tempdir per test so the child server's
+// `FileCardStore` roots at `$ALC_HOME/cards/`; neither test pollutes
+// `~/.algocline` nor leaks state to the other test.  Env vars are set
+// on the child process only (via `connect_with_alc_home_and_env`), so
+// the parent test process' env is untouched and no cross-test env
+// mutex is needed.
+
+/// Poll `alc_v2_state` at 20ms intervals until the session reaches
+/// `state = "done"`.  Panics if the terminal state is not reached
+/// within `max_wait` or if the session ends in `failed` / `cancelled`.
+async fn poll_until_v2_done(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    session_id: &str,
+    max_wait: Duration,
+) -> Value {
+    timeout(max_wait, async {
+        loop {
+            let state = call_json(client, "alc_v2_state", json!({"session_id": session_id})).await;
+            match state["state"].as_str() {
+                Some("done") => return state,
+                Some("failed") | Some("cancelled") => panic!(
+                    "session {session_id} ended non-successfully while awaiting done: {state}"
+                ),
+                _ => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for session {session_id} to reach done"))
+}
+
+/// `[setting.card].run = true` (via `ALC_SETTING_CARD_RUN=true` env) →
+/// `alc.card.create({ run = { ... } })` writes the Card and the resulting
+/// TOML round-trips all three `run` sub-fields (status/reason/action)
+/// through the MCP boundary via `alc_card_get`.
+#[tokio::test]
+async fn test_alc_card_create_with_run_section_when_enabled() {
+    let alc_home = tempfile::tempdir().expect("alc_home tempdir");
+    std::fs::create_dir_all(alc_home.path().join("packages")).expect("mk packages");
+
+    let client = connect_with_alc_home_and_env(
+        alc_home.path(),
+        &[("ALC_SETTING_CARD_RUN", "true")],
+    )
+    .await;
+
+    // 1. Drive `alc.card.create` via `alc_v2_run`.  Returning the closure
+    //    result surfaces `card_id` / `path` as an object in the terminal
+    //    ExecutionResult.value.
+    let script = r#"
+        local r = alc.card.create({
+            pkg = { name = "e2e_test" },
+            run = {
+                status = "failed",
+                reason = "e2e grader < 3",
+                action = "write",
+            },
+        })
+        return r
+    "#;
+    let spawn = call_json(&client, "alc_v2_run", json!({ "code": script })).await;
+    let sid = spawn["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alc_v2_run must return session_id, got: {spawn}"));
+
+    let state = poll_until_v2_done(&client, sid, Duration::from_secs(5)).await;
+    let value = &state["value"];
+    assert!(
+        value.is_object(),
+        "enable=on create must return an object with card_id/path, got state: {state}"
+    );
+    let card_id = value["card_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("card_id must be a string, got value: {value}"));
+    assert!(!card_id.is_empty(), "card_id must not be empty");
+    let path = value["path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("path must be a string, got value: {value}"));
+    assert!(!path.is_empty(), "path must not be empty");
+
+    // 2. Fetch the Card via `alc_card_get` and assert the `[run]` section
+    //    round-tripped through TOML with all three sub-fields intact.
+    let card = call_json(&client, "alc_card_get", json!({ "card_id": card_id })).await;
+    let run = card
+        .get("run")
+        .unwrap_or_else(|| panic!("[run] section missing from card: {card}"));
+    assert_eq!(
+        run["status"], "failed",
+        "run.status must round-trip, got card: {card}"
+    );
+    assert_eq!(
+        run["reason"], "e2e grader < 3",
+        "run.reason must round-trip, got card: {card}"
+    );
+    assert_eq!(
+        run["action"], "write",
+        "run.action must round-trip, got card: {card}"
+    );
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// `[setting.card].run = false` (via `ALC_SETTING_CARD_RUN=false` env) →
+/// `alc.card.create({ run = { ... } })` short-circuits with `nil` (surfaced
+/// as JSON `null` in the terminal `ExecutionResult.value`) and no Card
+/// file is written.  The `alc_card_list` empty result is a sufficient
+/// proxy for "no `CardEvent::Created` was published", since `publish`
+/// runs only after `store.write_new_card` — a gate that short-circuits
+/// before the store call cannot reach the event bus.
+#[tokio::test]
+async fn test_alc_card_create_with_run_section_noop_when_disabled() {
+    let alc_home = tempfile::tempdir().expect("alc_home tempdir");
+    std::fs::create_dir_all(alc_home.path().join("packages")).expect("mk packages");
+
+    // Explicit "false" — belt-and-suspenders against any inherited
+    // `ALC_SETTING_CARD_RUN` in the parent env.  The setting defaults to
+    // `false` when absent, so either shape is spec-legal.
+    let client = connect_with_alc_home_and_env(
+        alc_home.path(),
+        &[("ALC_SETTING_CARD_RUN", "false")],
+    )
+    .await;
+
+    // 1. Enable=off + `run` field present: the bridge short-circuits
+    //    with `nil`, which reaches the caller as JSON `null` in the
+    //    terminal `ExecutionResult.value`.
+    let script = r#"
+        local r = alc.card.create({
+            pkg = { name = "e2e_test" },
+            run = {
+                status = "failed",
+                reason = "e2e grader < 3",
+                action = "write",
+            },
+        })
+        return r
+    "#;
+    let spawn = call_json(&client, "alc_v2_run", json!({ "code": script })).await;
+    let sid = spawn["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alc_v2_run must return session_id, got: {spawn}"));
+
+    let state = poll_until_v2_done(&client, sid, Duration::from_secs(5)).await;
+    assert!(
+        state["value"].is_null(),
+        "enable=off create must return nil (JSON null), got state: {state}"
+    );
+
+    // 2. No Card was written — `alc_card_list(pkg="e2e_test")` must be
+    //    an empty array.
+    let list = call_json(&client, "alc_card_list", json!({ "pkg": "e2e_test" })).await;
+    let rows = list
+        .as_array()
+        .unwrap_or_else(|| panic!("alc_card_list must return an array, got: {list}"));
+    assert!(
+        rows.is_empty(),
+        "enable=off must not write a Card, got {} row(s): {list}",
+        rows.len()
+    );
+
+    client.cancel().await.expect("cancel failed");
+}

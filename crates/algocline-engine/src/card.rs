@@ -3204,6 +3204,102 @@ mod tests {
         assert_eq!(section.action.as_deref(), Some("write"));
     }
 
+    // ─── load_full [run] section round-trip (Phase 1-C) ────────────
+
+    /// A Card TOML file that carries a `[run]` section on disk must
+    /// surface every subfield (`status` / `reason` / `action`) in the
+    /// `CardRow.full` JSON produced by `load_full`.  `load_full` is a
+    /// raw `toml::from_str` + `toml_to_json` pass-through, so this test
+    /// locks in the guarantee that Phase 1-B's on-disk `[run]` shape
+    /// survives round-trip without any typed schema wiring at the
+    /// loader boundary.
+    #[test]
+    fn load_full_preserves_run_section_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "run_present_pkg";
+        let card_id = "run_present_pkg_20260101T000000_abcdef";
+
+        // Write the Card TOML directly so we exercise the on-disk
+        // representation Phase 1-B produces, rather than routing through
+        // `create_with_store` (which would obscure the wire shape).
+        let toml_text = format!(
+            r#"schema_version = "card/v0"
+card_id = "{card_id}"
+created_at = "2026-01-01T00:00:00Z"
+
+[pkg]
+name = "{pkg}"
+
+[run]
+status = "failed"
+reason = "grader rating < 3"
+action = "write"
+"#
+        );
+        let pkg_dir = tmp.path().join(pkg);
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let card_path = pkg_dir.join(format!("{card_id}.toml"));
+        fs::write(&card_path, &toml_text).unwrap();
+
+        let row = load_full(&store, &card_path, pkg)
+            .expect("load_full must succeed for a well-formed Card with [run] section");
+
+        let run = row
+            .full
+            .get("run")
+            .expect("run field must survive TOML → JSON round-trip");
+        assert_eq!(
+            run.get("status").and_then(|v| v.as_str()),
+            Some("failed"),
+            "status must be preserved verbatim"
+        );
+        assert_eq!(
+            run.get("reason").and_then(|v| v.as_str()),
+            Some("grader rating < 3"),
+            "reason must be preserved verbatim"
+        );
+        assert_eq!(
+            run.get("action").and_then(|v| v.as_str()),
+            Some("write"),
+            "action must be preserved verbatim"
+        );
+    }
+
+    /// Backward compat (Phase 1-C): a Card TOML file lacking `[run]`
+    /// must load cleanly with no `run` key in the JSON projection, so
+    /// existing Cards written before Phase 1-B remain unaffected by the
+    /// new schema.
+    #[test]
+    fn load_full_returns_no_run_field_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "run_absent_pkg";
+        let card_id = "run_absent_pkg_20260101T000000_abcdef";
+
+        let toml_text = format!(
+            r#"schema_version = "card/v0"
+card_id = "{card_id}"
+created_at = "2026-01-01T00:00:00Z"
+
+[pkg]
+name = "{pkg}"
+"#
+        );
+        let pkg_dir = tmp.path().join(pkg);
+        fs::create_dir_all(&pkg_dir).unwrap();
+        let card_path = pkg_dir.join(format!("{card_id}.toml"));
+        fs::write(&card_path, &toml_text).unwrap();
+
+        let row = load_full(&store, &card_path, pkg)
+            .expect("load_full must succeed for a Card without [run] section");
+
+        assert!(
+            row.full.get("run").is_none(),
+            "absent [run] section must not surface as a JSON field (backward compat)"
+        );
+    }
+
     #[test]
     fn minimum_valid_card() {
         let tmp = tempfile::tempdir().unwrap();

@@ -250,6 +250,18 @@ path = "/Users/me/journal.md"
 pkg  = false
 ```
 
+**Known targets used by algocline itself:**
+
+| Target / field | Type | Meaning |
+|---|---|---|
+| `[setting.card].run` | boolean (default `false`) | Gate `alc.card.create` / `alc.card.append` for callers that populate a `run` sub-table. When off, those calls become a silent no-op and return `nil`. When on, the `[run]` section is written verbatim into the Card TOML. Enable per-project via `alc.local.toml`, per-user via `config.toml`, or per-session via `ALC_SETTING_CARD_RUN=true`. See `docs/lua-stdlib.md` §alc.card for the `[run]` shape and §Card context injection for how these Cards feed back into `alc.llm` prompts. |
+
+```toml
+# ~/.algocline/config.toml — opt Run-side Card writes in
+[setting.card]
+run = true
+```
+
 ### Resolution order
 
 For each field, the highest-priority layer that defines it wins. Lower layers

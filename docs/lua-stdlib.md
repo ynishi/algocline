@@ -67,6 +67,7 @@ Call the Host LLM. The Lua coroutine yields until the host responds.
 | `opts.grounded` | boolean | no | Request grounded response (default: false) |
 | `opts.underspecified` | boolean | no | Signal underspecified prompt (default: false) |
 | `opts.cache_breakpoint` | string | no | Opaque prompt-cache hint forwarded to the host (e.g. `"context"` / `"prompt"`). Host is responsible for mapping to provider-specific cache API (Anthropic `cache_control` etc.). Hosts without prompt-cache support ignore the field. |
+| `opts.card_context` | string \| table | no | Inject prior Cards into the system prompt as a fixed `<past_cards>` XML-like block. String form resolves a single Card by id; table form `{pkg=..., limit=N}` fetches the N most recent Cards for that pkg (default 5, capped at 100). See `alc.card` §Card context injection for the template. |
 
 **Returns:** string (LLM response)
 
@@ -86,6 +87,15 @@ for i = 1, 5 do
         cache_breakpoint = "context",
     })
 end
+
+-- Card context injection: prepend prior success/failure history to the
+-- system prompt as few-shot context. `card_context` fails silently if
+-- the id/pkg is not found — an alc.llm call with a bad card_context
+-- behaves identically to one without it.
+alc.llm("Given past runs, what should I try next?", {
+    system = "You are a helpful assistant.",
+    card_context = { pkg = "cot", limit = 5 },
+})
 ```
 
 #### `alc.llm_batch(items) -> string[]`
@@ -902,6 +912,50 @@ alc.card.create({
 })
 ```
 
+**`[run]` section — Run-path outcome (opt-in, gated by `[setting.card].run`)**
+
+Strategies driving production Runs (not just eval sweeps) can attach
+per-run outcome data to a Card without leaving the primary
+`alc.card.create` API. The section carries three fields:
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `status` | string enum | yes (when `run` is present) | One of `"succeeded"`, `"failed"`, `"skipped"`. Unrecognized values raise a Lua error before the write. |
+| `reason` | string | no | Free-text explanation. Passed through to the LLM prompt when this Card is later injected via `card_context` (see `alc.llm`), so newlines are stripped there for template safety. |
+| `action` | string | no | Free-form tag for the action tried (e.g. `"write"`, `"read"`, `"refine"`). |
+
+The `[run]` section is **gated** by `[setting.card].run` (see
+`README.md` §Global settings). The default is **off**, so existing
+strategies that don't populate `run` see zero behavior change.
+
+- When the gate is **off** and a caller passes `run`, `alc.card.create`
+  / `alc.card.append` become a no-op and return `nil`: no file is
+  written, no CardEvent is published, and the CardStore is untouched.
+- When the gate is **on**, the section is written verbatim into
+  Tier 1 alongside `pkg` / `stats` / `metadata` etc. and appears in
+  `alc.card.get`'s returned table.
+
+Enable per-project via `alc.local.toml`, per-user via `config.toml`, or
+per-session via `ALC_SETTING_CARD_RUN=true`.
+
+```lua
+alc.card.create({
+    pkg = { name = "cot" },
+    stats = { pass_rate = 0.75 },
+    run = {
+        status = "failed",
+        reason = "grader returned rating < 3",
+        action = "write",
+    },
+})
+-- With [setting.card].run = true: writes a Card whose TOML carries
+--   [run]
+--   status = "failed"
+--   reason = "grader returned rating < 3"
+--   action = "write"
+-- With [setting.card].run absent or false: returns nil, no write.
+```
+
 ### Write API
 
 #### `alc.card.create(table) -> { card_id, path }`
@@ -1102,6 +1156,67 @@ end
 
 Cycle detection uses `card_id` visited-set; `card_id` embeds a UTC
 timestamp so cycles cannot form naturally, but the guard is present.
+
+### Card context injection
+
+`alc.llm(prompt, {card_context = ...})` prepends resolved Cards to the
+system prompt as a fixed XML-like block, giving the model a lightweight
+few-shot view of prior Run outcomes without the strategy having to
+hand-format anything. The block sits ahead of `opts.system`; when
+`opts.system` is absent, the block becomes the whole system prompt.
+
+**Spec forms:**
+
+| `card_context` value | Resolves to |
+|----------------------|-------------|
+| string | The single Card with that `card_id` (empty result on miss). |
+| `{pkg = "<name>", limit = N}` | The N most recent Cards for that pkg, ordered by `created_at` desc. `limit` defaults to 5; values above 100 are silently capped to keep the N+1 fetch bounded. |
+
+Unknown forms (list of ids, alias, `where` filter, etc.) are silently
+ignored — resolution failure is a no-op, not a Lua error, so `alc.llm`
+behavior is unchanged when the id/pkg is missing.
+
+**Fixed template** (each Card on one line, `created_at` desc):
+
+```
+<past_cards>
+Card MM/DD pkg=<pkg> card_id=<id> [run.status=<status>] Rating <val> reason=<reason>
+Card MM/DD pkg=<pkg> card_id=<id> [run.status=<status>]
+...
+</past_cards>
+```
+
+- `[run.status=...]` / `Rating <val>` / `reason=<r>` are each emitted
+  only when the Card carries the corresponding field (`[run]` section
+  from Phase 1 `alc.card.create({run=...})`, `stats.pass_rate` for
+  Rating).
+- `reason` / `pkg` / `card_id` / `run.status` are line-sanitized:
+  newlines in stored values become spaces so a Card cannot break out
+  of the `<past_cards>` wrapper.
+
+```lua
+-- Example: strategy consults its own last 5 Cards before proposing a
+-- new prompt variant.
+local response = alc.llm("Draft the next variant.", {
+    system = "You are a prompt optimizer.",
+    card_context = { pkg = "cot_variant", limit = 5 },
+})
+
+-- Emitted system prompt:
+-- <past_cards>
+-- Card 07/18 pkg=cot_variant card_id=cot_variant_... [run.status=succeeded] Rating 4.5
+-- Card 07/17 pkg=cot_variant card_id=cot_variant_... [run.status=failed] reason=grader<3
+-- ...
+-- </past_cards>
+--
+-- You are a prompt optimizer.
+```
+
+**Prerequisites for populating Cards for injection**: the `[run]`
+section only lands on disk when `[setting.card].run` is enabled (see
+§Schema Conventions above); strategies that never write `run` still
+resolve into the block using `pkg` / `card_id` / `stats.pass_rate`,
+just without the `[run.status=...]` and `reason=...` suffixes.
 
 ---
 

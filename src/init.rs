@@ -71,10 +71,16 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# user-global algocline config
 # Write [setting.<target>] tables here; read them via the
 # `alc_setting_resolve` MCP tool.
 #
-# Example:
+# Example — arbitrary strategy-defined target:
 # [setting.journal]
 # path = "/Users/.../journal.md"
 # pkg  = false
+#
+# Known target used by algocline itself:
+# [setting.card]
+# run = true   # opt Run-side `alc.card.create({run=...})` in.
+#              # Default off; when off, calls carrying a `run` field
+#              # become a silent no-op. See docs/lua-stdlib.md §alc.card.
 "#;
 
 /// LuaCats type definitions for editor completion (alc.d.lua).

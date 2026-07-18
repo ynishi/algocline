@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod card;
+pub mod card_context;
 pub mod execution;
 mod executor;
 mod llm_bridge;

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 3-F: `alc.llm` opts now accepts a `card_context` field that
+  injects prior Card summaries as an XML-like prefix
+  (`<past_cards>...</past_cards>`) in the system prompt. Two resolution
+  forms are supported (MVP): a Card id string
+  (`card_context = "cot_20260718_a3f9c1"`) resolves the single Card, and
+  a table (`card_context = { pkg = "cot", limit = 5 }`) fetches the most
+  recent N Cards for the given pkg in `created_at` descending order. The
+  emitted block uses a fixed template (1 line per Card, `pkg=` /
+  `card_id=` / optional `[run.status=...]` / optional `Rating <val>` /
+  optional `reason=...`) and is prefixed onto any existing `system`
+  string, or used as the sole system prompt when `system` is unset.
+  Resolution failures and empty results are silent no-op (no LuaError,
+  no prefix) so existing `alc.llm` call sites remain regression-free.
+  `alc.llm_batch` and fork-child VMs are out of scope for this phase.
 - Phase 2-E: added `tracing::error` emit at Card store write points
   (`write_new_card` / `write_samples_text` / `write_aliases`) for
   MCP-blind observability of persistence failures. Each write-side `?`

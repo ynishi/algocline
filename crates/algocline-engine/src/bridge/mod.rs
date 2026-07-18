@@ -116,7 +116,13 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
     llm::register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {
-        llm::register_llm(lua, alc_table, tx.clone(), config.budget.clone())?;
+        llm::register_llm(
+            lua,
+            alc_table,
+            tx.clone(),
+            config.budget.clone(),
+            Arc::clone(&config.card_store),
+        )?;
         llm::register_llm_batch(lua, alc_table, tx.clone(), config.budget.clone())?;
         fork::register_fork(
             lua,

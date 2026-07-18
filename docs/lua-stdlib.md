@@ -457,6 +457,173 @@ alc.progress(2, 5)  -- message is optional
 
 ---
 
+### Neural Networks
+
+`alc.nn` is a thin candle wrapper. The Host (Rust) owns tensors, the autograd
+graph, parameters, gradients, and optimizer state; Lua composes the model and
+the training loop. Optional — only present in builds enabled with the `nn`
+feature (`cargo install --path . --features nn`); absent in the default MCP
+build so it does not link candle.
+
+Layer boundary: Rust exposes only the primitives below. Loops, batching, and
+learning-rate schedules are written in Lua.
+
+#### `alc.nn.tensor(data)`
+
+Build a 1-D CPU `f32` tensor from a Lua array of numbers.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `data` | array of number | yes | 1-D input values (converted to `f32`) |
+
+**Returns:** an `AlcTensor` handle (intermediate activation).
+
+```lua
+local x = alc.nn.tensor({ 1, 2, 3 })
+```
+
+#### `alc.nn.var(size, init)`
+
+Create a trainable 1-D parameter registered in the Host-owned VarMap. Gradients
+flow back to it and the optimizer updates it in place. Lua receives an `AlcVar`
+handle usable as an operand.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `size` | integer | yes | Length of the parameter vector |
+| `init` | number | yes | Constant initial value for every element |
+
+**Returns:** an `AlcVar` handle.
+
+```lua
+local w = alc.nn.var(1, 0.0)
+local b = alc.nn.var(1, 0.0)
+```
+
+#### `alc.nn.adamw(vars, lr)`
+
+Create an AdamW optimizer over a list of `AlcVar`s. Optimizer state (momentum
+etc.) stays in Rust.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `vars` | array of `AlcVar` | yes | Parameters to optimize |
+| `lr` | number | yes | Learning rate |
+
+**Returns:** an `AlcOptimizer` handle.
+
+```lua
+local opt = alc.nn.adamw({ w, b }, 0.1)
+```
+
+#### Tensor / Var op methods
+
+Shared by `AlcTensor` and `AlcVar` — a `Var` can be used directly as an
+operand and the autograd graph still tracks it. Every op returns a new
+`AlcTensor`.
+
+| Method | Description |
+|--------|-------------|
+| `t:add(other)` | Element-wise addition. `other` is an `AlcTensor` or `AlcVar` |
+| `t:sub(other)` | Element-wise subtraction |
+| `t:mul(other)` | Element-wise multiplication |
+| `t:matmul(other)` | Matrix multiplication |
+| `t:sqr()` | Element-wise square |
+| `t:mean()` | Reduce to a scalar mean |
+| `t:dims()` | Shape as a Lua array of integers |
+| `t:to_vec()` | Read-back: flatten to a Lua array of numbers (`f32`) |
+
+```lua
+local out = w:mul(x):add(b)
+local loss = out:sub(target):sqr():mean()
+```
+
+#### `opt:backward_step(loss)`
+
+Fused path: candle runs `loss.backward()` into a `GradStore` and applies one
+update step to the owned `Var`s in a single call. There is no `zero_grad` —
+gradients are not accumulated on the parameters between steps.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `loss` | `AlcTensor` | yes | Scalar loss to backpropagate through |
+
+**Returns:** nil.
+
+```lua
+for i = 1, steps do
+    local loss = model.forward(batch_x, batch_y)
+    opt:backward_step(loss)
+end
+```
+
+#### `alc.nn.register(name, forward)`
+
+Register a Lua closure as an in-VM responder for `alc.llm(prompt, {role="nn",
+model=name})`. When the LLM bridge sees `role="nn"`, it looks up `model` in
+this registry and dispatches to the closure synchronously — no coroutine
+yield, no Host round-trip. The registry lives on the Lua VM as app data, so
+it is scoped to the current session.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | yes | Key to address the model via `alc.llm(..., { model = name })` |
+| `forward` | function | yes | `(prompt: string) -> string` — the model's forward function |
+
+**Returns:** nil. Re-registering the same name overwrites the previous entry.
+
+Errors are surfaced as Lua errors: an unknown `model` name returns
+`alc.llm role="nn": no model registered as "<name>"`.
+
+```lua
+-- Train a tiny linear model for y = 2x + 1
+local w = alc.nn.var(1, 0.0)
+local b = alc.nn.var(1, 0.0)
+local opt = alc.nn.adamw({ w, b }, 0.1)
+local xs = { 0, 1, 2, 3, 4 }
+local ys = { 1, 3, 5, 7, 9 }
+for _ = 1, 400 do
+    for i = 1, #xs do
+        local x = alc.nn.tensor({ xs[i] })
+        local target = alc.nn.tensor({ ys[i] })
+        local loss = w:mul(x):add(b):sub(target):sqr():mean()
+        opt:backward_step(loss)
+    end
+end
+
+-- Expose the trained model as an alc.llm responder
+alc.nn.register("tiny-linear", function(prompt)
+    local x = tonumber(prompt) or 0
+    local out = w:mul(alc.nn.tensor({ x })):add(b):to_vec()
+    return tostring(out[1])
+end)
+
+-- Call it through the standard alc.llm API (in-process, no yield)
+local reply = alc.llm("5", { role = "nn", model = "tiny-linear" })
+-- reply == "10.98..."
+```
+
+Notes:
+
+- The registry is per-VM. A separate `alc_run` session starts empty; retrain
+  and re-register, or export the model and load it in your own responder.
+- `role="nn"` calls do not count toward `stats.pauses` or `stats.llm_calls` —
+  they never leave the VM.
+- Any other `role` value (or absence) falls through to the normal Host LLM
+  path unchanged.
+
+---
+
 ## Layer 1: Prelude Combinators
 
 ### LLM Wrappers

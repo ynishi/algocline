@@ -18,7 +18,7 @@ pub(super) fn register_llm(
     llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
     budget: BudgetHandle,
 ) -> LuaResult<()> {
-    let llm = lua.create_async_function(move |_, (prompt, opts): (String, Option<LuaTable>)| {
+    let llm = lua.create_async_function(move |lua, (prompt, opts): (String, Option<LuaTable>)| {
         let tx = llm_tx.clone();
         let bh = budget.clone();
         async move {
@@ -42,6 +42,39 @@ pub(super) fn register_llm(
             // Optional role hint (e.g. "grader"). Additive: absent when not set.
             // Other opts keys are ignored for forward compatibility.
             let role = opts.as_ref().and_then(|o| o.get::<String>("role").ok());
+
+            // In-process route for role="nn": a caller with role="nn" and
+            // model=<name> is asking an in-VM tiny model to answer. Dispatch
+            // to the algocline-nn model registry synchronously — no yield,
+            // no host round-trip. Everything else falls through to the normal
+            // Host path unchanged.
+            #[cfg(feature = "nn")]
+            if role.as_deref() == Some("nn") {
+                let model_name = opts
+                    .as_ref()
+                    .and_then(|o| o.get::<String>("model").ok())
+                    .ok_or_else(|| {
+                        LuaError::external("alc.llm role=\"nn\": missing model = <name>")
+                    })?;
+                let registry = lua
+                    .app_data_ref::<algocline_nn::NnModelRegistry>()
+                    .ok_or_else(|| {
+                        LuaError::external(
+                            "alc.llm role=\"nn\": alc.nn registry missing — has alc.nn been \
+                             initialised on this VM?",
+                        )
+                    })?;
+                let forward = registry.get(&model_name).ok_or_else(|| {
+                    LuaError::external(format!(
+                        "alc.llm role=\"nn\": no model registered as {model_name:?}"
+                    ))
+                })?;
+                // Drop the borrow before calling the closure so a re-entrant
+                // alc.llm inside the model closure would not deadlock the
+                // registry cell.
+                drop(registry);
+                return forward.call::<String>(prompt);
+            }
 
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 

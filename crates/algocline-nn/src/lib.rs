@@ -45,6 +45,31 @@ pub fn probe() -> candle_core::Result<usize> {
 use candle_core::Var;
 use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use mlua::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Per-VM `alc.nn` model registry.
+///
+/// Holds Lua closures that the `alc.llm` bridge can dispatch to when a caller
+/// passes `role="nn"` with a `model=<name>`. The registry lives on the VM as
+/// app data, so its lifetime is tied to the Lua session and never crosses VMs.
+/// Only the `alc.llm` in-process routing needs to reach across the crate
+/// boundary, so this is the sole engine-visible export.
+///
+/// Values are `mlua::Function` (each entry is a Lua-side forward closure).
+/// The Send + Mutex wrapping is only there to satisfy mlua's `send` feature
+/// on `set_app_data`; the VM itself always runs on a single thread, so there
+/// is never any real cross-thread traffic through this cell.
+pub struct NnModelRegistry(pub Arc<Mutex<HashMap<String, mlua::Function>>>);
+
+impl NnModelRegistry {
+    /// Look up a registered model closure by name.
+    ///
+    /// Returns `None` if no model with `name` is registered on this VM.
+    pub fn get(&self, name: &str) -> Option<mlua::Function> {
+        self.0.lock().ok()?.get(name).cloned()
+    }
+}
 
 /// Extract a candle [`Tensor`] from a Lua userdata that is either an
 /// [`AlcTensor`] (an intermediate activation) or an [`AlcVar`] (a trainable
@@ -175,6 +200,14 @@ impl mlua::UserData for AlcOptimizer {
 pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
     let nn = lua.create_table()?;
 
+    // Per-VM model registry: dispatched by the alc.llm bridge when a caller
+    // passes role="nn". Installed idempotently — if the VM already has one
+    // (e.g. install_for_pkg_test also called `module()`), reuse it so registry
+    // lookups from the llm bridge see the same entries.
+    if lua.app_data_ref::<NnModelRegistry>().is_none() {
+        lua.set_app_data(NnModelRegistry(Arc::new(Mutex::new(HashMap::new()))));
+    }
+
     // nn.tensor(data) — a 1-D CPU f32 tensor from a Lua array of numbers.
     let tensor = lua.create_function(|_, data: Vec<f32>| {
         let len = data.len();
@@ -215,6 +248,23 @@ pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
         Ok(AlcOptimizer(opt))
     })?;
     nn.set("adamw", adamw)?;
+
+    // nn.register(name, forward_fn) — register a Lua closure as an alc.llm
+    // responder. The engine's alc.llm bridge dispatches to it when a call
+    // passes `role="nn"` and `model=<name>`, so a trained model becomes an
+    // in-process LLM the strategy addresses via the standard `alc.llm` API.
+    let register = lua.create_function(|lua, (name, forward): (String, mlua::Function)| {
+        let registry = lua
+            .app_data_ref::<NnModelRegistry>()
+            .ok_or_else(|| LuaError::external("alc.nn.register: registry missing"))?;
+        registry
+            .0
+            .lock()
+            .map_err(|e| LuaError::external(format!("alc.nn.register: poisoned lock: {e}")))?
+            .insert(name, forward);
+        Ok(())
+    })?;
+    nn.set("register", register)?;
 
     Ok(nn)
 }

@@ -180,6 +180,7 @@ impl Executor {
         state_store: Arc<JsonFileStore>,
         card_store: Arc<FileCardStore>,
         scenarios_dir: PathBuf,
+        card_run_enabled: bool,
     ) -> Result<Session, String> {
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
@@ -212,6 +213,7 @@ impl Executor {
             variant_pkgs: variant_pkgs.clone(), // fork child VMs inherit variant overrides
             state_store,
             card_store,
+            card_run_enabled,
             scenarios_dir,
             log_sink: Some(log_sink.clone()),
         };
@@ -303,6 +305,7 @@ impl Executor {
         state_store: Arc<JsonFileStore>,
         card_store: Arc<FileCardStore>,
         scenarios_dir: PathBuf,
+        card_run_enabled: bool,
     ) -> Result<Session, String> {
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
@@ -329,6 +332,7 @@ impl Executor {
             variant_pkgs: variant_pkgs.clone(),
             state_store,
             card_store,
+            card_run_enabled,
             scenarios_dir,
             log_sink: Some(log_sink.clone()),
         };

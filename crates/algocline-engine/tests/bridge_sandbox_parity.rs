@@ -43,6 +43,7 @@ fn production_vm() -> (Lua, tempfile::TempDir) {
         variant_pkgs: vec![],
         state_store: Arc::new(JsonFileStore::new(root.join("state"))),
         card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+        card_run_enabled: true,
         scenarios_dir: root.join("scenarios"),
         log_sink: None,
     };

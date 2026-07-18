@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 1-B: added optional `run` field to `alc.card.create` /
+  `alc.card.append`, gated by `[setting.card].run` (default false, opt-in
+  per session). When the setting is off, calls carrying a `run` field
+  become no-op and return Lua `nil` without touching the card store or
+  publishing a `CardEvent`; calls without `run` are unaffected. The
+  section shape is `{ status: "succeeded"|"failed"|"skipped",
+  reason?: string, action?: string }`; invalid status tokens raise a Lua
+  error naming all three accepted values regardless of the gate state.
 - `justfile` recipes to resync the vendored Lua packages from local
   upstream checkouts: `just vendor-alc-shapes` for the alc_shapes
   copy under `crates/algocline-app/src/service/gendoc/alc_shapes/`,

@@ -390,6 +390,7 @@ mod tests {
                 state_store,
                 card_store,
                 scenarios_dir,
+                false,
             )
             .await
             .unwrap();
@@ -445,6 +446,7 @@ mod tests {
                 state_store,
                 card_store,
                 scenarios_dir,
+                false,
             )
             .await
             .unwrap();
@@ -614,6 +616,7 @@ mod tests {
                 state_store,
                 card_store,
                 scenarios_dir,
+                false,
             )
             .await
             .unwrap();

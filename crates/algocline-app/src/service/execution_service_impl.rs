@@ -27,7 +27,25 @@ use crate::service::AppService;
 #[async_trait]
 impl ExecutionService for AppService {
     async fn spawn(&self, spec: SessionSpec) -> Result<SessionId, SpawnError> {
-        self.execution_registry.spawn_v2(spec).await
+        // Resolve `[setting.card].run` per session so the Phase 1-B `[run]`
+        // gate follows the same cascade (env > project > global) as any
+        // other setting.  Errors on the resolver path degrade to gate-off
+        // rather than failing spawn: an unreadable config.toml must not
+        // block execution, and a missing setting still yields `None` from
+        // `get_bool` which we treat as `false`.  See Phase 1-A cascade
+        // tests in `service::setting`.
+        let app_dir = self.log_config.app_dir();
+        let card_run_enabled = crate::service::setting::resolve_setting(
+            &app_dir,
+            spec.project_root.as_deref(),
+            Some("card"),
+        )
+        .ok()
+        .and_then(|s| s.get_bool("card", "run"))
+        .unwrap_or(false);
+        self.execution_registry
+            .spawn_v2(spec, card_run_enabled)
+            .await
     }
 
     async fn state(&self, id: &SessionId) -> Result<ExecutionState, StateError> {
@@ -445,7 +463,7 @@ mod tests {
         let interval = Duration::from_millis(50);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 1"))
+            .spawn_v2(simple_spec("return 1"), false)
             .await
             .expect("spawn must succeed");
 

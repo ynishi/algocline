@@ -90,7 +90,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value as Json};
 
 pub const SCHEMA_VERSION: &str = "card/v0";
@@ -409,6 +409,71 @@ fn require_pkg_name(input: &Json) -> Result<String, String> {
         .to_string();
     validate_name(&name, "pkg")?;
     Ok(name)
+}
+
+// ─── [run] section (Phase 1-B) ─────────────────────────────────────────────
+//
+// Optional strategy run outcome recorded on a Card as `[run].status`,
+// `[run].reason`, `[run].action`.  Serialized as a nested TOML table when
+// present.  Gated at the Lua bridge layer by `[setting.card].run` — when
+// the setting is disabled, `alc.card.create` / `alc.card.append` calls
+// carrying a `run` field become no-op and return Lua nil without touching
+// the store or publishing a `CardEvent`.
+
+/// Status of a strategy run, recorded in the `[run]` section of a Card.
+///
+/// The three variants are intentionally exhaustive so that downstream
+/// analysers can pattern-match without a catch-all arm.  Serde uses
+/// snake_case so that TOML values round-trip through the Lua bridge
+/// (`succeeded` / `failed` / `skipped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+/// Optional `[run]` section carrying strategy execution outcome.
+///
+/// * `status` is REQUIRED when the section is present.
+/// * `reason` / `action` are OPTIONAL free-form strings; when absent they
+///   are omitted from the serialized TOML entirely (`skip_serializing_if`).
+///
+/// Used only for input validation at the Lua bridge boundary — the actual
+/// Card TOML is written via the raw `serde_json::Value` path so that other
+/// top-level fields are preserved verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSection {
+    pub status: RunStatus,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub action: Option<String>,
+}
+
+impl RunSection {
+    /// Extract and validate the top-level `run` field from a Card input JSON.
+    ///
+    /// Returns:
+    /// * `Ok(None)` when `run` is absent (the Card carries no `[run]` section);
+    /// * `Ok(Some(section))` when `run` is a valid `[run]` table;
+    /// * `Err(msg)` when `run` is present but malformed — the error message
+    ///   always lists the accepted status tokens (`succeeded, failed, skipped`)
+    ///   so Lua callers get an actionable diagnostic.
+    pub fn from_json(input: &Json) -> Result<Option<RunSection>, String> {
+        let Some(run) = input.get("run") else {
+            return Ok(None);
+        };
+        serde_json::from_value::<RunSection>(run.clone())
+            .map(Some)
+            .map_err(|e| {
+                format!(
+                    "alc.card: invalid run field (status must be one of: \
+                     succeeded, failed, skipped): {e}"
+                )
+            })
+    }
 }
 
 /// Create a new Card backed by `store`.
@@ -3065,6 +3130,79 @@ fn percent_decode(src: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── RunSection unit tests (Phase 1-B) ─────────────────────────
+
+    /// All three `RunStatus` tokens must round-trip successfully via
+    /// `RunSection::from_json`.
+    #[test]
+    fn run_section_accepts_all_three_statuses() {
+        for status in ["succeeded", "failed", "skipped"] {
+            let input = json!({ "run": { "status": status } });
+            let parsed = RunSection::from_json(&input)
+                .unwrap_or_else(|e| panic!("status '{status}' should parse: {e}"));
+            let section = parsed.expect("run field present must yield Some");
+            let expected = match status {
+                "succeeded" => RunStatus::Succeeded,
+                "failed" => RunStatus::Failed,
+                "skipped" => RunStatus::Skipped,
+                _ => unreachable!(),
+            };
+            assert_eq!(section.status, expected);
+        }
+    }
+
+    /// An unknown status token must be rejected with an error message
+    /// enumerating the accepted values.  Downstream Lua callers rely on
+    /// the tokens `succeeded, failed, skipped` appearing verbatim in the
+    /// diagnostic so users can spot the typo without opening the docs.
+    #[test]
+    fn run_section_rejects_invalid_status() {
+        let input = json!({ "run": { "status": "unknown_status_xyz" } });
+        let err = RunSection::from_json(&input).unwrap_err();
+        assert!(
+            err.contains("succeeded") && err.contains("failed") && err.contains("skipped"),
+            "error message must enumerate accepted status tokens, got: {err}"
+        );
+    }
+
+    /// Absence of the top-level `run` field must yield `Ok(None)` so
+    /// existing Card creation call sites (no `run` field) are unaffected
+    /// by the new `[run]` schema.
+    #[test]
+    fn run_section_absent_returns_none() {
+        let input = json!({ "pkg": { "name": "no_run_pkg" } });
+        let parsed = RunSection::from_json(&input).unwrap();
+        assert!(parsed.is_none(), "absent run field must yield None");
+    }
+
+    /// Only `status` is required; when `reason` / `action` are omitted,
+    /// the parsed struct carries `None` and TOML serialization drops the
+    /// fields entirely (`skip_serializing_if`).
+    #[test]
+    fn run_section_optional_fields_default_none() {
+        let input = json!({ "run": { "status": "succeeded" } });
+        let section = RunSection::from_json(&input).unwrap().unwrap();
+        assert_eq!(section.status, RunStatus::Succeeded);
+        assert!(section.reason.is_none());
+        assert!(section.action.is_none());
+    }
+
+    /// A fully populated `[run]` section must round-trip every field.
+    #[test]
+    fn run_section_all_fields_present() {
+        let input = json!({
+            "run": {
+                "status": "failed",
+                "reason": "grader rating < 3",
+                "action": "write",
+            }
+        });
+        let section = RunSection::from_json(&input).unwrap().unwrap();
+        assert_eq!(section.status, RunStatus::Failed);
+        assert_eq!(section.reason.as_deref(), Some("grader rating < 3"));
+        assert_eq!(section.action.as_deref(), Some("write"));
+    }
 
     #[test]
     fn minimum_valid_card() {

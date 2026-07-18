@@ -362,18 +362,29 @@ pub(super) fn register_card(
     lua: &Lua,
     alc_table: &LuaTable,
     card_store: Arc<FileCardStore>,
+    card_run_enabled: bool,
 ) -> LuaResult<()> {
     let card_table = lua.create_table()?;
 
-    // alc.card.create(table) -> { card_id, path }
+    // alc.card.create(table) -> { card_id, path } | nil
+    //
+    // Validates any optional top-level `run` field before touching the
+    // store — invalid statuses surface as Lua errors regardless of the
+    // Enable gate.  When `run` is present and `card_run_enabled` is
+    // false, the closure short-circuits with `nil` so no card file is
+    // written and no `CardEvent::Created` is published (Phase 1-B gate).
     let store_create = Arc::clone(&card_store);
-    let create = lua.create_function(move |lua, input: LuaValue| {
+    let create = lua.create_function(move |lua, input: LuaValue| -> LuaResult<LuaValue> {
         let json: serde_json::Value = lua.from_value(input)?;
+        let run_section = card::RunSection::from_json(&json).map_err(LuaError::external)?;
+        if run_section.is_some() && !card_run_enabled {
+            return Ok(LuaValue::Nil);
+        }
         let (card_id, path) = store_create.create(json).map_err(LuaError::external)?;
         let ret = lua.create_table()?;
         ret.set("card_id", card_id)?;
         ret.set("path", path.to_string_lossy().to_string())?;
-        Ok(ret)
+        Ok(LuaValue::Table(ret))
     })?;
 
     // alc.card.get(card_id) -> table | nil
@@ -397,15 +408,26 @@ pub(super) fn register_card(
         to_lua_value(lua, &card::summaries_to_json(&rows))
     })?;
 
-    // alc.card.append(card_id, fields) -> merged_card
+    // alc.card.append(card_id, fields) -> merged_card | nil
+    //
+    // Symmetric to `create`: any `run` field inside `fields` is validated
+    // first, then gated by `card_run_enabled`.  A disabled gate causes
+    // the append call to no-op with `nil` — no store rewrite, no
+    // `CardEvent::Appended` publication.
     let store_append = Arc::clone(&card_store);
-    let append = lua.create_function(move |lua, (card_id, fields): (String, LuaValue)| {
-        let json: serde_json::Value = lua.from_value(fields)?;
-        let merged = store_append
-            .append(&card_id, json)
-            .map_err(LuaError::external)?;
-        to_lua_value(lua, &merged)
-    })?;
+    let append = lua.create_function(
+        move |lua, (card_id, fields): (String, LuaValue)| -> LuaResult<LuaValue> {
+            let json: serde_json::Value = lua.from_value(fields)?;
+            let run_section = card::RunSection::from_json(&json).map_err(LuaError::external)?;
+            if run_section.is_some() && !card_run_enabled {
+                return Ok(LuaValue::Nil);
+            }
+            let merged = store_append
+                .append(&card_id, json)
+                .map_err(LuaError::external)?;
+            to_lua_value(lua, &merged)
+        },
+    )?;
 
     // alc.card.get_by_alias(name) -> table | nil
     let store_gba = Arc::clone(&card_store);
@@ -751,6 +773,7 @@ mod tests {
             variant_pkgs: vec![],
             state_store: Arc::new(JsonFileStore::new(root.join("state"))),
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+            card_run_enabled: false,
             scenarios_dir: root.join("scenarios"),
             log_sink: None,
         }
@@ -1081,6 +1104,7 @@ mod tests {
                 variant_pkgs: vec![],
                 state_store: Arc::new(JsonFileStore::new(root.join("state"))),
                 card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+                card_run_enabled: false,
                 scenarios_dir: root.join("scenarios"),
                 log_sink: None,
             },
@@ -1137,6 +1161,7 @@ mod tests {
                 variant_pkgs: vec![],
                 state_store: Arc::new(JsonFileStore::new(root.join("state"))),
                 card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+                card_run_enabled: false,
                 scenarios_dir: root.join("scenarios"),
                 log_sink: None,
             },

@@ -912,8 +912,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         write_config(global_tmp.path(), "[setting.card]\nrun = false\n");
         let app_dir = make_app_dir(global_tmp.path());
-        let result =
-            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
         assert_eq!(result.get_bool("card", "run"), Some(true));
         assert_eq!(
             result.sources.get("card").unwrap().get("run"),
@@ -930,8 +929,7 @@ mod tests {
         write_alc_toml(project_tmp.path(), "[setting.card]\nrun = false\n");
         write_local_alc_toml(project_tmp.path(), "[setting.card]\nrun = true\n");
         let app_dir = make_app_dir(global_tmp.path());
-        let result =
-            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
         assert_eq!(result.get_bool("card", "run"), Some(true));
         assert_eq!(
             result.sources.get("card").unwrap().get("run"),
@@ -947,8 +945,7 @@ mod tests {
         write_config(global_tmp.path(), "[setting.card]\nrun = false\n");
         write_alc_toml(project_tmp.path(), "[setting.card]\nrun = true\n");
         let app_dir = make_app_dir(global_tmp.path());
-        let result =
-            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
         assert_eq!(result.get_bool("card", "run"), Some(true));
         assert_eq!(
             result.sources.get("card").unwrap().get("run"),
@@ -963,8 +960,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         write_config(global_tmp.path(), "[setting.card]\nrun = true\n");
         let app_dir = make_app_dir(global_tmp.path());
-        let result =
-            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
         assert_eq!(result.get_bool("card", "run"), Some(true));
         assert_eq!(
             result.sources.get("card").unwrap().get("run"),
@@ -979,8 +975,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         write_config(global_tmp.path(), "");
         let app_dir = make_app_dir(global_tmp.path());
-        let result =
-            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
         assert_eq!(result.get_bool("card", "run"), None);
         // Caller decides default:
         assert!(!result.get_bool("card", "run").unwrap_or(false));
@@ -991,15 +986,64 @@ mod tests {
         let _lock = ENV_MUTEX.lock().unwrap();
         let global_tmp = tempfile::tempdir().unwrap();
         let project_tmp = tempfile::tempdir().unwrap();
-        write_config(
-            global_tmp.path(),
-            "[setting.card]\nrun = \"not_a_bool\"\n",
-        );
+        write_config(global_tmp.path(), "[setting.card]\nrun = \"not_a_bool\"\n");
         let app_dir = make_app_dir(global_tmp.path());
-        let result =
-            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
         // resolve_setting succeeds (schemaless), but get_bool downgrades non-bool to None.
         assert!(result.resolved.contains_key("card"));
         assert_eq!(result.get_bool("card", "run"), None);
+    }
+
+    /// Regression test carried from Phase 1-A code review pass (CG-1).
+    ///
+    /// Confirms that `ALC_SETTING_CARD_RUN=false` produces `Some(false)`
+    /// (not `None` and not `Some(true)`) when no file layer contributes
+    /// the field, so downstream callers can distinguish "explicitly off"
+    /// from "not configured".
+    #[test]
+    fn card_run_env_false_produces_some_false() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("ALC_SETTING_CARD_RUN", "false");
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        // No file layer at all — env is the sole source.
+        let app_dir = make_app_dir(global_tmp.path());
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(
+            result.get_bool("card", "run"),
+            Some(false),
+            "env value 'false' must parse as Some(false), not None or Some(true)"
+        );
+        assert_eq!(
+            result.sources.get("card").unwrap().get("run"),
+            Some(&"env".to_string())
+        );
+        assert!(!result.get_bool("card", "run").unwrap_or(false));
+    }
+
+    /// Regression test carried from Phase 1-A code review pass (CG-2).
+    ///
+    /// Confirms env layer wins over `alc.local.toml` — a `true` env
+    /// override defeats a `false` local file, and the winning layer is
+    /// labelled `"env"` rather than `"project"`.
+    #[test]
+    fn card_run_env_wins_over_local() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("ALC_SETTING_CARD_RUN", "true");
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_local_alc_toml(project_tmp.path(), "[setting.card]\nrun = false\n");
+        let app_dir = make_app_dir(global_tmp.path());
+        let result = resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(
+            result.get_bool("card", "run"),
+            Some(true),
+            "env value 'true' must win over alc.local.toml 'false'"
+        );
+        assert_eq!(
+            result.sources.get("card").unwrap().get("run"),
+            Some(&"env".to_string()),
+            "source layer for run must be 'env', not 'project'"
+        );
     }
 }

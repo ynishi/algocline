@@ -98,6 +98,7 @@ mod tests {
             variant_pkgs: vec![],
             state_store: Arc::new(JsonFileStore::new(root.join("state"))),
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+            card_run_enabled: false,
             scenarios_dir: root.join("scenarios"),
             log_sink: None,
         }

@@ -89,6 +89,11 @@ impl SessionRegistryV2 {
     /// Other variants return [`SpawnError::InvalidSpec`].  Subtask 3 will extend this
     /// to handle `Advice` and `Eval` through the full `AppService` path.
     ///
+    /// `card_run_enabled` is the resolved `[setting.card].run` gate value.  It is
+    /// threaded through into the per-session bridge so `alc.card.create` /
+    /// `alc.card.append` calls carrying a `run` field are no-op when the gate
+    /// is off (Phase 1-B).
+    ///
     /// # Errors
     /// - [`SpawnError::Engine`] — the executor failed to start the session.
     /// - [`SpawnError::InvalidSpec`] — the provided spec is malformed or uses an
@@ -96,6 +101,7 @@ impl SessionRegistryV2 {
     pub async fn spawn_v2(
         &self,
         spec: algocline_core::execution::SessionSpec,
+        card_run_enabled: bool,
     ) -> Result<SessionId, SpawnError> {
         use algocline_core::execution::SpecKind;
 
@@ -128,6 +134,7 @@ impl SessionRegistryV2 {
                 Arc::clone(&self.state_store),
                 Arc::clone(&self.card_store),
                 self.scenarios_dir.clone(),
+                card_run_enabled,
             )
             .await
             .map_err(SpawnError::Engine)?;
@@ -604,7 +611,7 @@ mod tests {
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            registry.spawn_v2(simple_spec("return 42")),
+            registry.spawn_v2(simple_spec("return 42"), false),
         )
         .await;
 
@@ -633,7 +640,7 @@ mod tests {
 
         // Lua that pauses immediately so the session is observable.
         let sid = registry
-            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#), false)
             .await
             .expect("spawn");
 
@@ -660,7 +667,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#), false)
             .await
             .expect("spawn");
 
@@ -708,7 +715,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 1"))
+            .spawn_v2(simple_spec("return 1"), false)
             .await
             .expect("spawn");
 
@@ -739,7 +746,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 42"))
+            .spawn_v2(simple_spec("return 42"), false)
             .await
             .expect("spawn");
 
@@ -763,7 +770,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 99"))
+            .spawn_v2(simple_spec("return 99"), false)
             .await
             .expect("spawn");
 
@@ -800,7 +807,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#), false)
             .await
             .expect("spawn");
 
@@ -826,7 +833,7 @@ mod tests {
 
         // A script that returns immediately — the driver will publish Done.
         let sid = registry
-            .spawn_v2(simple_spec("return 99"))
+            .spawn_v2(simple_spec("return 99"), false)
             .await
             .expect("spawn");
 
@@ -883,7 +890,7 @@ mod tests {
         let interval = Duration::from_millis(50);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 1"))
+            .spawn_v2(simple_spec("return 1"), false)
             .await
             .expect("spawn");
 
@@ -928,7 +935,7 @@ mod tests {
         let interval = Duration::from_millis(50);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 2"))
+            .spawn_v2(simple_spec("return 2"), false)
             .await
             .expect("spawn");
 
@@ -985,7 +992,7 @@ mod tests {
         let interval = Duration::from_millis(500);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 3"))
+            .spawn_v2(simple_spec("return 3"), false)
             .await
             .expect("spawn");
 
@@ -1068,7 +1075,7 @@ mod tests {
         let interval = Duration::from_millis(5);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 42"))
+            .spawn_v2(simple_spec("return 42"), false)
             .await
             .expect("spawn");
 
@@ -1119,7 +1126,7 @@ mod tests {
         registry.spawn_gc_task(ttl, interval);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 99"))
+            .spawn_v2(simple_spec("return 99"), false)
             .await
             .expect("spawn");
 
@@ -1161,7 +1168,7 @@ mod tests {
 
         // Spawn via registry_a.
         let sid = registry_a
-            .spawn_v2(simple_spec("return 7"))
+            .spawn_v2(simple_spec("return 7"), false)
             .await
             .expect("spawn via registry_a");
 
@@ -1205,7 +1212,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec("return 42"))
+            .spawn_v2(simple_spec("return 42"), false)
             .await
             .expect("spawn");
 
@@ -1237,7 +1244,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#), false)
             .await
             .expect("spawn");
 
@@ -1299,7 +1306,7 @@ mod tests {
         let (registry, _tmp) = make_registry(executor);
 
         let sid = registry
-            .spawn_v2(simple_spec(r#"return alc.llm("q")"#))
+            .spawn_v2(simple_spec(r#"return alc.llm("q")"#), false)
             .await
             .expect("spawn");
 

@@ -693,6 +693,13 @@ impl AppService {
         variant_pkgs: Vec<VariantPkg>,
     ) -> Result<String, String> {
         let scenarios_dir = self.log_config.app_dir().scenarios_dir();
+        // Legacy start_and_tick paths (alc_run / advice / eval) do not
+        // resolve the Phase 1-B `[setting.card].run` gate; existing pkgs
+        // never populate a top-level `run` field on their Cards so the
+        // gate defaults to OFF here without behavioural change.  The v2
+        // ExecutionService path resolves the setting from the caller's
+        // project_root and threads it through spawn_v2.
+        let card_run_enabled = false;
         let session = self
             .executor
             .start_session_with_env(
@@ -704,6 +711,7 @@ impl AppService {
                 Arc::clone(&self.state_store),
                 Arc::clone(&self.card_store),
                 scenarios_dir,
+                card_run_enabled,
             )
             .await?;
         let (session_id, result) = self

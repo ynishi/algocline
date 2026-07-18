@@ -57,6 +57,15 @@ pub struct BridgeConfig {
     pub state_store: Arc<JsonFileStore>,
     /// Card store for `alc.card.*` (service layer resolves the root).
     pub card_store: Arc<FileCardStore>,
+    /// Cached `[setting.card].run` value resolved at session start.
+    ///
+    /// When `false` (default), `alc.card.create` / `alc.card.append` calls
+    /// that carry a top-level `run` field become no-op: the closures return
+    /// Lua `nil` without touching the card store or publishing a
+    /// `CardEvent`.  Calls without a `run` field are unaffected (Phase 1-B
+    /// gate is additive — existing pkgs that never populate `run` see no
+    /// behavioural change).
+    pub card_run_enabled: bool,
     /// Scenarios directory exposed to Lua via `alc._dirs.scenarios`.
     pub scenarios_dir: PathBuf,
     /// Per-session log-capture ring buffer.
@@ -87,7 +96,12 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
         data::register_log(lua, alc_table, algocline_core::LogSink::new())?;
     }
     data::register_state(lua, alc_table, config.ns, Arc::clone(&config.state_store))?;
-    data::register_card(lua, alc_table, Arc::clone(&config.card_store))?;
+    data::register_card(
+        lua,
+        alc_table,
+        Arc::clone(&config.card_store),
+        config.card_run_enabled,
+    )?;
     data::register_dirs(
         lua,
         alc_table,
@@ -113,6 +127,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
             config.variant_pkgs,
             config.state_store,
             config.card_store,
+            config.card_run_enabled,
             config.scenarios_dir,
         )?;
     }
@@ -169,6 +184,11 @@ pub fn install_for_pkg_test(lua: &Lua) -> LuaResult<()> {
         variant_pkgs: vec![],
         state_store: std::sync::Arc::new(crate::state::JsonFileStore::new(root.join("state"))),
         card_store: std::sync::Arc::new(crate::card::FileCardStore::new(root.join("cards"))),
+        // Enable the `[run]` gate by default in pkg-test sandboxes so
+        // spec authors can exercise the new field without extra plumbing.
+        // Production sessions receive the resolved `[setting.card].run`
+        // value from the service layer.
+        card_run_enabled: true,
         scenarios_dir: root.join("scenarios"),
         log_sink: None,
     };
@@ -253,6 +273,7 @@ mod tests {
             variant_pkgs: vec![],
             state_store: Arc::new(JsonFileStore::new(root.join("state"))),
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+            card_run_enabled: false,
             scenarios_dir: root.join("scenarios"),
             log_sink: None,
         }

@@ -63,6 +63,7 @@ pub(crate) fn register_fork(
     variant_pkgs: Vec<VariantPkg>,
     state_store: Arc<JsonFileStore>,
     card_store: Arc<FileCardStore>,
+    card_run_enabled: bool,
     scenarios_dir: PathBuf,
 ) -> LuaResult<()> {
     let fork_fn = lua.create_async_function(
@@ -170,6 +171,10 @@ pub(crate) fn register_fork(
                         variant_pkgs: vec![], // Children don't need to fork further
                         state_store: Arc::clone(&state_store),
                         card_store: Arc::clone(&card_store),
+                        // Fork children inherit the parent session's [run] gate
+                        // so `alc.card.create({run=...})` behaviour is uniform
+                        // across parent and child VMs.
+                        card_run_enabled,
                         scenarios_dir: scenarios_dir.clone(),
                         // Fork child sessions don't expose recent_logs via alc_status.
                         log_sink: None,

@@ -502,6 +502,9 @@ async fn dispatch(
             let ctx_value = ctx.clone().unwrap_or(serde_json::Value::Null);
 
             // start_session spawns a dedicated OS thread + mlua VM for this session.
+            // Pool worker sessions do not resolve the Phase 1-B
+            // `[setting.card].run` gate over IPC; the legacy path defaults
+            // to OFF, mirroring the `AppService::start_and_tick` policy.
             let session = match executor
                 .start_session(
                     code.clone(),
@@ -511,6 +514,7 @@ async fn dispatch(
                     Arc::clone(state_store),
                     Arc::clone(card_store),
                     scenarios_dir.to_path_buf(),
+                    false,
                 )
                 .await
             {

@@ -73,6 +73,12 @@ anyhow = "1"
 dirs = "6"
 tempfile = "3"
 
+[features]
+# Opt-in neural-network bridge (alc.nn). Off by default so the standard MCP
+# build does not link candle. Enable with `--features nn` to build/install an
+# `alc` binary whose alc_run exposes alc.nn.
+nn = ["algocline-engine/nn"]
+
 [dev-dependencies]
 insta = { version = "1", features = ["json", "redactions"] }
 libc = { workspace = true }

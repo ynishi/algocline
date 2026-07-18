@@ -42,43 +42,126 @@ pub fn probe() -> candle_core::Result<usize> {
 
 // ─── alc.nn Lua surface ──────────────────────────────────────────────────────
 
+use candle_core::Var;
+use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use mlua::prelude::*;
 
-/// Lua `UserData` view of a candle [`Tensor`].
+/// Extract a candle [`Tensor`] from a Lua userdata that is either an
+/// [`AlcTensor`] (an intermediate activation) or an [`AlcVar`] (a trainable
+/// parameter). This lets Lua write ops uniformly over both operand kinds, e.g.
+/// `w:mul(x)` where `w` is a Var and `x` is a Tensor.
+fn tensor_of(ud: &mlua::AnyUserData) -> LuaResult<Tensor> {
+    if let Ok(t) = ud.borrow::<AlcTensor>() {
+        Ok(t.0.clone())
+    } else if let Ok(v) = ud.borrow::<AlcVar>() {
+        Ok(v.0.as_tensor().clone())
+    } else {
+        Err(LuaError::external(
+            "alc.nn: expected an alc.nn tensor or var operand",
+        ))
+    }
+}
+
+/// Apply a binary candle op to `lhs` and the tensor behind `rhs`, wrapping the
+/// result as a new [`AlcTensor`]. The candle op builds the autograd graph.
+fn binop(
+    lhs: &Tensor,
+    rhs: &mlua::AnyUserData,
+    op: fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
+    name: &str,
+) -> LuaResult<AlcTensor> {
+    let r = tensor_of(rhs)?;
+    let out = op(lhs, &r).map_err(|e| LuaError::external(format!("alc.nn {name}: {e}")))?;
+    Ok(AlcTensor(out))
+}
+
+/// Register the tensor-op methods shared by [`AlcTensor`] and [`AlcVar`].
 ///
-/// The candle `Tensor` is held by value; because a candle `Tensor` is an
-/// `Arc`-backed handle, moving it into the UserData is a cheap clone of the
-/// handle (not the data). Lua sees an opaque handle and can only call the
-/// exposed methods — it never owns tensor storage or (later) a `Var` lifetime,
-/// which stays Host-owned per the design's layer boundary.
+/// `get` projects the receiver to its backing tensor. Every op returns a new
+/// [`AlcTensor`] (a plain activation); ops on a `Var` still track gradients
+/// because the returned tensor keeps the candle graph edge back to the `Var`.
+fn add_tensor_ops<T, M>(methods: &mut M, get: fn(&T) -> &Tensor)
+where
+    T: 'static,
+    M: mlua::UserDataMethods<T>,
+{
+    methods.add_method("add", move |_, this, other: mlua::AnyUserData| {
+        binop(get(this), &other, |a, b| a.add(b), "tensor:add")
+    });
+    methods.add_method("mul", move |_, this, other: mlua::AnyUserData| {
+        binop(get(this), &other, |a, b| a.mul(b), "tensor:mul")
+    });
+    methods.add_method("sub", move |_, this, other: mlua::AnyUserData| {
+        binop(get(this), &other, |a, b| a.sub(b), "tensor:sub")
+    });
+    methods.add_method("matmul", move |_, this, other: mlua::AnyUserData| {
+        binop(get(this), &other, |a, b| a.matmul(b), "tensor:matmul")
+    });
+    methods.add_method("sqr", move |_, this, ()| {
+        let out = get(this)
+            .sqr()
+            .map_err(|e| LuaError::external(format!("alc.nn tensor:sqr: {e}")))?;
+        Ok(AlcTensor(out))
+    });
+    methods.add_method("mean", move |_, this, ()| {
+        let out = get(this)
+            .mean_all()
+            .map_err(|e| LuaError::external(format!("alc.nn tensor:mean: {e}")))?;
+        Ok(AlcTensor(out))
+    });
+    methods.add_method("dims", move |_, this, ()| Ok(get(this).dims().to_vec()));
+    methods.add_method("to_vec", move |_, this, ()| {
+        let flat = get(this)
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| LuaError::external(format!("alc.nn tensor:to_vec: {e}")))?;
+        Ok(flat)
+    });
+}
+
+/// Lua `UserData` view of a candle [`Tensor`] — an intermediate activation.
 ///
-/// L1 exposes a single element-wise op (`add`) plus read-back helpers; the full
-/// op set is a later step.
+/// The candle `Tensor` is `Arc`-backed, so moving it into the UserData is a
+/// cheap handle clone (not a data copy). Lua sees an opaque handle and calls
+/// the shared tensor ops; it never owns tensor storage.
 pub(crate) struct AlcTensor(Tensor);
 
 impl mlua::UserData for AlcTensor {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        // add(other) — element-wise addition, returns a new AlcTensor.
-        methods.add_method("add", |_, this, other: mlua::UserDataRef<AlcTensor>| {
-            let sum = this
-                .0
-                .add(&other.0)
-                .map_err(|e| LuaError::external(format!("alc.nn tensor:add: {e}")))?;
-            Ok(AlcTensor(sum))
-        });
+        add_tensor_ops(methods, |this: &AlcTensor| &this.0);
+    }
+}
 
-        // dims() — shape as a Lua array of integers.
-        methods.add_method("dims", |_, this, ()| Ok(this.0.dims().to_vec()));
+/// Lua `UserData` view of a trainable candle [`Var`] (a parameter).
+///
+/// The `Var` is the Host-owned trainable state: gradients flow back to it and
+/// the optimizer updates it in place. Lua holds only this handle and never owns
+/// the `Var` lifetime beyond the handle, matching the design's layer boundary
+/// (parameters live in Rust, composition lives in Lua). Shares the same op set
+/// as [`AlcTensor`] so a Var can be used directly as an operand.
+pub(crate) struct AlcVar(Var);
 
-        // to_vec() — flatten to a 1-D Lua array of numbers (read-back for tests
-        // and simple inspection).
-        methods.add_method("to_vec", |_, this, ()| {
-            let flat = this
-                .0
-                .flatten_all()
-                .and_then(|t| t.to_vec1::<f32>())
-                .map_err(|e| LuaError::external(format!("alc.nn tensor:to_vec: {e}")))?;
-            Ok(flat)
+impl mlua::UserData for AlcVar {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        add_tensor_ops(methods, |this: &AlcVar| this.0.as_tensor());
+    }
+}
+
+/// Lua `UserData` for a candle optimizer over Host-owned [`Var`]s.
+///
+/// Holds the optimizer state (momentum etc.) in Rust. `backward_step(loss)` is
+/// the fused path: candle runs `loss.backward()` into a `GradStore` and applies
+/// one update step to the owned Vars in a single call.
+pub(crate) struct AlcOptimizer(AdamW);
+
+impl mlua::UserData for AlcOptimizer {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("backward_step", |_, this, loss: mlua::AnyUserData| {
+            let l = tensor_of(&loss)?;
+            this.0
+                .backward_step(&l)
+                .map_err(|e| LuaError::external(format!("alc.nn opt:backward_step: {e}")))?;
+            Ok(())
         });
     }
 }
@@ -86,12 +169,13 @@ impl mlua::UserData for AlcTensor {
 /// Build the `alc.nn` module table.
 ///
 /// Mirrors the `register_math` convention (`bridge/mod.rs`): the engine calls
-/// this behind the `nn` feature and sets the result as `alc.nn`. The returned
-/// table currently exposes a single constructor, `nn.tensor(data)`, which
-/// builds a 1-D CPU `f32` tensor from a Lua array of numbers.
+/// this behind the `nn` feature and sets the result as `alc.nn`. Exposes the
+/// thin candle primitives the layer boundary requires — tensor / var / adamw
+/// plus the shared tensor ops — so Lua can write a model and a training loop.
 pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
     let nn = lua.create_table()?;
 
+    // nn.tensor(data) — a 1-D CPU f32 tensor from a Lua array of numbers.
     let tensor = lua.create_function(|_, data: Vec<f32>| {
         let len = data.len();
         let t = Tensor::from_vec(data, (len,), &Device::Cpu)
@@ -99,6 +183,38 @@ pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
         Ok(AlcTensor(t))
     })?;
     nn.set("tensor", tensor)?;
+
+    // nn.var(n, init) — a trainable 1-D parameter of length n filled with init.
+    // The Var is Host-owned; Lua receives a handle usable as an operand.
+    let var = lua.create_function(|_, (n, init): (usize, f32)| {
+        let t = Tensor::from_vec(vec![init; n], (n,), &Device::Cpu)
+            .map_err(|e| LuaError::external(format!("alc.nn.var: {e}")))?;
+        let v = Var::from_tensor(&t).map_err(|e| LuaError::external(format!("alc.nn.var: {e}")))?;
+        Ok(AlcVar(v))
+    })?;
+    nn.set("var", var)?;
+
+    // nn.adamw(vars, lr) — AdamW over the given Vars (optimizer state Host-owned).
+    let adamw = lua.create_function(|_, (vars, lr): (mlua::Table, f64)| {
+        let mut collected: Vec<Var> = Vec::new();
+        for pair in vars.sequence_values::<mlua::AnyUserData>() {
+            let ud = pair?;
+            let v = ud.borrow::<AlcVar>().map_err(|_| {
+                LuaError::external("alc.nn.adamw: expected a list of alc.nn vars")
+            })?;
+            collected.push(v.0.clone());
+        }
+        let opt = AdamW::new(
+            collected,
+            ParamsAdamW {
+                lr,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| LuaError::external(format!("alc.nn.adamw: {e}")))?;
+        Ok(AlcOptimizer(opt))
+    })?;
+    nn.set("adamw", adamw)?;
 
     Ok(nn)
 }
@@ -220,6 +336,49 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(dims, vec![4]);
+    }
+
+    /// End-to-end: a tiny linear model is *trained* from Lua through the real
+    /// candle path, then "called" on a new input. Learns y = 2x + 1 with
+    /// `nn.var` parameters + `nn.adamw` + `opt:backward_step`, all composed in
+    /// Lua (Rust exposes only the primitives). Asserts the trained model
+    /// predicts x=5 -> ~11.
+    #[test]
+    fn lua_trains_linear_model_and_predicts() {
+        let lua = mlua::Lua::new();
+        let nn = module(&lua).unwrap();
+        lua.globals().set("nn", nn).unwrap();
+
+        let pred: Vec<f32> = lua
+            .load(
+                r#"
+                local w = nn.var(1, 0.0)   -- weight, starts at 0
+                local b = nn.var(1, 0.0)   -- bias, starts at 0
+                local opt = nn.adamw({ w, b }, 0.1)
+                local xs = { 0, 1, 2, 3, 4 }
+                local ys = { 1, 3, 5, 7, 9 }   -- y = 2x + 1
+                for _ = 1, 400 do
+                    for i = 1, #xs do
+                        local x = nn.tensor({ xs[i] })
+                        local target = nn.tensor({ ys[i] })
+                        local out = w:mul(x):add(b)          -- w*x + b
+                        local loss = out:sub(target):sqr():mean()
+                        opt:backward_step(loss)
+                    end
+                end
+                -- call the trained model on a new input
+                return w:mul(nn.tensor({ 5 })):add(b):to_vec()
+            "#,
+            )
+            .eval()
+            .expect("lua training loop");
+
+        // y = 2*5 + 1 = 11
+        assert!(
+            (pred[0] - 11.0).abs() < 0.2,
+            "trained model should predict ~11 for x=5, got {}",
+            pred[0]
+        );
     }
 
     /// Sum of all parameter values across the VarMap (test helper).

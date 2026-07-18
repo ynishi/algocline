@@ -8727,3 +8727,138 @@ async fn test_alc_card_create_with_run_section_noop_when_disabled() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+/// Phase 3-H3: `alc.llm(prompt, { card_context = { pkg, limit } })` must
+/// resolve prior Cards from the FileCardStore and prefix them onto the
+/// `system` prompt as a `<past_cards>...</past_cards>` block that
+/// surfaces verbatim in the `needs_response` payload.
+///
+/// The test seeds two `[run]`-carrying Cards via `alc_v2_run` under
+/// `[setting.card].run = true` (Phase 1-B gate open), then makes a
+/// separate `alc_run` call whose Lua yields immediately on `alc.llm`,
+/// letting us assert against `resp["system"]` at the MCP boundary.
+///
+/// Verifies the end-to-end integration point: (i) `card_context` opt is
+/// extracted from the Lua opts table; (ii) `CardContextResolver`
+/// resolves against the shared per-session `CardStore`; (iii)
+/// `format_past_cards` renders the fixed template; (iv) the block is
+/// prefixed onto `system` (not `prompt`) so downstream LLM callers see
+/// a Few-shot context region separated from the user turn.
+#[tokio::test]
+async fn test_alc_llm_card_context_injects_past_cards_into_system_prompt() {
+    let alc_home = tempfile::tempdir().expect("alc_home tempdir");
+    std::fs::create_dir_all(alc_home.path().join("packages")).expect("mk packages");
+
+    let client =
+        connect_with_alc_home_and_env(alc_home.path(), &[("ALC_SETTING_CARD_RUN", "true")]).await;
+
+    // ── Seed 2 Cards with distinct [run.status] + reason under pkg=e2e_ctx.
+    //    Each seed runs to completion (no `alc.llm` in the seed script), so
+    //    the FileCardStore is populated before the consumer run begins.
+    //
+    //    `created_at` on Card TOML is second-precision, so the two seeds
+    //    must land on distinct seconds for the `desc(created_at)` order
+    //    used by `card_context::resolve` (Query form) to be observable.
+    //    An 1100ms gap between seeds crosses a whole-second boundary and
+    //    makes the "newest-first" contract testable without leaning on the
+    //    (undefined) tie-break behavior of same-second inserts.
+    for (i, (status, reason)) in [("failed", "seed_A_reason"), ("succeeded", "seed_B_reason")]
+        .iter()
+        .enumerate()
+    {
+        if i > 0 {
+            sleep(Duration::from_millis(1100)).await;
+        }
+        let seed_lua = format!(
+            r#"
+            return alc.card.create({{
+                pkg = {{ name = "e2e_ctx" }},
+                run = {{ status = "{status}", reason = "{reason}", action = "seed" }},
+            }})
+        "#
+        );
+        let spawn = call_json(&client, "alc_v2_run", json!({ "code": seed_lua })).await;
+        let sid = spawn["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("alc_v2_run seed must return session_id, got: {spawn}"));
+        let state = poll_until_v2_done(&client, sid, Duration::from_secs(5)).await;
+        assert!(
+            state["value"].is_object(),
+            "seed create must return card object (gate open), got state: {state}"
+        );
+    }
+
+    // ── Consumer: `alc.llm` with card_context = { pkg, limit } yields with
+    //    the `<past_cards>` block prefixed onto the system prompt.  Use the
+    //    v1 `alc_run` path because it surfaces the paused `system` field
+    //    directly in the tool response (the v2 state projection does not).
+    let consumer_lua = r#"
+        return alc.llm("what is the failure pattern?", {
+            card_context = { pkg = "e2e_ctx", limit = 5 },
+        })
+    "#;
+    let resp = call_json(&client, "alc_run", json!({ "code": consumer_lua })).await;
+
+    assert_eq!(
+        resp["status"], "needs_response",
+        "consumer must pause on alc.llm, got: {resp}"
+    );
+    let system = resp["system"]
+        .as_str()
+        .unwrap_or_else(|| panic!("system must be a string carrying past_cards, got: {resp}"));
+
+    // Fixed-template invariants: wrapper + both seeded reasons + status tag
+    // + pkg name. Order (recent-first) is asserted separately via reason
+    // sequencing so a re-ordering regression is caught explicitly.
+    assert!(
+        system.contains("<past_cards>") && system.contains("</past_cards>"),
+        "system must contain the <past_cards> wrapper, got: {system}"
+    );
+    assert!(
+        system.contains("pkg=e2e_ctx"),
+        "system must cite the seeded pkg, got: {system}"
+    );
+    assert!(
+        system.contains("seed_A_reason"),
+        "system must include Card A reason verbatim, got: {system}"
+    );
+    assert!(
+        system.contains("seed_B_reason"),
+        "system must include Card B reason verbatim, got: {system}"
+    );
+    assert!(
+        system.contains("[run.status=failed]"),
+        "system must include the failed status tag from Card A, got: {system}"
+    );
+    assert!(
+        system.contains("[run.status=succeeded]"),
+        "system must include the succeeded status tag from Card B, got: {system}"
+    );
+
+    // Recent-first ordering: Card B was created after Card A, so seed_B_reason
+    // must appear before seed_A_reason in the rendered block.
+    let pos_a = system
+        .find("seed_A_reason")
+        .expect("seed_A_reason must appear in system");
+    let pos_b = system
+        .find("seed_B_reason")
+        .expect("seed_B_reason must appear in system");
+    assert!(
+        pos_b < pos_a,
+        "Cards must be rendered newest-first (seed_B before seed_A), got system:\n{system}"
+    );
+
+    // Cleanly resume the paused session so the child server exits without
+    // an orphan pending — the response body is irrelevant to this test.
+    let session_id = resp["session_id"]
+        .as_str()
+        .expect("session_id missing from consumer needs_response");
+    let _ = call_json(
+        &client,
+        "alc_continue",
+        json!({ "session_id": session_id, "response": "acknowledged" }),
+    )
+    .await;
+
+    client.cancel().await.expect("cancel failed");
+}

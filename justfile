@@ -253,3 +253,83 @@ check-agent-index:
 [group('allow-agent')]
 gen-shapes:
     cargo run -p algocline-app --example gen_alc_shapes_dlua
+
+# ─── Vendor Sync ────────────────────────────────────────────────
+#
+# Sync vendored copies of upstream Lua packages into `crates/**/vendor/`.
+# Each recipe wipes the destination dir, copies every `.lua` file from
+# the source dir preserving subdir structure, and prepends a 2-line
+# origin marker to each vendored file.
+#
+# Source dirs default to local checkouts under `$HOME/projects/`.
+# Override per invocation via env vars:
+#   ALC_SHAPES_SRC=<abs path> just vendor-alc-shapes
+#   EVALFRAME_SRC=<abs path>  just vendor-evalframe
+#
+# After a sync, run `just ci` (fmt / clippy / test / lua-fmt-check /
+# check-invariants) to verify no regressions before committing.
+
+# Sync vendored alc_shapes.
+# Source override: ALC_SHAPES_SRC=<abs path>
+[group('allow-agent')]
+vendor-alc-shapes:
+    #!/usr/bin/env bash
+    src="${ALC_SHAPES_SRC:-$HOME/projects/algocline-bundled-packages/alc_shapes}"
+    just _vendor-lua-pkg alc_shapes "$src" crates/algocline-app/src/service/gendoc/alc_shapes
+
+# Sync vendored evalframe.
+# Source override: EVALFRAME_SRC=<abs path>
+[group('allow-agent')]
+vendor-evalframe:
+    #!/usr/bin/env bash
+    src="${EVALFRAME_SRC:-$HOME/projects/evalframe/evalframe}"
+    just _vendor-lua-pkg evalframe "$src" crates/algocline-engine/src/vendor/evalframe
+
+# Sync every vendored Lua package.
+[group('allow-agent')]
+vendor-sync: vendor-alc-shapes vendor-evalframe
+
+# Internal: shared vendor-sync body used by every `vendor-*` recipe.
+# Not marked `[group('allow-agent')]` because it is not meant to be
+# invoked directly.
+_vendor-lua-pkg NAME SRC DST:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name="{{NAME}}"
+    src="{{SRC}}"
+    dst="{{DST}}"
+    if [ ! -d "$src" ]; then
+        echo "vendor-sync: source dir '$src' not found (set {{ uppercase(NAME) }}_SRC to override)" >&2
+        exit 1
+    fi
+    # Extract semver from init.lua; falls back to "unknown" when the
+    # file has no recognisable version field.
+    version="$(
+        if [ -f "$src/init.lua" ]; then
+            grep -hE "(^\s*version\s*=|M\.VERSION\s*=)" "$src/init.lua" \
+                | head -1 \
+                | sed -E "s/.*['\"]([0-9]+\.[0-9]+\.[0-9]+[^'\"]*)['\"].*/\1/"
+        else
+            echo ""
+        fi
+    )"
+    version="${version:-unknown}"
+    # Wipe the destination so files removed upstream stop shipping.
+    rm -rf "$dst"
+    mkdir -p "$dst"
+    count=0
+    while IFS= read -r rel; do
+        rel="${rel#./}"
+        subdir=$(dirname "$rel")
+        mkdir -p "$dst/$subdir"
+        # Recipe names use hyphens; package names may use underscores
+        # (e.g. `alc_shapes`). The origin marker points at the recipe.
+        recipe_name="${name//_/-}"
+        {
+            printf -- "-- vendored from %s v%s\n" "$name" "$version"
+            printf -- "-- DO NOT EDIT here — run \`just vendor-%s\` to resync\n" "$recipe_name"
+            cat "$src/$rel"
+        } > "$dst/$rel"
+        count=$((count + 1))
+    done < <(cd "$src" && find . -name '*.lua' -type f | sort)
+    echo "vendor-sync: $name v$version -> $dst ($count files)"

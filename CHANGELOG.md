@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `justfile` recipes to resync the vendored Lua packages from local
+  upstream checkouts: `just vendor-alc-shapes` for the alc_shapes
+  copy under `crates/algocline-app/src/service/gendoc/alc_shapes/`,
+  `just vendor-evalframe` for the evalframe copy under
+  `crates/algocline-engine/src/vendor/evalframe/`, and `just
+  vendor-sync` to run both. Each recipe wipes the destination
+  directory, copies every `.lua` file preserving subdirectory
+  structure, and prepends a two-line origin marker naming the
+  package, version, and resync recipe. Source directories default
+  to local checkouts under `$HOME/projects/` and can be overridden
+  per invocation with `ALC_SHAPES_SRC=<abs path>` or
+  `EVALFRAME_SRC=<abs path>`.
 - `alc.eval` simple form now accepts a per-case `rubric` field that
   overrides the default `llm_rubric` grader rubric for that case only.
   Cases without `rubric` continue to use the built-in three-axis default

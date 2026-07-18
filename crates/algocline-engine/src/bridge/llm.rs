@@ -18,8 +18,12 @@ pub(super) fn register_llm(
     llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
     budget: BudgetHandle,
 ) -> LuaResult<()> {
+    // `_lua` is only touched under `#[cfg(feature = "nn")]` (the in-VM
+    // role="nn" fast path); on default builds the whole nn block is
+    // compiled out, hence the underscore prefix to silence
+    // unused-variable.
     let llm =
-        lua.create_async_function(move |lua, (prompt, opts): (String, Option<LuaTable>)| {
+        lua.create_async_function(move |_lua, (prompt, opts): (String, Option<LuaTable>)| {
             let tx = llm_tx.clone();
             let bh = budget.clone();
             async move {
@@ -57,7 +61,7 @@ pub(super) fn register_llm(
                         .ok_or_else(|| {
                             LuaError::external("alc.llm role=\"nn\": missing model = <name>")
                         })?;
-                    let registry = lua
+                    let registry = _lua
                         .app_data_ref::<algocline_nn::NnModelRegistry>()
                         .ok_or_else(|| {
                             LuaError::external(

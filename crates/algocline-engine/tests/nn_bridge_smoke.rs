@@ -50,7 +50,9 @@ fn production_vm() -> (Lua, tempfile::TempDir) {
         variant_pkgs: vec![],
         state_store: Arc::new(JsonFileStore::new(root.join("state"))),
         card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+        card_run_enabled: false,
         scenarios_dir: root.join("scenarios"),
+        nn_dir: root.join("nn"),
         log_sink: None,
     };
 
@@ -130,7 +132,9 @@ fn alc_llm_role_nn_routes_to_registered_model_in_process() {
                 )
                 .eval()
                 .expect("build caller");
-            f.call_async::<String>(()).await.expect("alc.llm async call")
+            f.call_async::<String>(())
+                .await
+                .expect("alc.llm async call")
         });
 
     assert_eq!(out, "echo:hello");

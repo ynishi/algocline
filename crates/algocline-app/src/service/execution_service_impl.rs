@@ -452,12 +452,14 @@ mod tests {
             tmp.path().join("cards"),
         ));
         let scenarios_dir = tmp.path().join("scenarios");
-        let registry = algocline_engine::execution::SessionRegistryV2::new(
-            executor,
+        let nn_dir = tmp.path().join("nn");
+        let dirs = algocline_engine::SessionDirs {
             state_store,
             card_store,
             scenarios_dir,
-        );
+            nn_dir,
+        };
+        let registry = algocline_engine::execution::SessionRegistryV2::new(executor, dirs);
 
         let ttl = Duration::from_millis(100);
         let interval = Duration::from_millis(50);

@@ -66,6 +66,16 @@ impl AppDir {
         self.root.join("hub_cache")
     }
 
+    /// Store root for `alc.nn` model bundles (`<root>/nn`).
+    ///
+    /// Consumed by the engine bridge under the `nn` feature to construct the
+    /// filesystem-backed `NnStore` that `alc.nn.save` / `alc.nn.load` resolve
+    /// through. Kept alongside the other subsystem accessors so the engine
+    /// never inspects `$HOME` / `$ALC_HOME` directly (see crate docs).
+    pub fn nn_dir(&self) -> PathBuf {
+        self.root.join("nn")
+    }
+
     pub fn installed_json(&self) -> PathBuf {
         self.root.join("installed.json")
     }
@@ -105,6 +115,7 @@ mod tests {
             dir.hub_cache_dir(),
             PathBuf::from("/tmp/alc-root/hub_cache")
         );
+        assert_eq!(dir.nn_dir(), PathBuf::from("/tmp/alc-root/nn"));
         assert_eq!(
             dir.installed_json(),
             PathBuf::from("/tmp/alc-root/installed.json")

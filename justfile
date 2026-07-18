@@ -58,6 +58,22 @@ filter PATTERN:
 e2e:
     cargo test --test e2e
 
+# Run nn-feature tests (candle wrapper unit tests + feature-gated engine bridge
+# smoke). `just test` does NOT cover nn_bridge_smoke because it lives behind
+# `--features nn`; this recipe closes that gap so nn work can be verified with
+# one command.
+[group: 'agent']
+test-nn:
+    cargo test -p algocline-nn
+    cargo test -p algocline-engine --features nn --test nn_bridge_smoke
+
+# Install locally with the `nn` feature enabled (alc.nn Lua surface + candle).
+# Same overwrite target as `just install` (~/.cargo/bin/alc); the default
+# `just install` builds without nn to keep the MCP binary light.
+[group: 'agent']
+install-nn:
+    cargo install --path . --features nn
+
 # Review insta snapshots (interactive)
 snapshots:
     cargo insta review

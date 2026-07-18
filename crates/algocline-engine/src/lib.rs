@@ -9,7 +9,7 @@ pub mod state;
 mod variant_pkg;
 
 pub use card::FileCardStore;
-pub use executor::Executor;
+pub use executor::{Executor, SessionDirs};
 pub use llm_bridge::{LlmRequest, QueryRequest};
 pub use session::{
     ExecutionResult, FeedResult, PendingFilter, PromptProjection, Session, SessionRegistry,

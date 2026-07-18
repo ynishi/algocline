@@ -65,6 +65,7 @@ pub(crate) fn register_fork(
     card_store: Arc<FileCardStore>,
     card_run_enabled: bool,
     scenarios_dir: PathBuf,
+    nn_dir: PathBuf,
 ) -> LuaResult<()> {
     let fork_fn = lua.create_async_function(
         move |lua, (strategies, ctx, opts): (LuaTable, LuaTable, Option<LuaTable>)| {
@@ -75,6 +76,7 @@ pub(crate) fn register_fork(
             let state_store = Arc::clone(&state_store);
             let card_store = Arc::clone(&card_store);
             let scenarios_dir = scenarios_dir.clone();
+            let nn_dir = nn_dir.clone();
             async move {
                 let n = strategies.len()? as usize;
                 if n == 0 {
@@ -176,6 +178,7 @@ pub(crate) fn register_fork(
                         // across parent and child VMs.
                         card_run_enabled,
                         scenarios_dir: scenarios_dir.clone(),
+                        nn_dir: nn_dir.clone(),
                         // Fork child sessions don't expose recent_logs via alc_status.
                         log_sink: None,
                     };

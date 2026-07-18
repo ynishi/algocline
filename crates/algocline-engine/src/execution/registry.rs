@@ -33,9 +33,7 @@ use tokio_util::sync::CancellationToken;
 use super::driver::{build_cancel_info, driver_loop, now_ms, transition_state, DriverContext};
 use super::observer::BroadcastObserverHandle;
 use super::record::{RespTxsMap, SessionRecord};
-use crate::card::FileCardStore;
 use crate::executor::Executor;
-use crate::state::JsonFileStore;
 
 // ---------------------------------------------------------------------------
 // SessionRegistryV2
@@ -48,30 +46,23 @@ use crate::state::JsonFileStore;
 pub struct SessionRegistryV2 {
     sessions: Arc<RwLock<HashMap<SessionId, Arc<SessionRecord>>>>,
     executor: Arc<Executor>,
-    state_store: Arc<JsonFileStore>,
-    card_store: Arc<FileCardStore>,
-    scenarios_dir: std::path::PathBuf,
+    dirs: crate::executor::SessionDirs,
 }
 
 impl SessionRegistryV2 {
-    /// Create a new empty registry backed by `executor`, with the storage paths
-    /// that will be injected into each spawned VM session.
+    /// Create a new empty registry backed by `executor`, with the storage
+    /// paths that will be injected into each spawned VM session.
     ///
-    /// The `state_store` / `card_store` / `scenarios_dir` mirror the legacy
-    /// `AppService` resolution against the `AppConfig::app_dir()` layout, so a
-    /// v2 caller produces the same on-disk side effects as a legacy caller.
-    pub fn new(
-        executor: Arc<Executor>,
-        state_store: Arc<JsonFileStore>,
-        card_store: Arc<FileCardStore>,
-        scenarios_dir: std::path::PathBuf,
-    ) -> Self {
+    /// `dirs` mirrors the legacy `AppService` resolution against the
+    /// `AppConfig::app_dir()` layout, so a v2 caller produces the same
+    /// on-disk side effects as a legacy caller. An empty
+    /// [`crate::executor::SessionDirs::nn_dir`] disables the `alc.nn` store
+    /// install (save/load then error).
+    pub fn new(executor: Arc<Executor>, dirs: crate::executor::SessionDirs) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             executor,
-            state_store,
-            card_store,
-            scenarios_dir,
+            dirs,
         }
     }
 
@@ -131,9 +122,7 @@ impl SessionRegistryV2 {
                 ctx,
                 vec![], // extra_lib_paths — populated by Advice/Eval kinds later
                 vec![], // variant_pkgs   — populated by Advice/Eval kinds later
-                Arc::clone(&self.state_store),
-                Arc::clone(&self.card_store),
-                self.scenarios_dir.clone(),
+                self.dirs.clone(),
                 card_run_enabled,
             )
             .await
@@ -571,13 +560,17 @@ mod tests {
     /// `~/.algocline` directory.
     fn make_registry(executor: Arc<Executor>) -> (SessionRegistryV2, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let state_store = Arc::new(JsonFileStore::new(tmp.path().join("state")));
-        let card_store = Arc::new(FileCardStore::new(tmp.path().join("cards")));
+        let state_store = Arc::new(crate::state::JsonFileStore::new(tmp.path().join("state")));
+        let card_store = Arc::new(crate::card::FileCardStore::new(tmp.path().join("cards")));
         let scenarios_dir = tmp.path().join("scenarios");
-        (
-            SessionRegistryV2::new(executor, state_store, card_store, scenarios_dir),
-            tmp,
-        )
+        let nn_dir = tmp.path().join("nn");
+        let dirs = crate::executor::SessionDirs {
+            state_store,
+            card_store,
+            scenarios_dir,
+            nn_dir,
+        };
+        (SessionRegistryV2::new(executor, dirs), tmp)
     }
 
     fn simple_spec(code: &str) -> SessionSpec {

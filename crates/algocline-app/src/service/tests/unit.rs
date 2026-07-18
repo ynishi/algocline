@@ -565,13 +565,16 @@ fn log_list_prefers_meta_file() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -635,13 +638,16 @@ fn stats_empty_dir() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -719,13 +725,16 @@ fn stats_aggregates_by_strategy() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -807,13 +816,16 @@ fn stats_legacy_logs_without_strategy() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -868,13 +880,16 @@ fn info_returns_valid_json_with_expected_keys() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -933,13 +948,16 @@ fn info_stderr_only_when_no_log_dir() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -996,13 +1014,16 @@ fn require_log_dir_returns_path_when_present() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -1051,13 +1072,16 @@ fn require_log_dir_returns_err_when_none() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -1147,13 +1171,16 @@ fn log_list_returns_empty_when_no_log_dir() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(
@@ -1204,13 +1231,16 @@ fn stats_returns_zero_when_no_log_dir() {
         registry: Arc::new(algocline_engine::SessionRegistry::new()),
         execution_registry: Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             _test_executor.clone(),
-            Arc::new(algocline_engine::JsonFileStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            Arc::new(algocline_engine::FileCardStore::new(
-                std::path::PathBuf::from("."),
-            )),
-            std::path::PathBuf::from("."),
+            algocline_engine::SessionDirs {
+                state_store: Arc::new(algocline_engine::JsonFileStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                card_store: Arc::new(algocline_engine::FileCardStore::new(
+                    std::path::PathBuf::from("."),
+                )),
+                scenarios_dir: std::path::PathBuf::from("."),
+                nn_dir: std::path::PathBuf::from("."),
+            },
         )),
         log_config: config,
         state_store: Arc::new(algocline_engine::JsonFileStore::new(

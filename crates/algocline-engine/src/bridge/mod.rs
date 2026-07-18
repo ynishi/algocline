@@ -68,6 +68,19 @@ pub struct BridgeConfig {
     pub card_run_enabled: bool,
     /// Scenarios directory exposed to Lua via `alc._dirs.scenarios`.
     pub scenarios_dir: PathBuf,
+    /// Store root for `alc.nn` model bundles.
+    ///
+    /// Consumed by `register_nn` under the `nn` feature to construct the
+    /// filesystem-backed [`algocline_nn::FsStore`] wired via
+    /// [`algocline_nn::install_store`]. Resolved by the service layer via
+    /// [`algocline_core::AppDir::nn_dir`] so the engine crate never touches
+    /// `$HOME` / `$ALC_HOME` directly.
+    ///
+    /// An empty [`PathBuf`] means "do not install a store" — `alc.nn.save` /
+    /// `alc.nn.load` then error with `"no NN store registered"`. Test sites
+    /// that never exercise save/load can pass [`PathBuf::new`]. Ignored when
+    /// the `nn` feature is disabled.
+    pub nn_dir: PathBuf,
     /// Per-session log-capture ring buffer.
     ///
     /// Obtained from `ExecutionMetrics::log_sink_handle()`.  Passed to
@@ -114,7 +127,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     register_time(lua, alc_table)?;
     register_math(lua, alc_table)?;
     #[cfg(feature = "nn")]
-    register_nn(lua, alc_table)?;
+    register_nn(lua, alc_table, config.nn_dir.clone())?;
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
     llm::register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {
@@ -131,6 +144,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
             config.card_store,
             config.card_run_enabled,
             config.scenarios_dir,
+            config.nn_dir,
         )?;
     }
     Ok(())
@@ -148,10 +162,21 @@ fn register_math(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
 /// Only compiled when the `nn` feature is enabled, so the default build never
 /// links candle. Mirrors [`register_math`]: delegate table construction to the
 /// dedicated bridge crate and set it as `alc.nn`.
+///
+/// When `nn_dir` is non-empty, an [`algocline_nn::FsStore`] rooted there is
+/// installed on the VM so `alc.nn.save` / `alc.nn.load` resolve through it.
+/// An empty `nn_dir` skips the install; save/load then error with
+/// `"no NN store registered"` — suitable for test VMs that never exercise
+/// persistence. The path itself is resolved by the service layer via
+/// [`algocline_core::AppDir::nn_dir`]; the engine crate stays free of any
+/// `$HOME` / `$ALC_HOME` reads.
 #[cfg(feature = "nn")]
-fn register_nn(lua: &Lua, alc_table: &LuaTable) -> LuaResult<()> {
+fn register_nn(lua: &Lua, alc_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
     let nn_table = algocline_nn::module(lua)?;
     alc_table.set("nn", nn_table)?;
+    if !nn_dir.as_os_str().is_empty() {
+        algocline_nn::install_store(lua, Arc::new(algocline_nn::FsStore::new(nn_dir)))?;
+    }
     Ok(())
 }
 
@@ -204,6 +229,7 @@ pub fn install_for_pkg_test(lua: &Lua) -> LuaResult<()> {
         // value from the service layer.
         card_run_enabled: true,
         scenarios_dir: root.join("scenarios"),
+        nn_dir: root.join("nn"),
         log_sink: None,
     };
 
@@ -289,6 +315,7 @@ mod tests {
             card_store: Arc::new(FileCardStore::new(root.join("cards"))),
             card_run_enabled: false,
             scenarios_dir: root.join("scenarios"),
+            nn_dir: root.join("nn"),
             log_sink: None,
         }
     }

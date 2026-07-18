@@ -46,7 +46,114 @@ use candle_core::Var;
 use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use mlua::prelude::*;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+// ─── NN Store (save/load DI) ─────────────────────────────────────────────────
+
+/// Error returned by an [`NnStore`] operation.
+///
+/// String-wrapping so a concrete implementation can carry its own error type
+/// (fs, network, database, blob store) without leaking it across the boundary.
+#[derive(Debug)]
+pub struct NnStoreError(String);
+
+impl NnStoreError {
+    /// Wrap any displayable error message.
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
+impl std::fmt::Display for NnStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NnStoreError {}
+
+/// Storage backend for `alc.nn.save` / `alc.nn.load` — the injection point for
+/// where saved model bundles live.
+///
+/// The Host injects a concrete implementation via [`install_store`]; the nn
+/// crate itself has no awareness of the process's app dir, `$HOME`, or any
+/// environment variable. Implementations resolve a model `name` to a concrete
+/// on-disk path; the tensor serialization (safetensors dump / load) stays
+/// inside the nn crate.
+///
+/// Typical wiring: the engine constructs [`FsStore`] with a root chosen from
+/// its AppDir (e.g. `<app_dir>/nn`) and calls [`install_store`]. Tests inject
+/// an [`FsStore`] over a temp dir, or their own mock impl.
+pub trait NnStore: Send + Sync {
+    /// Return a writable path for `name`. Implementations create parent
+    /// directories as needed so the caller can hand the path straight to the
+    /// safetensors writer.
+    fn save_path(&self, name: &str) -> Result<PathBuf, NnStoreError>;
+
+    /// Return the read path for `name`. Implementations do not need to check
+    /// existence — the caller surfaces missing-file errors from the loader.
+    fn load_path(&self, name: &str) -> Result<PathBuf, NnStoreError>;
+}
+
+/// Filesystem-rooted default [`NnStore`].
+///
+/// Root is provided at construction time so the nn crate never inspects
+/// `$HOME` or env directly. `name` is restricted to `[A-Za-z0-9_.-]` and
+/// cannot contain `..`, so it cannot escape the root.
+pub struct FsStore {
+    root: PathBuf,
+}
+
+impl FsStore {
+    /// Create a store rooted at `root`. Each `name` maps to
+    /// `<root>/<name>.safetensors`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn resolve(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+            || name.contains("..")
+        {
+            return Err(NnStoreError::new(format!(
+                "invalid model name {name:?} (allowed: [A-Za-z0-9_.-], no '..')"
+            )));
+        }
+        Ok(self.root.join(format!("{name}.safetensors")))
+    }
+}
+
+impl NnStore for FsStore {
+    fn save_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+        let p = self.resolve(name)?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| NnStoreError::new(format!("create {parent:?}: {e}")))?;
+        }
+        Ok(p)
+    }
+
+    fn load_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+        self.resolve(name)
+    }
+}
+
+/// App-data handle placed on the Lua VM by [`install_store`].
+struct NnStoreHandle(Arc<dyn NnStore>);
+
+/// Register a concrete [`NnStore`] on the Lua VM.
+///
+/// Must be called before `alc.nn.save` / `alc.nn.load` are used; otherwise
+/// both closures return an "no NN store registered" error. Re-installing
+/// overwrites the previous store.
+pub fn install_store(lua: &Lua, store: Arc<dyn NnStore>) -> LuaResult<()> {
+    lua.set_app_data(NnStoreHandle(store));
+    Ok(())
+}
 
 /// Per-VM `alc.nn` model registry.
 ///
@@ -232,9 +339,9 @@ pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
         let mut collected: Vec<Var> = Vec::new();
         for pair in vars.sequence_values::<mlua::AnyUserData>() {
             let ud = pair?;
-            let v = ud.borrow::<AlcVar>().map_err(|_| {
-                LuaError::external("alc.nn.adamw: expected a list of alc.nn vars")
-            })?;
+            let v = ud
+                .borrow::<AlcVar>()
+                .map_err(|_| LuaError::external("alc.nn.adamw: expected a list of alc.nn vars"))?;
             collected.push(v.0.clone());
         }
         let opt = AdamW::new(
@@ -265,6 +372,57 @@ pub fn module(lua: &Lua) -> LuaResult<LuaTable> {
         Ok(())
     })?;
     nn.set("register", register)?;
+
+    // nn.save(vars, name) — dump the given named Vars via the installed
+    // NnStore. `vars` is a Lua table keyed by string (e.g. `{ w = w, b = b }`);
+    // each key becomes a safetensors entry name. The Host's NnStore chose the
+    // on-disk location; this crate owns the tensor → bytes serialization
+    // (candle safetensors), so callers can swap the backend without touching
+    // the dump path.
+    let save = lua.create_function(|lua, (vars, name): (mlua::Table, String)| {
+        let store = lua
+            .app_data_ref::<NnStoreHandle>()
+            .ok_or_else(|| LuaError::external("alc.nn.save: no NN store registered"))?;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        for pair in vars.pairs::<String, mlua::AnyUserData>() {
+            let (k, ud) = pair?;
+            let v = ud
+                .borrow::<AlcVar>()
+                .map_err(|_| LuaError::external("alc.nn.save: table values must be alc.nn vars"))?;
+            map.insert(k, v.0.as_tensor().clone());
+        }
+        let path = store
+            .0
+            .save_path(&name)
+            .map_err(|e| LuaError::external(format!("alc.nn.save: {e}")))?;
+        candle_core::safetensors::save(&map, &path)
+            .map_err(|e| LuaError::external(format!("alc.nn.save: {e}")))?;
+        Ok(())
+    })?;
+    nn.set("save", save)?;
+
+    // nn.load(name) — restore Vars via the installed NnStore. Returns a Lua
+    // table keyed by the safetensors entry names produced by `save`. Each
+    // value is a fresh Host-owned Var initialised from the stored tensor.
+    let load = lua.create_function(|lua, name: String| {
+        let store = lua
+            .app_data_ref::<NnStoreHandle>()
+            .ok_or_else(|| LuaError::external("alc.nn.load: no NN store registered"))?;
+        let path = store
+            .0
+            .load_path(&name)
+            .map_err(|e| LuaError::external(format!("alc.nn.load: {e}")))?;
+        let tensors = candle_core::safetensors::load(&path, &Device::Cpu)
+            .map_err(|e| LuaError::external(format!("alc.nn.load: {e}")))?;
+        let out = lua.create_table()?;
+        for (k, t) in tensors {
+            let v = Var::from_tensor(&t)
+                .map_err(|e| LuaError::external(format!("alc.nn.load: {e}")))?;
+            out.set(k, AlcVar(v))?;
+        }
+        Ok(out)
+    })?;
+    nn.set("load", load)?;
 
     Ok(nn)
 }
@@ -431,18 +589,110 @@ mod tests {
         );
     }
 
+    /// DI roundtrip: train a linear model, save through an injected
+    /// [`FsStore`] over a temp dir, load it in a fresh Lua VM, and verify the
+    /// restored Vars produce the same prediction. Confirms the store trait
+    /// carries the whole dump / restore path — no `$HOME` / env lookup, no
+    /// path leakage into the nn crate.
+    #[test]
+    fn lua_save_load_roundtrip_via_store() {
+        let root = std::env::temp_dir().join("alc-nn-save-load-roundtrip");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store: Arc<dyn NnStore> = Arc::new(FsStore::new(&root));
+
+        // Train + save in VM A.
+        let lua_a = mlua::Lua::new();
+        install_store(&lua_a, Arc::clone(&store)).unwrap();
+        let nn_a = module(&lua_a).unwrap();
+        lua_a.globals().set("nn", nn_a).unwrap();
+        let pred_before: Vec<f32> = lua_a
+            .load(
+                r#"
+                local w = nn.var(1, 0.0)
+                local b = nn.var(1, 0.0)
+                local opt = nn.adamw({ w, b }, 0.1)
+                local xs = { 0, 1, 2, 3, 4 }
+                local ys = { 1, 3, 5, 7, 9 }
+                for _ = 1, 400 do
+                    for i = 1, #xs do
+                        local x = nn.tensor({ xs[i] })
+                        local target = nn.tensor({ ys[i] })
+                        local loss = w:mul(x):add(b):sub(target):sqr():mean()
+                        opt:backward_step(loss)
+                    end
+                end
+                nn.save({ w = w, b = b }, "roundtrip")
+                return w:mul(nn.tensor({ 5 })):add(b):to_vec()
+            "#,
+            )
+            .eval()
+            .expect("train + save");
+        assert!(root.join("roundtrip.safetensors").exists());
+
+        // Load in a fresh VM B with only the store re-installed.
+        let lua_b = mlua::Lua::new();
+        install_store(&lua_b, Arc::clone(&store)).unwrap();
+        let nn_b = module(&lua_b).unwrap();
+        lua_b.globals().set("nn", nn_b).unwrap();
+        let pred_after: Vec<f32> = lua_b
+            .load(
+                r#"
+                local m = nn.load("roundtrip")
+                return m.w:mul(nn.tensor({ 5 })):add(m.b):to_vec()
+            "#,
+            )
+            .eval()
+            .expect("load + predict");
+
+        assert!(
+            (pred_before[0] - pred_after[0]).abs() < 1e-4,
+            "prediction must survive save/load (before={}, after={})",
+            pred_before[0],
+            pred_after[0]
+        );
+    }
+
+    /// save/load without an installed store must return a clear Lua error, so
+    /// callers can't silently write to a nn-crate-chosen default location.
+    #[test]
+    fn save_without_installed_store_errors() {
+        let lua = mlua::Lua::new();
+        let nn = module(&lua).unwrap();
+        lua.globals().set("nn", nn).unwrap();
+        let err = lua
+            .load(
+                r#"
+                local w = nn.var(1, 0.0)
+                nn.save({ w = w }, "noop")
+            "#,
+            )
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no NN store registered"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// FsStore rejects names that could escape the store root.
+    #[test]
+    fn fs_store_rejects_path_traversal() {
+        let root = std::env::temp_dir().join("alc-nn-traversal-test");
+        let store = FsStore::new(&root);
+        assert!(store.save_path("../evil").is_err());
+        assert!(store.save_path("a/b").is_err());
+        assert!(store.save_path("").is_err());
+        assert!(store.save_path("ok_name-1.v2").is_ok());
+    }
+
     /// Sum of all parameter values across the VarMap (test helper).
     fn weight_sum(varmap: &VarMap) -> f32 {
         varmap
             .all_vars()
             .iter()
-            .map(|v| {
-                v.as_tensor()
-                    .sum_all()
-                    .unwrap()
-                    .to_scalar::<f32>()
-                    .unwrap()
-            })
+            .map(|v| v.as_tensor().sum_all().unwrap().to_scalar::<f32>().unwrap())
             .sum()
     }
 }

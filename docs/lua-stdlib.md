@@ -613,14 +613,67 @@ local reply = alc.llm("5", { role = "nn", model = "tiny-linear" })
 -- reply == "10.98..."
 ```
 
+#### `alc.nn.save(vars, name)`
+
+Persist a set of trained parameters as a safetensors bundle. `vars` is a table
+keyed by string; each key becomes an entry name inside the bundle. Storage is
+resolved by an `NnStore` the Host injected at VM setup — the nn crate owns
+tensor serialization but never chooses the location, so a session, a test, or
+an alternate Host can each aim `save`/`load` at different roots without
+changing this API.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `vars` | table<string, `AlcVar`> | yes | Named parameters to persist |
+| `name` | string | yes | Bundle name (validated by the store; `FsStore` allows `[A-Za-z0-9_.-]` and rejects `..`) |
+
+**Returns:** nil. Errors as `alc.nn.save: no NN store registered` if the Host
+did not install one.
+
+```lua
+alc.nn.save({ w = w, b = b }, "tiny-linear")
+```
+
+#### `alc.nn.load(name)`
+
+Restore a bundle previously written with `alc.nn.save`. Each entry becomes a
+fresh `AlcVar` handle owned by the current VM; the returned table mirrors the
+keys used at save time. Combine with `alc.nn.register` to expose a persisted
+model as an `alc.llm` responder without re-training.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `name` | string | yes | Bundle name previously passed to `save` |
+
+**Returns:** table<string, `AlcVar`> — restored parameters. Errors as
+`alc.nn.load: no NN store registered` when the Host did not install one, and
+propagates the underlying loader error (e.g. missing file) otherwise.
+
+```lua
+local m = alc.nn.load("tiny-linear")
+alc.nn.register("tiny-linear", function(prompt)
+    local x = tonumber(prompt) or 0
+    return tostring(m.w:mul(alc.nn.tensor({ x })):add(m.b):to_vec()[1])
+end)
+```
+
 Notes:
 
-- The registry is per-VM. A separate `alc_run` session starts empty; retrain
-  and re-register, or export the model and load it in your own responder.
+- The registry is per-VM. A separate `alc_run` session starts empty; either
+  retrain and re-register, or `alc.nn.load` a previously saved bundle and
+  re-register from it.
 - `role="nn"` calls do not count toward `stats.pauses` or `stats.llm_calls` —
   they never leave the VM.
 - Any other `role` value (or absence) falls through to the normal Host LLM
   path unchanged.
+- `save`/`load` require the Host to have installed an `NnStore` on the VM.
+  The default engine wiring maps names to a Host-chosen directory (typically
+  under the algocline app dir); tests and alternate Hosts can inject their
+  own store without changing the Lua-visible API.
 
 ---
 

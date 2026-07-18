@@ -38,6 +38,30 @@ use crate::variant_pkg::{register_variant_pkgs, VariantPkg};
 /// Embedded at compile time and loaded into every session.
 const PRELUDE: &str = include_str!("prelude.lua");
 
+/// Per-session storage roots resolved by the service layer.
+///
+/// Bundles the four filesystem handles that flow into every
+/// [`Executor::start_session`] / [`Executor::start_session_with_env`] call so
+/// callers don't juggle four parallel arguments. The service layer builds one
+/// from [`algocline_core::AppDir`] and hands it in; the engine consumes fields
+/// as needed.
+///
+/// Adding a new subsystem-owned path (e.g. a future `blob_dir`) is a single
+/// field on this struct rather than a sweep across every start_session caller.
+#[derive(Clone)]
+pub struct SessionDirs {
+    /// Backing store for `alc.state.*` (typically `<app_dir>/state`).
+    pub state_store: Arc<JsonFileStore>,
+    /// Backing store for `alc.card.*` (typically `<app_dir>/cards`).
+    pub card_store: Arc<FileCardStore>,
+    /// Directory exposed to Lua via `alc._dirs.scenarios`.
+    pub scenarios_dir: PathBuf,
+    /// Store root for `alc.nn.save` / `alc.nn.load` (typically `<app_dir>/nn`).
+    /// An empty [`PathBuf`] disables the store install (save/load then error);
+    /// consumed only when the `nn` feature is enabled.
+    pub nn_dir: PathBuf,
+}
+
 /// Lua execution engine.
 ///
 /// Holds a **shared VM** for lightweight stateless operations (`eval_simple`)
@@ -166,10 +190,12 @@ impl Executor {
     /// `variant_pkgs` come from `alc.local.toml` and override both layers
     /// (registered at the highest priority).
     ///
-    /// `state_store` / `card_store` / `scenarios_dir` are resolved by the
-    /// service layer (typically from `AppConfig.app_dir()`) so the engine
-    /// crate never touches HOME. They flow through [`bridge::BridgeConfig`]
-    /// to back `alc.state.*` / `alc.card.*` / `alc._dirs.scenarios`.
+    /// `dirs` is resolved by the service layer (typically from
+    /// `AppConfig.app_dir()`) so the engine crate never touches HOME. Its
+    /// fields flow through [`bridge::BridgeConfig`] to back `alc.state.*` /
+    /// `alc.card.*` / `alc._dirs.scenarios` and the `nn` feature's
+    /// `alc.nn.save/load` store. An empty [`SessionDirs::nn_dir`] disables
+    /// the store install (save/load then error).
     #[allow(clippy::too_many_arguments)]
     pub async fn start_session(
         &self,
@@ -177,11 +203,15 @@ impl Executor {
         ctx: serde_json::Value,
         extra_lib_paths: Vec<PathBuf>,
         variant_pkgs: Vec<VariantPkg>,
-        state_store: Arc<JsonFileStore>,
-        card_store: Arc<FileCardStore>,
-        scenarios_dir: PathBuf,
+        dirs: SessionDirs,
         card_run_enabled: bool,
     ) -> Result<Session, String> {
+        let SessionDirs {
+            state_store,
+            card_store,
+            scenarios_dir,
+            nn_dir,
+        } = dirs;
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
 
@@ -215,6 +245,7 @@ impl Executor {
             card_store,
             card_run_enabled,
             scenarios_dir,
+            nn_dir,
             log_sink: Some(log_sink.clone()),
         };
         let lua_ctx = spec.ctx.clone();
@@ -302,11 +333,15 @@ impl Executor {
         ctx: serde_json::Value,
         extra_lib_paths: Vec<PathBuf>,
         variant_pkgs: Vec<VariantPkg>,
-        state_store: Arc<JsonFileStore>,
-        card_store: Arc<FileCardStore>,
-        scenarios_dir: PathBuf,
+        dirs: SessionDirs,
         card_run_enabled: bool,
     ) -> Result<Session, String> {
+        let SessionDirs {
+            state_store,
+            card_store,
+            scenarios_dir,
+            nn_dir,
+        } = dirs;
         let spec = ExecutionSpec::new(code, ctx);
         let metrics = ExecutionMetrics::new();
 
@@ -334,6 +369,7 @@ impl Executor {
             card_store,
             card_run_enabled,
             scenarios_dir,
+            nn_dir,
             log_sink: Some(log_sink.clone()),
         };
         let lua_ctx = spec.ctx.clone();

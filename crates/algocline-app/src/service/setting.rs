@@ -12,6 +12,17 @@
 //! Target names and field names are arbitrary (`BTreeMap<String, _>`).
 //! No per-target schema is enforced here; all schema validation is the
 //! responsibility of the caller.
+//!
+//! ## Known targets
+//!
+//! Known targets are informational only. No target is whitelisted.
+//! Callers may add new `[setting.<name>]` sections freely; the resolver
+//! is target-agnostic (see `## Schemaless design` above).
+//!
+//! Targets currently used by algocline:
+//!
+//! - `card.run: bool` — Whether Card writes are enabled on the
+//!   Run path. Consumer-side default: `false`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +66,33 @@ pub struct SettingResolved {
     pub resolved: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     /// Winning layer per field per target.
     pub sources: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl SettingResolved {
+    /// Get a field value as a boolean.
+    ///
+    /// Returns `None` when the target is absent, the field is absent,
+    /// or the value is not a boolean. Callers decide the default value
+    /// (typically `.unwrap_or(false)` or `.unwrap_or(true)`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let resolved = resolve_setting(&app_dir, project_root, Some("card"))?;
+    /// let run = resolved.get_bool("card", "run").unwrap_or(false);
+    /// ```
+    // The first production consumer is planned for Phase 1-B
+    // (`bridge/data.rs::resolve_setting(...).get_bool("card", "run")`).
+    // Until then, this method is exercised by unit tests only. The
+    // `service::setting` module is `pub(crate)`, so the reachability analyser
+    // cannot see the tests-only call sites as usages of the public API.
+    #[allow(dead_code)]
+    pub fn get_bool(&self, target: &str, field: &str) -> Option<bool> {
+        self.resolved
+            .get(target)
+            .and_then(|fields| fields.get(field))
+            .and_then(|v| v.as_bool())
+    }
 }
 
 // ─── Internal TOML holder ────────────────────────────────────────────────────
@@ -862,5 +900,106 @@ mod tests {
         assert_eq!(resolved.get("path"), Some(&serde_json::json!("G")));
         let sources = result.sources.get("journal").unwrap();
         assert_eq!(sources.get("path"), Some(&"global".to_string()));
+    }
+
+    // ── [setting.card].run cascade tests (Phase 1-A) ─────────────────
+
+    #[test]
+    fn card_run_env_wins() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("ALC_SETTING_CARD_RUN", "true");
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_config(global_tmp.path(), "[setting.card]\nrun = false\n");
+        let app_dir = make_app_dir(global_tmp.path());
+        let result =
+            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(result.get_bool("card", "run"), Some(true));
+        assert_eq!(
+            result.sources.get("card").unwrap().get("run"),
+            Some(&"env".to_string())
+        );
+    }
+
+    #[test]
+    fn card_run_local_wins_over_alc() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_config(global_tmp.path(), "");
+        write_alc_toml(project_tmp.path(), "[setting.card]\nrun = false\n");
+        write_local_alc_toml(project_tmp.path(), "[setting.card]\nrun = true\n");
+        let app_dir = make_app_dir(global_tmp.path());
+        let result =
+            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(result.get_bool("card", "run"), Some(true));
+        assert_eq!(
+            result.sources.get("card").unwrap().get("run"),
+            Some(&"project".to_string())
+        );
+    }
+
+    #[test]
+    fn card_run_alc_wins_over_global() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_config(global_tmp.path(), "[setting.card]\nrun = false\n");
+        write_alc_toml(project_tmp.path(), "[setting.card]\nrun = true\n");
+        let app_dir = make_app_dir(global_tmp.path());
+        let result =
+            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(result.get_bool("card", "run"), Some(true));
+        assert_eq!(
+            result.sources.get("card").unwrap().get("run"),
+            Some(&"project".to_string())
+        );
+    }
+
+    #[test]
+    fn card_run_global_only() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_config(global_tmp.path(), "[setting.card]\nrun = true\n");
+        let app_dir = make_app_dir(global_tmp.path());
+        let result =
+            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(result.get_bool("card", "run"), Some(true));
+        assert_eq!(
+            result.sources.get("card").unwrap().get("run"),
+            Some(&"global".to_string())
+        );
+    }
+
+    #[test]
+    fn card_run_absent_returns_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_config(global_tmp.path(), "");
+        let app_dir = make_app_dir(global_tmp.path());
+        let result =
+            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        assert_eq!(result.get_bool("card", "run"), None);
+        // Caller decides default:
+        assert!(!result.get_bool("card", "run").unwrap_or(false));
+    }
+
+    #[test]
+    fn card_run_non_bool_value_returns_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let global_tmp = tempfile::tempdir().unwrap();
+        let project_tmp = tempfile::tempdir().unwrap();
+        write_config(
+            global_tmp.path(),
+            "[setting.card]\nrun = \"not_a_bool\"\n",
+        );
+        let app_dir = make_app_dir(global_tmp.path());
+        let result =
+            resolve_setting(&app_dir, Some(project_tmp.path()), Some("card")).unwrap();
+        // resolve_setting succeeds (schemaless), but get_bool downgrades non-bool to None.
+        assert!(result.resolved.contains_key("card"));
+        assert_eq!(result.get_bool("card", "run"), None);
     }
 }

@@ -45,7 +45,14 @@ tempfile = { workspace = true }
 # CPU builds keep this off (`candle-core` without `cuda`). On dev hosts
 # without an `nvcc` toolchain this feature does not compile — that is
 # expected; verification runs on the CUDA-enabled tier.
-nn-cuda = ["candle-core/cuda"]
+#
+# Both `candle-core/cuda` and `candle-nn/cuda` must be enabled together:
+# candle-nn 0.11's `LayerNorm` is a `CustomOp3` whose `cuda_fwd` is
+# `#[cfg(feature = "cuda")]`-gated, so a `candle-core/cuda`-only build
+# still dispatches CustomOp on CPU and fails at forward time with
+# `Candle("no cuda implementation for layer-norm")`. Keep this pair
+# in sync when bumping candle.
+nn-cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 # GPU smoke-test example: builds a full-size GPT-2 medium (355M) on
 # CUDA when the `nn-cuda` feature is enabled, otherwise falls back to

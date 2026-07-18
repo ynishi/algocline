@@ -46,3 +46,11 @@ tempfile = { workspace = true }
 # without an `nvcc` toolchain this feature does not compile — that is
 # expected; verification runs on the CUDA-enabled tier.
 nn-cuda = ["candle-core/cuda"]
+
+# GPU smoke-test example: builds a full-size GPT-2 medium (355M) on
+# CUDA when the `nn-cuda` feature is enabled, otherwise falls back to
+# CPU (usable for compile checks but far too slow for a real run).
+# Kept out of the crate's public API surface.
+[[example]]
+name = "nn_medium_gpu_smoke"
+required-features = []

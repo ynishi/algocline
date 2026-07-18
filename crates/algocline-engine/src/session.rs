@@ -341,6 +341,15 @@ pub struct Session {
     /// Wall-clock Unix ms of the most recent activity (feed_one or session creation).
     /// Updated with `Relaxed` ordering — observability use only, no cross-thread invariant.
     last_activity_ms: Arc<AtomicI64>,
+    /// RAII guard for per-session `LogSink` registration on the
+    /// process-wide [`crate::card::LogSinkCardSubscriber`]. Dropped when the
+    /// session is dropped, which unregisters the sink so `CardEvent` fan-outs
+    /// stop targeting this session.
+    ///
+    /// `None` for eval_simple / fork children (BridgeConfig::log_sink is
+    /// None in those paths). The field is underscore-prefixed to signal
+    /// intentionally-unused: its only observable effect is the `Drop`.
+    _log_sink_registration: Option<crate::card::LogSinkRegistration>,
 }
 
 impl Session {
@@ -383,7 +392,24 @@ impl Session {
             last_active: std::time::Instant::now(),
             started_at_ms,
             last_activity_ms: Arc::new(AtomicI64::new(started_at_ms)),
+            _log_sink_registration: None,
         }
+    }
+
+    /// Attach an RAII [`crate::card::LogSinkRegistration`] to this session so
+    /// that `CardEvent` fan-outs are routed into the session's `LogSink` until
+    /// the session is dropped.
+    ///
+    /// Called by [`crate::executor::Executor::start_session`] and
+    /// [`crate::executor::Executor::start_session_with_env`] immediately after
+    /// `Session::new` when `BridgeConfig::log_sink` is `Some`. `None` for
+    /// `eval_simple` / fork children and for test setups that construct a
+    /// session by hand.
+    pub(crate) fn attach_log_sink_registration(
+        &mut self,
+        guard: Option<crate::card::LogSinkRegistration>,
+    ) {
+        self._log_sink_registration = guard;
     }
 
     /// Wait for the next event from Lua execution.

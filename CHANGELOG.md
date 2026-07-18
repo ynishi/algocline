@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 2-D: added `LogSinkCardSubscriber` that fans out `CardEvent`
+  (`Created` / `Appended` / `SamplesWritten` / `AliasesWritten`) into
+  per-session `LogSink` ring buffers, closing the "Card writes → Log
+  observability" Domain link. Each `Executor::start_session` (and
+  `start_session_with_env`) registers the session's own `LogSink` on the
+  process-wide `LogSinkCardSubscriber` via a new `register_log_sink` RAII
+  API; the returned `LogSinkRegistration` guard is dropped when the
+  `Session` is dropped so per-session lifecycle is closed. `CardEventBus`
+  gains a new `add_subscriber` production API used by the singleton to
+  self-register on first access. The subscriber uses the same
+  snapshot-clone-then-iterate pattern as the existing publish path so
+  registrations and unregistrations from other threads never deadlock a
+  fan-out in flight. Additive change: existing subscribers
+  (`FileCardSubscriber` seeded from `ALC_CARD_SINKS`) are unaffected.
 - Phase 1-B: added optional `run` field to `alc.card.create` /
   `alc.card.append`, gated by `[setting.card].run` (default false, opt-in
   per session). When the setting is off, calls carrying a `run` field

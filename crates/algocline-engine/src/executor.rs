@@ -202,6 +202,12 @@ impl Executor {
         // The same Arc is shared with Session so snapshot() can read recent_logs.
         let log_sink = metrics.log_sink_handle();
 
+        // Phase 2-D: register this session's LogSink with the process-wide
+        // LogSinkCardSubscriber so `CardEvent`s land as `LogEntry`s alongside
+        // `alc.log()` / `print()` output. The guard's `Drop` unregisters when
+        // the session ends.
+        let log_sink_registration = crate::card::register_log_sink(log_sink.clone());
+
         let bridge_config = bridge::BridgeConfig {
             llm_tx: Some(llm_tx),
             ns: spec.namespace.clone(),
@@ -281,7 +287,9 @@ impl Executor {
         // The driver keeps the channel alive until the session completes.
         drop(session_isle);
 
-        Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
+        let mut session = Session::new(llm_rx, exec_task, metrics, session_driver);
+        session.attach_log_sink_registration(Some(log_sink_registration));
+        Ok(session)
     }
 
     /// Like [`start_session`] but registers `alc.env` inside the setup closure
@@ -320,6 +328,10 @@ impl Executor {
         effective.extend(self.lib_paths.iter().cloned());
 
         let log_sink = metrics.log_sink_handle();
+
+        // Phase 2-D: register per-session LogSink on the card subscriber bus,
+        // parallel to `start_session`. See that method's comment for details.
+        let log_sink_registration = crate::card::register_log_sink(log_sink.clone());
 
         let bridge_config = bridge::BridgeConfig {
             llm_tx: Some(llm_tx),
@@ -384,7 +396,9 @@ impl Executor {
 
         drop(session_isle);
 
-        Ok(Session::new(llm_rx, exec_task, metrics, session_driver))
+        let mut session = Session::new(llm_rx, exec_task, metrics, session_driver);
+        session.attach_log_sink_registration(Some(log_sink_registration));
+        Ok(session)
     }
 }
 

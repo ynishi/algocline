@@ -90,6 +90,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use algocline_core::{LogEntry, LogSink};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value as Json};
 
@@ -2676,6 +2677,225 @@ impl CardSubscriber for FileCardSubscriber {
     }
 }
 
+// ─── LogSinkCardSubscriber — fan-out into per-session LogSink ──
+
+/// Fan-out `CardEvent`s into per-session `LogSink` ring buffers.
+///
+/// Process-wide singleton accessed via [`log_sink_subscriber`]. Each Session
+/// registers its own `LogSink` on start-up via [`register_log_sink`] and
+/// unregisters on `Drop` of the returned [`LogSinkRegistration`] guard.
+///
+/// # Concurrency
+///
+/// `Send + Sync`. Internal state is `Mutex<Vec<(u64, LogSink)>>` +
+/// `AtomicU64`. `on_event` uses the same snapshot-clone-then-iterate
+/// pattern as [`CardEventBus::publish`]: sinks are cloned under the lock
+/// then iterated with the lock released, so registrations/unregistrations
+/// from other threads never deadlock a fan-out in flight. The mutex uses
+/// the crate-wide `unwrap_or_else(|p| p.into_inner())` policy so a
+/// poisoned lock never propagates a panic.
+#[derive(Debug)]
+pub struct LogSinkCardSubscriber {
+    sinks: Mutex<Vec<(u64, LogSink)>>,
+    next_id: AtomicU64,
+}
+
+impl LogSinkCardSubscriber {
+    /// Fixed subscriber URI used by [`CardEventBus`] to key
+    /// `SubscriberStats` and to guard against duplicate registration.
+    pub const URI: &'static str = "log-sink://alc.card";
+
+    fn new() -> Self {
+        Self {
+            sinks: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Format a `CardEvent` into the message payload for a `LogEntry`.
+    ///
+    /// The payload body itself is intentionally omitted (ring buffer is
+    /// cap=20 by design; full-payload archival is [`FileCardSubscriber`]'s
+    /// job).
+    fn format_message(ev: &CardEvent) -> String {
+        match ev {
+            CardEvent::Created { pkg, card_id, .. } => {
+                format!("created pkg={pkg} card_id={card_id}")
+            }
+            CardEvent::Appended { card_id, .. } => {
+                format!("appended card_id={card_id}")
+            }
+            CardEvent::SamplesWritten {
+                card_id,
+                jsonl_text,
+            } => {
+                format!(
+                    "samples_written card_id={card_id} bytes={}",
+                    jsonl_text.len()
+                )
+            }
+            CardEvent::AliasesWritten { toml_text } => {
+                format!("aliases_written bytes={}", toml_text.len())
+            }
+        }
+    }
+}
+
+impl CardSubscriber for LogSinkCardSubscriber {
+    /// Always returns `Ok(())`.
+    ///
+    /// Snapshots the sink list under `sinks.lock()`, releases the lock, then
+    /// pushes a `LogEntry { source: "alc.card", level: "info", message: <fmt> }`
+    /// into every snapshotted `LogSink`. Individual `LogSink::push` failures
+    /// (poisoned per-sink mutex) are silently dropped, matching the ring-buffer
+    /// best-effort policy in `algocline_core::recent_log`.
+    ///
+    /// # Concurrency
+    ///
+    /// Cancel-safe (no `.await`). Safe to call from any thread. Does not hold
+    /// `self.sinks` across the fan-out loop, so re-entrant registration from
+    /// within a `LogSink::push` implementation (currently impossible) would
+    /// still not deadlock.
+    fn on_event(&self, ev: &CardEvent) -> Result<(), String> {
+        let snapshot: Vec<LogSink> = {
+            let guard = self.sinks.lock().unwrap_or_else(|p| p.into_inner());
+            guard.iter().map(|(_, sink)| sink.clone()).collect()
+        };
+        let message = Self::format_message(ev);
+        for sink in &snapshot {
+            sink.push(LogEntry::new("info", "alc.card", message.clone()));
+        }
+        Ok(())
+    }
+
+    /// Returns the fixed subscriber URI `"log-sink://alc.card"`.
+    ///
+    /// Used by [`CardEventBus`] to key `SubscriberStats` and by
+    /// [`log_sink_subscriber`] initializer to guard against duplicate
+    /// registration on the bus.
+    fn describe(&self) -> String {
+        Self::URI.to_string()
+    }
+}
+
+/// RAII guard that unregisters a `LogSink` from the singleton
+/// [`LogSinkCardSubscriber`] when dropped.
+///
+/// Returned by [`register_log_sink`]. The guard owns a strong `Arc` to
+/// the singleton subscriber and the monotonic `id` assigned at registration
+/// time. `Drop` removes the matching `(id, LogSink)` entry via
+/// `Vec::retain`.
+///
+/// # Concurrency
+///
+/// `Send + Sync`. `Drop::drop` acquires the subscriber's `sinks` mutex
+/// once, using the poison-recovery policy: a panic in another thread that
+/// left the lock poisoned does NOT prevent unregistration. The drop
+/// races safely with concurrent `CardEventBus::publish` fan-outs because
+/// the publisher takes a snapshot clone of the sinks vec before iterating;
+/// an in-flight publish may or may not observe the just-unregistered sink,
+/// but never deadlocks and never observes torn state.
+///
+/// Dropping the guard is O(N) in the number of registered sinks (typically
+/// == active session count). Callers must not hold the returned guard
+/// across `.await` points that could execute on a runtime worker also
+/// running the fan-out — with the current single-shot lock scope this is
+/// not a hazard.
+#[derive(Debug)]
+pub struct LogSinkRegistration {
+    subscriber: Arc<LogSinkCardSubscriber>,
+    id: u64,
+}
+
+impl LogSinkRegistration {
+    /// Numeric id assigned to this registration at
+    /// [`register_log_sink`] time. Exposed for test verification of
+    /// atomic id uniqueness; not intended as a stable API for callers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for LogSinkRegistration {
+    fn drop(&mut self) {
+        let mut guard = self
+            .subscriber
+            .sinks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// Register `sink` with the process-wide [`LogSinkCardSubscriber`] and
+/// return an RAII guard.
+///
+/// The returned [`LogSinkRegistration`] MUST be kept alive for the lifetime
+/// of the owning `Session`. Dropping the guard unregisters the sink; the
+/// sink itself (`Arc<Mutex<VecDeque<LogEntry>>>`) is not mutated by the
+/// drop.
+///
+/// This function is infallible. Internally it assigns a monotonically
+/// increasing `u64` id via `AtomicU64::fetch_add(1, Ordering::Relaxed)`
+/// (Relaxed is sufficient because the id only becomes visible to other
+/// threads once the subsequent `sinks.lock()` push publishes it).
+///
+/// On first call, this transitively initializes the singleton
+/// [`LogSinkCardSubscriber`] and registers it on the [`CardEventBus`] via
+/// [`log_sink_subscriber`].
+///
+/// # Concurrency
+///
+/// Cancel-safe. `Send + Sync` arguments; safe to call from any thread
+/// concurrently. Two concurrent calls receive distinct ids.
+pub fn register_log_sink(sink: LogSink) -> LogSinkRegistration {
+    let subscriber = log_sink_subscriber();
+    let id = subscriber.next_id.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut guard = subscriber.sinks.lock().unwrap_or_else(|p| p.into_inner());
+        guard.push((id, sink));
+    }
+    LogSinkRegistration { subscriber, id }
+}
+
+static LOG_SINK_SUBSCRIBER: OnceLock<Arc<LogSinkCardSubscriber>> = OnceLock::new();
+
+/// Return the process-wide [`LogSinkCardSubscriber`] singleton.
+///
+/// On first call, initializes the singleton via
+/// `OnceLock::get_or_init` and registers it on the [`CardEventBus`]
+/// through [`CardEventBus::add_subscriber`]. Subsequent calls return the
+/// already-initialized `Arc`.
+///
+/// # Concurrency
+///
+/// `OnceLock` guarantees the initializer runs exactly once even under
+/// concurrent first-callers. The initializer calls `event_bus()` (a
+/// distinct `OnceLock`); this cross-cell reentrance is safe because the
+/// two cells are independent (see std::sync::OnceLock docs — reentrance
+/// deadlock only applies to the same cell). Callers holding the returned
+/// `Arc` may drop it freely; the singleton itself lives for `'static`.
+pub fn log_sink_subscriber() -> Arc<LogSinkCardSubscriber> {
+    LOG_SINK_SUBSCRIBER
+        .get_or_init(|| {
+            let arc = Arc::new(LogSinkCardSubscriber::new());
+            let bus = event_bus();
+            // Defensive de-dup guard: OnceLock guarantees single init,
+            // but we still avoid pushing twice if another code path has
+            // already registered a subscriber with the same URI.
+            if !bus
+                .subscriber_uris()
+                .iter()
+                .any(|u| u == LogSinkCardSubscriber::URI)
+            {
+                bus.add_subscriber(arc.clone() as Arc<dyn CardSubscriber>);
+            }
+            arc
+        })
+        .clone()
+}
+
 // ─── CardEventBus + OnceLock singleton ─────────────────────────
 
 /// Process-wide fan-out bus. Subscribers are registered once at startup
@@ -2770,6 +2990,31 @@ impl CardEventBus {
     pub fn find_subscriber(&self, uri: &str) -> Option<Arc<dyn CardSubscriber>> {
         let guard = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
         guard.iter().find(|s| s.describe() == uri).cloned()
+    }
+
+    /// Append `sub` to the subscriber list.
+    ///
+    /// Unlike [`replace_subscribers_for_test`], this is a production API used
+    /// by singleton subscribers (currently only [`log_sink_subscriber`]) to
+    /// self-register after the bus is initialized.
+    ///
+    /// # Concurrency
+    ///
+    /// Acquires `self.subscribers.lock()` briefly to push. The lock scope
+    /// does not include any subscriber callback, so this method cannot
+    /// deadlock against an in-flight [`Self::publish`] (publish takes a
+    /// snapshot clone under the same mutex, then releases before
+    /// dispatching).
+    ///
+    /// Poisoned-lock recovery uses `unwrap_or_else(|p| p.into_inner())` in
+    /// line with the rest of `CardEventBus`.
+    ///
+    /// This method does **not** de-duplicate. Callers that need at-most-once
+    /// registration (e.g. [`log_sink_subscriber`]) rely on `OnceLock` at the
+    /// call site to guarantee a single invocation.
+    pub fn add_subscriber(&self, sub: Arc<dyn CardSubscriber>) {
+        let mut guard = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
+        guard.push(sub);
     }
 
     /// Replace the subscriber list in place while preserving singleton
@@ -5736,5 +5981,468 @@ name = "{pkg}"
             "install after init must return Err per OnceLock contract"
         );
         assert_eq!(result.unwrap_err(), "bus already initialized");
+    }
+
+    // ─── LogSinkCardSubscriber unit tests (Phase 2-D) ─────────────
+
+    mod log_sink_subscriber_tests {
+        use super::*;
+        use std::collections::HashSet;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Barrier;
+        use std::time::{Duration, Instant};
+
+        /// Empty `String` toml_text sentinel used to keep test payloads short
+        /// while still exercising every `CardEvent` variant.
+        fn make_events() -> Vec<CardEvent> {
+            vec![
+                CardEvent::Created {
+                    pkg: "pkg_a".to_string(),
+                    card_id: "card_1".to_string(),
+                    toml_text: String::new(),
+                },
+                CardEvent::Appended {
+                    card_id: "card_1".to_string(),
+                    toml_text: String::new(),
+                },
+                CardEvent::SamplesWritten {
+                    card_id: "card_1".to_string(),
+                    jsonl_text: "abc\ndef\n".to_string(),
+                },
+                CardEvent::AliasesWritten {
+                    toml_text: "aliases".to_string(),
+                },
+            ]
+        }
+
+        // T1: single LogSink registration receives all 4 CardEvent variants,
+        // each landing as `LogEntry { source: "alc.card", level: "info" }`.
+        #[test]
+        fn t1_single_sink_receives_all_variants() {
+            let sub = LogSinkCardSubscriber::new();
+            let sink = LogSink::new();
+            {
+                let mut g = sub.sinks.lock().unwrap();
+                g.push((0, sink.clone()));
+            }
+            for ev in &make_events() {
+                sub.on_event(ev).expect("on_event returns Ok");
+            }
+            let entries = sink.entries();
+            assert_eq!(entries.len(), 4, "one entry per variant");
+            for e in &entries {
+                assert_eq!(e.source, "alc.card");
+                assert_eq!(e.level, "info");
+            }
+        }
+
+        // T2: multiple LogSinks all receive fan-out.
+        #[test]
+        fn t2_multiple_sinks_fan_out() {
+            let sub = LogSinkCardSubscriber::new();
+            let sink_a = LogSink::new();
+            let sink_b = LogSink::new();
+            {
+                let mut g = sub.sinks.lock().unwrap();
+                g.push((0, sink_a.clone()));
+                g.push((1, sink_b.clone()));
+            }
+            let ev = CardEvent::Created {
+                pkg: "pkg_x".into(),
+                card_id: "card_x".into(),
+                toml_text: String::new(),
+            };
+            sub.on_event(&ev).expect("on_event returns Ok");
+            assert_eq!(sink_a.entries().len(), 1);
+            assert_eq!(sink_b.entries().len(), 1);
+        }
+
+        // T3: after RAII drop, the removed sink no longer receives events.
+        #[test]
+        fn t3_drop_stops_delivery() {
+            let _gate = bus_test_gate().lock().unwrap_or_else(|p| p.into_inner());
+            INSIDE_BUS_TEST.with(|f| f.set(true));
+            struct Restore;
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    INSIDE_BUS_TEST.with(|f| f.set(false));
+                }
+            }
+            let _r = Restore;
+
+            let sink = LogSink::new();
+            let reg = register_log_sink(sink.clone());
+            let ev = CardEvent::AliasesWritten {
+                toml_text: "aliases".to_string(),
+            };
+            log_sink_subscriber().on_event(&ev).unwrap();
+            let n_before_drop = sink.entries().len();
+            assert!(n_before_drop >= 1, "sink must receive event before drop");
+            drop(reg);
+            log_sink_subscriber().on_event(&ev).unwrap();
+            assert_eq!(
+                sink.entries().len(),
+                n_before_drop,
+                "no new entries after drop"
+            );
+        }
+
+        // T4: describe() returns the canonical identity URI.
+        #[test]
+        fn t4_describe_returns_canonical_uri() {
+            let sub = LogSinkCardSubscriber::new();
+            assert_eq!(sub.describe(), "log-sink://alc.card");
+            assert_eq!(LogSinkCardSubscriber::URI, "log-sink://alc.card");
+        }
+
+        // T5: on_event returns Ok(()) for every variant (never Err).
+        #[test]
+        fn t5_on_event_never_returns_err() {
+            let sub = LogSinkCardSubscriber::new();
+            for ev in &make_events() {
+                assert!(sub.on_event(ev).is_ok(), "on_event must always be Ok(())");
+            }
+        }
+
+        // T6: message format literal for each of the 4 variants.
+        #[test]
+        fn t6_message_format_literals() {
+            let sub = LogSinkCardSubscriber::new();
+            let sink = LogSink::new();
+            {
+                let mut g = sub.sinks.lock().unwrap();
+                g.push((0, sink.clone()));
+            }
+
+            let ev_created = CardEvent::Created {
+                pkg: "pkg_a".into(),
+                card_id: "card_1".into(),
+                toml_text: String::new(),
+            };
+            sub.on_event(&ev_created).unwrap();
+
+            let ev_appended = CardEvent::Appended {
+                card_id: "card_1".into(),
+                toml_text: String::new(),
+            };
+            sub.on_event(&ev_appended).unwrap();
+
+            let ev_samples = CardEvent::SamplesWritten {
+                card_id: "card_1".into(),
+                jsonl_text: "abc\ndef\n".into(),
+            };
+            sub.on_event(&ev_samples).unwrap();
+
+            let ev_aliases = CardEvent::AliasesWritten {
+                toml_text: "aliases".into(),
+            };
+            sub.on_event(&ev_aliases).unwrap();
+
+            let entries = sink.entries();
+            assert_eq!(entries.len(), 4);
+            assert_eq!(entries[0].message, "created pkg=pkg_a card_id=card_1");
+            assert_eq!(entries[1].message, "appended card_id=card_1");
+            assert_eq!(
+                entries[2].message,
+                format!(
+                    "samples_written card_id=card_1 bytes={}",
+                    "abc\ndef\n".len()
+                )
+            );
+            assert_eq!(
+                entries[3].message,
+                format!("aliases_written bytes={}", "aliases".len())
+            );
+        }
+
+        // ─── 6 concurrency boundary tests (§2 of concurrency-analysis.md) ─
+
+        /// Pin the current thread as the bus-test owner (skips
+        /// `bus_test_gate`) and hold the gate lock for the duration of the
+        /// test. Callers that spawn child threads which publish must set
+        /// `INSIDE_BUS_TEST` on each child thread too.
+        fn with_bus_owner<F: FnOnce()>(f: F) {
+            let _gate = bus_test_gate().lock().unwrap_or_else(|p| p.into_inner());
+            INSIDE_BUS_TEST.with(|f| f.set(true));
+            struct Restore;
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    INSIDE_BUS_TEST.with(|f| f.set(false));
+                }
+            }
+            let _r = Restore;
+            f();
+        }
+
+        // Concurrency #1: 8 threads publish concurrently through the bus,
+        // subscriber-internal Mutex serializes all pushes without deadlock.
+        #[test]
+        fn test_log_sink_subscriber_multithread_publish_fanout() {
+            with_bus_owner(|| {
+                let bus = event_bus();
+                bus.replace_subscribers_for_test(vec![
+                    log_sink_subscriber() as Arc<dyn CardSubscriber>
+                ]);
+                bus.reset_stats_for_test();
+
+                let sink = LogSink::new();
+                let _reg = register_log_sink(sink.clone());
+
+                let n_threads = 8usize;
+                let per_thread = 100usize;
+                let barrier = Arc::new(Barrier::new(n_threads));
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|_| {
+                        let b = Arc::clone(&barrier);
+                        std::thread::spawn(move || {
+                            INSIDE_BUS_TEST.with(|f| f.set(true));
+                            b.wait();
+                            for _ in 0..per_thread {
+                                event_bus().publish(&CardEvent::Appended {
+                                    card_id: "card_x".into(),
+                                    toml_text: String::new(),
+                                });
+                            }
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.join().expect("thread join");
+                }
+
+                // Verify SubscriberStats recorded exactly n_threads * per_thread
+                // successful deliveries.
+                let snap = bus.stats().snapshot();
+                let row = snap
+                    .iter()
+                    .find(|r| r.sink == LogSinkCardSubscriber::URI)
+                    .expect("log-sink row");
+                assert_eq!(
+                    row.ok.get("appended").copied().unwrap_or(0),
+                    (n_threads * per_thread) as u64
+                );
+
+                // Reset for later tests.
+                bus.replace_subscribers_for_test(Vec::new());
+                bus.reset_stats_for_test();
+            });
+        }
+
+        // Concurrency #2: registration drop races with in-flight publish
+        // through the bus; drop must not deadlock and post-drop entries
+        // stop landing on the removed sink.
+        #[test]
+        fn test_log_sink_registration_drop_during_publish() {
+            with_bus_owner(|| {
+                let bus = event_bus();
+                bus.replace_subscribers_for_test(vec![
+                    log_sink_subscriber() as Arc<dyn CardSubscriber>
+                ]);
+                bus.reset_stats_for_test();
+
+                let sink = LogSink::new();
+                let reg = register_log_sink(sink.clone());
+
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_clone = Arc::clone(&stop);
+                let publisher = std::thread::spawn(move || {
+                    INSIDE_BUS_TEST.with(|f| f.set(true));
+                    while !stop_clone.load(Ordering::Relaxed) {
+                        event_bus().publish(&CardEvent::AliasesWritten {
+                            toml_text: "a".into(),
+                        });
+                    }
+                });
+
+                // Let the publisher run briefly, then drop the registration.
+                std::thread::sleep(Duration::from_millis(20));
+                let drop_start = Instant::now();
+                drop(reg);
+                let drop_elapsed = drop_start.elapsed();
+                assert!(
+                    drop_elapsed < Duration::from_millis(200),
+                    "drop must not deadlock: took {drop_elapsed:?}"
+                );
+
+                // Give the publisher a moment past the drop, then verify no new
+                // entries appear.
+                std::thread::sleep(Duration::from_millis(20));
+                let snap1 = sink.entries().len();
+                std::thread::sleep(Duration::from_millis(30));
+                let snap2 = sink.entries().len();
+                assert_eq!(
+                    snap1, snap2,
+                    "no new entries after drop (before/after equal, both = {snap1})"
+                );
+
+                stop.store(true, Ordering::Relaxed);
+                publisher.join().expect("publisher join");
+
+                bus.replace_subscribers_for_test(Vec::new());
+                bus.reset_stats_for_test();
+            });
+        }
+
+        // Concurrency #3: 4 threads race on the singleton's first init;
+        // OnceLock guarantees single Arc identity + single bus subscribe.
+        #[test]
+        fn test_log_sink_subscriber_oncelock_init_race() {
+            with_bus_owner(|| {
+                let bus = event_bus();
+                // Force the singleton to already exist so we test the
+                // observed OnceLock idempotence (a truly-first init requires
+                // a fresh process which is not possible here).
+                let _ = log_sink_subscriber();
+                bus.replace_subscribers_for_test(vec![
+                    log_sink_subscriber() as Arc<dyn CardSubscriber>
+                ]);
+
+                let n = 4usize;
+                let barrier = Arc::new(Barrier::new(n));
+                let handles: Vec<_> = (0..n)
+                    .map(|_| {
+                        let b = Arc::clone(&barrier);
+                        std::thread::spawn(move || {
+                            b.wait();
+                            log_sink_subscriber()
+                        })
+                    })
+                    .collect();
+                let arcs: Vec<Arc<LogSinkCardSubscriber>> =
+                    handles.into_iter().map(|h| h.join().unwrap()).collect();
+                for a in arcs.windows(2) {
+                    assert!(
+                        Arc::ptr_eq(&a[0], &a[1]),
+                        "all threads must observe the same singleton Arc"
+                    );
+                }
+
+                // Bus contains "log-sink://alc.card" exactly once.
+                let count = bus
+                    .subscriber_uris()
+                    .iter()
+                    .filter(|u| *u == LogSinkCardSubscriber::URI)
+                    .count();
+                assert_eq!(count, 1, "bus must have exactly 1 log-sink subscriber");
+
+                bus.replace_subscribers_for_test(Vec::new());
+            });
+        }
+
+        // Concurrency #4: publish loop, registration add, registration drop
+        // interleave; no thread hangs and no torn state observed.
+        #[test]
+        fn test_log_sink_subscriber_fanout_during_registration() {
+            with_bus_owner(|| {
+                let bus = event_bus();
+                bus.replace_subscribers_for_test(vec![
+                    log_sink_subscriber() as Arc<dyn CardSubscriber>
+                ]);
+                bus.reset_stats_for_test();
+
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_pub = Arc::clone(&stop);
+                let publisher = std::thread::spawn(move || {
+                    INSIDE_BUS_TEST.with(|f| f.set(true));
+                    while !stop_pub.load(Ordering::Relaxed) {
+                        event_bus().publish(&CardEvent::AliasesWritten {
+                            toml_text: "a".into(),
+                        });
+                    }
+                });
+
+                let stop_reg = Arc::clone(&stop);
+                let registrar = std::thread::spawn(move || {
+                    while !stop_reg.load(Ordering::Relaxed) {
+                        let sink = LogSink::new();
+                        let _reg = register_log_sink(sink);
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                });
+
+                let stop_dropper = Arc::clone(&stop);
+                let dropper = std::thread::spawn(move || {
+                    while !stop_dropper.load(Ordering::Relaxed) {
+                        let sink = LogSink::new();
+                        let reg = register_log_sink(sink);
+                        std::thread::sleep(Duration::from_micros(25));
+                        drop(reg);
+                    }
+                });
+
+                std::thread::sleep(Duration::from_millis(100));
+                stop.store(true, Ordering::Relaxed);
+
+                publisher.join().expect("publisher join");
+                registrar.join().expect("registrar join");
+                dropper.join().expect("dropper join");
+
+                bus.replace_subscribers_for_test(Vec::new());
+                bus.reset_stats_for_test();
+            });
+        }
+
+        // Concurrency #5: 16 threads register concurrently, all ids unique.
+        #[test]
+        fn test_log_sink_subscriber_atomicu64_id_uniqueness() {
+            let n = 16usize;
+            let barrier = Arc::new(Barrier::new(n));
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let b = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let sink = LogSink::new();
+                        b.wait();
+                        register_log_sink(sink)
+                    })
+                })
+                .collect();
+            let regs: Vec<LogSinkRegistration> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let ids: HashSet<u64> = regs.iter().map(|r| r.id()).collect();
+            assert_eq!(ids.len(), n, "all {n} ids must be unique");
+        }
+
+        // Concurrency #6: registration drop must recover from a poisoned
+        // sinks Mutex left by another thread's panic while holding the lock.
+        #[test]
+        fn test_log_sink_registration_drop_poisoned_mutex() {
+            // Use an isolated subscriber instance rather than the process-wide
+            // singleton so the poison state does not leak into other tests.
+            let sub = Arc::new(LogSinkCardSubscriber::new());
+            let sink = LogSink::new();
+            let id = sub.next_id.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut g = sub.sinks.lock().unwrap();
+                g.push((id, sink.clone()));
+            }
+            let reg = LogSinkRegistration {
+                subscriber: Arc::clone(&sub),
+                id,
+            };
+
+            // Poison the mutex by panicking while holding the lock.
+            let sub_poison = Arc::clone(&sub);
+            let handle = std::thread::spawn(move || {
+                let _guard = sub_poison.sinks.lock().unwrap();
+                panic!("intentional panic to poison mutex");
+            });
+            let result = handle.join();
+            assert!(result.is_err(), "poisoning thread must have panicked");
+            assert!(
+                sub.sinks.is_poisoned(),
+                "mutex must be poisoned after panic"
+            );
+
+            // Drop the registration; must silently recover the poisoned lock
+            // and remove our entry via retain.
+            drop(reg);
+
+            let guard = sub.sinks.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                !guard.iter().any(|(entry_id, _)| *entry_id == id),
+                "entry with matching id must be removed from sinks vec"
+            );
+        }
     }
 }

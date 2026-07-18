@@ -20,9 +20,15 @@
 //! initialiser) so its outcome is fully deterministic regardless of
 //! candle's RNG state.
 
-use algocline_nn::arch::{max_abs_diff_f32, LoraConfig, LoraLinear};
+use algocline_nn::arch::{max_abs_diff_f32, Gpt2Config, Gpt2Model, LoraConfig, LoraLinear};
+use algocline_nn::train::{
+    run_lora_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, ScheduleKind, TokenizedDataset,
+    TrainingLease,
+};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{Linear, Module};
+use candle_nn::{Linear, Module, VarBuilder, VarMap};
+use std::sync::Arc;
+use tempfile::TempDir;
 
 fn tensor2(vals: &[f32], rows: usize, cols: usize, dev: &Device) -> Tensor {
     Tensor::from_slice(vals, (rows, cols), dev).unwrap()
@@ -115,6 +121,113 @@ fn merged_weight_shape_matches_base() {
     );
     let merged = lora.merged_weight().unwrap();
     assert_eq!(merged.dims(), &[6, 8]);
+}
+
+/// Base-frozen invariant:
+/// running [`run_lora_ft`] must leave the base parameters bit-identical
+/// before and after training. Only the freshly-created LoRA A/B legs
+/// are handed to AdamW; the base varmap never sees the optimizer.
+///
+/// We snapshot every base tensor as an `f32` vector before the run and
+/// re-read them after the run — any drift indicates the frozen-base
+/// contract has broken.
+#[test]
+fn run_lora_ft_leaves_base_weights_bit_identical() {
+    let cfg = Gpt2Config {
+        layers: 2,
+        heads: 2,
+        dim: 16,
+        ctx: 8,
+        vocab: 32,
+        dtype: DType::F32,
+        device: Device::Cpu,
+        eps: 1e-5,
+    };
+    let base_vm = VarMap::new();
+    let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+    let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+
+    // Snapshot base tensors before training.
+    let base_before: Vec<Vec<f32>> = base_vm
+        .all_vars()
+        .iter()
+        .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+        .collect();
+    let base_var_count = base_vm.all_vars().len();
+
+    let row: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| row.clone()).take(50).collect();
+    let mut ds = TokenizedDataset::new(
+        rows,
+        DatasetOpts {
+            batch_size: 1,
+            ctx_len: 8,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        },
+    );
+    let loss = CrossEntropyLoss::new();
+    let train_cfg = FullFtConfig {
+        lr: 5e-3,
+        batch_size: 1,
+        grad_accum: 1,
+        steps: 10,
+        warmup: 2,
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+    let lora_cfg = LoraConfig::new(4, 8.0);
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+    let ckpt = run_lora_ft(
+        &mut model,
+        &mut ds,
+        &lora_cfg,
+        &train_cfg,
+        &loss,
+        tmp.path(),
+        "invariant-1",
+        lease,
+    )
+    .expect("run_lora_ft must succeed");
+
+    // Terminal Δ file lives under `<ckpt_dir>/nn/lora-<card>.safetensors`.
+    let delta_path = tmp.path().join("nn").join("lora-invariant-1.safetensors");
+    assert!(
+        delta_path.exists(),
+        "expected Δ ckpt at {}",
+        delta_path.display()
+    );
+    // Δ file is tiny (16 vars × ~1 KB each on this micro model). The
+    // 20 MB size cap from invariant #3 is exercised on the full
+    // GPT-2 medium build; here we just guard that the file is not
+    // accidentally storing the full base model.
+    let delta_size = std::fs::metadata(&delta_path).unwrap().len();
+    assert!(
+        delta_size < 100_000,
+        "Δ ckpt is unexpectedly large: {delta_size} bytes"
+    );
+    assert!(ckpt.train_loss.is_finite());
+
+    // Base var count unchanged.
+    assert_eq!(base_vm.all_vars().len(), base_var_count);
+
+    // Every base tensor bit-identical to its pre-training snapshot.
+    let base_after: Vec<Vec<f32>> = base_vm
+        .all_vars()
+        .iter()
+        .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+        .collect();
+    for (idx, (before, after)) in base_before.iter().zip(base_after.iter()).enumerate() {
+        assert_eq!(
+            before,
+            after,
+            "base var index {idx} drifted through run_lora_ft"
+        );
+    }
 }
 
 #[test]

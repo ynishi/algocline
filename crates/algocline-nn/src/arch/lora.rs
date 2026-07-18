@@ -24,13 +24,23 @@
 use candle_core::{DType, Result as CandleResult, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
-/// LoRA rank + scaling configuration.
+/// LoRA rank + scaling + wrap-target configuration.
 ///
 /// `alpha` and `rank` together determine the scaling factor
 /// `alpha / rank`; the caller sets both explicitly rather than passing
 /// a pre-computed factor so a saved LoRA can be re-derived from the
 /// two integer fields alone.
-#[derive(Debug, Clone, Copy)]
+///
+/// `target_modules` is consumed by [`crate::arch::Gpt2Model::wrap_lora`]
+/// — the low-level [`LoraLinear::wrap`] path itself never inspects it.
+/// `dropout` is reserved for a future stage (per-forward LoRA dropout,
+/// design §7.2) and is currently ignored by both `LoraLinear::forward`
+/// and the training loops; it lives on the config today so the on-disk
+/// LoRA schema does not need a breaking migration when dropout ships.
+///
+/// The struct is `Clone` (not `Copy`) because `target_modules` is
+/// heap-allocated.
+#[derive(Debug, Clone)]
 pub struct LoraConfig {
     /// Rank of the low-rank decomposition. Typical values are 8, 16,
     /// 32; the invariants below assume `rank > 0` and `rank <= min(in,
@@ -38,12 +48,56 @@ pub struct LoraConfig {
     pub rank: usize,
     /// Alpha scaling numerator (see the paper's `alpha / r` factor).
     pub alpha: f32,
+    /// Module names to wrap when `Gpt2Model::wrap_lora` walks the
+    /// model. Canonical GPT-2 vocabulary: `q_proj`, `k_proj`, `v_proj`,
+    /// `o_proj`, `up`, `down`.
+    pub target_modules: Vec<String>,
+    /// Dropout probability applied on the low-rank leg during training
+    /// (reserved; currently unused — see the struct-level docs).
+    pub dropout: f32,
 }
 
 impl LoraConfig {
-    /// Build a config with the given rank and alpha.
+    /// Build a config with the given rank and alpha and the full
+    /// canonical target-module set (attention Q/K/V/O + MLP up/down).
+    ///
+    /// Callers who want a narrower wrap should either mutate
+    /// `target_modules` after construction or use
+    /// [`LoraConfig::with_targets`].
     pub fn new(rank: usize, alpha: f32) -> Self {
-        Self { rank, alpha }
+        Self {
+            rank,
+            alpha,
+            target_modules: Self::default_targets(),
+            dropout: 0.0,
+        }
+    }
+
+    /// Build a config with an explicit target-module list.
+    pub fn with_targets<I, S>(rank: usize, alpha: f32, targets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            rank,
+            alpha,
+            target_modules: targets.into_iter().map(Into::into).collect(),
+            dropout: 0.0,
+        }
+    }
+
+    /// The canonical GPT-2 target-module set: attention Q/K/V/O plus
+    /// MLP up/down projections.
+    pub fn default_targets() -> Vec<String> {
+        vec![
+            "q_proj".into(),
+            "k_proj".into(),
+            "v_proj".into(),
+            "o_proj".into(),
+            "up".into(),
+            "down".into(),
+        ]
     }
 
     /// The scaling factor applied to the low-rank product before it is

@@ -22,8 +22,91 @@
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
 use candle_nn::{
-    embedding, layer_norm, linear, ops, Embedding, LayerNorm, Linear, Module, VarBuilder,
+    embedding, layer_norm, linear, ops, Embedding, LayerNorm, Linear, Module, VarBuilder, VarMap,
 };
+
+use super::lora::{LoraConfig, LoraLinear};
+
+/// A linear projection inside a GPT-2 [`Block`], possibly wrapped with a
+/// LoRA additive update.
+///
+/// The `Plain` variant carries a frozen `candle_nn::Linear` (either the
+/// initial random init built by [`Block::new`] or a pretrained weight
+/// loaded via [`Gpt2Model::from_pretrained`]). The `Lora` variant
+/// wraps the same base linear with two low-rank matrices (see
+/// [`LoraLinear`]).
+///
+/// `LinearVariant` implements [`Module`] via a `match` in `forward`, so
+/// the block's forward code path stays uniform whether or not a LoRA
+/// wrap has been applied.
+pub(crate) enum LinearVariant {
+    /// Plain frozen linear.
+    Plain(Linear),
+    /// Base + rank-r additive update.
+    Lora(LoraLinear),
+}
+
+impl Module for LinearVariant {
+    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Plain(l) => l.forward(xs),
+            Self::Lora(l) => l.forward(xs),
+        }
+    }
+}
+
+/// Which projections inside a [`Block`] the caller wants LoRA-wrapped.
+#[derive(Debug, Clone, Copy)]
+struct WrapFlags {
+    /// Wrap the fused Q/K/V projection (`c_attn`). Any of `q_proj`,
+    /// `k_proj`, `v_proj` in the target list flips this on because
+    /// candle-nn's GPT-2 layout keeps the three projections fused.
+    qkv: bool,
+    /// Wrap the attention output projection (`c_proj`).
+    o: bool,
+    /// Wrap the MLP up-projection (`mlp.c_fc`).
+    up: bool,
+    /// Wrap the MLP down-projection (`mlp.c_proj`).
+    down: bool,
+}
+
+/// Move the `Plain` linear currently in `v` into a fresh
+/// [`LoraLinear::wrap`] and put the resulting wrap back into `v`.
+///
+/// Fails with a clear message when `v` is already `Lora` (double-wrap
+/// is a caller programming error, not a silent no-op).
+fn wrap_variant_in_place(
+    v: &mut LinearVariant,
+    cfg: &LoraConfig,
+    vs: VarBuilder,
+) -> CandleResult<()> {
+    // We need to take ownership of the current `Plain(Linear)` value to
+    // hand it to `LoraLinear::wrap`, which takes the base by value.
+    // `std::mem::replace` with a cheap placeholder Linear achieves this
+    // without requiring `LinearVariant: Default`. The placeholder is
+    // dropped as soon as the new wrap is written back.
+    let placeholder = LinearVariant::Plain(Linear::new(
+        Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+        None,
+    ));
+    let old = std::mem::replace(v, placeholder);
+    let base = match old {
+        LinearVariant::Plain(l) => l,
+        LinearVariant::Lora(_) => {
+            return Err(candle_core::Error::Msg(
+                "wrap_variant_in_place: layer is already LoRA-wrapped".into(),
+            ));
+        }
+    };
+    *v = LinearVariant::Lora(LoraLinear::wrap(base, cfg.clone(), vs)?);
+    Ok(())
+}
+
+/// Canonical GPT-2 target-module names accepted by
+/// [`Gpt2Model::wrap_lora`]. Any name outside this list triggers an
+/// error at wrap time so a typo does not silently degrade to "no-op".
+const KNOWN_TARGET_MODULES: [&str; 6] =
+    ["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"];
 
 /// Immutable configuration for a GPT-2 preset.
 #[derive(Debug, Clone)]
@@ -101,13 +184,18 @@ impl Gpt2Config {
 ///
 /// Pre-LN topology (LN → Attention → residual → LN → MLP → residual)
 /// matches nanoGPT and HF GPT-2.
+///
+/// The four linear projections (`c_attn`, `c_proj`, `mlp_c_fc`,
+/// `mlp_c_proj`) are held as [`LinearVariant`] so a subsequent
+/// [`Gpt2Model::wrap_lora`] call can replace individual layers with a
+/// LoRA wrap without changing the surrounding forward code path.
 struct Block {
     ln_1: LayerNorm,
-    c_attn: Linear,
-    c_proj: Linear,
+    c_attn: LinearVariant,
+    c_proj: LinearVariant,
     ln_2: LayerNorm,
-    mlp_c_fc: Linear,
-    mlp_c_proj: Linear,
+    mlp_c_fc: LinearVariant,
+    mlp_c_proj: LinearVariant,
     heads: usize,
     head_dim: usize,
 }
@@ -125,14 +213,43 @@ impl Block {
         let mlp_c_proj = linear(4 * cfg.dim, cfg.dim, mlp_vs.pp("c_proj"))?;
         Ok(Self {
             ln_1,
-            c_attn,
-            c_proj,
+            c_attn: LinearVariant::Plain(c_attn),
+            c_proj: LinearVariant::Plain(c_proj),
             ln_2,
-            mlp_c_fc,
-            mlp_c_proj,
+            mlp_c_fc: LinearVariant::Plain(mlp_c_fc),
+            mlp_c_proj: LinearVariant::Plain(mlp_c_proj),
             heads: cfg.heads,
             head_dim,
         })
+    }
+
+    /// Replace this block's `Plain` linear projections with LoRA-wrapped
+    /// counterparts according to `flags`. Idempotency: a layer already
+    /// in the `Lora` variant is left untouched (double-wrap error).
+    ///
+    /// Callers pass the per-block `VarBuilder` scoped so LoRA parameter
+    /// names line up with the block index, e.g. `h.<i>.attn.lora.c_attn`.
+    fn wrap_lora(
+        &mut self,
+        cfg: &LoraConfig,
+        flags: WrapFlags,
+        vs: VarBuilder,
+    ) -> CandleResult<()> {
+        let attn_vs = vs.pp("attn");
+        let mlp_vs = vs.pp("mlp");
+        if flags.qkv {
+            wrap_variant_in_place(&mut self.c_attn, cfg, attn_vs.pp("c_attn"))?;
+        }
+        if flags.o {
+            wrap_variant_in_place(&mut self.c_proj, cfg, attn_vs.pp("c_proj"))?;
+        }
+        if flags.up {
+            wrap_variant_in_place(&mut self.mlp_c_fc, cfg, mlp_vs.pp("c_fc"))?;
+        }
+        if flags.down {
+            wrap_variant_in_place(&mut self.mlp_c_proj, cfg, mlp_vs.pp("c_proj"))?;
+        }
+        Ok(())
     }
 
     fn attention(&self, x: &Tensor, mask: &Tensor) -> CandleResult<Tensor> {
@@ -331,6 +448,73 @@ impl Gpt2Model {
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
         Ok(logits)
     }
+
+    /// Wrap the model's per-block linear projections with LoRA
+    /// low-rank updates.
+    ///
+    /// The base parameters (already registered against the model's
+    /// original `VarMap`) are held frozen inside each new [`LoraLinear`];
+    /// only the freshly-created `lora_a` / `lora_b` matrices are
+    /// registered against the returned [`VarMap`]. Callers pass that
+    /// map to the optimizer so gradients flow through the LoRA legs
+    /// only — the design invariant "base parameters bit-identical
+    /// before / after training" holds automatically because the base
+    /// varmap is never handed to AdamW.
+    ///
+    /// # Errors
+    ///
+    /// - Any `cfg.target_modules` entry outside the canonical GPT-2 set
+    ///   (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `up`, `down`) is
+    ///   rejected with a clear message. Empty `target_modules` errors
+    ///   too rather than silently no-op'ing.
+    /// - `cfg.rank == 0` or `cfg.rank > min(in, out)` for any wrapped
+    ///   layer propagates the underlying `LoraLinear::wrap` error.
+    /// - candle-side allocation failure for the LoRA parameters.
+    ///
+    /// # Notes
+    ///
+    /// The three `q_proj` / `k_proj` / `v_proj` names all map to
+    /// wrapping the fused `c_attn` linear because GPT-2 keeps the
+    /// three attention projections combined; a caller who requests
+    /// only `q_proj` still gets Q, K, V wrapped as a single Δ (this
+    /// matches the PEFT reference behaviour).
+    pub fn wrap_lora(&mut self, cfg: &LoraConfig) -> CandleResult<VarMap> {
+        if cfg.target_modules.is_empty() {
+            return Err(candle_core::Error::Msg(
+                "wrap_lora: target_modules is empty; nothing to wrap".into(),
+            ));
+        }
+        for m in &cfg.target_modules {
+            if !KNOWN_TARGET_MODULES.contains(&m.as_str()) {
+                return Err(candle_core::Error::Msg(format!(
+                    "wrap_lora: unknown target module {m:?} (known: {KNOWN_TARGET_MODULES:?})"
+                )));
+            }
+        }
+        let flags = WrapFlags {
+            qkv: cfg
+                .target_modules
+                .iter()
+                .any(|m| matches!(m.as_str(), "q_proj" | "k_proj" | "v_proj")),
+            o: cfg.target_modules.iter().any(|m| m == "o_proj"),
+            up: cfg.target_modules.iter().any(|m| m == "up"),
+            down: cfg.target_modules.iter().any(|m| m == "down"),
+        };
+
+        // Clone the device and dtype up front so `VarBuilder` borrows
+        // local values rather than a slice of `self` — otherwise the
+        // simultaneous `self.blocks.iter_mut()` borrow below would
+        // conflict with the `&self.cfg.device` inside the VarBuilder.
+        let device = self.cfg.device.clone();
+        let dtype = self.cfg.dtype;
+        let lora_vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&lora_vm, dtype, &device);
+        let h_vs = vs.pp("h");
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            block.wrap_lora(cfg, flags, h_vs.pp(i.to_string()))?;
+        }
+        Ok(lora_vm)
+    }
 }
 
 /// Errors from [`Gpt2Model::from_pretrained`].
@@ -378,6 +562,7 @@ fn build_causal_mask(ctx: usize, device: &Device, _dtype: DType) -> CandleResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::LoraConfig;
     use candle_nn::VarMap;
 
     #[test]
@@ -494,5 +679,106 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(msg.contains("exceeds ctx"));
+    }
+
+    fn tiny_cfg() -> Gpt2Config {
+        Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: 8,
+            vocab: 32,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        }
+    }
+
+    #[test]
+    fn wrap_lora_rejects_empty_target_modules() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+        let lora = LoraConfig::with_targets(4, 8.0, Vec::<String>::new());
+        let msg = match model.wrap_lora(&lora) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("empty"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn wrap_lora_rejects_unknown_target_module() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+        let lora = LoraConfig::with_targets(4, 8.0, vec!["typo_proj"]);
+        let msg = match model.wrap_lora(&lora) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("unknown"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn wrap_lora_populates_lora_vm_and_freezes_base() {
+        // Snapshot every base parameter before wrap + a single training-
+        // like `opt.backward_step` on the LoRA legs. The base vars must
+        // stay bit-identical; only lora_a / lora_b tensors should have
+        // been created and any updates land there.
+        let cfg = tiny_cfg();
+        let base_vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+        let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+
+        // Base tensor bytes before wrap.
+        let base_before: Vec<Vec<f32>> = base_vm
+            .all_vars()
+            .iter()
+            .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+            .collect();
+        let base_var_count = base_vm.all_vars().len();
+
+        let lora_cfg = LoraConfig::new(4, 8.0);
+        let lora_vm = model.wrap_lora(&lora_cfg).expect("wrap_lora ok");
+
+        // 2 layers * (c_attn + c_proj + mlp_c_fc + mlp_c_proj) * (a + b)
+        // = 2 * 4 * 2 = 16 new Vars.
+        assert_eq!(lora_vm.all_vars().len(), 16);
+        // Base var count is unchanged (no new registrations on the base
+        // varmap).
+        assert_eq!(base_vm.all_vars().len(), base_var_count);
+
+        // Base tensor bytes after wrap must match the snapshot.
+        let base_after: Vec<Vec<f32>> = base_vm
+            .all_vars()
+            .iter()
+            .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+            .collect();
+        for (before, after) in base_before.iter().zip(base_after.iter()) {
+            assert_eq!(before, after, "wrap_lora perturbed a base tensor");
+        }
+
+        // Forward still runs and returns the right shape.
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, cfg.vocab]);
+    }
+
+    #[test]
+    fn wrap_lora_with_narrow_targets_only_wraps_selected_layers() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+
+        // Only wrap MLP down-projection (`mlp_c_proj`). Attention and
+        // MLP-up stay `Plain`.
+        let lora_cfg = LoraConfig::with_targets(2, 4.0, vec!["down"]);
+        let lora_vm = model.wrap_lora(&lora_cfg).unwrap();
+        // 2 layers * 1 wrapped linear * 2 vars (a + b) = 4.
+        assert_eq!(lora_vm.all_vars().len(), 4);
     }
 }

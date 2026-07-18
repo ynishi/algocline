@@ -22,7 +22,7 @@ use std::sync::{
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::Gpt2Model;
+use crate::arch::{Gpt2Model, LoraConfig};
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
@@ -201,6 +201,38 @@ pub fn run_full_ft(
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
 ) -> Result<Checkpoint, TrainError> {
+    // `run_full_ft` optimises every variable registered against
+    // `varmap` — the full-fine-tune baseline. It shares its inner
+    // step/save loop with `run_lora_ft` via `run_ft_core`; the only
+    // difference is which VarMap the optimizer holds and which VarMap
+    // the checkpoint store saves.
+    run_ft_core(
+        model, varmap, varmap, dataset, cfg, loss_fn, ckpt_dir, ckpt_prefix, lease,
+    )
+}
+
+/// Shared inner training loop.
+///
+/// - `opt_vm` — VarMap whose variables get optimizer updates. In a
+///   Full FT run this is the same map as the model was constructed
+///   against; in a LoRA run it is the fresh LoRA-only map returned by
+///   [`Gpt2Model::wrap_lora`] so the base parameters stay frozen.
+/// - `save_vm` — VarMap whose contents get written to disk. Same as
+///   `opt_vm` for both current callers, but kept as a distinct
+///   parameter so a future full-vs-delta save-side split can flip
+///   independently.
+#[allow(clippy::too_many_arguments)]
+fn run_ft_core(
+    model: &Gpt2Model,
+    opt_vm: &VarMap,
+    save_vm: &VarMap,
+    dataset: &mut dyn Dataset,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    ckpt_dir: &Path,
+    ckpt_prefix: &str,
+    lease: Arc<TrainingLease>,
+) -> Result<Checkpoint, TrainError> {
     if cfg.steps == 0 {
         return Err(TrainError::ZeroSteps);
     }
@@ -210,10 +242,17 @@ pub fn run_full_ft(
 
     let _lease = lease.acquire().ok_or(TrainError::LeaseHeld)?;
 
+    let vars = opt_vm.all_vars();
+    if vars.is_empty() {
+        return Err(TrainError::Candle(
+            "run_ft_core: optimizer VarMap has no trainable variables".into(),
+        ));
+    }
+
     // AdamW picks up its `lr` from the config once and then follows
     // `set_learning_rate` at each step.
     let mut opt = AdamW::new(
-        varmap.all_vars(),
+        vars,
         ParamsAdamW {
             lr: cfg.lr,
             weight_decay: cfg.weight_decay,
@@ -256,14 +295,14 @@ pub fn run_full_ft(
 
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
             ckpt_store
-                .save_step(varmap, step + 1)
+                .save_step(save_vm, step + 1)
                 .map_err(|e| TrainError::Ckpt(e.to_string()))?;
         }
     }
 
     // Terminal save under the stable `<prefix>.safetensors` filename.
     let final_path = ckpt_store
-        .save_final(varmap)
+        .save_final(save_vm)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
 
     let mut metrics: HashMap<String, f32> = HashMap::new();
@@ -272,6 +311,76 @@ pub fn run_full_ft(
 
     checkpoint_from_path(&final_path, cfg.steps, last_train_loss, None, metrics)
         .map_err(TrainError::Ckpt)
+}
+
+/// Run LoRA fine-tuning and return the final Δ-only checkpoint record.
+///
+/// The base model's `Linear` projections are wrapped in-place with
+/// [`LoraLinear`] instances (attention Q/K/V/O and MLP up/down per
+/// [`LoraConfig::target_modules`]). Only the freshly-created LoRA A/B
+/// matrices are handed to AdamW, so the base weights registered
+/// against the model's original `VarMap` are guaranteed
+/// bit-identical before and after training (LoRA invariant:
+/// base parameters are frozen).
+///
+/// The Δ checkpoint is written to
+/// `<ckpt_dir>/nn/lora-<card_id>.safetensors` — a filename convention
+/// that keeps LoRA bundles clearly separated from full-model bundles
+/// on disk. The `nn/` subdirectory is created if missing.
+///
+/// # Errors
+///
+/// - [`TrainError::ZeroSteps`] / [`TrainError::GradAccumUnsupported`]
+///   / [`TrainError::LeaseHeld`] mirror the Full FT path.
+/// - Any error raised by [`Gpt2Model::wrap_lora`] surfaces as
+///   [`TrainError::Candle`] (unknown `target_modules`, oversized
+///   rank, etc.).
+/// - Checkpoint I/O failures surface as [`TrainError::Ckpt`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_lora_ft(
+    base: &mut Gpt2Model,
+    dataset: &mut dyn Dataset,
+    lora_cfg: &LoraConfig,
+    train_cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    ckpt_dir: &Path,
+    card_id: &str,
+    lease: Arc<TrainingLease>,
+) -> Result<Checkpoint, TrainError> {
+    if card_id.is_empty() {
+        return Err(TrainError::Candle("run_lora_ft: card_id is empty".into()));
+    }
+
+    // Wrap first so we surface `LoraConfig` validation errors (unknown
+    // target module, oversized rank) before the lease is acquired.
+    let lora_vm = base.wrap_lora(lora_cfg)?;
+
+    let nn_dir = ckpt_dir.join("nn");
+    std::fs::create_dir_all(&nn_dir).map_err(|e| {
+        TrainError::Ckpt(format!(
+            "run_lora_ft: mkdir {:?}: {e}",
+            nn_dir.display()
+        ))
+    })?;
+    let ckpt_prefix = format!("lora-{card_id}");
+
+    // `run_ft_core` uses `lora_vm` for both the optimizer and the
+    // checkpoint save: the optimizer only sees LoRA A/B parameters
+    // (so base weights are structurally frozen — the base varmap is
+    // never handed to AdamW) and the saved safetensors bundle
+    // contains only those same LoRA A/B tensors (so the Δ file stays
+    // small — invariant #3, < 20 MB for GPT-2 medium at rank 16).
+    run_ft_core(
+        base,
+        &lora_vm,
+        &lora_vm,
+        dataset,
+        train_cfg,
+        loss_fn,
+        &nn_dir,
+        &ckpt_prefix,
+        lease,
+    )
 }
 
 /// Which distillation loss the caller wants for [`run_distill`].

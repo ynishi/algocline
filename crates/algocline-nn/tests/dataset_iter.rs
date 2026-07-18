@@ -80,8 +80,10 @@ fn tokenized_dataset_len_hint_matches_row_count() {
 
 #[test]
 fn parquet_scaffold_errors_on_iteration_and_reports_no_len_hint() {
-    let mut ds =
-        ParquetDataset::new(&PathBuf::from("/nowhere/data.parquet"), DatasetOpts::default());
+    let mut ds = ParquetDataset::new(
+        &PathBuf::from("/nowhere/data.parquet"),
+        DatasetOpts::default(),
+    );
     let err = ds
         .next_batch()
         .expect_err("parquet scaffold must not silently return None");

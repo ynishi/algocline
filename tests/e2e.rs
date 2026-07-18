@@ -8611,11 +8611,8 @@ async fn test_alc_card_create_with_run_section_when_enabled() {
     let alc_home = tempfile::tempdir().expect("alc_home tempdir");
     std::fs::create_dir_all(alc_home.path().join("packages")).expect("mk packages");
 
-    let client = connect_with_alc_home_and_env(
-        alc_home.path(),
-        &[("ALC_SETTING_CARD_RUN", "true")],
-    )
-    .await;
+    let client =
+        connect_with_alc_home_and_env(alc_home.path(), &[("ALC_SETTING_CARD_RUN", "true")]).await;
 
     // 1. Drive `alc.card.create` via `alc_v2_run`.  Returning the closure
     //    result surfaces `card_id` / `path` as an object in the terminal
@@ -8688,11 +8685,8 @@ async fn test_alc_card_create_with_run_section_noop_when_disabled() {
     // Explicit "false" — belt-and-suspenders against any inherited
     // `ALC_SETTING_CARD_RUN` in the parent env.  The setting defaults to
     // `false` when absent, so either shape is spec-legal.
-    let client = connect_with_alc_home_and_env(
-        alc_home.path(),
-        &[("ALC_SETTING_CARD_RUN", "false")],
-    )
-    .await;
+    let client =
+        connect_with_alc_home_and_env(alc_home.path(), &[("ALC_SETTING_CARD_RUN", "false")]).await;
 
     // 1. Enable=off + `run` field present: the bridge short-circuits
     //    with `nil`, which reaches the caller as JSON `null` in the

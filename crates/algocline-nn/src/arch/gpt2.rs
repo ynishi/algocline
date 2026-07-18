@@ -21,7 +21,9 @@
 //! #1. Attention uses a causal (lower-triangular) mask.
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{embedding, layer_norm, linear, ops, Embedding, LayerNorm, Linear, Module, VarBuilder};
+use candle_nn::{
+    embedding, layer_norm, linear, ops, Embedding, LayerNorm, Linear, Module, VarBuilder,
+};
 
 /// Immutable configuration for a GPT-2 preset.
 #[derive(Debug, Clone)]
@@ -282,10 +284,7 @@ impl Gpt2Model {
                 .get("model.safetensors")
                 .map_err(|e| PretrainedError::Download(e.to_string()))?;
             std::fs::copy(&downloaded, &cache_path).map_err(|e| {
-                PretrainedError::CacheIo(format!(
-                    "copy {:?} -> {:?}: {e}",
-                    downloaded, cache_path
-                ))
+                PretrainedError::CacheIo(format!("copy {:?} -> {:?}: {e}", downloaded, cache_path))
             })?;
         }
 
@@ -326,7 +325,7 @@ impl Gpt2Model {
             h = block.forward(&h, &self.causal_mask)?;
         }
         let h = self.ln_f.forward(&h)?; // [B, T, D]
-        // Tied LM head: logits = h @ wte.weight^T.
+                                        // Tied LM head: logits = h @ wte.weight^T.
         let w = self.wte.embeddings(); // [V, D]
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
@@ -468,8 +467,7 @@ mod tests {
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
         let model = Gpt2Model::new(&cfg, vs).unwrap();
-        let ids =
-            Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 8], (2, 4), &cfg.device).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 8], (2, 4), &cfg.device).unwrap();
         let logits = model.forward(&ids).unwrap();
         assert_eq!(logits.dims(), &[2, 4, 16]);
     }

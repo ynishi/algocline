@@ -42,8 +42,7 @@ fn load_from_file_missing_path_errors() {
 fn full_roundtrip_gpt2_encode_decode() {
     let cache_dir = std::env::temp_dir().join("alc-nn-tokroundtrip-gpt2");
     // Don't clean the dir — reuse the cache on repeat runs.
-    let tok = HfTokenizer::load_cached("gpt2", &cache_dir)
-        .expect("gpt2 tokenizer download / load");
+    let tok = HfTokenizer::load_cached("gpt2", &cache_dir).expect("gpt2 tokenizer download / load");
     assert_eq!(tok.preset(), "gpt2");
 
     let text = "hello world";

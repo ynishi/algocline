@@ -115,10 +115,7 @@ fn save_load_roundtrip_preserves_var_values_and_meta() {
     );
 
     // The safetensors bundle lives at nn_dir/<card_id>.safetensors.
-    let bundle = tmp
-        .path()
-        .join("nn")
-        .join(format!("{card_id}.safetensors"));
+    let bundle = tmp.path().join("nn").join(format!("{card_id}.safetensors"));
     assert!(
         bundle.exists(),
         "safetensors bundle missing at {bundle:?} (invariant #1)"
@@ -131,8 +128,8 @@ fn save_load_roundtrip_preserves_var_values_and_meta() {
         .join("cards")
         .join("alc_nn")
         .join(format!("{card_id}.toml"));
-    let card_text = std::fs::read_to_string(&card_toml_path)
-        .expect("card TOML must exist under cards/alc_nn/");
+    let card_text =
+        std::fs::read_to_string(&card_toml_path).expect("card TOML must exist under cards/alc_nn/");
     assert!(
         card_text.contains(r#"kind = "nn_model""#),
         "Card kind must be nn_model, got: {card_text}"
@@ -339,10 +336,7 @@ fn load_missing_bundle_errors() {
         .eval()
         .expect("initial save must succeed");
     // Delete the safetensors bundle out from under the Card.
-    let bundle = tmp
-        .path()
-        .join("nn")
-        .join(format!("{card_id}.safetensors"));
+    let bundle = tmp.path().join("nn").join(format!("{card_id}.safetensors"));
     std::fs::remove_file(&bundle).expect("delete safetensors bundle for the test");
 
     let err = lua

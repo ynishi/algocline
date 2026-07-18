@@ -281,9 +281,8 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
         candle: Some(candle),
     };
 
-    let nn_meta_json = serde_json::to_value(&nn_meta).map_err(|e| {
-        LuaError::external(format!("alc.nn.card.save: serialize meta: {e}"))
-    })?;
+    let nn_meta_json = serde_json::to_value(&nn_meta)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.save: serialize meta: {e}")))?;
 
     Ok(json!({
         "pkg": { "name": NN_PKG },
@@ -355,15 +354,15 @@ fn compact_epoch_us() -> String {
 /// caller once every primitive is wired, so by the time these closures
 /// fire from user Lua code the lookup path is stable.
 fn alc_nn_fn(lua: &Lua, key: &str) -> LuaResult<LuaFunction> {
-    let alc: LuaTable = lua.globals().get("alc").map_err(|e| {
-        LuaError::external(format!("alc.nn.card: `alc` global missing: {e}"))
-    })?;
+    let alc: LuaTable = lua
+        .globals()
+        .get("alc")
+        .map_err(|e| LuaError::external(format!("alc.nn.card: `alc` global missing: {e}")))?;
     let nn: LuaTable = alc
         .get("nn")
         .map_err(|e| LuaError::external(format!("alc.nn.card: `alc.nn` missing: {e}")))?;
-    nn.get::<LuaFunction>(key).map_err(|e| {
-        LuaError::external(format!("alc.nn.card: `alc.nn.{key}` missing: {e}"))
-    })
+    nn.get::<LuaFunction>(key)
+        .map_err(|e| LuaError::external(format!("alc.nn.card: `alc.nn.{key}` missing: {e}")))
 }
 
 // ─── alc.nn.preset ────────────────────────────────────────────────
@@ -511,15 +510,12 @@ fn parse_device(s: &str) -> LuaResult<Device> {
             ))
         })?;
         return Device::new_cuda(ord).map_err(|e| {
-            LuaError::external(format!(
-                "alc.nn.preset.gpt2: cuda:{ord} unavailable: {e}"
-            ))
+            LuaError::external(format!("alc.nn.preset.gpt2: cuda:{ord} unavailable: {e}"))
         });
     }
     if s == "cuda" {
-        return Device::new_cuda(0).map_err(|e| {
-            LuaError::external(format!("alc.nn.preset.gpt2: cuda unavailable: {e}"))
-        });
+        return Device::new_cuda(0)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: cuda unavailable: {e}")));
     }
     Err(LuaError::external(format!(
         "alc.nn.preset.gpt2: unknown device '{s}' (expected 'cpu', 'cuda', or 'cuda:N')"
@@ -563,18 +559,21 @@ impl mlua::UserData for DatasetHandle {
             })?;
             Ok(ds.len_hint())
         });
-        methods.add_method_mut("next_batch", |lua, this, ()| -> LuaResult<Option<LuaTable>> {
-            let mut ds = this.inner.lock().map_err(|e| {
-                LuaError::external(format!("alc.nn.data: dataset lock poisoned: {e}"))
-            })?;
-            match ds
-                .next_batch()
-                .map_err(|e| LuaError::external(format!("alc.nn.data.next_batch: {e}")))?
-            {
-                Some(batch) => Ok(Some(batch_to_lua(lua, batch)?)),
-                None => Ok(None),
-            }
-        });
+        methods.add_method_mut(
+            "next_batch",
+            |lua, this, ()| -> LuaResult<Option<LuaTable>> {
+                let mut ds = this.inner.lock().map_err(|e| {
+                    LuaError::external(format!("alc.nn.data: dataset lock poisoned: {e}"))
+                })?;
+                match ds
+                    .next_batch()
+                    .map_err(|e| LuaError::external(format!("alc.nn.data.next_batch: {e}")))?
+                {
+                    Some(batch) => Ok(Some(batch_to_lua(lua, batch)?)),
+                    None => Ok(None),
+                }
+            },
+        );
     }
 }
 
@@ -646,9 +645,7 @@ fn register_data_ns(
     let from_card_store = Arc::clone(&card_store);
     let from_card_tok_dir = nn_dir.join("tokenizers");
     let from_card = lua.create_function(
-        move |_lua,
-              (card_id, opts): (String, Option<LuaTable>)|
-              -> LuaResult<DatasetHandle> {
+        move |_lua, (card_id, opts): (String, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
             let dopts = extract_dataset_opts(opts.as_ref())?;
             let tokenizer_name = opts
                 .as_ref()
@@ -684,9 +681,7 @@ fn register_data_ns(
                     continue;
                 };
                 let ids = tok.encode(&text).map_err(|e| {
-                    LuaError::external(format!(
-                        "alc.nn.data.from_card: sample {idx}: {e}"
-                    ))
+                    LuaError::external(format!("alc.nn.data.from_card: sample {idx}: {e}"))
                 })?;
                 if !ids.is_empty() {
                     rows.push(ids);

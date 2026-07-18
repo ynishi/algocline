@@ -223,8 +223,7 @@ impl JsonlDataset {
         };
         let mut rows: Vec<Vec<u32>> = Vec::new();
         for (idx, line) in reader.lines().enumerate() {
-            let line = line
-                .map_err(|e| DatasetError::Io(format!("read {:?}: {e}", self.path)))?;
+            let line = line.map_err(|e| DatasetError::Io(format!("read {:?}: {e}", self.path)))?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -440,7 +439,10 @@ mod tests {
 
     #[test]
     fn parquet_scaffold_errors_on_iteration() {
-        let mut ds = ParquetDataset::new(Path::new("/does/not/matter.parquet"), DatasetOpts::default());
+        let mut ds = ParquetDataset::new(
+            Path::new("/does/not/matter.parquet"),
+            DatasetOpts::default(),
+        );
         let err = ds.next_batch().unwrap_err();
         assert!(matches!(err, DatasetError::NotImplemented(_)));
         assert!(ds.len_hint().is_none());

@@ -73,8 +73,8 @@ impl HfTokenizer {
                 cache = %cache_path.display(),
                 "downloading tokenizer"
             );
-            let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| TokenizerError::HubApi(e.to_string()))?;
+            let api =
+                hf_hub::api::sync::Api::new().map_err(|e| TokenizerError::HubApi(e.to_string()))?;
             let downloaded = api
                 .model(repo.to_string())
                 .get("tokenizer.json")

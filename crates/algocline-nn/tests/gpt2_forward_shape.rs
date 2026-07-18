@@ -60,7 +60,9 @@ fn forward_rejects_seq_over_ctx() {
     let cfg = tiny_cfg(1, 2, 8, 3, 16);
     let model = build_random(&cfg);
     let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
-    let err = model.forward(&ids).expect_err("expected ctx overflow error");
+    let err = model
+        .forward(&ids)
+        .expect_err("expected ctx overflow error");
     let msg = err.to_string();
     assert!(msg.contains("exceeds ctx"), "unexpected error: {msg}");
 }
@@ -68,11 +70,17 @@ fn forward_rejects_seq_over_ctx() {
 #[test]
 fn config_medium_and_large_expose_expected_shapes() {
     let m = Gpt2Config::medium();
-    assert_eq!((m.layers, m.heads, m.dim, m.ctx, m.vocab), (24, 16, 1024, 1024, 50257));
+    assert_eq!(
+        (m.layers, m.heads, m.dim, m.ctx, m.vocab),
+        (24, 16, 1024, 1024, 50257)
+    );
     assert_eq!(m.hf_repo(), Some("openai-community/gpt2-medium"));
 
     let l = Gpt2Config::large();
-    assert_eq!((l.layers, l.heads, l.dim, l.ctx, l.vocab), (36, 20, 1280, 1024, 50257));
+    assert_eq!(
+        (l.layers, l.heads, l.dim, l.ctx, l.vocab),
+        (36, 20, 1280, 1024, 50257)
+    );
     assert_eq!(l.hf_repo(), Some("openai-community/gpt2-large"));
 }
 

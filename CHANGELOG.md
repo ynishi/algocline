@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Phase 2-E: added `tracing::error` emit at Card store write points
+  (`write_new_card` / `write_samples_text` / `write_aliases`) for
+  MCP-blind observability of persistence failures. Each write-side `?`
+  propagate is wrapped in `.map_err(|e| { tracing::error!(target:
+  "alc.card", ...); e })` so the underlying I/O error still surfaces to
+  the caller (Lua via `LuaError::external`) while operators get a
+  structured `alc.card`-targeted diagnostic without needing an active
+  Card session (`LogSink`) or the fan-out subscriber to be attached.
+  The write-once conflict path in `write_samples_with_store` also emits
+  an `error` entry so both underlying I/O failures and immutability
+  violations show up in the same log target. Additive change: `?`
+  propagate contract unchanged (rmcp / MCP wire shape identical), no
+  new subscriber layer, no `LogSinkLayer`. Companion sweep for the read
+  paths (`load_full` / `find_with_store` / `get_with_store` /
+  `get_by_alias_with_store` / `read_samples_with_store`) is tracked as
+  a separate carry issue and only marked with `TODO(issue:e60cd19d)`
+  in this phase.
 - Phase 2-D: added `LogSinkCardSubscriber` that fans out `CardEvent`
   (`Created` / `Appended` / `SamplesWritten` / `AliasesWritten`) into
   per-session `LogSink` ring buffers, closing the "Card writes → Log

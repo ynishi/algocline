@@ -526,7 +526,18 @@ pub fn create_with_store(
     let toml_val = json_to_toml(input)?;
     let text = toml::to_string_pretty(&toml_val)
         .map_err(|e| format!("Failed to serialize card TOML: {e}"))?;
-    let path = store.write_new_card(&pkg_name, &card_id, &text)?;
+    let path = store
+        .write_new_card(&pkg_name, &card_id, &text)
+        .map_err(|e| {
+            tracing::error!(
+                target: "alc.card",
+                pkg = %pkg_name,
+                card_id = %card_id,
+                error = %e,
+                "write_new_card failed"
+            );
+            e
+        })?;
 
     publish(CardEvent::Created {
         pkg: pkg_name.clone(),
@@ -538,6 +549,7 @@ pub fn create_with_store(
 }
 
 /// Read a Card from `store` by id. Returns None if not found.
+// TODO(issue:e60cd19d): tracing::error emit — Card 全域 Error Log pattern スイープで対応
 pub fn get_with_store(store: &dyn CardStore, card_id: &str) -> Result<Option<Json>, String> {
     let text = match store.read_card_text(card_id)? {
         Some(t) => t,
@@ -751,7 +763,16 @@ pub fn alias_set_with_store(
         note: note.map(String::from),
     };
     aliases.push(entry.clone());
-    store.write_aliases(&aliases)?;
+    store.write_aliases(&aliases).map_err(|e| {
+        tracing::error!(
+            target: "alc.card",
+            name = %name,
+            card_id = %card_id,
+            error = %e,
+            "write_aliases failed"
+        );
+        e
+    })?;
 
     // Mirror the full alias table to subscribers as TOML text. The
     // primary FileCardStore already serialized it internally; we
@@ -795,6 +816,7 @@ fn serialize_aliases_toml(aliases: &[Alias]) -> Result<String, String> {
 /// Shortcut for `alias_list → filter → get`. Returns `None` when the alias
 /// does not exist. Errors when the alias points at a missing Card — that
 /// would indicate a corrupt alias table (the target was deleted out of band).
+// TODO(issue:e60cd19d): tracing::error emit — Card 全域 Error Log pattern スイープで対応
 pub fn get_by_alias_with_store(store: &dyn CardStore, name: &str) -> Result<Option<Json>, String> {
     validate_name(name, "alias")?;
     let aliases = store.read_aliases()?;
@@ -1180,6 +1202,7 @@ struct CardRow {
 }
 
 /// Load a single Card file into a `CardRow`.
+// TODO(issue:e60cd19d): tracing::error emit — Card 全域 Error Log pattern スイープで対応
 fn load_full(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Option<CardRow> {
     let text = store.read_locator_text(locator).ok().flatten()?;
     let val: toml::Value = toml::from_str(&text).ok()?;
@@ -1291,6 +1314,7 @@ fn order_summaries(a: &Summary, b: &Summary, keys: &[OrderKey]) -> std::cmp::Ord
 /// When no `where` clause is specified and `order_by` only references
 /// summary-level fields, uses the lightweight `list_with_store` path to
 /// avoid loading full TOML.  Otherwise loads full TOML per Card.
+// TODO(issue:e60cd19d): tracing::error emit — Card 全域 Error Log pattern スイープで対応
 pub fn find_with_store(store: &dyn CardStore, q: FindQuery) -> Result<Vec<Summary>, String> {
     // Fast path: lightweight query, no full-TOML load needed.
     if is_lightweight_query(&q) {
@@ -1798,10 +1822,25 @@ pub fn write_samples_with_store(
     card_id: &str,
     samples: Vec<Json>,
 ) -> Result<PathBuf, String> {
-    if store.samples_exists(card_id)? {
-        return Err(format!(
+    if store.samples_exists(card_id).map_err(|e| {
+        tracing::error!(
+            target: "alc.card",
+            card_id = %card_id,
+            error = %e,
+            "samples_exists failed"
+        );
+        e
+    })? {
+        let msg = format!(
             "alc.card.write_samples: samples already exist for card '{card_id}' (write-once)"
-        ));
+        );
+        tracing::error!(
+            target: "alc.card",
+            card_id = %card_id,
+            error = %msg,
+            "write_samples_text failed (write-once conflict)"
+        );
+        return Err(msg);
     }
     let mut buf = String::new();
     for (idx, s) in samples.iter().enumerate() {
@@ -1811,7 +1850,15 @@ pub fn write_samples_with_store(
         buf.push_str(&line);
         buf.push('\n');
     }
-    let path = store.write_samples_text(card_id, &buf)?;
+    let path = store.write_samples_text(card_id, &buf).map_err(|e| {
+        tracing::error!(
+            target: "alc.card",
+            card_id = %card_id,
+            error = %e,
+            "write_samples_text failed"
+        );
+        e
+    })?;
 
     publish(CardEvent::SamplesWritten {
         card_id: card_id.to_string(),
@@ -1842,6 +1889,7 @@ pub struct SamplesQuery {
 ///
 /// Returns an empty Vec if no samples file exists (Cards without
 /// per-case details are the common case, not an error).
+// TODO(issue:e60cd19d): tracing::error emit — Card 全域 Error Log pattern スイープで対応
 pub fn read_samples_with_store(
     store: &dyn CardStore,
     card_id: &str,
@@ -6442,6 +6490,217 @@ name = "{pkg}"
             assert!(
                 !guard.iter().any(|(entry_id, _)| *entry_id == id),
                 "entry with matching id must be removed from sinks vec"
+            );
+        }
+    }
+
+    // ─── Card store fail → tracing::error emit tests (Phase 2-E) ──
+
+    mod store_fail_tracing_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            span, Event, Level, Metadata, Subscriber,
+        };
+
+        /// Minimal `tracing::Subscriber` that captures error-level events
+        /// emitted at target `alc.card`. Records the `message` field
+        /// so tests can assert on the human-readable slug (e.g.
+        /// `"write_new_card failed"`). No dependency on `tracing-subscriber`
+        /// / `tracing-test` — implements the Subscriber trait directly.
+        #[derive(Default)]
+        struct AlcCardErrorCapture {
+            fired: AtomicBool,
+            messages: Mutex<Vec<String>>,
+        }
+
+        impl Subscriber for AlcCardErrorCapture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.level() == &Level::ERROR && metadata.target() == "alc.card"
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct MsgVisitor(Option<String>);
+                impl Visit for MsgVisitor {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "message" {
+                            self.0 = Some(format!("{value:?}"));
+                        }
+                    }
+                }
+                let mut v = MsgVisitor(None);
+                event.record(&mut v);
+                self.fired.store(true, Ordering::SeqCst);
+                if let Some(msg) = v.0 {
+                    self.messages.lock().unwrap().push(msg);
+                }
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        /// CardStore mock that fails every write. Read paths return
+        /// enough state to reach the target write call.
+        struct FailingWriteStore {
+            fail_msg: String,
+        }
+
+        impl FailingWriteStore {
+            fn new(fail_msg: &str) -> Self {
+                Self {
+                    fail_msg: fail_msg.to_string(),
+                }
+            }
+        }
+
+        impl CardStore for FailingWriteStore {
+            fn write_new_card(
+                &self,
+                _pkg: &str,
+                _card_id: &str,
+                _toml_text: &str,
+            ) -> Result<PathBuf, String> {
+                Err(self.fail_msg.clone())
+            }
+            fn overwrite_card(&self, _card_id: &str, _toml_text: &str) -> Result<PathBuf, String> {
+                Err(self.fail_msg.clone())
+            }
+            fn find_card_locator(&self, card_id: &str) -> Result<Option<PathBuf>, String> {
+                // Return Some so `alias_set_with_store` proceeds past the
+                // existence check and reaches `write_aliases`.
+                Ok(Some(PathBuf::from(format!("/nonexistent/{card_id}.toml"))))
+            }
+            fn read_card_text(&self, _card_id: &str) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            fn list_card_locators(
+                &self,
+                _pkg_filter: Option<&str>,
+            ) -> Result<Vec<(String, PathBuf)>, String> {
+                Ok(Vec::new())
+            }
+            fn read_locator_text(&self, _locator: &Path) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            fn read_aliases(&self) -> Result<Vec<Alias>, String> {
+                Ok(Vec::new())
+            }
+            fn write_aliases(&self, _aliases: &[Alias]) -> Result<(), String> {
+                Err(self.fail_msg.clone())
+            }
+            fn samples_exists(&self, _card_id: &str) -> Result<bool, String> {
+                // Return Ok(false) so we proceed to the write call.
+                Ok(false)
+            }
+            fn write_samples_text(
+                &self,
+                _card_id: &str,
+                _jsonl_text: &str,
+            ) -> Result<PathBuf, String> {
+                Err(self.fail_msg.clone())
+            }
+            fn read_samples_text(&self, _card_id: &str) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            fn import_from_dir(
+                &self,
+                _source_dir: &Path,
+                _pkg: &str,
+            ) -> Result<(Vec<String>, Vec<String>), String> {
+                Ok((Vec::new(), Vec::new()))
+            }
+        }
+
+        /// `create_with_store` Err path must emit
+        /// `tracing::error!(target: "alc.card", ..., "write_new_card failed")`.
+        #[test]
+        fn write_new_card_err_emits_tracing_error() {
+            let capture = Arc::new(AlcCardErrorCapture::default());
+            let store = FailingWriteStore::new("disk full: no space left on device");
+            let input = json!({
+                "pkg": { "name": "tracing_test_pkg" },
+                "model": { "id": "test-model" },
+            });
+
+            let subscriber = capture.clone();
+            let err = tracing::subscriber::with_default(subscriber, || {
+                create_with_store(&store, input).expect_err("write must fail")
+            });
+
+            assert!(
+                err.contains("disk full"),
+                "Err content must propagate unchanged: got {err}"
+            );
+            assert!(
+                capture.fired.load(Ordering::SeqCst),
+                "tracing::error must have fired at target alc.card"
+            );
+            let msgs = capture.messages.lock().unwrap();
+            assert!(
+                msgs.iter().any(|m| m.contains("write_new_card failed")),
+                "captured messages must include 'write_new_card failed', got: {msgs:?}"
+            );
+        }
+
+        /// `write_samples_with_store` Err path must emit
+        /// `tracing::error!(target: "alc.card", ..., "write_samples_text failed")`.
+        #[test]
+        fn write_samples_text_err_emits_tracing_error() {
+            let capture = Arc::new(AlcCardErrorCapture::default());
+            let store = FailingWriteStore::new("permission denied");
+            let samples = vec![json!({"case_id": "c1", "score": 0.5})];
+
+            let subscriber = capture.clone();
+            let err = tracing::subscriber::with_default(subscriber, || {
+                write_samples_with_store(&store, "card_abc", samples).expect_err("write must fail")
+            });
+
+            assert!(
+                err.contains("permission denied"),
+                "Err content must propagate unchanged: got {err}"
+            );
+            assert!(
+                capture.fired.load(Ordering::SeqCst),
+                "tracing::error must have fired at target alc.card"
+            );
+            let msgs = capture.messages.lock().unwrap();
+            assert!(
+                msgs.iter().any(|m| m.contains("write_samples_text failed")),
+                "captured messages must include 'write_samples_text failed', got: {msgs:?}"
+            );
+        }
+
+        /// `alias_set_with_store` Err path must emit
+        /// `tracing::error!(target: "alc.card", ..., "write_aliases failed")`.
+        #[test]
+        fn write_aliases_err_emits_tracing_error() {
+            let capture = Arc::new(AlcCardErrorCapture::default());
+            let store = FailingWriteStore::new("read-only filesystem");
+
+            let subscriber = capture.clone();
+            let err = tracing::subscriber::with_default(subscriber, || {
+                alias_set_with_store(&store, "best", "card_xyz", None, None)
+                    .expect_err("write must fail")
+            });
+
+            assert!(
+                err.contains("read-only filesystem"),
+                "Err content must propagate unchanged: got {err}"
+            );
+            assert!(
+                capture.fired.load(Ordering::SeqCst),
+                "tracing::error must have fired at target alc.card"
+            );
+            let msgs = capture.messages.lock().unwrap();
+            assert!(
+                msgs.iter().any(|m| m.contains("write_aliases failed")),
+                "captured messages must include 'write_aliases failed', got: {msgs:?}"
             );
         }
     }

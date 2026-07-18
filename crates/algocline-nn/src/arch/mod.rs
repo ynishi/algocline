@@ -15,5 +15,7 @@
 //! with the same variable names used at construction time.
 
 pub mod gpt2;
+pub mod lora;
 
 pub use gpt2::{Gpt2Config, Gpt2Model};
+pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear};

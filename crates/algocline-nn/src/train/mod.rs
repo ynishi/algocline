@@ -53,8 +53,12 @@ pub struct Checkpoint {
 
 pub use ckpt::{checkpoint_from_path, CheckpointStore};
 pub use data::{
-    Batch, Dataset, DatasetError, DatasetOpts, JsonlDataset, ParquetDataset, TokenizedDataset,
+    Batch, Dataset, DatasetError, DatasetOpts, JsonlDataset, ParquetDataset, TeacherCardDataset,
+    TokenizedDataset,
 };
-pub use fullft::{run_full_ft, FullFtConfig, TrainError, TrainingLease, TrainingLeaseGuard};
-pub use loss::{CrossEntropyLoss, Loss, Reduction};
+pub use fullft::{
+    run_distill, run_full_ft, DistillLossKind, DistillSpec, FullFtConfig, TrainError,
+    TrainingLease, TrainingLeaseGuard,
+};
+pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};
 pub use scheduler::{ScheduleKind, Scheduler};

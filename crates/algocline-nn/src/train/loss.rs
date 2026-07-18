@@ -62,6 +62,48 @@ impl CrossEntropyLoss {
     }
 }
 
+/// Hard-label distillation loss.
+///
+/// Semantically a thin wrapper around [`CrossEntropyLoss`] — the
+/// distillation caller supplies a per-token loss mask (via
+/// `TeacherCardDataset`) that zeroes out prompt-region positions,
+/// leaving only the response region driving the gradient. A separate
+/// named type helps the training loop and Card metadata carry the
+/// distinction ("this run was a distillation, not a Full FT") without
+/// changing the underlying loss math.
+///
+/// A future KL-soft variant (needing teacher log-probs, deferred) can
+/// live alongside this type without touching the `Loss` trait or the
+/// training loop.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HardLabelDistillLoss {
+    inner: CrossEntropyLoss,
+}
+
+impl HardLabelDistillLoss {
+    /// Construct with the default (mean) reduction.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Access the underlying cross-entropy loss (mostly useful for
+    /// tests that want to compare against a plain CE reference).
+    pub fn inner(&self) -> &CrossEntropyLoss {
+        &self.inner
+    }
+}
+
+impl Loss for HardLabelDistillLoss {
+    fn compute(
+        &self,
+        logits: &Tensor,
+        targets: &Tensor,
+        loss_mask: Option<&Tensor>,
+    ) -> CandleResult<Tensor> {
+        self.inner.compute(logits, targets, loss_mask)
+    }
+}
+
 impl Loss for CrossEntropyLoss {
     fn compute(
         &self,

@@ -96,6 +96,16 @@ pub struct Batch {
     /// `batch_size × ctx_len` token ids row-major (each inner `Vec`
     /// is exactly `ctx_len` long after padding).
     pub input_ids: Vec<Vec<u32>>,
+    /// Optional per-token loss mask, shape identical to `input_ids`
+    /// (each inner `Vec` of `f32`, `1.0` = counted / `0.0` = ignored).
+    ///
+    /// `None` = uniform mask (every token position contributes to
+    /// the loss). Populated by teacher-log style datasets so a
+    /// downstream `Loss::compute` call receives the mask that zeroes
+    /// out prompt-region tokens, leaving only the response region to
+    /// drive the gradient. See `TeacherCardDataset`.
+    #[allow(clippy::type_complexity)]
+    pub loss_mask: Option<Vec<Vec<f32>>>,
     /// `true` when this is the final batch of the source and the
     /// caller may want to skip a gradient step (or scale the loss).
     pub is_last: bool,
@@ -157,6 +167,7 @@ impl TokenizedDataset {
             .collect();
         Some(Batch {
             input_ids,
+            loss_mask: None,
             is_last: end == self.rows.len(),
         })
     }
@@ -307,6 +318,7 @@ impl Dataset for JsonlDataset {
                 .collect();
             return Ok(Some(Batch {
                 input_ids,
+                loss_mask: None,
                 is_last: end == self.buffer.len(),
             }));
         }
@@ -325,6 +337,7 @@ impl Dataset for JsonlDataset {
             .collect();
         Ok(Some(Batch {
             input_ids,
+            loss_mask: None,
             is_last: short_batch,
         }))
     }
@@ -391,6 +404,112 @@ fn pad_or_truncate(row: &[u32], ctx: usize, pad: u32) -> Vec<u32> {
         out.extend_from_slice(row);
         out.resize(ctx, pad);
         out
+    }
+}
+
+/// Pad `mask` up to `ctx` with `0.0` (positions past the real content
+/// contribute nothing to the loss), or truncate to `ctx` when longer.
+fn pad_or_truncate_mask(mask: &[f32], ctx: usize) -> Vec<f32> {
+    if mask.len() >= ctx {
+        mask[..ctx].to_vec()
+    } else {
+        let mut out = Vec::with_capacity(ctx);
+        out.extend_from_slice(mask);
+        out.resize(ctx, 0.0);
+        out
+    }
+}
+
+/// In-memory dataset for hard-label distillation.
+///
+/// Each row carries the concatenated `[prompt || sep || response]`
+/// token ids alongside a per-token float mask picking out the
+/// response region. The mask is padded / truncated in lockstep with
+/// the token ids so a downstream `Loss::compute` call receives shape-
+/// aligned inputs.
+///
+/// The trainer plumbing (bridge / Lua caller) is responsible for
+/// reading the actual Card sample rows via a `FileCardStore` and
+/// tokenising them before constructing this dataset — the
+/// `algocline-nn` crate never touches the filesystem itself. That
+/// keeps the dataset trivially testable with hand-picked deterministic
+/// rows here, and lets the bridge decide the exact prompt / response
+/// split rule.
+pub struct TeacherCardDataset {
+    rows: Vec<Vec<u32>>,
+    masks: Vec<Vec<f32>>,
+    opts: DatasetOpts,
+    cursor: usize,
+}
+
+impl TeacherCardDataset {
+    /// Construct from a paired vector of `(input_ids, loss_mask)` rows.
+    ///
+    /// Every mask row must have the same length as its paired
+    /// `input_ids` row — otherwise the caller has broken the
+    /// per-position-mask invariant and the constructor refuses rather
+    /// than silently truncating.
+    pub fn from_rows(
+        rows: Vec<(Vec<u32>, Vec<f32>)>,
+        opts: DatasetOpts,
+    ) -> Result<Self, DatasetError> {
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut masks = Vec::with_capacity(rows.len());
+        for (idx, (row_ids, row_mask)) in rows.into_iter().enumerate() {
+            if row_ids.len() != row_mask.len() {
+                return Err(DatasetError::MissingField {
+                    field: format!(
+                        "loss_mask length {} != input_ids length {}",
+                        row_mask.len(),
+                        row_ids.len()
+                    ),
+                    index: idx,
+                });
+            }
+            ids.push(row_ids);
+            masks.push(row_mask);
+        }
+        Ok(Self {
+            rows: ids,
+            masks,
+            opts,
+            cursor: 0,
+        })
+    }
+
+    /// Rows currently held by this dataset.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+impl Dataset for TeacherCardDataset {
+    fn next_batch(&mut self) -> Result<Option<Batch>, DatasetError> {
+        if self.cursor >= self.rows.len() {
+            return Ok(None);
+        }
+        let start = self.cursor;
+        let end = (start + self.opts.batch_size).min(self.rows.len());
+        self.cursor = end;
+        let ctx = self.opts.ctx_len;
+        let pad = self.opts.pad_id;
+        let input_ids: Vec<Vec<u32>> = self.rows[start..end]
+            .iter()
+            .map(|row| pad_or_truncate(row, ctx, pad))
+            .collect();
+        let loss_mask: Vec<Vec<f32>> = self.masks[start..end]
+            .iter()
+            .map(|m| pad_or_truncate_mask(m, ctx))
+            .collect();
+        Ok(Some(Batch {
+            input_ids,
+            loss_mask: Some(loss_mask),
+            is_last: end == self.rows.len(),
+        }))
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.rows.len())
     }
 }
 

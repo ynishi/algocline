@@ -242,9 +242,9 @@ pub fn run_full_ft(
             requested: cfg.steps,
         })?;
 
-        let (inputs, targets) = batch_to_input_target(&batch, &device)?;
+        let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
         let logits = model.forward(&inputs)?;
-        let loss = loss_fn.compute(&logits, &targets, None)?;
+        let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
 
         let loss_val: f32 = loss.to_scalar()?;
         last_train_loss = loss_val;
@@ -274,15 +274,101 @@ pub fn run_full_ft(
         .map_err(TrainError::Ckpt)
 }
 
-/// Break a [`Batch`] into `(inputs, targets)` tensors on the model's
-/// device.
+/// Which distillation loss the caller wants for [`run_distill`].
+///
+/// Only the hard-label cross-entropy variant ships today; a KL-soft
+/// variant (needing teacher log-probs) is scheduled for a later
+/// stage. Callers stay forward-compatible by matching on the enum.
+#[derive(Debug, Clone, Copy)]
+pub enum DistillLossKind {
+    /// Hard-label cross-entropy on the teacher-emitted tokens
+    /// ([`crate::train::HardLabelDistillLoss`]).
+    Ce,
+}
+
+/// Distillation-run configuration.
+///
+/// A thin wrapper around a `FullFtConfig` plus the loss variant to
+/// use. The actual dataset (a `TeacherCardDataset` in practice) is
+/// passed separately to [`run_distill`] so a caller can reuse a
+/// pre-built dataset across multiple distillation runs without
+/// reconstructing it.
+#[derive(Debug, Clone)]
+pub struct DistillSpec {
+    /// Training hyperparameters (learning rate, steps, schedule, etc.).
+    pub hyperparams: FullFtConfig,
+    /// Which distillation loss to use.
+    pub loss_kind: DistillLossKind,
+}
+
+impl DistillSpec {
+    /// Build a spec with the default cross-entropy loss and the
+    /// supplied hyperparams.
+    pub fn ce(hyperparams: FullFtConfig) -> Self {
+        Self {
+            hyperparams,
+            loss_kind: DistillLossKind::Ce,
+        }
+    }
+}
+
+/// Run a distillation training loop.
+///
+/// Wraps [`run_full_ft`] with the loss selected by `spec.loss_kind`
+/// and the caller-supplied `dataset` (which is expected to carry a
+/// `Batch::loss_mask` so the loss is scored only on the response
+/// region of each teacher log).
+///
+/// Everything else — checkpoint rotation, scheduler, lease — behaves
+/// exactly the same as a Full FT run because that is precisely the
+/// underlying loop. The named entry exists so downstream callers
+/// (Card metadata, Lua bridge) can encode "this run was a
+/// distillation" without inspecting the training config.
+#[allow(clippy::too_many_arguments)]
+pub fn run_distill(
+    student: &Gpt2Model,
+    varmap: &VarMap,
+    dataset: &mut dyn Dataset,
+    spec: &DistillSpec,
+    ckpt_dir: &Path,
+    ckpt_prefix: &str,
+    lease: Arc<TrainingLease>,
+) -> Result<Checkpoint, TrainError> {
+    match spec.loss_kind {
+        DistillLossKind::Ce => {
+            let loss = crate::train::HardLabelDistillLoss::new();
+            run_full_ft(
+                student,
+                varmap,
+                dataset,
+                &spec.hyperparams,
+                &loss,
+                ckpt_dir,
+                ckpt_prefix,
+                lease,
+            )
+        }
+    }
+}
+
+/// Break a [`Batch`] into `(inputs, targets, mask)` tensors on the
+/// model's device.
 ///
 /// Inputs are `[batch, seq-1]`, targets are `[batch, seq-1]` and are
 /// simply the inputs shifted by one position. This matches the
 /// standard next-token-prediction training setup: for a sequence
 /// `[a, b, c, d]` the model consumes `[a, b, c]` and predicts
 /// `[b, c, d]`.
-fn batch_to_input_target(batch: &Batch, device: &Device) -> CandleResult<(Tensor, Tensor)> {
+///
+/// When the batch carries a `loss_mask` (teacher-log style datasets),
+/// the mask is likewise shifted by one so it lines up with the target
+/// positions: mask position `k` gates the loss contribution of target
+/// token `input_ids[k+1]`. Batches without a mask return `Ok((.., ..,
+/// None))` and the caller passes `None` through to `Loss::compute`.
+fn batch_to_input_target(
+    batch: &Batch,
+    device: &Device,
+) -> CandleResult<(Tensor, Tensor, Option<Tensor>)> {
     let batch_size = batch.input_ids.len();
     if batch_size == 0 {
         return Err(candle_core::Error::Msg(
@@ -319,7 +405,42 @@ fn batch_to_input_target(batch: &Batch, device: &Device) -> CandleResult<(Tensor
         .narrow(1, 1, seq - 1)?
         .to_dtype(DType::U32)?
         .contiguous()?;
-    Ok((inputs, targets))
+
+    // Slice the mask in lockstep with the target shift so mask
+    // position `k` gates target token position `k` (== input position
+    // `k + 1`).
+    let mask = if let Some(mask_rows) = batch.loss_mask.as_ref() {
+        if mask_rows.len() != batch_size {
+            return Err(candle_core::Error::Msg(format!(
+                "batch_to_input_target: loss_mask row count {} != batch size {}",
+                mask_rows.len(),
+                batch_size
+            )));
+        }
+        for (i, row) in mask_rows.iter().enumerate() {
+            if row.len() != seq {
+                return Err(candle_core::Error::Msg(format!(
+                    "batch_to_input_target: loss_mask row {i} has length {} (expected {seq})",
+                    row.len()
+                )));
+            }
+        }
+        let mut mflat: Vec<f32> = Vec::with_capacity(batch_size * seq);
+        for row in mask_rows {
+            mflat.extend_from_slice(row);
+        }
+        let full_mask = Tensor::from_vec(mflat, (batch_size, seq), device)?;
+        Some(
+            full_mask
+                .narrow(1, 1, seq - 1)?
+                .to_dtype(DType::F32)?
+                .contiguous()?,
+        )
+    } else {
+        None
+    };
+
+    Ok((inputs, targets, mask))
 }
 
 #[cfg(test)]

@@ -27,13 +27,18 @@ mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"]
 # downstream training subtasks.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# ST2: HuggingFace tokenizer + hub download for pre-trained tokenizer and
+# HuggingFace tokenizer + hub download for pre-trained tokenizer and
 # base-weight fetch (design §6.3 / §12 Q2 / §12 Q5). `hf-hub` uses the
 # blocking sync client to keep the bridge path Runtime-free.
 tokenizers = "0.19"
 hf-hub = "0.3"
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# tempfile — used by the ckpt / training-loop unit tests to sandbox
+# safetensors output under a scoped directory.
+tempfile = { workspace = true }
 
 [features]
 # Enable candle's CUDA backend for training on RunPod A40 / A100 hosts.

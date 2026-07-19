@@ -381,7 +381,13 @@ pub fn run_lora_ft(
     // (so base weights are structurally frozen — the base varmap is
     // never handed to AdamW) and the saved safetensors bundle
     // contains only those same LoRA A/B tensors (so the Δ file stays
-    // small — invariant #3, < 20 MB for GPT-2 medium at rank 16).
+    // small — invariant #3). On GPT-2 medium the empirical Δ size at
+    // rank 16 depends on the target set: ~9.5 MB for attention-only
+    // wrap (Q/K/V fused + O = 4 wraps × 24 layers), and ~24 MB when
+    // the canonical 6-target set also wraps the two MLP linears
+    // (add ~14.5 MB from the 4× MLP widening). The previous
+    // "< 20 MB" figure only held for the attention-only variant and
+    // has been corrected to reflect both cases.
     run_ft_core(
         base,
         &lora_vm,

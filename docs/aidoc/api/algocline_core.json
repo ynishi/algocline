@@ -1,0 +1,264 @@
+{
+  "crate": "algocline-core",
+  "version": "0.45.0",
+  "items": [
+    {
+      "path": "algocline_core::domain",
+      "kind": "module",
+      "docs": "Re-exports for domain types.\n\nThis module exists to provide a clean `algocline_core::domain::*` import path.\nAll types are also re-exported at the crate root."
+    },
+    {
+      "path": "algocline_core::execution",
+      "kind": "module",
+      "docs": "Pure execution service layer for `algocline-core`.\n\nThis module provides the [`ExecutionService`] trait and all associated value types\nfor the new service layer design.  It coexists with the legacy types in\n`crate::state` and `crate::engine_api` without modifying them (parallel evolution).\n\n## Module structure\n\n| Module | Key types |\n|--------|-----------|\n| [`session_id`] | [`SessionId`] |\n| [`spec`] | [`SessionSpec`], [`SpecKind`], [`ScenarioRef`] |\n| [`state`] | [`ExecutionState`] (v2), [`ExecutionStateTag`], [`ExecutionResult`] |\n| [`pause`] | [`PauseInfo`], [`PauseKind`], [`PausePrompt`] |\n| [`resume`] | [`ResumePayload`], [`QueryResponse`], [`ResumeOutcome`], [`TerminalOutcome`] |\n| [`cancel`] | [`CancelReason`], [`CancelCode`], [`CancelInfo`], [`FailureInfo`], [`FailureKind`] |\n| [`progress`] | [`ProgressEvent`], [`ObserverHandle`] |\n| [`error`] | [`SpawnError`], [`StateError`], [`ResumeError`], [`CancelError`], [`ObserveError`], [`AwaitError`], [`ObserverRecvError`] |\n| [`service`] | [`ExecutionService`] |\n\n## Access path\n\nTypes in this module are accessed as `algocline_core::execution::Foo`.\nThey are **not** re-exported at the top level of `algocline_core` to avoid\nnaming conflicts with legacy top-level types (e.g., `QueryResponse`)."
+    },
+    {
+      "path": "algocline_core::execution::cancel",
+      "kind": "module",
+      "docs": "Cancellation and failure types for the `ExecutionService` layer."
+    },
+    {
+      "path": "algocline_core::execution::cancel::CancelCode",
+      "kind": "enum",
+      "docs": "Categorized cause of a cancellation.\n\nThis is a **closed** enum — `#[non_exhaustive]` is intentionally absent so that\nexhaustive `match` is enforced on consumers (design-v1.md §2).\n\nNo forceful kill variants (e.g., `Aborted`, `Killed`, `ForcedExit`) are included;\nall cancellation in this design is cooperative (crux: Cooperative cancellation\n4-checkpoint)."
+    },
+    {
+      "path": "algocline_core::execution::cancel::CancelInfo",
+      "kind": "struct",
+      "docs": "Information recorded when a session transitions to `Cancelled`.\n\n`state_before` is boxed to avoid a recursive type without indirection.\n`observed_at` is a Unix timestamp in milliseconds."
+    },
+    {
+      "path": "algocline_core::execution::cancel::CancelReason",
+      "kind": "struct",
+      "docs": "Reason supplied to [`crate::execution::ExecutionService::cancel`].\n\n`requested_at` is a Unix timestamp in milliseconds."
+    },
+    {
+      "path": "algocline_core::execution::cancel::FailureInfo",
+      "kind": "struct",
+      "docs": "Information recorded when a session transitions to `Failed`.\n\n`occurred_at` is a Unix timestamp in milliseconds."
+    },
+    {
+      "path": "algocline_core::execution::cancel::FailureKind",
+      "kind": "enum",
+      "docs": "Categorized kind of failure.\n\nClosed enum — `#[non_exhaustive]` intentionally absent."
+    },
+    {
+      "path": "algocline_core::execution::error",
+      "kind": "module",
+      "docs": "Dedicated error enums for each `ExecutionService` verb.\n\nAll error types are **closed enums** (no `#[non_exhaustive]`): wire consumers\nmust handle every variant, and the adapter layer converts to a string before\ncrossing the MCP boundary (design-v1.md §2).\n\nAll error types derive `serde::Serialize + serde::Deserialize` so they can be\nembedded in structured JSON responses if needed by callers."
+    },
+    {
+      "path": "algocline_core::execution::error::AwaitError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ExecutionService::await_terminal`]."
+    },
+    {
+      "path": "algocline_core::execution::error::CancelError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ExecutionService::cancel`].\n\n`cancel` is idempotent for sessions already in a terminal state: calling\n`cancel` on a `Done`, `Failed`, or already-`Cancelled` session returns `Ok(())`.\nThe only error is when the session does not exist at all."
+    },
+    {
+      "path": "algocline_core::execution::error::ObserveError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ExecutionService::observe`]."
+    },
+    {
+      "path": "algocline_core::execution::error::ObserverRecvError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ObserverHandle::recv`] and\n[`crate::execution::ObserverHandle::try_recv`]."
+    },
+    {
+      "path": "algocline_core::execution::error::ResumeError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ExecutionService::resume`].\n\n# Note on `#[from]` and serde compatibility\n`FeedError` (from `crates/algocline-core/src/state.rs`) does not derive\n`serde::Serialize + serde::Deserialize`, so we cannot use `#[from] FeedError`\ndirectly on a serde-enabled enum.  Instead, the `FeedError` variant stores the\ndisplay string, and a manual `From<FeedError>` impl converts it.\n\nSubtask 2 may add `From<SessionError>` to this enum; if a second `#[from]`\nconversion causes a trait impl conflict (K-79), the later conversion must use\n`map_err` instead."
+    },
+    {
+      "path": "algocline_core::execution::error::SpawnError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ExecutionService::spawn`].\n\n# Note on `#[from] EngineError`\nIn this subtask, the engine-level error is represented as a `String` wrapper.\nSubtask 2 will replace `Engine(String)` with `Engine(#[from] SessionError)` once\nthe engine's `SessionError` type is available, using `#[from]` for automatic\nconversion."
+    },
+    {
+      "path": "algocline_core::execution::error::StateError",
+      "kind": "enum",
+      "docs": "Error returned by [`crate::execution::ExecutionService::state`]."
+    },
+    {
+      "path": "algocline_core::execution::pause",
+      "kind": "module",
+      "docs": "Pause-related types for the `ExecutionService` layer."
+    },
+    {
+      "path": "algocline_core::execution::pause::PauseInfo",
+      "kind": "struct",
+      "docs": "Information about a paused execution session.\n\nCarried by [`crate::execution::ExecutionState::Paused`] and emitted in\n[`crate::execution::ProgressEvent::PauseRequested`]."
+    },
+    {
+      "path": "algocline_core::execution::pause::PauseKind",
+      "kind": "enum",
+      "docs": "Discriminant indicating whether a pause expects a single or batch response."
+    },
+    {
+      "path": "algocline_core::execution::pause::PausePrompt",
+      "kind": "struct",
+      "docs": "A single pending LLM prompt within a paused session."
+    },
+    {
+      "path": "algocline_core::execution::progress",
+      "kind": "module",
+      "docs": "Progress observation types for the `ExecutionService` layer."
+    },
+    {
+      "path": "algocline_core::execution::progress::ObserverHandle",
+      "kind": "trait",
+      "docs": "Handle returned by [`crate::execution::ExecutionService::observe`].\n\nWraps a `tokio::sync::broadcast::Receiver<ProgressEvent>` (provided by the engine\nlayer, Subtask 2).  Multiple handles may exist concurrently; each receives the full\nevent stream independently.  When the session's broadcast sender is dropped (session\nterminates), `recv()` returns `Err(ObserverRecvError::Closed)`.\n\nThis is a **trait** to allow the engine layer (Subtask 2) to provide a concrete\n`BroadcastObserverHandle` struct without a circular dependency on core."
+    },
+    {
+      "path": "algocline_core::execution::progress::ProgressEvent",
+      "kind": "enum",
+      "docs": "An event emitted on the per-session broadcast channel.\n\nAll variants carry an `at` field (Unix timestamp in milliseconds).\nThe channel is emitted from [`crate::execution::ExecutionService`] implementations\ninside the engine layer; multiple independent observers may subscribe via\n[`crate::execution::ExecutionService::observe`] without affecting one another\n(crux: Sink-free broadcast Progress fan-out).\n\n# Serde\nUses `#[serde(tag = \"kind\", rename_all = \"snake_case\")]` internally tagged\nrepresentation, so JSON consumers see `{\"kind\": \"state_transition\", ...}`."
+    },
+    {
+      "path": "algocline_core::execution::resume",
+      "kind": "module",
+      "docs": "Resume-related types for the `ExecutionService` layer."
+    },
+    {
+      "path": "algocline_core::execution::resume::QueryResponse",
+      "kind": "struct",
+      "docs": "A single LLM response in a [`ResumePayload::Batch`].\n\nNote: this type is distinct from the legacy `algocline_core::QueryResponse`\n(re-exported via `engine_api.rs`) to avoid naming conflicts.  Access this type\nvia `algocline_core::execution::QueryResponse`."
+    },
+    {
+      "path": "algocline_core::execution::resume::ResumeOutcome",
+      "kind": "enum",
+      "docs": "Outcome returned by [`crate::execution::ExecutionService::resume`]."
+    },
+    {
+      "path": "algocline_core::execution::resume::ResumePayload",
+      "kind": "enum",
+      "docs": "Payload supplied to [`crate::execution::ExecutionService::resume`].\n\nMust match the pause kind of the session being resumed: a `Single`-paused session\nrequires `Single`, a `Batch`-paused session requires `Batch`."
+    },
+    {
+      "path": "algocline_core::execution::resume::TerminalOutcome",
+      "kind": "enum",
+      "docs": "Terminal outcome for a session — carried by [`ResumeOutcome::Terminal`] and\nby [`crate::execution::ExecutionService::await_terminal`]."
+    },
+    {
+      "path": "algocline_core::execution::service",
+      "kind": "module",
+      "docs": "`ExecutionService` trait — the primary verb surface of the new service layer."
+    },
+    {
+      "path": "algocline_core::execution::service::ExecutionService",
+      "kind": "trait",
+      "docs": "Pure service trait for managing execution sessions.\n\nImplementors must ensure the following invariants hold:\n\n1. **Wire-concept exclusion**: no MCP/rmcp types, `progressToken`, `_meta` fields,\n   `notifications/*` paths, or `mcp_`-prefixed identifiers are referenced by this\n   trait or its supporting types.\n2. **`SessionId` is the sole handle**: all verbs after `spawn` accept only a\n   `&SessionId`; no session-internal handles leak through the API.\n3. **Pure value types**: all inputs and outputs are value types (no callbacks,\n   no `Arc`-leaked internals).\n4. **Cooperative cancellation only**: `cancel` signals the session via a\n   `CancellationToken`; no `JoinHandle::abort()` or process kill may be invoked.\n5. **Sink-free progress fan-out**: `observe` returns a `broadcast::Receiver`\n   wrapper that is valid without any pre-registered observer.  Multiple concurrent\n   subscribers each receive the full event stream independently.\n6. **Immediate `SessionId` return**: `spawn` returns the `SessionId` before\n   execution completes.\n7. **Single trait, all verbs**: CLI, Server, and programmatic callers all use\n   this single trait.\n\n# Async vs sync verbs\nAll verbs are `async fn` except `observe`, which is a synchronous `fn`.\n`observe` is sync because `broadcast::Sender::subscribe()` is itself synchronous\nand does not perform I/O — making it `async` would force callers to `.await`\nwithout reason and obscure the sink-free subscription semantics."
+    },
+    {
+      "path": "algocline_core::execution::session_id",
+      "kind": "module",
+      "docs": "Session identifier type for the `ExecutionService` layer."
+    },
+    {
+      "path": "algocline_core::execution::session_id::SessionId",
+      "kind": "struct",
+      "docs": "Opaque handle that uniquely identifies an execution session across all verb calls.\n\n`SessionId` is a newtype over [`String`] and is the sole cross-boundary handle\nneeded to address a session.  Generation is the responsibility of the engine layer;\nthe core value layer only provides construction and inspection primitives.\n\n# Serde\nSerializes as a plain JSON string (transparent newtype) so that wire consumers do\nnot need to unwrap a wrapper object."
+    },
+    {
+      "path": "algocline_core::execution::spec",
+      "kind": "module",
+      "docs": "Session specification types for the `ExecutionService` layer."
+    },
+    {
+      "path": "algocline_core::execution::spec::ScenarioRef",
+      "kind": "enum",
+      "docs": "Reference to a scenario used in [`SpecKind::Eval`]."
+    },
+    {
+      "path": "algocline_core::execution::spec::SessionSpec",
+      "kind": "struct",
+      "docs": "Complete specification required to spawn a new execution session.\n\n`SessionSpec` is a pure value type passed to [`crate::execution::ExecutionService::spawn`].\nIt carries no runtime handles and is safe to clone and serialize."
+    },
+    {
+      "path": "algocline_core::execution::spec::SpecKind",
+      "kind": "enum",
+      "docs": "Discriminant for the execution kind carried by [`SessionSpec`].\n\nEach variant corresponds to one of the primary operations the engine can perform."
+    },
+    {
+      "path": "algocline_core::execution::state",
+      "kind": "module",
+      "docs": "Execution state types (v2) for the `ExecutionService` layer.\n\nThis module defines [`ExecutionState`] v2, [`ExecutionStateTag`], and [`ExecutionResult`].\nThese types are **distinct** from the legacy `state::ExecutionState` in\n`crates/algocline-core/src/state.rs`; both coexist while the migration to the new\n`ExecutionService` API is in progress."
+    },
+    {
+      "path": "algocline_core::execution::state::ExecutionResult",
+      "kind": "struct",
+      "docs": "Payload carried by [`ExecutionState::Done`].\n\n`finished_at` is stored as a Unix timestamp in milliseconds to ensure\nlossless serde without additional crate dependencies (the standard library\n`SystemTime` has no built-in serde support)."
+    },
+    {
+      "path": "algocline_core::execution::state::ExecutionState",
+      "kind": "enum",
+      "docs": "Rich execution state used by [`crate::execution::ExecutionService`].\n\nThis is the v2 variant; the legacy `crate::ExecutionState` from `state.rs` remains\nuntouched for backward compatibility with existing engine consumers."
+    },
+    {
+      "path": "algocline_core::execution::state::ExecutionStateTag",
+      "kind": "enum",
+      "docs": "Lightweight discriminant for [`ExecutionState`].\n\nUsed in [`crate::execution::ProgressEvent::StateTransition`] to avoid carrying\nthe full state payload in every event."
+    },
+    {
+      "path": "algocline_core::metrics",
+      "kind": "module"
+    },
+    {
+      "path": "algocline_core::metrics::ExecutionMetrics",
+      "kind": "struct",
+      "docs": "Measurement data for a single execution.\n\nCreated per-session in `Executor::start_session()`. The `auto` and\n`custom` mutexes are **not shared across sessions** — each session\ngets independent instances. Handles (`BudgetHandle`, `ProgressHandle`,\n`MetricsObserver`) are cloned from the same `Arc` and handed to the\nLua bridge and observer respectively.\n\nThe `log_sink` is a separate `Arc`-backed ring buffer for per-session log\ncapture. It is shared with the Lua bridge (via `log_sink_handle()`) so that\n`print()` and `alc.log()` output is routed directly without acquiring the\n`SessionStatus` mutex."
+    },
+    {
+      "path": "algocline_core::metrics::MetricsObserver",
+      "kind": "struct",
+      "docs": "Updates SessionStatus via the ExecutionObserver trait."
+    },
+    {
+      "path": "algocline_core::metrics::StatsHandle",
+      "kind": "struct",
+      "docs": "Read-only handle exposing auto-counted [`SessionStatus`] metrics to\nthe Lua bridge (e.g. `alc.stats.llm_calls()`).\n\nCloned per session and per fork-child VM. Each holds an\n`Arc<Mutex<SessionStatus>>` shared with the observer that writes to\n`llm_calls` on every paused-cycle complete.\n\n# Poison policy\n\nRead methods return `0` (or sensible defaults) on mutex poison —\nthey are observational and non-fatal, mirroring `BudgetHandle::remaining`.\nReads do **not** mutate `SessionStatus`."
+    },
+    {
+      "path": "algocline_core::pkg",
+      "kind": "module",
+      "docs": "Canonical projection of a Lua package's `M.meta` block.\n\n`PkgEntity` captures the identity portion of an algocline package: the\nfields users rely on to discover, categorize, and version-track a package.\nIt is the single source of truth for \"what is this package?\" and is\nflattened into higher-level records (`IndexEntry`, `SearchResult`,\n`hub_info` responses) so the JSON wire shape stays consistent across the\nHub, the manifest, and project lockfiles.\n\n## Parsing contract\n\n[`PkgEntity::parse_from_init_lua`] is a non-Lua-VM best-effort parser over\nthe `M.meta = { ... }` block of an `init.lua`. It deliberately only\nsupports flat key–value pairs with (possibly concatenated) string\nliterals; nested tables (e.g. `tags = { ... }`) are skipped via\nbrace-depth tracking. When `M.meta.name` is absent or empty the parser\nreturns `None` — this is the **inclusion gate** for hub indexing. The\ncaller (`build_index` in `algocline-app::service::hub`) is expected to\ndrop `None` directories silently so \"draft\" directories like\n`alc_shapes/` (a type DSL library, not an algocline package) do not\npollute the hub index.\n\n## Wire format\n\n`Option` fields use `#[serde(default)]` but deliberately do **not** use\n`skip_serializing_if`. A missing field deserializes as `None` and\nserializes back as `null`. This preserves the key-presence guarantee of\nthe current `hub_index.json` consumers (Bundled-side doc generation,\n`README.md` package-count scripts) so they do not break on field\nabsence."
+    },
+    {
+      "path": "algocline_core::pkg::PkgEntity",
+      "kind": "struct",
+      "docs": "Canonical projection of a Lua package's `M.meta` block.\n\n`name` is required (= hub-index inclusion gate). Other fields are\noptional and degrade UI / discoverability when absent, following the\nBP convention of Cargo / JSR / npm."
+    },
+    {
+      "path": "algocline_core::pkg::PkgType",
+      "kind": "enum",
+      "docs": "Package type discriminator: runnable (has `M.run`) or library (API surface only).\n\nUsed by the adviser and eval entry points to route packages correctly:\n- `Runnable` packages are executed via `M.run(ctx)`.\n- `Library` packages expose an API surface and must not be executed via `M.run`.\n\nWire format: `\"runnable\"` / `\"library\"` (lowercase via `#[serde(rename_all = \"lowercase\")]`).\n\nAuto-detection: when `M.meta.type` is absent, the Lua VM path uses\n`type(pkg.run) == \"function\"` at runtime (canonical). Type is set via\nVM eval (`LUA_TYPE_AUTODETECT`) and attached to the entity by the caller."
+    },
+    {
+      "path": "algocline_core::pkg::TypeSource",
+      "kind": "enum",
+      "docs": "Records how `pkg_type` was determined for a package.\n\nThis is stored alongside `PkgType` in `PkgEntity.type_source` so\ndownstream consumers (`alc_pkg_list`) can inspect the provenance of the\ntype determination.\n\nWire format: `\"auto_detected_runnable\"` / `\"auto_detected_library\"`\n(snake_case via `#[serde(rename_all = \"snake_case\")]`).\nType is always determined by VM eval (`LUA_TYPE_AUTODETECT`)."
+    },
+    {
+      "path": "algocline_core::recent_log",
+      "kind": "module"
+    },
+    {
+      "path": "algocline_core::recent_log::LOG_SINK_CAP",
+      "kind": "constant",
+      "docs": "Maximum number of entries retained in a [`LogSink`]."
+    },
+    {
+      "path": "algocline_core::recent_log::LogEntry",
+      "kind": "struct",
+      "docs": "A single log entry captured from a running session.\n\nEntries are produced by Lua `print()`, `alc.log()`, and engine-internal\nevents, then accumulated in a per-session ring buffer (cap=20) for\nlightweight observability via `alc_status`.\n\n# Fields\n\n- `ts` — Unix milliseconds (i64) when the entry was recorded.\n- `level` — Severity string: `\"info\"`, `\"warn\"`, `\"error\"`, `\"debug\"`, etc.\n- `source` — Originator: `\"alc.lua.print\"`, `\"alc.log\"`, `\"engine\"`, etc.\n- `message` — Human-readable log text."
+    },
+    {
+      "path": "algocline_core::recent_log::LogSink",
+      "kind": "struct",
+      "docs": "A shared, bounded ring-buffer sink for [`LogEntry`] items.\n\nWraps `Arc<Mutex<VecDeque<LogEntry>>>` and enforces a maximum capacity\nof 20 entries.  Oldest entries are evicted when the cap is exceeded.\n\n`LogSink` can be cloned cheaply (clones the `Arc`, not the buffer).\nIt is intended to be passed to the Lua bridge so that log output from\nboth `print()` and `alc.log()` is routed into the session's ring buffer."
+    }
+  ]
+}

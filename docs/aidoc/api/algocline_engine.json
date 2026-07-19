@@ -1,0 +1,365 @@
+{
+  "crate": "algocline-engine",
+  "version": "0.45.0",
+  "items": [
+    {
+      "path": "algocline_engine::bridge",
+      "kind": "module",
+      "docs": "Layer 0: Runtime Primitives\n\nRegisters Rust-backed functions into the `alc.*` Lua namespace.\nThese provide capabilities that cannot be expressed in Pure Lua:\nI/O (state), serialization (json), host communication (llm),\nand text processing (chunk).\n\nAll functions registered here are available in every Lua session\nwithout explicit `require()`."
+    },
+    {
+      "path": "algocline_engine::bridge::BridgeConfig",
+      "kind": "struct",
+      "docs": "All handles needed by Layer 0 runtime primitives.\n\nCollects the various per-session handles into a single config,\navoiding a growing parameter list on `register()`."
+    },
+    {
+      "path": "algocline_engine::bridge::PRELUDE",
+      "kind": "constant",
+      "docs": "Layer 1 prelude (also used by fork to setup child VMs)."
+    },
+    {
+      "path": "algocline_engine::bridge::install_for_pkg_test",
+      "kind": "function",
+      "docs": "Install the production `alc.*` primitive surface plus the mock layer\non `lua` for use by the `alc_pkg_test` sandbox.\n\nSpec authors get:\n* the full `alc.*` surface that `alc_run` exposes (stateless helpers\n  like `alc.json_encode`, `alc.fingerprint`, `alc.parse_number`,\n  `alc.fuzzy.*`, plus stateful helpers backed by in-memory\n  per-VM tempdirs for `alc.state.*` and `alc.card.*`);\n* `alc.llm` / `alc.llm_batch` / `alc.fork` as stubs that error out\n  when called without a `with_alc({ llm = … }, …)` override;\n* a Pure-Lua mock layer (`with_alc(overrides, fn)`,\n  `alc_mock.install/restore`, `alc.spy(name, default_fn?)`).\n\n**Invariant** (enforced by `tests/bridge_sandbox_parity.rs`):\n`production primitive surface ⊆ test sandbox primitive surface`.\nEvery key reachable on `_G.alc` after a successful production\n[`register`] call is also reachable after `install_for_pkg_test`.\n\nThe per-VM tempdir backing `state_store` / `card_store` is held on\nthe Lua VM via `set_app_data` and dropped together with the VM."
+    },
+    {
+      "path": "algocline_engine::bridge::register",
+      "kind": "function",
+      "docs": "Register all Layer 0 runtime primitives onto the given table."
+    },
+    {
+      "path": "algocline_engine::card",
+      "kind": "module",
+      "docs": "Card storage — immutable run-result snapshots.\n\nA Card is a frozen record of a strategy run: identity, parameters,\nmodel, scenario, aggregate stats, and (optionally) per-case detail.\nCards are **immutable** — once written they are never modified, only\nannotated via additive `append`.  Mutable **aliases** point to a\nCard and can be rebound freely.\n\n## Design principles\n\n1. **Minimal REQUIRED, maximal OPTIONAL** — v0 needs only 4 fields;\n   lightweight \"ran this pkg\" records and heavy optimize snapshots\n   share the same schema.\n2. **Immutable append-only** — no overwrite, no delete.  New data is\n   added via `append` (new top-level keys only) or by creating a new\n   Card with a fresh `card_id`.\n3. **Two-tier storage** — TOML for human-readable aggregate, JSONL\n   sidecar for machine-parseable per-case detail.\n4. **File-primary** — files are the source of truth; in-memory state\n   is cache.  Cards can be copied, diffed, and version-controlled.\n\n## Storage layout (two-tier)\n\n| Tier | File | Content |\n|------|------|---------|\n| **Tier 1** | `~/.algocline/cards/{pkg}/{card_id}.toml` | Aggregate scalars, decisions, identity, params |\n| **Tier 2** | `~/.algocline/cards/{pkg}/{card_id}.samples.jsonl` | Per-case raw data (JSONL, write-once) |\n\nTier 1 holds a shareable summary (a few KB). Tier 2 holds per-case\ndetail ��� the engine does not interpret its columns; packages define\ntheir own schema.\n\nAlias table: `~/.algocline/cards/_aliases.toml` (global).\n\n## card_id naming\n\n`{pkg}_{model_short}_{compact_ts}_{hash6}`\n\n- `compact_ts`: `YYYYMMDDTHHMMSS` in UTC\n- `hash6`: first 6 hex chars of DJB2 param fingerprint\n- Example: `cot_opus46_20260412T061500_a3f9c1`\n\n## v0 schema (frozen)\n\n### REQUIRED (minimum valid Card)\n\n| Field | Type | Example |\n|-------|------|---------|\n| `schema_version` | string | `\"card/v0\"` |\n| `card_id` | string | `\"cot_opus46_20260412T061500_a3f9c1\"` |\n| `created_at` | string (RFC 3339) | `\"2026-04-12T06:15:00Z\"` |\n| `[pkg].name` | string | `\"cot\"` |\n\n### OPTIONAL (auto-injected where possible)\n\n| Section | Fields |\n|---------|--------|\n| `[pkg]` | `version`, `category`, `source`, `source_ref`, `source_sha` |\n| `[runtime]` | `alc_version`, `lua_version`, `host_os`, `git_sha` |\n| `[model]` | `provider`, `id`, `id_short`, `cutoff` |\n| `[params]` | Free-form ctx snapshot; `param_fingerprint` for DJB2 hash |\n| `[strategy_params]` | Strategy-tunable parameters surfaced for sweeps / optimizers (e.g. `alpha`, `temperature`, `depth`). Free-form, but `where`-queryable as a first-class section |\n| `[scenario]` | `name`, `source`, `case_count`, `grader` |\n| `[stats]` | `pass_rate`, `mean_score`, `std`, `median`, `min`, `max`, `n` |\n| `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |\n| `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |\n| `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |\n| `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `\"sweep_variant\"`, `\"reflection_of\"`, `\"derived_from\"`) |\n\n## Lua API (`alc.card.*`)\n\n| Function | Description |\n|----------|-------------|\n| `create(table)` | Write new Card (Tier 1). Returns `{ card_id, path }` |\n| `get(card_id)` | Read Card by id. Returns table or nil |\n| `list(filter?)` | List Cards as summaries (newest first) |\n| `find(query?)` | Prisma-style `where` DSL + dotted-path `order_by` + `offset`/`limit` |\n| `append(card_id, fields)` | Additive-only annotation (new keys only) |\n| `alias_set(name, card_id, opts?)` | Pin mutable alias |\n| `alias_list(filter?)` | List aliases |\n| `get_by_alias(name)` | Resolve alias → full Card |\n| `write_samples(card_id, samples)` | Write Tier 2 sidecar (write-once) |\n| `read_samples(card_id, opts?)` | Read Tier 2 with `where` filtering + offset/limit paging |\n| `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |"
+    },
+    {
+      "path": "algocline_engine::card::Alias",
+      "kind": "struct"
+    },
+    {
+      "path": "algocline_engine::card::CardEvent",
+      "kind": "enum",
+      "docs": "A Card-level event emitted from the write path.\n\nEach variant carries the already-serialized payload text so that\nsubscribers can persist the exact bytes that were written to the\nprimary store (byte-for-byte parity)."
+    },
+    {
+      "path": "algocline_engine::card::CardEventBus",
+      "kind": "struct",
+      "docs": "Process-wide fan-out bus. Subscribers are registered once at startup\n(from `ALC_CARD_SINKS`) and stored behind a `Mutex` so that tests\ncan swap them out via `replace_subscribers_for_test` without losing\nthe singleton identity."
+    },
+    {
+      "path": "algocline_engine::card::CardEventKind",
+      "kind": "enum",
+      "docs": "Lightweight discriminant for `CardEvent`. Used as a `HashMap` key in\n`SubscriberStats` so that ok/err counters can be tracked per event\nkind without holding the full payload."
+    },
+    {
+      "path": "algocline_engine::card::CardStore",
+      "kind": "trait",
+      "docs": "Storage backend for Cards.\n\nImplementations must be `Send + Sync` so that they can be shared\nacross Lua host threads safely. All methods may fail with an\nerror `String` describing the backend-specific failure."
+    },
+    {
+      "path": "algocline_engine::card::CardSubscriber",
+      "kind": "trait",
+      "docs": "A downstream backend that receives `CardEvent`s in best-effort,\nserial fan-out order.\n\nImplementations must be `Send + Sync` so that the bus can hold\n`Arc<dyn CardSubscriber>` safely across threads."
+    },
+    {
+      "path": "algocline_engine::card::CmpOp",
+      "kind": "enum",
+      "docs": "Single comparison operator."
+    },
+    {
+      "path": "algocline_engine::card::Comparison",
+      "kind": "struct",
+      "docs": "One parsed comparison: `path` points at a nested field,\n`op` + `value` describe how to compare it."
+    },
+    {
+      "path": "algocline_engine::card::FileCardStore",
+      "kind": "struct",
+      "docs": "File-backed implementation of [`CardStore`]."
+    },
+    {
+      "path": "algocline_engine::card::FileCardSubscriber",
+      "kind": "struct",
+      "docs": "A subscriber that mirrors events to a local directory using the\nsame two-tier layout as [`FileCardStore`]:\n\n- `{root}/{pkg}/{card_id}.toml` — Card TOML\n- `{root}/{pkg}/{card_id}.samples.jsonl` — samples sidecar\n- `{root}/_aliases.toml` — global alias table"
+    },
+    {
+      "path": "algocline_engine::card::FindQuery",
+      "kind": "struct",
+      "docs": "Query parameters for `find`."
+    },
+    {
+      "path": "algocline_engine::card::LastError",
+      "kind": "struct",
+      "docs": "Most recent delivery failure for a single subscriber. Exposed via\n`SubscriberHealthRow.last_error` in the `alc_stats` JSON snapshot."
+    },
+    {
+      "path": "algocline_engine::card::LineageDirection",
+      "kind": "enum",
+      "docs": "Walk direction for `lineage`."
+    },
+    {
+      "path": "algocline_engine::card::LineageEdge",
+      "kind": "struct",
+      "docs": "One edge in the lineage result (child → parent, always)."
+    },
+    {
+      "path": "algocline_engine::card::LineageNode",
+      "kind": "struct",
+      "docs": "One node in the lineage result.\n\n`depth` is the signed distance from the root: negative for\nancestors (up-walk), 0 for the root, positive for descendants."
+    },
+    {
+      "path": "algocline_engine::card::LineageQuery",
+      "kind": "struct",
+      "docs": "Query parameters for `lineage`."
+    },
+    {
+      "path": "algocline_engine::card::LineageResult",
+      "kind": "struct",
+      "docs": "Full lineage walk result."
+    },
+    {
+      "path": "algocline_engine::card::OrderKey",
+      "kind": "struct",
+      "docs": "Parsed sort key: path with optional descending flag."
+    },
+    {
+      "path": "algocline_engine::card::PerSubscriber",
+      "kind": "struct",
+      "docs": "Per-subscriber counter state. Held inside `SubscriberStats` under a\n`Mutex`; `snapshot` clones the fields into an owned `SubscriberHealthRow`\nwhile the lock is held, so the lock window stays short."
+    },
+    {
+      "path": "algocline_engine::card::Predicate",
+      "kind": "enum",
+      "docs": "Parsed predicate tree."
+    },
+    {
+      "path": "algocline_engine::card::RunSection",
+      "kind": "struct",
+      "docs": "Optional `[run]` section carrying strategy execution outcome.\n\n* `status` is REQUIRED when the section is present.\n* `reason` / `action` are OPTIONAL free-form strings; when absent they\n  are omitted from the serialized TOML entirely (`skip_serializing_if`).\n\nUsed only for input validation at the Lua bridge boundary — the actual\nCard TOML is written via the raw `serde_json::Value` path so that other\ntop-level fields are preserved verbatim."
+    },
+    {
+      "path": "algocline_engine::card::RunStatus",
+      "kind": "enum",
+      "docs": "Status of a strategy run, recorded in the `[run]` section of a Card.\n\nThe three variants are intentionally exhaustive so that downstream\nanalysers can pattern-match without a catch-all arm.  Serde uses\nsnake_case so that TOML values round-trip through the Lua bridge\n(`succeeded` / `failed` / `skipped`)."
+    },
+    {
+      "path": "algocline_engine::card::SCHEMA_VERSION",
+      "kind": "constant"
+    },
+    {
+      "path": "algocline_engine::card::SamplesQuery",
+      "kind": "struct",
+      "docs": "Query parameters for `read_samples`."
+    },
+    {
+      "path": "algocline_engine::card::SinkBackfillReport",
+      "kind": "struct",
+      "docs": "Result of a [`card_sink_backfill`] run. One row per card the tool\ntouched (classified as pushed / skipped / failed / pushed_samples).\nThe `failed` entries carry the error message so an operator can\ntriage read-only mounts etc."
+    },
+    {
+      "path": "algocline_engine::card::SubscriberHealthRow",
+      "kind": "struct",
+      "docs": "Snapshot row for a single subscriber, serialized directly into the\n`alc_stats` JSON output as one element of the `card_sinks` array."
+    },
+    {
+      "path": "algocline_engine::card::SubscriberStats",
+      "kind": "struct",
+      "docs": "Process-wide per-subscriber statistics, keyed by subscriber URI\n(the value returned by `CardSubscriber::describe`)."
+    },
+    {
+      "path": "algocline_engine::card::Summary",
+      "kind": "struct",
+      "docs": "Summary row for `alc.card.list()`."
+    },
+    {
+      "path": "algocline_engine::card::alias_list_with_store",
+      "kind": "function",
+      "docs": "List aliases from `store`, optionally filtered by pkg."
+    },
+    {
+      "path": "algocline_engine::card::alias_set_with_store",
+      "kind": "function",
+      "docs": "Bind (or rebind) an alias to a Card in `store`.\n\nValidates that `card_id` exists. If an alias with the same `name` already\nexists it is overwritten — the alias table is intentionally mutable even\nthough the Cards themselves are not."
+    },
+    {
+      "path": "algocline_engine::card::aliases_to_json",
+      "kind": "function"
+    },
+    {
+      "path": "algocline_engine::card::append_with_store",
+      "kind": "function",
+      "docs": "Append new top-level fields to an existing Card.\n\nSemantics: **additive only**. If any top-level key in `fields` already\nexists in the Card, the call fails — Cards are immutable w.r.t. existing\ndata. New top-level keys are inserted and the Card file is rewritten\natomically.\n\nReturns the merged Card JSON."
+    },
+    {
+      "path": "algocline_engine::card::card_sink_backfill_with_store",
+      "kind": "function",
+      "docs": "Backfill one subscriber (`sink` URI) from the primary store.\n\nSteps:\n1. Look up the target subscriber on the event bus; fail fast if\n   the URI is not registered so the caller gets an immediate\n   error rather than a silent no-op.\n2. Enumerate every `(pkg, card_id)` pair from the default\n   [`CardStore`].\n3. For each pair, ask the subscriber whether it already has that\n   card (`CardSubscriber::has_card`). If yes → skipped (drift-safe,\n   no overwrite). If no → read the primary TOML and `publish_to`\n   the one target sink. Samples are mirrored the same way.\n4. `dry_run = true` short-circuits step 3: the report lists\n   what would have been pushed but no `publish_to` is issued,\n   so `SubscriberStats` does not increment.\n\n`card_sink_backfill` operates with an injectable [`CardStore`]; tests\ndrive this directly against a tempdir-backed [`FileCardStore`] so they\nnever touch the user's real cards directory."
+    },
+    {
+      "path": "algocline_engine::card::create_with_store",
+      "kind": "function",
+      "docs": "Create a new Card backed by `store`."
+    },
+    {
+      "path": "algocline_engine::card::eval_predicate",
+      "kind": "function",
+      "docs": "Evaluate a predicate tree against a full Card JSON."
+    },
+    {
+      "path": "algocline_engine::card::event_bus",
+      "kind": "function",
+      "docs": "Return the process-wide `CardEventBus` singleton, initializing it\non the first call from the `ALC_CARD_SINKS` environment variable."
+    },
+    {
+      "path": "algocline_engine::card::find_with_store",
+      "kind": "function",
+      "docs": "Filter/sort Cards across the store using the `where` DSL.\n\nWhen no `where` clause is specified and `order_by` only references\nsummary-level fields, uses the lightweight `list_with_store` path to\navoid loading full TOML.  Otherwise loads full TOML per Card."
+    },
+    {
+      "path": "algocline_engine::card::get_by_alias_with_store",
+      "kind": "function",
+      "docs": "Resolve an alias name to its bound Card and return the full Card JSON.\n\nShortcut for `alias_list → filter → get`. Returns `None` when the alias\ndoes not exist. Errors when the alias points at a missing Card — that\nwould indicate a corrupt alias table (the target was deleted out of band)."
+    },
+    {
+      "path": "algocline_engine::card::get_with_store",
+      "kind": "function",
+      "docs": "Read a Card from `store` by id. Returns None if not found."
+    },
+    {
+      "path": "algocline_engine::card::import_from_dir_with_store",
+      "kind": "function",
+      "docs": "Import Card files into `store` from `source_dir` under `pkg`.\n\nCopies `*.toml` and `*.samples.jsonl` files. Existing cards with the\nsame id are skipped (first-writer wins — Card immutability).\n\nReturns `(imported, skipped)` card_id lists."
+    },
+    {
+      "path": "algocline_engine::card::init_event_bus",
+      "kind": "function",
+      "docs": "Eagerly initialize the bus. Idempotent and safe to call multiple\ntimes; intended for startup hooks (`main.rs`) so that subscriber\nregistration `tracing::info!` lines are emitted at boot rather than\non the first Card write."
+    },
+    {
+      "path": "algocline_engine::card::lineage_to_json",
+      "kind": "function",
+      "docs": "Render a LineageResult as JSON for the service layer."
+    },
+    {
+      "path": "algocline_engine::card::lineage_with_store",
+      "kind": "function",
+      "docs": "Walk the lineage tree from `q.card_id` in `store`."
+    },
+    {
+      "path": "algocline_engine::card::list_with_store",
+      "kind": "function",
+      "docs": "List cards from `store`. `pkg_filter = Some(\"name\")` restricts to that pkg subdir."
+    },
+    {
+      "path": "algocline_engine::card::parse_order_by",
+      "kind": "function",
+      "docs": "Parse an order_by JSON value.  Accepts:\n  - a string: `\"stats.pass_rate\"` or `\"-stats.pass_rate\"`\n  - an array of strings: `[\"-stats.pass_rate\", \"created_at\"]`"
+    },
+    {
+      "path": "algocline_engine::card::parse_where",
+      "kind": "function",
+      "docs": "Parse a `where` JSON value into a `Predicate`.\n\n`prefix` is the current nested-key path as we descend through\nsection objects."
+    },
+    {
+      "path": "algocline_engine::card::publish",
+      "kind": "function",
+      "docs": "Convenience wrapper: publish through the singleton."
+    },
+    {
+      "path": "algocline_engine::card::read_samples_with_store",
+      "kind": "function",
+      "docs": "Read per-case samples from `{card_id}.samples.jsonl`.\n\nStreams the JSONL file line by line; rows are parsed, optionally\nfiltered by `q.where_`, then paged by `offset` + `limit`.  Offset\napplies to the **post-filter** stream, matching Prisma/SQL\nsemantics.\n\nReturns an empty Vec if no samples file exists (Cards without\nper-case details are the common case, not an error)."
+    },
+    {
+      "path": "algocline_engine::card::subscriber_stats_snapshot",
+      "kind": "function",
+      "docs": "Public entry point: snapshot of all process-wide subscriber stats.\nWrapper around `event_bus().stats().snapshot()` so that downstream\ncrates (notably `algocline-app`) do not need a handle to the\n`CardEventBus` singleton."
+    },
+    {
+      "path": "algocline_engine::card::summaries_to_json",
+      "kind": "function"
+    },
+    {
+      "path": "algocline_engine::card::validate_name",
+      "kind": "function"
+    },
+    {
+      "path": "algocline_engine::card::write_samples_with_store",
+      "kind": "function",
+      "docs": "Write per-case samples to `{card_id}.samples.jsonl` (write-once).\n\nEach `samples` entry is serialized as one compact JSON line.\nFails if a samples file already exists for this card — mirrors\nthe immutability guarantee of Cards themselves."
+    },
+    {
+      "path": "algocline_engine::execution",
+      "kind": "module",
+      "docs": "`algocline-engine::execution` — v2 execution module.\n\nProvides the engine-level session lifecycle machinery:\n\n- [`SessionRecord`] — per-session ownership bundle (state, broadcast tx,\n  cancellation token, join handle, response senders).\n- [`SessionRegistryV2`] — registry that spawns, tracks, and controls v2\n  sessions (coexists with the legacy `SessionRegistry` in `session.rs`).\n- [`driver_loop`] — background async fn that drives a session to completion,\n  embedding the four cooperative cancellation checkpoints (Crux R2).\n- [`BroadcastObserverHandle`] — concrete [`algocline_core::execution::ObserverHandle`]\n  implementation backed by a `broadcast::Receiver<ProgressEvent>` (Crux R3).\n\n# Design invariants\n\n- **Crux R1**: No `rmcp::*`, `progressToken`, `_meta`, `notifications/*`, or\n  `mcp_`-prefixed identifiers in this module tree.\n- **Crux R2**: Cancellation uses `CancellationToken::cancel()` only;\n  `JoinHandle::abort()` and process-kill paths are absent.\n- **Crux R3**: `observe()` is sync and returns a valid handle even with zero\n  pre-registered observers (sink-free fan-out)."
+    },
+    {
+      "path": "algocline_engine::session",
+      "kind": "module",
+      "docs": "Session-based Lua execution with pause/resume on alc.llm() calls.\n\nRuntime layer: ties Domain (ExecutionState) and Metrics (ExecutionMetrics)\ntogether with channel-based Lua pause/resume machinery."
+    },
+    {
+      "path": "algocline_engine::session::DEFAULT_PROMPT_PREVIEW_CHARS",
+      "kind": "constant",
+      "docs": "Default preview length (chars) used when `PendingFilter::preset_preview()`\nis constructed without an explicit length. Env var\n`ALC_PROMPT_PREVIEW_CHARS` (resolved in `AppConfig`) overrides this."
+    },
+    {
+      "path": "algocline_engine::session::ExecutionResult",
+      "kind": "struct",
+      "docs": "Session completion data: terminal state + metrics."
+    },
+    {
+      "path": "algocline_engine::session::FeedResult",
+      "kind": "enum",
+      "docs": "Result of a session interaction (start or feed)."
+    },
+    {
+      "path": "algocline_engine::session::PendingFilter",
+      "kind": "struct",
+      "docs": "Per-field filter controlling which `LlmQuery` attributes are projected\ninto a Snapshot's `pending` array.\n\nAdding a new field to `LlmQuery` only requires adding one matching\n`bool` here — the shape stays stable so API surface does not grow\nenum variants for every new attribute."
+    },
+    {
+      "path": "algocline_engine::session::PromptProjection",
+      "kind": "enum",
+      "docs": "Prompt projection mode — 3 states rather than a bool so that truncation\nlength can travel inside the filter object.\n\nJSON tag is `mode`: `{\"mode\":\"off\"}` / `{\"mode\":\"preview\",\"chars\":200}` /\n`{\"mode\":\"full\"}`."
+    },
+    {
+      "path": "algocline_engine::session::Session",
+      "kind": "struct",
+      "docs": "A Lua execution session with domain state tracking.\n\nEach session owns a dedicated Lua VM via `_vm_driver`. The VM's OS thread\nstays alive as long as the driver is held, and exits cleanly when the\nsession is dropped (channel closes → Lua thread drains and exits)."
+    },
+    {
+      "path": "algocline_engine::session::SessionError",
+      "kind": "enum"
+    },
+    {
+      "path": "algocline_engine::session::SessionRegistry",
+      "kind": "struct",
+      "docs": "Manages active sessions.\n\n# Locking design (lock **C**)\n\nUses `tokio::sync::Mutex` because `feed_response` holds the lock\nwhile calling `Session::feed_one()` (which itself acquires the\nper-session `std::sync::Mutex<SessionStatus>`, lock **A**). The lock\nordering invariant is always **C → A** — no code path acquires A\nthen C, so deadlock is structurally impossible.\n\n`tokio::sync::Mutex` is chosen here (rather than `std::sync::Mutex`)\nbecause `feed_response` must take the session out of the map for\nthe async `wait_event()` call. The two-phase pattern (lock → remove\n→ unlock → await → lock → reinsert) requires an async-aware mutex\nto avoid holding the lock across the `wait_event().await`.\n\n## Contention\n\n`list_snapshots()` (from `alc_status`) holds lock C while iterating\nall sessions. During this time, `feed_response` for any session is\nblocked. Given that snapshot iteration is O(n) with n = active\nsessions (typically 1–3) and each snapshot takes microseconds, this\nis acceptable. If session count grows significantly, consider\nswitching to a concurrent map or per-session locks.\n\n## Interaction with lock A\n\n`Session::snapshot()` (called under lock C in `list_snapshots`)\nacquires lock A via `ExecutionMetrics::snapshot()`. This is safe:\n- Lock order: C → A (consistent with `feed_response`)\n- Lock A hold time: microseconds (JSON field reads)\n- Lock A is per-session (no cross-session contention)"
+    },
+    {
+      "path": "algocline_engine::state",
+      "kind": "module",
+      "docs": "Persistent key-value state backed by JSON files.\n\n## Architecture\n\nAll state operations go through the [`StateStore`] trait, which\nabstracts the storage backend.  The default implementation,\n[`JsonFileStore`], persists each namespace as a JSON file under a\ncaller-provided root directory with atomic writes (tmp + rename).\n\n## Tier 1 — Current API\n\n| Operation | Description |\n|-----------|-------------|\n| `get` | Read a value (returns `None` if absent) |\n| `set` | Write a value (upsert) |\n| `delete` | Remove a key (returns whether it existed) |\n| `keys` | List all keys in a namespace |\n| `has` | Check existence (cost is backend-dependent) |\n| `set_nx` | Set-if-not-exists (returns `false` if key already present) |\n| `incr` | Counter increment — single-process atomic (read-modify-write) |\n\n## Tier 2 — Future Extensions (design notes, not yet implemented)\n\nThe following operations are planned but **not yet implemented**.\nThe trait is designed to accommodate them without breaking changes.\nReview this list when adding a new backend.\n\n- **TTL**: `set(key, value, opts)` with `opts.ttl_secs`, plus\n  `ttl(key) -> Option<Duration>` to query remaining time.  Useful\n  for caching patterns (e.g. Hub index cache, LLM response cache).\n- **Batch**: `mget(keys) -> Vec<Option<Value>>` and\n  `mset(pairs) -> Result<()>`.  Reduces I/O round-trips for\n  file/network backends.\n- **clear**: Flush all keys in a namespace.  OpenResty's\n  `flush_all` equivalent.\n\n## Backend Swappability\n\nBecause the engine interacts with state only through the\n[`StateStore`] trait, backends can be swapped without changing Lua\ncode.  Planned backends:\n\n- `JsonFileStore` (current, default)\n- In-memory `HashMap` (for tests and short-lived sessions)\n- SQLite (for larger datasets with indexed queries)\n- Redis (for distributed / multi-process scenarios)"
+    },
+    {
+      "path": "algocline_engine::state::JsonFileStore",
+      "kind": "struct",
+      "docs": "JSON-file-backed state store.\n\nEach namespace is a single JSON file at\n`{root}/{namespace}.json`.  Writes are atomic: the new state is\nwritten to a `.tmp` sibling and then renamed.\n\nThe root directory is provided at construction time; callers are\nexpected to resolve it from the service-layer `AppDir` abstraction\n(typically `~/.algocline/state/`).\n\n## Concurrency\n\nPer-namespace locks (`std::sync::Mutex`) prevent lost updates under\nconcurrent `alc.state.*` calls within the same process.  The lock\nis acquired for the full load → mutate → atomic-rename cycle, so\ntwo tokio tasks operating on the **same** namespace are serialised.\n\nRationale for `std::sync::Mutex` over `tokio::sync::Mutex`:\nall I/O inside the lock uses `std::fs` (synchronous, no `.await`),\nso a standard mutex is sufficient and avoids holding a tokio mutex\nacross potential scheduler context switches.\n\n**Multi-process safety is NOT provided.**  If multiple `alc`\nprocesses share the same state directory (uncommon), use a backend\nwith native `INCR` (Redis) or transactions (SQLite)."
+    },
+    {
+      "path": "algocline_engine::state::ResetReport",
+      "kind": "struct",
+      "docs": "Report returned by [`JsonFileStore::reset_dispatched_with_backup`]\ndescribing what was modified."
+    },
+    {
+      "path": "algocline_engine::state::StateError",
+      "kind": "enum",
+      "docs": "Errors returned by the dispatched-layout helpers\n(`list_dispatched`, `show_dispatched`, `reset_dispatched_with_backup`).\n\nUnlike the legacy [`StateStore`] trait methods (which return `String`\nerrors), these helpers use a typed enum so callers can distinguish\nmissing-key from I/O failure at the type level without pattern-matching\non OS error codes."
+    },
+    {
+      "path": "algocline_engine::state::StateStore",
+      "kind": "trait",
+      "docs": "Backend-agnostic key-value state store.\n\nAll operations are namespace-scoped.  Implementations must be\n`Send + Sync` so they can be shared across Lua VMs (e.g. fork)."
+    }
+  ]
+}

@@ -1,0 +1,1190 @@
+<!-- algocline/index.md -->
+# algocline 0.45.0
+
+# algocline — LLM amplification engine
+
+algocline provides a Lua execution environment for structurally enhancing LLM
+reasoning. Strategies are Pure Lua modules that call `alc.*` primitives
+to orchestrate multi-step LLM interactions.
+
+## Architecture: Three-Layer StdLib
+
+```text
+Layer 0: Runtime Primitives (Rust → alc.*)
+│  Injected by bridge.rs into every Lua session.
+│  These are the foundational building blocks that cannot be
+│  expressed in Pure Lua (I/O, LLM calls, serialization).
+│
+│  alc.llm(prompt, opts?)       — Host LLM call via MCP Sampling
+│  alc.json_encode / json_decode — serde_json bridge
+│  alc.log(level, msg)          — tracing bridge
+│  alc.state.get/set/keys/delete — persistent key-value store
+│  alc.chunk(text, opts?)       — text segmentation
+│
+Layer 1: Prelude Combinators (Lua → alc.*)
+│  Loaded from prelude.lua (embedded via include_str!).
+│  Higher-order functions that compose Layer 0 primitives.
+│  Auto-injected into alc.* namespace alongside Layer 0.
+│
+│  alc.map(items, fn)          — transform each element
+│  alc.reduce(items, fn, init) — fold to single value
+│  alc.vote(answers)           — majority aggregation
+│  alc.filter(items, fn)       — conditional selection
+│
+Layer 2: Bundled Packages (require() from ~/.algocline/packages/)
+   Installed to ~/.algocline/packages/ via `alc init`.
+   Each is a self-contained Lua module built on Layer 0/1.
+   Loaded explicitly via require("{name}").
+
+   explore  — UCB1 hypothesis space exploration    [selection]
+   panel    — multi-perspective deliberation       [synthesis]
+   chain    — iterative chain-of-thought           [reasoning]
+   ensemble — independent sampling + majority vote [aggregation]
+   verify   — draft-verify-revise cycle            [validation]
+```
+
+**Design rationale**: Layer 0/1 form the built-in library — always
+available, no explicit import needed. Layer 2 packages are bundled
+but opt-in via `require()`, analogous to how `tokio` relates to `std`
+in the Rust ecosystem.
+
+
+<!-- algocline_app/index.md -->
+# algocline-app 0.45.0
+
+_This crate has no crate-root documentation._
+
+## Modules
+
+- [`pool`](pool.md): Process-pool IPC layer for `host_mode=true` execution.
+- [`pool::client`](pool__client.md): UDS client for connecting to a pool worker process.
+- [`pool::dispatch`](pool__dispatch.md): Host-mode dispatch helpers.
+- [`pool::error`](pool__error.md): (no module-level documentation)
+- [`pool::protocol`](pool__protocol.md): (no module-level documentation)
+- [`pool::registry`](pool__registry.md): Pool registry: persistent session-to-worker mapping.
+
+
+<!-- algocline_app/pool.md -->
+# algocline-app::pool
+
+Process-pool IPC layer for `host_mode=true` execution.
+
+This module provides the foundation types and dispatch helpers for the
+pool worker protocol:
+
+- [`error`] — [`PoolError`] enum (thiserror-derived)
+- [`protocol`] — [`PoolRequest`] / [`PoolResponse`] wire types (serde JSON line)
+- [`client`] — [`PoolClient`] UDS client (connect + handshake + send_request)
+- [`registry`] — [`PoolRegistry`] persistence + GC (registry.json)
+- [`dispatch`] — worker spawn + UDS proxy orchestration (ST6)
+
+
+<!-- algocline_app/pool__client.md -->
+# algocline-app::pool::client
+
+UDS client for connecting to a pool worker process.
+
+[`PoolClient`] is the MCP-side (AppService-side) handle that opens a Unix
+domain socket connection to a worker subprocess and exchanges
+[`PoolRequest`] / [`PoolResponse`] messages in JSON-line format.
+
+## Types
+
+- `PoolClient` — A thin UDS client for communicating with a pool worker process.
+
+## Constants
+
+- `POOL_PROTOCOL_VERSION` — Version string embedded in every handshake to prevent client/server skew.
+
+
+<!-- algocline_app/pool__dispatch.md -->
+# algocline-app::pool::dispatch
+
+Host-mode dispatch helpers.
+
+Provides [`run_via_pool`] and [`continue_via_pool`] which orchestrate
+worker subprocess spawning, UDS connection, registry persistence, and
+response forwarding.
+
+## Crux invariants enforced here
+
+- (MCP thin proxy IPC boundary): all host_mode=true calls reach a worker
+  subprocess via [`PoolClient`] over a Unix domain socket.  The MCP-internal
+  [`SessionRegistry`] is never touched on this path.
+- (Registry reconnect across restarts): every successful [`run_via_pool`]
+  call persists the session entry to `registry.json` via
+  [`with_registry_lock`] before returning.  A restarted MCP process can
+  rediscover live workers from that file.
+
+## Functions
+
+- `continue_via_pool` — Reconnect to an existing pool worker via its registry entry and forward a
+- `run_via_pool` — Spawn a worker subprocess, connect via UDS, proxy a `Run` request,
+
+
+<!-- algocline_app/pool__error.md -->
+# algocline-app::pool::error
+
+_This module has no module-level documentation._
+
+## Types
+
+- `PoolError` — Errors produced by the process-pool IPC layer.
+
+
+<!-- algocline_app/pool__protocol.md -->
+# algocline-app::pool::protocol
+
+_This module has no module-level documentation._
+
+## Types
+
+- `PoolRequest` — A message sent from the MCP process (pool client) to a pool worker.
+- `PoolResponse` — A message sent from a pool worker back to the pool client.
+- `PoolResponseData` — Data payload carried by a successful [`PoolResponse`].
+
+
+<!-- algocline_app/pool__registry.md -->
+# algocline-app::pool::registry
+
+Pool registry: persistent session-to-worker mapping.
+
+[`PoolRegistry`] tracks live pool worker processes in
+`~/.algocline/state/pool/registry.json`.  The file survives MCP-process
+death so a restarted MCP can rediscover live worker sockets.
+
+## Crux invariant (Registry reconnect across restarts)
+
+`registry.json` is the **persistent source of truth**.  The in-memory
+`PoolRegistry` value is a short-lived view — callers must reload from disk
+after acquiring the advisory lock rather than caching across lock cycles.
+
+## Functions
+
+- `with_registry_lock` — Run `f` while holding an exclusive advisory lock on `lock_path`, using the
+
+## Types
+
+- `PoolRegistry` — In-memory view of `registry.json`.
+- `PoolSessionEntry` — A single session entry in the pool registry.
+
+
+<!-- algocline_core/index.md -->
+# algocline-core 0.45.0
+
+_This crate has no crate-root documentation._
+
+## Modules
+
+- [`domain`](domain.md): Re-exports for domain types.
+- [`execution`](execution.md): Pure execution service layer for `algocline-core`.
+- [`execution::cancel`](execution__cancel.md): Cancellation and failure types for the `ExecutionService` layer.
+- [`execution::error`](execution__error.md): Dedicated error enums for each `ExecutionService` verb.
+- [`execution::pause`](execution__pause.md): Pause-related types for the `ExecutionService` layer.
+- [`execution::progress`](execution__progress.md): Progress observation types for the `ExecutionService` layer.
+- [`execution::resume`](execution__resume.md): Resume-related types for the `ExecutionService` layer.
+- [`execution::service`](execution__service.md): `ExecutionService` trait — the primary verb surface of the new service layer.
+- [`execution::session_id`](execution__session_id.md): Session identifier type for the `ExecutionService` layer.
+- [`execution::spec`](execution__spec.md): Session specification types for the `ExecutionService` layer.
+- [`execution::state`](execution__state.md): Execution state types (v2) for the `ExecutionService` layer.
+- [`metrics`](metrics.md): (no module-level documentation)
+- [`pkg`](pkg.md): Canonical projection of a Lua package's `M.meta` block.
+- [`recent_log`](recent_log.md): (no module-level documentation)
+
+
+<!-- algocline_core/domain.md -->
+# algocline-core::domain
+
+Re-exports for domain types.
+
+This module exists to provide a clean `algocline_core::domain::*` import path.
+All types are also re-exported at the crate root.
+
+
+<!-- algocline_core/execution.md -->
+# algocline-core::execution
+
+Pure execution service layer for `algocline-core`.
+
+This module provides the [`ExecutionService`] trait and all associated value types
+for the new service layer design.  It coexists with the legacy types in
+`crate::state` and `crate::engine_api` without modifying them (parallel evolution).
+
+## Module structure
+
+| Module | Key types |
+|--------|-----------|
+| [`session_id`] | [`SessionId`] |
+| [`spec`] | [`SessionSpec`], [`SpecKind`], [`ScenarioRef`] |
+| [`state`] | [`ExecutionState`] (v2), [`ExecutionStateTag`], [`ExecutionResult`] |
+| [`pause`] | [`PauseInfo`], [`PauseKind`], [`PausePrompt`] |
+| [`resume`] | [`ResumePayload`], [`QueryResponse`], [`ResumeOutcome`], [`TerminalOutcome`] |
+| [`cancel`] | [`CancelReason`], [`CancelCode`], [`CancelInfo`], [`FailureInfo`], [`FailureKind`] |
+| [`progress`] | [`ProgressEvent`], [`ObserverHandle`] |
+| [`error`] | [`SpawnError`], [`StateError`], [`ResumeError`], [`CancelError`], [`ObserveError`], [`AwaitError`], [`ObserverRecvError`] |
+| [`service`] | [`ExecutionService`] |
+
+## Access path
+
+Types in this module are accessed as `algocline_core::execution::Foo`.
+They are **not** re-exported at the top level of `algocline_core` to avoid
+naming conflicts with legacy top-level types (e.g., `QueryResponse`).
+
+
+<!-- algocline_core/execution__cancel.md -->
+# algocline-core::execution::cancel
+
+Cancellation and failure types for the `ExecutionService` layer.
+
+## Types
+
+- `CancelCode` — Categorized cause of a cancellation.
+- `CancelInfo` — Information recorded when a session transitions to `Cancelled`.
+- `CancelReason` — Reason supplied to [`crate::execution::ExecutionService::cancel`].
+- `FailureInfo` — Information recorded when a session transitions to `Failed`.
+- `FailureKind` — Categorized kind of failure.
+
+
+<!-- algocline_core/execution__error.md -->
+# algocline-core::execution::error
+
+Dedicated error enums for each `ExecutionService` verb.
+
+All error types are **closed enums** (no `#[non_exhaustive]`): wire consumers
+must handle every variant, and the adapter layer converts to a string before
+crossing the MCP boundary (design-v1.md §2).
+
+All error types derive `serde::Serialize + serde::Deserialize` so they can be
+embedded in structured JSON responses if needed by callers.
+
+## Types
+
+- `AwaitError` — Error returned by [`crate::execution::ExecutionService::await_terminal`].
+- `CancelError` — Error returned by [`crate::execution::ExecutionService::cancel`].
+- `ObserveError` — Error returned by [`crate::execution::ExecutionService::observe`].
+- `ObserverRecvError` — Error returned by [`crate::execution::ObserverHandle::recv`] and
+- `ResumeError` — Error returned by [`crate::execution::ExecutionService::resume`].
+- `SpawnError` — Error returned by [`crate::execution::ExecutionService::spawn`].
+- `StateError` — Error returned by [`crate::execution::ExecutionService::state`].
+
+
+<!-- algocline_core/execution__pause.md -->
+# algocline-core::execution::pause
+
+Pause-related types for the `ExecutionService` layer.
+
+## Types
+
+- `PauseInfo` — Information about a paused execution session.
+- `PauseKind` — Discriminant indicating whether a pause expects a single or batch response.
+- `PausePrompt` — A single pending LLM prompt within a paused session.
+
+
+<!-- algocline_core/execution__progress.md -->
+# algocline-core::execution::progress
+
+Progress observation types for the `ExecutionService` layer.
+
+## Types
+
+- `ProgressEvent` — An event emitted on the per-session broadcast channel.
+
+## Traits
+
+- `ObserverHandle` — Handle returned by [`crate::execution::ExecutionService::observe`].
+
+
+<!-- algocline_core/execution__resume.md -->
+# algocline-core::execution::resume
+
+Resume-related types for the `ExecutionService` layer.
+
+## Types
+
+- `QueryResponse` — A single LLM response in a [`ResumePayload::Batch`].
+- `ResumeOutcome` — Outcome returned by [`crate::execution::ExecutionService::resume`].
+- `ResumePayload` — Payload supplied to [`crate::execution::ExecutionService::resume`].
+- `TerminalOutcome` — Terminal outcome for a session — carried by [`ResumeOutcome::Terminal`] and
+
+
+<!-- algocline_core/execution__service.md -->
+# algocline-core::execution::service
+
+`ExecutionService` trait — the primary verb surface of the new service layer.
+
+## Traits
+
+- `ExecutionService` — Pure service trait for managing execution sessions.
+
+
+<!-- algocline_core/execution__session_id.md -->
+# algocline-core::execution::session_id
+
+Session identifier type for the `ExecutionService` layer.
+
+## Types
+
+- `SessionId` — Opaque handle that uniquely identifies an execution session across all verb calls.
+
+
+<!-- algocline_core/execution__spec.md -->
+# algocline-core::execution::spec
+
+Session specification types for the `ExecutionService` layer.
+
+## Types
+
+- `ScenarioRef` — Reference to a scenario used in [`SpecKind::Eval`].
+- `SessionSpec` — Complete specification required to spawn a new execution session.
+- `SpecKind` — Discriminant for the execution kind carried by [`SessionSpec`].
+
+
+<!-- algocline_core/execution__state.md -->
+# algocline-core::execution::state
+
+Execution state types (v2) for the `ExecutionService` layer.
+
+This module defines [`ExecutionState`] v2, [`ExecutionStateTag`], and [`ExecutionResult`].
+These types are **distinct** from the legacy `state::ExecutionState` in
+`crates/algocline-core/src/state.rs`; both coexist while the migration to the new
+`ExecutionService` API is in progress.
+
+## Types
+
+- `ExecutionResult` — Payload carried by [`ExecutionState::Done`].
+- `ExecutionState` — Rich execution state used by [`crate::execution::ExecutionService`].
+- `ExecutionStateTag` — Lightweight discriminant for [`ExecutionState`].
+
+
+<!-- algocline_core/metrics.md -->
+# algocline-core::metrics
+
+_This module has no module-level documentation._
+
+## Types
+
+- `ExecutionMetrics` — Measurement data for a single execution.
+- `MetricsObserver` — Updates SessionStatus via the ExecutionObserver trait.
+- `StatsHandle` — Read-only handle exposing auto-counted [`SessionStatus`] metrics to
+
+
+<!-- algocline_core/pkg.md -->
+# algocline-core::pkg
+
+Canonical projection of a Lua package's `M.meta` block.
+
+`PkgEntity` captures the identity portion of an algocline package: the
+fields users rely on to discover, categorize, and version-track a package.
+It is the single source of truth for "what is this package?" and is
+flattened into higher-level records (`IndexEntry`, `SearchResult`,
+`hub_info` responses) so the JSON wire shape stays consistent across the
+Hub, the manifest, and project lockfiles.
+
+## Parsing contract
+
+[`PkgEntity::parse_from_init_lua`] is a non-Lua-VM best-effort parser over
+the `M.meta = { ... }` block of an `init.lua`. It deliberately only
+supports flat key–value pairs with (possibly concatenated) string
+literals; nested tables (e.g. `tags = { ... }`) are skipped via
+brace-depth tracking. When `M.meta.name` is absent or empty the parser
+returns `None` — this is the **inclusion gate** for hub indexing. The
+caller (`build_index` in `algocline-app::service::hub`) is expected to
+drop `None` directories silently so "draft" directories like
+`alc_shapes/` (a type DSL library, not an algocline package) do not
+pollute the hub index.
+
+## Wire format
+
+`Option` fields use `#[serde(default)]` but deliberately do **not** use
+`skip_serializing_if`. A missing field deserializes as `None` and
+serializes back as `null`. This preserves the key-presence guarantee of
+the current `hub_index.json` consumers (Bundled-side doc generation,
+`README.md` package-count scripts) so they do not break on field
+absence.
+
+## Types
+
+- `PkgEntity` — Canonical projection of a Lua package's `M.meta` block.
+- `PkgType` — Package type discriminator: runnable (has `M.run`) or library (API surface only).
+- `TypeSource` — Records how `pkg_type` was determined for a package.
+
+
+<!-- algocline_core/recent_log.md -->
+# algocline-core::recent_log
+
+_This module has no module-level documentation._
+
+## Types
+
+- `LogEntry` — A single log entry captured from a running session.
+- `LogSink` — A shared, bounded ring-buffer sink for [`LogEntry`] items.
+
+## Constants
+
+- `LOG_SINK_CAP` — Maximum number of entries retained in a [`LogSink`].
+
+
+<!-- algocline_engine/index.md -->
+# algocline-engine 0.45.0
+
+_This crate has no crate-root documentation._
+
+## Modules
+
+- [`bridge`](bridge.md): Layer 0: Runtime Primitives
+- [`card`](card.md): Card storage — immutable run-result snapshots.
+- [`execution`](execution.md): `algocline-engine::execution` — v2 execution module.
+- [`session`](session.md): Session-based Lua execution with pause/resume on alc.llm() calls.
+- [`state`](state.md): Persistent key-value state backed by JSON files.
+
+
+<!-- algocline_engine/bridge.md -->
+# algocline-engine::bridge
+
+Layer 0: Runtime Primitives
+
+Registers Rust-backed functions into the `alc.*` Lua namespace.
+These provide capabilities that cannot be expressed in Pure Lua:
+I/O (state), serialization (json), host communication (llm),
+and text processing (chunk).
+
+All functions registered here are available in every Lua session
+without explicit `require()`.
+
+## Functions
+
+- `install_for_pkg_test` — Install the production `alc.*` primitive surface plus the mock layer
+- `register` — Register all Layer 0 runtime primitives onto the given table.
+
+## Types
+
+- `BridgeConfig` — All handles needed by Layer 0 runtime primitives.
+
+## Constants
+
+- `PRELUDE` — Layer 1 prelude (also used by fork to setup child VMs).
+
+
+<!-- algocline_engine/card.md -->
+# algocline-engine::card
+
+Card storage — immutable run-result snapshots.
+
+A Card is a frozen record of a strategy run: identity, parameters,
+model, scenario, aggregate stats, and (optionally) per-case detail.
+Cards are **immutable** — once written they are never modified, only
+annotated via additive `append`.  Mutable **aliases** point to a
+Card and can be rebound freely.
+
+## Design principles
+
+1. **Minimal REQUIRED, maximal OPTIONAL** — v0 needs only 4 fields;
+   lightweight "ran this pkg" records and heavy optimize snapshots
+   share the same schema.
+2. **Immutable append-only** — no overwrite, no delete.  New data is
+   added via `append` (new top-level keys only) or by creating a new
+   Card with a fresh `card_id`.
+3. **Two-tier storage** — TOML for human-readable aggregate, JSONL
+   sidecar for machine-parseable per-case detail.
+4. **File-primary** — files are the source of truth; in-memory state
+   is cache.  Cards can be copied, diffed, and version-controlled.
+
+## Storage layout (two-tier)
+
+| Tier | File | Content |
+|------|------|---------|
+| **Tier 1** | `~/.algocline/cards/{pkg}/{card_id}.toml` | Aggregate scalars, decisions, identity, params |
+| **Tier 2** | `~/.algocline/cards/{pkg}/{card_id}.samples.jsonl` | Per-case raw data (JSONL, write-once) |
+
+Tier 1 holds a shareable summary (a few KB). Tier 2 holds per-case
+detail ��� the engine does not interpret its columns; packages define
+their own schema.
+
+Alias table: `~/.algocline/cards/_aliases.toml` (global).
+
+## card_id naming
+
+`{pkg}_{model_short}_{compact_ts}_{hash6}`
+
+- `compact_ts`: `YYYYMMDDTHHMMSS` in UTC
+- `hash6`: first 6 hex chars of DJB2 param fingerprint
+- Example: `cot_opus46_20260412T061500_a3f9c1`
+
+## v0 schema (frozen)
+
+### REQUIRED (minimum valid Card)
+
+| Field | Type | Example |
+|-------|------|---------|
+| `schema_version` | string | `"card/v0"` |
+| `card_id` | string | `"cot_opus46_20260412T061500_a3f9c1"` |
+| `created_at` | string (RFC 3339) | `"2026-04-12T06:15:00Z"` |
+| `[pkg].name` | string | `"cot"` |
+
+### OPTIONAL (auto-injected where possible)
+
+| Section | Fields |
+|---------|--------|
+| `[pkg]` | `version`, `category`, `source`, `source_ref`, `source_sha` |
+| `[runtime]` | `alc_version`, `lua_version`, `host_os`, `git_sha` |
+| `[model]` | `provider`, `id`, `id_short`, `cutoff` |
+| `[params]` | Free-form ctx snapshot; `param_fingerprint` for DJB2 hash |
+| `[strategy_params]` | Strategy-tunable parameters surfaced for sweeps / optimizers (e.g. `alpha`, `temperature`, `depth`). Free-form, but `where`-queryable as a first-class section |
+| `[scenario]` | `name`, `source`, `case_count`, `grader` |
+| `[stats]` | `pass_rate`, `mean_score`, `std`, `median`, `min`, `max`, `n` |
+| `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |
+| `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |
+| `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |
+| `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`) |
+
+## Lua API (`alc.card.*`)
+
+| Function | Description |
+|----------|-------------|
+| `create(table)` | Write new Card (Tier 1). Returns `{ card_id, path }` |
+| `get(card_id)` | Read Card by id. Returns table or nil |
+| `list(filter?)` | List Cards as summaries (newest first) |
+| `find(query?)` | Prisma-style `where` DSL + dotted-path `order_by` + `offset`/`limit` |
+| `append(card_id, fields)` | Additive-only annotation (new keys only) |
+| `alias_set(name, card_id, opts?)` | Pin mutable alias |
+| `alias_list(filter?)` | List aliases |
+| `get_by_alias(name)` | Resolve alias → full Card |
+| `write_samples(card_id, samples)` | Write Tier 2 sidecar (write-once) |
+| `read_samples(card_id, opts?)` | Read Tier 2 with `where` filtering + offset/limit paging |
+| `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |
+
+## Functions
+
+- `alias_list_with_store` — List aliases from `store`, optionally filtered by pkg.
+- `alias_set_with_store` — Bind (or rebind) an alias to a Card in `store`.
+- `aliases_to_json` — (no documentation)
+- `append_with_store` — Append new top-level fields to an existing Card.
+- `card_sink_backfill_with_store` — Backfill one subscriber (`sink` URI) from the primary store.
+- `create_with_store` — Create a new Card backed by `store`.
+- `eval_predicate` — Evaluate a predicate tree against a full Card JSON.
+- `event_bus` — Return the process-wide `CardEventBus` singleton, initializing it
+- `find_with_store` — Filter/sort Cards across the store using the `where` DSL.
+- `get_by_alias_with_store` — Resolve an alias name to its bound Card and return the full Card JSON.
+- `get_with_store` — Read a Card from `store` by id. Returns None if not found.
+- `import_from_dir_with_store` — Import Card files into `store` from `source_dir` under `pkg`.
+- `init_event_bus` — Eagerly initialize the bus. Idempotent and safe to call multiple
+- `lineage_to_json` — Render a LineageResult as JSON for the service layer.
+- `lineage_with_store` — Walk the lineage tree from `q.card_id` in `store`.
+- `list_with_store` — List cards from `store`. `pkg_filter = Some("name")` restricts to that pkg subdir.
+- `parse_order_by` — Parse an order_by JSON value.  Accepts:
+- `parse_where` — Parse a `where` JSON value into a `Predicate`.
+- `publish` — Convenience wrapper: publish through the singleton.
+- `read_samples_with_store` — Read per-case samples from `{card_id}.samples.jsonl`.
+- `subscriber_stats_snapshot` — Public entry point: snapshot of all process-wide subscriber stats.
+- `summaries_to_json` — (no documentation)
+- `validate_name` — (no documentation)
+- `write_samples_with_store` — Write per-case samples to `{card_id}.samples.jsonl` (write-once).
+
+## Types
+
+- `Alias` — (no documentation)
+- `CardEvent` — A Card-level event emitted from the write path.
+- `CardEventBus` — Process-wide fan-out bus. Subscribers are registered once at startup
+- `CardEventKind` — Lightweight discriminant for `CardEvent`. Used as a `HashMap` key in
+- `CmpOp` — Single comparison operator.
+- `Comparison` — One parsed comparison: `path` points at a nested field,
+- `FileCardStore` — File-backed implementation of [`CardStore`].
+- `FileCardSubscriber` — A subscriber that mirrors events to a local directory using the
+- `FindQuery` — Query parameters for `find`.
+- `LastError` — Most recent delivery failure for a single subscriber. Exposed via
+- `LineageDirection` — Walk direction for `lineage`.
+- `LineageEdge` — One edge in the lineage result (child → parent, always).
+- `LineageNode` — One node in the lineage result.
+- `LineageQuery` — Query parameters for `lineage`.
+- `LineageResult` — Full lineage walk result.
+- `OrderKey` — Parsed sort key: path with optional descending flag.
+- `PerSubscriber` — Per-subscriber counter state. Held inside `SubscriberStats` under a
+- `Predicate` — Parsed predicate tree.
+- `RunSection` — Optional `[run]` section carrying strategy execution outcome.
+- `RunStatus` — Status of a strategy run, recorded in the `[run]` section of a Card.
+- `SamplesQuery` — Query parameters for `read_samples`.
+- `SinkBackfillReport` — Result of a [`card_sink_backfill`] run. One row per card the tool
+- `SubscriberHealthRow` — Snapshot row for a single subscriber, serialized directly into the
+- `SubscriberStats` — Process-wide per-subscriber statistics, keyed by subscriber URI
+- `Summary` — Summary row for `alc.card.list()`.
+
+## Traits
+
+- `CardStore` — Storage backend for Cards.
+- `CardSubscriber` — A downstream backend that receives `CardEvent`s in best-effort,
+
+## Constants
+
+- `SCHEMA_VERSION` — (no documentation)
+
+
+<!-- algocline_engine/execution.md -->
+# algocline-engine::execution
+
+`algocline-engine::execution` — v2 execution module.
+
+Provides the engine-level session lifecycle machinery:
+
+- [`SessionRecord`] — per-session ownership bundle (state, broadcast tx,
+  cancellation token, join handle, response senders).
+- [`SessionRegistryV2`] — registry that spawns, tracks, and controls v2
+  sessions (coexists with the legacy `SessionRegistry` in `session.rs`).
+- [`driver_loop`] — background async fn that drives a session to completion,
+  embedding the four cooperative cancellation checkpoints (Crux R2).
+- [`BroadcastObserverHandle`] — concrete [`algocline_core::execution::ObserverHandle`]
+  implementation backed by a `broadcast::Receiver<ProgressEvent>` (Crux R3).
+
+# Design invariants
+
+- **Crux R1**: No `rmcp::*`, `progressToken`, `_meta`, `notifications/*`, or
+  `mcp_`-prefixed identifiers in this module tree.
+- **Crux R2**: Cancellation uses `CancellationToken::cancel()` only;
+  `JoinHandle::abort()` and process-kill paths are absent.
+- **Crux R3**: `observe()` is sync and returns a valid handle even with zero
+  pre-registered observers (sink-free fan-out).
+
+
+<!-- algocline_engine/session.md -->
+# algocline-engine::session
+
+Session-based Lua execution with pause/resume on alc.llm() calls.
+
+Runtime layer: ties Domain (ExecutionState) and Metrics (ExecutionMetrics)
+together with channel-based Lua pause/resume machinery.
+
+## Types
+
+- `ExecutionResult` — Session completion data: terminal state + metrics.
+- `FeedResult` — Result of a session interaction (start or feed).
+- `PendingFilter` — Per-field filter controlling which `LlmQuery` attributes are projected
+- `PromptProjection` — Prompt projection mode — 3 states rather than a bool so that truncation
+- `Session` — A Lua execution session with domain state tracking.
+- `SessionError` — (no documentation)
+- `SessionRegistry` — Manages active sessions.
+
+## Constants
+
+- `DEFAULT_PROMPT_PREVIEW_CHARS` — Default preview length (chars) used when `PendingFilter::preset_preview()`
+
+
+<!-- algocline_engine/state.md -->
+# algocline-engine::state
+
+Persistent key-value state backed by JSON files.
+
+## Architecture
+
+All state operations go through the [`StateStore`] trait, which
+abstracts the storage backend.  The default implementation,
+[`JsonFileStore`], persists each namespace as a JSON file under a
+caller-provided root directory with atomic writes (tmp + rename).
+
+## Tier 1 — Current API
+
+| Operation | Description |
+|-----------|-------------|
+| `get` | Read a value (returns `None` if absent) |
+| `set` | Write a value (upsert) |
+| `delete` | Remove a key (returns whether it existed) |
+| `keys` | List all keys in a namespace |
+| `has` | Check existence (cost is backend-dependent) |
+| `set_nx` | Set-if-not-exists (returns `false` if key already present) |
+| `incr` | Counter increment — single-process atomic (read-modify-write) |
+
+## Tier 2 — Future Extensions (design notes, not yet implemented)
+
+The following operations are planned but **not yet implemented**.
+The trait is designed to accommodate them without breaking changes.
+Review this list when adding a new backend.
+
+- **TTL**: `set(key, value, opts)` with `opts.ttl_secs`, plus
+  `ttl(key) -> Option<Duration>` to query remaining time.  Useful
+  for caching patterns (e.g. Hub index cache, LLM response cache).
+- **Batch**: `mget(keys) -> Vec<Option<Value>>` and
+  `mset(pairs) -> Result<()>`.  Reduces I/O round-trips for
+  file/network backends.
+- **clear**: Flush all keys in a namespace.  OpenResty's
+  `flush_all` equivalent.
+
+## Backend Swappability
+
+Because the engine interacts with state only through the
+[`StateStore`] trait, backends can be swapped without changing Lua
+code.  Planned backends:
+
+- `JsonFileStore` (current, default)
+- In-memory `HashMap` (for tests and short-lived sessions)
+- SQLite (for larger datasets with indexed queries)
+- Redis (for distributed / multi-process scenarios)
+
+## Types
+
+- `JsonFileStore` — JSON-file-backed state store.
+- `ResetReport` — Report returned by [`JsonFileStore::reset_dispatched_with_backup`]
+- `StateError` — Errors returned by the dispatched-layout helpers
+
+## Traits
+
+- `StateStore` — Backend-agnostic key-value state store.
+
+
+<!-- algocline_mcp/index.md -->
+# algocline-mcp 0.45.0
+
+_This crate has no crate-root documentation._
+
+## Modules
+
+- [`progress_forwarder`](progress_forwarder.md): Progress forwarder task for the v2 MCP adapter.
+- [`prompts`](prompts.md): MCP Prompts capability — workflow-trigger prompts.
+- [`req_registry`](req_registry.md): `ReqIdRegistry` — wire-layer adapter exclusive mapping from `RequestId` to [`SessionId`].
+- [`resources`](resources.md): MCP Resources catalog for algocline.
+
+
+<!-- algocline_mcp/progress_forwarder.md -->
+# algocline-mcp::progress_forwarder
+
+Progress forwarder task for the v2 MCP adapter.
+
+Bridges the `ExecutionService` broadcast channel to MCP `ProgressNotification`
+messages.  A forwarder is spawned **only** when `_meta.progressToken` is present
+in the inbound request (Crux: ProgressToken-conditional forwarder spawn).
+
+## Functions
+
+- `spawn_progress_forwarder` — Spawn a background task that forwards execution progress events to the MCP client.
+
+
+<!-- algocline_mcp/prompts.md -->
+# algocline-mcp::prompts
+
+MCP Prompts capability — workflow-trigger prompts.
+
+algocline exposes a small, static set of Prompts that act as user-side
+entry points into Tool-driven workflows. Each Prompt's `messages` body is
+an instruction directed at the host LLM telling it to dispatch one or more
+algocline MCP Tools (e.g. `alc_advice`, `alc_pkg_scaffold`) to complete
+the workflow. See `docs/design/mcp-support.md` for the rationale behind
+this scope (in particular, why per-package 1:1 mapping is not used).
+
+## Types
+
+- `PromptCatalog` — Catalog of workflow-trigger MCP prompts.
+
+
+<!-- algocline_mcp/req_registry.md -->
+# algocline-mcp::req_registry
+
+`ReqIdRegistry` — wire-layer adapter exclusive mapping from `RequestId` to [`SessionId`].
+
+This module is intentionally confined to the `algocline-mcp` adapter crate.
+Service-layer crates (`algocline-core`, `algocline-app`, `algocline-engine`) must never
+import or reference any type from this module; wire concepts must not leak into the
+service layer (Crux: `ReqIdRegistry wire-concept isolation`).
+
+# Lock discipline
+
+Every method acquires an `RwLock` guard, clones or mutates the value, and drops the guard
+before the method returns. No guard is ever held across an `.await` point
+(K-4 clone-then-release pattern; the `tokio::sync::RwLockReadGuard` / `RwLockWriteGuard`
+are `!Send`, so holding one across `.await` in a `tokio::spawn` context would be a
+compile error — this serves as the `test_req_rwlock_no_await_across_lock` compile-time gate).
+
+## Types
+
+- `ReqIdRegistry` — Owns the sole `RequestId` → [`SessionId`] mapping for in-flight MCP requests.
+- `RequestId` — Wire-level request identifier. This is a re-export of rmcp's `NumberOrString` so that
+
+
+<!-- algocline_mcp/resources.md -->
+# algocline-mcp::resources
+
+MCP Resources catalog for algocline.
+
+Implements a `ResourceCatalog` that dispatches `alc://<service>/<path>`
+URIs to the appropriate backing store. Fixed resources (static files) are
+fully implemented here; template dispatch stubs will be filled in by
+Subtask 2.
+
+## Functions
+
+- `build_list_resources_result` — Build a `ListResourcesResult` from the catalog's fixed list.
+- `build_list_templates_result` — Build a `ListResourceTemplatesResult` from the catalog's template list.
+- `err_to_mcp` — Convert an `EngineApi` `Err(String)` to a `McpError`.
+- `extract_template_vars` — Extract all RFC 6570 Level-1 variable names from a URI template string.
+- `parse_uri` — Parse an `alc://<service>/<path>?<query>` URI.
+
+## Types
+
+- `CompletionCandidates` — Candidate result for a `completion/complete` request.
+- `ParsedUri` — Parsed representation of an `alc://` URI.
+- `ResourceCatalog` — Catalog that maps `alc://` URIs to MCP resource responses.
+- `UriParseError` — Errors produced when parsing an `alc://` URI.
+
+## Constants
+
+- `DEFAULT_CARD_SAMPLES_LIMIT` — Default `limit` for `alc://cards/{id}/samples` when `?limit=` is absent.
+- `DEFAULT_LOGS_LIMIT` — Default `limit` for `alc://logs/{session_id}` when `?limit=` is absent.
+- `DEFAULT_LOGS_MAX_CHARS` — Default `max_chars` for `alc://logs/{session_id}` when `?max_chars=` is absent.
+- `MAX_CARD_SAMPLES_LIMIT` — Hard cap for `?limit=` on `alc://cards/{id}/samples`.
+- `MAX_CARD_SAMPLES_OFFSET` — Hard cap for `?offset=` on `alc://cards/{id}/samples`.
+- `MAX_LOGS_LIMIT` — Hard cap for `?limit=` on `alc://logs/{session_id}`.
+- `MAX_LOGS_MAX_CHARS` — Hard cap for `?max_chars=` on `alc://logs/{session_id}`.
+
+
+<!-- algocline_nn/index.md -->
+# algocline-nn 0.45.0
+
+algocline-nn — thin candle wrapper for the `alc.nn` Lua surface.
+
+# Architecture
+
+This crate is the Host(Rust) side of the alc.nn layer boundary. The design
+intent is:
+
+- **Host owns the heavy state**: tensors, the autograd graph, parameters
+  (`candle_nn::VarMap`), optimizer state, and the `GradStore` all live in
+  Rust. Lua never holds a `Var` lifetime — only opaque handles.
+- **Lua owns composition and loops**: model assembly, the training loop, lr
+  schedule, and batching are written in Lua. Rust exposes only thin wraps of
+  individual candle ops; it does not embed loop / schedule / batching logic.
+- **core stays clean**: `algocline-core` never depends on candle or tensor
+  types. This crate is an optional, feature-gated dependency of the engine
+  (`nn` feature, default off) so the default MCP build stays light.
+
+# L1 spike scope
+
+Phase L1 is a spike: it validates the riskiest unknowns (candle link
+interference, GradStore key access, and `mlua::UserData` tensor exposure)
+and lands a minimal primitive. It is not the full op set.
+
+In Step 1 this crate only links `candle-core` (CPU) to confirm there is no
+link interference with the mlua-vendored workspace. Later steps add
+`candle-nn` (VarMap / autograd / optimizer) and the `mlua` UserData surface.
+
+## Modules
+
+- [`arch`](arch.md): Architecture presets for `alc.nn.preset.*`.
+- [`arch::gpt2`](arch__gpt2.md): GPT-2 architecture builder.
+- [`arch::lora`](arch__lora.md): Low-rank adaptation ("LoRA") wrap for a candle-nn `Linear`.
+- [`card`](card.md): Card metadata schema for `alc.nn.card.*`.
+- [`tokenizer`](tokenizer.md): HuggingFace `tokenizers` wrap with first-use download cache.
+- [`train`](train.md): Training-side scaffolding.
+- [`train::ckpt`](train__ckpt.md): Rotating safetensors checkpoint writer.
+- [`train::data`](train__data.md): Dataset iterator abstraction.
+- [`train::loss`](train__loss.md): Loss functions used by the training loop.
+- [`train::scheduler`](train__scheduler.md): Learning-rate schedules for the training loop.
+- [`train::fullft`](train__fullft.md): Full FT training loop.
+
+
+<!-- algocline_nn/arch.md -->
+# algocline-nn::arch
+
+Architecture presets for `alc.nn.preset.*`.
+
+Each preset is a pure function of a config → runnable candle module.
+Phase 1 ships GPT-2 (medium / large) here; TinyLlama (Phase 2) will
+land alongside as `arch::tinyllama` on the same layout.
+
+The Lua bridge in `algocline-engine` (`bridge/nn_card.rs`) builds a
+[`Gpt2Config`] from user opts, then calls [`Gpt2Model::new`] (random
+init) or [`Gpt2Model::from_pretrained`] (HF warm-start; design §12
+Q5) to obtain the model handle.
+
+Weight naming convention follows the reference GPT-2 checkpoints
+(nanoGPT / `openai-community/gpt2*`) so a downloaded safetensors
+bundle can be loaded through [`candle_nn::VarBuilder::from_mmaped_safetensors`]
+with the same variable names used at construction time.
+
+
+<!-- algocline_nn/arch__gpt2.md -->
+# algocline-nn::arch::gpt2
+
+GPT-2 architecture builder.
+
+Implements the two variants shipped in Phase 1 (design §6.1):
+
+- `gpt2-medium` — 24 layers, 16 heads, 1024 dim, 1024 ctx, 50257 vocab
+- `gpt2-large`  — 36 layers, 20 heads, 1280 dim, 1024 ctx, 50257 vocab
+
+Architecture components (nanoGPT / HuggingFace `openai-community/gpt2`
+reference layout):
+
+- `wte` — token embedding (`vocab × dim`)
+- `wpe` — learned positional embedding (`ctx × dim`)
+- `h.<i>.ln_1` / `ln_2` — pre-LayerNorm (dim)
+- `h.<i>.attn.c_attn` — fused Q/K/V projection (`dim → 3·dim`)
+- `h.<i>.attn.c_proj` — attention output projection (`dim → dim`)
+- `h.<i>.mlp.c_fc` / `mlp.c_proj` — 4× expansion MLP with GELU
+- `ln_f` — final LayerNorm (dim)
+- LM head weights are tied to `wte` (shared matrix)
+
+Forward output shape is `[batch, seq, vocab]` per subtask invariant
+#1. Attention uses a causal (lower-triangular) mask.
+
+## Types
+
+- `Gpt2Config` — Immutable configuration for a GPT-2 preset.
+- `Gpt2Model` — GPT-2 forward-only model.
+- `PretrainedError` — Errors from [`Gpt2Model::from_pretrained`].
+
+
+<!-- algocline_nn/arch__lora.md -->
+# algocline-nn::arch::lora
+
+Low-rank adaptation ("LoRA") wrap for a candle-nn `Linear`.
+
+Wraps a frozen base linear layer with two thin trainable matrices
+(`lora_a` shaped `[rank, in_features]`, `lora_b` shaped
+`[out_features, rank]`) and a scaling factor of `alpha / rank`.
+The forward pass computes
+
+```text
+y = base.forward(x) + scaling * (lora_b(lora_a(x)))
+```
+
+The base parameters are held as a `Linear` value (so
+`.weight()` / `.bias()` are still accessible for merge equivalence
+checks) but the caller is expected to keep them out of the
+optimizer's parameter list — only `lora_a` and `lora_b` should be
+trainable during LoRA fine-tuning.
+
+[`LoraLinear::merged_weight`] materialises the equivalent
+`base.weight() + scaling * (lora_b.weight() @ lora_a.weight())`
+matrix so a caller can construct a plain `Linear` that produces
+identical outputs for the same input. This is what the merge-
+equivalence integration test asserts within 1e-4 element-wise.
+
+## Functions
+
+- `max_abs_diff_f32` — Snapshot two tensors as flat f32 vectors and return the maximum
+
+## Types
+
+- `LoraConfig` — LoRA rank + scaling + wrap-target configuration.
+- `LoraLinear` — A `Linear` layer wrapped with a low-rank additive update.
+
+
+<!-- algocline_nn/card.md -->
+# algocline-nn::card
+
+Card metadata schema for `alc.nn.card.*`.
+
+Mirrors the `[metadata.nn]` TOML block written by the engine bridge
+(`bridge/nn_card.rs`) when it assembles the Card create payload.
+Downstream training paths (Full FT / LoRA / Distillation) populate
+`hyperparams` / `metrics` / `lineage` uniformly through this schema.
+
+`hyperparams` and `metrics` are free-form JSON pass-through so trainer
+subtasks can extend without reshaping this crate.
+
+The Card foundation leaves `NnCandleBranch::lora` as `None`. A
+later LoRA follow-up populates it via the [`NnLoraBranch`]
+sub-struct without breaking foundation serialization
+(`skip_serializing_if = "Option::is_none"`).
+
+## Types
+
+- `NnCandleBranch` — Content of `[metadata.nn.candle]`.
+- `NnCardMeta` — Content of `[metadata.nn]`.
+- `NnLineage` — Content of `[metadata.nn.lineage]`.
+- `NnLoraBranch` — Content of `[metadata.nn.candle.lora]`.
+
+
+<!-- algocline_nn/tokenizer.md -->
+# algocline-nn::tokenizer
+
+HuggingFace `tokenizers` wrap with first-use download cache.
+
+Design §6.3 / §12 Q2 policy: the tokenizer artifact (`tokenizer.json`
+in `tokenizers` format) is fetched from the HuggingFace hub on the
+first call and cached to `<cache_dir>/<preset>.json`. Subsequent
+calls read straight from disk with no network access (subtask
+invariant #2).
+
+Preset → HF repo mapping:
+
+| preset  | repo                                    |
+|---------|-----------------------------------------|
+| `gpt2`  | `openai-community/gpt2`                 |
+| `llama` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0`    |
+
+Error handling follows the crate's Service-layer error-propagation
+discipline: every failure surfaces as [`TokenizerError`] rather
+than silently returning an empty result.
+
+## Types
+
+- `HfTokenizer` — Loaded pre-trained tokenizer keyed by preset name.
+- `TokenizerError` — Errors returned by [`HfTokenizer`] APIs.
+
+
+<!-- algocline_nn/train.md -->
+# algocline-nn::train
+
+Training-side scaffolding.
+
+This module owns four building blocks the trainer entry uses:
+
+- [`data`] — streaming batch abstraction (`Dataset` trait + JSONL /
+  Parquet / in-memory implementations).
+- [`loss`] — [`loss::Loss`] trait + [`loss::CrossEntropyLoss`], the
+  default used by Full FT. A distillation follow-up plugs in the
+  same trait.
+- [`scheduler`] — cosine-with-warmup learning-rate schedule.
+- [`ckpt`] — rotating safetensors [`ckpt::CheckpointStore`] and the
+  [`Checkpoint`] record type used by the caller.
+- [`fullft`] — [`fullft::run_full_ft`] entry point: `forward → loss →
+  backward → optimizer step`, with per-step LR from the scheduler
+  and rotating checkpoints from the store.
+
+The Lua bridge only reaches for the top-level re-exports; internal
+callers can still pull individual submodule items when needed.
+
+## Types
+
+- `Checkpoint` — Snapshot of a completed training run.
+
+
+<!-- algocline_nn/train__ckpt.md -->
+# algocline-nn::train::ckpt
+
+Rotating safetensors checkpoint writer.
+
+During Full FT the trainer writes an intermediate checkpoint every
+`ckpt_every` steps and keeps only the most recent `ckpt_keep`
+files on disk. The older files are dropped by modification time
+rather than by step number so a manual `touch` cannot hide the
+trainer's own bookkeeping from `ls -t`.
+
+## Functions
+
+- `checkpoint_from_path` — Build a [`Checkpoint`] record from a save path and per-run metrics.
+
+## Types
+
+- `CheckpointStore` — Rotating checkpoint writer.
+
+
+<!-- algocline_nn/train__data.md -->
+# algocline-nn::train::data
+
+Dataset iterator abstraction.
+
+Design §8.4: `alc.nn.data.jsonl`, `alc.nn.data.parquet`, and
+`alc.nn.data.from_card` all return an opaque handle that the
+trainer follow-up entries consume batch-by-batch. Iteration is Rust-side
+(no per-batch Lua callback) so the trainer stays on the hot path
+without VM cross-calls.
+
+Subtask invariants:
+
+- Batches produce `[batch_size, ctx_len]` `u32` token ids. The last
+  batch may be short (`Batch::is_last == true`).
+- JSONL adapter reads each line as `{ "text": "..." }` (default
+  field name; overridable via [`DatasetOpts::text_field`]) and
+  tokenizes with the caller-supplied [`crate::tokenizer::HfTokenizer`].
+- `from_card` reads Card sample rows via `FileCardStore` (invariant
+  #5); the `algocline-nn` crate does no filesystem access itself.
+  The bridge builds a [`TokenizedDataset`] from the pre-tokenized
+  rows and hands it back to the trainer.
+- Parquet reading is scaffolded (see [`ParquetDataset`]); a later
+  stage picks up the concrete reader implementation. Constructing the
+  handle is legal, `next_batch` returns an error so no silent
+  empty iterator is exposed (Rust exception-free discipline).
+
+## Types
+
+- `Batch` — One training batch.
+- `DatasetError` — Errors surfaced by dataset iterators.
+- `DatasetOpts` — Iterator config shared across dataset kinds.
+- `JsonlDataset` — JSONL-backed dataset.
+- `ParquetDataset` — Parquet-backed dataset (scaffold).
+- `TeacherCardDataset` — In-memory dataset for hard-label distillation.
+- `TokenizedDataset` — In-memory dataset built from a `Vec<Vec<u32>>` of pre-tokenized
+
+## Traits
+
+- `Dataset` — Streaming batch iterator.
+
+
+<!-- algocline_nn/train__loss.md -->
+# algocline-nn::train::loss
+
+Loss functions used by the training loop.
+
+Introduces a small [`Loss`] trait so the loop stays agnostic to the
+specific reduction and can accept plain cross-entropy (Full FT), a
+hard-label distillation variant, or a future KL-soft variant without
+changing the loop signature.
+
+The optional `loss_mask` on `Loss::compute` is what lets a
+distillation caller zero out prompt-region tokens: for Full FT the
+caller passes `None`; distillation passes a per-token 0/1 mask so
+only the response region contributes to the loss.
+
+## Types
+
+- `CrossEntropyLoss` — Standard token-level cross-entropy against a hard target.
+- `HardLabelDistillLoss` — Hard-label distillation loss.
+- `Reduction` — Reduction strategy applied inside a `Loss::compute` call.
+
+## Traits
+
+- `Loss` — Loss function on `[batch, seq, vocab]` logits.
+
+
+<!-- algocline_nn/train__scheduler.md -->
+# algocline-nn::train::scheduler
+
+Learning-rate schedules for the training loop.
+
+Trainers ask for a scheduler once at construction time and then call
+[`Scheduler::lr_at`] each step to get the current learning rate.
+The loop then passes the value through to the optimizer via
+`AdamW::set_learning_rate`.
+
+Two schedules ship today: a plain constant one (useful for tests and
+sanity checks) and a cosine schedule with linear warmup that matches
+the nanoGPT / HF Trainer default. Both live behind the [`Schedule`]
+enum so a config can pick between them via a plain string field.
+
+## Types
+
+- `ScheduleKind` — Which schedule variant the trainer requested.
+- `Scheduler` — Learning-rate schedule state carried across steps.
+
+
+<!-- algocline_nn/train__fullft.md -->
+# algocline-nn::train::fullft
+
+Full FT training loop.
+
+Ties [`crate::arch::gpt2::Gpt2Model`], a [`crate::train::data::Dataset`]
+source, an AdamW optimizer, a learning-rate [`Scheduler`], and a
+rotating [`CheckpointStore`] together into a single
+[`run_full_ft`] entry point.
+
+The loop is intentionally CPU-friendly: the tests build a
+2-layer / 2-head / 16-dim model and overfit a synthetic 4-token
+sequence in ~100 steps. On a real GPU the same code path scales to
+the full 355M / 774M presets without further changes because every
+candle operation used here already dispatches on the device the
+`VarMap` was built with.
+
+## Functions
+
+- `run_distill` — Run a distillation training loop.
+- `run_full_ft` — Run Full FT training and return the final checkpoint record.
+- `run_lora_ft` — Run LoRA fine-tuning and return the final Δ-only checkpoint record.
+
+## Types
+
+- `DistillLossKind` — Which distillation loss the caller wants for [`run_distill`].
+- `DistillSpec` — Distillation-run configuration.
+- `FullFtConfig` — Hyperparameters for [`run_full_ft`].
+- `TrainError` — Errors surfaced by the training loop.
+- `TrainingLease` — One-time guard preventing two Full FT loops from running against
+- `TrainingLeaseGuard` — RAII guard that releases the training lease on drop.
+
+

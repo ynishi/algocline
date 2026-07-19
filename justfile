@@ -263,6 +263,16 @@ check-agent-index:
     fi
     echo "AGENT_INDEX.md OK"
 
+# Generate LLM-facing docs (llms.txt / llms-full.txt) under docs/aidoc/
+[group: 'agent']
+aidoc-gen:
+    cargo aidoc
+
+# CI drift + lint gate (exit 2 on drift, --strict promotes lint warnings to errors)
+[group: 'agent']
+aidoc-check:
+    cargo aidoc --check --strict
+
 # ─── Codegen ────────────────────────────────────────────────────
 
 # Regenerate types/alc_shapes.d.lua from embedded alc_shapes Lua sources

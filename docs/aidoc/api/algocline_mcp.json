@@ -1,0 +1,126 @@
+{
+  "crate": "algocline-mcp",
+  "version": "0.45.0",
+  "items": [
+    {
+      "path": "algocline_mcp::progress_forwarder",
+      "kind": "module",
+      "docs": "Progress forwarder task for the v2 MCP adapter.\n\nBridges the `ExecutionService` broadcast channel to MCP `ProgressNotification`\nmessages.  A forwarder is spawned **only** when `_meta.progressToken` is present\nin the inbound request (Crux: ProgressToken-conditional forwarder spawn)."
+    },
+    {
+      "path": "algocline_mcp::progress_forwarder::spawn_progress_forwarder",
+      "kind": "function",
+      "docs": "Spawn a background task that forwards execution progress events to the MCP client.\n\nThe task runs until the broadcast channel closes (`Err(Closed)`) or the wire\nconnection is broken (`notify_progress` returns `Err`).\n\n`Lagged(n)` events are forwarded as wrapper JSON `{\"kind\":\"lagged\",\"n\":n}` so the\nclient is informed about missed events without dropping subsequent real events.\n\n# Crux invariant\nThis function must **only** be called when `progressToken` is present.  The caller\n(`alc_v2_run`) gates the call on `meta.get_progress_token() == Some(token)`."
+    },
+    {
+      "path": "algocline_mcp::prompts",
+      "kind": "module",
+      "docs": "MCP Prompts capability — workflow-trigger prompts.\n\nalgocline exposes a small, static set of Prompts that act as user-side\nentry points into Tool-driven workflows. Each Prompt's `messages` body is\nan instruction directed at the host LLM telling it to dispatch one or more\nalgocline MCP Tools (e.g. `alc_advice`, `alc_pkg_scaffold`) to complete\nthe workflow. See `docs/design/mcp-support.md` for the rationale behind\nthis scope (in particular, why per-package 1:1 mapping is not used)."
+    },
+    {
+      "path": "algocline_mcp::prompts::PromptCatalog",
+      "kind": "struct",
+      "docs": "Catalog of workflow-trigger MCP prompts.\n\nThe prompt list is static (see `PROMPTS`). `Arc<dyn EngineApi>` and\n`Arc<AppDir>` are retained on the struct for parity with `ResourceCatalog`\nand to support future workflows that may need to enumerate or read engine\nstate at `prompts/get` time."
+    },
+    {
+      "path": "algocline_mcp::req_registry",
+      "kind": "module",
+      "docs": "`ReqIdRegistry` — wire-layer adapter exclusive mapping from `RequestId` to [`SessionId`].\n\nThis module is intentionally confined to the `algocline-mcp` adapter crate.\nService-layer crates (`algocline-core`, `algocline-app`, `algocline-engine`) must never\nimport or reference any type from this module; wire concepts must not leak into the\nservice layer (Crux: `ReqIdRegistry wire-concept isolation`).\n\n# Lock discipline\n\nEvery method acquires an `RwLock` guard, clones or mutates the value, and drops the guard\nbefore the method returns. No guard is ever held across an `.await` point\n(K-4 clone-then-release pattern; the `tokio::sync::RwLockReadGuard` / `RwLockWriteGuard`\nare `!Send`, so holding one across `.await` in a `tokio::spawn` context would be a\ncompile error — this serves as the `test_req_rwlock_no_await_across_lock` compile-time gate)."
+    },
+    {
+      "path": "algocline_mcp::req_registry::ReqIdRegistry",
+      "kind": "struct",
+      "docs": "Owns the sole `RequestId` → [`SessionId`] mapping for in-flight MCP requests.\n\n`AlcService` holds this registry behind an `Arc<ReqIdRegistry>` so that the\n`on_cancelled` handler can reverse-look up the session to cancel without any direct\ntask-kill path outside `ExecutionService`."
+    },
+    {
+      "path": "algocline_mcp::req_registry::RequestId",
+      "kind": "type_alias",
+      "docs": "Wire-level request identifier. This is a re-export of rmcp's `NumberOrString` so that\ncallers within `algocline-mcp` can use `RequestId` without importing rmcp directly."
+    },
+    {
+      "path": "algocline_mcp::resources",
+      "kind": "module",
+      "docs": "MCP Resources catalog for algocline.\n\nImplements a `ResourceCatalog` that dispatches `alc://<service>/<path>`\nURIs to the appropriate backing store. Fixed resources (static files) are\nfully implemented here; template dispatch stubs will be filled in by\nSubtask 2."
+    },
+    {
+      "path": "algocline_mcp::resources::CompletionCandidates",
+      "kind": "struct",
+      "docs": "Candidate result for a `completion/complete` request.\n\nReturned by [`ResourceCatalog::complete_resource_arg`] for use in the\n`CompleteResult.completion` field on the MCP wire."
+    },
+    {
+      "path": "algocline_mcp::resources::DEFAULT_CARD_SAMPLES_LIMIT",
+      "kind": "constant",
+      "docs": "Default `limit` for `alc://cards/{id}/samples` when `?limit=` is absent."
+    },
+    {
+      "path": "algocline_mcp::resources::DEFAULT_LOGS_LIMIT",
+      "kind": "constant",
+      "docs": "Default `limit` for `alc://logs/{session_id}` when `?limit=` is absent."
+    },
+    {
+      "path": "algocline_mcp::resources::DEFAULT_LOGS_MAX_CHARS",
+      "kind": "constant",
+      "docs": "Default `max_chars` for `alc://logs/{session_id}` when `?max_chars=` is absent."
+    },
+    {
+      "path": "algocline_mcp::resources::MAX_CARD_SAMPLES_LIMIT",
+      "kind": "constant",
+      "docs": "Hard cap for `?limit=` on `alc://cards/{id}/samples`."
+    },
+    {
+      "path": "algocline_mcp::resources::MAX_CARD_SAMPLES_OFFSET",
+      "kind": "constant",
+      "docs": "Hard cap for `?offset=` on `alc://cards/{id}/samples`."
+    },
+    {
+      "path": "algocline_mcp::resources::MAX_LOGS_LIMIT",
+      "kind": "constant",
+      "docs": "Hard cap for `?limit=` on `alc://logs/{session_id}`."
+    },
+    {
+      "path": "algocline_mcp::resources::MAX_LOGS_MAX_CHARS",
+      "kind": "constant",
+      "docs": "Hard cap for `?max_chars=` on `alc://logs/{session_id}`."
+    },
+    {
+      "path": "algocline_mcp::resources::ParsedUri",
+      "kind": "struct",
+      "docs": "Parsed representation of an `alc://` URI."
+    },
+    {
+      "path": "algocline_mcp::resources::ResourceCatalog",
+      "kind": "struct",
+      "docs": "Catalog that maps `alc://` URIs to MCP resource responses.\n\nFixed resources (e.g. `alc://types/alc.d.lua`) are backed by on-disk\nfiles under `AppDir::types_dir()`. Template resources are dispatched via\nthe `EngineApi` trait and will be added in Subtask 2."
+    },
+    {
+      "path": "algocline_mcp::resources::UriParseError",
+      "kind": "enum",
+      "docs": "Errors produced when parsing an `alc://` URI."
+    },
+    {
+      "path": "algocline_mcp::resources::build_list_resources_result",
+      "kind": "function",
+      "docs": "Build a `ListResourcesResult` from the catalog's fixed list."
+    },
+    {
+      "path": "algocline_mcp::resources::build_list_templates_result",
+      "kind": "function",
+      "docs": "Build a `ListResourceTemplatesResult` from the catalog's template list."
+    },
+    {
+      "path": "algocline_mcp::resources::err_to_mcp",
+      "kind": "function",
+      "docs": "Convert an `EngineApi` `Err(String)` to a `McpError`."
+    },
+    {
+      "path": "algocline_mcp::resources::extract_template_vars",
+      "kind": "function",
+      "docs": "Extract all RFC 6570 Level-1 variable names from a URI template string.\n\nScans the template for `{var}` patterns (no operator support — only\nLevel-1 simple expansion is used by algocline templates). Variables appear\nin the order they are encountered; duplicates are preserved.\n\n# Arguments\n\n* `template` — a URI template string, e.g. `\"alc://packages/{name}/init.lua\"`.\n\n# Returns\n\nA `Vec<String>` of variable names found between `{` and `}`.\n\n# Examples\n\n`extract_template_vars(\"alc://packages/{name}/init.lua\")` returns `[\"name\"]`.\n`extract_template_vars(\"alc://types/alc.d.lua\")` returns `[]`."
+    },
+    {
+      "path": "algocline_mcp::resources::parse_uri",
+      "kind": "function",
+      "docs": "Parse an `alc://<service>/<path>?<query>` URI.\n\nV1 constraints:\n- Scheme must be exactly `alc://`\n- Service must be one of the known services\n- At least one path segment after the service is required\n- Query values are treated as raw strings (no URL-decoding)"
+    }
+  ]
+}

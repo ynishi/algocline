@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New opt-in `algocline-nn` workspace crate + `alc.nn.*` Lua bridge, gated
+  behind the `nn` feature on `algocline-engine` (default off — the default
+  build does not link candle). Provides a thin candle-based
+  neural-network layer exposing GPT-2 training primitives through
+  `alc.nn.trainer.*`:
+  - `alc.nn.trainer.full_ft` — Full fine-tuning training loop with
+    optimizer / loss / scheduler / checkpoint store abstractions
+  - `alc.nn.trainer.lora` — LoRA wrap + `run_lora_ft` with delta-only
+    checkpoint (`alc_shapes` `Gpt2Model::wrap_lora`), merge-equivalence
+    guarantee (wrapped forward matches merged linear within tolerance)
+  - `alc.nn.trainer.distill` — Hard-label distillation loop with
+    `TeacherCardDataset` teacher adapter
+  - `alc.nn.data.synthetic` — CPU-scale synthetic corpus binding for
+    smoke tests without HuggingFace hub network calls
+  - `alc.nn.card.*` — Card-backed model metadata schema for
+    save / load / register of models, weights, and deltas, with
+    Card load-with-merge for LoRA branches
+  - GPT-2 arch (tiny / medium / large presets), HF tokenizer, and
+    `Dataset` trait for `alc.nn`
+  - `nn-cuda` feature enables candle's CUDA backend on GPU hosts
+    (RunPod A40 / A100). Both `candle-core/cuda` and `candle-nn/cuda`
+    are enabled together as an invariant (see Fixed below).
+  - Lua smoke examples: `nn_full_ft` / `nn_lora` / `nn_distill`.
+    Rust smoke examples: `nn_medium_lora_gpu_smoke` (instrumented with
+    per-step tracing + base-frozen VarMap verify).
+- `cargo aidoc` setup for LLM-facing rustdoc distribution under
+  `docs/aidoc/`. Landed `llms.txt` (5.1 KB summary) + `llms-full.txt`
+  (46 KB full dump) + 52 per-crate / per-module markdown files.
+  `just aidoc-gen` builds artifacts and `just aidoc-check` runs the
+  strict-lint gate (`cargo aidoc --check --strict`, 0 findings after
+  4 crate-root + 4 module rustdoc gap closures on `algocline-app` /
+  `-core` / `-engine` / `-mcp` + `pool::error` / `pool::protocol` /
+  `core::metrics` / `core::recent_log`). Wire into CI going forward.
 - Phase 1-B: added optional `run` field to `alc.card.create` /
   `alc.card.append`, gated by `[setting.card].run` (default false, opt-in
   per session). When the setting is off, calls carrying a `run` field
@@ -98,6 +131,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+
+- `algocline-nn`: route `LayerNorm` through the backward-safe slow path
+  in `crates/algocline-nn/src/arch/gpt2.rs`. `candle-nn` 0.11's fused
+  `LayerNorm::forward` fast path dispatches through `apply_op3_no_bwd`,
+  which yields a tensor with `BackpropOp::none()` — severing the
+  autograd graph at every LayerNorm. Any trainable `Var` upstream of a
+  LayerNorm (i.e. every transformer-block parameter — the tied `wte` LM
+  head is the only exception because it participates only downstream of
+  the final LN) receives no gradient during backward, so full FT and
+  LoRA both silently fail to learn while forward + loss + optimizer.step
+  still run without error. A local `apply_slow_layer_norm` helper
+  routes all three call sites (`Block::ln_1`, `Block::ln_2`,
+  `Gpt2Model::ln_f`) through `candle_nn::ops::layer_norm_slow`, which
+  decomposes the LN into basic ops (`sub` / `sqr` / `sum_keepdim` /
+  `div` / `sqrt` / `mul` / `add`), each of which has a proper backward
+  implementation. Numerical output matches the fast path bit-exactly.
+  Two CPU regression tests
+  (`run_lora_ft_reduces_loss_on_overfit_corpus` /
+  `run_lora_ft_updates_lora_weights` in
+  `crates/algocline-nn/tests/lora_merge_equivalence.rs`) plus GPU A40
+  verify (LoRA 200-step loss reduction, Full-FT 200-step sanity,
+  192-tensor LoRA A/B before/after diff, base-frozen invariant) cover
+  the fix. Tracked upstream as huggingface/candle#3011 (issue) and
+  huggingface/candle#3613 (fix PR); this workaround is a permanent
+  shim as long as the pinned `candle-nn` version predates the upstream
+  fix.
+- `algocline-nn`: propagate `candle-nn/cuda` in the `nn-cuda` feature.
+  The feature previously enabled only `candle-core/cuda`, leaving
+  `candle-nn` without its own cuda feature. `candle-nn` 0.11's
+  `LayerNorm` is a `CustomOp3` whose `cuda_fwd` is
+  `#[cfg(feature = "cuda")]`-gated, so a `candle-core/cuda`-only build
+  still dispatched CustomOp on CPU and failed at runtime with
+  `Candle("no cuda implementation for layer-norm")`. Enable
+  `candle-nn/cuda` in the same feature and keep the feature pair in
+  sync when bumping candle.
 
 ### Security
 

@@ -71,6 +71,22 @@ nn-cuda = [
     "candle-transformers/cuda",
 ]
 
+# Enable candle's Metal backend for inference on Apple silicon (M-series
+# GPU). Same lockstep discipline as `nn-cuda`: candle-core / candle-nn /
+# candle-transformers must be flipped together so a Metal-enabled build
+# has the CustomOp kernels for LayerNorm / RmsNorm / etc. on GPU rather
+# than dispatching to the CPU fallback and failing at forward time.
+#
+# Unlike `nn-cuda` this feature compiles on macOS without an external
+# toolchain (Metal is part of the OS SDK); on non-macOS hosts the
+# feature still builds but the runtime `Device::new_metal(...)` call
+# errors when no Metal device is available.
+nn-metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
+
 # GPU smoke-test example: builds a full-size GPT-2 medium (355M) on
 # CUDA when the `nn-cuda` feature is enabled, otherwise falls back to
 # CPU (usable for compile checks but far too slow for a real run).

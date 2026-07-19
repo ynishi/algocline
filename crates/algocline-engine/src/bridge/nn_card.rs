@@ -760,16 +760,7 @@ fn build_llama_handle(variant: &str, opts: Option<&LuaTable>) -> LuaResult<Llama
         .unwrap_or_else(|| "cpu".to_string());
     let dtype_str = opts
         .and_then(|t| t.get::<Option<String>>("dtype").ok().flatten())
-        .unwrap_or_else(|| {
-            // Match the GPT-2 default matrix: bf16 on CUDA, f32
-            // elsewhere. The `nn-metal` follow-up (GH #9 Layer 3)
-            // extends this with f16 on Metal.
-            if device_str.starts_with("cuda") {
-                "bf16".to_string()
-            } else {
-                "f32".to_string()
-            }
-        });
+        .unwrap_or_else(|| default_dtype_for_device(&device_str).to_string());
     let use_kv_cache = opts
         .and_then(|t| t.get::<Option<bool>>("use_kv_cache").ok().flatten())
         .unwrap_or(true);
@@ -778,12 +769,7 @@ fn build_llama_handle(variant: &str, opts: Option<&LuaTable>) -> LuaResult<Llama
     cfg.dtype = parse_llama_dtype(&dtype_str)?;
     cfg.use_kv_cache = use_kv_cache;
 
-    if matches!(cfg.device, Device::Cpu) && matches!(cfg.dtype, DType::BF16) {
-        return Err(LuaError::external(
-            "alc.nn.preset.llama: bf16 dtype requires a CUDA device (use dtype='f32' on CPU)"
-                .to_string(),
-        ));
-    }
+    guard_device_dtype_matrix("alc.nn.preset.llama", &cfg.device, cfg.dtype)?;
 
     // Weight source: `opts.weights` is either a single string path or
     // a Lua array of strings for a sharded safetensors bundle. Absent
@@ -852,38 +838,11 @@ fn extract_weights_paths(opts: Option<&LuaTable>) -> LuaResult<Option<Vec<PathBu
 }
 
 fn parse_llama_device(s: &str) -> LuaResult<Device> {
-    if s == "cpu" {
-        return Ok(Device::Cpu);
-    }
-    if let Some(rest) = s.strip_prefix("cuda:") {
-        let ord: usize = rest.parse().map_err(|e| {
-            LuaError::external(format!(
-                "alc.nn.preset.llama: invalid cuda ordinal '{rest}': {e}"
-            ))
-        })?;
-        return Device::new_cuda(ord).map_err(|e| {
-            LuaError::external(format!("alc.nn.preset.llama: cuda:{ord} unavailable: {e}"))
-        });
-    }
-    if s == "cuda" {
-        return Device::new_cuda(0).map_err(|e| {
-            LuaError::external(format!("alc.nn.preset.llama: cuda unavailable: {e}"))
-        });
-    }
-    Err(LuaError::external(format!(
-        "alc.nn.preset.llama: unknown device '{s}' (expected 'cpu', 'cuda', or 'cuda:N')"
-    )))
+    parse_device_for("alc.nn.preset.llama", s)
 }
 
 fn parse_llama_dtype(s: &str) -> LuaResult<DType> {
-    match s {
-        "f32" | "fp32" => Ok(DType::F32),
-        "bf16" => Ok(DType::BF16),
-        "f16" | "fp16" => Ok(DType::F16),
-        other => Err(LuaError::external(format!(
-            "alc.nn.preset.llama: unknown dtype '{other}' (expected 'f32', 'bf16', or 'f16')"
-        ))),
-    }
+    parse_dtype_for("alc.nn.preset.llama", s)
 }
 
 fn build_gpt2_handle(
@@ -902,14 +861,7 @@ fn build_gpt2_handle(
         .unwrap_or_else(|| "cpu".to_string());
     let dtype_str = opts
         .and_then(|t| t.get::<Option<String>>("dtype").ok().flatten())
-        .unwrap_or_else(|| {
-            // Design §6.1 default: bf16 on CUDA, f32 on CPU.
-            if device_str.starts_with("cuda") {
-                "bf16".to_string()
-            } else {
-                "f32".to_string()
-            }
-        });
+        .unwrap_or_else(|| default_dtype_for_device(&device_str).to_string());
     let pretrained = opts
         .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
         .unwrap_or(true);
@@ -917,14 +869,7 @@ fn build_gpt2_handle(
     cfg.device = parse_device(&device_str)?;
     cfg.dtype = parse_dtype(&dtype_str)?;
 
-    // Guard the "bf16 on CPU" combo: error early rather than let
-    // candle emit an obscure kernel error downstream.
-    if matches!(cfg.device, Device::Cpu) && matches!(cfg.dtype, DType::BF16) {
-        return Err(LuaError::external(
-            "alc.nn.preset.gpt2: bf16 dtype requires a CUDA device (use dtype='f32' on CPU)"
-                .to_string(),
-        ));
-    }
+    guard_device_dtype_matrix("alc.nn.preset.gpt2", &cfg.device, cfg.dtype)?;
 
     let (model, varmap) = if pretrained {
         let cache_dir = nn_dir.to_path_buf();
@@ -959,36 +904,128 @@ fn build_gpt2_handle(
 }
 
 fn parse_device(s: &str) -> LuaResult<Device> {
+    parse_device_for("alc.nn.preset.gpt2", s)
+}
+
+/// Resolve the default dtype for a caller-provided device string when
+/// the caller does not supply `opts.dtype` explicitly.
+///
+/// Matrix (GH #9 Layer 3):
+///
+/// - `"cuda"` / `"cuda:N"` — `"bf16"` (the design §6.1 GPU default).
+/// - `"metal"` / `"metal:N"` — `"f16"` (Metal has no bf16 kernels;
+///   f16 keeps the same memory footprint benefit).
+/// - Everything else (including unrecognized strings — they will fail
+///   parsing downstream in [`parse_device_for`]) — `"f32"`.
+///
+/// The returned string is fed straight into [`parse_dtype_for`], so
+/// keeping this a `&'static str` avoids an allocation on the common
+/// path.
+fn default_dtype_for_device(device: &str) -> &'static str {
+    if device.starts_with("cuda") {
+        "bf16"
+    } else if device.starts_with("metal") {
+        "f16"
+    } else {
+        "f32"
+    }
+}
+
+fn parse_dtype(s: &str) -> LuaResult<DType> {
+    parse_dtype_for("alc.nn.preset.gpt2", s)
+}
+
+/// Shared device string parser used by both `alc.nn.preset.gpt2` and
+/// `alc.nn.preset.llama`. `preset` is the caller-facing tag used in
+/// error messages so a Lua-side error still points at the right
+/// preset call site.
+///
+/// Accepted device strings (GH #9 Layer 3 dtype / device matrix):
+///
+/// - `"cpu"` — always available.
+/// - `"cuda"` / `"cuda:N"` — enabled only in a `--features nn-cuda`
+///   build; the runtime `Device::new_cuda(...)` call errors otherwise.
+/// - `"metal"` / `"metal:N"` — enabled only in a `--features nn-metal`
+///   build; the runtime `Device::new_metal(...)` call errors otherwise.
+fn parse_device_for(preset: &str, s: &str) -> LuaResult<Device> {
     if s == "cpu" {
         return Ok(Device::Cpu);
     }
     if let Some(rest) = s.strip_prefix("cuda:") {
         let ord: usize = rest.parse().map_err(|e| {
-            LuaError::external(format!(
-                "alc.nn.preset.gpt2: invalid cuda ordinal '{rest}': {e}"
-            ))
+            LuaError::external(format!("{preset}: invalid cuda ordinal '{rest}': {e}"))
         })?;
-        return Device::new_cuda(ord).map_err(|e| {
-            LuaError::external(format!("alc.nn.preset.gpt2: cuda:{ord} unavailable: {e}"))
-        });
+        return Device::new_cuda(ord)
+            .map_err(|e| LuaError::external(format!("{preset}: cuda:{ord} unavailable: {e}")));
     }
     if s == "cuda" {
         return Device::new_cuda(0)
-            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: cuda unavailable: {e}")));
+            .map_err(|e| LuaError::external(format!("{preset}: cuda unavailable: {e}")));
+    }
+    if let Some(rest) = s.strip_prefix("metal:") {
+        let ord: usize = rest.parse().map_err(|e| {
+            LuaError::external(format!("{preset}: invalid metal ordinal '{rest}': {e}"))
+        })?;
+        return Device::new_metal(ord)
+            .map_err(|e| LuaError::external(format!("{preset}: metal:{ord} unavailable: {e}")));
+    }
+    if s == "metal" {
+        return Device::new_metal(0)
+            .map_err(|e| LuaError::external(format!("{preset}: metal unavailable: {e}")));
     }
     Err(LuaError::external(format!(
-        "alc.nn.preset.gpt2: unknown device '{s}' (expected 'cpu', 'cuda', or 'cuda:N')"
+        "{preset}: unknown device '{s}' (expected 'cpu', 'cuda', 'cuda:N', 'metal', or 'metal:N')"
     )))
 }
 
-fn parse_dtype(s: &str) -> LuaResult<DType> {
+/// Shared dtype string parser. See [`parse_device_for`] for the sibling
+/// dtype / device matrix rationale. Downstream device / dtype
+/// combinability is validated by [`guard_device_dtype_matrix`].
+fn parse_dtype_for(preset: &str, s: &str) -> LuaResult<DType> {
     match s {
         "f32" | "fp32" => Ok(DType::F32),
         "bf16" => Ok(DType::BF16),
         "f16" | "fp16" => Ok(DType::F16),
         other => Err(LuaError::external(format!(
-            "alc.nn.preset.gpt2: unknown dtype '{other}' (expected 'f32', 'bf16', or 'f16')"
+            "{preset}: unknown dtype '{other}' (expected 'f32', 'bf16', or 'f16')"
         ))),
+    }
+}
+
+/// Validate a resolved (device, dtype) pair against candle 0.11's
+/// backend support matrix. Called by both `alc.nn.preset.gpt2` and
+/// `alc.nn.preset.llama` so the two presets have identical failure
+/// modes for unsupported combinations.
+///
+/// Matrix (GH #9 Layer 3):
+///
+/// | device | f32 | bf16 | f16 |
+/// |--------|-----|------|-----|
+/// | CPU    | ok  | ERR  | ok  |
+/// | CUDA   | ok  | ok   | ok  |
+/// | Metal  | ok  | ERR  | ok  |
+///
+/// `bf16` is rejected up front on CPU and Metal because candle-nn 0.11
+/// only ships bf16 kernels for the CUDA backend; the CPU / Metal
+/// fallback would otherwise fail deep inside a forward pass with an
+/// opaque kernel-not-found error. Every other combination is passed
+/// through to candle — if a specific kernel is unimplemented for the
+/// chosen shape (rare in the shipping presets) the caller still gets a
+/// candle-side error surfaced by the preset's `map_err`.
+fn guard_device_dtype_matrix(preset: &str, device: &Device, dtype: DType) -> LuaResult<()> {
+    if dtype != DType::BF16 {
+        return Ok(());
+    }
+    match device {
+        Device::Cpu => Err(LuaError::external(format!(
+            "{preset}: bf16 dtype requires a CUDA device (use dtype='f32' on CPU, \
+             or dtype='f16' on Metal)"
+        ))),
+        Device::Metal(_) => Err(LuaError::external(format!(
+            "{preset}: bf16 dtype is not supported on Metal (use dtype='f16' or 'f32' on Metal, \
+             or move to CUDA for bf16)"
+        ))),
+        _ => Ok(()),
     }
 }
 

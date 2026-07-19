@@ -52,6 +52,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     documenting variants, opts, methods, and the "wrap the handle in
     a Lua closure + `alc.nn.register`" recipe for exposing the model
     through `alc.llm(prompt, {role="nn", model=name})`.
+- `algocline-nn`: `nn-metal` cargo feature + device / dtype matrix
+  expansion (Layer 3 of GH #9).
+  - New `nn-metal = ["candle-core/metal", "candle-nn/metal",
+    "candle-transformers/metal"]` feature enables candle's Metal
+    backend in lockstep across the three candle crates (same
+    P3-pitfall discipline as `nn-cuda`). Compiles on macOS without an
+    external toolchain; on non-macOS hosts the feature still builds
+    but the runtime `Device::new_metal(...)` call errors when no
+    Metal device is present.
+  - `alc.nn.preset.{gpt2,llama}` device string now accepts `"metal"`
+    and `"metal:N"` alongside `"cpu"` / `"cuda"` / `"cuda:N"`. The
+    device / dtype default when the caller omits `opts.dtype` picks
+    `"bf16"` on CUDA, `"f16"` on Metal, and `"f32"` elsewhere.
+  - The bf16 pre-flight guard now spans both CPU and Metal: candle-nn
+    0.11 only ships bf16 kernels for the CUDA backend, so a
+    `dtype = "bf16"` call on Metal errors up front with a clear
+    "use dtype='f16' or move to CUDA" message rather than failing
+    deep inside a forward pass. The GPT-2 / Llama presets share the
+    guard through the new `guard_device_dtype_matrix` helper so the
+    two paths keep identical failure modes.
+  - Bridge-layer `parse_device` / `parse_dtype` were refactored into
+    preset-tagged `parse_device_for` / `parse_dtype_for` /
+    `default_dtype_for_device` helpers so both presets consume the
+    same allowlist. No caller-visible behaviour change on the pre-
+    existing `"cpu"` / `"cuda"` / `"cuda:N"` paths.
+  - Smoke tests: `alc_nn_preset_llama_{metal_device_string_is_recognised,
+    bf16_on_metal_errors}` on `nn_bridge_smoke.rs` — 2 new tests, all
+    green.
+  - `docs/lua-stdlib.md` `alc.nn.preset.llama` section updated with
+    the new device string list, dtype defaults, and the bf16 / Metal
+    error path.
 
 ### Changed
 

@@ -700,10 +700,15 @@ Build an inference-only Llama-family handle by wrapping
 
 **opts fields (all optional):**
 
-- `device` — `"cpu"` / `"cuda"` / `"cuda:N"`. Default: `"cpu"`. The
-  `nn-metal` follow-up (GH #9 Layer 3) adds `"metal"`.
+- `device` — `"cpu"` / `"cuda"` / `"cuda:N"` / `"metal"` / `"metal:N"`.
+  Default: `"cpu"`. `"cuda"` requires a `--features nn-cuda` build;
+  `"metal"` requires a `--features nn-metal` build (available on
+  macOS). Unrecognised strings error with the full accepted list.
 - `dtype` — `"f32"` / `"bf16"` / `"f16"`. Default: `"bf16"` on CUDA,
-  `"f32"` elsewhere. `bf16` on CPU errors up front.
+  `"f16"` on Metal, `"f32"` elsewhere. The device / dtype matrix is
+  `f32` on any device, `bf16` on CUDA only, `f16` on CUDA / Metal /
+  CPU (but CPU `f16` is slow). `bf16` on CPU or Metal errors up
+  front with a message that points at the working combination.
 - `weights` — a single safetensors path or an array of paths for a
   sharded bundle. Absent → random VarMap-backed handle (only useful
   for the `"tiny"` variant's shape assertions; production callers must

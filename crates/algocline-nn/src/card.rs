@@ -112,9 +112,13 @@ pub struct NnCandleBranch {
 
 /// Content of `[metadata.nn.candle.lora]`.
 ///
-/// Present only when `training_path == "lora"`. The LoRA follow-up
-/// populates all three fields; the Card foundation does not
-/// construct this struct.
+/// Present only when `training_path == "lora"`. `rank` / `alpha` /
+/// `base_bundle_ref` are always populated by the trainer; the extra
+/// `target_modules` / `dropout` / `delta_path` fields carry defaults
+/// for backwards compatibility with cards written before ST-d landed
+/// (a foundation-era card without these fields still deserializes,
+/// but `alc.nn.card.load_gpt2` errors when `delta_path` is missing —
+/// the load path cannot locate the delta without it).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NnLoraBranch {
     /// Low-rank decomposition rank (typical: 8 / 16 / 32).
@@ -127,6 +131,47 @@ pub struct NnLoraBranch {
     /// Bundle reference for the frozen base model
     /// (e.g. `"nn/base-gpt2-medium"`).
     pub base_bundle_ref: String,
+
+    /// LoRA target modules (subset of
+    /// `["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"]`).
+    /// Recorded so the load-with-merge path can rebuild the same
+    /// `LoraConfig` that produced the delta and wrap the base model
+    /// identically.
+    #[serde(default = "default_target_modules")]
+    pub target_modules: Vec<String>,
+
+    /// LoRA dropout probability applied during training. Currently
+    /// held for provenance only — the shipped [`crate::arch::LoraLinear`]
+    /// forward does not apply dropout at inference; the field is
+    /// preserved so a future dropout-at-train-only variant can be
+    /// distinguished from cards trained without it.
+    #[serde(default)]
+    pub dropout: f32,
+
+    /// Absolute path of the delta safetensors file emitted by
+    /// [`crate::train::run_lora_ft`] at
+    /// `<ckpt_dir>/nn/lora-<ckpt_prefix>.safetensors`. Recorded so
+    /// `alc.nn.card.load_gpt2` can locate the delta without knowing
+    /// the caller's `ckpt_dir` / `ckpt_prefix` conventions.
+    ///
+    /// Absent for hand-authored cards; the load path errors loudly
+    /// when a lora card lacks `delta_path` rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_path: Option<String>,
+}
+
+/// Default target modules when a LoRA card was written before ST-d
+/// added the field. Matches
+/// [`crate::arch::LoraConfig::default_targets`].
+fn default_target_modules() -> Vec<String> {
+    vec![
+        "q_proj".into(),
+        "k_proj".into(),
+        "v_proj".into(),
+        "o_proj".into(),
+        "up".into(),
+        "down".into(),
+    ]
 }
 
 /// Default value for `hyperparams` / `metrics` — an empty JSON object.
@@ -193,6 +238,11 @@ mod tests {
                     rank: 16,
                     alpha: 32,
                     base_bundle_ref: "nn/base-gpt2-medium".into(),
+                    target_modules: default_target_modules(),
+                    dropout: 0.0,
+                    delta_path: Some(
+                        "/var/algocline/nn/ckpt/nn/lora-student-lora.safetensors".into(),
+                    ),
                 }),
             }),
         };
@@ -205,6 +255,56 @@ mod tests {
         assert_eq!(
             lora.get("base_bundle_ref"),
             Some(&serde_json::json!("nn/base-gpt2-medium"))
+        );
+        // Post-ST-d extension: target_modules + dropout serialize
+        // alongside the trio.
+        assert_eq!(
+            lora.get("target_modules"),
+            Some(&serde_json::json!(default_target_modules()))
+        );
+        assert_eq!(lora.get("dropout"), Some(&serde_json::json!(0.0)));
+        assert_eq!(
+            lora.get("delta_path"),
+            Some(&serde_json::json!(
+                "/var/algocline/nn/ckpt/nn/lora-student-lora.safetensors"
+            ))
+        );
+    }
+
+    /// A pre-ST-d card (only `rank` / `alpha` / `base_bundle_ref` in
+    /// the lora sub-table) must still deserialize. `target_modules`
+    /// falls back to the canonical six, `dropout` to 0.0, and
+    /// `delta_path` to `None` — the load path then errors when it
+    /// tries to locate the delta.
+    #[test]
+    fn deserialize_backwards_compat_lora_without_new_fields() {
+        let legacy = serde_json::json!({
+            "name": "legacy-lora",
+            "backend": "candle",
+            "architecture": "gpt2-medium",
+            "training_path": "lora",
+            "candle": {
+                "bundle_ref": "nn/legacy-lora",
+                "lora": {
+                    "rank": 8,
+                    "alpha": 16,
+                    "base_bundle_ref": "nn/base-gpt2-medium",
+                }
+            }
+        });
+        let meta: NnCardMeta = serde_json::from_value(legacy).expect("legacy lora deserialize");
+        let lora = meta
+            .candle
+            .as_ref()
+            .and_then(|c| c.lora.as_ref())
+            .expect("lora branch present");
+        assert_eq!(lora.rank, 8);
+        assert_eq!(lora.alpha, 16);
+        assert_eq!(lora.target_modules, default_target_modules());
+        assert_eq!(lora.dropout, 0.0);
+        assert!(
+            lora.delta_path.is_none(),
+            "delta_path defaults to None for pre-ST-d cards"
         );
     }
 

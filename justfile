@@ -7,33 +7,33 @@ _default:
 # ─── Check ──────────────────────────────────────────────────────
 
 # Run all checks (fmt, clippy, test, V0 invariants) — CI equivalent
-[group: 'agent']
+[group('allow-agent')]
 ci: fmt-check lua-fmt-check clippy test check-invariants check-agent-index
 
 # Lint with clippy (warnings = errors)
-[group: 'agent']
+[group('allow-agent')]
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Check formatting (Rust)
-[group: 'agent']
+[group('allow-agent')]
 fmt-check:
     cargo fmt --all -- --check
 
 # Check formatting (Lua, stylua)
-[group: 'agent']
+[group('allow-agent')]
 lua-fmt-check:
     stylua --check .
 
 # ─── Build ──────────────────────────────────────────────────────
 
 # Type-check without codegen
-[group: 'agent']
+[group('allow-agent')]
 check:
     cargo check --workspace --all-targets
 
 # Build release binary
-[group: 'agent']
+[group('allow-agent')]
 build:
     cargo build --release
 
@@ -44,17 +44,17 @@ install:
 # ─── Test ───────────────────────────────────────────────────────
 
 # Run all tests
-[group: 'agent']
+[group('allow-agent')]
 test:
     cargo test --workspace
 
 # Run tests matching a pattern
-[group: 'agent']
+[group('allow-agent')]
 filter PATTERN:
     cargo test --workspace -- {{PATTERN}}
 
 # Run e2e tests only
-[group: 'agent']
+[group('allow-agent')]
 e2e:
     cargo test --test e2e
 
@@ -62,7 +62,7 @@ e2e:
 # smoke). `just test` does NOT cover nn_bridge_smoke because it lives behind
 # `--features nn`; this recipe closes that gap so nn work can be verified with
 # one command.
-[group: 'agent']
+[group('allow-agent')]
 test-nn:
     cargo test -p algocline-nn
     cargo test -p algocline-engine --features nn --test nn_bridge_smoke
@@ -70,7 +70,7 @@ test-nn:
 # Install locally with the `nn` feature enabled (alc.nn Lua surface + candle).
 # Same overwrite target as `just install` (~/.cargo/bin/alc); the default
 # `just install` builds without nn to keep the MCP binary light.
-[group: 'agent']
+[group('allow-agent')]
 install-nn:
     cargo install --path . --features nn
 
@@ -81,12 +81,12 @@ snapshots:
 # ─── Format ─────────────────────────────────────────────────────
 
 # Auto-format all code (Rust)
-[group: 'agent']
+[group('allow-agent')]
 fmt:
     cargo fmt --all
 
 # Auto-format Lua code (stylua)
-[group: 'agent']
+[group('allow-agent')]
 lua-fmt:
     stylua .
 
@@ -113,7 +113,7 @@ ready:
 #          calls live outside `service/manifest.rs` (the `FsInstalledManifestStore`
 #          impl block is the single source). Added in Subtask 3b together
 #          with the `InstalledManifestStore` trait extraction (Subtask 3a).
-[group: 'agent']
+[group('allow-agent')]
 check-invariants:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -223,7 +223,7 @@ publish VERSION:
 
 # Verify docs/AGENT_INDEX.md: all linked paths exist + all docs/*.md are
 # referenced (except AGENT_INDEX.md itself).
-[group: 'agent']
+[group('allow-agent')]
 check-agent-index:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -264,12 +264,12 @@ check-agent-index:
     echo "AGENT_INDEX.md OK"
 
 # Generate LLM-facing docs (llms.txt / llms-full.txt) under docs/aidoc/
-[group: 'agent']
+[group('allow-agent')]
 aidoc-gen:
     cargo aidoc
 
 # CI drift + lint gate (exit 2 on drift, --strict promotes lint warnings to errors)
-[group: 'agent']
+[group('allow-agent')]
 aidoc-check:
     cargo aidoc --check --strict
 

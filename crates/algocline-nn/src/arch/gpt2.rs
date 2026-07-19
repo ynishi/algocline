@@ -108,6 +108,40 @@ fn wrap_variant_in_place(
 const KNOWN_TARGET_MODULES: [&str; 6] =
     ["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"];
 
+/// LayerNorm forward that always uses the backward-safe basic-op path
+/// (`layer_norm_slow`).
+///
+/// Rationale: candle-nn 0.11's `LayerNorm::forward` fast path calls
+/// `crate::ops::layer_norm`, a `CustomOp3` registered via
+/// `apply_op3_no_bwd`. That path yields a tensor with
+/// `BackpropOp::none()`, which **severs the autograd graph** at every
+/// LayerNorm: any parameter upstream of a LayerNorm (i.e. every
+/// transformer-block Var — the tied `wte` LM head is the only exception
+/// because it participates only downstream of the final LN) receives no
+/// gradient, so full FT and LoRA both silently fail to learn while
+/// forward + loss + optimizer.step still run without error.
+/// See <https://github.com/huggingface/candle/blob/candle-nn-v0.11.0/candle-nn/src/ops.rs>
+/// `apply_op3_no_bwd`.
+///
+/// The slow path (`layer_norm_slow`) computes the same numerical result
+/// via `sub` / `sqr` / `sum_keepdim` / `div` / `sqrt` / `mul` / `add`,
+/// each of which has a proper backward implementation, keeping the
+/// gradient chain intact from loss back to every trainable Var.
+///
+/// The affine parameters (`weight`, `bias`) are supplied by the caller
+/// via `ln.weight()` / `ln.bias()`; only the `remove_mean = true` case
+/// with `bias.is_some()` is exercised in this crate today, matching the
+/// GPT-2 LayerNorm topology. A None-bias fallback (RmsNorm-style) is
+/// out of scope until a caller needs it.
+fn apply_slow_layer_norm(ln: &LayerNorm, x: &Tensor) -> CandleResult<Tensor> {
+    let bias = ln.bias().ok_or_else(|| {
+        candle_core::Error::Msg(
+            "apply_slow_layer_norm: LayerNorm without bias is not supported yet".into(),
+        )
+    })?;
+    candle_nn::ops::layer_norm_slow(x, ln.weight(), bias, ln.eps() as f32)
+}
+
 /// Immutable configuration for a GPT-2 preset.
 #[derive(Debug, Clone)]
 pub struct Gpt2Config {
@@ -328,10 +362,10 @@ impl Block {
     }
 
     fn forward(&self, x: &Tensor, mask: &Tensor) -> CandleResult<Tensor> {
-        let n = self.ln_1.forward(x)?;
+        let n = apply_slow_layer_norm(&self.ln_1, x)?;
         let a = self.attention(&n, mask)?;
         let x = (x + a)?;
-        let n = self.ln_2.forward(&x)?;
+        let n = apply_slow_layer_norm(&self.ln_2, &x)?;
         let m = self.mlp(&n)?;
         x + m
     }
@@ -472,8 +506,8 @@ impl Gpt2Model {
         for block in &self.blocks {
             h = block.forward(&h, &self.causal_mask)?;
         }
-        let h = self.ln_f.forward(&h)?; // [B, T, D]
-                                        // Tied LM head: logits = h @ wte.weight^T.
+        let h = apply_slow_layer_norm(&self.ln_f, &h)?; // [B, T, D]
+                                                        // Tied LM head: logits = h @ wte.weight^T.
         let w = self.wte.embeddings(); // [V, D]
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);

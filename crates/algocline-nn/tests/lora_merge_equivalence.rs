@@ -22,8 +22,8 @@
 
 use algocline_nn::arch::{max_abs_diff_f32, Gpt2Config, Gpt2Model, LoraConfig, LoraLinear};
 use algocline_nn::train::{
-    run_lora_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, ScheduleKind, TokenizedDataset,
-    TrainingLease,
+    run_full_ft, run_lora_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, Loss, ScheduleKind,
+    TokenizedDataset, TrainingLease,
 };
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, VarMap};
@@ -228,6 +228,229 @@ fn run_lora_ft_leaves_base_weights_bit_identical() {
             "base var index {idx} drifted through run_lora_ft"
         );
     }
+}
+
+/// Learning invariant #2 (LoRA loss reduction):
+/// [`run_lora_ft`] must reduce loss on an overfit corpus. Mirrors
+/// [`crate::train::run_full_ft`]'s `tiny_overfit_reduces_loss` so the
+/// LoRA path is covered by the same shape of evidence: baseline loss
+/// captured *before* wrap+train, then `min_train_loss` from the
+/// returned [`Checkpoint`] must fall to `< 0.7 * baseline`.
+///
+/// A "form runs, learning zero" bug would leave `min_train_loss` at
+/// baseline (no update path through the LoRA legs). This test catches
+/// exactly that failure mode.
+#[test]
+fn run_lora_ft_reduces_loss_on_overfit_corpus() {
+    let cfg = Gpt2Config {
+        layers: 2,
+        heads: 2,
+        dim: 16,
+        ctx: 8,
+        vocab: 32,
+        dtype: DType::F32,
+        device: Device::Cpu,
+        eps: 1e-5,
+    };
+    let base_vm = VarMap::new();
+    let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+    let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+
+    // Baseline: forward loss on the exact input the training loop will
+    // see, captured BEFORE wrap_lora + training.
+    let row: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let loss_fn = CrossEntropyLoss::new();
+    let baseline = {
+        let inputs = Tensor::from_vec(row.clone(), (1, 8), &cfg.device)
+            .unwrap()
+            .narrow(1, 0, 7)
+            .unwrap()
+            .to_dtype(DType::U32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let targets = Tensor::from_vec(row.clone(), (1, 8), &cfg.device)
+            .unwrap()
+            .narrow(1, 1, 7)
+            .unwrap()
+            .to_dtype(DType::U32)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let logits = model.forward(&inputs).unwrap();
+        loss_fn
+            .compute(&logits, &targets, None)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    };
+
+    let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| row.clone()).take(400).collect();
+    let mut ds = TokenizedDataset::new(
+        rows,
+        DatasetOpts {
+            batch_size: 1,
+            ctx_len: 8,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        },
+    );
+    let lora_cfg = LoraConfig::new(4, 8.0);
+    let train_cfg = FullFtConfig {
+        lr: 8e-3,
+        batch_size: 1,
+        grad_accum: 1,
+        steps: 150,
+        warmup: 5,
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+    let ckpt = run_lora_ft(
+        &mut model,
+        &mut ds,
+        &lora_cfg,
+        &train_cfg,
+        &loss_fn,
+        tmp.path(),
+        "loss-reduce",
+        lease,
+    )
+    .expect("run_lora_ft must succeed");
+
+    let min_loss = *ckpt
+        .metrics
+        .get("min_train_loss")
+        .expect("min_train_loss");
+    assert!(
+        min_loss < baseline * 0.7,
+        "run_lora_ft did not reduce loss: min_train_loss={min_loss}, baseline={baseline}, \
+         threshold=0.7*baseline={} (LoRA training may not be updating params)",
+        baseline * 0.7
+    );
+    assert!(
+        ckpt.train_loss.is_finite(),
+        "final train loss must be finite: {}",
+        ckpt.train_loss
+    );
+}
+
+/// Learning invariant #3 (LoRA weight movement):
+/// [`Gpt2Model::wrap_lora`] + training via [`run_full_ft`] on the
+/// returned LoRA `VarMap` must materially update at least one LoRA
+/// tensor. Complements the loss-reduction test by asserting the
+/// mechanism (Var updates) rather than the outcome (loss down).
+///
+/// Uses `run_full_ft(&model, &lora_vm, ...)` after manual `wrap_lora`
+/// so the test can snapshot `lora_vm.all_vars()` before/after. This
+/// exercises the same `run_ft_core` code path `run_lora_ft` takes
+/// internally (both dispatch to `run_ft_core` with `opt_vm == save_vm
+/// == lora_vm`), just with the wrap step surfaced so before/after
+/// state is inspectable.
+///
+/// A "backward step doesn't reach LoRA vars" bug leaves
+/// `lora_before == lora_after` for every tensor; that condition is
+/// exactly what this test asserts against.
+#[test]
+fn run_lora_ft_updates_lora_weights() {
+    let cfg = Gpt2Config {
+        layers: 2,
+        heads: 2,
+        dim: 16,
+        ctx: 8,
+        vocab: 32,
+        dtype: DType::F32,
+        device: Device::Cpu,
+        eps: 1e-5,
+    };
+    let base_vm = VarMap::new();
+    let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+    let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+
+    let lora_cfg = LoraConfig::new(4, 8.0);
+    let lora_vm = model.wrap_lora(&lora_cfg).expect("wrap_lora ok");
+
+    // Snapshot LoRA tensors BEFORE training (read straight off the Var
+    // storage — this is what AdamW updates).
+    let lora_before: Vec<Vec<f32>> = lora_vm
+        .all_vars()
+        .iter()
+        .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+        .collect();
+    assert!(
+        !lora_before.is_empty(),
+        "wrap_lora should have registered LoRA vars"
+    );
+
+    let row: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| row.clone()).take(100).collect();
+    let mut ds = TokenizedDataset::new(
+        rows,
+        DatasetOpts {
+            batch_size: 1,
+            ctx_len: 8,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        },
+    );
+    let loss_fn = CrossEntropyLoss::new();
+    let train_cfg = FullFtConfig {
+        lr: 8e-3,
+        batch_size: 1,
+        grad_accum: 1,
+        steps: 30,
+        warmup: 2,
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+
+    // Drive training directly against `lora_vm`. Equivalent to what
+    // `run_lora_ft` does internally (`run_ft_core(base, &lora_vm,
+    // &lora_vm, ...)`) minus the wrap step (already done above).
+    let _ckpt = run_full_ft(
+        &model,
+        &lora_vm,
+        &mut ds,
+        &train_cfg,
+        &loss_fn,
+        tmp.path(),
+        "weight-update",
+        lease,
+    )
+    .expect("run_full_ft on lora_vm must succeed");
+
+    let lora_after: Vec<Vec<f32>> = lora_vm
+        .all_vars()
+        .iter()
+        .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+        .collect();
+
+    // At least one tensor must have moved. `before == after` for every
+    // tensor is exactly the "199 backward steps updated nothing" signal
+    // observed on GPU (Phase 2 verify report).
+    let mut changed_count = 0usize;
+    let mut inspected_count = 0usize;
+    for (before, after) in lora_before.iter().zip(lora_after.iter()) {
+        inspected_count += 1;
+        if before != after {
+            changed_count += 1;
+        }
+    }
+    assert!(
+        changed_count > 0,
+        "run_full_ft on lora_vm left ALL {inspected_count} LoRA tensors bit-identical \
+         before/after training — AdamW is not updating LoRA Vars (backward path or \
+         Var/Tensor identity is broken)"
+    );
 }
 
 #[test]

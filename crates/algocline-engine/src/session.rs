@@ -1681,20 +1681,17 @@ mod tests {
     // struct fields (started_at_ms, last_activity_ms, phase) are exercised
     // end-to-end without requiring direct construction of AsyncTask/AsyncIsleDriver.
 
-    /// Helper: build a minimal temp directory pair for state/card stores.
-    fn tmp_dirs() -> (
-        std::sync::Arc<crate::state::JsonFileStore>,
-        std::sync::Arc<crate::card::FileCardStore>,
-        std::path::PathBuf,
-    ) {
+    /// Helper: build a minimal temp SessionDirs for state/card/scenarios/nn.
+    fn tmp_dirs() -> crate::executor::SessionDirs {
         let tmp = tempfile::tempdir().expect("test tempdir");
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        (
-            std::sync::Arc::new(crate::state::JsonFileStore::new(root.join("state"))),
-            std::sync::Arc::new(crate::card::FileCardStore::new(root.join("cards"))),
-            root.join("scenarios"),
-        )
+        crate::executor::SessionDirs {
+            state_store: std::sync::Arc::new(crate::state::JsonFileStore::new(root.join("state"))),
+            card_store: std::sync::Arc::new(crate::card::FileCardStore::new(root.join("cards"))),
+            scenarios_dir: root.join("scenarios"),
+            nn_dir: root.join("nn"),
+        }
     }
 
     // T1: Session snapshot contains phase, started_at, last_activity_at
@@ -1706,7 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_v2_contains_phase_and_timestamps() {
         let executor = crate::executor::Executor::new(vec![]).await.unwrap();
-        let (state_store, card_store, scenarios_dir) = tmp_dirs();
+        let dirs = tmp_dirs();
 
         // Lua: pause the session with a single alc.llm() call
         let code = r#"
@@ -1716,16 +1713,7 @@ mod tests {
         .to_string();
 
         let session = executor
-            .start_session(
-                code,
-                serde_json::json!({}),
-                vec![],
-                vec![],
-                state_store,
-                card_store,
-                scenarios_dir,
-                false,
-            )
+            .start_session(code, serde_json::json!({}), vec![], vec![], dirs, false)
             .await
             .unwrap();
 
@@ -1799,7 +1787,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_conversation_history_opt_in() {
         let executor = crate::executor::Executor::new(vec![]).await.unwrap();
-        let (state_store, card_store, scenarios_dir) = tmp_dirs();
+        let dirs = tmp_dirs();
 
         let code = r#"
             local response = alc.llm("explain recursion")
@@ -1808,16 +1796,7 @@ mod tests {
         .to_string();
 
         let session = executor
-            .start_session(
-                code,
-                serde_json::json!({}),
-                vec![],
-                vec![],
-                state_store,
-                card_store,
-                scenarios_dir,
-                false,
-            )
+            .start_session(code, serde_json::json!({}), vec![], vec![], dirs, false)
             .await
             .unwrap();
 
@@ -1847,7 +1826,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_last_activity_at_starts_equal_to_started_at() {
         let executor = crate::executor::Executor::new(vec![]).await.unwrap();
-        let (state_store, card_store, scenarios_dir) = tmp_dirs();
+        let dirs = tmp_dirs();
 
         let code = r#"
             local response = alc.llm("test query")
@@ -1856,16 +1835,7 @@ mod tests {
         .to_string();
 
         let session = executor
-            .start_session(
-                code,
-                serde_json::json!({}),
-                vec![],
-                vec![],
-                state_store,
-                card_store,
-                scenarios_dir,
-                false,
-            )
+            .start_session(code, serde_json::json!({}), vec![], vec![], dirs, false)
             .await
             .unwrap();
 

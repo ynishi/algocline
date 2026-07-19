@@ -1,0 +1,91 @@
+{
+  "crate": "algocline-app",
+  "version": "0.45.0",
+  "items": [
+    {
+      "path": "algocline_app::pool",
+      "kind": "module",
+      "docs": "Process-pool IPC layer for `host_mode=true` execution.\n\nThis module provides the foundation types and dispatch helpers for the\npool worker protocol:\n\n- [`error`] — [`PoolError`] enum (thiserror-derived)\n- [`protocol`] — [`PoolRequest`] / [`PoolResponse`] wire types (serde JSON line)\n- [`client`] — [`PoolClient`] UDS client (connect + handshake + send_request)\n- [`registry`] — [`PoolRegistry`] persistence + GC (registry.json)\n- [`dispatch`] — worker spawn + UDS proxy orchestration (ST6)"
+    },
+    {
+      "path": "algocline_app::pool::client",
+      "kind": "module",
+      "docs": "UDS client for connecting to a pool worker process.\n\n[`PoolClient`] is the MCP-side (AppService-side) handle that opens a Unix\ndomain socket connection to a worker subprocess and exchanges\n[`PoolRequest`] / [`PoolResponse`] messages in JSON-line format."
+    },
+    {
+      "path": "algocline_app::pool::client::POOL_PROTOCOL_VERSION",
+      "kind": "constant",
+      "docs": "Version string embedded in every handshake to prevent client/server skew."
+    },
+    {
+      "path": "algocline_app::pool::client::PoolClient",
+      "kind": "struct",
+      "docs": "A thin UDS client for communicating with a pool worker process.\n\nEach `PoolClient` instance owns a single Unix domain socket connection to\none worker. Messages are JSON lines (`\\n`-terminated).\n\n# Lifecycle\n\n1. Call [`PoolClient::connect`] — opens the socket and runs the version\n   handshake atomically.  If the handshake fails the connection is dropped\n   and an error is returned; no `PoolClient` instance is produced.\n2. Call [`PoolClient::send_request`] for each message.\n3. Drop the `PoolClient` when done; the underlying socket is closed."
+    },
+    {
+      "path": "algocline_app::pool::dispatch",
+      "kind": "module",
+      "docs": "Host-mode dispatch helpers.\n\nProvides [`run_via_pool`] and [`continue_via_pool`] which orchestrate\nworker subprocess spawning, UDS connection, registry persistence, and\nresponse forwarding.\n\n## Crux invariants enforced here\n\n- (MCP thin proxy IPC boundary): all host_mode=true calls reach a worker\n  subprocess via [`PoolClient`] over a Unix domain socket.  The MCP-internal\n  [`SessionRegistry`] is never touched on this path.\n- (Registry reconnect across restarts): every successful [`run_via_pool`]\n  call persists the session entry to `registry.json` via\n  [`with_registry_lock`] before returning.  A restarted MCP process can\n  rediscover live workers from that file."
+    },
+    {
+      "path": "algocline_app::pool::dispatch::continue_via_pool",
+      "kind": "function",
+      "docs": "Reconnect to an existing pool worker via its registry entry and forward a\n`Continue` request.\n\n# Arguments\n\n* `entry` — the registry entry for the target worker (sock path, etc.).\n* `sid` — session ID to resume.\n* `response` — LLM response text.\n* `query_id` — optional query ID being answered.\n* `usage` — optional token usage.\n\n# Returns\n\n`Ok(json_response)` — the stringified `feed_result` JSON from the worker.\n\n# Errors\n\nReturns `Err(PoolError)` on UDS connect failure or invalid response.\n\n# Cancel safety\n\nIf this future is cancelled mid-await, the `PoolClient` is dropped and\nthe socket is closed.  `read_line` is not cancel-safe; a partial line\nwould corrupt the buffer.  Dropping the client is the correct recovery —\nthe next `continue_via_pool` call creates a fresh connection."
+    },
+    {
+      "path": "algocline_app::pool::dispatch::run_via_pool",
+      "kind": "function",
+      "docs": "Spawn a worker subprocess, connect via UDS, proxy a `Run` request,\nand persist the session entry to `registry.json`.\n\nOn success, returns `(session_id, json_response, Option<pool_save_error>)`.\nThe optional `pool_save_error` is `Some(msg)` when the registry write\nfailed — callers must surface this as an additive field on the MCP wire\nresponse.\n\n# Concurrency\n\n**Cancel safety**: this function is **not** cancel safe. If dropped during\n`PoolClient::connect` or `send_request`, the `PoolClient` is dropped and\nthe UDS connection is closed. The worker subprocess continues running; the\nsession can be resumed via `continue_via_pool` using the registry entry.\n\n**Locks**: acquires an advisory `fs4` flock (inside `spawn_blocking`) for\nthe registry add/save. The lock is held only for the duration of the\nsynchronous I/O in `persist_entry` and is released before this function\nreturns. No `std::sync::Mutex` or `tokio::sync::Mutex` is held across\n`.await` points in this function.\n\n**Zombie reaping**: `spawn_worker` starts a background `tokio::spawn` reap\ntask. If this function returns `Err`, the spawned reap task continues in the\nbackground and the OS process entry is reaped when the worker exits.\n\n**Socket wait timeout**: polls for socket file appearance with a 5 s\n`tokio::time::timeout`. If the socket does not appear in 5 s,\n`Err(PoolError::Handshake)` is returned.\n\n# Errors\n\nReturns `Err(PoolError)` if worker spawn, socket wait, or UDS run\nround-trip fails. Registry persistence failure is returned in the\n`pool_save_error` field, not as `Err`."
+    },
+    {
+      "path": "algocline_app::pool::error",
+      "kind": "module",
+      "docs": "Error types produced by the process-pool IPC layer.\n\nAll variants propagate to callers via `Result<T, PoolError>` and\nare converted to `String` at the `AppService` boundary (Subtask\n5/6) to satisfy the existing `EngineApi` wire contract."
+    },
+    {
+      "path": "algocline_app::pool::error::PoolError",
+      "kind": "enum",
+      "docs": "Errors produced by the process-pool IPC layer.\n\nAll variants are propagated to callers via `Result<T, PoolError>`.\nAt the `AppService` boundary (Subtask 5/6) these are converted to\n`String` to satisfy the existing `EngineApi` wire contract."
+    },
+    {
+      "path": "algocline_app::pool::protocol",
+      "kind": "module",
+      "docs": "Wire protocol messages exchanged between the pool client (MCP\nprocess) and pool workers over Unix domain sockets.\n\nRequests carry an `\"op\"` discriminant and are serialised as single\nJSON lines. Responses mirror the same shape and are correlated by\nthe request ordering on a per-connection basis."
+    },
+    {
+      "path": "algocline_app::pool::protocol::PoolRequest",
+      "kind": "enum",
+      "docs": "A message sent from the MCP process (pool client) to a pool worker.\n\nSerialised as a single JSON line with an `\"op\"` discriminant field.\n\n```json\n{\"op\":\"handshake\",\"version\":\"0.31.0\"}\n{\"op\":\"run\",\"code\":\"return 1\",\"ctx\":null,\"lib_paths\":[]}\n{\"op\":\"continue\",\"sid\":\"abc\",\"response\":\"yes\",\"query_id\":\"q1\",\"usage\":null}\n{\"op\":\"status\"}\n{\"op\":\"shutdown\"}\n```"
+    },
+    {
+      "path": "algocline_app::pool::protocol::PoolResponse",
+      "kind": "struct",
+      "docs": "A message sent from a pool worker back to the pool client.\n\nSerialised as a single JSON line:\n\n```json\n{\"ok\":true,\"data\":{\"kind\":\"handshake\",\"version\":\"0.31.0\"}}\n{\"ok\":false,\"error\":\"worker handshake failed: version mismatch\"}\n```"
+    },
+    {
+      "path": "algocline_app::pool::protocol::PoolResponseData",
+      "kind": "enum",
+      "docs": "Data payload carried by a successful [`PoolResponse`].\n\n`FeedResult`-equivalent payloads are represented as `serde_json::Value` so\nthat the `pool` protocol module does not introduce a hard dependency on the\n`algocline-engine` crate's concrete type.  Subtask 5 (AppService dispatch)\nwill deserialize the value into the appropriate engine type at the call site."
+    },
+    {
+      "path": "algocline_app::pool::registry",
+      "kind": "module",
+      "docs": "Pool registry: persistent session-to-worker mapping.\n\n[`PoolRegistry`] tracks live pool worker processes in\n`~/.algocline/state/pool/registry.json`.  The file survives MCP-process\ndeath so a restarted MCP can rediscover live worker sockets.\n\n## Crux invariant (Registry reconnect across restarts)\n\n`registry.json` is the **persistent source of truth**.  The in-memory\n`PoolRegistry` value is a short-lived view — callers must reload from disk\nafter acquiring the advisory lock rather than caching across lock cycles."
+    },
+    {
+      "path": "algocline_app::pool::registry::PoolRegistry",
+      "kind": "struct",
+      "docs": "In-memory view of `registry.json`.\n\nThis struct must **always** be loaded from and saved to disk within a\nsingle advisory-lock region (see [`with_registry_lock`]).  Do not hold\na `PoolRegistry` value across lock boundaries.\n\n## Crux: registry.json is the persistent source of truth\n\nMCP processes must not rely on any in-memory state to discover live\nworkers after a restart.  Every mutation path must call [`save`] before\ndropping the lock.\n\n[`save`]: PoolRegistry::save"
+    },
+    {
+      "path": "algocline_app::pool::registry::PoolSessionEntry",
+      "kind": "struct",
+      "docs": "A single session entry in the pool registry.\n\n# Fields\n\n- `sid` — session ID string (UUID or similar).\n- `pid` — OS process-ID of the worker; used for liveness checks via\n  `kill -0`.\n- `sock` — absolute path to the Unix-domain socket owned by the worker.\n- `version` — crate version at the time the worker was spawned; used in\n  version-handshake validation.\n- `created_at` — ISO 8601 timestamp of worker creation."
+    },
+    {
+      "path": "algocline_app::pool::registry::with_registry_lock",
+      "kind": "function",
+      "docs": "Run `f` while holding an exclusive advisory lock on `lock_path`, using the\nsame `fs4`-backed mechanism as `service::lock::with_exclusive_lock`.\n\nCallers should pass the `registry.lock` sentinel path (e.g.\n`app_dir.root().join(\"pool/registry.lock\")`).\n\n# Arguments\n\n* `lock_path` — path to the advisory lock file (created if absent).\n* `f` — closure to run under the lock.\n\n# Returns\n\nPropagates the return value of `f`.\n\n# Errors\n\nReturns `PoolError::RegistryCorrupted` if the lock file cannot be created\nor the exclusive lock cannot be acquired.\n\n# Concurrency\n\nThe lock is released when the underlying `File` is dropped, which occurs\non all exit paths from this function including panics (RAII / drop)."
+    }
+  ]
+}

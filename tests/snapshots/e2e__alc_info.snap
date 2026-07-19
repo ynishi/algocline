@@ -39,8 +39,16 @@ expression: redacted
     }
   ],
   "settings": {
-    "resolved": {},
-    "sources": {}
+    "resolved": {
+      "card": {
+        "run": true
+      }
+    },
+    "sources": {
+      "card": {
+        "run": "global"
+      }
+    }
   },
   "tracing": "file + stderr",
   "version": "0.45.0"

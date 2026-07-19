@@ -85,6 +85,7 @@ fn setup_fixture() -> Fixture {
         card_store: Arc::new(FileCardStore::new(root.join("cards"))),
         card_run_enabled: true,
         scenarios_dir: root.join("scenarios"),
+        nn_dir: root.join("nn"),
         log_sink: None,
     };
 

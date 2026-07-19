@@ -692,7 +692,13 @@ impl AppService {
         extra_lib_paths: Vec<std::path::PathBuf>,
         variant_pkgs: Vec<VariantPkg>,
     ) -> Result<String, String> {
-        let scenarios_dir = self.log_config.app_dir().scenarios_dir();
+        let app_dir = self.log_config.app_dir();
+        let dirs = algocline_engine::SessionDirs {
+            state_store: Arc::clone(&self.state_store),
+            card_store: Arc::clone(&self.card_store),
+            scenarios_dir: app_dir.scenarios_dir(),
+            nn_dir: app_dir.nn_dir(),
+        };
         // Legacy start_and_tick paths (alc_run / advice / eval) do not
         // resolve the Phase 1-B `[setting.card].run` gate; existing pkgs
         // never populate a top-level `run` field on their Cards so the
@@ -708,9 +714,7 @@ impl AppService {
                 ctx,
                 extra_lib_paths,
                 variant_pkgs,
-                Arc::clone(&self.state_store),
-                Arc::clone(&self.card_store),
-                scenarios_dir,
+                dirs,
                 card_run_enabled,
             )
             .await?;

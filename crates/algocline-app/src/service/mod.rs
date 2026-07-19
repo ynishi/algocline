@@ -146,11 +146,15 @@ impl AppService {
         // V2 execution registry — shares the Executor + AppConfig-derived
         // storage paths with the legacy `start_and_tick` path so a v2 caller
         // produces the same on-disk side effects as a legacy caller.
+        let session_dirs = algocline_engine::SessionDirs {
+            state_store: Arc::clone(&state_store),
+            card_store: Arc::clone(&card_store),
+            scenarios_dir: app_dir.scenarios_dir(),
+            nn_dir: app_dir.nn_dir(),
+        };
         let execution_registry = Arc::new(algocline_engine::execution::SessionRegistryV2::new(
             Arc::clone(&executor),
-            Arc::clone(&state_store),
-            Arc::clone(&card_store),
-            app_dir.scenarios_dir(),
+            session_dirs,
         ));
         // V2 GC: TTL = 3h (same as legacy), interval = 60s (same as legacy).
         // Debt #4 resolution: wires GC for the v2 execution_registry.

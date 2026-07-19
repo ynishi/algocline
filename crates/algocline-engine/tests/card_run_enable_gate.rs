@@ -54,6 +54,7 @@ fn make_lua_with_bridge(card_run_enabled: bool) -> (Lua, Arc<FileCardStore>, Tem
         card_store: Arc::clone(&card_store),
         card_run_enabled,
         scenarios_dir: root.join("scenarios"),
+        nn_dir: root.join("nn"),
         log_sink: None,
     };
 

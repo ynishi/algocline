@@ -343,19 +343,16 @@ mod tests {
     // Helpers using real Executor to get real AsyncTask handles
     // -----------------------------------------------------------------------
 
-    fn tmp_dirs() -> (
-        Arc<crate::state::JsonFileStore>,
-        Arc<crate::card::FileCardStore>,
-        std::path::PathBuf,
-    ) {
+    fn tmp_dirs() -> crate::executor::SessionDirs {
         let tmp = tempfile::tempdir().expect("test tempdir");
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
-        (
-            Arc::new(crate::state::JsonFileStore::new(root.join("state"))),
-            Arc::new(crate::card::FileCardStore::new(root.join("cards"))),
-            root.join("scenarios"),
-        )
+        crate::executor::SessionDirs {
+            state_store: Arc::new(crate::state::JsonFileStore::new(root.join("state"))),
+            card_store: Arc::new(crate::card::FileCardStore::new(root.join("cards"))),
+            scenarios_dir: root.join("scenarios"),
+            nn_dir: root.join("nn"),
+        }
     }
 
     fn make_state_and_bus() -> (
@@ -377,21 +374,12 @@ mod tests {
     #[tokio::test]
     async fn cancel_at_checkpoint_a_before_first_lua_chunk() {
         let executor = crate::executor::Executor::new(vec![]).await.unwrap();
-        let (state_store, card_store, scenarios_dir) = tmp_dirs();
+        let dirs = tmp_dirs();
 
         // Lua that would run indefinitely if not cancelled.
         let code = "while true do end".to_string();
         let session = executor
-            .start_session(
-                code,
-                serde_json::json!({}),
-                vec![],
-                vec![],
-                state_store,
-                card_store,
-                scenarios_dir,
-                false,
-            )
+            .start_session(code, serde_json::json!({}), vec![], vec![], dirs, false)
             .await
             .unwrap();
 
@@ -433,21 +421,12 @@ mod tests {
     #[tokio::test]
     async fn cancel_at_checkpoint_b_before_pause_publish() {
         let executor = crate::executor::Executor::new(vec![]).await.unwrap();
-        let (state_store, card_store, scenarios_dir) = tmp_dirs();
+        let dirs = tmp_dirs();
 
         // Lua that immediately calls alc.llm() to trigger a pause request.
         let code = r#"return alc.llm("question")"#.to_string();
         let session = executor
-            .start_session(
-                code,
-                serde_json::json!({}),
-                vec![],
-                vec![],
-                state_store,
-                card_store,
-                scenarios_dir,
-                false,
-            )
+            .start_session(code, serde_json::json!({}), vec![], vec![], dirs, false)
             .await
             .unwrap();
 
@@ -605,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn driver_loop_completes_with_done() {
         let executor = crate::executor::Executor::new(vec![]).await.unwrap();
-        let (state_store, card_store, scenarios_dir) = tmp_dirs();
+        let dirs = tmp_dirs();
 
         let session = executor
             .start_session(
@@ -613,9 +592,7 @@ mod tests {
                 serde_json::json!({}),
                 vec![],
                 vec![],
-                state_store,
-                card_store,
-                scenarios_dir,
+                dirs,
                 false,
             )
             .await

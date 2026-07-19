@@ -1,3 +1,12 @@
+//! Core domain types and primitives shared across the algocline workspace.
+//!
+//! Provides the shared vocabulary consumed by `algocline-engine`,
+//! `algocline-app`, and `algocline-mcp`: [`AppDir`] path handling,
+//! [`Budget`] / token accounting, the [`EngineApi`] trait, execution
+//! and query domain types, metrics collection, package (`pkg`) metadata,
+//! progress reporting ([`ProgressInfo`]), the recent-log ring buffer,
+//! and shared state primitives.
+
 mod app_dir;
 mod budget;
 mod custom;

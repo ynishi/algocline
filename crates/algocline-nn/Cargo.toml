@@ -1,0 +1,69 @@
+[package]
+name = "algocline-nn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "algocline neural-network bridge — thin candle wrapper exposing alc.nn to Lua"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# CPU by default. The optional `nn-cuda` feature turns on candle's CUDA
+# backend; on a CUDA-less dev host that feature only compiles behind an
+# `nvcc` toolchain (see subtask-2.md §Done Criteria). candle-core /
+# candle-nn are released in lockstep; keep their minor versions equal.
+candle-core = "0.11"
+candle-nn = "0.11"
+# Must match the engine's mlua (0.11, lua54, vendored, send) so a single mlua
+# links in the `--features nn` engine build. The `send` feature requires
+# UserData to be Send — candle `Tensor` is Arc-backed and Send + Sync.
+mlua = { version = "0.11", features = ["lua54", "vendored", "send", "serialize"] }
+# Card metadata schema (`card.rs`) — Serialize/Deserialize helpers for the
+# `[metadata.nn]` block written by the engine bridge and populated by
+# downstream training subtasks.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# HuggingFace tokenizer + hub download for pre-trained tokenizer and
+# base-weight fetch (design §6.3 / §12 Q2 / §12 Q5). `hf-hub` uses the
+# blocking sync client to keep the bridge path Runtime-free.
+tokenizers = "0.19"
+hf-hub = "0.3"
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# tempfile — used by the ckpt / training-loop unit tests to sandbox
+# safetensors output under a scoped directory.
+tempfile = { workspace = true }
+# tracing-subscriber — the GPU smoke examples install a stderr fmt
+# subscriber so the per-step `tracing::info!` events emitted by
+# `run_ft_core` show up as a loss trajectory when the caller sets
+# `RUST_LOG=algocline_nn=info`. Kept in dev-deps so production builds
+# of the library never pull it in.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[features]
+# Enable candle's CUDA backend for training on RunPod A40 / A100 hosts.
+# CPU builds keep this off (`candle-core` without `cuda`). On dev hosts
+# without an `nvcc` toolchain this feature does not compile — that is
+# expected; verification runs on the CUDA-enabled tier.
+#
+# Both `candle-core/cuda` and `candle-nn/cuda` must be enabled together:
+# candle-nn 0.11's `LayerNorm` is a `CustomOp3` whose `cuda_fwd` is
+# `#[cfg(feature = "cuda")]`-gated, so a `candle-core/cuda`-only build
+# still dispatches CustomOp on CPU and fails at forward time with
+# `Candle("no cuda implementation for layer-norm")`. Keep this pair
+# in sync when bumping candle.
+nn-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+# GPU smoke-test example: builds a full-size GPT-2 medium (355M) on
+# CUDA when the `nn-cuda` feature is enabled, otherwise falls back to
+# CPU (usable for compile checks but far too slow for a real run).
+# Kept out of the crate's public API surface.
+[[example]]
+name = "nn_medium_gpu_smoke"
+required-features = []

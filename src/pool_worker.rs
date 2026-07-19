@@ -260,6 +260,7 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
     let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
     let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
     let scenarios_dir = app_dir.scenarios_dir();
+    let nn_dir = app_dir.nn_dir();
 
     // 6. Build the executor.
     let executor = Arc::new(Executor::new(resolve_lib_paths()).await?);
@@ -368,6 +369,7 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
                 &state_store,
                 &card_store,
                 &scenarios_dir,
+                &nn_dir,
             )
             .await;
 
@@ -467,6 +469,7 @@ async fn dispatch(
     state_store: &Arc<JsonFileStore>,
     card_store: &Arc<FileCardStore>,
     scenarios_dir: &Path,
+    nn_dir: &Path,
 ) -> PoolResponse {
     match req {
         // ── Handshake ──────────────────────────────────────────────────────
@@ -505,15 +508,19 @@ async fn dispatch(
             // Pool worker sessions do not resolve the Phase 1-B
             // `[setting.card].run` gate over IPC; the legacy path defaults
             // to OFF, mirroring the `AppService::start_and_tick` policy.
+            let dirs = algocline_engine::SessionDirs {
+                state_store: Arc::clone(state_store),
+                card_store: Arc::clone(card_store),
+                scenarios_dir: scenarios_dir.to_path_buf(),
+                nn_dir: nn_dir.to_path_buf(),
+            };
             let session = match executor
                 .start_session(
                     code.clone(),
                     ctx_value,
                     extra_lib_paths.clone(),
                     vec![], // variant_pkgs: not passed via IPC in this subtask
-                    Arc::clone(state_store),
-                    Arc::clone(card_store),
-                    scenarios_dir.to_path_buf(),
+                    dirs,
                     false,
                 )
                 .await

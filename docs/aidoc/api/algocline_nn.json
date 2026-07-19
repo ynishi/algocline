@@ -1,0 +1,286 @@
+{
+  "crate": "algocline-nn",
+  "version": "0.45.0",
+  "items": [
+    {
+      "path": "algocline_nn::FsStore",
+      "kind": "struct",
+      "docs": "Filesystem-rooted default [`NnStore`].\n\nRoot is provided at construction time so the nn crate never inspects\n`$HOME` or env directly. `name` is restricted to `[A-Za-z0-9_.-]` and\ncannot contain `..`, so it cannot escape the root."
+    },
+    {
+      "path": "algocline_nn::NnModelRegistry",
+      "kind": "struct",
+      "docs": "Per-VM `alc.nn` model registry.\n\nHolds Lua closures that the `alc.llm` bridge can dispatch to when a caller\npasses `role=\"nn\"` with a `model=<name>`. The registry lives on the VM as\napp data, so its lifetime is tied to the Lua session and never crosses VMs.\nOnly the `alc.llm` in-process routing needs to reach across the crate\nboundary, so this is the sole engine-visible export.\n\nValues are `mlua::Function` (each entry is a Lua-side forward closure).\nThe Send + Mutex wrapping is only there to satisfy mlua's `send` feature\non `set_app_data`; the VM itself always runs on a single thread, so there\nis never any real cross-thread traffic through this cell."
+    },
+    {
+      "path": "algocline_nn::NnStore",
+      "kind": "trait",
+      "docs": "Storage backend for `alc.nn.save` / `alc.nn.load` — the injection point for\nwhere saved model bundles live.\n\nThe Host injects a concrete implementation via [`install_store`]; the nn\ncrate itself has no awareness of the process's app dir, `$HOME`, or any\nenvironment variable. Implementations resolve a model `name` to a concrete\non-disk path; the tensor serialization (safetensors dump / load) stays\ninside the nn crate.\n\nTypical wiring: the engine constructs [`FsStore`] with a root chosen from\nits AppDir (e.g. `<app_dir>/nn`) and calls [`install_store`]. Tests inject\nan [`FsStore`] over a temp dir, or their own mock impl."
+    },
+    {
+      "path": "algocline_nn::NnStoreError",
+      "kind": "struct",
+      "docs": "Error returned by an [`NnStore`] operation.\n\nString-wrapping so a concrete implementation can carry its own error type\n(fs, network, database, blob store) without leaking it across the boundary."
+    },
+    {
+      "path": "algocline_nn::arch",
+      "kind": "module",
+      "docs": "Architecture presets for `alc.nn.preset.*`.\n\nEach preset is a pure function of a config → runnable candle module.\nPhase 1 ships GPT-2 (medium / large) here; TinyLlama (Phase 2) will\nland alongside as `arch::tinyllama` on the same layout.\n\nThe Lua bridge in `algocline-engine` (`bridge/nn_card.rs`) builds a\n[`Gpt2Config`] from user opts, then calls [`Gpt2Model::new`] (random\ninit) or [`Gpt2Model::from_pretrained`] (HF warm-start; design §12\nQ5) to obtain the model handle.\n\nWeight naming convention follows the reference GPT-2 checkpoints\n(nanoGPT / `openai-community/gpt2*`) so a downloaded safetensors\nbundle can be loaded through [`candle_nn::VarBuilder::from_mmaped_safetensors`]\nwith the same variable names used at construction time."
+    },
+    {
+      "path": "algocline_nn::arch::gpt2",
+      "kind": "module",
+      "docs": "GPT-2 architecture builder.\n\nImplements the two variants shipped in Phase 1 (design §6.1):\n\n- `gpt2-medium` — 24 layers, 16 heads, 1024 dim, 1024 ctx, 50257 vocab\n- `gpt2-large`  — 36 layers, 20 heads, 1280 dim, 1024 ctx, 50257 vocab\n\nArchitecture components (nanoGPT / HuggingFace `openai-community/gpt2`\nreference layout):\n\n- `wte` — token embedding (`vocab × dim`)\n- `wpe` — learned positional embedding (`ctx × dim`)\n- `h.<i>.ln_1` / `ln_2` — pre-LayerNorm (dim)\n- `h.<i>.attn.c_attn` — fused Q/K/V projection (`dim → 3·dim`)\n- `h.<i>.attn.c_proj` — attention output projection (`dim → dim`)\n- `h.<i>.mlp.c_fc` / `mlp.c_proj` — 4× expansion MLP with GELU\n- `ln_f` — final LayerNorm (dim)\n- LM head weights are tied to `wte` (shared matrix)\n\nForward output shape is `[batch, seq, vocab]` per subtask invariant\n#1. Attention uses a causal (lower-triangular) mask."
+    },
+    {
+      "path": "algocline_nn::arch::gpt2::Gpt2Config",
+      "kind": "struct",
+      "docs": "Immutable configuration for a GPT-2 preset."
+    },
+    {
+      "path": "algocline_nn::arch::gpt2::Gpt2Model",
+      "kind": "struct",
+      "docs": "GPT-2 forward-only model.\n\nConstructed via [`Gpt2Model::new`] (random init from a [`VarBuilder`])\nor [`Gpt2Model::from_pretrained`] (HuggingFace warm-start, design\n§12 Q5). Training loops live in a follow-up stage; this stage\nships the forward path only."
+    },
+    {
+      "path": "algocline_nn::arch::gpt2::PretrainedError",
+      "kind": "enum",
+      "docs": "Errors from [`Gpt2Model::from_pretrained`].\n\nExplicit variants so the caller (Lua bridge) can surface an\nactionable error string per the crate's Service-layer\nerror-propagation discipline — no silent fallback."
+    },
+    {
+      "path": "algocline_nn::arch::lora",
+      "kind": "module",
+      "docs": "Low-rank adaptation (\"LoRA\") wrap for a candle-nn `Linear`.\n\nWraps a frozen base linear layer with two thin trainable matrices\n(`lora_a` shaped `[rank, in_features]`, `lora_b` shaped\n`[out_features, rank]`) and a scaling factor of `alpha / rank`.\nThe forward pass computes\n\n```text\ny = base.forward(x) + scaling * (lora_b(lora_a(x)))\n```\n\nThe base parameters are held as a `Linear` value (so\n`.weight()` / `.bias()` are still accessible for merge equivalence\nchecks) but the caller is expected to keep them out of the\noptimizer's parameter list — only `lora_a` and `lora_b` should be\ntrainable during LoRA fine-tuning.\n\n[`LoraLinear::merged_weight`] materialises the equivalent\n`base.weight() + scaling * (lora_b.weight() @ lora_a.weight())`\nmatrix so a caller can construct a plain `Linear` that produces\nidentical outputs for the same input. This is what the merge-\nequivalence integration test asserts within 1e-4 element-wise."
+    },
+    {
+      "path": "algocline_nn::arch::lora::LoraConfig",
+      "kind": "struct",
+      "docs": "LoRA rank + scaling + wrap-target configuration.\n\n`alpha` and `rank` together determine the scaling factor\n`alpha / rank`; the caller sets both explicitly rather than passing\na pre-computed factor so a saved LoRA can be re-derived from the\ntwo integer fields alone.\n\n`target_modules` is consumed by [`crate::arch::Gpt2Model::wrap_lora`]\n— the low-level [`LoraLinear::wrap`] path itself never inspects it.\n`dropout` is reserved for a future stage (per-forward LoRA dropout,\ndesign §7.2) and is currently ignored by both `LoraLinear::forward`\nand the training loops; it lives on the config today so the on-disk\nLoRA schema does not need a breaking migration when dropout ships.\n\nThe struct is `Clone` (not `Copy`) because `target_modules` is\nheap-allocated."
+    },
+    {
+      "path": "algocline_nn::arch::lora::LoraLinear",
+      "kind": "struct",
+      "docs": "A `Linear` layer wrapped with a low-rank additive update.\n\nConstructed via [`LoraLinear::wrap`] once the frozen base linear\nhas been built (e.g. via `candle_nn::linear` on the loaded base\ncheckpoint's `VarBuilder`). The LoRA matrices come from a distinct\n`VarBuilder` so the caller can register them under a different\n`VarMap` and hand *that* map to the optimizer, keeping the base\nweights frozen."
+    },
+    {
+      "path": "algocline_nn::arch::lora::max_abs_diff_f32",
+      "kind": "function",
+      "docs": "Snapshot two tensors as flat f32 vectors and return the maximum\nelement-wise absolute difference. Small utility so tests and\ndownstream callers can share the same tolerance check.\n\nUses `f32` because our merge-equivalence test runs on `DType::F32`\nweights."
+    },
+    {
+      "path": "algocline_nn::card",
+      "kind": "module",
+      "docs": "Card metadata schema for `alc.nn.card.*`.\n\nMirrors the `[metadata.nn]` TOML block written by the engine bridge\n(`bridge/nn_card.rs`) when it assembles the Card create payload.\nDownstream training paths (Full FT / LoRA / Distillation) populate\n`hyperparams` / `metrics` / `lineage` uniformly through this schema.\n\n`hyperparams` and `metrics` are free-form JSON pass-through so trainer\nsubtasks can extend without reshaping this crate.\n\nThe Card foundation leaves `NnCandleBranch::lora` as `None`. A\nlater LoRA follow-up populates it via the [`NnLoraBranch`]\nsub-struct without breaking foundation serialization\n(`skip_serializing_if = \"Option::is_none\"`)."
+    },
+    {
+      "path": "algocline_nn::card::NnCandleBranch",
+      "kind": "struct",
+      "docs": "Content of `[metadata.nn.candle]`.\n\n`bundle_ref` is required and always equal to `\"nn/<card_id>\"` per\ndesign §5 (1:1 mapping between Card id and safetensors bundle name)."
+    },
+    {
+      "path": "algocline_nn::card::NnCardMeta",
+      "kind": "struct",
+      "docs": "Content of `[metadata.nn]`.\n\n`training_path` and `architecture` are required; everything else is\noptional with a sensible default so trainer subtasks can populate\nincrementally."
+    },
+    {
+      "path": "algocline_nn::card::NnLineage",
+      "kind": "struct",
+      "docs": "Content of `[metadata.nn.lineage]`.\n\nEvery field is optional so a fresh full-FT card (no parent, no\nteacher) can omit the block entirely without breaking the schema."
+    },
+    {
+      "path": "algocline_nn::card::NnLoraBranch",
+      "kind": "struct",
+      "docs": "Content of `[metadata.nn.candle.lora]`.\n\nPresent only when `training_path == \"lora\"`. `rank` / `alpha` /\n`base_bundle_ref` are always populated by the trainer; the extra\n`target_modules` / `dropout` / `delta_path` fields carry defaults\nfor backwards compatibility with cards written before ST-d landed\n(a foundation-era card without these fields still deserializes,\nbut `alc.nn.card.load_gpt2` errors when `delta_path` is missing —\nthe load path cannot locate the delta without it)."
+    },
+    {
+      "path": "algocline_nn::install_store",
+      "kind": "function",
+      "docs": "Register a concrete [`NnStore`] on the Lua VM.\n\nMust be called before `alc.nn.save` / `alc.nn.load` are used; otherwise\nboth closures return an \"no NN store registered\" error. Re-installing\noverwrites the previous store."
+    },
+    {
+      "path": "algocline_nn::module",
+      "kind": "function",
+      "docs": "Build the `alc.nn` module table.\n\nMirrors the `register_math` convention (`bridge/mod.rs`): the engine calls\nthis behind the `nn` feature and sets the result as `alc.nn`. Exposes the\nthin candle primitives the layer boundary requires — tensor / var / adamw\nplus the shared tensor ops — so Lua can write a model and a training loop."
+    },
+    {
+      "path": "algocline_nn::probe",
+      "kind": "function",
+      "docs": "Link-gate probe used by the Step 1 spike.\n\nConstructs a tiny CPU tensor and returns its element count. The only purpose\nis to force `candle-core` to actually link and execute in the algocline\nworkspace so the spike can confirm there is no link interference with the\nmlua-vendored build."
+    },
+    {
+      "path": "algocline_nn::tokenizer",
+      "kind": "module",
+      "docs": "HuggingFace `tokenizers` wrap with first-use download cache.\n\nDesign §6.3 / §12 Q2 policy: the tokenizer artifact (`tokenizer.json`\nin `tokenizers` format) is fetched from the HuggingFace hub on the\nfirst call and cached to `<cache_dir>/<preset>.json`. Subsequent\ncalls read straight from disk with no network access (subtask\ninvariant #2).\n\nPreset → HF repo mapping:\n\n| preset  | repo                                    |\n|---------|-----------------------------------------|\n| `gpt2`  | `openai-community/gpt2`                 |\n| `llama` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0`    |\n\nError handling follows the crate's Service-layer error-propagation\ndiscipline: every failure surfaces as [`TokenizerError`] rather\nthan silently returning an empty result."
+    },
+    {
+      "path": "algocline_nn::tokenizer::HfTokenizer",
+      "kind": "struct",
+      "docs": "Loaded pre-trained tokenizer keyed by preset name."
+    },
+    {
+      "path": "algocline_nn::tokenizer::TokenizerError",
+      "kind": "enum",
+      "docs": "Errors returned by [`HfTokenizer`] APIs.\n\nWrapping into named variants (rather than `String`) lets the Lua\nbridge (`engine/src/bridge/nn_card.rs`) map the failure to an\nactionable message without inspecting substrings."
+    },
+    {
+      "path": "algocline_nn::train",
+      "kind": "module",
+      "docs": "Training-side scaffolding.\n\nThis module owns four building blocks the trainer entry uses:\n\n- [`data`] — streaming batch abstraction (`Dataset` trait + JSONL /\n  Parquet / in-memory implementations).\n- [`loss`] — [`loss::Loss`] trait + [`loss::CrossEntropyLoss`], the\n  default used by Full FT. A distillation follow-up plugs in the\n  same trait.\n- [`scheduler`] — cosine-with-warmup learning-rate schedule.\n- [`ckpt`] — rotating safetensors [`ckpt::CheckpointStore`] and the\n  [`Checkpoint`] record type used by the caller.\n- [`fullft`] — [`fullft::run_full_ft`] entry point: `forward → loss →\n  backward → optimizer step`, with per-step LR from the scheduler\n  and rotating checkpoints from the store.\n\nThe Lua bridge only reaches for the top-level re-exports; internal\ncallers can still pull individual submodule items when needed."
+    },
+    {
+      "path": "algocline_nn::train::Checkpoint",
+      "kind": "struct",
+      "docs": "Snapshot of a completed training run.\n\nReturned by [`fullft::run_full_ft`] and consumed by the Lua bridge\nwhen it converts the run outcome into the Card metadata block. Kept\ndeliberately flat (owned strings + primitives + `HashMap`) so it\ncrosses the mlua boundary without borrowing gymnastics."
+    },
+    {
+      "path": "algocline_nn::train::ckpt",
+      "kind": "module",
+      "docs": "Rotating safetensors checkpoint writer.\n\nDuring Full FT the trainer writes an intermediate checkpoint every\n`ckpt_every` steps and keeps only the most recent `ckpt_keep`\nfiles on disk. The older files are dropped by modification time\nrather than by step number so a manual `touch` cannot hide the\ntrainer's own bookkeeping from `ls -t`."
+    },
+    {
+      "path": "algocline_nn::train::ckpt::CheckpointStore",
+      "kind": "struct",
+      "docs": "Rotating checkpoint writer.\n\nFilenames follow the shape\n`<prefix>-step<N>.safetensors` under `ckpt_dir`. The prefix defaults\nto `\"ckpt\"` but the trainer passes in a card id so multiple\nconcurrent runs (should they ever be allowed) do not collide."
+    },
+    {
+      "path": "algocline_nn::train::ckpt::checkpoint_from_path",
+      "kind": "function",
+      "docs": "Build a [`Checkpoint`] record from a save path and per-run metrics.\n\nThe trainer calls this after `save_step` / `save_final` so the\nreturned struct carries the actual bundle path plus the metrics\nsnapshot the caller will attach to the Card."
+    },
+    {
+      "path": "algocline_nn::train::data",
+      "kind": "module",
+      "docs": "Dataset iterator abstraction.\n\nDesign §8.4: `alc.nn.data.jsonl`, `alc.nn.data.parquet`, and\n`alc.nn.data.from_card` all return an opaque handle that the\ntrainer follow-up entries consume batch-by-batch. Iteration is Rust-side\n(no per-batch Lua callback) so the trainer stays on the hot path\nwithout VM cross-calls.\n\nSubtask invariants:\n\n- Batches produce `[batch_size, ctx_len]` `u32` token ids. The last\n  batch may be short (`Batch::is_last == true`).\n- JSONL adapter reads each line as `{ \"text\": \"...\" }` (default\n  field name; overridable via [`DatasetOpts::text_field`]) and\n  tokenizes with the caller-supplied [`crate::tokenizer::HfTokenizer`].\n- `from_card` reads Card sample rows via `FileCardStore` (invariant\n  #5); the `algocline-nn` crate does no filesystem access itself.\n  The bridge builds a [`TokenizedDataset`] from the pre-tokenized\n  rows and hands it back to the trainer.\n- Parquet reading is scaffolded (see [`ParquetDataset`]); a later\n  stage picks up the concrete reader implementation. Constructing the\n  handle is legal, `next_batch` returns an error so no silent\n  empty iterator is exposed (Rust exception-free discipline)."
+    },
+    {
+      "path": "algocline_nn::train::data::Batch",
+      "kind": "struct",
+      "docs": "One training batch."
+    },
+    {
+      "path": "algocline_nn::train::data::Dataset",
+      "kind": "trait",
+      "docs": "Streaming batch iterator.\n\nKept small on purpose so the trainer follow-up can hold a `Box<dyn Dataset>` in the\ntrainer state without a generic parameter explosion."
+    },
+    {
+      "path": "algocline_nn::train::data::DatasetError",
+      "kind": "enum",
+      "docs": "Errors surfaced by dataset iterators.\n\nAll variants surface loudly through `next_batch` so caller Lua sees\na real error rather than a silent end-of-stream."
+    },
+    {
+      "path": "algocline_nn::train::data::DatasetOpts",
+      "kind": "struct",
+      "docs": "Iterator config shared across dataset kinds.\n\nEvery field has a sensible default; unspecified fields via the Lua\nbridge collapse to these values."
+    },
+    {
+      "path": "algocline_nn::train::data::JsonlDataset",
+      "kind": "struct",
+      "docs": "JSONL-backed dataset.\n\nEach line is parsed as a JSON object; the field named\n[`DatasetOpts::text_field`] is tokenized. Lines are loaded lazily\n(line-by-line) unless [`DatasetOpts::shuffle`] is set, in which\ncase the loader materialises all rows first."
+    },
+    {
+      "path": "algocline_nn::train::data::ParquetDataset",
+      "kind": "struct",
+      "docs": "Parquet-backed dataset (scaffold).\n\nA later stage lands the concrete Apache Arrow / Parquet reader\nwiring. The current stage exposes the constructor so the Lua\nbridge surface is stable — a\n`next_batch` call surfaces [`DatasetError::NotImplemented`] instead\nof silently returning an empty iterator (Rust exception-free\ndiscipline — no silent drop, per the crate's Service-layer\nerror-propagation discipline)."
+    },
+    {
+      "path": "algocline_nn::train::data::TeacherCardDataset",
+      "kind": "struct",
+      "docs": "In-memory dataset for hard-label distillation.\n\nEach row carries the concatenated `[prompt || sep || response]`\ntoken ids alongside a per-token float mask picking out the\nresponse region. The mask is padded / truncated in lockstep with\nthe token ids so a downstream `Loss::compute` call receives shape-\naligned inputs.\n\nThe trainer plumbing (bridge / Lua caller) is responsible for\nreading the actual Card sample rows via a `FileCardStore` and\ntokenising them before constructing this dataset — the\n`algocline-nn` crate never touches the filesystem itself. That\nkeeps the dataset trivially testable with hand-picked deterministic\nrows here, and lets the bridge decide the exact prompt / response\nsplit rule."
+    },
+    {
+      "path": "algocline_nn::train::data::TokenizedDataset",
+      "kind": "struct",
+      "docs": "In-memory dataset built from a `Vec<Vec<u32>>` of pre-tokenized\nrows.\n\nUsed by the bridge's `from_card` path (invariant #5) and by tests\nthat want to feed deterministic token sequences without a JSONL\n/ Parquet fixture on disk."
+    },
+    {
+      "path": "algocline_nn::train::fullft",
+      "kind": "module",
+      "docs": "Full FT training loop.\n\nTies [`crate::arch::gpt2::Gpt2Model`], a [`crate::train::data::Dataset`]\nsource, an AdamW optimizer, a learning-rate [`Scheduler`], and a\nrotating [`CheckpointStore`] together into a single\n[`run_full_ft`] entry point.\n\nThe loop is intentionally CPU-friendly: the tests build a\n2-layer / 2-head / 16-dim model and overfit a synthetic 4-token\nsequence in ~100 steps. On a real GPU the same code path scales to\nthe full 355M / 774M presets without further changes because every\ncandle operation used here already dispatches on the device the\n`VarMap` was built with."
+    },
+    {
+      "path": "algocline_nn::train::fullft::DistillLossKind",
+      "kind": "enum",
+      "docs": "Which distillation loss the caller wants for [`run_distill`].\n\nOnly the hard-label cross-entropy variant ships today; a KL-soft\nvariant (needing teacher log-probs) is scheduled for a later\nstage. Callers stay forward-compatible by matching on the enum."
+    },
+    {
+      "path": "algocline_nn::train::fullft::DistillSpec",
+      "kind": "struct",
+      "docs": "Distillation-run configuration.\n\nA thin wrapper around a `FullFtConfig` plus the loss variant to\nuse. The actual dataset (a `TeacherCardDataset` in practice) is\npassed separately to [`run_distill`] so a caller can reuse a\npre-built dataset across multiple distillation runs without\nreconstructing it."
+    },
+    {
+      "path": "algocline_nn::train::fullft::FullFtConfig",
+      "kind": "struct",
+      "docs": "Hyperparameters for [`run_full_ft`].\n\nEvery field has a sensible default so callers coming through the\nLua bridge with a partial opts table can still get a runnable\nconfig."
+    },
+    {
+      "path": "algocline_nn::train::fullft::TrainError",
+      "kind": "enum",
+      "docs": "Errors surfaced by the training loop."
+    },
+    {
+      "path": "algocline_nn::train::fullft::TrainingLease",
+      "kind": "struct",
+      "docs": "One-time guard preventing two Full FT loops from running against\nthe same in-process `NnModelRegistry`.\n\nThe design's \"one training session per VM\" constraint sits here.\nConcurrent inference (calls to the registry from a Lua strategy)\nis unaffected; the guard only refuses a *second* trainer entry\nwhile a first one is still holding a lease."
+    },
+    {
+      "path": "algocline_nn::train::fullft::TrainingLeaseGuard",
+      "kind": "struct",
+      "docs": "RAII guard that releases the training lease on drop."
+    },
+    {
+      "path": "algocline_nn::train::fullft::run_distill",
+      "kind": "function",
+      "docs": "Run a distillation training loop.\n\nWraps [`run_full_ft`] with the loss selected by `spec.loss_kind`\nand the caller-supplied `dataset` (which is expected to carry a\n`Batch::loss_mask` so the loss is scored only on the response\nregion of each teacher log).\n\nEverything else — checkpoint rotation, scheduler, lease — behaves\nexactly the same as a Full FT run because that is precisely the\nunderlying loop. The named entry exists so downstream callers\n(Card metadata, Lua bridge) can encode \"this run was a\ndistillation\" without inspecting the training config."
+    },
+    {
+      "path": "algocline_nn::train::fullft::run_full_ft",
+      "kind": "function",
+      "docs": "Run Full FT training and return the final checkpoint record.\n\nThe caller supplies both the `model` (holding forward-pass weights)\nand the `varmap` those weights were registered against; the loop\npulls the parameter list out of the varmap and hands it to AdamW.\nThe dataset is consumed batch-by-batch; when it drains before\n`cfg.steps`, an explicit error surfaces rather than a silent\nshort-run.\n\n`ckpt_dir` is the directory the rotating checkpoints live in. A\ndedicated `<card_id>` prefix keeps concurrent (or historical) runs\nfrom colliding on filenames."
+    },
+    {
+      "path": "algocline_nn::train::fullft::run_lora_ft",
+      "kind": "function",
+      "docs": "Run LoRA fine-tuning and return the final Δ-only checkpoint record.\n\nThe base model's `Linear` projections are wrapped in-place with\n[`LoraLinear`] instances (attention Q/K/V/O and MLP up/down per\n[`LoraConfig::target_modules`]). Only the freshly-created LoRA A/B\nmatrices are handed to AdamW, so the base weights registered\nagainst the model's original `VarMap` are guaranteed\nbit-identical before and after training (LoRA invariant:\nbase parameters are frozen).\n\nThe Δ checkpoint is written to\n`<ckpt_dir>/nn/lora-<card_id>.safetensors` — a filename convention\nthat keeps LoRA bundles clearly separated from full-model bundles\non disk. The `nn/` subdirectory is created if missing.\n\n# Errors\n\n- [`TrainError::ZeroSteps`] / [`TrainError::GradAccumUnsupported`]\n  / [`TrainError::LeaseHeld`] mirror the Full FT path.\n- Any error raised by [`Gpt2Model::wrap_lora`] surfaces as\n  [`TrainError::Candle`] (unknown `target_modules`, oversized\n  rank, etc.).\n- Checkpoint I/O failures surface as [`TrainError::Ckpt`]."
+    },
+    {
+      "path": "algocline_nn::train::loss",
+      "kind": "module",
+      "docs": "Loss functions used by the training loop.\n\nIntroduces a small [`Loss`] trait so the loop stays agnostic to the\nspecific reduction and can accept plain cross-entropy (Full FT), a\nhard-label distillation variant, or a future KL-soft variant without\nchanging the loop signature.\n\nThe optional `loss_mask` on `Loss::compute` is what lets a\ndistillation caller zero out prompt-region tokens: for Full FT the\ncaller passes `None`; distillation passes a per-token 0/1 mask so\nonly the response region contributes to the loss."
+    },
+    {
+      "path": "algocline_nn::train::loss::CrossEntropyLoss",
+      "kind": "struct",
+      "docs": "Standard token-level cross-entropy against a hard target.\n\nSemantics match nanoGPT's loss:\n`-log_softmax(logits, dim=-1).gather(targets)`, then averaged over\nmasked-in positions. When no mask is given, every `[batch, seq]`\nposition contributes."
+    },
+    {
+      "path": "algocline_nn::train::loss::HardLabelDistillLoss",
+      "kind": "struct",
+      "docs": "Hard-label distillation loss.\n\nSemantically a thin wrapper around [`CrossEntropyLoss`] — the\ndistillation caller supplies a per-token loss mask (via\n`TeacherCardDataset`) that zeroes out prompt-region positions,\nleaving only the response region driving the gradient. A separate\nnamed type helps the training loop and Card metadata carry the\ndistinction (\"this run was a distillation, not a Full FT\") without\nchanging the underlying loss math.\n\nA future KL-soft variant (needing teacher log-probs, deferred) can\nlive alongside this type without touching the `Loss` trait or the\ntraining loop."
+    },
+    {
+      "path": "algocline_nn::train::loss::Loss",
+      "kind": "trait",
+      "docs": "Loss function on `[batch, seq, vocab]` logits.\n\n`targets` is `[batch, seq]` of `u32` next-token ids. `loss_mask`,\nwhen `Some`, is `[batch, seq]` of `f32` (`1.0` = counted, `0.0` =\nignored). The trainer loop passes `None` for standard Full FT and a\nprompt-masked tensor for distillation."
+    },
+    {
+      "path": "algocline_nn::train::loss::Reduction",
+      "kind": "enum",
+      "docs": "Reduction strategy applied inside a `Loss::compute` call.\n\nKept minimal: the current callers only need `Mean` (average loss\nacross all non-masked positions). A `Sum` variant is easy to add\nlater if a scheduler needs unnormalised loss."
+    },
+    {
+      "path": "algocline_nn::train::scheduler",
+      "kind": "module",
+      "docs": "Learning-rate schedules for the training loop.\n\nTrainers ask for a scheduler once at construction time and then call\n[`Scheduler::lr_at`] each step to get the current learning rate.\nThe loop then passes the value through to the optimizer via\n`AdamW::set_learning_rate`.\n\nTwo schedules ship today: a plain constant one (useful for tests and\nsanity checks) and a cosine schedule with linear warmup that matches\nthe nanoGPT / HF Trainer default. Both live behind the [`Schedule`]\nenum so a config can pick between them via a plain string field."
+    },
+    {
+      "path": "algocline_nn::train::scheduler::ScheduleKind",
+      "kind": "enum",
+      "docs": "Which schedule variant the trainer requested.\n\nAdding a new variant is intentionally cheap — grow the enum and\nimplement [`Scheduler::lr_at`] for it. The loop does not need to be\ntouched."
+    },
+    {
+      "path": "algocline_nn::train::scheduler::Scheduler",
+      "kind": "struct",
+      "docs": "Learning-rate schedule state carried across steps."
+    }
+  ]
+}

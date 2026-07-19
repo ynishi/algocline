@@ -18,7 +18,7 @@ use algocline_core::LogSink;
 use algocline_engine::card::{
     register_log_sink, FileCardStore, FileCardSubscriber, LogSinkCardSubscriber,
 };
-use algocline_engine::{Executor, FeedResult, JsonFileStore, SessionRegistry};
+use algocline_engine::{Executor, FeedResult, JsonFileStore, SessionDirs, SessionRegistry};
 use tokio::sync::Mutex;
 
 /// Shared serialization gate — all tests in this file take it before
@@ -29,33 +29,32 @@ fn integration_test_gate() -> &'static Mutex<()> {
     GATE.get_or_init(|| Mutex::new(()))
 }
 
-/// Create a fresh temp-dir triple (state_store, card_store, scenarios_dir)
-/// mirroring the pattern used by existing `session.rs` tests.
-fn tmp_dirs() -> (Arc<JsonFileStore>, Arc<FileCardStore>, std::path::PathBuf) {
+/// Create a fresh `SessionDirs` bundle mirroring the pattern used by
+/// existing `session.rs` tests (post-`e99642b` SessionDirs refactor).
+fn tmp_dirs() -> SessionDirs {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     std::mem::forget(tmp);
-    (
-        Arc::new(JsonFileStore::new(root.join("state"))),
-        Arc::new(FileCardStore::new(root.join("cards"))),
-        root.join("scenarios"),
-    )
+    SessionDirs {
+        state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+        card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+        scenarios_dir: root.join("scenarios"),
+        nn_dir: root.join("nn"),
+    }
 }
 
 /// Run `code` in a fresh Session end-to-end (start → drive to completion).
 /// Returns `Ok(())` on `FeedResult::Finished { Completed | Cancelled }`.
 async fn run_to_completion(code: &str, card_run_enabled: bool) -> Result<(), String> {
     let executor = Executor::new(vec![]).await.map_err(|e| e.to_string())?;
-    let (state_store, card_store, scenarios_dir) = tmp_dirs();
+    let dirs = tmp_dirs();
     let session = executor
         .start_session(
             code.to_string(),
             serde_json::json!({}),
             vec![],
             vec![],
-            state_store,
-            card_store,
-            scenarios_dir,
+            dirs,
             card_run_enabled,
         )
         .await?;

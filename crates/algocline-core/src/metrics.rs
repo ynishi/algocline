@@ -1,3 +1,11 @@
+//! Metrics collection primitives.
+//!
+//! Aggregates per-query token usage, budget consumption, custom metric
+//! handles ([`CustomMetrics`]), and [`ProgressInfo`], and forwards
+//! observation events through registered
+//! [`ExecutionObserver`](crate::observer::ExecutionObserver) instances
+//! and the recent-log sink.
+
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

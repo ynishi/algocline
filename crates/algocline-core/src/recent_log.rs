@@ -1,3 +1,11 @@
+//! Per-session recent-log ring buffer.
+//!
+//! [`LogEntry`] captures events from Lua `print()`, `alc.log()`, and
+//! engine-internal callsites. [`LogSink`] accumulates entries with a
+//! fixed cap (=20) for retrieval via `alc_log_view` and MCP resource
+//! endpoints, providing bounded per-session observability without
+//! unbounded memory growth.
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -29,105 +29,143 @@ pub(super) fn register_llm(
     budget: BudgetHandle,
     card_store: Arc<FileCardStore>,
 ) -> LuaResult<()> {
-    let llm = lua.create_async_function(move |_, (prompt, opts): (String, Option<LuaTable>)| {
-        let tx = llm_tx.clone();
-        let bh = budget.clone();
-        let cs = card_store.clone();
-        async move {
-            bh.check().map_err(LuaError::external)?;
-            let system = opts.as_ref().and_then(|o| o.get::<String>("system").ok());
-            let max_tokens = opts
-                .as_ref()
-                .and_then(|o| o.get::<u32>("max_tokens").ok())
-                .unwrap_or(1024);
-            let grounded = opts
-                .as_ref()
-                .and_then(|o| o.get::<bool>("grounded").ok())
-                .unwrap_or(false);
-            let underspecified = opts
-                .as_ref()
-                .and_then(|o| o.get::<bool>("underspecified").ok())
-                .unwrap_or(false);
-            let cache_breakpoint = opts
-                .as_ref()
-                .and_then(|o| o.get::<String>("cache_breakpoint").ok());
-            // Optional role hint (e.g. "grader"). Additive: absent when not set.
-            // Other opts keys are ignored for forward compatibility.
-            let role = opts.as_ref().and_then(|o| o.get::<String>("role").ok());
+    // `_lua` is only touched under `#[cfg(feature = "nn")]` (the in-VM
+    // role="nn" fast path); on default builds the whole nn block is
+    // compiled out, hence the underscore prefix to silence
+    // unused-variable.
+    let llm =
+        lua.create_async_function(move |_lua, (prompt, opts): (String, Option<LuaTable>)| {
+            let tx = llm_tx.clone();
+            let bh = budget.clone();
+            let cs = card_store.clone();
+            async move {
+                bh.check().map_err(LuaError::external)?;
+                let system = opts.as_ref().and_then(|o| o.get::<String>("system").ok());
+                let max_tokens = opts
+                    .as_ref()
+                    .and_then(|o| o.get::<u32>("max_tokens").ok())
+                    .unwrap_or(1024);
+                let grounded = opts
+                    .as_ref()
+                    .and_then(|o| o.get::<bool>("grounded").ok())
+                    .unwrap_or(false);
+                let underspecified = opts
+                    .as_ref()
+                    .and_then(|o| o.get::<bool>("underspecified").ok())
+                    .unwrap_or(false);
+                let cache_breakpoint = opts
+                    .as_ref()
+                    .and_then(|o| o.get::<String>("cache_breakpoint").ok());
+                // Optional role hint (e.g. "grader"). Additive: absent when not set.
+                // Other opts keys are ignored for forward compatibility.
+                let role = opts.as_ref().and_then(|o| o.get::<String>("role").ok());
 
-            // Phase 3-F: optional card_context opt.  Two forms:
-            //   - String  → CardContextSpec::CardId
-            //   - Table   → CardContextSpec::Query { pkg (required), limit (default 5) }
-            // Other Lua types silently fall through to None (forward compat).
-            let card_context_spec = opts.as_ref().and_then(|o| {
-                let raw = o.get::<LuaValue>("card_context").ok()?;
-                match raw {
-                    LuaValue::String(s) => {
-                        Some(CardContextSpec::CardId(s.to_str().ok()?.to_string()))
-                    }
-                    LuaValue::Table(t) => {
-                        let pkg = t.get::<String>("pkg").ok()?;
-                        // Cap `limit` at 100 to bound the blocking N+1
-                        // fetch (find_with_store + N × get_with_store) that
-                        // runs synchronously inside this async closure.
-                        // Default matches the MVP contract (5); the ceiling
-                        // is a defensive guard against unbounded Lua input
-                        // stalling a tokio worker thread. Callers who need
-                        // more Cards should batch or narrow the query.
-                        let limit = t.get::<usize>("limit").unwrap_or(5).min(100);
-                        Some(CardContextSpec::Query { pkg, limit })
-                    }
-                    _ => None,
+                // In-process route for role="nn": a caller with role="nn" and
+                // model=<name> is asking an in-VM tiny model to answer. Dispatch
+                // to the algocline-nn model registry synchronously — no yield,
+                // no host round-trip. Everything else falls through to the normal
+                // Host path unchanged.
+                #[cfg(feature = "nn")]
+                if role.as_deref() == Some("nn") {
+                    let model_name = opts
+                        .as_ref()
+                        .and_then(|o| o.get::<String>("model").ok())
+                        .ok_or_else(|| {
+                            LuaError::external("alc.llm role=\"nn\": missing model = <name>")
+                        })?;
+                    let registry = _lua
+                        .app_data_ref::<algocline_nn::NnModelRegistry>()
+                        .ok_or_else(|| {
+                            LuaError::external(
+                                "alc.llm role=\"nn\": alc.nn registry missing — has alc.nn been \
+                             initialised on this VM?",
+                            )
+                        })?;
+                    let forward = registry.get(&model_name).ok_or_else(|| {
+                        LuaError::external(format!(
+                            "alc.llm role=\"nn\": no model registered as {model_name:?}"
+                        ))
+                    })?;
+                    // Drop the borrow before calling the closure so a re-entrant
+                    // alc.llm inside the model closure would not deadlock the
+                    // registry cell.
+                    drop(registry);
+                    return forward.call::<String>(prompt);
                 }
-            });
 
-            let effective_system = if let Some(spec) = card_context_spec {
-                match card_context::resolve(cs.as_ref(), spec) {
-                    Ok(cards) if !cards.is_empty() => {
-                        let prefix = card_context::format_past_cards(&cards);
-                        Some(match system {
-                            Some(existing) => format!("{prefix}\n\n{existing}"),
-                            None => prefix,
-                        })
+                // Phase 3-F: optional card_context opt.  Two forms:
+                //   - String  → CardContextSpec::CardId
+                //   - Table   → CardContextSpec::Query { pkg (required), limit (default 5) }
+                // Other Lua types silently fall through to None (forward compat).
+                let card_context_spec = opts.as_ref().and_then(|o| {
+                    let raw = o.get::<LuaValue>("card_context").ok()?;
+                    match raw {
+                        LuaValue::String(s) => {
+                            Some(CardContextSpec::CardId(s.to_str().ok()?.to_string()))
+                        }
+                        LuaValue::Table(t) => {
+                            let pkg = t.get::<String>("pkg").ok()?;
+                            // Cap `limit` at 100 to bound the blocking N+1
+                            // fetch (find_with_store + N × get_with_store) that
+                            // runs synchronously inside this async closure.
+                            // Default matches the MVP contract (5); the ceiling
+                            // is a defensive guard against unbounded Lua input
+                            // stalling a tokio worker thread. Callers who need
+                            // more Cards should batch or narrow the query.
+                            let limit = t.get::<usize>("limit").unwrap_or(5).min(100);
+                            Some(CardContextSpec::Query { pkg, limit })
+                        }
+                        _ => None,
                     }
-                    Ok(_) => system,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "algocline::card_context",
-                            error = %e,
-                            "resolve failed, skipping card_context inject"
-                        );
-                        system
+                });
+
+                let effective_system = if let Some(spec) = card_context_spec {
+                    match card_context::resolve(cs.as_ref(), spec) {
+                        Ok(cards) if !cards.is_empty() => {
+                            let prefix = card_context::format_past_cards(&cards);
+                            Some(match system {
+                                Some(existing) => format!("{prefix}\n\n{existing}"),
+                                None => prefix,
+                            })
+                        }
+                        Ok(_) => system,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "algocline::card_context",
+                                error = %e,
+                                "resolve failed, skipping card_context inject"
+                            );
+                            system
+                        }
                     }
-                }
-            } else {
-                system
-            };
+                } else {
+                    system
+                };
 
-            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
-            tx.send(LlmRequest {
-                queries: vec![QueryRequest {
-                    id: QueryId::single(),
-                    prompt,
-                    system: effective_system,
-                    max_tokens,
-                    grounded,
-                    underspecified,
-                    cache_breakpoint,
-                    role,
-                    resp_tx,
-                }],
-            })
-            .await
-            .map_err(|e| LuaError::external(format!("LLM bridge send failed: {e}")))?;
-
-            resp_rx
+                tx.send(LlmRequest {
+                    queries: vec![QueryRequest {
+                        id: QueryId::single(),
+                        prompt,
+                        system: effective_system,
+                        max_tokens,
+                        grounded,
+                        underspecified,
+                        cache_breakpoint,
+                        role,
+                        resp_tx,
+                    }],
+                })
                 .await
-                .map_err(|e| LuaError::external(format!("LLM bridge recv failed: {e}")))?
-                .map_err(LuaError::external)
-        }
-    })?;
+                .map_err(|e| LuaError::external(format!("LLM bridge send failed: {e}")))?;
+
+                resp_rx
+                    .await
+                    .map_err(|e| LuaError::external(format!("LLM bridge recv failed: {e}")))?
+                    .map_err(LuaError::external)
+            }
+        })?;
 
     alc_table.set("llm", llm)?;
     Ok(())

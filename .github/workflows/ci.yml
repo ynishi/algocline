@@ -24,7 +24,10 @@ jobs:
           tool: just
 
       - name: Install stylua 2.3.1 (pinned)
-        run: cargo install --locked --version 2.3.1 stylua
+        # `lua54` feature enables Lua 5.3+ parser (bitwise `>>` / `&`, `goto`
+        # label). stylua's default features omit it, so `cargo install stylua`
+        # ships a Lua 5.1-only parser and fails on prod Lua sources here.
+        run: cargo install --locked --version 2.3.1 --features lua54 stylua
 
       - name: Run CI checks
         run: just ci

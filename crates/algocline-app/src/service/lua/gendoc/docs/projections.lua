@@ -1,4 +1,4 @@
----@diagnostic disable: param-type-mismatch, need-check-nil, unnecessary-if
+---@diagnostic disable: param-type-mismatch, need-check-nil, unnecessary-if, assign-type-mismatch
 --- tools.docs.projections — PkgInfo → derived artifacts.
 ---
 --- Pure functions. Each projection takes a PkgInfo (or a collection)

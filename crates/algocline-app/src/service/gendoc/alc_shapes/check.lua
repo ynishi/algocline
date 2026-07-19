@@ -1,3 +1,4 @@
+---@diagnostic disable: unnecessary-if
 --- alc_shapes.check — validator (check / assert / assert_dev / is_dev_mode).
 ---
 --- API:

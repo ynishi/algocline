@@ -81,8 +81,15 @@ assert(reloaded:vocab() == 64, "reloaded handle must keep vocab=64")
 -- restored inside the shared model, so this exercises the
 -- LoraLinear::forward code path.
 local shape = reloaded:forward_shape(1, 4)
-assert(shape[1] == 1 and shape[2] == 4 and shape[3] == 64,
-    "reloaded forward_shape mismatch: " .. tostring(shape[1]) .. "x" .. tostring(shape[2]) .. "x" .. tostring(shape[3]))
+assert(
+    shape[1] == 1 and shape[2] == 4 and shape[3] == 64,
+    "reloaded forward_shape mismatch: "
+        .. tostring(shape[1])
+        .. "x"
+        .. tostring(shape[2])
+        .. "x"
+        .. tostring(shape[3])
+)
 
 return {
     ok = true,

@@ -799,7 +799,8 @@ do
     -- Default rubric for the `llm_rubric` judge (Boost Bench v3 axes).
     -- Criteria are specific and behavioral (no vague catch-alls); the judge
     -- reads them and returns a single overall 1-5 rating.
-    local DEFAULT_RUBRIC = [[Grade the response against these three criteria, then give ONE overall rating:
+    local DEFAULT_RUBRIC =
+        [[Grade the response against these three criteria, then give ONE overall rating:
 1. Factual accuracy — every claim is correct and free of fabrication; no unsupported, outdated, or misleading statements.
 2. Frontier reach — the answer reflects the current state of the art of the topic rather than introductory or obsolete content.
 3. Depth of reasoning — the response explains why, works through trade-offs and edge cases, instead of only stating conclusions.]]
@@ -832,8 +833,7 @@ do
         local scale_min, scale_max = 1, 5
         return ef.grader("llm_rubric")({
             check = function(resp, case)
-                local rubric = (case.context and case.context._alc_rubric)
-                    or DEFAULT_RUBRIC
+                local rubric = (case.context and case.context._alc_rubric) or DEFAULT_RUBRIC
                 local prompt = string.format(
                     [[You are an evaluation judge. Grade the following response.
 
@@ -870,11 +870,7 @@ Reply with ONLY a single number, nothing else.]],
                 end
                 local rating = tonumber(text:match("(%d+%.?%d*)"))
                 if not rating then
-                    return nil,
-                        string.format(
-                            "judge did not return a number: %s",
-                            text:sub(1, 100)
-                        )
+                    return nil, string.format("judge did not return a number: %s", text:sub(1, 100))
                 end
                 return math.max(scale_min, math.min(scale_max, rating))
             end,

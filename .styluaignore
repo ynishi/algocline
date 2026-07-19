@@ -8,6 +8,9 @@ crates/algocline-engine/tests/lua/
 tests/fixtures/
 examples/cards/
 
+# Vendored upstream (DO NOT EDIT — upstream sync via manual copy)
+crates/algocline-engine/src/vendor/
+
 # Build / worktree / workspace
 target/
 workspace/

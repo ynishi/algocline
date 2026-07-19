@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.46.0] - 2026-07-19
+
+### Added
+
 - New opt-in `algocline-nn` workspace crate + `alc.nn.*` Lua bridge, gated
   behind the `nn` feature on `algocline-engine` (default off — the default
   build does not link candle). Provides a thin candle-based

@@ -505,8 +505,9 @@ impl AppService {
         {
             if is_credential {
                 let app_dir_path = self.log_config.app_dir().root().to_owned();
+                let home = crate::service::config::AppConfig::resolve_home();
                 let report = tokio::task::spawn_blocking(move || {
-                    crate::service::gh_credentials::diagnose(&app_dir_path)
+                    crate::service::gh_credentials::diagnose(&app_dir_path, home.as_deref())
                 })
                 .await
                 .map_err(|e| CardPublishError::GitCommand {
@@ -583,8 +584,9 @@ impl AppService {
         {
             if is_credential {
                 let app_dir_path = self.log_config.app_dir().root().to_owned();
+                let home = crate::service::config::AppConfig::resolve_home();
                 let report = tokio::task::spawn_blocking(move || {
-                    crate::service::gh_credentials::diagnose(&app_dir_path)
+                    crate::service::gh_credentials::diagnose(&app_dir_path, home.as_deref())
                 })
                 .await
                 .map_err(|e| CardPublishError::GitCommand {

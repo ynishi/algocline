@@ -142,8 +142,17 @@ check-invariants:
         fail=1
     fi
     # Inv-3: engine crate must not import AppDir/AppConfig from core.
+    #
+    # Rustdoc intra-doc links inside doc comments (`///` / `//!`) reference
+    # `algocline_core::AppDir::nn_dir` etc. as documentation about *what the
+    # service layer resolves for us* — engine keeps the direct dependency in
+    # Cargo.toml purely for these links. Those are not runtime references,
+    # so we strip doc-comment lines before deciding failure. Ordinary `//`
+    # code comments are left in the grep window on purpose so that "sneaking
+    # a use behind a `// comment`" still gets caught.
     if grep -rn -E 'algocline_core::(AppDir|AppConfig)' \
-            crates/algocline-engine/src/ --include='*.rs'; then
+            crates/algocline-engine/src/ --include='*.rs' \
+            | grep -v -E '^[^:]+:[0-9]+:[[:space:]]*(///|//!)'; then
         echo "Inv-3 FAILED: engine references algocline_core::AppDir/AppConfig" >&2
         fail=1
     fi

@@ -76,10 +76,10 @@ pub(crate) struct OriginRemoteStatus {
 /// Call it from `logging::info()` (sync) directly.  When calling from an
 /// async context (e.g. `card_publish_inner`), wrap in
 /// `tokio::task::spawn_blocking`.
-pub(crate) fn diagnose(app_dir: &Path) -> GhCredentialReport {
+pub(crate) fn diagnose(app_dir: &Path, home: Option<&Path>) -> GhCredentialReport {
     GhCredentialReport {
         gh_auth: check_gh_auth(),
-        ssh_keys: check_ssh_keys(),
+        ssh_keys: check_ssh_keys(home),
         git_config: check_git_config(),
         origin_remote: check_origin_remote(app_dir),
     }
@@ -166,7 +166,7 @@ fn check_gh_auth() -> GhAuthStatus {
     }
 }
 
-fn check_ssh_keys() -> SshKeyStatus {
+fn check_ssh_keys(home: Option<&Path>) -> SshKeyStatus {
     let candidates = [
         "id_ed25519",
         "id_rsa",
@@ -176,7 +176,6 @@ fn check_ssh_keys() -> SshKeyStatus {
         "id_ecdsa_sk",
     ];
 
-    let home = dirs::home_dir();
     let found: Vec<String> = match home {
         None => Vec::new(),
         Some(h) => {
@@ -287,7 +286,7 @@ mod tests {
     #[test]
     fn diagnose_does_not_panic_with_nonexistent_dir() {
         let dir = PathBuf::from("/nonexistent/path/that/does/not/exist");
-        let report = diagnose(&dir);
+        let report = diagnose(&dir, None);
         // origin_remote must absorb the error rather than panicking.
         assert!(!report.origin_remote.present);
     }
@@ -300,7 +299,7 @@ mod tests {
         // Use the current directory — git/gh may or may not be installed,
         // but the function must return a coherent report either way.
         let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let report = diagnose(&dir);
+        let report = diagnose(&dir, None);
 
         // Structural invariant: any_present must match found.is_empty() negation.
         assert_eq!(

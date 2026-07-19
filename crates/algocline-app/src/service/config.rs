@@ -120,6 +120,21 @@ impl AppConfig {
         self
     }
 
+    /// Resolve the user's home directory for facilities that legitimately
+    /// need real `~` access (e.g. `~/.ssh/` key detection in
+    /// `gh_credentials::check_ssh_keys`).
+    ///
+    /// This is the single Service-layer HOME-read site aside from
+    /// [`Self::resolve_app_dir`] itself. Every other caller in
+    /// `crates/algocline-app/src/service/**` MUST route through this fn
+    /// (or `resolve_app_dir` / `AppDir`) so `check-invariants` Inv-1
+    /// keeps a single-source-of-truth whitelist. Returns `None` on
+    /// sandboxes where `HOME` cannot be resolved (mirroring
+    /// `resolve_app_dir`'s fallback path).
+    pub fn resolve_home() -> Option<PathBuf> {
+        dirs::home_dir()
+    }
+
     /// Resolve the application root directory.
     ///
     /// 1. `ALC_HOME` env var (explicit override — highest priority).

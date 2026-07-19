@@ -212,7 +212,11 @@ impl AppService {
         // failures are absorbed into per-field error strings so info() never
         // short-circuits on a missing gh/git binary.
         // Uses std::process::Command (sync) because info() is a sync fn.
-        let gh_report = crate::service::gh_credentials::diagnose(self.log_config.app_dir().root());
+        let home = crate::service::config::AppConfig::resolve_home();
+        let gh_report = crate::service::gh_credentials::diagnose(
+            self.log_config.app_dir().root(),
+            home.as_deref(),
+        );
         info["gh_credentials"] = serde_json::to_value(&gh_report)
             .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
 

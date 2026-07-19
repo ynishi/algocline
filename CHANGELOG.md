@@ -26,6 +26,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `<root>/<name>.gguf` under the same root and name-safety rules as
     the safetensors path. Additive on the MCP wire; breaking only for
     downstream code that implements `NnStore` and wants to expose GGUF.
+- `algocline-nn`: inference adapter over `candle-transformers` for
+  Llama-family models (Layer 2 of GH #9).
+  - New optional-feature-free dependency on `candle-transformers = "0.11"`
+    (lockstep with `candle-core` / `candle-nn`; the `nn-cuda` feature
+    now also enables `candle-transformers/cuda`).
+  - New `algocline_nn::arch::adapter::{LlamaAdapter, LlamaAdapterConfig}`
+    module wrapping `candle_transformers::models::llama::Llama` behind
+    an inference handle. `LlamaAdapter::load` / `from_safetensors_files`
+    load parameters through a `VarBuilder`; `LlamaAdapter::forward`
+    threads through an owned KV `Cache` so token-by-token generation
+    reuses cache state without exposing candle-transformers types to
+    the caller.
+  - `alc.nn.preset.llama(variant, opts)` — Lua binding returning a
+    `LlamaHandle` UserData with the same metadata surface as
+    `Gpt2Handle` (`variant` / `layers` / `heads` / `kv_heads` / `dim` /
+    `ctx` / `vocab` / `device` / `dtype` / `forward_shape`).
+    Accepts `"tiny"` / `"7b-v1"` / `"7b-v2"` (plus their `"llama-*"`
+    aliases) with `device` / `dtype` / `weights` / `use_kv_cache` /
+    `flash_attn` options.
+  - The handle is inference-only by construction (no `VarMap`), so
+    `alc.nn.trainer.*` continues to refuse handles that were not built
+    from a from-scratch VarMap — no training-path regression.
+  - `docs/lua-stdlib.md` gains an `alc.nn.preset.llama` section
+    documenting variants, opts, methods, and the "wrap the handle in
+    a Lua closure + `alc.nn.register`" recipe for exposing the model
+    through `alc.llm(prompt, {role="nn", model=name})`.
 
 ### Changed
 

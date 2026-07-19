@@ -14,6 +14,7 @@
 //! bundle can be loaded through [`candle_nn::VarBuilder::from_mmaped_safetensors`]
 //! with the same variable names used at construction time.
 
+pub mod adapter;
 pub mod gpt2;
 pub mod lora;
 

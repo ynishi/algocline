@@ -31,6 +31,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use algocline_nn::arch::adapter::{LlamaAdapter, LlamaAdapterConfig};
 use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig};
 use algocline_nn::card::{
     validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
@@ -653,14 +654,236 @@ impl Gpt2Handle {
 fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
     let preset = lua.create_table()?;
 
+    let gpt2_nn_dir = nn_dir.clone();
     let gpt2 = lua.create_function(
         move |_lua, (variant, opts): (String, Option<LuaTable>)| -> LuaResult<Gpt2Handle> {
-            build_gpt2_handle(&variant, opts.as_ref(), &nn_dir)
+            build_gpt2_handle(&variant, opts.as_ref(), &gpt2_nn_dir)
         },
     )?;
     preset.set("gpt2", gpt2)?;
+
+    // Llama-family inference preset (GH #9 Layer 2). Wraps
+    // `candle_transformers::models::llama` through
+    // `algocline_nn::arch::adapter::LlamaAdapter` and hands Lua a
+    // `LlamaHandle` UserData mirroring the `Gpt2Handle` shape. This
+    // path is inference-only: `LlamaHandle` deliberately does not
+    // carry a `VarMap`, so `alc.nn.trainer.*` refuses it up front
+    // rather than silently producing a no-op training loop.
+    let llama = lua.create_function(
+        move |_lua, (variant, opts): (String, Option<LuaTable>)| -> LuaResult<LlamaHandle> {
+            build_llama_handle(&variant, opts.as_ref())
+        },
+    )?;
+    preset.set("llama", llama)?;
+
     nn_table.set("preset", preset)?;
     Ok(())
+}
+
+// ─── alc.nn.preset.llama ──────────────────────────────────────────
+
+/// Opaque handle exposed to Lua for a constructed Llama-family model.
+///
+/// Inference-only counterpart of [`Gpt2Handle`]: wraps a
+/// [`LlamaAdapter`] (which itself wraps
+/// `candle_transformers::models::llama::Llama`) and carries the same
+/// metadata fields the caller inspects (`variant` / `layers` /
+/// `heads` / `dim` / `ctx` / `vocab` / `device` / `dtype`). No
+/// `VarMap` is carried because the adapter loads its parameters from
+/// a `VarBuilder::from_mmaped_safetensors` reader or a plain
+/// `VarBuilder::from_varmap` for the smoke `tiny` variant; the
+/// training bindings check the absent `VarMap` on the sibling
+/// [`Gpt2Handle`] to refuse from-pretrained handles, and the same
+/// invariant applies to Llama by construction (no `varmap()`
+/// accessor is exposed).
+pub(super) struct LlamaHandle {
+    inner: Arc<LlamaAdapter>,
+    variant: String,
+    layers: usize,
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+    ctx: usize,
+    vocab: usize,
+    device: String,
+    dtype: String,
+}
+
+impl mlua::UserData for LlamaHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("variant", |_, this, ()| Ok(this.variant.clone()));
+        methods.add_method("layers", |_, this, ()| Ok(this.layers));
+        methods.add_method("heads", |_, this, ()| Ok(this.heads));
+        methods.add_method("kv_heads", |_, this, ()| Ok(this.kv_heads));
+        methods.add_method("dim", |_, this, ()| Ok(this.dim));
+        methods.add_method("ctx", |_, this, ()| Ok(this.ctx));
+        methods.add_method("vocab", |_, this, ()| Ok(this.vocab));
+        methods.add_method("device", |_, this, ()| Ok(this.device.clone()));
+        methods.add_method("dtype", |_, this, ()| Ok(this.dtype.clone()));
+        methods.add_method("forward_shape", |_, this, (batch, _seq): (usize, usize)| {
+            // Llama forward slices the last-token logits before
+            // returning, so the caller-visible output shape is
+            // `[batch, vocab]` regardless of the input sequence
+            // length.
+            Ok(vec![batch, this.vocab])
+        });
+    }
+}
+
+impl LlamaHandle {
+    /// Shared handle to the underlying adapter, for callers who want
+    /// to drive `forward` from Rust-side helper code.
+    #[allow(dead_code)]
+    pub(super) fn adapter(&self) -> Arc<LlamaAdapter> {
+        Arc::clone(&self.inner)
+    }
+}
+
+fn build_llama_handle(variant: &str, opts: Option<&LuaTable>) -> LuaResult<LlamaHandle> {
+    // Resolve the variant with the caller-visible `flash_attn` opt so
+    // an `--features flash-attn` GPU build can enable fused attention
+    // without a second call site. Defaults to `false` because
+    // `candle-transformers`'s flash-attn path requires the extra
+    // Cargo feature to be enabled.
+    let flash_attn = opts
+        .and_then(|t| t.get::<Option<bool>>("flash_attn").ok().flatten())
+        .unwrap_or(false);
+    let mut cfg = LlamaAdapterConfig::from_variant(variant, flash_attn).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.preset.llama: unknown variant '{variant}' \
+             (expected 'tiny' / '7b-v1' / '7b-v2', or one of their 'llama-*' aliases)"
+        ))
+    })?;
+
+    let device_str = opts
+        .and_then(|t| t.get::<Option<String>>("device").ok().flatten())
+        .unwrap_or_else(|| "cpu".to_string());
+    let dtype_str = opts
+        .and_then(|t| t.get::<Option<String>>("dtype").ok().flatten())
+        .unwrap_or_else(|| {
+            // Match the GPT-2 default matrix: bf16 on CUDA, f32
+            // elsewhere. The `nn-metal` follow-up (GH #9 Layer 3)
+            // extends this with f16 on Metal.
+            if device_str.starts_with("cuda") {
+                "bf16".to_string()
+            } else {
+                "f32".to_string()
+            }
+        });
+    let use_kv_cache = opts
+        .and_then(|t| t.get::<Option<bool>>("use_kv_cache").ok().flatten())
+        .unwrap_or(true);
+
+    cfg.device = parse_llama_device(&device_str)?;
+    cfg.dtype = parse_llama_dtype(&dtype_str)?;
+    cfg.use_kv_cache = use_kv_cache;
+
+    if matches!(cfg.device, Device::Cpu) && matches!(cfg.dtype, DType::BF16) {
+        return Err(LuaError::external(
+            "alc.nn.preset.llama: bf16 dtype requires a CUDA device (use dtype='f32' on CPU)"
+                .to_string(),
+        ));
+    }
+
+    // Weight source: `opts.weights` is either a single string path or
+    // a Lua array of strings for a sharded safetensors bundle. Absent
+    // → random VarMap-backed adapter (only useful for the `tiny`
+    // smoke variant; caller can still `forward` for shape assertions).
+    let weights_paths = extract_weights_paths(opts)?;
+
+    let (adapter, cfg_snapshot) = if let Some(paths) = weights_paths {
+        let cfg_snapshot = cfg.clone();
+        let adapter = LlamaAdapter::from_safetensors_files(&paths, cfg)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.llama: {e}")))?;
+        (adapter, cfg_snapshot)
+    } else {
+        let cfg_snapshot = cfg.clone();
+        let vm = VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let adapter = LlamaAdapter::load(vb, cfg)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.llama: {e}")))?;
+        // Drop `vm` on purpose: the adapter is inference-only and
+        // never expects a trainable VarMap; the surrounding scope
+        // guarantees the mmap-less handle stays valid because the
+        // adapter now owns the tensor snapshots.
+        drop(vm);
+        (adapter, cfg_snapshot)
+    };
+
+    Ok(LlamaHandle {
+        inner: Arc::new(adapter),
+        variant: variant.to_string(),
+        layers: cfg_snapshot.config.num_hidden_layers,
+        heads: cfg_snapshot.config.num_attention_heads,
+        kv_heads: cfg_snapshot.config.num_key_value_heads,
+        dim: cfg_snapshot.config.hidden_size,
+        ctx: cfg_snapshot.config.max_position_embeddings,
+        vocab: cfg_snapshot.config.vocab_size,
+        device: device_str,
+        dtype: dtype_str,
+    })
+}
+
+fn extract_weights_paths(opts: Option<&LuaTable>) -> LuaResult<Option<Vec<PathBuf>>> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+    let Some(raw) = opts.get::<Option<mlua::Value>>("weights").ok().flatten() else {
+        return Ok(None);
+    };
+    match raw {
+        mlua::Value::String(s) => Ok(Some(vec![PathBuf::from(s.to_str()?.to_string())])),
+        mlua::Value::Table(tbl) => {
+            let mut out = Vec::new();
+            for pair in tbl.sequence_values::<String>() {
+                out.push(PathBuf::from(pair?));
+            }
+            if out.is_empty() {
+                return Err(LuaError::external(
+                    "alc.nn.preset.llama: opts.weights is empty; provide at least one path",
+                ));
+            }
+            Ok(Some(out))
+        }
+        _ => Err(LuaError::external(
+            "alc.nn.preset.llama: opts.weights must be a string or an array of strings",
+        )),
+    }
+}
+
+fn parse_llama_device(s: &str) -> LuaResult<Device> {
+    if s == "cpu" {
+        return Ok(Device::Cpu);
+    }
+    if let Some(rest) = s.strip_prefix("cuda:") {
+        let ord: usize = rest.parse().map_err(|e| {
+            LuaError::external(format!(
+                "alc.nn.preset.llama: invalid cuda ordinal '{rest}': {e}"
+            ))
+        })?;
+        return Device::new_cuda(ord).map_err(|e| {
+            LuaError::external(format!("alc.nn.preset.llama: cuda:{ord} unavailable: {e}"))
+        });
+    }
+    if s == "cuda" {
+        return Device::new_cuda(0).map_err(|e| {
+            LuaError::external(format!("alc.nn.preset.llama: cuda unavailable: {e}"))
+        });
+    }
+    Err(LuaError::external(format!(
+        "alc.nn.preset.llama: unknown device '{s}' (expected 'cpu', 'cuda', or 'cuda:N')"
+    )))
+}
+
+fn parse_llama_dtype(s: &str) -> LuaResult<DType> {
+    match s {
+        "f32" | "fp32" => Ok(DType::F32),
+        "bf16" => Ok(DType::BF16),
+        "f16" | "fp16" => Ok(DType::F16),
+        other => Err(LuaError::external(format!(
+            "alc.nn.preset.llama: unknown dtype '{other}' (expected 'f32', 'bf16', or 'f16')"
+        ))),
+    }
 }
 
 fn build_gpt2_handle(

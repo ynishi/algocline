@@ -173,3 +173,77 @@ fn alc_llm_role_nn_unknown_model_errors() {
         "unexpected error: {err}"
     );
 }
+
+/// `alc.nn.preset.llama("tiny")` builds a Llama handle and exposes the
+/// same metadata shape as `Gpt2Handle`. Covers GH #9 Layer 2 (inference
+/// adapter): the Lua-facing preset returns a UserData with `variant`,
+/// `layers`, `heads`, `kv_heads`, `dim`, `ctx`, `vocab`, `device`,
+/// `dtype`, and `forward_shape(batch, seq)`. The `tiny` variant
+/// deliberately does not require a weights bundle so the smoke test
+/// stays offline.
+#[test]
+fn alc_nn_preset_llama_tiny_builds_handle_with_metadata() {
+    let lua = nn_vm();
+    let dims: Vec<usize> = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            assert(h:variant() == "tiny", "variant mismatch")
+            assert(h:layers() == 2, "layers mismatch")
+            assert(h:heads() == 2, "heads mismatch")
+            assert(h:kv_heads() == 2, "kv_heads mismatch")
+            assert(h:dim() == 32, "dim mismatch")
+            assert(h:ctx() == 16, "ctx mismatch")
+            assert(h:vocab() == 64, "vocab mismatch")
+            assert(h:device() == "cpu", "device mismatch")
+            assert(h:dtype() == "f32", "dtype mismatch")
+            return h:forward_shape(1, 4)
+        "#,
+        )
+        .eval()
+        .expect("build tiny llama handle");
+    assert_eq!(dims, vec![1, 64]);
+}
+
+/// Unknown variant surfaces a clear Lua-side error with the allowed
+/// name list, so a typo (`"tinyllma"`, `"7b-v3"`) is caught early
+/// rather than percolating into a candle-side load failure.
+#[test]
+fn alc_nn_preset_llama_unknown_variant_errors() {
+    let lua = nn_vm();
+    let err = lua
+        .load(
+            r#"
+            alc.nn.preset.llama("tinyllma")
+        "#,
+        )
+        .exec()
+        .expect_err("unknown variant must error")
+        .to_string();
+    assert!(
+        err.contains("unknown variant") && err.contains("tinyllma"),
+        "unexpected error: {err}"
+    );
+}
+
+/// bf16 requires CUDA — the CPU path must reject `dtype = "bf16"` up
+/// front rather than let candle emit an obscure kernel error at
+/// forward time. Matches the existing `Gpt2Handle` guard so the two
+/// presets keep the same failure mode.
+#[test]
+fn alc_nn_preset_llama_bf16_on_cpu_errors() {
+    let lua = nn_vm();
+    let err = lua
+        .load(
+            r#"
+            alc.nn.preset.llama("tiny", { device = "cpu", dtype = "bf16" })
+        "#,
+        )
+        .exec()
+        .expect_err("bf16 on cpu must error")
+        .to_string();
+    assert!(
+        err.contains("bf16 dtype requires a CUDA device"),
+        "unexpected error: {err}"
+    );
+}

@@ -685,6 +685,71 @@ Notes:
   under the algocline app dir); tests and alternate Hosts can inject their
   own store without changing the Lua-visible API.
 
+#### `alc.nn.preset.llama(variant, opts?)`
+
+Build an inference-only Llama-family handle by wrapping
+`candle_transformers::models::llama::Llama` behind the same UserData shape
+`alc.nn.preset.gpt2` returns.
+
+**Parameters:**
+
+| name    | type   | required | notes                                         |
+|---------|--------|----------|-----------------------------------------------|
+| variant | string | yes      | `"tiny"` / `"7b-v1"` / `"7b-v2"` (or the `"llama-*"` aliases) |
+| opts    | table  | no       | `device` / `dtype` / `weights` / `use_kv_cache` / `flash_attn` |
+
+**opts fields (all optional):**
+
+- `device` — `"cpu"` / `"cuda"` / `"cuda:N"`. Default: `"cpu"`. The
+  `nn-metal` follow-up (GH #9 Layer 3) adds `"metal"`.
+- `dtype` — `"f32"` / `"bf16"` / `"f16"`. Default: `"bf16"` on CUDA,
+  `"f32"` elsewhere. `bf16` on CPU errors up front.
+- `weights` — a single safetensors path or an array of paths for a
+  sharded bundle. Absent → random VarMap-backed handle (only useful
+  for the `"tiny"` variant's shape assertions; production callers must
+  supply weights).
+- `use_kv_cache` — `bool`, default `true`. `false` disables the
+  streaming KV cache for one-shot benchmarks.
+- `flash_attn` — `bool`, default `false`. Enables fused attention on
+  CUDA builds compiled with the `flash-attn` cargo feature.
+
+**Returns:** `LlamaHandle` UserData. Methods: `:variant()`,
+`:layers()`, `:heads()`, `:kv_heads()`, `:dim()`, `:ctx()`, `:vocab()`,
+`:device()`, `:dtype()`, `:forward_shape(batch, seq) -> {batch, vocab}`.
+
+**Errors:**
+
+- `alc.nn.preset.llama: unknown variant '...'` — variant is not one of
+  the accepted names.
+- `alc.nn.preset.llama: bf16 dtype requires a CUDA device (use dtype='f32' on CPU)`.
+- `alc.nn.preset.llama: opts.weights must be a string or an array of strings`.
+
+```lua
+-- Shape check on the tiny (offline) variant:
+local h = alc.nn.preset.llama("tiny")
+assert(h:forward_shape(1, 4)[2] == h:vocab())
+
+-- Real load from local safetensors shards:
+local h = alc.nn.preset.llama("7b-v2", {
+    device = "cuda:0",
+    dtype = "bf16",
+    weights = { "/models/llama-7b/model-00001-of-00002.safetensors",
+                "/models/llama-7b/model-00002-of-00002.safetensors" },
+})
+```
+
+Notes:
+
+- **Inference-only.** The handle does not carry a `VarMap`, so
+  `alc.nn.trainer.full_ft` / `.lora` / `.distill` refuse it. Training
+  on Llama is scoped to a sibling issue.
+- **Adapter over candle-transformers.** The Rust-side wrapper lives in
+  `algocline_nn::arch::adapter::llama`. Adding a new architecture
+  (Qwen2 / Phi / Gemma) is a sibling module on the same shape.
+- Wrap the returned handle in a Lua closure and pass it to
+  `alc.nn.register(name, forward)` to expose the model through
+  `alc.llm(prompt, { role = "nn", model = name })`.
+
 ---
 
 ## Layer 1: Prelude Combinators

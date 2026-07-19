@@ -179,6 +179,48 @@ fn empty_object() -> Json {
     Json::Object(serde_json::Map::new())
 }
 
+/// Architecture family prefixes accepted for [`NnCardMeta::architecture`].
+///
+/// Values written by the engine bridge use the `<family>-<variant>` shape
+/// (e.g. `"gpt2-medium"`, `"llama-3.2-1b"`, `"tinyllama-1.1b"`). At save
+/// time the bridge validates the prefix against this list so a typo does
+/// not silently write an unloadable Card, and downstream loaders can
+/// route by family prefix without a second lookup table.
+///
+/// Extend this list when a new trainable or inference-only architecture
+/// lands; the corresponding `alc.nn.preset.<family>` binding is expected
+/// to populate the same prefix.
+pub const SUPPORTED_ARCHITECTURE_FAMILIES: &[&str] =
+    &["gpt2", "llama", "tinyllama", "qwen2", "phi", "gemma"];
+
+/// Validate that `arch` starts with a known family prefix from
+/// [`SUPPORTED_ARCHITECTURE_FAMILIES`].
+///
+/// Accepts either the bare family name (`"gpt2"`) or the
+/// `<family>-<variant>` form (`"gpt2-medium"`). The prefix must be
+/// followed by end-of-string or `-`; a longer identifier that happens to
+/// start with a family name (`"gpt2experimental"`) is rejected so the
+/// namespace stays partitioned.
+pub fn validate_architecture(arch: &str) -> Result<(), String> {
+    if arch.is_empty() {
+        return Err("architecture must not be empty".into());
+    }
+    for family in SUPPORTED_ARCHITECTURE_FAMILIES {
+        if arch == *family {
+            return Ok(());
+        }
+        if let Some(rest) = arch.strip_prefix(family) {
+            if rest.starts_with('-') {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "unknown architecture family for {arch:?} (expected one of {SUPPORTED_ARCHITECTURE_FAMILIES:?}, \
+         optionally followed by '-<variant>')"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +390,41 @@ mod tests {
         assert!(meta.lineage.parent.is_none());
         assert_eq!(meta.hyperparams, empty_object());
         assert_eq!(meta.metrics, empty_object());
+    }
+
+    #[test]
+    fn validate_architecture_accepts_known_families() {
+        for arch in [
+            "gpt2",
+            "gpt2-medium",
+            "gpt2-large",
+            "gpt2-tiny",
+            "llama",
+            "llama-3.2-1b",
+            "tinyllama",
+            "tinyllama-1.1b",
+            "tinyllama-tiny",
+            "qwen2",
+            "qwen2-0.5b",
+            "phi",
+            "phi-1.5",
+            "gemma",
+            "gemma-2b",
+        ] {
+            assert!(
+                validate_architecture(arch).is_ok(),
+                "expected {arch} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_architecture_rejects_unknown_and_typos() {
+        for arch in ["", "gpt3", "mistral-7b", "gpt2experimental", " gpt2-medium"] {
+            assert!(
+                validate_architecture(arch).is_err(),
+                "expected {arch:?} to be rejected"
+            );
+        }
     }
 }

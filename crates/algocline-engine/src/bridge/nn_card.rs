@@ -32,7 +32,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig};
-use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch};
+use algocline_nn::card::{
+    validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
+};
 use algocline_nn::tokenizer::HfTokenizer;
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, Batch, CrossEntropyLoss, Dataset, DatasetOpts,
@@ -428,6 +430,8 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
         .and_then(|v| v.as_str())
         .ok_or_else(|| LuaError::external("alc.nn.card.save: meta.architecture is required"))?
         .to_string();
+    validate_architecture(&architecture)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.save: {e}")))?;
     let task = user_meta
         .get("task")
         .and_then(|v| v.as_str())

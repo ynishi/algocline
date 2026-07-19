@@ -99,6 +99,22 @@ pub trait NnStore: Send + Sync {
     /// Return the read path for `name`. Implementations do not need to check
     /// existence — the caller surfaces missing-file errors from the loader.
     fn load_path(&self, name: &str) -> Result<PathBuf, NnStoreError>;
+
+    /// Return the read path for a pretrained GGUF (Q4 / Q8) bundle
+    /// named `name`. Used by inference-only architectures that consume
+    /// quantized weights alongside the standard safetensors write path.
+    ///
+    /// The default implementation returns `Err` so a backend that does
+    /// not manage quantized bundles never has to acknowledge the
+    /// extension; concrete backends that place `.gguf` files alongside
+    /// their safetensors bundles override this to return the concrete
+    /// path.
+    fn load_gguf_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+        let _ = name;
+        Err(NnStoreError::new(
+            "GGUF read path is not implemented by this NnStore backend",
+        ))
+    }
 }
 
 /// Filesystem-rooted default [`NnStore`].
@@ -117,7 +133,7 @@ impl FsStore {
         Self { root: root.into() }
     }
 
-    fn resolve(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+    fn resolve(&self, name: &str, extension: &str) -> Result<PathBuf, NnStoreError> {
         if name.is_empty()
             || !name
                 .chars()
@@ -128,13 +144,13 @@ impl FsStore {
                 "invalid model name {name:?} (allowed: [A-Za-z0-9_.-], no '..')"
             )));
         }
-        Ok(self.root.join(format!("{name}.safetensors")))
+        Ok(self.root.join(format!("{name}.{extension}")))
     }
 }
 
 impl NnStore for FsStore {
     fn save_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
-        let p = self.resolve(name)?;
+        let p = self.resolve(name, "safetensors")?;
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| NnStoreError::new(format!("create {parent:?}: {e}")))?;
@@ -143,7 +159,14 @@ impl NnStore for FsStore {
     }
 
     fn load_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
-        self.resolve(name)
+        self.resolve(name, "safetensors")
+    }
+
+    /// Resolve `name` to `<root>/<name>.gguf`. Existence is not checked
+    /// here so the loader emits the missing-file error with its own
+    /// context (`alc.nn.load` / adapter loader).
+    fn load_gguf_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+        self.resolve(name, "gguf")
     }
 }
 
@@ -690,6 +713,49 @@ mod tests {
         assert!(store.save_path("a/b").is_err());
         assert!(store.save_path("").is_err());
         assert!(store.save_path("ok_name-1.v2").is_ok());
+    }
+
+    /// FsStore resolves `<name>.gguf` under the same root and enforces
+    /// the same name-safety rules as the safetensors path.
+    #[test]
+    fn fs_store_gguf_path_resolves_alongside_safetensors() {
+        let root = std::env::temp_dir().join("alc-nn-gguf-test");
+        let store = FsStore::new(&root);
+
+        let st = store.load_path("model-a").unwrap();
+        let gg = store.load_gguf_path("model-a").unwrap();
+        assert_eq!(st.parent(), gg.parent());
+        assert_eq!(st.file_name().unwrap(), "model-a.safetensors");
+        assert_eq!(gg.file_name().unwrap(), "model-a.gguf");
+
+        assert!(store.load_gguf_path("../evil").is_err());
+        assert!(store.load_gguf_path("a/b").is_err());
+        assert!(store.load_gguf_path("").is_err());
+    }
+
+    /// A backend that leaves `load_gguf_path` at its default must surface
+    /// a clear error rather than silently no-oping.
+    #[test]
+    fn nn_store_default_gguf_path_is_not_implemented() {
+        struct NoGgufStore;
+        impl NnStore for NoGgufStore {
+            fn save_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+                Ok(PathBuf::from(format!("/tmp/{name}.safetensors")))
+            }
+            fn load_path(&self, name: &str) -> Result<PathBuf, NnStoreError> {
+                Ok(PathBuf::from(format!("/tmp/{name}.safetensors")))
+            }
+        }
+
+        let store = NoGgufStore;
+        let err = store
+            .load_gguf_path("m")
+            .expect_err("default impl must return Err");
+        assert!(
+            err.to_string()
+                .contains("GGUF read path is not implemented"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Sum of all parameter values across the VarMap (test helper).

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `algocline-nn`: arch-neutral prerequisites for the inference-fleet
+  expansion tracked in GH #9 (Layer 1 of 3).
+  - `algocline_nn::card::validate_architecture` + the
+    `SUPPORTED_ARCHITECTURE_FAMILIES` allowlist (`gpt2` / `llama` /
+    `tinyllama` / `qwen2` / `phi` / `gemma`) accepted at Card save
+    time. `alc.nn.card.save` now rejects typos and unknown architecture
+    identifiers early with a clear Lua-side error instead of persisting
+    an unloadable Card; existing `gpt2-medium` / `gpt2-large` cards
+    remain round-trippable unchanged.
+  - `NnStore::load_gguf_path` — read path for pretrained GGUF (Q4 / Q8)
+    bundles alongside the existing safetensors read path. The trait
+    method defaults to `Err("GGUF read path is not implemented ...")`
+    so a backend that does not manage quantized bundles never has to
+    acknowledge the extension; `FsStore` overrides it to resolve
+    `<root>/<name>.gguf` under the same root and name-safety rules as
+    the safetensors path. Additive on the MCP wire; breaking only for
+    downstream code that implements `NnStore` and wants to expose GGUF.
+
 ### Changed
 
 ### Deprecated

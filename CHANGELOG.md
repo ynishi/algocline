@@ -19,6 +19,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.46.1] - 2026-07-20
+
+Hotfix for the v0.46.0 CI pipeline. The release commit landed with a
+chain of drift between the developer laptop's environment and the
+Ubuntu CI runner that only surfaced after tagging — stylua parser
+features, environment-dependent snapshot assertions, missing bundled
+scenarios, and pre-existing service-layer invariant violations
+introduced by the alc-nn merge. No user-facing API change; every fix
+is either CI plumbing or an internal invariant repair.
+
+### Fixed
+
+- `just lua-fmt-check` on CI now installs `stylua` with the `lua54`
+  Cargo feature enabled so it can parse Lua 5.3+ syntax (bitwise
+  `>>` / `&`, `goto` labels) used in prod Lua sources. Homebrew's
+  stylua bottle enables the feature by default, which hid the drift
+  locally.
+- Vendored evalframe Lua files (`crates/algocline-engine/src/vendor/`)
+  are now excluded from `stylua --check .` via `.styluaignore`, and
+  the one drifted `examples/nn_lora_smoke.lua` was reformatted.
+  Vendor files remain untouched per their `DO NOT EDIT` header.
+- `test_alc_info` snapshot no longer captures the developer's
+  `gh auth status`, `git config user.*`, `~/.ssh/` presence, or
+  `~/.algocline/settings.toml` contents. `redact_gh_credentials`
+  now collapses every environment-varying field
+  (`gh_auth.available` / `.error` / `.logged_in`,
+  `git_config.complete` / `.user_name` / `.user_email`,
+  `ssh_keys.any_present`, and `settings.resolved` / `.sources`)
+  into stable placeholders so the snapshot is portable across
+  developer laptops and CI runners.
+- `test_alc_card_*` (3 cases) and `test_alc_eval_llm_rubric_*`
+  (4 cases) now succeed on CI. The runner had no
+  `$HOME/.algocline/packages` (fixed by running `alc init` before
+  the test suite) and no default `git user.email` / `user.name`
+  (fixed by a `git config --global` step before the tests, needed
+  by `alc_card_publish`'s internal `git commit`). Both are CI-only
+  workflow additions; the developer laptop already had them
+  populated.
+- `test_alc_fork_roundtrip` was collateral damage from the missing
+  `$HOME/.algocline/packages` above and is fixed by the same
+  `alc init` bootstrap.
+- `crates/algocline-engine/tests/lua/eval_integration_test.lua`
+  resolves `math_basic.lua` via `~/.algocline/scenarios/`, which
+  `alc init` does not populate (it installs `packages/` only).
+  CI now clones the pinned `algocline-bundled-packages` tag a
+  second time and copies `scenarios/*.lua` into place so the
+  spec resolves the scenario the same way the laptop does.
+- `just check-invariants` Inv-1 now stays green: the SSH key
+  enumeration in `service::gh_credentials::check_ssh_keys` no
+  longer calls `dirs::home_dir()` directly. HOME is resolved once
+  in the whitelisted `service::config::AppConfig::resolve_home`
+  and threaded through `diagnose(app_dir, home)` to the three call
+  sites (`logging.rs`, and both branches of
+  `card.rs::card_publish`).
+- `just check-invariants` Inv-3 no longer trips on rustdoc
+  intra-doc links. The three hits inside `crates/algocline-engine/
+  src/bridge/mod.rs` and `executor.rs` were all documentation
+  references (`/// [`algocline_core::AppDir::nn_dir`]`) explaining
+  what the invariant protects; there is no `use algocline_core::
+  AppDir` in engine code. The Inv-3 grep now strips `///` and `//!`
+  lines before deciding failure — ordinary `//` code comments stay
+  in the scan window so a smuggled `// use algocline_core::AppDir;`
+  is still caught.
+
+### Added
+
+- `@alc-maint:alc-pre-push` sensor Agent
+  (`plugins/alc-maint/agents/alc-pre-push.md`). Runs each sub-recipe
+  of `just ci` individually via `mcp__lds__recipe_run`, aggregates
+  per-step PASS / BLOCKED, and returns a single verdict with
+  evidence and fix hints. Three modes: `full` (default, ~5–10 min),
+  `quick` (fmt / clippy only, ~1 min), `custom` (caller-provided
+  list). Sensor only — no autofix, no commit, no push. Sibling of
+  `@alc-maint:alc-bundled-sync`. Motivated by the v0.46.0 CI
+  ping-pong: the author ran `cargo test` locally but forgot
+  `cargo fmt --check` and `just lua-fmt-check`, and each miss burnt
+  a CI round-trip.
+- `/alc-maint-wake` skill now guides callers to `@alc-pre-push`
+  alongside `@alc-bundled-sync`, so the dispatch example is visible
+  from the maintenance-session dashboard.
+
+### Changed
+
+- `justfile` recipe group markers unified to
+  `[group('allow-agent')]`. The previous `[group: 'agent']` syntax
+  was accepted silently by `just` but did not match task-mcp's
+  `allow-agent` allowlist, so `ci` / `fmt-check` / `lua-fmt-check`
+  / `clippy` / `test` / `check-invariants` / `check-agent-index`
+  were not dispatchable via `mcp__lds__recipe_run` — a hidden gate
+  that made `@alc-pre-push`'s first live run BLOCKED at preflight.
+  All 17 previously-mistagged recipes are now exposed under a
+  single `[allow-agent]` group; CI shell path is unaffected.
+
 ## [0.46.0] - 2026-07-19
 
 ### Added

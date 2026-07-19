@@ -45,6 +45,20 @@ jobs:
         # init explicitly before the test suite.
         run: cargo run --bin alc -- init
 
+      - name: Install bundled scenarios for eval_integration_spec
+        # `crates/algocline-engine/tests/lua/eval_integration_test.lua` uses
+        # `alc.eval("math_basic", ...)` which resolves via
+        # `~/.algocline/scenarios/math_basic.lua`. `alc init` only installs
+        # `packages/`; scenarios are userland (populated on the laptop via
+        # `alc_scenario_install` at some point) and CI must mirror that by
+        # copying the bundled scenarios from the same repo alc init pulls.
+        # Tag is kept in sync with `BUNDLED_SOURCES` in src/init.rs.
+        run: |
+          mkdir -p ~/.algocline/scenarios
+          git clone --depth 1 --branch v0.29.1 https://github.com/ynishi/algocline-bundled-packages /tmp/alc-bundled
+          cp /tmp/alc-bundled/scenarios/*.lua ~/.algocline/scenarios/
+          rm -rf /tmp/alc-bundled
+
       - name: Run CI checks
         run: just ci
 

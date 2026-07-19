@@ -86,3 +86,18 @@ and out of scope for every agent in this set.
 - After apply, back on the main thread:
   `cargo install --path .` → session restart → `alc update` →
   `alc_pkg_doctor` → commit on go sign.
+- **Before `git push`** (any push, release-related or otherwise):
+  `@alc-pre-push` with `mode: full` — runs each sub-recipe of `just ci`
+  (fmt-check / lua-fmt-check / clippy / test / check-invariants /
+  check-agent-index) individually and returns a single VERDICT: PASS |
+  BLOCKED plus per-step evidence. Use `mode: quick` when you only want
+  fmt / clippy sanity (~1 min instead of ~5-10 min). Sensor only —
+  autofix hints are reported, never executed. Sibling of
+  `@alc-bundled-sync`; both stay Edit-only / sensor-only.
+
+  This exists because the CI pipeline (`.github/workflows/ci.yml`) runs
+  the same `just ci` chain on Ubuntu, and drift the developer forgot to
+  check locally (a common one: `cargo fmt --check`) surfaces as a
+  remote CI failure that burns a runner minute per iteration. See
+  `.claude/CLAUDE.md` §Pre-Push 規律 for the fire trigger and the
+  2026-07-19 v0.46.0 incident that motivated the agent.

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `algocline-nn`: TinyLlama-1.1B trainable architecture (Layer 1 of GH
+  #10, landed in two sub-phases).
+  - Layer 1a — backward-safe primitives in `arch::tinyllama`:
+    `apply_slow_rms_norm` (routes through `candle_nn::ops::rms_norm_slow`
+    to keep the autograd chain intact — candle-nn 0.11 `RmsNorm::forward`
+    is a `CustomOp3` with no backward, gated by
+    `tests/rms_norm_autograd_gate.rs`), `apply_rope` (routes through
+    `candle_nn::rotary_emb::rope_slow` for the same reason,
+    `tests/rope_autograd_gate.rs`), `build_rope_cache` (canonical
+    Llama-family `theta_i = base^{-2i/head_dim}` cos/sin cache), and
+    `repeat_kv` (grouped-query-attention KV expansion).
+  - Layer 1b — model:
+    `arch::tinyllama::{TinyLlamaConfig, TinyLlamaModel}` (re-exported
+    from `arch::mod`). Presets `tinyllama-1.1b` (22 layers, 32 heads,
+    4 KV heads, dim 2048, hidden 5632, ctx 2048, vocab 32000,
+    rope_theta 10000) and `tinyllama-tiny` (CPU smoke shape).
+    `TinyLlamaModel::forward` returns `[batch, seq, vocab]` with GQA +
+    RoPE + SwiGLU MLP and a cached causal mask.
+    `TinyLlamaModel::from_pretrained` downloads via `hf-hub` and mmaps
+    a `TinyLlama/TinyLlama-1.1B-*` safetensors bundle under the HF
+    weight layout (`model.embed_tokens.weight`, `model.layers.<i>.*`,
+    `model.norm.weight`, `lm_head.weight`). Verified by
+    `tests/tinyllama_forward_shape.rs`.
 - `algocline-nn`: arch-neutral prerequisites for the inference-fleet
   expansion tracked in GH #9 (Layer 1 of 3).
   - `algocline_nn::card::validate_architecture` + the

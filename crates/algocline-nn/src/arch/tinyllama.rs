@@ -1,7 +1,7 @@
-//! TinyLlama-1.1B trainable architecture — Layer 1a primitives.
+//! TinyLlama-1.1B trainable architecture.
 //!
-//! This file provides the backward-safe primitives that a full
-//! `TinyLlamaModel` (Layer 1b) will compose:
+//! Layer 1a — primitives (backward-safe shims + RoPE cache + GQA
+//! `repeat_kv`):
 //!
 //! - [`apply_slow_rms_norm`] — RMSNorm forward via
 //!   [`candle_nn::ops::rms_norm_slow`] to keep the autograd chain
@@ -14,15 +14,44 @@
 //!   canonical Llama-family frequency formula
 //!   `theta_i = base^{-2i/head_dim}` for `i ∈ [0, head_dim/2)`.
 //! - [`repeat_kv`] — grouped-query-attention KV expansion:
-//!   `[B, H_kv, S, head_dim] → [B, H, S, head_dim]` via `repeat`.
+//!   `[B, H_kv, S, head_dim] → [B, H, S, head_dim]` via `expand`.
 //!
-//! Full `TinyLlamaConfig` / `TinyLlamaBlock` / `TinyLlamaModel` land
-//! in Layer 1b. Keeping this file primitive-only makes each helper
-//! individually testable and forces the shim layer to stabilize
-//! before the model wiring depends on it.
+//! Layer 1b — model:
+//!
+//! - [`TinyLlamaConfig`] with presets `tinyllama-1.1b` and
+//!   `tinyllama-tiny` (CPU-friendly smoke shape).
+//! - [`TinyLlamaModel`] — pre-RMSNorm decoder stack with GQA + RoPE +
+//!   SwiGLU MLP, mirroring the HuggingFace `LlamaModel` weight layout
+//!   so a downloaded `TinyLlama-1.1B-*` safetensors bundle loads
+//!   through [`candle_nn::VarBuilder::from_mmaped_safetensors`] without
+//!   any renaming.
+//!
+//! HF weight naming (matches
+//! `TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T`):
+//!
+//! ```text
+//! model.embed_tokens.weight                     [vocab, dim]
+//! model.layers.<i>.input_layernorm.weight       [dim]
+//! model.layers.<i>.self_attn.q_proj.weight      [heads   *head_dim, dim]
+//! model.layers.<i>.self_attn.k_proj.weight      [kv_heads*head_dim, dim]
+//! model.layers.<i>.self_attn.v_proj.weight      [kv_heads*head_dim, dim]
+//! model.layers.<i>.self_attn.o_proj.weight      [dim, heads*head_dim]
+//! model.layers.<i>.post_attention_layernorm.weight  [dim]
+//! model.layers.<i>.mlp.gate_proj.weight         [hidden, dim]
+//! model.layers.<i>.mlp.up_proj.weight           [hidden, dim]
+//! model.layers.<i>.mlp.down_proj.weight         [dim, hidden]
+//! model.norm.weight                             [dim]
+//! lm_head.weight                                [vocab, dim]
+//! ```
+//!
+//! Forward output shape is `[batch, seq, vocab]`. Attention uses a
+//! causal (lower-triangular) mask cached to `ctx`.
 
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_nn::{ops, rotary_emb, RmsNorm};
+use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
+use candle_nn::{
+    embedding, linear_no_bias, ops, rms_norm, rotary_emb, Embedding, Linear, Module, RmsNorm,
+    VarBuilder,
+};
 
 /// RMSNorm forward that always uses the backward-safe basic-op path
 /// (`rms_norm_slow`).
@@ -142,11 +171,487 @@ pub fn repeat_kv(xs: &Tensor, n_rep: usize) -> CandleResult<Tensor> {
         .reshape((b, n_kv * n_rep, s, d))
 }
 
+// ---------------------------------------------------------------------
+// Layer 1b — Config / Block / Model / from_pretrained
+// ---------------------------------------------------------------------
+
+/// Immutable configuration for a TinyLlama preset.
+///
+/// Field naming mirrors the HuggingFace `LlamaConfig` so a future
+/// generic `from_hf_config_json` helper stays a mechanical translation.
+#[derive(Debug, Clone)]
+pub struct TinyLlamaConfig {
+    /// Number of transformer blocks.
+    pub layers: usize,
+    /// Number of query attention heads. `dim % heads == 0` required.
+    pub heads: usize,
+    /// Number of key / value heads (GQA). `heads % kv_heads == 0`
+    /// required; `heads / kv_heads` is the `n_rep` passed to
+    /// [`repeat_kv`].
+    pub kv_heads: usize,
+    /// Model hidden size (`d_model`).
+    pub dim: usize,
+    /// SwiGLU MLP intermediate size.
+    pub hidden_dim: usize,
+    /// Maximum context length (RoPE cache size).
+    pub ctx: usize,
+    /// Vocabulary size (matches the SentencePiece tokenizer, 32000
+    /// for TinyLlama).
+    pub vocab: usize,
+    /// RoPE base (theta_0).
+    pub rope_theta: f32,
+    /// RMSNorm epsilon (HF `rms_norm_eps`, TinyLlama = 1e-5).
+    pub eps: f64,
+    /// Weight precision.
+    pub dtype: DType,
+    /// Device the parameters live on.
+    pub device: Device,
+}
+
+impl TinyLlamaConfig {
+    /// `tinyllama-1.1b` preset (~1.1B params, 22 layers, 32 heads,
+    /// 4 KV heads, dim 2048, hidden 5632, ctx 2048, vocab 32000).
+    ///
+    /// Numbers match
+    /// `TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T/config.json`.
+    pub fn tinyllama_1_1b() -> Self {
+        Self {
+            layers: 22,
+            heads: 32,
+            kv_heads: 4,
+            dim: 2048,
+            hidden_dim: 5632,
+            ctx: 2048,
+            vocab: 32000,
+            rope_theta: 10_000.0,
+            eps: 1e-5,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        }
+    }
+
+    /// `tinyllama-tiny` — a 2-layer / 2-head / 1-KV-head / dim-64 /
+    /// hidden-128 / ctx-16 / vocab-32 shape for CPU smoke tests.
+    ///
+    /// `head_dim = 32` keeps RoPE cache small; `heads / kv_heads == 2`
+    /// exercises the GQA `repeat_kv` path with `n_rep > 1`. There is
+    /// no HuggingFace bundle at this size, so
+    /// [`TinyLlamaModel::from_pretrained`] refuses this variant
+    /// ([`Self::hf_repo`] returns `None`).
+    pub fn tiny() -> Self {
+        Self {
+            layers: 2,
+            heads: 2,
+            kv_heads: 1,
+            dim: 64,
+            hidden_dim: 128,
+            ctx: 16,
+            vocab: 32,
+            rope_theta: 10_000.0,
+            eps: 1e-5,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        }
+    }
+
+    /// Resolve a variant name (`"tinyllama-1.1b"` / `"1.1b"` /
+    /// `"tinyllama-tiny"` / `"tiny"`) to the matching preset. Returns
+    /// `None` for unknown names.
+    pub fn from_variant(variant: &str) -> Option<Self> {
+        match variant {
+            "tinyllama-1.1b" | "1.1b" => Some(Self::tinyllama_1_1b()),
+            "tinyllama-tiny" | "tiny" => Some(Self::tiny()),
+            _ => None,
+        }
+    }
+
+    /// HuggingFace repository id for warm-start weight download.
+    /// Returns `None` for a config not built from a shipped preset,
+    /// including [`Self::tiny`].
+    pub fn hf_repo(&self) -> Option<&'static str> {
+        match (self.layers, self.heads, self.kv_heads, self.dim) {
+            (22, 32, 4, 2048) => Some("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"),
+            _ => None,
+        }
+    }
+
+    /// Convenience: `dim / heads` per-query head dimension.
+    pub fn head_dim(&self) -> usize {
+        self.dim / self.heads
+    }
+}
+
+/// Errors from [`TinyLlamaModel::from_pretrained`].
+///
+/// Mirror of [`super::gpt2::PretrainedError`] — kept per-arch so a
+/// caller matching on the enum can produce arch-specific messages
+/// without an intermediate `Box<dyn Error>`.
+#[derive(Debug, thiserror::Error)]
+pub enum PretrainedError {
+    /// Requested variant has no known HuggingFace mapping.
+    #[error("unknown pretrained preset: {0}")]
+    UnknownPreset(String),
+    /// hf-hub client construction failure.
+    #[error("hf-hub api: {0}")]
+    HubApi(String),
+    /// Weight download failure.
+    #[error("hf-hub download: {0}")]
+    Download(String),
+    /// Local cache IO failure.
+    #[error("cache io: {0}")]
+    CacheIo(String),
+    /// safetensors / candle loading failure.
+    #[error("load: {0}")]
+    Load(String),
+}
+
+/// A single TinyLlama transformer block.
+///
+/// Pre-RMSNorm topology:
+///
+/// ```text
+/// x' = x + attn(input_layernorm(x))
+/// y  = x' + mlp(post_attention_layernorm(x'))
+/// ```
+///
+/// `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`,
+/// `down_proj` are all held as plain [`Linear`] (bias-less). The
+/// Layer 2 LoRA wrap will wrap them in a `LinearVariant` in the same
+/// spirit as [`super::gpt2::Block`]; kept plain for now so Layer 1b
+/// stays focused on the forward path only.
+struct Block {
+    input_layernorm: RmsNorm,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    post_attention_layernorm: RmsNorm,
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    n_rep: usize,
+}
+
+impl Block {
+    fn new(cfg: &TinyLlamaConfig, vs: VarBuilder) -> CandleResult<Self> {
+        let head_dim = cfg.head_dim();
+        let n_rep = cfg.heads / cfg.kv_heads;
+
+        let input_layernorm = rms_norm(cfg.dim, cfg.eps, vs.pp("input_layernorm"))?;
+        let post_attention_layernorm =
+            rms_norm(cfg.dim, cfg.eps, vs.pp("post_attention_layernorm"))?;
+
+        let attn_vs = vs.pp("self_attn");
+        let q_proj = linear_no_bias(cfg.dim, cfg.heads * head_dim, attn_vs.pp("q_proj"))?;
+        let k_proj = linear_no_bias(cfg.dim, cfg.kv_heads * head_dim, attn_vs.pp("k_proj"))?;
+        let v_proj = linear_no_bias(cfg.dim, cfg.kv_heads * head_dim, attn_vs.pp("v_proj"))?;
+        let o_proj = linear_no_bias(cfg.heads * head_dim, cfg.dim, attn_vs.pp("o_proj"))?;
+
+        let mlp_vs = vs.pp("mlp");
+        let gate_proj = linear_no_bias(cfg.dim, cfg.hidden_dim, mlp_vs.pp("gate_proj"))?;
+        let up_proj = linear_no_bias(cfg.dim, cfg.hidden_dim, mlp_vs.pp("up_proj"))?;
+        let down_proj = linear_no_bias(cfg.hidden_dim, cfg.dim, mlp_vs.pp("down_proj"))?;
+
+        Ok(Self {
+            input_layernorm,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            post_attention_layernorm,
+            gate_proj,
+            up_proj,
+            down_proj,
+            heads: cfg.heads,
+            kv_heads: cfg.kv_heads,
+            head_dim,
+            n_rep,
+        })
+    }
+
+    fn attention(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: &Tensor,
+    ) -> CandleResult<Tensor> {
+        let (b, t, _d) = x.dims3()?;
+
+        // Project to Q / K / V.
+        let q = self.q_proj.forward(x)?; // [B, T, H  *Dh]
+        let k = self.k_proj.forward(x)?; // [B, T, Hkv*Dh]
+        let v = self.v_proj.forward(x)?; // [B, T, Hkv*Dh]
+
+        // Reshape + transpose to [B, H_?, T, Dh].
+        let q = q
+            .reshape((b, t, self.heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((b, t, self.kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape((b, t, self.kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Rotary embeddings on Q and K. `apply_rope` calls the
+        // backward-safe `rope_slow` path, so gradients flow through
+        // Q / K back to `q_proj` / `k_proj`.
+        let q = apply_rope(&q, cos, sin)?;
+        let k = apply_rope(&k, cos, sin)?;
+
+        // GQA: broadcast the KV heads across the query groups.
+        let k = repeat_kv(&k, self.n_rep)?; // [B, H, T, Dh]
+        let v = repeat_kv(&v, self.n_rep)?; // [B, H, T, Dh]
+
+        // Scaled dot-product [B, H, T, T].
+        let scale = (self.head_dim as f64).sqrt();
+        let mut scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        scores = (scores / scale)?;
+
+        // Causal mask: keep positions j <= i.
+        let mask = mask.i((..t, ..t))?; // [T, T]
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
+            .to_dtype(scores.dtype())?
+            .broadcast_as(scores.shape())?;
+        let mask4 = mask
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .broadcast_as(scores.shape())?;
+        scores = mask4.where_cond(&scores, &neg_inf)?;
+        let probs = ops::softmax_last_dim(&scores)?;
+
+        // Weighted values → merge heads back to [B, T, D].
+        let ctx = probs.matmul(&v)?;
+        let ctx = ctx
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, t, self.heads * self.head_dim))?;
+        self.o_proj.forward(&ctx)
+    }
+
+    /// SwiGLU MLP: `down_proj( silu(gate_proj(x)) * up_proj(x) )`.
+    fn mlp(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let gate = self.gate_proj.forward(x)?.silu()?;
+        let up = self.up_proj.forward(x)?;
+        let h = (gate * up)?;
+        self.down_proj.forward(&h)
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: &Tensor,
+    ) -> CandleResult<Tensor> {
+        let n = apply_slow_rms_norm(&self.input_layernorm, x)?;
+        let a = self.attention(&n, cos, sin, mask)?;
+        let x = (x + a)?;
+        let n = apply_slow_rms_norm(&self.post_attention_layernorm, &x)?;
+        let m = self.mlp(&n)?;
+        x + m
+    }
+}
+
+/// TinyLlama forward-only model.
+///
+/// Constructed via [`TinyLlamaModel::new`] (random init from a
+/// [`VarBuilder`]) or [`TinyLlamaModel::from_pretrained`] (HuggingFace
+/// warm-start). Training loops are added in Layer 3.
+pub struct TinyLlamaModel {
+    embed_tokens: Embedding,
+    blocks: Vec<Block>,
+    norm: RmsNorm,
+    lm_head: Linear,
+    /// Precomputed RoPE cos cache, `[ctx, head_dim / 2]`.
+    rope_cos: Tensor,
+    /// Precomputed RoPE sin cache, `[ctx, head_dim / 2]`.
+    rope_sin: Tensor,
+    /// Cached causal mask (`u8`, `1` on / below diagonal) sized to
+    /// [`TinyLlamaConfig::ctx`].
+    causal_mask: Tensor,
+    cfg: TinyLlamaConfig,
+}
+
+impl TinyLlamaModel {
+    /// Build a fresh TinyLlama model (random parameters) from a
+    /// [`VarBuilder`]. The `VarBuilder` is expected to be scoped to the
+    /// model root — i.e. `embed_tokens` etc. are registered directly
+    /// under `vs`. To match the HuggingFace safetensors layout (which
+    /// nests everything under `model.` except `lm_head`),
+    /// [`Self::from_pretrained`] internally calls
+    /// `Self::new_from_model_root(vs.pp("model"), lm_head_vs)` — see
+    /// that method for the split VarBuilder path.
+    pub fn new(cfg: &TinyLlamaConfig, vs: VarBuilder) -> CandleResult<Self> {
+        Self::new_from_split(cfg, vs.clone(), vs)
+    }
+
+    /// Build a model where the `model.*` weights come from one
+    /// [`VarBuilder`] and `lm_head.weight` from another. This matches
+    /// the HF safetensors bundle layout: `model.<all>` + top-level
+    /// `lm_head.weight`.
+    ///
+    /// Callers that construct a fresh `VarMap` (training / init) can
+    /// pass the same builder for both arguments; the pretrained loader
+    /// splits the root builder via `pp("model")` for the first.
+    fn new_from_split(
+        cfg: &TinyLlamaConfig,
+        model_vs: VarBuilder,
+        lm_head_vs: VarBuilder,
+    ) -> CandleResult<Self> {
+        if !cfg.dim.is_multiple_of(cfg.heads) {
+            return Err(candle_core::Error::Msg(format!(
+                "tinyllama: dim {} must be divisible by heads {}",
+                cfg.dim, cfg.heads
+            )));
+        }
+        if !cfg.heads.is_multiple_of(cfg.kv_heads) {
+            return Err(candle_core::Error::Msg(format!(
+                "tinyllama: heads {} must be divisible by kv_heads {}",
+                cfg.heads, cfg.kv_heads
+            )));
+        }
+        if cfg.kv_heads == 0 {
+            return Err(candle_core::Error::Msg(
+                "tinyllama: kv_heads must be >= 1".into(),
+            ));
+        }
+
+        let head_dim = cfg.head_dim();
+        let embed_tokens = embedding(cfg.vocab, cfg.dim, model_vs.pp("embed_tokens"))?;
+        let layers_vs = model_vs.pp("layers");
+        let mut blocks = Vec::with_capacity(cfg.layers);
+        for i in 0..cfg.layers {
+            blocks.push(Block::new(cfg, layers_vs.pp(i.to_string()))?);
+        }
+        let norm = rms_norm(cfg.dim, cfg.eps, model_vs.pp("norm"))?;
+        let lm_head = linear_no_bias(cfg.dim, cfg.vocab, lm_head_vs.pp("lm_head"))?;
+
+        let (rope_cos, rope_sin) =
+            build_rope_cache(cfg.ctx, head_dim, cfg.rope_theta, cfg.dtype, &cfg.device)?;
+        let causal_mask = build_causal_mask(cfg.ctx, &cfg.device)?;
+
+        Ok(Self {
+            embed_tokens,
+            blocks,
+            norm,
+            lm_head,
+            rope_cos,
+            rope_sin,
+            causal_mask,
+            cfg: cfg.clone(),
+        })
+    }
+
+    /// Return the configuration this model was built from.
+    pub fn config(&self) -> &TinyLlamaConfig {
+        &self.cfg
+    }
+
+    /// Load pretrained TinyLlama weights from HuggingFace on first use
+    /// and cache the safetensors bundle at
+    /// `cache_dir/base/<repo-basename>.safetensors`.
+    ///
+    /// Mirrors [`super::gpt2::Gpt2Model::from_pretrained`] — same
+    /// first-use guard, same mmap-safetensors path, same error surface.
+    pub fn from_pretrained(
+        variant: &str,
+        cfg: &TinyLlamaConfig,
+        cache_dir: &std::path::Path,
+    ) -> Result<Self, PretrainedError> {
+        let repo = cfg
+            .hf_repo()
+            .ok_or_else(|| PretrainedError::UnknownPreset(variant.to_string()))?;
+
+        let base_dir = cache_dir.join("base");
+        std::fs::create_dir_all(&base_dir)
+            .map_err(|e| PretrainedError::CacheIo(format!("mkdir {:?}: {e}", base_dir)))?;
+        let repo_leaf = repo.rsplit('/').next().unwrap_or(repo);
+        let cache_path = base_dir.join(format!("{repo_leaf}.safetensors"));
+
+        if !cache_path.exists() {
+            tracing::info!(
+                target: "algocline_nn::arch::tinyllama",
+                repo,
+                cache = %cache_path.display(),
+                "downloading tinyllama pretrained weights"
+            );
+            let api = hf_hub::api::sync::Api::new()
+                .map_err(|e| PretrainedError::HubApi(e.to_string()))?;
+            let downloaded = api
+                .model(repo.to_string())
+                .get("model.safetensors")
+                .map_err(|e| PretrainedError::Download(e.to_string()))?;
+            std::fs::copy(&downloaded, &cache_path).map_err(|e| {
+                PretrainedError::CacheIo(format!("copy {:?} -> {:?}: {e}", downloaded, cache_path))
+            })?;
+        }
+
+        // SAFETY: candle exposes `from_mmaped_safetensors` as unsafe
+        // because the caller must ensure the mmap-backed file is not
+        // concurrently truncated. The cache path is only written once
+        // above under a first-use guard; subsequent readers hold the
+        // mmap for the lifetime of this call.
+        let root = unsafe {
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&cache_path),
+                cfg.dtype,
+                &cfg.device,
+            )
+            .map_err(|e| PretrainedError::Load(e.to_string()))?
+        };
+        // HF layout: `model.<...>` + top-level `lm_head.weight`.
+        Self::new_from_split(cfg, root.pp("model"), root)
+            .map_err(|e| PretrainedError::Load(e.to_string()))
+    }
+
+    /// Forward pass. Input `xs` is `[batch, seq]` of `u32` token ids;
+    /// output is `[batch, seq, vocab]` — the raw logits.
+    pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let (b, t) = xs.dims2()?;
+        if t > self.cfg.ctx {
+            return Err(candle_core::Error::Msg(format!(
+                "tinyllama forward: seq {t} exceeds ctx {}",
+                self.cfg.ctx
+            )));
+        }
+        let mut h = self.embed_tokens.forward(xs)?; // [B, T, D]
+        for block in &self.blocks {
+            h = block.forward(&h, &self.rope_cos, &self.rope_sin, &self.causal_mask)?;
+        }
+        let h = apply_slow_rms_norm(&self.norm, &h)?;
+        let logits = self.lm_head.forward(&h)?;
+        debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
+        Ok(logits)
+    }
+}
+
+/// Build a causal (lower-triangular) mask `[ctx, ctx]` where valid
+/// (kept) positions are `1` and masked-out are `0`.
+///
+/// Returned as `u8` because candle's `Tensor::where_cond` only accepts
+/// unsigned-integer condition tensors.
+fn build_causal_mask(ctx: usize, device: &Device) -> CandleResult<Tensor> {
+    let mut data = vec![0u8; ctx * ctx];
+    for i in 0..ctx {
+        for j in 0..=i {
+            data[i * ctx + j] = 1;
+        }
+    }
+    Tensor::from_vec(data, (ctx, ctx), device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::IndexOp;
-    use candle_nn::{rms_norm, VarBuilder, VarMap};
+    use candle_nn::VarMap;
 
     /// `apply_slow_rms_norm` produces the same numerical result as the
     /// canonical `RmsNorm::forward` (mean-square normalization with the
@@ -168,7 +673,12 @@ mod tests {
         let y_fast = rn.forward(&x)?;
         let y_slow = apply_slow_rms_norm(&rn, &x)?;
 
-        let diff: f32 = (y_fast - y_slow)?.abs()?.max(0)?.max(0)?.max(0)?.to_scalar()?;
+        let diff: f32 = (y_fast - y_slow)?
+            .abs()?
+            .max(0)?
+            .max(0)?
+            .max(0)?
+            .to_scalar()?;
         assert!(
             diff < 1e-4,
             "slow-path RMSNorm diverges from fast path: max_abs_diff = {diff}"
@@ -232,9 +742,161 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (2, 4, 8, 16), &device)?;
         let y = repeat_kv(&x, 1)?;
         assert_eq!(y.dims4()?, x.dims4()?);
-        let diff: f32 = (&x - &y)?.abs()?.max(0)?.max(0)?.max(0)?.max(0)?.to_scalar()?;
+        let diff: f32 = (&x - &y)?
+            .abs()?
+            .max(0)?
+            .max(0)?
+            .max(0)?
+            .max(0)?
+            .to_scalar()?;
         assert_eq!(diff, 0.0);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Layer 1b tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tinyllama_1_1b_preset_shape() {
+        let cfg = TinyLlamaConfig::tinyllama_1_1b();
+        assert_eq!(cfg.layers, 22);
+        assert_eq!(cfg.heads, 32);
+        assert_eq!(cfg.kv_heads, 4);
+        assert_eq!(cfg.dim, 2048);
+        assert_eq!(cfg.hidden_dim, 5632);
+        assert_eq!(cfg.ctx, 2048);
+        assert_eq!(cfg.vocab, 32000);
+        assert_eq!(cfg.head_dim(), 64);
+        assert_eq!(
+            cfg.hf_repo(),
+            Some("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+        );
+    }
+
+    #[test]
+    fn tinyllama_tiny_preset_has_no_hf_repo() {
+        let cfg = TinyLlamaConfig::tiny();
+        assert_eq!(cfg.layers, 2);
+        assert_eq!(cfg.heads, 2);
+        assert_eq!(cfg.kv_heads, 1);
+        assert_eq!(cfg.dim, 64);
+        assert_eq!(cfg.head_dim(), 32);
+        // Tiny has no pretrained bundle.
+        assert!(cfg.hf_repo().is_none());
+    }
+
+    #[test]
+    fn tinyllama_from_variant_recognizes_aliases() {
+        assert!(TinyLlamaConfig::from_variant("tinyllama-1.1b").is_some());
+        assert!(TinyLlamaConfig::from_variant("1.1b").is_some());
+        assert!(TinyLlamaConfig::from_variant("tinyllama-tiny").is_some());
+        assert!(TinyLlamaConfig::from_variant("tiny").is_some());
+        assert!(TinyLlamaConfig::from_variant("llama-2").is_none());
+    }
+
+    #[test]
+    fn rejects_dim_not_divisible_by_heads() {
+        let cfg = TinyLlamaConfig {
+            layers: 2,
+            heads: 3, // 8 % 3 != 0
+            kv_heads: 1,
+            dim: 8,
+            hidden_dim: 16,
+            ctx: 4,
+            vocab: 10,
+            rope_theta: 10_000.0,
+            eps: 1e-5,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let msg = match TinyLlamaModel::new(&cfg, vs) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("divisible"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn rejects_heads_not_divisible_by_kv_heads() {
+        let cfg = TinyLlamaConfig {
+            layers: 2,
+            heads: 4,
+            kv_heads: 3, // 4 % 3 != 0
+            dim: 32,
+            hidden_dim: 64,
+            ctx: 4,
+            vocab: 16,
+            rope_theta: 10_000.0,
+            eps: 1e-5,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let msg = match TinyLlamaModel::new(&cfg, vs) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(
+            msg.contains("kv_heads"),
+            "expected kv_heads error, got: {msg}"
+        );
+    }
+
+    /// Tiny preset forward on CPU. Confirms the exact
+    /// `[batch, seq, vocab]` output shape.
+    #[test]
+    fn tiny_forward_shape() {
+        let cfg = TinyLlamaConfig::tiny();
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = TinyLlamaModel::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, cfg.vocab]);
+    }
+
+    #[test]
+    fn tiny_forward_batch_shape() {
+        let cfg = TinyLlamaConfig {
+            layers: 1,
+            heads: 2,
+            kv_heads: 1,
+            dim: 16,
+            hidden_dim: 32,
+            ctx: 4,
+            vocab: 8,
+            rope_theta: 10_000.0,
+            eps: 1e-5,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        };
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = TinyLlamaModel::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 0], (2, 4), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[2, 4, 8]);
+    }
+
+    #[test]
+    fn forward_rejects_seq_over_ctx() {
+        let cfg = TinyLlamaConfig::tiny();
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = TinyLlamaModel::new(&cfg, vs).unwrap();
+        // ctx = 16, seq = 17
+        let ids: Vec<u32> = (0u32..17).collect();
+        let seq_len = ids.len();
+        let ids = Tensor::from_vec(ids, (1, seq_len), &cfg.device).unwrap();
+        let msg = match model.forward(&ids) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("exceeds ctx"), "unexpected error: {msg}");
     }
 
     /// `repeat_kv` expansion matches TinyLlama-1.1B's `H_kv=4, H=32`

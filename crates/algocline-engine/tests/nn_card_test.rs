@@ -152,7 +152,7 @@ fn save_load_roundtrip_preserves_var_values_and_meta() {
     // Card after training.
     let (lua2, _) = fresh_vm_sharing_root(tmp.path().to_path_buf());
     let (w_vec, b_vec): (Vec<f32>, Vec<f32>) = lua2
-        .load(&format!(
+        .load(format!(
             r#"
             local m = alc.nn.card.load("{card_id}")
             return m.w:to_vec(), m.b:to_vec()
@@ -340,7 +340,7 @@ fn load_missing_bundle_errors() {
     std::fs::remove_file(&bundle).expect("delete safetensors bundle for the test");
 
     let err = lua
-        .load(&format!(
+        .load(format!(
             r#"
             return alc.nn.card.load("{card_id}")
             "#

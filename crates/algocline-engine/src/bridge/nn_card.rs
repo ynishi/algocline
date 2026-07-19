@@ -30,13 +30,16 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use algocline_nn::arch::{Gpt2Config, Gpt2Model};
-use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage};
+use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig};
+use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch};
 use algocline_nn::tokenizer::HfTokenizer;
 use algocline_nn::train::{
-    Batch, Dataset, DatasetOpts, JsonlDataset, ParquetDataset, TokenizedDataset,
+    run_distill, run_full_ft, run_lora_ft, Batch, CrossEntropyLoss, Dataset, DatasetOpts,
+    DistillLossKind, DistillSpec, FullFtConfig, JsonlDataset, ParquetDataset, ScheduleKind,
+    TokenizedDataset, TrainError, TrainingLease,
 };
 use candle_core::{DType, Device};
+use candle_nn::VarMap;
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 use serde_json::{json, Value as Json};
@@ -61,7 +64,8 @@ pub(super) fn register_nn_card(
 ) -> LuaResult<()> {
     let nn_table: LuaTable = alc_table.get("nn")?;
     register_preset_ns(lua, &nn_table, nn_dir.clone())?;
-    register_data_ns(lua, &nn_table, Arc::clone(&card_store), nn_dir)?;
+    register_data_ns(lua, &nn_table, Arc::clone(&card_store), nn_dir.clone())?;
+    register_trainer_ns(lua, &nn_table, nn_dir)?;
     let card_ns = lua.create_table()?;
 
     let save_store = Arc::clone(&card_store);
@@ -254,6 +258,19 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
     let metrics = normalise_object(user_meta.get("metrics").cloned());
 
     let candle_in = user_meta.get("candle");
+
+    // LoRA sub-branch is optional: only `alc.nn.trainer.lora` populates
+    // it via the returned Checkpoint table's `lora` field, which the
+    // caller then threads back through `meta.candle.lora` when saving
+    // the Card. `full_ft` / `distill` callers omit it (Card foundation
+    // invariant: only lora-trained models carry `NnLoraBranch`).
+    let lora = match candle_in.and_then(|c| c.get("lora")) {
+        Some(v) if !v.is_null() => Some(serde_json::from_value::<NnLoraBranch>(v.clone()).map_err(
+            |e| LuaError::external(format!("alc.nn.card.save: invalid meta.candle.lora: {e}")),
+        )?),
+        _ => None,
+    };
+
     let candle = NnCandleBranch {
         bundle_ref: format!("nn/{card_id}"),
         device: candle_in
@@ -264,9 +281,7 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
             .and_then(|c| c.get("dtype"))
             .and_then(|v| v.as_str())
             .map(String::from),
-        // LoRA is populated by the LoRA follow-up; the Card
-        // foundation always leaves this None.
-        lora: None,
+        lora,
     };
 
     let nn_meta = NnCardMeta {
@@ -375,11 +390,24 @@ fn alc_nn_fn(lua: &Lua, key: &str) -> LuaResult<LuaFunction> {
 /// trainer wrap; this stage only needs read access for shape
 /// assertions from Lua.
 pub(super) struct Gpt2Handle {
-    // A later trainer follow-up consumes this via `Gpt2Handle::model()`
-    // for the training-loop wiring. This stage exposes only shape
-    // accessors from Lua, so the field is deliberately unread today.
-    #[allow(dead_code)]
     inner: Arc<Mutex<Gpt2Model>>,
+    /// `VarMap` the model's parameters were registered against.
+    ///
+    /// Populated only for from-scratch handles (`pretrained = false`)
+    /// because [`Gpt2Model::from_pretrained`] loads its weights through
+    /// an mmap-backed [`candle_nn::VarBuilder`] that has no `VarMap`
+    /// counterpart on the caller side. `full_ft` / `distill` bindings
+    /// require this field and error out on `None`; `lora` binding does
+    /// not — [`Gpt2Model::wrap_lora`] builds its own delta `VarMap`
+    /// internally and leaves the base parameters frozen.
+    ///
+    /// Wrapped in `Arc<VarMap>` rather than `Arc<Mutex<VarMap>>`:
+    /// `VarMap::all_vars` is `&self`, and the candle-nn optimizer
+    /// (`AdamW`) only needs read access to build its parameter list.
+    /// The concurrency guard is the [`TrainingLease`] one layer up,
+    /// which structurally prevents overlapping training sessions
+    /// against the same handle.
+    varmap: Option<Arc<VarMap>>,
     variant: String,
     layers: usize,
     heads: usize,
@@ -408,16 +436,22 @@ impl mlua::UserData for Gpt2Handle {
     }
 }
 
-/// Access the underlying model. Consumed by the trainer follow-up's
-/// wiring.
-///
-/// This stage does not exercise this method (real forward runs
-/// through the nn crate's `Gpt2Model::forward` directly), so it stays
-/// unused until the trainer entry (`alc.nn.trainer.full_ft`) lands.
 impl Gpt2Handle {
-    #[allow(dead_code)]
+    /// Shared handle to the underlying model. The trainer bindings
+    /// lock this for the duration of a `run_full_ft` / `run_lora_ft` /
+    /// `run_distill` call; concurrent access is barred one layer up by
+    /// [`TrainingLease`].
     pub(super) fn model(&self) -> Arc<Mutex<Gpt2Model>> {
         Arc::clone(&self.inner)
+    }
+
+    /// Shared handle to the model's `VarMap`, if constructed from
+    /// scratch (see the field-level rationale). Returns `None` for
+    /// `pretrained = true` handles, in which case `full_ft` and
+    /// `distill` bindings surface a clear Lua-side error rather than
+    /// panic or silently no-op.
+    pub(super) fn varmap(&self) -> Option<Arc<VarMap>> {
+        self.varmap.as_ref().map(Arc::clone)
     }
 }
 
@@ -474,19 +508,26 @@ fn build_gpt2_handle(
         ));
     }
 
-    let model = if pretrained {
+    let (model, varmap) = if pretrained {
         let cache_dir = nn_dir.to_path_buf();
-        Gpt2Model::from_pretrained(variant, &cfg, &cache_dir)
-            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?
+        let m = Gpt2Model::from_pretrained(variant, &cfg, &cache_dir)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?;
+        // `from_pretrained` loads through an mmap-backed VarBuilder that
+        // has no VarMap counterpart on the caller side. Downstream
+        // trainer bindings that need one (`full_ft` / `distill`) error
+        // out cleanly when the handle carries `None` (§field docs).
+        (m, None)
     } else {
-        let varmap = candle_nn::VarMap::new();
-        let vs = candle_nn::VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
-        Gpt2Model::new(&cfg, vs)
-            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?
+        let vm = VarMap::new();
+        let vs = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let m = Gpt2Model::new(&cfg, vs)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?;
+        (m, Some(Arc::new(vm)))
     };
 
     Ok(Gpt2Handle {
         inner: Arc::new(Mutex::new(model)),
+        varmap,
         variant: variant.to_string(),
         layers: cfg.layers,
         heads: cfg.heads,
@@ -733,4 +774,777 @@ fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
         ));
     }
     Ok(d)
+}
+
+// ─── alc.nn.trainer ───────────────────────────────────────────────
+
+/// Register `alc.nn.trainer.{full_ft, lora, distill}` onto the
+/// pre-existing `alc.nn` table.
+///
+/// Symmetric to [`register_data_ns`]; the three bindings share:
+///
+/// - a single per-VM [`TrainingLease`] (design's "one training session
+///   per VM" invariant — [`run_full_ft`] / [`run_lora_ft`] /
+///   [`run_distill`] all `acquire()` it internally),
+/// - the `FullFtConfig` opts-table extractor ([`extract_full_ft_opts`]),
+/// - a common [`ckpt_from_lease_result`] converter that turns
+///   [`TrainError`] into `mlua::Error` and the returned [`Checkpoint`]
+///   into a Lua table with primitive fields plus a metrics sub-table.
+///
+/// The `lora` binding additionally attaches a `lora = { rank, alpha,
+/// base_bundle_ref }` sub-table to the returned Checkpoint so callers
+/// can thread it back through `alc.nn.card.save`'s `meta.candle.lora`
+/// field (invariant: `NnCandleBranch::lora` populate is a lora-only
+/// concern; `full_ft` and `distill` never emit it).
+fn register_trainer_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
+    let trainer = lua.create_table()?;
+    let lease = Arc::new(TrainingLease::new());
+
+    let full_ft_lease = Arc::clone(&lease);
+    let full_ft_dir = nn_dir.clone();
+    let full_ft = lua.create_function(
+        move |lua, (handle, dataset, opts): (LuaAnyUserData, LuaAnyUserData, Option<LuaTable>)| -> LuaResult<LuaTable> {
+            full_ft_impl(
+                lua,
+                &handle,
+                &dataset,
+                opts.as_ref(),
+                &full_ft_dir,
+                Arc::clone(&full_ft_lease),
+            )
+        },
+    )?;
+    trainer.set("full_ft", full_ft)?;
+
+    let lora_lease = Arc::clone(&lease);
+    let lora_dir = nn_dir.clone();
+    let lora = lua.create_function(
+        move |lua, (handle, dataset, opts): (LuaAnyUserData, LuaAnyUserData, Option<LuaTable>)| -> LuaResult<LuaTable> {
+            lora_impl(
+                lua,
+                &handle,
+                &dataset,
+                opts.as_ref(),
+                &lora_dir,
+                Arc::clone(&lora_lease),
+            )
+        },
+    )?;
+    trainer.set("lora", lora)?;
+
+    let distill_lease = Arc::clone(&lease);
+    let distill_dir = nn_dir;
+    let distill = lua.create_function(
+        move |lua, (handle, dataset, opts): (LuaAnyUserData, LuaAnyUserData, Option<LuaTable>)| -> LuaResult<LuaTable> {
+            distill_impl(
+                lua,
+                &handle,
+                &dataset,
+                opts.as_ref(),
+                &distill_dir,
+                Arc::clone(&distill_lease),
+            )
+        },
+    )?;
+    trainer.set("distill", distill)?;
+
+    nn_table.set("trainer", trainer)?;
+    Ok(())
+}
+
+/// `alc.nn.trainer.full_ft(handle, dataset, opts?) -> Checkpoint`.
+///
+/// Requires a from-scratch handle (`opts.pretrained = false` at
+/// [`build_gpt2_handle`] time) — the `VarMap` the optimizer needs
+/// doesn't exist for pretrained handles today (see [`Gpt2Handle`]).
+/// Surfaces that as a Lua-side error before touching the training
+/// lease.
+fn full_ft_impl(
+    lua: &Lua,
+    handle: &LuaAnyUserData,
+    dataset: &LuaAnyUserData,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+    lease: Arc<TrainingLease>,
+) -> LuaResult<LuaTable> {
+    let cfg = extract_full_ft_opts(opts)?;
+    let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "full_ft")?;
+    let card_id = ckpt_prefix.clone();
+
+    let gpt2 = handle.borrow::<Gpt2Handle>()?;
+    let model_arc = gpt2.model();
+    let vm_arc = gpt2.varmap().ok_or_else(|| {
+        LuaError::external(
+            "alc.nn.trainer.full_ft: handle was built with pretrained=true; \
+             full-fine-tune requires a from-scratch handle (pretrained=false)"
+                .to_string(),
+        )
+    })?;
+    drop(gpt2);
+
+    let ds_guard = dataset.borrow_mut::<DatasetHandle>()?;
+    let mut ds_lock = ds_guard
+        .inner
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.full_ft: dataset lock: {e}")))?;
+
+    let loss_fn = CrossEntropyLoss::new();
+    let model = model_arc
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.full_ft: model lock: {e}")))?;
+
+    let result = run_full_ft(
+        &model,
+        &vm_arc,
+        ds_lock.as_mut(),
+        &cfg,
+        &loss_fn,
+        &ckpt_dir,
+        &ckpt_prefix,
+        lease,
+    );
+    drop(model);
+    drop(ds_lock);
+    drop(ds_guard);
+
+    let ckpt = result.map_err(train_err_to_lua)?;
+    checkpoint_to_lua(lua, &ckpt, &card_id, None)
+}
+
+/// `alc.nn.trainer.lora(handle, dataset, opts) -> Checkpoint`.
+///
+/// `opts.rank` and `opts.alpha` are required. `opts.target_modules`
+/// defaults to the canonical GPT-2 set (`q_proj` / `k_proj` / `v_proj`
+/// / `o_proj` / `up` / `down`). The returned Checkpoint carries a
+/// `lora = { rank, alpha, base_bundle_ref }` sub-table so callers can
+/// thread it through `alc.nn.card.save(vars, name, { candle = { lora
+/// = ckpt.lora } })` without repeating the values.
+///
+/// **Not idempotent per handle**: [`Gpt2Model::wrap_lora`] rejects a
+/// second wrap of an already-LoRA-wrapped block (double-wrap surfaces
+/// as `TrainError::Candle`). Callers who want to run multiple LoRA
+/// trainings should build a fresh [`Gpt2Handle`] per run.
+fn lora_impl(
+    lua: &Lua,
+    handle: &LuaAnyUserData,
+    dataset: &LuaAnyUserData,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+    lease: Arc<TrainingLease>,
+) -> LuaResult<LuaTable> {
+    let train_cfg = extract_full_ft_opts(opts)?;
+    let lora_cfg = extract_lora_cfg(opts)?;
+    let (ckpt_dir, card_id) = resolve_ckpt_dest(opts, nn_dir, "lora")?;
+
+    let gpt2 = handle.borrow::<Gpt2Handle>()?;
+    let model_arc = gpt2.model();
+    // Base bundle_ref recorded on the Card metadata later. For a
+    // from-scratch handle the base is transient (no persisted bundle);
+    // callers who want a durable base_bundle_ref should `alc.nn.card
+    // .save` the base first, then run lora on top, and pass
+    // `opts.base_bundle_ref = "nn/<base-card_id>"`. Wrong-type input
+    // (e.g. `base_bundle_ref = 42`) surfaces as a Lua type-mismatch
+    // error rather than silently falling back to the default.
+    let base_bundle_ref = match opts {
+        Some(t) => t
+            .get::<Option<String>>("base_bundle_ref")?
+            .unwrap_or_else(|| format!("nn/{}", gpt2.variant)),
+        None => format!("nn/{}", gpt2.variant),
+    };
+    drop(gpt2);
+
+    let ds_guard = dataset.borrow_mut::<DatasetHandle>()?;
+    let mut ds_lock = ds_guard
+        .inner
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.lora: dataset lock: {e}")))?;
+
+    let loss_fn = CrossEntropyLoss::new();
+    let mut model = model_arc
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.lora: model lock: {e}")))?;
+
+    let result = run_lora_ft(
+        &mut model,
+        ds_lock.as_mut(),
+        &lora_cfg,
+        &train_cfg,
+        &loss_fn,
+        &ckpt_dir,
+        &card_id,
+        lease,
+    );
+    drop(model);
+    drop(ds_lock);
+    drop(ds_guard);
+
+    let ckpt = result.map_err(train_err_to_lua)?;
+
+    // Attach the LoRA branch descriptor. The Card foundation reads
+    // this back through `meta.candle.lora` in `build_create_payload`.
+    let lora_tbl = lua.create_table()?;
+    lora_tbl.set("rank", lora_cfg.rank as u32)?;
+    lora_tbl.set("alpha", lora_cfg.alpha as u32)?;
+    lora_tbl.set("base_bundle_ref", base_bundle_ref)?;
+
+    checkpoint_to_lua(lua, &ckpt, &card_id, Some(lora_tbl))
+}
+
+/// `alc.nn.trainer.distill(handle, dataset, opts?) -> Checkpoint`.
+///
+/// Currently supports only `loss_kind = "ce"` (hard-label CE, the
+/// only variant [`DistillLossKind`] exposes). Unknown `loss_kind`
+/// values error out rather than silently fall back to CE.
+fn distill_impl(
+    lua: &Lua,
+    handle: &LuaAnyUserData,
+    dataset: &LuaAnyUserData,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+    lease: Arc<TrainingLease>,
+) -> LuaResult<LuaTable> {
+    let hyperparams = extract_full_ft_opts(opts)?;
+    let loss_kind = extract_distill_loss_kind(opts)?;
+    let spec = DistillSpec {
+        hyperparams,
+        loss_kind,
+    };
+    let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "distill")?;
+    let card_id = ckpt_prefix.clone();
+
+    let gpt2 = handle.borrow::<Gpt2Handle>()?;
+    let model_arc = gpt2.model();
+    let vm_arc = gpt2.varmap().ok_or_else(|| {
+        LuaError::external(
+            "alc.nn.trainer.distill: handle was built with pretrained=true; \
+             distillation requires a from-scratch student handle (pretrained=false)"
+                .to_string(),
+        )
+    })?;
+    drop(gpt2);
+
+    let ds_guard = dataset.borrow_mut::<DatasetHandle>()?;
+    let mut ds_lock = ds_guard
+        .inner
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.distill: dataset lock: {e}")))?;
+
+    let model = model_arc
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.distill: model lock: {e}")))?;
+
+    let result = run_distill(
+        &model,
+        &vm_arc,
+        ds_lock.as_mut(),
+        &spec,
+        &ckpt_dir,
+        &ckpt_prefix,
+        lease,
+    );
+    drop(model);
+    drop(ds_lock);
+    drop(ds_guard);
+
+    let ckpt = result.map_err(train_err_to_lua)?;
+    checkpoint_to_lua(lua, &ckpt, &card_id, None)
+}
+
+/// Extract [`FullFtConfig`] from an opts table, applying the crate's
+/// defaults for any missing key. Rejects zero-sized values at the
+/// boundary (matches the training-loop's own early exit shape).
+fn extract_full_ft_opts(opts: Option<&LuaTable>) -> LuaResult<FullFtConfig> {
+    let mut cfg = FullFtConfig::default();
+    let Some(t) = opts else {
+        return Ok(cfg);
+    };
+    if let Some(v) = t.get::<Option<f64>>("lr")? {
+        cfg.lr = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("batch_size")? {
+        cfg.batch_size = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("grad_accum")? {
+        cfg.grad_accum = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("steps")? {
+        cfg.steps = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("warmup")? {
+        cfg.warmup = v;
+    }
+    if let Some(v) = t.get::<Option<String>>("schedule")? {
+        cfg.schedule = parse_schedule(&v)?;
+    }
+    if let Some(v) = t.get::<Option<f64>>("weight_decay")? {
+        cfg.weight_decay = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("ckpt_every")? {
+        cfg.ckpt_every = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("ckpt_keep")? {
+        cfg.ckpt_keep = v;
+    }
+    if cfg.batch_size == 0 {
+        return Err(LuaError::external(
+            "alc.nn.trainer: batch_size must be >= 1".to_string(),
+        ));
+    }
+    Ok(cfg)
+}
+
+fn parse_schedule(s: &str) -> LuaResult<ScheduleKind> {
+    match s {
+        "cosine" | "cosine_with_warmup" => Ok(ScheduleKind::CosineWithWarmup),
+        "constant" => Ok(ScheduleKind::Constant),
+        other => Err(LuaError::external(format!(
+            "alc.nn.trainer: unknown schedule '{other}' \
+             (expected 'cosine' or 'constant')"
+        ))),
+    }
+}
+
+/// Extract [`LoraConfig`] from an opts table. `rank` and `alpha` are
+/// required — omitting them is almost certainly a user error and
+/// silently defaulting would hide a wrong training run.
+fn extract_lora_cfg(opts: Option<&LuaTable>) -> LuaResult<LoraConfig> {
+    let t = opts.ok_or_else(|| {
+        LuaError::external(
+            "alc.nn.trainer.lora: opts table is required (need at least rank and alpha)"
+                .to_string(),
+        )
+    })?;
+    let rank = t.get::<Option<usize>>("rank")?.ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.lora: opts.rank is required".to_string())
+    })?;
+    let alpha_raw = t.get::<Option<f32>>("alpha")?.ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.lora: opts.alpha is required".to_string())
+    })?;
+    if rank == 0 {
+        return Err(LuaError::external(
+            "alc.nn.trainer.lora: rank must be >= 1".to_string(),
+        ));
+    }
+    if !alpha_raw.is_finite() || alpha_raw <= 0.0 {
+        return Err(LuaError::external(
+            "alc.nn.trainer.lora: alpha must be a positive finite number".to_string(),
+        ));
+    }
+    let dropout = t.get::<Option<f32>>("dropout")?.unwrap_or(0.0);
+    let target_modules = match t.get::<Option<LuaTable>>("target_modules")? {
+        Some(list) => {
+            let mut names = Vec::new();
+            for pair in list.pairs::<LuaValue, String>() {
+                let (_k, name) = pair?;
+                names.push(name);
+            }
+            if names.is_empty() {
+                return Err(LuaError::external(
+                    "alc.nn.trainer.lora: opts.target_modules must not be empty".to_string(),
+                ));
+            }
+            names
+        }
+        None => LoraConfig::default_targets(),
+    };
+    Ok(LoraConfig {
+        rank,
+        alpha: alpha_raw,
+        target_modules,
+        dropout,
+    })
+}
+
+fn extract_distill_loss_kind(opts: Option<&LuaTable>) -> LuaResult<DistillLossKind> {
+    // Wrong-type input (`loss_kind = 42`) must surface as a Lua
+    // type-mismatch error rather than silently falling back to `"ce"`
+    // — silent fallback would hide a misconfigured caller.
+    let raw = match opts {
+        Some(t) => t
+            .get::<Option<String>>("loss_kind")?
+            .unwrap_or_else(|| "ce".to_string()),
+        None => "ce".to_string(),
+    };
+    match raw.as_str() {
+        "ce" => Ok(DistillLossKind::Ce),
+        other => Err(LuaError::external(format!(
+            "alc.nn.trainer.distill: unknown loss_kind '{other}' (expected 'ce')"
+        ))),
+    }
+}
+
+/// Decide where checkpoints get written for this training run.
+///
+/// - `opts.ckpt_dir` overrides the default (`<nn_dir>/ckpt`) when the
+///   caller wants a scenario-specific location.
+/// - `opts.card_id` overrides the default `<path>_<epoch_us>` prefix
+///   when the caller wants the ckpt filename to match a Card id they
+///   already own (`run_lora_ft` in particular expects this to line up
+///   with the `nn/lora-<card_id>.safetensors` bundle name).
+fn resolve_ckpt_dest(
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+    stage: &str,
+) -> LuaResult<(PathBuf, String)> {
+    // Both `ckpt_dir` and `card_id` are read strictly: wrong-type input
+    // surfaces as a Lua error rather than silently falling back to the
+    // default (which would write the checkpoint to an unexpected
+    // location without diagnostic).
+    let ckpt_dir = match opts {
+        Some(t) => t
+            .get::<Option<String>>("ckpt_dir")?
+            .map(PathBuf::from)
+            .unwrap_or_else(|| nn_dir.join("ckpt")),
+        None => nn_dir.join("ckpt"),
+    };
+    std::fs::create_dir_all(&ckpt_dir).map_err(|e| {
+        LuaError::external(format!(
+            "alc.nn.trainer.{stage}: mkdir {:?}: {e}",
+            ckpt_dir.display()
+        ))
+    })?;
+    let ckpt_prefix = match opts {
+        Some(t) => match t.get::<Option<String>>("card_id")? {
+            Some(id) => sanitize_name(&id),
+            None => generate_card_id(stage),
+        },
+        None => generate_card_id(stage),
+    };
+    Ok((ckpt_dir, ckpt_prefix))
+}
+
+/// Convert a [`TrainError`] into an `mlua::Error` with the training
+/// stage prefixed onto the message.
+fn train_err_to_lua(e: TrainError) -> LuaError {
+    LuaError::external(format!("alc.nn.trainer: {e}"))
+}
+
+/// Convert a [`algocline_nn::train::Checkpoint`] into a Lua table.
+///
+/// Optional `lora_branch` sub-table is attached under `ckpt.lora` for
+/// the LoRA binding; `full_ft` / `distill` pass `None`.
+///
+/// **On `ckpt.card_id`**: this is the *checkpoint filename prefix*
+/// (matches the safetensors bundle `<prefix>.safetensors`), NOT the
+/// Card store's card_id. `alc.nn.card.save` currently generates its
+/// own Card id internally (`generate_card_id(name)`) rather than
+/// accepting a caller-provided value, so `alc.nn.card.load(ckpt.card_id)`
+/// will not resolve. Callers who need to correlate the trainer output
+/// with a saved Card should use the return value of `alc.nn.card.save`
+/// directly. Renaming this field to `ckpt_prefix` is deferred pending
+/// a Phase 2 follow-up that threads the prefix through to `save_impl`.
+fn checkpoint_to_lua(
+    lua: &Lua,
+    ckpt: &algocline_nn::train::Checkpoint,
+    card_id: &str,
+    lora_branch: Option<LuaTable>,
+) -> LuaResult<LuaTable> {
+    let out = lua.create_table()?;
+    out.set("bundle_ref", ckpt.bundle_ref.clone())?;
+    out.set("card_id", card_id.to_string())?;
+    out.set("step", ckpt.step)?;
+    out.set("train_loss", ckpt.train_loss)?;
+    match ckpt.val_loss {
+        Some(v) => out.set("val_loss", v)?,
+        None => out.set("val_loss", LuaValue::Nil)?,
+    }
+    let metrics = lua.create_table()?;
+    for (k, v) in &ckpt.metrics {
+        metrics.set(k.as_str(), *v)?;
+    }
+    out.set("metrics", metrics)?;
+    if let Some(lora) = lora_branch {
+        out.set("lora", lora)?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod trainer_tests {
+    use super::*;
+    use mlua::Lua;
+
+    fn opts_from(lua: &Lua, pairs: &[(&str, LuaValue)]) -> LuaTable {
+        let t = lua.create_table().expect("create opts table");
+        for (k, v) in pairs {
+            t.set(*k, v.clone()).expect("set opt field");
+        }
+        t
+    }
+
+    #[test]
+    fn full_ft_opts_defaults_when_empty() {
+        let lua = Lua::new();
+        let cfg = extract_full_ft_opts(None).expect("None -> defaults");
+        let default = FullFtConfig::default();
+        assert_eq!(cfg.lr, default.lr);
+        assert_eq!(cfg.batch_size, default.batch_size);
+        assert_eq!(cfg.steps, default.steps);
+
+        let empty = lua.create_table().unwrap();
+        let cfg2 = extract_full_ft_opts(Some(&empty)).expect("empty table -> defaults");
+        assert_eq!(cfg2.lr, default.lr);
+        assert_eq!(cfg2.batch_size, default.batch_size);
+    }
+
+    #[test]
+    fn full_ft_opts_partial_merges_with_defaults() {
+        let lua = Lua::new();
+        let opts = opts_from(
+            &lua,
+            &[
+                ("lr", LuaValue::Number(1e-3)),
+                ("steps", LuaValue::Integer(42)),
+            ],
+        );
+        let cfg = extract_full_ft_opts(Some(&opts)).expect("partial merge");
+        assert!((cfg.lr - 1e-3).abs() < 1e-12, "lr override");
+        assert_eq!(cfg.steps, 42, "steps override");
+        // Unset fields keep the crate default.
+        let d = FullFtConfig::default();
+        assert_eq!(cfg.batch_size, d.batch_size);
+        assert_eq!(cfg.warmup, d.warmup);
+    }
+
+    #[test]
+    fn full_ft_opts_reject_zero_batch_size() {
+        let lua = Lua::new();
+        let opts = opts_from(&lua, &[("batch_size", LuaValue::Integer(0))]);
+        let err = extract_full_ft_opts(Some(&opts)).expect_err("zero batch_size");
+        assert!(
+            err.to_string().contains("batch_size must be >= 1"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn schedule_parser_accepts_known_and_rejects_unknown() {
+        assert!(matches!(
+            parse_schedule("cosine").unwrap(),
+            ScheduleKind::CosineWithWarmup
+        ));
+        assert!(matches!(
+            parse_schedule("cosine_with_warmup").unwrap(),
+            ScheduleKind::CosineWithWarmup
+        ));
+        assert!(matches!(
+            parse_schedule("constant").unwrap(),
+            ScheduleKind::Constant
+        ));
+        let err = parse_schedule("linear").expect_err("unknown");
+        assert!(err.to_string().contains("linear"), "message: {err}");
+    }
+
+    #[test]
+    fn lora_cfg_requires_opts_table() {
+        let err = extract_lora_cfg(None).expect_err("None opts");
+        assert!(err.to_string().contains("opts table is required"));
+    }
+
+    #[test]
+    fn lora_cfg_requires_rank_and_alpha() {
+        let lua = Lua::new();
+        let no_rank = opts_from(&lua, &[("alpha", LuaValue::Number(16.0))]);
+        let err = extract_lora_cfg(Some(&no_rank)).expect_err("missing rank");
+        assert!(err.to_string().contains("opts.rank is required"));
+
+        let no_alpha = opts_from(&lua, &[("rank", LuaValue::Integer(8))]);
+        let err = extract_lora_cfg(Some(&no_alpha)).expect_err("missing alpha");
+        assert!(err.to_string().contains("opts.alpha is required"));
+    }
+
+    #[test]
+    fn lora_cfg_rejects_zero_rank_and_nonpositive_alpha() {
+        let lua = Lua::new();
+        let zero_rank = opts_from(
+            &lua,
+            &[
+                ("rank", LuaValue::Integer(0)),
+                ("alpha", LuaValue::Number(1.0)),
+            ],
+        );
+        let err = extract_lora_cfg(Some(&zero_rank)).expect_err("zero rank");
+        assert!(err.to_string().contains("rank must be >= 1"));
+
+        let neg_alpha = opts_from(
+            &lua,
+            &[
+                ("rank", LuaValue::Integer(4)),
+                ("alpha", LuaValue::Number(-1.0)),
+            ],
+        );
+        let err = extract_lora_cfg(Some(&neg_alpha)).expect_err("negative alpha");
+        assert!(err.to_string().contains("positive finite number"));
+    }
+
+    #[test]
+    fn lora_cfg_defaults_target_modules_when_omitted() {
+        let lua = Lua::new();
+        let opts = opts_from(
+            &lua,
+            &[
+                ("rank", LuaValue::Integer(8)),
+                ("alpha", LuaValue::Number(16.0)),
+            ],
+        );
+        let cfg = extract_lora_cfg(Some(&opts)).expect("defaults");
+        let defaults = LoraConfig::default_targets();
+        assert_eq!(cfg.target_modules, defaults);
+        assert_eq!(cfg.rank, 8);
+        assert!((cfg.alpha - 16.0).abs() < 1e-6);
+        assert_eq!(cfg.dropout, 0.0);
+    }
+
+    #[test]
+    fn lora_cfg_rejects_empty_target_modules_list() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("rank", LuaValue::Integer(4)).unwrap();
+        opts.set("alpha", LuaValue::Number(8.0)).unwrap();
+        let empty = lua.create_table().unwrap();
+        opts.set("target_modules", empty).unwrap();
+        let err = extract_lora_cfg(Some(&opts)).expect_err("empty targets");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn lora_cfg_reads_custom_targets_dropout() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("rank", LuaValue::Integer(16)).unwrap();
+        opts.set("alpha", LuaValue::Number(32.0)).unwrap();
+        opts.set("dropout", LuaValue::Number(0.05)).unwrap();
+        let targets = lua.create_table().unwrap();
+        targets.set(1, "q_proj").unwrap();
+        targets.set(2, "v_proj").unwrap();
+        opts.set("target_modules", targets).unwrap();
+        let cfg = extract_lora_cfg(Some(&opts)).expect("custom");
+        assert_eq!(cfg.target_modules, vec!["q_proj".to_string(), "v_proj".into()]);
+        assert!((cfg.dropout - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn distill_loss_kind_rejects_wrong_type_input() {
+        let lua = Lua::new();
+        // `loss_kind = true` (boolean) must surface as a Lua
+        // type-mismatch error, not silently fall back to "ce".
+        // (Integers coerce to strings in mlua, so booleans are used to
+        // provoke the type check.)
+        let opts = opts_from(&lua, &[("loss_kind", LuaValue::Boolean(true))]);
+        let err =
+            extract_distill_loss_kind(Some(&opts)).expect_err("wrong-type loss_kind");
+        let msg = err.to_string();
+        assert!(!msg.is_empty(), "type-mismatch error should have a message");
+    }
+
+    #[test]
+    fn resolve_ckpt_dest_rejects_wrong_type_ckpt_dir() {
+        let lua = Lua::new();
+        let opts = opts_from(&lua, &[("ckpt_dir", LuaValue::Boolean(false))]);
+        let tmp = std::env::temp_dir();
+        let err = resolve_ckpt_dest(Some(&opts), &tmp, "full_ft")
+            .expect_err("wrong-type ckpt_dir");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn distill_loss_kind_defaults_to_ce_and_rejects_unknown() {
+        assert!(matches!(
+            extract_distill_loss_kind(None).unwrap(),
+            DistillLossKind::Ce
+        ));
+        let lua = Lua::new();
+        let opts = opts_from(&lua, &[("loss_kind", LuaValue::String(lua.create_string("ce").unwrap()))]);
+        assert!(matches!(
+            extract_distill_loss_kind(Some(&opts)).unwrap(),
+            DistillLossKind::Ce
+        ));
+        let bad = opts_from(
+            &lua,
+            &[(
+                "loss_kind",
+                LuaValue::String(lua.create_string("kl_soft").unwrap()),
+            )],
+        );
+        let err = extract_distill_loss_kind(Some(&bad)).expect_err("unknown loss");
+        assert!(err.to_string().contains("kl_soft"));
+    }
+
+    #[test]
+    fn build_create_payload_populates_lora_branch_when_meta_provides_it() {
+        let user_meta = json!({
+            "training_path": "lora",
+            "architecture": "gpt2-medium",
+            "candle": {
+                "device": "cuda:0",
+                "dtype": "bf16",
+                "lora": {
+                    "rank": 8,
+                    "alpha": 16,
+                    "base_bundle_ref": "nn/base-gpt2-medium"
+                }
+            }
+        });
+        let payload = build_create_payload("card-abc", "my-model", &user_meta)
+            .expect("payload with lora");
+        let lora = payload
+            .pointer("/metadata/nn/candle/lora")
+            .expect("lora sub-object");
+        assert_eq!(lora.get("rank"), Some(&json!(8)));
+        assert_eq!(lora.get("alpha"), Some(&json!(16)));
+        assert_eq!(
+            lora.get("base_bundle_ref"),
+            Some(&json!("nn/base-gpt2-medium"))
+        );
+    }
+
+    #[test]
+    fn build_create_payload_omits_lora_when_meta_absent_or_null() {
+        let no_candle = json!({
+            "training_path": "full_ft",
+            "architecture": "gpt2-medium",
+        });
+        let p = build_create_payload("c1", "m", &no_candle).unwrap();
+        let candle = p.pointer("/metadata/nn/candle").expect("candle present");
+        assert!(
+            candle.get("lora").is_none() || candle.get("lora") == Some(&Json::Null),
+            "lora must be absent: {candle}"
+        );
+
+        let candle_only = json!({
+            "training_path": "full_ft",
+            "architecture": "gpt2-medium",
+            "candle": { "device": "cpu" }
+        });
+        let p2 = build_create_payload("c2", "m", &candle_only).unwrap();
+        let candle2 = p2.pointer("/metadata/nn/candle").expect("candle present");
+        assert!(candle2.get("lora").is_none() || candle2.get("lora") == Some(&Json::Null));
+
+        let explicit_null = json!({
+            "training_path": "full_ft",
+            "architecture": "gpt2-medium",
+            "candle": { "lora": Json::Null }
+        });
+        let p3 = build_create_payload("c3", "m", &explicit_null).unwrap();
+        let candle3 = p3.pointer("/metadata/nn/candle").expect("candle present");
+        assert!(candle3.get("lora").is_none() || candle3.get("lora") == Some(&Json::Null));
+    }
+
+    #[test]
+    fn build_create_payload_reports_invalid_lora_shape() {
+        // Missing required NnLoraBranch fields (`rank` / `alpha` /
+        // `base_bundle_ref`) surfaces as a clear error rather than a
+        // silently half-populated Card.
+        let bad = json!({
+            "training_path": "lora",
+            "architecture": "gpt2-medium",
+            "candle": { "lora": { "rank": 8 } }
+        });
+        let err = build_create_payload("cx", "m", &bad).expect_err("invalid lora");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid meta.candle.lora"),
+            "message: {msg}"
+        );
+    }
 }

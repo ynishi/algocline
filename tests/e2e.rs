@@ -81,42 +81,96 @@ fn redact_paths(text: &str) -> String {
     }
 }
 
-/// Redact environment-specific values inside the `gh_credentials` block.
+/// Redact environment-specific values inside the `gh_credentials` block
+/// and the `settings` block.
 ///
-/// The following fields vary across machines and are replaced with stable
-/// placeholders so the snapshot is portable:
-///   - git_config.user_name  → "<GIT_USER_NAME>"
-///   - git_config.user_email → "<GIT_USER_EMAIL>"
-///   - ssh_keys.found        → ["<REDACTED>"] or []
-///   - origin_remote.error   → "<GIT_REMOTE_ERROR>" (git error messages vary)
+/// Every field that varies between the developer laptop (git configured,
+/// `gh` logged in, SSH keys present, `~/.algocline/settings.toml` populated)
+/// and the CI runner (fresh Ubuntu image, no gh CLI, empty settings) is
+/// mapped to a stable placeholder so the same snapshot passes in both
+/// environments.
 fn redact_gh_credentials(text: &str) -> String {
-    let re_user_name = regex::Regex::new(r#""user_name":\s*"[^"]*""#).expect("invalid regex");
-    let re_user_email = regex::Regex::new(r#""user_email":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_name_str =
+        regex::Regex::new(r#""user_name":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_email_str =
+        regex::Regex::new(r#""user_email":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_name_null = regex::Regex::new(r#""user_name":\s*null"#).expect("invalid regex");
+    let re_user_email_null =
+        regex::Regex::new(r#""user_email":\s*null"#).expect("invalid regex");
     // ssh found array: replace entries but preserve structure (present/absent)
     let re_ssh_found = regex::Regex::new(r#""found":\s*\[[^\]]*\]"#).expect("invalid regex");
-    // origin_remote error string
-    let re_origin_err = regex::Regex::new(r#"("error":\s*)"[^"]*""#).expect("invalid regex");
+    // Any non-null `"error":"..."` string (covers gh_auth.error when the CLI
+    // reports failure and origin_remote.error).
+    let re_error_str = regex::Regex::new(r#"("error":\s*)"[^"]*""#).expect("invalid regex");
+    // gh_auth null error (present when `gh auth status` succeeded).
+    let re_gh_auth_error_null = regex::Regex::new(r#""error":\s*null"#).expect("invalid regex");
+    // Bool fields that differ CI vs local:
+    //   gh_auth.available / gh_auth.logged_in / git_config.complete / ssh_keys.any_present.
+    let re_available =
+        regex::Regex::new(r#""available":\s*(?:true|false)"#).expect("invalid regex");
+    let re_logged_in =
+        regex::Regex::new(r#""logged_in":\s*(?:true|false)"#).expect("invalid regex");
+    let re_git_complete =
+        regex::Regex::new(r#""complete":\s*(?:true|false)"#).expect("invalid regex");
+    let re_any_present =
+        regex::Regex::new(r#""any_present":\s*(?:true|false)"#).expect("invalid regex");
+    // settings.resolved / sources: object contents depend on
+    // `~/.algocline/settings.toml`. Collapse the whole (possibly nested)
+    // object to a single placeholder. The nested regex handles at most one
+    // level of nesting, which matches the current settings.toml shape
+    // (e.g. `{"card": {"run": true}}`).
+    let re_settings_resolved = regex::Regex::new(
+        r#""resolved":\s*\{(?:[^{}]|\{[^{}]*\})*\}"#,
+    )
+    .expect("invalid regex");
+    let re_settings_sources = regex::Regex::new(
+        r#""sources":\s*\{(?:[^{}]|\{[^{}]*\})*\}"#,
+    )
+    .expect("invalid regex");
 
-    // We only want to redact origin_remote.error, not gh_auth.error.
-    // Strategy: redact all error strings inside gh_credentials block via a
-    // two-pass approach — replace within the gh_credentials JSON object.
-    let text = re_user_name
+    let text = re_user_name_str
         .replace_all(text, r#""user_name": "<GIT_USER_NAME>""#)
         .into_owned();
-    let text = re_user_email
+    let text = re_user_email_str
+        .replace_all(&text, r#""user_email": "<GIT_USER_EMAIL>""#)
+        .into_owned();
+    let text = re_user_name_null
+        .replace_all(&text, r#""user_name": "<GIT_USER_NAME>""#)
+        .into_owned();
+    let text = re_user_email_null
         .replace_all(&text, r#""user_email": "<GIT_USER_EMAIL>""#)
         .into_owned();
     // Replace ssh found list with a stable redacted placeholder that preserves
-    // whether keys were present (any_present field is separate and unchanged).
+    // the array shape (any_present is redacted separately below).
     let text = re_ssh_found
         .replace_all(&text, r#""found": ["<REDACTED>"]"#)
         .into_owned();
-    // Replace all error strings that are non-null (null stays null).
-    // This covers both gh_auth.error and origin_remote.error inside the
-    // gh_credentials block without touching errors outside it.
-    // Simple approach: only replace non-null error values (quoted strings).
-    let text = re_origin_err
+    // Redact all non-null error strings (gh_auth.error / origin_remote.error).
+    let text = re_error_str
         .replace_all(&text, r#"$1"<REDACTED>""#)
+        .into_owned();
+    // Then unify the null variant of gh_auth.error so that CI (string) and
+    // local (null) collapse to the same placeholder.
+    let text = re_gh_auth_error_null
+        .replace_all(&text, r#""error": "<REDACTED>""#)
+        .into_owned();
+    let text = re_available
+        .replace_all(&text, r#""available": "<REDACTED>""#)
+        .into_owned();
+    let text = re_logged_in
+        .replace_all(&text, r#""logged_in": "<REDACTED>""#)
+        .into_owned();
+    let text = re_git_complete
+        .replace_all(&text, r#""complete": "<REDACTED>""#)
+        .into_owned();
+    let text = re_any_present
+        .replace_all(&text, r#""any_present": "<REDACTED>""#)
+        .into_owned();
+    let text = re_settings_resolved
+        .replace_all(&text, r#""resolved": "<REDACTED>""#)
+        .into_owned();
+    let text = re_settings_sources
+        .replace_all(&text, r#""sources": "<REDACTED>""#)
         .into_owned();
     text
 }

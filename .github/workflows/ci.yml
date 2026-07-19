@@ -29,6 +29,22 @@ jobs:
         # ships a Lua 5.1-only parser and fails on prod Lua sources here.
         run: cargo install --locked --version 2.3.1 --features lua54 stylua
 
+      - name: Configure git identity
+        # Several e2e tests (test_alc_card_publish_*) create git commits via
+        # `alc_card_publish`; the CI runner has no default `user.name` /
+        # `user.email` and `git commit` fails with "Author identity unknown".
+        run: |
+          git config --global user.email "ci@algocline.local"
+          git config --global user.name "algocline-ci"
+
+      - name: Bootstrap ~/.algocline/packages via alc init
+        # `test_alc_card_analyze_roundtrip` (and other card e2e tests) treat
+        # `$HOME/.algocline/packages` as a Collection root that must contain
+        # the bundled `card_analysis` package. The developer laptop has this
+        # populated by prior `alc init`; the CI runner does not, so we run
+        # init explicitly before the test suite.
+        run: cargo run --bin alc -- init
+
       - name: Run CI checks
         run: just ci
 

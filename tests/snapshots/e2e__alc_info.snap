@@ -6,12 +6,12 @@ expression: redacted
 {
   "gh_credentials": {
     "gh_auth": {
-      "available": true,
-      "error": null,
-      "logged_in": true
+      "available": "<REDACTED>",
+      "error": "<REDACTED>",
+      "logged_in": "<REDACTED>"
     },
     "git_config": {
-      "complete": true,
+      "complete": "<REDACTED>",
       "user_email": "<GIT_USER_EMAIL>",
       "user_name": "<GIT_USER_NAME>"
     },
@@ -21,7 +21,7 @@ expression: redacted
       "url": null
     },
     "ssh_keys": {
-      "any_present": true,
+      "any_present": "<REDACTED>",
       "found": ["<REDACTED>"]
     }
   },
@@ -39,16 +39,8 @@ expression: redacted
     }
   ],
   "settings": {
-    "resolved": {
-      "card": {
-        "run": true
-      }
-    },
-    "sources": {
-      "card": {
-        "run": "global"
-      }
-    }
+    "resolved": "<REDACTED>",
+    "sources": "<REDACTED>"
   },
   "tracing": "file + stderr",
   "version": "0.46.0"

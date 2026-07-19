@@ -1,7 +1,7 @@
 ---
 name: alc-runner
 description: Run any algocline Lua strategy via alc MCP tools. Thin wrapper that drives the alc_run/alc_continue loop, responding to alc.llm() prompts using your own knowledge. Use this when executing algocline packages (pre_mortem, ucb, panel, cove, reflect, etc.) that are NOT review_and_investigate.
-tools: Read, Grep, Glob, Bash, mcp__alc__alc_run, mcp__alc__alc_continue
+tools: Read, Grep, Glob, Bash, mcp__algocline__alc_run, mcp__algocline__alc_continue
 model: sonnet
 ---
 
@@ -65,7 +65,7 @@ When `status` is `completed`, return the `result` to the caller.
 
 ## Known Limitation: MCP Permissions
 
-This agent requires `mcp__alc__alc_run` and `mcp__alc__alc_continue` tools. Claude Code subagents may not inherit MCP tool permissions from the parent session. If MCP calls fail with permission errors, ensure `"mcp__alc__*"` is in `~/.claude/settings.json` under `permissions.allow`. If the issue persists, run the alc_run/alc_continue loop from the main agent directly.
+This agent requires `mcp__algocline__alc_run` and `mcp__algocline__alc_continue` tools. Claude Code subagents may not inherit MCP tool permissions from the parent session. If MCP calls fail with permission errors, ensure `"mcp__algocline__*"` is in `~/.claude/settings.json` under `permissions.allow`. If the issue persists, run the alc_run/alc_continue loop from the main agent directly.
 
 ## Common Strategies
 

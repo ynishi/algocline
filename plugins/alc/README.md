@@ -16,6 +16,7 @@ are injected into the main thread as load-only Skill prose at all times.
 | Agent (coder) | `@alc-coder` | Writes `init.lua` and specs into `~/.algocline/packages/<name>/` and iterates up to three retries until `alc_pkg_test` passes. Appends a journal entry on completion |
 | Agent (refiner) | `@alc-refiner` | Reads a journal excerpt and returns a single-turn improvement proposal for the target, then appends an entry to the journal |
 | Agent (eval) | `@alc-eval` | Paused-session runner for measurement / AnyModel routing. Answers each pending `alc.llm` query as the LLM itself (the caller-picked `model` at dispatch is the model under test), loops via `alc_continue` until completion, and appends one journal entry (skippable with `journal: off`) |
+| Agent (runner) | `@alc-runner` | Thin `alc_run` / `alc_continue` loop driver for arbitrary Lua strategies (pre_mortem, ucb, panel, cove, reflect, etc.). Answers each `alc.llm()` prompt from its own knowledge and returns the final result to the caller |
 
 ## Usage
 

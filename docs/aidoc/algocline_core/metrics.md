@@ -1,6 +1,12 @@
 # algocline-core::metrics
 
-_This module has no module-level documentation._
+Metrics collection primitives.
+
+Aggregates per-query token usage, budget consumption, custom metric
+handles ([`CustomMetrics`]), and [`ProgressInfo`], and forwards
+observation events through registered
+[`ExecutionObserver`](crate::observer::ExecutionObserver) instances
+and the recent-log sink.
 
 ## Types
 

@@ -39,7 +39,8 @@
     },
     {
       "path": "algocline_app::pool::error",
-      "kind": "module"
+      "kind": "module",
+      "docs": "Error types produced by the process-pool IPC layer.\n\nAll variants propagate to callers via `Result<T, PoolError>` and\nare converted to `String` at the `AppService` boundary (Subtask\n5/6) to satisfy the existing `EngineApi` wire contract."
     },
     {
       "path": "algocline_app::pool::error::PoolError",
@@ -48,7 +49,8 @@
     },
     {
       "path": "algocline_app::pool::protocol",
-      "kind": "module"
+      "kind": "module",
+      "docs": "Wire protocol messages exchanged between the pool client (MCP\nprocess) and pool workers over Unix domain sockets.\n\nRequests carry an `\"op\"` discriminant and are serialised as single\nJSON lines. Responses mirror the same shape and are correlated by\nthe request ordering on a per-connection basis."
     },
     {
       "path": "algocline_app::pool::protocol::PoolRequest",

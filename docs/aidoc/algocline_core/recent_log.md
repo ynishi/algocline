@@ -1,6 +1,12 @@
 # algocline-core::recent_log
 
-_This module has no module-level documentation._
+Per-session recent-log ring buffer.
+
+[`LogEntry`] captures events from Lua `print()`, `alc.log()`, and
+engine-internal callsites. [`LogSink`] accumulates entries with a
+fixed cap (=20) for retrieval via `alc_log_view` and MCP resource
+endpoints, providing bounded per-session observability without
+unbounded memory growth.
 
 ## Types
 

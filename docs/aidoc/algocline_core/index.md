@@ -1,6 +1,13 @@
 # algocline-core 0.45.0
 
-_This crate has no crate-root documentation._
+Core domain types and primitives shared across the algocline workspace.
+
+Provides the shared vocabulary consumed by `algocline-engine`,
+`algocline-app`, and `algocline-mcp`: [`AppDir`] path handling,
+[`Budget`] / token accounting, the [`EngineApi`] trait, execution
+and query domain types, metrics collection, package (`pkg`) metadata,
+progress reporting ([`ProgressInfo`]), the recent-log ring buffer,
+and shared state primitives.
 
 ## Modules
 
@@ -15,7 +22,7 @@ _This crate has no crate-root documentation._
 - [`execution::session_id`](execution__session_id.md): Session identifier type for the `ExecutionService` layer.
 - [`execution::spec`](execution__spec.md): Session specification types for the `ExecutionService` layer.
 - [`execution::state`](execution__state.md): Execution state types (v2) for the `ExecutionService` layer.
-- [`metrics`](metrics.md): (no module-level documentation)
+- [`metrics`](metrics.md): Metrics collection primitives.
 - [`pkg`](pkg.md): Canonical projection of a Lua package's `M.meta` block.
-- [`recent_log`](recent_log.md): (no module-level documentation)
+- [`recent_log`](recent_log.md): Per-session recent-log ring buffer.
 

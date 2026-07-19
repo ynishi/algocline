@@ -52,15 +52,21 @@ in the Rust ecosystem.
 <!-- algocline_app/index.md -->
 # algocline-app 0.45.0
 
-_This crate has no crate-root documentation._
+Service layer sitting between `algocline-engine` and `algocline-mcp`.
+
+Hosts [`AppConfig`], [`AppService`], and the process pool ([`pool`])
+providing UDS-based worker isolation for MCP tool calls. Also owns
+the hub-projection preset resolution (`load_hub_projection_config`
+and related config types) that translates preset selectors into
+runtime-ready projection contexts.
 
 ## Modules
 
 - [`pool`](pool.md): Process-pool IPC layer for `host_mode=true` execution.
 - [`pool::client`](pool__client.md): UDS client for connecting to a pool worker process.
 - [`pool::dispatch`](pool__dispatch.md): Host-mode dispatch helpers.
-- [`pool::error`](pool__error.md): (no module-level documentation)
-- [`pool::protocol`](pool__protocol.md): (no module-level documentation)
+- [`pool::error`](pool__error.md): Error types produced by the process-pool IPC layer.
+- [`pool::protocol`](pool__protocol.md): Wire protocol messages exchanged between the pool client (MCP
 - [`pool::registry`](pool__registry.md): Pool registry: persistent session-to-worker mapping.
 
 
@@ -125,7 +131,11 @@ response forwarding.
 <!-- algocline_app/pool__error.md -->
 # algocline-app::pool::error
 
-_This module has no module-level documentation._
+Error types produced by the process-pool IPC layer.
+
+All variants propagate to callers via `Result<T, PoolError>` and
+are converted to `String` at the `AppService` boundary (Subtask
+5/6) to satisfy the existing `EngineApi` wire contract.
 
 ## Types
 
@@ -135,7 +145,12 @@ _This module has no module-level documentation._
 <!-- algocline_app/pool__protocol.md -->
 # algocline-app::pool::protocol
 
-_This module has no module-level documentation._
+Wire protocol messages exchanged between the pool client (MCP
+process) and pool workers over Unix domain sockets.
+
+Requests carry an `"op"` discriminant and are serialised as single
+JSON lines. Responses mirror the same shape and are correlated by
+the request ordering on a per-connection basis.
 
 ## Types
 
@@ -172,7 +187,14 @@ after acquiring the advisory lock rather than caching across lock cycles.
 <!-- algocline_core/index.md -->
 # algocline-core 0.45.0
 
-_This crate has no crate-root documentation._
+Core domain types and primitives shared across the algocline workspace.
+
+Provides the shared vocabulary consumed by `algocline-engine`,
+`algocline-app`, and `algocline-mcp`: [`AppDir`] path handling,
+[`Budget`] / token accounting, the [`EngineApi`] trait, execution
+and query domain types, metrics collection, package (`pkg`) metadata,
+progress reporting ([`ProgressInfo`]), the recent-log ring buffer,
+and shared state primitives.
 
 ## Modules
 
@@ -187,9 +209,9 @@ _This crate has no crate-root documentation._
 - [`execution::session_id`](execution__session_id.md): Session identifier type for the `ExecutionService` layer.
 - [`execution::spec`](execution__spec.md): Session specification types for the `ExecutionService` layer.
 - [`execution::state`](execution__state.md): Execution state types (v2) for the `ExecutionService` layer.
-- [`metrics`](metrics.md): (no module-level documentation)
+- [`metrics`](metrics.md): Metrics collection primitives.
 - [`pkg`](pkg.md): Canonical projection of a Lua package's `M.meta` block.
-- [`recent_log`](recent_log.md): (no module-level documentation)
+- [`recent_log`](recent_log.md): Per-session recent-log ring buffer.
 
 
 <!-- algocline_core/domain.md -->
@@ -359,7 +381,13 @@ These types are **distinct** from the legacy `state::ExecutionState` in
 <!-- algocline_core/metrics.md -->
 # algocline-core::metrics
 
-_This module has no module-level documentation._
+Metrics collection primitives.
+
+Aggregates per-query token usage, budget consumption, custom metric
+handles ([`CustomMetrics`]), and [`ProgressInfo`], and forwards
+observation events through registered
+[`ExecutionObserver`](crate::observer::ExecutionObserver) instances
+and the recent-log sink.
 
 ## Types
 
@@ -412,7 +440,13 @@ absence.
 <!-- algocline_core/recent_log.md -->
 # algocline-core::recent_log
 
-_This module has no module-level documentation._
+Per-session recent-log ring buffer.
+
+[`LogEntry`] captures events from Lua `print()`, `alc.log()`, and
+engine-internal callsites. [`LogSink`] accumulates entries with a
+fixed cap (=20) for retrieval via `alc_log_view` and MCP resource
+endpoints, providing bounded per-session observability without
+unbounded memory growth.
 
 ## Types
 
@@ -427,7 +461,14 @@ _This module has no module-level documentation._
 <!-- algocline_engine/index.md -->
 # algocline-engine 0.45.0
 
-_This crate has no crate-root documentation._
+Lua strategy execution engine.
+
+Owns the [`Session`] lifecycle (running / needs_response / completed),
+the [`Executor`] loop that drives Lua coroutines and mediates
+`alc.llm()` pauses, the [`FileCardStore`] for structured session
+artifacts, [`bridge`] modules that expose Rust-backed globals
+(`alc.*`) to Lua, and the resolver factory that wires strategies
+to LLM providers.
 
 ## Modules
 
@@ -731,7 +772,14 @@ code.  Planned backends:
 <!-- algocline_mcp/index.md -->
 # algocline-mcp 0.45.0
 
-_This crate has no crate-root documentation._
+MCP (Model Context Protocol) server layer.
+
+Exposes [`AlcService`] — the rmcp handler implementing MCP tools
+(`alc_run` / `alc_continue` / `alc_status` / `alc_card_*` /
+`alc_pkg_*` / `alc_hub_*` / `alc_eval_*` etc.), the [`PromptCatalog`]
+and [`ResourceCatalog`], the request registry used for MCP sampling
+continuations, and the [`progress_forwarder`] mapping engine
+progress events to MCP progress notifications.
 
 ## Modules
 

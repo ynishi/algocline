@@ -1,6 +1,13 @@
 # algocline-mcp 0.45.0
 
-_This crate has no crate-root documentation._
+MCP (Model Context Protocol) server layer.
+
+Exposes [`AlcService`] — the rmcp handler implementing MCP tools
+(`alc_run` / `alc_continue` / `alc_status` / `alc_card_*` /
+`alc_pkg_*` / `alc_hub_*` / `alc_eval_*` etc.), the [`PromptCatalog`]
+and [`ResourceCatalog`], the request registry used for MCP sampling
+continuations, and the [`progress_forwarder`] mapping engine
+progress events to MCP progress notifications.
 
 ## Modules
 

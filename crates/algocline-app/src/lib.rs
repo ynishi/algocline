@@ -1,3 +1,11 @@
+//! Service layer sitting between `algocline-engine` and `algocline-mcp`.
+//!
+//! Hosts [`AppConfig`], [`AppService`], and the process pool ([`pool`])
+//! providing UDS-based worker isolation for MCP tool calls. Also owns
+//! the hub-projection preset resolution (`load_hub_projection_config`
+//! and related config types) that translates preset selectors into
+//! runtime-ready projection contexts.
+
 pub mod pool;
 mod service;
 

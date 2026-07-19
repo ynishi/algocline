@@ -1,3 +1,12 @@
+//! Lua strategy execution engine.
+//!
+//! Owns the [`Session`] lifecycle (running / needs_response / completed),
+//! the [`Executor`] loop that drives Lua coroutines and mediates
+//! `alc.llm()` pauses, the [`FileCardStore`] for structured session
+//! artifacts, [`bridge`] modules that expose Rust-backed globals
+//! (`alc.*`) to Lua, and the resolver factory that wires strategies
+//! to LLM providers.
+
 pub mod bridge;
 pub mod card;
 pub mod execution;

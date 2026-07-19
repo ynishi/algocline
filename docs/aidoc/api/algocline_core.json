@@ -204,7 +204,8 @@
     },
     {
       "path": "algocline_core::metrics",
-      "kind": "module"
+      "kind": "module",
+      "docs": "Metrics collection primitives.\n\nAggregates per-query token usage, budget consumption, custom metric\nhandles ([`CustomMetrics`]), and [`ProgressInfo`], and forwards\nobservation events through registered\n[`ExecutionObserver`](crate::observer::ExecutionObserver) instances\nand the recent-log sink."
     },
     {
       "path": "algocline_core::metrics::ExecutionMetrics",
@@ -243,7 +244,8 @@
     },
     {
       "path": "algocline_core::recent_log",
-      "kind": "module"
+      "kind": "module",
+      "docs": "Per-session recent-log ring buffer.\n\n[`LogEntry`] captures events from Lua `print()`, `alc.log()`, and\nengine-internal callsites. [`LogSink`] accumulates entries with a\nfixed cap (=20) for retrieval via `alc_log_view` and MCP resource\nendpoints, providing bounded per-session observability without\nunbounded memory growth."
     },
     {
       "path": "algocline_core::recent_log::LOG_SINK_CAP",

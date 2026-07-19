@@ -8,17 +8,17 @@
 
 ## algocline-app 0.45.0
 
-- [algocline-app overview](algocline_app/index.md): (no crate-root documentation)
+- [algocline-app overview](algocline_app/index.md): Service layer sitting between `algocline-engine` and `algocline-mcp`.
 - [algocline-app::pool](algocline_app/pool.md): Process-pool IPC layer for `host_mode=true` execution.
 - [algocline-app::pool::client](algocline_app/pool__client.md): UDS client for connecting to a pool worker process.
 - [algocline-app::pool::dispatch](algocline_app/pool__dispatch.md): Host-mode dispatch helpers.
-- [algocline-app::pool::error](algocline_app/pool__error.md): (no module-level documentation)
-- [algocline-app::pool::protocol](algocline_app/pool__protocol.md): (no module-level documentation)
+- [algocline-app::pool::error](algocline_app/pool__error.md): Error types produced by the process-pool IPC layer.
+- [algocline-app::pool::protocol](algocline_app/pool__protocol.md): Wire protocol messages exchanged between the pool client (MCP
 - [algocline-app::pool::registry](algocline_app/pool__registry.md): Pool registry: persistent session-to-worker mapping.
 
 ## algocline-core 0.45.0
 
-- [algocline-core overview](algocline_core/index.md): (no crate-root documentation)
+- [algocline-core overview](algocline_core/index.md): Core domain types and primitives shared across the algocline workspace.
 - [algocline-core::domain](algocline_core/domain.md): Re-exports for domain types.
 - [algocline-core::execution](algocline_core/execution.md): Pure execution service layer for `algocline-core`.
 - [algocline-core::execution::cancel](algocline_core/execution__cancel.md): Cancellation and failure types for the `ExecutionService` layer.
@@ -30,13 +30,13 @@
 - [algocline-core::execution::session_id](algocline_core/execution__session_id.md): Session identifier type for the `ExecutionService` layer.
 - [algocline-core::execution::spec](algocline_core/execution__spec.md): Session specification types for the `ExecutionService` layer.
 - [algocline-core::execution::state](algocline_core/execution__state.md): Execution state types (v2) for the `ExecutionService` layer.
-- [algocline-core::metrics](algocline_core/metrics.md): (no module-level documentation)
+- [algocline-core::metrics](algocline_core/metrics.md): Metrics collection primitives.
 - [algocline-core::pkg](algocline_core/pkg.md): Canonical projection of a Lua package's `M.meta` block.
-- [algocline-core::recent_log](algocline_core/recent_log.md): (no module-level documentation)
+- [algocline-core::recent_log](algocline_core/recent_log.md): Per-session recent-log ring buffer.
 
 ## algocline-engine 0.45.0
 
-- [algocline-engine overview](algocline_engine/index.md): (no crate-root documentation)
+- [algocline-engine overview](algocline_engine/index.md): Lua strategy execution engine.
 - [algocline-engine::bridge](algocline_engine/bridge.md): Layer 0: Runtime Primitives
 - [algocline-engine::card](algocline_engine/card.md): Card storage — immutable run-result snapshots.
 - [algocline-engine::execution](algocline_engine/execution.md): `algocline-engine::execution` — v2 execution module.
@@ -45,7 +45,7 @@
 
 ## algocline-mcp 0.45.0
 
-- [algocline-mcp overview](algocline_mcp/index.md): (no crate-root documentation)
+- [algocline-mcp overview](algocline_mcp/index.md): MCP (Model Context Protocol) server layer.
 - [algocline-mcp::progress_forwarder](algocline_mcp/progress_forwarder.md): Progress forwarder task for the v2 MCP adapter.
 - [algocline-mcp::prompts](algocline_mcp/prompts.md): MCP Prompts capability — workflow-trigger prompts.
 - [algocline-mcp::req_registry](algocline_mcp/req_registry.md): `ReqIdRegistry` — wire-layer adapter exclusive mapping from `RequestId` to [`SessionId`].

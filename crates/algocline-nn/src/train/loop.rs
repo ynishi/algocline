@@ -291,6 +291,18 @@ fn run_ft_core(
             running_min_loss = loss_val;
         }
 
+        // Per-step observability. Emit through `tracing` so downstream
+        // subscribers (RUST_LOG=algocline_nn=info) can collect the loss
+        // trajectory without changing the return shape. The training
+        // loop itself stays a closed function: this line is the only
+        // window a caller has into intermediate loss values.
+        tracing::info!(
+            step = step,
+            loss = loss_val,
+            lr = lr,
+            "train_step"
+        );
+
         opt.backward_step(&loss)?;
 
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {

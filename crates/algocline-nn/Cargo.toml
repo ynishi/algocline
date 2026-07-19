@@ -39,6 +39,12 @@ thiserror = { workspace = true }
 # tempfile — used by the ckpt / training-loop unit tests to sandbox
 # safetensors output under a scoped directory.
 tempfile = { workspace = true }
+# tracing-subscriber — the GPU smoke examples install a stderr fmt
+# subscriber so the per-step `tracing::info!` events emitted by
+# `run_ft_core` show up as a loss trajectory when the caller sets
+# `RUST_LOG=algocline_nn=info`. Kept in dev-deps so production builds
+# of the library never pull it in.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
 # Enable candle's CUDA backend for training on RunPod A40 / A100 hosts.

@@ -673,8 +673,6 @@ impl EngineApi for AppService {
                 .map_err(AppService::state_err_to_wire)
                 .and_then(|keys| {
                     // Wire shape: { "keys": [string] } per docs/state-management.md L92.
-                    // TODO(ST2): verify this shape via real rmcp stdio in tests/e2e.rs
-                    // (test_alc_state_list_* happy path should assert parsed["keys"].is_array()).
                     serde_json::to_string(&serde_json::json!({"keys": keys}))
                         .map_err(|e| format!("state_list: serialize: {e}"))
                 })

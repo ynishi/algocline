@@ -238,7 +238,7 @@ impl AppService {
         // - `-active` (desc) puts `active=true` first, `active=false` last
         //   (bool DESC: true > false in apply_sort_by_value).
         // - `-installed_at` (desc) breaks ties with newest install first.
-        // The plan.md §3.3 prose says "active=true 先頭"; using `-active`
+        // Sort prose says "active=true 先頭"; using `-active`
         // (DESC) is the only way to satisfy that with the bool ordering
         // contract — see context-st2.md Pitfall #3.
         let sort_str = opts.sort.as_deref().unwrap_or("-active,-installed_at");

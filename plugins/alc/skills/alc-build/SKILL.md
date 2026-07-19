@@ -76,12 +76,12 @@ Required elements of `design_para`:
   be filled in manually.
 - **Pass conditions** (what `alc_pkg_test` should confirm to declare done —
   the coder's completion is bounded by this).
-- **Card emission (swarm_frame orch packages only)**: wire
+- **Card emission (swarm_frame orchestration packages only)**: wire
   `plugin_run_card.create({pkg_name="..."})` into
   `make_dispatcher({plugins=...})` (the default fixture for the nine major
   orchestrators; see wake -> Swarm framework). Single-shot strategy
-  packages are not in scope, but orch packages should include it **unless
-  there is a specific reason not to**.
+  packages are not in scope, but orchestration packages should include it
+  **unless there is a specific reason not to**.
 
 **Pre-impl plan check recommended (optional, for important / complex
 packages)**: before finalizing `design_para`, throw a plan-review query at
@@ -118,8 +118,8 @@ arms as the pass condition."
    (Write `init.lua` + spec -> `alc_pkg_test` -> Edit on failure -> <= 3
    retries) + return contract (three sections: `### Result` / `### Artifacts`
    / `### Key Observations`).
-5. **Spawn `@alc-coder` via the `Task` tool** — no other Agents
-   (`impl-lead` / orch agents, etc.) may be called.
+5. **Spawn `@alc-coder` via the `Task` tool** — no other Agents (external
+   pipeline / implementation agents from other plugins) may be called.
 6. Return the `result_summary` to the main thread and hand control back to
    the rendezvous where the User confirms, re-kicks, or injects a Delta.
 
@@ -208,8 +208,8 @@ section to both paths.
 
 - **Do not run design dialogue inside this Skill** (mixing it in breaks the
   Skill's scope).
-- **Do not spawn any Agent other than `@alc-coder`** (no orch agents,
-  `impl-lead`, etc.).
+- **Do not spawn any Agent other than `@alc-coder`** (no external pipeline
+  agents from other plugins).
 - Do not summarize or truncate `design_para` (it causes requirements to
   drop on the Agent side).
 - **Do not invoke without the Maturity Self-check passing** (AI-invoked

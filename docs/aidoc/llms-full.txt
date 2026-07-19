@@ -82,7 +82,7 @@ pool worker protocol:
 - [`protocol`] — [`PoolRequest`] / [`PoolResponse`] wire types (serde JSON line)
 - [`client`] — [`PoolClient`] UDS client (connect + handshake + send_request)
 - [`registry`] — [`PoolRegistry`] persistence + GC (registry.json)
-- [`dispatch`] — worker spawn + UDS proxy orchestration (ST6)
+- [`dispatch`] — worker spawn + UDS proxy orchestration
 
 
 <!-- algocline_app/pool__client.md -->
@@ -474,6 +474,7 @@ to LLM providers.
 
 - [`bridge`](bridge.md): Layer 0: Runtime Primitives
 - [`card`](card.md): Card storage — immutable run-result snapshots.
+- [`card_context`](card_context.md): Card context injection — resolves Card summaries for prompt injection.
 - [`execution`](execution.md): `algocline-engine::execution` — v2 execution module.
 - [`session`](session.md): Session-based Lua execution with pause/resume on alc.llm() calls.
 - [`state`](state.md): Persistent key-value state backed by JSON files.
@@ -612,10 +613,12 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 - `lineage_to_json` — Render a LineageResult as JSON for the service layer.
 - `lineage_with_store` — Walk the lineage tree from `q.card_id` in `store`.
 - `list_with_store` — List cards from `store`. `pkg_filter = Some("name")` restricts to that pkg subdir.
+- `log_sink_subscriber` — Return the process-wide [`LogSinkCardSubscriber`] singleton.
 - `parse_order_by` — Parse an order_by JSON value.  Accepts:
 - `parse_where` — Parse a `where` JSON value into a `Predicate`.
 - `publish` — Convenience wrapper: publish through the singleton.
 - `read_samples_with_store` — Read per-case samples from `{card_id}.samples.jsonl`.
+- `register_log_sink` — Register `sink` with the process-wide [`LogSinkCardSubscriber`] and
 - `subscriber_stats_snapshot` — Public entry point: snapshot of all process-wide subscriber stats.
 - `summaries_to_json` — (no documentation)
 - `validate_name` — (no documentation)
@@ -638,6 +641,8 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 - `LineageNode` — One node in the lineage result.
 - `LineageQuery` — Query parameters for `lineage`.
 - `LineageResult` — Full lineage walk result.
+- `LogSinkCardSubscriber` — Fan-out `CardEvent`s into per-session `LogSink` ring buffers.
+- `LogSinkRegistration` — RAII guard that unregisters a `LogSink` from the singleton
 - `OrderKey` — Parsed sort key: path with optional descending flag.
 - `PerSubscriber` — Per-subscriber counter state. Held inside `SubscriberStats` under a
 - `Predicate` — Parsed predicate tree.
@@ -657,6 +662,62 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 ## Constants
 
 - `SCHEMA_VERSION` — (no documentation)
+
+
+<!-- algocline_engine/card_context.md -->
+# algocline-engine::card_context
+
+Card context injection — resolves Card summaries for prompt injection.
+
+Phase 3-F MVP: `alc.llm(prompt, {card_context = ...})` opts key wires
+a small set of prior Cards into the LLM system prompt as an XML-like
+`<past_cards>` block.  This module is the pure-Rust core: Lua bridge
+wiring lives in `bridge/llm.rs`.
+
+## Public API
+
+* [`CardContextSpec`] — 2-form spec (`CardId` or `Query { pkg, limit }`)
+  received from the Lua bridge after opts extraction.
+* [`resolve`] — spec → `Vec<Json>` full Card resolution against a
+  `CardStore`.  Silent Ok(empty) on not-found / empty query.
+* [`format_past_cards`] — infallible fixed-template renderer producing
+  the `<past_cards>...</past_cards>` block.
+
+## Fixed format template (MVP)
+
+```text
+<past_cards>
+Card MM/DD pkg=<pkg> card_id=<id> [run.status=<status>] Rating <val> reason=<reason>
+...
+</past_cards>
+```
+
+* Each Card on 1 line, `created_at` desc order (newest first)
+* `[run.status=...]` emitted only when the Card JSON carries `run.status`
+* `Rating <val>` emitted only when `stats.pass_rate` is present
+  (formatted with 1 decimal digit)
+* `reason=<reason>` emitted only when `run.reason` is present
+* `MM/DD` derived from RFC 3339 `created_at` (`&s[5..10]` with the
+  `-` separator rewritten to `/`); omitted when `created_at` is
+  missing or too short
+* Empty input slice → empty string (no `<past_cards>` wrapper)
+
+## Error handling
+
+`resolve` returns `Result<Vec<Json>, String>`.  Underlying
+`card::get_with_store` / `card::find_with_store` errors are re-wrapped
+with a `"card_context resolve: "` prefix so the bridge layer can
+surface them via `tracing::warn!` before silently dropping the inject
+(Phase 3-F Done Criteria #4: silent no-op on resolution failure).
+
+## Functions
+
+- `format_past_cards` — Render a slice of resolved Card JSON values as the fixed
+- `resolve` — Resolve a [`CardContextSpec`] against `store`, returning full Card
+
+## Types
+
+- `CardContextSpec` — Card context specification extracted from the Lua `card_context` opt.
 
 
 <!-- algocline_engine/execution.md -->

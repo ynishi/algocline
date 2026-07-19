@@ -58,8 +58,8 @@ pub enum SettingError {
 /// `sources` maps `target -> field -> layer` where layer ∈ {"env", "project", "global"}.
 ///
 /// Both maps are always populated in a single call — callers never need to
-/// perform additional TOML or env parsing to obtain the complete resolved config
-/// (crux-card.md must_not_simplify: alc_setting_resolve single-call contract).
+/// perform additional TOML or env parsing to obtain the complete resolved
+/// config (single-call contract for `alc_setting_resolve`).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SettingResolved {
     /// Resolved field values per target.

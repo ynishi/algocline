@@ -28,8 +28,7 @@ that earlier shape introduced an `OrchState` type and leaked the `orch`
 application term into shared crates. The 0.37.0 entry of `CHANGELOG.md`
 documents the constraint:
 
-> The new design keeps all application terms in caller packages
-> (`coding_orch`, `incubator`, etc.).
+> The new design keeps all application terms in caller packages.
 
 The Lua method surface (`alc.state.list/show/reset`) was provided as the
 post-rollback path, callable via a `mcp__algocline__alc_run` + Lua snippet.
@@ -276,9 +275,9 @@ Acceptance:
 ### Documentation
 
 - This file is the canonical specification (linked from `AGENT_INDEX.md`).
-- The `agent-profiles` repo's `workspace-pipeline.md §orch state.json 編集
-  SOP` will be updated to point at the new MCP tools instead of the Lua
-  snippet path, after Phase A lands.
+- External consumer documentation (state.json editing runbooks in
+  downstream orchestration projects) will be updated to point at the new
+  MCP tools instead of the Lua snippet path, after Phase A lands.
 
 ## File reference
 

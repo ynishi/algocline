@@ -14,8 +14,8 @@ categories.workspace = true
 [dependencies]
 # CPU by default. The optional `nn-cuda` feature turns on candle's CUDA
 # backend; on a CUDA-less dev host that feature only compiles behind an
-# `nvcc` toolchain (see subtask-2.md §Done Criteria). candle-core /
-# candle-nn are released in lockstep; keep their minor versions equal.
+# `nvcc` toolchain. candle-core / candle-nn are released in lockstep;
+# keep their minor versions equal.
 candle-core = "0.11"
 candle-nn = "0.11"
 # Must match the engine's mlua (0.11, lua54, vendored, send) so a single mlua

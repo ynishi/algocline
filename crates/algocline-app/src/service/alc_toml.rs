@@ -6,14 +6,14 @@
 //! ## Schema example
 //! ```toml
 //! [packages]
-//! coding_orch = "*"
-//! flow_design = "0.2.0"
+//! my_pkg = "*"
+//! another_pkg = "0.2.0"
 //!
-//! [packages.head_agent]
-//! path = "packages/head_agent"
+//! [packages.local_pkg]
+//! path = "packages/local_pkg"
 //!
-//! [packages.my_pkg]
-//! git = "https://github.com/user/my-pkg"
+//! [packages.git_pkg]
+//! git = "https://github.com/user/git-pkg"
 //! rev = "abc123"
 //! ```
 

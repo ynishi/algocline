@@ -55,7 +55,7 @@ mind. For heavy lookups or investigations, throw a single-turn query at
 - `alc_pkg_test` runs spec-based tests; `alc_pkg_doctor` diagnoses
   structural health.
 
-### Swarm framework (when building orch-style packages)
+### Swarm framework (when building orchestration-style packages)
 
 Multi-step, multi-role orchestrator packages should use **swarm_frame**.
 Simple strategies do not need it; bring it in when you need "a state machine
@@ -63,7 +63,7 @@ plus a role call per step".
 
 - **Three required deps**: `require("flow")` + `require("swarm_frame")` +
   `require("swarm_frame_algocline")`.
-- **Four exports (orch convention)**: `M.parse_verdict(text)` /
+- **Four exports (orchestration convention)**: `M.parse_verdict(text)` /
   `M.build_prompt(step, state)` / `M.phases` / `M.run(ctx)`, plus
   `M.meta`.
 - **init**: the default is `frame.init({ check_mode = "format" })` (orch
@@ -86,10 +86,9 @@ plus a role call per step".
   hooks (`before_dispatch` / `around_dispatch` / `after_dispatch` /
   `finalize`). Examples: `plugin_variant_ab` (Blue/Green slot rewrite),
   `plugin_run_card` (Card writes), `plugin_3step_gate`.
-- **`plugin_run_card` is the default fixture for orch packages** (measured:
-  all nine major orchestrators use it — coding_orch / olympian_weekly /
-  modeling_orch / distillation_orch / saas_{scan,profile,digest,technique}
-  / flow_implement / flow_refine_orch). Standard call site:
+- **`plugin_run_card` is the default fixture for orchestration packages** (measured:
+  all nine major orchestrators in the algocline ecosystem use it as their
+  default Card-emission fixture). Standard call site:
 
   ```lua
   local plugin_run_card = require("plugin_run_card")
@@ -105,14 +104,14 @@ plus a role call per step".
 
   Frame writes one `alc.card` per group at finalize. With Cards in place,
   `alc_card_list` / `alc_card_get` / `alc_card_analyze` can read execution
-  traces. **Always include `plugin_run_card` when building an orch package
+  traces. **Always include `plugin_run_card` when building an orchestration package
   unless there is a specific reason not to** (omitting it leaves zero Card
   emissions and no execution trace).
 
 **Reference implementation**: `bundled_base_curator_orch` v0.3.0 (a complete
 six-step / six-role implementation; the source pattern for
 `SPEC_BUILDERS` / `PATHS` / `STEP_TO_PATH` / `register_steps` / `M.run`).
-For new orch packages, read it verbatim first.
+For new orchestration packages, read it verbatim first.
 
 ### ALC Conventions (rules established in production, applied on every coder dispatch)
 
@@ -148,7 +147,7 @@ separate axis.)
    `biz_re_invest_validator` on 2026-05-19).
 5. **Minimum requirements for complete `M.meta`**: the four scaffold
    default fields (name / version / description / category) plus, for
-   orch / composite packages, the manually filled `docs` (usage + main
+   orchestration / composite packages, the manually filled `docs` (usage + main
    helpers) and `narrative` (5-10 lines of orchestrator story prose).
    `alc_pkg_scaffold` only generates the first four; the coder is
    responsible for filling in the remaining two by hand.

@@ -352,7 +352,7 @@ local r = alc.state.reset("my_app", "task_42", {
     fields = { "repo_readiness", "repo_readiness_report" },
 })
 -- r.ok = true
--- r.backup_path = "/Users/.../my_app/task_42.json.bak"
+-- r.backup_path = "~/.algocline/state/orch/my_app/task_42.json.bak"
 -- r.steps_removed = 1
 -- r.fields_removed = 2
 ```

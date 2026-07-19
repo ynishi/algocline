@@ -708,7 +708,7 @@ use.
 | Forbidden inside a pkg     | `os.getenv`, `std.env.get`, hand-rolled dotenv parsing, ad-hoc `API_KEY` / `BASE_URL` lookups                        |
 | Recommended inside a pkg   | `local env = alc.env:use{ "KEY1", "KEY2" }` then `env.KEY1` to read                                                 |
 | Caller-side responsibility | Pass sources at run time: `alc_run(code, ctx = { env = { dotenv = ".env", allow_os = true } })`                     |
-| Reference integration      | `coding_orch` Phase 2 migration (agent-profiles issue `1778976345-92995`) replaces `resolve_*_env` helpers with `alc.env:use` |
+| Reference integration      | External orchestration hosts have replaced `resolve_*_env` helpers with `alc.env:use` in their Phase 2 migrations |
 
 ### Example (Phase 2 reference)
 
@@ -732,7 +732,7 @@ Lua VM test-runtime constraint, not an application-level env access.
 - Pkgs are portable units; reading env inside an `init.lua` couples the
   pkg to a specific host's secret-loading convention.
 - `alc.env:use` makes the required vars **declarative** at the point of
-  use, which lets `coding_orch` / future hosts pre-validate and surface
+  use, which lets external orchestration hosts pre-validate and surface
   a single `NEEDS_CONTEXT: <KEY>` error to the caller instead of failing
   deep inside pkg code.
 - Audit and caching live in the host (`ctx.env`), not scattered across

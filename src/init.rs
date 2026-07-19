@@ -73,7 +73,7 @@ const CONFIG_TOML_TEMPLATE: &str = r#"# user-global algocline config
 #
 # Example — arbitrary strategy-defined target:
 # [setting.journal]
-# path = "/Users/.../journal.md"
+# path = "~/journal.md"
 # pkg  = false
 #
 # Known target used by algocline itself:

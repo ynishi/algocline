@@ -27,7 +27,7 @@ main thread.
   of pass or fail).
 - **Don't**: continue design dialogue; ask the main thread clarifying
   questions (fill gaps by inference, or surface them in `Key Observations`);
-  invoke the `/orch` pipeline agents; loop beyond four retries; modify
+  invoke external pipeline agents from other plugins/sets; loop beyond four retries; modify
   anything outside the scope of `design_para`; emit improvement proposals
   (refinement belongs to `@alc-refiner`).
 
@@ -298,8 +298,9 @@ either because both are runtime-shape concerns.
 - **Return `result_summary` without ever calling `alc_pkg_test`.**
 - **Exceed the retry cap of three** (treat a fourth retry as a max-retry
   failure and return).
-- **Call `/orch` pipeline agents** (`impl-lead` / `quality-gate` /
-  `committer`, etc.).
+- **Call external pipeline agents from other plugins/sets** (implementation
+  agents, quality gates, commit agents, etc. from an orchestration plugin
+  outside `alc`).
 - **Return `result_summary` missing any of the three sections.**
 - **Continue the dialogue with the main thread after returning
   `result_summary`.**
@@ -359,7 +360,7 @@ either because both are runtime-shape concerns.
   violation; the SOP is Read full -> concat -> Write whole file).
 - `infinite-loop-no-cap` — looping implementation without the retry cap of
   three.
-- `orch-agent-call` — calling an `/orch` pipeline agent.
+- `external-pipeline-agent-call` — calling an external pipeline agent from another plugin/set.
 - `incomplete-result-sections` — missing any of
   `### Result / ### Artifacts / ### Key Observations`.
 - `conversation-continuation` — continuing the conversation after returning

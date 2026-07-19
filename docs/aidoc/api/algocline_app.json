@@ -5,7 +5,7 @@
     {
       "path": "algocline_app::pool",
       "kind": "module",
-      "docs": "Process-pool IPC layer for `host_mode=true` execution.\n\nThis module provides the foundation types and dispatch helpers for the\npool worker protocol:\n\n- [`error`] — [`PoolError`] enum (thiserror-derived)\n- [`protocol`] — [`PoolRequest`] / [`PoolResponse`] wire types (serde JSON line)\n- [`client`] — [`PoolClient`] UDS client (connect + handshake + send_request)\n- [`registry`] — [`PoolRegistry`] persistence + GC (registry.json)\n- [`dispatch`] — worker spawn + UDS proxy orchestration (ST6)"
+      "docs": "Process-pool IPC layer for `host_mode=true` execution.\n\nThis module provides the foundation types and dispatch helpers for the\npool worker protocol:\n\n- [`error`] — [`PoolError`] enum (thiserror-derived)\n- [`protocol`] — [`PoolRequest`] / [`PoolResponse`] wire types (serde JSON line)\n- [`client`] — [`PoolClient`] UDS client (connect + handshake + send_request)\n- [`registry`] — [`PoolRegistry`] persistence + GC (registry.json)\n- [`dispatch`] — worker spawn + UDS proxy orchestration"
     },
     {
       "path": "algocline_app::pool::client",

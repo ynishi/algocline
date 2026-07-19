@@ -84,8 +84,8 @@ algocline repository for the canonical marketplace location once published.
 
 - **algocline core MCP server** (`alc_run` / `alc_continue` / `alc_pkg_*` /
   `alc_card_*` / `alc_hub_*` / `alc_scenario_*` / `alc_eval` tools)
-- **swarm_frame / swarm_frame_algocline / flow** (required when building orch
-  packages; deployed as linked packages via `alc_pkg_link`)
+- **swarm_frame / swarm_frame_algocline / flow** (required when building
+  orchestration-style packages; deployed as linked packages via `alc_pkg_link`)
 - **evalframe** (for post-impl e2e smokes; installed via `alc_pkg_install`)
 - (optional) git-reader MCP (for the adviser to investigate the upstream repo)
 

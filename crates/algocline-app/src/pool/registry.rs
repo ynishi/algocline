@@ -531,12 +531,11 @@ mod tests {
 
     // ── T5: permissions (Unix only) ───────────────────────────────────────────
 
-    /// T5 — save() restricts pool dir to 0700 and registry.json to 0600.
+    /// save() restricts pool dir to 0700 and registry.json to 0600.
     ///
-    /// Verifies that the secure-permissions requirement introduced in ST2
-    /// (item 6) is met on Unix targets.  The pool directory must be accessible
-    /// only by its owner (`drwx------`) and the registry file must be
-    /// readable/writable only by its owner (`-rw-------`).
+    /// The pool directory must be accessible only by its owner (`drwx------`)
+    /// and the registry file must be readable/writable only by its owner
+    /// (`-rw-------`).
     #[test]
     #[cfg(unix)]
     fn save_sets_secure_permissions() {

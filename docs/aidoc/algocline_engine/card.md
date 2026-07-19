@@ -103,10 +103,12 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 - `lineage_to_json` — Render a LineageResult as JSON for the service layer.
 - `lineage_with_store` — Walk the lineage tree from `q.card_id` in `store`.
 - `list_with_store` — List cards from `store`. `pkg_filter = Some("name")` restricts to that pkg subdir.
+- `log_sink_subscriber` — Return the process-wide [`LogSinkCardSubscriber`] singleton.
 - `parse_order_by` — Parse an order_by JSON value.  Accepts:
 - `parse_where` — Parse a `where` JSON value into a `Predicate`.
 - `publish` — Convenience wrapper: publish through the singleton.
 - `read_samples_with_store` — Read per-case samples from `{card_id}.samples.jsonl`.
+- `register_log_sink` — Register `sink` with the process-wide [`LogSinkCardSubscriber`] and
 - `subscriber_stats_snapshot` — Public entry point: snapshot of all process-wide subscriber stats.
 - `summaries_to_json` — (no documentation)
 - `validate_name` — (no documentation)
@@ -129,6 +131,8 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 - `LineageNode` — One node in the lineage result.
 - `LineageQuery` — Query parameters for `lineage`.
 - `LineageResult` — Full lineage walk result.
+- `LogSinkCardSubscriber` — Fan-out `CardEvent`s into per-session `LogSink` ring buffers.
+- `LogSinkRegistration` — RAII guard that unregisters a `LogSink` from the singleton
 - `OrderKey` — Parsed sort key: path with optional descending flag.
 - `PerSubscriber` — Per-subscriber counter state. Held inside `SubscriberStats` under a
 - `Predicate` — Parsed predicate tree.

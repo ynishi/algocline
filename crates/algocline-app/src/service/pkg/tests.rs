@@ -143,10 +143,10 @@ async fn pkg_list_no_project_root() {
     assert!(json["packages"].is_array());
 }
 
-// ── ST2: ListOpts wiring tests ───────────────────────────────
+// ── ListOpts wiring tests ────────────────────────────────────
 //
 // These exercise the new list-tool pipeline (filter / sort / truncate /
-// project_fields) introduced in ST2. They rely on a small synthetic
+// project_fields). They rely on a small synthetic
 // fixture: a project root with N declared packages, each with its own
 // vendor directory, registered via `alc.toml` + `alc.lock` (path
 // entries). This keeps every entry deterministic and timezone-free.
@@ -1937,9 +1937,9 @@ async fn pkg_install_rejects_missing_local_source_with_clear_error() {
     );
 }
 
-// ─── Size regression guard (ST3) ──────────────────────────────
+// ─── Size regression guard ────────────────────────────────────
 //
-// Before the list-tool unification (pre-ST1), `alc_pkg_list` and
+// Before the list-tool unification, `alc_pkg_list` and
 // `alc_hub_search` emitted 63K–68K-char single-line JSON that exceeded
 // Claude Code's context window on populated environments. The summary
 // preset now caps per-entry output to roughly 6 fields; at the default

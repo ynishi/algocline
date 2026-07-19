@@ -196,9 +196,8 @@ mod tests {
 
     /// When the `ALC_REGENERATE` environment variable is set to `1`, write
     /// the generated output to `types/alc_shapes.d.lua` in the workspace
-    /// root.  This is equivalent to running the `gen_alc_shapes_dlua`
-    /// example and is provided as a fallback for ST1 where the example
-    /// binary cannot yet be built (visibility not yet exported via lib.rs).
+    /// root. Equivalent to running the `gen_alc_shapes_dlua` example
+    /// binary; provided as a fallback when the example is not built.
     #[test]
     fn regenerate_if_env_set() {
         if std::env::var("ALC_REGENERATE").as_deref() != Ok("1") {

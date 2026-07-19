@@ -848,7 +848,7 @@ mod tests {
         );
     }
 
-    // ── ST6: pool registry routing tests ────────────────────────────────────
+    // ── pool registry routing tests ─────────────────────────────────────────
 
     use crate::pool::PoolSessionEntry;
 
@@ -966,8 +966,8 @@ mod tests {
     /// T1 (happy path): splice_response_string inserts pool_cache_reload_warning
     /// into a valid JSON object response.
     ///
-    /// Verifies the crux-card constraint: cache-reload failure must surface on
-    /// the MCP wire as an additive field, not remain warn!-only.
+    /// Verifies the invariant: cache-reload failure must surface on the MCP
+    /// wire as an additive field, not remain warn!-only.
     #[test]
     fn splice_response_string_injects_cache_reload_warning() {
         let json = r#"{"status":"finished","result":{"ok":true}}"#;
@@ -1265,7 +1265,7 @@ mod tests {
         );
     }
 
-    // ── resolve_pkg_type_lua unit tests (ST2) ───────────────────────────────
+    // ── resolve_pkg_type_lua unit tests ─────────────────────────────────────
 
     use algocline_core::pkg::{PkgType, TypeSource};
 

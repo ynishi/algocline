@@ -114,7 +114,7 @@ Read-full → Write truncation.
 The `Write` tool overwrites the file by default; writing only the new section
 or reconstructing from a full Read both risk silent truncation. The mandatory
 SOP is therefore append-only Tool / Recipe per
-`sets/base/rules/journal.md §Adviser/Agent write 規律` (which also
+the caller-defined journal write discipline (which also
 prohibits full-file Read for files exceeding 100 lines).
 
 Note: frontmatter `tools:` entry for `Write` removal and physical append-only
@@ -198,7 +198,7 @@ lines).
 - **Overwrite the journal by truncation** — never use `Read` full content
   → concat → `Write` whole file to append; use an append-only Tool / Recipe
   (e.g. lds recipe / `Bash(printf >> path)`) per
-  `sets/base/rules/journal.md §Adviser/Agent write 規律` (`journal-truncate-write`
+  the caller-defined journal write discipline (`journal-truncate-write`
   anti-pattern; incident `94f692ef`, 2026-06-10).
 - **Skip step 3b(a-0) alc-wake SKILL.md Read** — silent skip is forbidden.
   If `Read(plugins/alc/skills/alc-wake/SKILL.md)` fails, you must emit
@@ -244,8 +244,8 @@ The query contains build-intent signals: "build" / "create" / "作りたい" /
 2. **Search building blocks** — `alc_hub_search` by keywords + `alc_pkg_list`
    to enumerate candidates. Check `type` field (runnable vs library).
 3. **Find reference implementations** — Read/Grep existing complex packages
-   (e.g., `coding_orch`, `conglo`, `review_and_investigate`) that use similar
-   combination patterns.
+   that use similar combination patterns (browse `alc_pkg_list` output for
+   candidates).
 3b. **Substrate Cross-Check** — before composing the proposal, cross-reference
     the workspace's bundled substrate primitives so every gap finding is paired
     with an existing primitive path or an explicit `no primitive applies` note.
@@ -337,7 +337,7 @@ The query contains build-intent signals: "build" / "create" / "作りたい" /
 - `journal-truncate-write` — never use Read full → concat → Write to append
   to journal.md; the correct SOP is append-only Tool / Recipe (e.g. lds
   recipe / Bash(printf >> path) / dedicated MCP tool) per
-  `sets/base/rules/journal.md §Adviser/Agent write 規律`; Read full →
+  the caller-defined journal write discipline; Read full →
   concat → Write is structurally prohibited (incident `94f692ef`,
   2026-06-10).
 - `design-scaffold-leak` — scaffolding or writing `init.lua` during design

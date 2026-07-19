@@ -215,7 +215,7 @@ fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTa
 /// "expected Plain, got Lora" error surfaced by
 /// [`Gpt2Model::wrap_lora`].
 ///
-/// Invariant #4 (subtask-4.md): a forward pass through the returned
+/// Merge-equivalence invariant: a forward pass through the returned
 /// handle matches `LoraLinear(base + Δ).forward` element-wise —
 /// candle-nn's [`VarMap::load`] restores only the vars whose names
 /// match those registered by `wrap_lora`, so the base parameters
@@ -275,18 +275,6 @@ fn load_gpt2_impl(
         )));
     }
 
-    // Architecture pre-check (holistic-reviewer M-1). Compare the
-    // card's recorded `metadata.nn.architecture` against the base
-    // handle's `variant` before the mutex lock, so a caller who
-    // pairs a `gpt2-small` base with a `gpt2-medium` card gets a
-    // clear "architecture mismatch" message instead of a downstream
-    // `wrap_lora`/`VarMap::load` shape-mismatch surface. The
-    // comparison is string-exact against the canonical form
-    // (`gpt2-medium` / `gpt2-large`) — [`Gpt2Config::from_variant`]
-    // accepts both bare `medium` and prefixed `gpt2-medium`, so we
-    // normalise the base handle side to avoid a false mismatch when a
-    // caller wrote `pretrained = false, variant = "medium"` on the
-    // base and the card uses `architecture = "gpt2-medium"`.
     let card_arch = card
         .get("metadata")
         .and_then(|m| m.get("nn"))
@@ -321,7 +309,7 @@ fn load_gpt2_impl(
     // so `VarMap::load` finds every var by name. `dropout` is set for
     // provenance only — [`crate::arch::LoraLinear::forward`] does not
     // apply dropout at inference, so this field does not affect the
-    // element-wise bit-exact invariant (subtask-4.md invariant #2).
+    // element-wise bit-exact merge-equivalence invariant.
     let mut lora_cfg = LoraConfig::with_targets(
         lora_branch.rank as usize,
         lora_branch.alpha as f32,

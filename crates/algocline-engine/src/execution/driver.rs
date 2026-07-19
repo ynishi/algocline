@@ -131,7 +131,7 @@ pub(crate) async fn build_cancel_info(
 /// Field declaration order MUST match the original flat-argument order of
 /// `driver_loop` (`state, bus_tx, cancel_token, resp_txs, last_active`) so
 /// that `Arc` reference-count releases and cancellation-token drops occur
-/// in the same sequence as before this refactor (see crux-card.md #2).
+/// in the same sequence as before this refactor (drop-order invariant).
 /// `metrics` is appended last; `Arc` drop is order-independent.
 pub(crate) struct DriverContext {
     pub state: Arc<Mutex<ExecutionState>>,

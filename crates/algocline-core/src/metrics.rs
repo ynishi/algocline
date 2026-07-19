@@ -229,9 +229,8 @@ impl SessionStatus {
     ///   Always included.
     /// - `conversation_history` — last ≤10 transcript entries.
     ///   Included **only** when `include_history=true` to protect high-frequency
-    ///   polling callers from wire-size inflation (see design: wf-sim
-    ///   restructure_shape verdict and metrics.rs doc "without transcript which
-    ///   can be large").
+    ///   polling callers from wire-size inflation (the transcript can grow large
+    ///   and is opt-in for callers that actually need it).
     ///
     /// # Arguments
     ///

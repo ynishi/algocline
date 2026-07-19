@@ -247,7 +247,7 @@ The L-1 lint bucket added in algocline v0.33.0 (commit
       "name": "cot",
       "kind": "unmigrated",
       "severity": "info",
-      "resolved_path": "/Users/.../packages/cot/narrative.md",
+      "resolved_path": "~/.algocline/packages/cot/narrative.md",
       "message": "convention narrative.md exists but M.docs is not declared (#1778197753 adoption candidate)",
       "suggestion": "Add M.docs = { narrative = \"narrative.md\", schema_version = 1 } to init.lua to make the SSOT explicit."
     }

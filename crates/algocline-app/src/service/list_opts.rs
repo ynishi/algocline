@@ -4,11 +4,11 @@
 //! This module centralises the `limit / sort / filter / fields / verbose`
 //! knobs so individual tools do not each reinvent their own
 //! query / projection / sort logic. The whole module is `pub(crate)`:
-//! nothing here is meant to leak beyond `algocline-app` (see plan.md
-//! §4.1 — `algocline-core` must never import these types).
+//! nothing here is meant to leak beyond `algocline-app` (`algocline-core`
+//! must never import these types).
 //!
-//! Error type is `String` on purpose (plan.md §3.5) — these are internal
-//! helpers whose failures are surfaced to MCP callers via existing
+//! Error type is `String` on purpose — these are internal helpers whose
+//! failures are surfaced to MCP callers via existing
 //! `Result<String, String>` tool boundaries.
 
 use std::cmp::Ordering;
@@ -22,7 +22,7 @@ use serde_json::Value;
 /// The caller is responsible for translating MCP schema fields into
 /// this struct; no `Default` impl is provided to force explicit
 /// construction at call-sites.
-#[allow(dead_code)] // consumed by ST1b / ST2 (hub_search / pkg_list)
+#[allow(dead_code)] // consumed by hub_search / pkg_list wiring
 pub(crate) struct ListOpts {
     pub limit: Option<usize>,
     pub sort: Option<String>,
@@ -44,12 +44,11 @@ pub(crate) struct SortKey {
 // ─── Preset field sets ──────────────────────────────────────────────
 //
 // These presets define the "summary" / "full" verbose aliases for each
-// list tool. See plan.md §3.2 / §3.3 for rationale. Changing any of
-// these arrays is a semver-relevant action — field addition is a minor
-// bump, field removal is a major bump (plan.md §3.3.2).
+// list tool. Changing any of these arrays is a semver-relevant action —
+// field addition is a minor bump, field removal is a major bump.
 
 /// `alc_pkg_list` verbose=summary preset.
-#[allow(dead_code)] // consumed by ST2 (pkg_list wiring)
+#[allow(dead_code)] // consumed by pkg_list wiring
 pub(crate) const PKG_LIST_SUMMARY: &[&str] = &[
     "name",
     "scope",
@@ -61,7 +60,7 @@ pub(crate) const PKG_LIST_SUMMARY: &[&str] = &[
 ];
 
 /// `alc_pkg_list` verbose=full preset (summary + extended fields).
-#[allow(dead_code)] // consumed by ST2 (pkg_list wiring)
+#[allow(dead_code)] // consumed by pkg_list wiring
 pub(crate) const PKG_LIST_FULL: &[&str] = &[
     "name",
     "scope",
@@ -86,7 +85,7 @@ pub(crate) const PKG_LIST_FULL: &[&str] = &[
 ];
 
 /// `alc_hub_search` verbose=summary preset.
-#[allow(dead_code)] // consumed by ST1b (hub_search wiring)
+#[allow(dead_code)] // consumed by hub_search wiring
 pub(crate) const HUB_SEARCH_SUMMARY: &[&str] = &[
     "name",
     "version",
@@ -97,7 +96,7 @@ pub(crate) const HUB_SEARCH_SUMMARY: &[&str] = &[
 ];
 
 /// `alc_hub_search` verbose=full preset (summary + extended fields).
-#[allow(dead_code)] // consumed by ST1b (hub_search wiring)
+#[allow(dead_code)] // consumed by hub_search wiring
 pub(crate) const HUB_SEARCH_FULL: &[&str] = &[
     "name",
     "version",
@@ -119,7 +118,7 @@ pub(crate) const HUB_SEARCH_FULL: &[&str] = &[
 ///
 /// Rejects: empty string, bare `"-"`, empty split elements (`"a,,b"`,
 /// trailing comma, dash-only element `"a,-"`).
-#[allow(dead_code)] // consumed by ST1b / ST2
+#[allow(dead_code)] // consumed by hub_search / pkg_list wiring
 pub(crate) fn parse_sort(s: &str) -> Result<Vec<SortKey>, String> {
     if s.is_empty() {
         return Err("sort string is empty".to_string());
@@ -159,7 +158,7 @@ pub(crate) fn parse_sort(s: &str) -> Result<Vec<SortKey>, String> {
 ///
 /// Unknown `verbose` values (anything outside `"summary"` / `"full"`)
 /// are rejected with `Err`.
-#[allow(dead_code)] // consumed by ST1b / ST2
+#[allow(dead_code)] // consumed by hub_search / pkg_list wiring
 pub(crate) fn resolve_fields(
     verbose: Option<&str>,
     fields: Option<&[String]>,
@@ -184,8 +183,8 @@ pub(crate) fn resolve_fields(
 ///
 /// Key order in the returned object follows the order in `fields`.
 /// Unknown keys are silently skipped (JSON:API sparse fieldsets
-/// convention, plan.md §3.5). Non-object values pass through unchanged.
-#[allow(dead_code)] // consumed by ST1b / ST2
+/// convention). Non-object values pass through unchanged.
+#[allow(dead_code)] // consumed by hub_search / pkg_list wiring
 pub(crate) fn project_fields(v: Value, fields: &[String]) -> Value {
     let Value::Object(mut map) = v else {
         return v;
@@ -206,7 +205,7 @@ pub(crate) fn project_fields(v: Value, fields: &[String]) -> Value {
 /// Returns `true` iff `v` is an object AND every `(k, expected)` entry
 /// in `filter` has `v[k] == expected`. A missing key is treated as
 /// "not match" (never matches). Non-object `v` always returns `false`.
-#[allow(dead_code)] // consumed by ST1b / ST2
+#[allow(dead_code)] // consumed by hub_search / pkg_list wiring
 pub(crate) fn matches_filter(v: &Value, filter: &HashMap<String, Value>) -> bool {
     let Value::Object(map) = v else {
         return false;
@@ -230,7 +229,7 @@ pub(crate) fn matches_filter(v: &Value, filter: &HashMap<String, Value>) -> bool
 /// - Mixed-type fallback: `null < bool < number < string`.
 /// - Numbers compare as `f64` (i64 promoted); NaN treated as equal to NaN.
 /// - Missing keys or non-object items are coerced to `null` for the key.
-#[allow(dead_code)] // consumed by ST1b / ST2
+#[allow(dead_code)] // consumed by hub_search / pkg_list wiring
 pub(crate) fn apply_sort_by_value(items: &mut [Value], keys: &[SortKey]) {
     if keys.is_empty() {
         return;

@@ -246,7 +246,7 @@ algocline core does not impose a schema.
 
 ```toml
 [setting.journal]
-path = "/Users/me/journal.md"
+path = "~/journal.md"
 pkg  = false
 ```
 
@@ -280,7 +280,7 @@ are not discarded — fields they uniquely define are still surfaced.
 
 // Response (JSON string)
 {
-  "resolved": { "journal": { "path": "/Users/me/journal.md", "pkg": true } },
+  "resolved": { "journal": { "path": "~/journal.md", "pkg": true } },
   "sources":  { "journal": { "path": "env", "pkg": "project" } }
 }
 ```

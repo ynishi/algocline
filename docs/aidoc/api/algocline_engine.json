@@ -117,6 +117,16 @@
       "docs": "Full lineage walk result."
     },
     {
+      "path": "algocline_engine::card::LogSinkCardSubscriber",
+      "kind": "struct",
+      "docs": "Fan-out `CardEvent`s into per-session `LogSink` ring buffers.\n\nProcess-wide singleton accessed via [`log_sink_subscriber`]. Each Session\nregisters its own `LogSink` on start-up via [`register_log_sink`] and\nunregisters on `Drop` of the returned [`LogSinkRegistration`] guard.\n\n# Concurrency\n\n`Send + Sync`. Internal state is `Mutex<Vec<(u64, LogSink)>>` +\n`AtomicU64`. `on_event` uses the same snapshot-clone-then-iterate\npattern as [`CardEventBus::publish`]: sinks are cloned under the lock\nthen iterated with the lock released, so registrations/unregistrations\nfrom other threads never deadlock a fan-out in flight. The mutex uses\nthe crate-wide `unwrap_or_else(|p| p.into_inner())` policy so a\npoisoned lock never propagates a panic."
+    },
+    {
+      "path": "algocline_engine::card::LogSinkRegistration",
+      "kind": "struct",
+      "docs": "RAII guard that unregisters a `LogSink` from the singleton\n[`LogSinkCardSubscriber`] when dropped.\n\nReturned by [`register_log_sink`]. The guard owns a strong `Arc` to\nthe singleton subscriber and the monotonic `id` assigned at registration\ntime. `Drop` removes the matching `(id, LogSink)` entry via\n`Vec::retain`.\n\n# Concurrency\n\n`Send + Sync`. `Drop::drop` acquires the subscriber's `sinks` mutex\nonce, using the poison-recovery policy: a panic in another thread that\nleft the lock poisoned does NOT prevent unregistration. The drop\nraces safely with concurrent `CardEventBus::publish` fan-outs because\nthe publisher takes a snapshot clone of the sinks vec before iterating;\nan in-flight publish may or may not observe the just-unregistered sink,\nbut never deadlocks and never observes torn state.\n\nDropping the guard is O(N) in the number of registered sinks (typically\n== active session count). Callers must not hold the returned guard\nacross `.await` points that could execute on a runtime worker also\nrunning the fan-out — with the current single-shot lock scope this is\nnot a hazard."
+    },
+    {
       "path": "algocline_engine::card::OrderKey",
       "kind": "struct",
       "docs": "Parsed sort key: path with optional descending flag."
@@ -250,6 +260,11 @@
       "docs": "List cards from `store`. `pkg_filter = Some(\"name\")` restricts to that pkg subdir."
     },
     {
+      "path": "algocline_engine::card::log_sink_subscriber",
+      "kind": "function",
+      "docs": "Return the process-wide [`LogSinkCardSubscriber`] singleton.\n\nOn first call, initializes the singleton via\n`OnceLock::get_or_init` and registers it on the [`CardEventBus`]\nthrough [`CardEventBus::add_subscriber`]. Subsequent calls return the\nalready-initialized `Arc`.\n\n# Concurrency\n\n`OnceLock` guarantees the initializer runs exactly once even under\nconcurrent first-callers. The initializer calls `event_bus()` (a\ndistinct `OnceLock`); this cross-cell reentrance is safe because the\ntwo cells are independent (see std::sync::OnceLock docs — reentrance\ndeadlock only applies to the same cell). Callers holding the returned\n`Arc` may drop it freely; the singleton itself lives for `'static`."
+    },
+    {
       "path": "algocline_engine::card::parse_order_by",
       "kind": "function",
       "docs": "Parse an order_by JSON value.  Accepts:\n  - a string: `\"stats.pass_rate\"` or `\"-stats.pass_rate\"`\n  - an array of strings: `[\"-stats.pass_rate\", \"created_at\"]`"
@@ -270,6 +285,11 @@
       "docs": "Read per-case samples from `{card_id}.samples.jsonl`.\n\nStreams the JSONL file line by line; rows are parsed, optionally\nfiltered by `q.where_`, then paged by `offset` + `limit`.  Offset\napplies to the **post-filter** stream, matching Prisma/SQL\nsemantics.\n\nReturns an empty Vec if no samples file exists (Cards without\nper-case details are the common case, not an error)."
     },
     {
+      "path": "algocline_engine::card::register_log_sink",
+      "kind": "function",
+      "docs": "Register `sink` with the process-wide [`LogSinkCardSubscriber`] and\nreturn an RAII guard.\n\nThe returned [`LogSinkRegistration`] MUST be kept alive for the lifetime\nof the owning `Session`. Dropping the guard unregisters the sink; the\nsink itself (`Arc<Mutex<VecDeque<LogEntry>>>`) is not mutated by the\ndrop.\n\nThis function is infallible. Internally it assigns a monotonically\nincreasing `u64` id via `AtomicU64::fetch_add(1, Ordering::Relaxed)`\n(Relaxed is sufficient because the id only becomes visible to other\nthreads once the subsequent `sinks.lock()` push publishes it).\n\nOn first call, this transitively initializes the singleton\n[`LogSinkCardSubscriber`] and registers it on the [`CardEventBus`] via\n[`log_sink_subscriber`].\n\n# Concurrency\n\nCancel-safe. `Send + Sync` arguments; safe to call from any thread\nconcurrently. Two concurrent calls receive distinct ids."
+    },
+    {
       "path": "algocline_engine::card::subscriber_stats_snapshot",
       "kind": "function",
       "docs": "Public entry point: snapshot of all process-wide subscriber stats.\nWrapper around `event_bus().stats().snapshot()` so that downstream\ncrates (notably `algocline-app`) do not need a handle to the\n`CardEventBus` singleton."
@@ -286,6 +306,26 @@
       "path": "algocline_engine::card::write_samples_with_store",
       "kind": "function",
       "docs": "Write per-case samples to `{card_id}.samples.jsonl` (write-once).\n\nEach `samples` entry is serialized as one compact JSON line.\nFails if a samples file already exists for this card — mirrors\nthe immutability guarantee of Cards themselves."
+    },
+    {
+      "path": "algocline_engine::card_context",
+      "kind": "module",
+      "docs": "Card context injection — resolves Card summaries for prompt injection.\n\nPhase 3-F MVP: `alc.llm(prompt, {card_context = ...})` opts key wires\na small set of prior Cards into the LLM system prompt as an XML-like\n`<past_cards>` block.  This module is the pure-Rust core: Lua bridge\nwiring lives in `bridge/llm.rs`.\n\n## Public API\n\n* [`CardContextSpec`] — 2-form spec (`CardId` or `Query { pkg, limit }`)\n  received from the Lua bridge after opts extraction.\n* [`resolve`] — spec → `Vec<Json>` full Card resolution against a\n  `CardStore`.  Silent Ok(empty) on not-found / empty query.\n* [`format_past_cards`] — infallible fixed-template renderer producing\n  the `<past_cards>...</past_cards>` block.\n\n## Fixed format template (MVP)\n\n```text\n<past_cards>\nCard MM/DD pkg=<pkg> card_id=<id> [run.status=<status>] Rating <val> reason=<reason>\n...\n</past_cards>\n```\n\n* Each Card on 1 line, `created_at` desc order (newest first)\n* `[run.status=...]` emitted only when the Card JSON carries `run.status`\n* `Rating <val>` emitted only when `stats.pass_rate` is present\n  (formatted with 1 decimal digit)\n* `reason=<reason>` emitted only when `run.reason` is present\n* `MM/DD` derived from RFC 3339 `created_at` (`&s[5..10]` with the\n  `-` separator rewritten to `/`); omitted when `created_at` is\n  missing or too short\n* Empty input slice → empty string (no `<past_cards>` wrapper)\n\n## Error handling\n\n`resolve` returns `Result<Vec<Json>, String>`.  Underlying\n`card::get_with_store` / `card::find_with_store` errors are re-wrapped\nwith a `\"card_context resolve: \"` prefix so the bridge layer can\nsurface them via `tracing::warn!` before silently dropping the inject\n(Phase 3-F Done Criteria #4: silent no-op on resolution failure)."
+    },
+    {
+      "path": "algocline_engine::card_context::CardContextSpec",
+      "kind": "enum",
+      "docs": "Card context specification extracted from the Lua `card_context` opt.\n\nTwo forms are accepted at the Lua boundary:\n\n* `card_context = \"<card_id>\"` → [`CardContextSpec::CardId`]\n* `card_context = { pkg = \"<name>\", limit = N }` → [`CardContextSpec::Query`]\n\nThe Lua bridge is responsible for the extraction; this module treats\nthe parsed enum as-is."
+    },
+    {
+      "path": "algocline_engine::card_context::format_past_cards",
+      "kind": "function",
+      "docs": "Render a slice of resolved Card JSON values as the fixed\n`<past_cards>` XML-like block.\n\nInfallible: unknown / missing fields are silently omitted from the\nper-Card line rather than surfaced as errors.  Empty input yields an\nempty string so the caller can unconditionally prefix without\nproducing a stray `<past_cards></past_cards>` wrapper."
+    },
+    {
+      "path": "algocline_engine::card_context::resolve",
+      "kind": "function",
+      "docs": "Resolve a [`CardContextSpec`] against `store`, returning full Card\nJSON documents.\n\n* [`CardContextSpec::CardId`] → 1-element `Vec<Json>` on hit, empty\n  `Vec<Json>` on miss (miss is Ok, not Err).\n* [`CardContextSpec::Query`] → up to `limit` Card JSON values ordered\n  by `created_at` descending; empty result set is Ok.\n\nThe query form loads full TOML for each hit via a second\n`get_with_store` call (N+1 fetch).  With the MVP default `limit = 5`\nthis is well within I/O budget; if a future phase needs to raise the\nlimit substantially we can add a `find_full_with_store` batching API."
     },
     {
       "path": "algocline_engine::execution",

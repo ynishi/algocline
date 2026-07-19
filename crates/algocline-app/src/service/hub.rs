@@ -1667,7 +1667,7 @@ mod tests {
 
     #[test]
     fn repo_to_index_url_local_path() {
-        assert_eq!(repo_to_index_url("/home/user/my-pkg"), None);
+        assert_eq!(repo_to_index_url("/tmp/my-pkg"), None);
     }
 
     #[test]
@@ -1845,9 +1845,9 @@ mod tests {
     // These tests exercise the projection path that `hub_search` uses to
     // shape output: `resolve_fields` + `project_fields` applied to a
     // `to_value_with_optional_docstring`-serialized entry. They pin the
-    // wf-sim-verbose contract: `fields` wins over `verbose`, default
-    // summary preset excludes docstring, `full` preset includes
-    // docstring, unknown keys silently skipped.
+    // verbose-vs-fields precedence contract: `fields` wins over
+    // `verbose`, default summary preset excludes docstring, `full`
+    // preset includes docstring, unknown keys silently skipped.
 
     #[test]
     fn hub_search_default_summary_excludes_docstring() {

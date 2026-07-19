@@ -151,11 +151,10 @@ pub trait EngineApi: Send + Sync {
     /// When `project_root` is provided, project-local packages from `alc.toml`/`alc.lock`
     /// are included with `scope: "project"`. Global packages carry `scope: "global"`.
     ///
-    /// Mirrors the list-tool knob contract used by [`Self::hub_search`]
-    /// (plan.md §4.1). Parameters are individual JSON-primitive
-    /// `Option<T>` values so the `algocline-core` crate stays free of
-    /// `algocline-app`-internal types; the impl folds them into its
-    /// `pub(crate) ListOpts` struct.
+    /// Mirrors the list-tool knob contract used by [`Self::hub_search`].
+    /// Parameters are individual JSON-primitive `Option<T>` values so
+    /// the `algocline-core` crate stays free of `algocline-app`-internal
+    /// types; the impl folds them into its `pub(crate) ListOpts` struct.
     ///
     /// - `limit` is `Option<i32>` at this layer (MCP/JSON boundary).
     ///   The impl clamps negative values to 0 and casts to `usize`.
@@ -657,9 +656,8 @@ pub trait EngineApi: Send + Sync {
     /// This trait method mirrors the MCP `alc_hub_search` tool. Parameters
     /// are deliberately individual JSON-primitive `Option<T>` values
     /// (rather than an aggregate struct) so that the `algocline-core` crate
-    /// stays free of `algocline-app`-internal types (see plan.md §4.1).
-    /// The `algocline-app` side of the impl folds these into its
-    /// `pub(crate) ListOpts` struct.
+    /// stays free of `algocline-app`-internal types. The `algocline-app`
+    /// side of the impl folds these into its `pub(crate) ListOpts` struct.
     ///
     /// - `limit` is `Option<i32>` at this layer (MCP/JSON boundary). The
     ///   impl casts to `usize` internally.

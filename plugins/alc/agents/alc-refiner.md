@@ -118,7 +118,7 @@ Use an append-only Tool or Recipe such as `mcp__lds__recipe_run(recipe=
 Never reconstruct the full file content and Write it back.
 
 The mandatory SOP is append-only Tool / Recipe per
-`sets/base/rules/journal.md §Adviser/Agent write 規律` (which also
+the caller-defined journal write discipline (which also
 prohibits full-file Read for files exceeding 100 lines).
 
 Note: frontmatter `tools:` entry for `Write` removal and physical append-only
@@ -227,7 +227,7 @@ package-style (file / path / Set, etc.), the per-package append is skipped.
 - **Overwrite the journal by truncation** — never use `Read` full content
   → concat → `Write` whole file to append; use an append-only Tool / Recipe
   (e.g. lds recipe / `Bash(printf >> path)`) per
-  `sets/base/rules/journal.md §Adviser/Agent write 規律` (`journal-truncate-write`
+  the caller-defined journal write discipline (`journal-truncate-write`
   anti-pattern; incident `94f692ef`, 2026-06-10).
 - **Silent skip on alc-wake SKILL.md Read failure** — if step 2b (a-0)
   `Read(plugins/alc/skills/alc-wake/SKILL.md)` fails, emit
@@ -268,7 +268,7 @@ package-style (file / path / Set, etc.), the per-package append is skipped.
 - `journal-truncate-write` — never use Read full → concat → Write to append
   to journal.md; the correct SOP is append-only Tool / Recipe (e.g. lds
   recipe / Bash(printf >> path) / dedicated MCP tool) per
-  `sets/base/rules/journal.md §Adviser/Agent write 規律`; Read full →
+  the caller-defined journal write discipline; Read full →
   concat → Write is structurally prohibited (incident `94f692ef`,
   2026-06-10).
 - `dedup-skip` — proposing improvements that overlap with entries in

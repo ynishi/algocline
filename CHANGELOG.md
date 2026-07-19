@@ -629,8 +629,8 @@ precedent as the 0.23.0 / 0.24.0 BREAKING additions.
 
 - **No MCP tool** is added (no `alc_state_list` / `alc_state_show` / `alc_state_reset`). Callers run these via `mcp__algocline__alc_run` with a short Lua snippet.
 - **No `EngineApi` trait method** is added. The implementation lives entirely inside the `algocline-engine` crate as inherent methods on `JsonFileStore`.
-- Replaces the rolled-back design from issue `1778990062-86012` (`alc_state_*` MCP tool + `OrchState` types) which leaked application terminology (`orch`) into the shared `algocline-core` / `-engine` / `-app` / `-mcp` crates. The new design keeps all application terms in caller packages (`coding_orch`, `incubator`, etc.).
-- The `agent-profiles` repo's `workspace-pipeline.md §orch state.json 編集 SOP` section will be updated separately to point at the Lua snippet path; that change lives outside this repo.
+- Replaces the rolled-back design (`alc_state_*` MCP tool + `OrchState` types) which leaked application terminology into the shared `algocline-core` / `-engine` / `-app` / `-mcp` crates. The new design keeps all application terms in caller packages.
+- External consumer documentation (state.json editing SOP in downstream orchestration projects) will be updated separately to point at the Lua snippet path; that change lives outside this repo.
 
 ## [0.36.0] - 2026-05-15
 
@@ -899,8 +899,8 @@ abort the search. This is useful for pre-push verification of a new
   array, the server reparses the payload before injecting into the
   Lua VM (`AppService::run` / `::advice` / `::eval`). Conforming
   clients (which already send a real object) are unaffected; legacy
-  callers that still stringify the field — including the existing
-  `agent-profiles` Skills that defensively called
+  callers that still stringify the field — including downstream
+  consumer Skills that defensively called
   `alc.json_decode(ctx)` to recover from the bug — keep working
   without code changes. Regression coverage:
   `tests/e2e.rs::test_alc_run_ctx_stringified_json_normalized_to_table`.
@@ -2014,7 +2014,7 @@ outputs follow suit.
 "source": ""
 "source": "installed"
 "source": "bundled"
-"source": "/Users/me/pkgs/foo"
+"source": "~/pkgs/foo"
 "source": "https://github.com/owner/repo"
 ```
 
@@ -2024,7 +2024,7 @@ outputs follow suit.
 "source": {"type": "unknown"}
 "source": {"type": "installed"}
 "source": {"type": "bundled", "collection": null}
-"source": {"type": "path", "path": "/Users/me/pkgs/foo"}
+"source": {"type": "path", "path": "~/pkgs/foo"}
 "source": {"type": "git",  "url":  "https://github.com/owner/repo", "rev": null}
 ```
 

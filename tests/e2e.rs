@@ -2362,7 +2362,7 @@ return M
 
 /// Pool session survives MCP restart and can be resumed via registry.json reconnect.
 ///
-/// Acceptance criterion 3 from subtask-6.md: a `host_mode=true` session paused by
+/// Acceptance criterion: a `host_mode=true` session paused by
 /// `alc.llm(...)` must remain continuable after the originating MCP process
 /// (AppService) dies and a brand-new AppService starts against the same ALC_HOME.
 ///
@@ -5721,7 +5721,7 @@ return M"#,
 
 // ─── LLM judge role wiring (issue 12770ca6) ──────────────────────────────────
 
-/// ST1/ST3.1: `alc.llm(prompt, { role = "grader" })` propagates `role` onto
+/// `alc.llm(prompt, { role = "grader" })` propagates `role` onto
 /// the `needs_response` payload, and the session resumes cleanly via
 /// `alc_continue`.
 #[tokio::test]
@@ -5756,7 +5756,7 @@ async fn test_alc_llm_role_propagates_to_needs_response() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// ST3.2 (backward compat): a plain `alc.llm(prompt)` call must NOT add a
+/// backward compat: a plain `alc.llm(prompt)` call must NOT add a
 /// `role` field to the `needs_response` payload (additive contract).
 #[tokio::test]
 async fn test_alc_llm_no_role_absent_from_needs_response() {
@@ -5786,7 +5786,7 @@ async fn test_alc_llm_no_role_absent_from_needs_response() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// ST3.3 (error path): an unknown grader name in `alc_eval` simple form must
+/// error path: an unknown grader name in `alc_eval` simple form must
 /// surface a typed error naming the grader. Uses a runnable echo strategy
 /// (no LLM calls) so the error fires deterministically at suite-build time.
 #[tokio::test]
@@ -5815,7 +5815,7 @@ async fn test_alc_eval_unknown_grader_typed_error() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// ST3.4: `alc_eval` simple form with `graders = { "llm_rubric" }` reaches the
+/// `alc_eval` simple form with `graders = { "llm_rubric" }` reaches the
 /// LLM-as-Judge grader. Because the echo strategy makes no LLM calls, the very
 /// first pause is the judge call, which must carry `role = "grader"`. Feeding a
 /// numeric rating resumes the suite to completion.

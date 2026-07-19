@@ -116,7 +116,7 @@ pub struct SessionRecord {
     /// `SessionStatus` that `driver_loop` reads via `usage_aggregate()` at Done.
     /// `Arc` drop is order-independent.
     ///
-    /// Read path added in ST2 (`registry.resume` → `on_response_fed`).
+    /// Read path: `registry.resume` → `on_response_fed`.
     pub(crate) metrics: Arc<ExecutionMetrics>,
 }
 

@@ -308,8 +308,7 @@ pub struct PkgListParams {
     /// safely ignore the new key). Removing a field is a **major**
     /// version bump (output parsers can break). Every such change
     /// MUST be recorded verbatim in `CHANGELOG.md` — listing both the
-    /// pre-change and post-change preset contents (see plan.md §3.3.2
-    /// and ST3 deliverable).
+    /// pre-change and post-change preset contents.
     ///
     /// ### Projection scope
     ///
@@ -956,8 +955,7 @@ pub struct HubSearchParams {
     /// safely ignore the new key). Removing a field is a **major**
     /// version bump (output parsers can break). Every such change
     /// MUST be recorded verbatim in `CHANGELOG.md` — listing both the
-    /// pre-change and post-change preset contents (see plan.md §3.3.2
-    /// and ST3 deliverable).
+    /// pre-change and post-change preset contents.
     ///
     /// ### Projection scope
     ///
@@ -3006,11 +3004,10 @@ mod tests {
     /// Verifies that the terminal-cleanup background task unconditionally removes the
     /// registry entry even when `await_terminal` returns `Err(AwaitError::NotFound)`.
     ///
-    /// This is the direct invariant gate for the registry-entry-leak risk
-    /// (plan.md §Risks: "registry entry of the leak").
+    /// This is the direct invariant gate for the registry-entry-leak risk.
     ///
-    /// Uses `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` as required by
-    /// concurrency-analysis.md §2 `test_terminal_cleanup_task_unconditional_remove`.
+    /// Uses `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` to
+    /// exercise the cleanup task under a real multi-thread executor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_cleanup_task_unconditional_remove() {
         use algocline_core::execution::state::ExecutionState;

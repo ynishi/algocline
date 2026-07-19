@@ -26,6 +26,7 @@
 //!   - `xs`   : `[batch, n_head, seq_len, head_dim]`, contiguous
 //!   - `cos`  : `[seq_max, head_dim / 2]`, contiguous
 //!   - `sin`  : `[seq_max, head_dim / 2]`, contiguous
+//!
 //! `head_dim` must be even; `cos_n_embd * 2 == head_dim`.
 
 use candle_core::{DType, Device, Result, Tensor};

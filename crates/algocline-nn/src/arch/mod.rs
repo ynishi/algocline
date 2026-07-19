@@ -17,6 +17,7 @@
 pub mod adapter;
 pub mod gpt2;
 pub mod lora;
+pub mod tinyllama;
 
 pub use gpt2::{Gpt2Config, Gpt2Model};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear};

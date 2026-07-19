@@ -90,8 +90,23 @@ fn config_from_variant_resolves_aliases_and_rejects_unknown() {
     assert!(Gpt2Config::from_variant("gpt2-medium").is_some());
     assert!(Gpt2Config::from_variant("large").is_some());
     assert!(Gpt2Config::from_variant("gpt2-large").is_some());
+    // Post-ST-e-infra: tiny variant added for CPU smoke examples.
+    assert!(Gpt2Config::from_variant("tiny").is_some());
+    assert!(Gpt2Config::from_variant("gpt2-tiny").is_some());
     assert!(Gpt2Config::from_variant("small").is_none());
     assert!(Gpt2Config::from_variant("").is_none());
+}
+
+#[test]
+fn config_tiny_exposes_expected_shapes_and_no_hf_repo() {
+    let t = Gpt2Config::tiny();
+    assert_eq!(
+        (t.layers, t.heads, t.dim, t.ctx, t.vocab),
+        (2, 2, 32, 16, 64)
+    );
+    // No HuggingFace bundle at this size — pretrained=true is
+    // rejected downstream by from_pretrained.
+    assert_eq!(t.hf_repo(), None);
 }
 
 #[test]

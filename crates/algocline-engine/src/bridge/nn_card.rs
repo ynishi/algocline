@@ -944,6 +944,60 @@ fn register_data_ns(
     )?;
     data.set("from_card", from_card)?;
 
+    // synthetic(rows, opts) — build a TokenizedDataset directly from
+    // a Lua table of pre-tokenized u32 sequences, skipping the
+    // tokenizer path. Purpose: enable CPU smoke examples
+    // (`examples/nn_*_smoke.lua`) with the `tiny` preset, whose
+    // vocab=64 has no matching HuggingFace tokenizer. Each row is a
+    // Lua array of integers in `[0, vocab)` — out-of-range ids
+    // surface as an index-select error inside the model forward
+    // rather than here (this binding only enforces integer typing).
+    let synthetic = lua.create_function(
+        move |_lua, (rows_tbl, opts): (LuaTable, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
+            let dopts = extract_dataset_opts(opts.as_ref())?;
+            let row_count = rows_tbl.raw_len();
+            if row_count == 0 {
+                return Err(LuaError::external(
+                    "alc.nn.data.synthetic: rows must be a non-empty array of token id \
+                     sequences (each row itself an array of u32)"
+                        .to_string(),
+                ));
+            }
+            let mut rows: Vec<Vec<u32>> = Vec::with_capacity(row_count);
+            for i in 1..=row_count {
+                let row: LuaTable = rows_tbl.get(i).map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn.data.synthetic: row {i} not a table: {e}"
+                    ))
+                })?;
+                let len = row.raw_len();
+                if len == 0 {
+                    return Err(LuaError::external(format!(
+                        "alc.nn.data.synthetic: row {i} is empty (need at least 1 token)"
+                    )));
+                }
+                let mut ids: Vec<u32> = Vec::with_capacity(len);
+                for j in 1..=len {
+                    let id: u32 = row.get(j).map_err(|e| {
+                        LuaError::external(format!(
+                            "alc.nn.data.synthetic: row {i} token {j} not a u32 integer: {e}"
+                        ))
+                    })?;
+                    ids.push(id);
+                }
+                rows.push(ids);
+            }
+            let ds = TokenizedDataset::new(rows, dopts.clone());
+            Ok(DatasetHandle {
+                inner: Mutex::new(Box::new(ds)),
+                source: format!("synthetic:{row_count}rows"),
+                batch_size: dopts.batch_size,
+                ctx_len: dopts.ctx_len,
+            })
+        },
+    )?;
+    data.set("synthetic", synthetic)?;
+
     nn_table.set("data", data)?;
     Ok(())
 }

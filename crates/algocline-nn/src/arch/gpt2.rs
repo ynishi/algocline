@@ -158,19 +158,50 @@ impl Gpt2Config {
         }
     }
 
-    /// Resolve a variant name (`"medium"` or `"large"`) to the matching
-    /// preset. Returns `None` for unknown names.
+    /// `tiny` preset — a 2-layer / 2-head / dim-32 / ctx-16 / vocab-64
+    /// GPT-2 built for CPU smoke tests.
+    ///
+    /// Shape lets a from-scratch forward pass complete in milliseconds
+    /// on CPU (integration tests in `tests/{full_ft,distill}_synthetic.rs`
+    /// use a comparable configuration inline) so the Lua-facing
+    /// `examples/nn_*_smoke.lua` scripts run in a couple of seconds
+    /// without downloading pretrained weights.
+    ///
+    /// [`Self::hf_repo`] returns `None` for this shape — there is no
+    /// HuggingFace bundle at this size, and
+    /// [`Gpt2Model::from_pretrained`] therefore refuses `pretrained =
+    /// true` on the tiny variant. Callers of `alc.nn.preset.gpt2(
+    /// "tiny", ...)` must pass `pretrained = false` to build a
+    /// from-scratch handle whose `VarMap` the trainer bindings can
+    /// then optimise.
+    pub fn tiny() -> Self {
+        Self {
+            layers: 2,
+            heads: 2,
+            dim: 32,
+            ctx: 16,
+            vocab: 64,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+        }
+    }
+
+    /// Resolve a variant name (`"medium"` / `"large"` / `"tiny"`) to
+    /// the matching preset. Returns `None` for unknown names.
     pub fn from_variant(variant: &str) -> Option<Self> {
         match variant {
             "medium" | "gpt2-medium" => Some(Self::medium()),
             "large" | "gpt2-large" => Some(Self::large()),
+            "tiny" | "gpt2-tiny" => Some(Self::tiny()),
             _ => None,
         }
     }
 
     /// HuggingFace repository id for warm-start weight download
     /// (design §12 Q5). Returns `None` for a config not built from a
-    /// standard preset.
+    /// standard preset (including [`Self::tiny`], which has no
+    /// pretrained bundle).
     pub fn hf_repo(&self) -> Option<&'static str> {
         match (self.layers, self.heads, self.dim) {
             (24, 16, 1024) => Some("openai-community/gpt2-medium"),

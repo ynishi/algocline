@@ -90,13 +90,10 @@ fn redact_paths(text: &str) -> String {
 /// mapped to a stable placeholder so the same snapshot passes in both
 /// environments.
 fn redact_gh_credentials(text: &str) -> String {
-    let re_user_name_str =
-        regex::Regex::new(r#""user_name":\s*"[^"]*""#).expect("invalid regex");
-    let re_user_email_str =
-        regex::Regex::new(r#""user_email":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_name_str = regex::Regex::new(r#""user_name":\s*"[^"]*""#).expect("invalid regex");
+    let re_user_email_str = regex::Regex::new(r#""user_email":\s*"[^"]*""#).expect("invalid regex");
     let re_user_name_null = regex::Regex::new(r#""user_name":\s*null"#).expect("invalid regex");
-    let re_user_email_null =
-        regex::Regex::new(r#""user_email":\s*null"#).expect("invalid regex");
+    let re_user_email_null = regex::Regex::new(r#""user_email":\s*null"#).expect("invalid regex");
     // ssh found array: replace entries but preserve structure (present/absent)
     let re_ssh_found = regex::Regex::new(r#""found":\s*\[[^\]]*\]"#).expect("invalid regex");
     // Any non-null `"error":"..."` string (covers gh_auth.error when the CLI
@@ -119,14 +116,10 @@ fn redact_gh_credentials(text: &str) -> String {
     // object to a single placeholder. The nested regex handles at most one
     // level of nesting, which matches the current settings.toml shape
     // (e.g. `{"card": {"run": true}}`).
-    let re_settings_resolved = regex::Regex::new(
-        r#""resolved":\s*\{(?:[^{}]|\{[^{}]*\})*\}"#,
-    )
-    .expect("invalid regex");
-    let re_settings_sources = regex::Regex::new(
-        r#""sources":\s*\{(?:[^{}]|\{[^{}]*\})*\}"#,
-    )
-    .expect("invalid regex");
+    let re_settings_resolved =
+        regex::Regex::new(r#""resolved":\s*\{(?:[^{}]|\{[^{}]*\})*\}"#).expect("invalid regex");
+    let re_settings_sources =
+        regex::Regex::new(r#""sources":\s*\{(?:[^{}]|\{[^{}]*\})*\}"#).expect("invalid regex");
 
     let text = re_user_name_str
         .replace_all(text, r#""user_name": "<GIT_USER_NAME>""#)

@@ -207,7 +207,15 @@ pub fn run_full_ft(
     // difference is which VarMap the optimizer holds and which VarMap
     // the checkpoint store saves.
     run_ft_core(
-        model, varmap, varmap, dataset, cfg, loss_fn, ckpt_dir, ckpt_prefix, lease,
+        model,
+        varmap,
+        varmap,
+        dataset,
+        cfg,
+        loss_fn,
+        ckpt_dir,
+        ckpt_prefix,
+        lease,
     )
 }
 
@@ -296,12 +304,7 @@ fn run_ft_core(
         // trajectory without changing the return shape. The training
         // loop itself stays a closed function: this line is the only
         // window a caller has into intermediate loss values.
-        tracing::info!(
-            step = step,
-            loss = loss_val,
-            lr = lr,
-            "train_step"
-        );
+        tracing::info!(step = step, loss = loss_val, lr = lr, "train_step");
 
         opt.backward_step(&loss)?;
 
@@ -368,12 +371,8 @@ pub fn run_lora_ft(
     let lora_vm = base.wrap_lora(lora_cfg)?;
 
     let nn_dir = ckpt_dir.join("nn");
-    std::fs::create_dir_all(&nn_dir).map_err(|e| {
-        TrainError::Ckpt(format!(
-            "run_lora_ft: mkdir {:?}: {e}",
-            nn_dir.display()
-        ))
-    })?;
+    std::fs::create_dir_all(&nn_dir)
+        .map_err(|e| TrainError::Ckpt(format!("run_lora_ft: mkdir {:?}: {e}", nn_dir.display())))?;
     let ckpt_prefix = format!("lora-{card_id}");
 
     // `run_ft_core` uses `lora_vm` for both the optimizer and the

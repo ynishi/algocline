@@ -217,8 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ckpt_dir: PathBuf = std::env::var("NN_SMOKE_CKPT_DIR")
         .unwrap_or_else(|_| "/tmp".into())
         .into();
-    let card_id =
-        std::env::var("NN_SMOKE_CARD_ID").unwrap_or_else(|_| "smoke-lora-medium".into());
+    let card_id = std::env::var("NN_SMOKE_CARD_ID").unwrap_or_else(|_| "smoke-lora-medium".into());
     let lora_rank = env_usize("NN_SMOKE_LORA_RANK", 16);
     let lora_alpha = env_f32("NN_SMOKE_LORA_ALPHA", 32.0);
     let delta_max_bytes = env_u64("NN_SMOKE_DELTA_MAX_BYTES", 32 * 1024 * 1024);
@@ -256,13 +255,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_pre_path = frozen_dir.join(format!("base-pre-{card_id}.safetensors"));
     let base_post_path = frozen_dir.join(format!("base-post-{card_id}.safetensors"));
     if base_frozen_check {
-        std::fs::create_dir_all(&frozen_dir).map_err(|e| {
-            format!("mkdir {:?}: {e}", frozen_dir.display())
-        })?;
-        eprintln!("[smoke] dumping base VarMap pre-train → {:?}", base_pre_path);
+        std::fs::create_dir_all(&frozen_dir)
+            .map_err(|e| format!("mkdir {:?}: {e}", frozen_dir.display()))?;
+        eprintln!(
+            "[smoke] dumping base VarMap pre-train → {:?}",
+            base_pre_path
+        );
         base_vm.save(&base_pre_path)?;
         let sz = std::fs::metadata(&base_pre_path)?.len();
-        eprintln!("[smoke] base pre-dump = {sz} bytes ({:.2} MB)", sz as f64 / (1024.0 * 1024.0));
+        eprintln!(
+            "[smoke] base pre-dump = {sz} bytes ({:.2} MB)",
+            sz as f64 / (1024.0 * 1024.0)
+        );
     }
 
     let rows_needed = steps.saturating_mul(batch).saturating_add(batch);

@@ -223,8 +223,7 @@ fn run_lora_ft_leaves_base_weights_bit_identical() {
         .collect();
     for (idx, (before, after)) in base_before.iter().zip(base_after.iter()).enumerate() {
         assert_eq!(
-            before,
-            after,
+            before, after,
             "base var index {idx} drifted through run_lora_ft"
         );
     }
@@ -322,10 +321,7 @@ fn run_lora_ft_reduces_loss_on_overfit_corpus() {
     )
     .expect("run_lora_ft must succeed");
 
-    let min_loss = *ckpt
-        .metrics
-        .get("min_train_loss")
-        .expect("min_train_loss");
+    let min_loss = *ckpt.metrics.get("min_train_loss").expect("min_train_loss");
     assert!(
         min_loss < baseline * 0.7,
         "run_lora_ft did not reduce loss: min_train_loss={min_loss}, baseline={baseline}, \

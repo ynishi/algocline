@@ -105,8 +105,7 @@ fn wrap_variant_in_place(
 /// Canonical GPT-2 target-module names accepted by
 /// [`Gpt2Model::wrap_lora`]. Any name outside this list triggers an
 /// error at wrap time so a typo does not silently degrade to "no-op".
-const KNOWN_TARGET_MODULES: [&str; 6] =
-    ["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"];
+const KNOWN_TARGET_MODULES: [&str; 6] = ["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"];
 
 /// LayerNorm forward that always uses the backward-safe basic-op path
 /// (`layer_norm_slow`).

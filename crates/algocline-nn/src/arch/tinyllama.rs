@@ -821,6 +821,76 @@ impl super::lora::LoraWrappable for TinyLlamaModel {
     }
 }
 
+/// Emit a merged inference-ready weight bundle keyed by HF Llama
+/// safetensors names. Every `LinearVariant::Lora` in a block is
+/// collapsed via [`LoraLinear::merged_weight`]; every `Plain`
+/// projection passes through unchanged. GQA shape is preserved:
+/// `k_proj` / `v_proj` output dimension stays `kv_heads * head_dim`
+/// (`256` on the 1.1B preset), never broadcast up to Q's shape.
+///
+/// The emitted key layout matches exactly what
+/// [`TinyLlamaModel::from_pretrained`] reads (HF Llama layout with
+/// `model.` prefix and `layers.<i>` per-block indexing), so the
+/// bundle is a drop-in base for the same `TinyLlamaConfig`.
+///
+/// Layer 4a §3 Q2 — HF-native layout keys.
+impl super::lora::MergeableLora for TinyLlamaModel {
+    fn export_merged(&self) -> CandleResult<std::collections::HashMap<String, Tensor>> {
+        let mut out: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+
+        // Top-level: token embedding + final norm + lm_head.
+        // Naming mirrors `from_pretrained`'s HF Llama layout —
+        // everything under `model.*` except `lm_head.weight`.
+        out.insert(
+            "model.embed_tokens.weight".into(),
+            self.embed_tokens.embeddings().clone(),
+        );
+
+        // Per-block: input_layernorm, self_attn.{q,k,v,o}_proj,
+        // post_attention_layernorm, mlp.{gate,up,down}_proj.
+        // RmsNorm carries weight only (no bias); attention/MLP
+        // linears are bias-less (`linear_no_bias`).
+        for (i, block) in self.blocks.iter().enumerate() {
+            let prefix = format!("model.layers.{i}");
+
+            out.insert(
+                format!("{prefix}.input_layernorm.weight"),
+                block.input_layernorm.weight().clone(),
+            );
+            out.insert(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                block.post_attention_layernorm.weight().clone(),
+            );
+
+            // Attention projections (potentially LoRA-wrapped).
+            let q = block.q_proj.merged_weight()?;
+            out.insert(format!("{prefix}.self_attn.q_proj.weight"), q);
+            let k = block.k_proj.merged_weight()?;
+            out.insert(format!("{prefix}.self_attn.k_proj.weight"), k);
+            let v = block.v_proj.merged_weight()?;
+            out.insert(format!("{prefix}.self_attn.v_proj.weight"), v);
+            let o = block.o_proj.merged_weight()?;
+            out.insert(format!("{prefix}.self_attn.o_proj.weight"), o);
+
+            // MLP projections (potentially LoRA-wrapped).
+            let gate = block.gate_proj.merged_weight()?;
+            out.insert(format!("{prefix}.mlp.gate_proj.weight"), gate);
+            let up = block.up_proj.merged_weight()?;
+            out.insert(format!("{prefix}.mlp.up_proj.weight"), up);
+            let down = block.down_proj.merged_weight()?;
+            out.insert(format!("{prefix}.mlp.down_proj.weight"), down);
+        }
+
+        // Final RmsNorm + lm_head (lm_head is at the top level,
+        // outside the `model.*` subtree).
+        out.insert("model.norm.weight".into(), self.norm.weight().clone());
+        out.insert("lm_head.weight".into(), self.lm_head.weight().clone());
+
+        Ok(out)
+    }
+}
+
 /// Build a causal (lower-triangular) mask `[ctx, ctx]` where valid
 /// (kept) positions are `1` and masked-out are `0`.
 ///

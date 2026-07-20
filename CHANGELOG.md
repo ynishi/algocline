@@ -47,7 +47,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`arch::tinyllama::tests::wrap_lora_*` +
     `default_lora_targets_matches_canonical_seven`) and 2 integration
     tests (`tests/tinyllama_lora_merge_equivalence.rs`). Layer 3
-    (training loop) tracked as follow-up.
+    (training-loop generalisation) landed in the same `[Unreleased]`
+    window — see below.
+  - Layer 3 — LoRA fine-tune training loop generalisation for the
+    trainable model family. The three trainer entry points
+    (`train::run_ft_core`, `train::run_full_ft`, `train::run_lora_ft`)
+    are now generic over `M: candle_nn::Module + DeviceView
+    [+ LoraWrappable]` rather than monomorphic in `Gpt2Model`, so the
+    same loop drives GPT-2 and TinyLlama through identical code
+    paths. Two new local traits carry the shape:
+    * `pub trait DeviceView { fn device(&self) -> &Device; }` in
+      `train::mod` — pairs with `candle_nn::Module` so the loop can
+      place input tensors on the model's device before the forward
+      pass (`Module::forward` alone doesn't expose device info).
+    * `pub trait LoraWrappable { fn wrap_lora(&mut self, &LoraConfig)
+      -> CandleResult<VarMap>; }` in `arch::lora` — trait extraction
+      of the previously-inherent `wrap_lora` method so `run_lora_ft`
+      can dispatch uniformly.
+    Both `Gpt2Model` and `TinyLlamaModel` receive `impl Module`,
+    `impl DeviceView`, and `impl LoraWrappable` — all thin delegates
+    to the existing inherent methods, so every existing call site
+    (test suites, Lua bridge, external callers) resolves through the
+    inherent path unchanged; only the generic loop dispatches through
+    the traits. Verified by 4 new TinyLlama integration tests
+    (`tests/tinyllama_lora_ft.rs`: freeze invariant, loss reduction
+    on overfit corpus, LoRA weight movement, delta safetensors shape
+    = 28 vars = 2 layers × 7 targets × 2) and 3 new inline unit tests
+    for trait dispatch (`train::fullft::tests::gpt2_and_tinyllama_impl_*`).
+    All 6 pre-existing GPT-2 LoRA integration tests re-monomorphise
+    under the new generic bounds with no source change. Engine-side
+    Lua bridge (`bridge/nn_card.rs`) updated to deref through
+    `MutexGuard<Gpt2Model>` explicitly (`&*model` / `&mut *model`)
+    since the guard doesn't itself impl the trait bounds. New public
+    API surface is additive; the trainer entry-point signature change
+    is only breaking for a downstream that spelled the concrete
+    `Gpt2Model` type in a `fn` pointer or `type` alias (none known).
 - `algocline-nn`: arch-neutral prerequisites for the inference-fleet
   expansion tracked in GH #9 (Layer 1 of 3).
   - `algocline_nn::card::validate_architecture` + the

@@ -3368,3 +3368,298 @@ mod trainer_tests {
         assert!(msg.contains("invalid meta.candle.lora"), "message: {msg}");
     }
 }
+
+/// Layer 4b S6 integration tests — arch-neutral preset + card
+/// load dispatch. These target the arch-neutral entry
+/// (`build_neutral_preset`, `load_handle_impl`, `load_wrap_impl`)
+/// plus `NnHandle` dispatch, and the directional errors that keep
+/// the two load surfaces (`load_handle` / `load_wrap`) from silently
+/// swallowing each other's cards.
+///
+/// Scope note: end-to-end tests that need a physical bundle at
+/// `<nn_dir>/<card_id>.safetensors` matching the auto-generated
+/// card_id are deferred until a `FileCardStore::update` (or Lua
+/// bridge `card.save`) test hook lands — the current
+/// `FileCardStore::create` returns the id post-hoc, so a
+/// pre-write bundle can't pin the correct filename. The tests
+/// here exercise the dispatch decisions + error paths that
+/// don't require this.
+#[cfg(test)]
+mod load_dispatch_tests {
+    use super::*;
+    use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig};
+    use candle_nn::{VarBuilder, VarMap};
+    use mlua::Lua;
+    use serde_json::json;
+
+    fn write_test_card(store: &FileCardStore, nn_meta: serde_json::Value) -> String {
+        let payload = json!({
+            "pkg": { "name": "alc_nn" },
+            "metadata": { "kind": "nn_model", "nn": nn_meta }
+        });
+        let (card_id, _path) = store.create(payload).expect("create test card");
+        card_id
+    }
+
+    // ── arch-neutral preset dispatch ─────────────────────────
+
+    #[test]
+    fn neutral_preset_gpt2_returns_gpt2_nn_handle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let opts_val = lua.to_value(&json!({ "pretrained": false })).unwrap();
+        let opts_tbl = match opts_val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let h = build_neutral_preset("gpt2", "tiny", Some(&opts_tbl), tmp.path())
+            .expect("neutral preset gpt2 tiny");
+        assert_eq!(h.arch(), "gpt2");
+        assert!(h.as_gpt2().is_some());
+        assert!(h.as_tinyllama().is_none());
+    }
+
+    #[test]
+    fn neutral_preset_tinyllama_returns_tinyllama_nn_handle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // pretrained=false to skip HF hub.
+        let lua = Lua::new();
+        let opts_val = lua
+            .to_value(&json!({ "pretrained": false }))
+            .unwrap();
+        let opts_tbl = match opts_val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let h = build_neutral_preset(
+            "tinyllama",
+            "tinyllama-tiny",
+            Some(&opts_tbl),
+            tmp.path(),
+        )
+        .expect("neutral preset tinyllama-tiny");
+        assert_eq!(h.arch(), "tinyllama");
+        assert!(h.as_tinyllama().is_some());
+    }
+
+    #[test]
+    fn neutral_preset_rejects_unregistered_arch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let msg = match build_neutral_preset("qwen2", "1.5b", None, tmp.path()) {
+            Ok(_) => panic!("qwen2 must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("qwen2") && msg.contains("not registered"),
+            "message: {msg}"
+        );
+    }
+
+    // ── load_handle_impl directional errors ──────────────────
+
+    #[test]
+    fn load_handle_refuses_lora_card_with_directional_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-lora",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "lora",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "lora": {
+                        "rank": 4, "alpha": 8, "base_bundle_ref": "nn/base",
+                        "target_modules": ["q_proj"], "dropout": 0.0,
+                        "delta_path": "/nonexistent/lora.safetensors"
+                    }
+                }
+            }),
+        );
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("lora card must be refused by load_handle"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("training_path=\"lora\"") && msg.contains("load_wrap"),
+            "directional error must point at load_wrap: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_handle_refuses_unknown_training_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-bogus",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "quantized_awq",
+                "candle": { "bundle_ref": "nn/placeholder" }
+            }),
+        );
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("unknown training_path must error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("unknown training_path") || msg.contains("quantized_awq"),
+            "message: {msg}"
+        );
+    }
+
+    // ── load_wrap_impl directional errors + arch match ───────
+
+    #[test]
+    fn load_wrap_refuses_merged_card_with_directional_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-merged",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "merged",
+                "candle": { "bundle_ref": "nn/placeholder" }
+            }),
+        );
+        let lua = Lua::new();
+        let placeholder = lua.create_any_userdata(0u32).unwrap();
+        let msg = match load_wrap_impl(&store, &card_id, &placeholder) {
+            Ok(_) => panic!("merged card must be refused by load_wrap"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("training_path=\"merged\"") && msg.contains("load_handle"),
+            "directional error must point at load_handle: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_wrap_refuses_full_ft_card_with_directional_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-fullft",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "full_ft",
+                "candle": { "bundle_ref": "nn/placeholder" }
+            }),
+        );
+        let lua = Lua::new();
+        let placeholder = lua.create_any_userdata(0u32).unwrap();
+        let msg = match load_wrap_impl(&store, &card_id, &placeholder) {
+            Ok(_) => panic!("full_ft card must be refused by load_wrap"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("training_path=\"full_ft\"") && msg.contains("load_handle"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_wrap_rejects_arch_mismatched_base_handle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+
+        // Build a valid LoRA delta on gpt2-tiny so precheck passes.
+        let cfg = Gpt2Config::from_variant("tiny").unwrap();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+        let lora_cfg = LoraConfig::new(4, 8.0);
+        let lora_vm = model.wrap_lora(&lora_cfg).unwrap();
+        let delta_path = tmp.path().join("gpt2-lora.safetensors");
+        lora_vm.save(&delta_path).unwrap();
+
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-lora",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "lora",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "lora": {
+                        "rank": 4, "alpha": 8, "base_bundle_ref": "nn/base-gpt2",
+                        "target_modules": ["q_proj", "k_proj", "v_proj"],
+                        "dropout": 0.0,
+                        "delta_path": delta_path.to_str().unwrap()
+                    }
+                }
+            }),
+        );
+
+        // Build a tinyllama base handle — arch mismatch.
+        let tll_nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+        let opts_val = lua.to_value(&json!({ "pretrained": false })).unwrap();
+        let opts_tbl = match opts_val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let tll_handle =
+            build_tinyllama_handle("tinyllama-tiny", Some(&opts_tbl), &tll_nn_dir)
+                .unwrap();
+        let tll_ud = lua.create_userdata(tll_handle).unwrap();
+
+        let msg = match load_wrap_impl(&store, &card_id, &tll_ud) {
+            Ok(_) => panic!("arch mismatch must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("gpt2 card requires a gpt2 base handle")
+                && msg.contains("tinyllama"),
+            "arch mismatch message must name both sides: {msg}"
+        );
+    }
+
+    // ── legacy shims still work ──────────────────────────────
+
+    #[test]
+    fn legacy_load_gpt2_shim_delegates_to_shared_core() {
+        // The 3 existing trainer_tests::load_gpt2_impl_errors_*
+        // tests exercise the pre-borrow schema-precheck path
+        // (candle / lora / delta_path); this test guards that the
+        // shim continues to route through the shared core after
+        // the S5 refactor by asserting the same delta_path error
+        // shape survives.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "legacy-lora",
+                "backend": "candle",
+                "architecture": "gpt2-medium",
+                "training_path": "lora",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "lora": {
+                        "rank": 8, "alpha": 16,
+                        "base_bundle_ref": "nn/base-gpt2-medium"
+                    }
+                }
+            }),
+        );
+        let lua = Lua::new();
+        let placeholder = lua.create_any_userdata(0u32).unwrap();
+        let msg = match load_gpt2_impl(&store, &card_id, &placeholder) {
+            Ok(_) => panic!("missing delta_path must error via shim"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("delta_path"), "message: {msg}");
+    }
+}

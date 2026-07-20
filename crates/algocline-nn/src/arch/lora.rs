@@ -278,6 +278,31 @@ impl Module for LinearVariant {
     }
 }
 
+impl LinearVariant {
+    /// Materialise the effective weight for inference-time export.
+    ///
+    /// `Plain` returns the frozen base weight as-is; `Lora` composes
+    /// `base + scaling * (B @ A)` via [`LoraLinear::merged_weight`].
+    /// The returned tensor is the same shape as the underlying base
+    /// linear's weight — a merged bundle can drop this tensor in
+    /// place of the base weight without any shape adaptation.
+    pub(crate) fn merged_weight(&self) -> CandleResult<Tensor> {
+        match self {
+            Self::Plain(l) => Ok(l.weight().clone()),
+            Self::Lora(l) => l.merged_weight(),
+        }
+    }
+
+    /// Access the bias of the underlying base linear (identical for
+    /// `Plain` and `Lora`, since LoRA never adds a bias term).
+    pub(crate) fn bias(&self) -> Option<&Tensor> {
+        match self {
+            Self::Plain(l) => l.bias(),
+            Self::Lora(l) => l.base().bias(),
+        }
+    }
+}
+
 /// Move the `Plain` linear currently in `v` into a fresh
 /// [`LoraLinear::wrap`] and put the resulting wrap back into `v`.
 ///
@@ -335,6 +360,42 @@ pub trait LoraWrappable {
     /// Wrap the model's per-block linear projections with LoRA
     /// low-rank updates and return the fresh LoRA-only `VarMap`.
     fn wrap_lora(&mut self, cfg: &LoraConfig) -> CandleResult<candle_nn::VarMap>;
+}
+
+/// A model that can export a merged inference-ready weight bundle.
+///
+/// After a LoRA-wrapped model has been trained (via
+/// [`crate::train::run_lora_ft`]), the on-disk delta bundle plus the
+/// base model can be composed into a single safetensors bundle that
+/// downstream consumers load as if it were a plain pretrained model.
+/// This trait is what the generic [`crate::merged::export_merged`]
+/// entry point walks; each arch impl emits its own HF-canonical key
+/// layout so the emitted bundle is a drop-in replacement for the base
+/// (loadable by the same `from_pretrained` / `VarBuilder::from_mmaped_safetensors`
+/// path).
+///
+/// # Invariants (mirrored per arch impl)
+///
+/// - Every `LinearVariant::Lora` projection is collapsed via
+///   [`LoraLinear::merged_weight`]; every `LinearVariant::Plain`
+///   projection passes its base weight through unchanged.
+/// - Emitted keys match exactly what the arch's `from_pretrained`
+///   reads (HF-native layout, e.g. `h.<i>.attn.c_attn.weight` for
+///   GPT-2, `model.layers.<i>.self_attn.q_proj.weight` for TinyLlama).
+///   Divergence is a correctness bug caught by the parity integration
+///   tests.
+/// - The base parameter freeze invariant is respected: export is a
+///   pure read; no `VarMap` bytes on the model change.
+/// - The returned map is on the model's current device; the
+///   downstream `export_merged` entry moves tensors to CPU before
+///   writing safetensors (Layer 4a §3 Q4).
+pub trait MergeableLora {
+    /// Walk this model's parameters and return a
+    /// `{safetensors_key -> tensor}` map ready to be written as a
+    /// plain inference bundle. Every LoRA-wrapped projection is
+    /// collapsed into a single merged weight; other tensors
+    /// (embeddings, layer norms, plain linears) pass through.
+    fn export_merged(&self) -> CandleResult<std::collections::HashMap<String, Tensor>>;
 }
 
 /// Snapshot two tensors as flat f32 vectors and return the maximum

@@ -548,6 +548,76 @@ impl super::lora::LoraWrappable for Gpt2Model {
     }
 }
 
+/// Emit a merged inference-ready weight bundle keyed by HF GPT-2
+/// safetensors names. Every `LinearVariant::Lora` in a block is
+/// collapsed via [`LoraLinear::merged_weight`]; every `Plain`
+/// projection passes through unchanged. The emitted key layout
+/// matches exactly what [`Gpt2Model::from_pretrained`] reads, so the
+/// bundle is a drop-in base for the same `Gpt2Config`.
+///
+/// Layer 4a §3 Q2 — HF-native layout keys.
+impl super::lora::MergeableLora for Gpt2Model {
+    fn export_merged(&self) -> CandleResult<std::collections::HashMap<String, Tensor>> {
+        let mut out: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::new();
+
+        // Top-level: token + positional embeddings (LM head is tied
+        // to `wte`, so no separate `lm_head.weight` — matches
+        // Gpt2Model::new which uses wte for both).
+        out.insert("wte.weight".into(), self.wte.embeddings().clone());
+        out.insert("wpe.weight".into(), self.wpe.embeddings().clone());
+
+        // Per-block: ln_1, attn.c_attn, attn.c_proj, ln_2,
+        // mlp.c_fc, mlp.c_proj. Naming mirrors Block::new's
+        // VarBuilder path (`h.<i>.<field>`).
+        for (i, block) in self.blocks.iter().enumerate() {
+            let prefix = format!("h.{i}");
+
+            // LayerNorms carry both weight and bias.
+            out.insert(format!("{prefix}.ln_1.weight"), block.ln_1.weight().clone());
+            if let Some(b) = block.ln_1.bias() {
+                out.insert(format!("{prefix}.ln_1.bias"), b.clone());
+            }
+            out.insert(format!("{prefix}.ln_2.weight"), block.ln_2.weight().clone());
+            if let Some(b) = block.ln_2.bias() {
+                out.insert(format!("{prefix}.ln_2.bias"), b.clone());
+            }
+
+            // Attention linears (potentially LoRA-wrapped).
+            let c_attn_w = block.c_attn.merged_weight()?;
+            out.insert(format!("{prefix}.attn.c_attn.weight"), c_attn_w);
+            if let Some(b) = block.c_attn.bias() {
+                out.insert(format!("{prefix}.attn.c_attn.bias"), b.clone());
+            }
+            let c_proj_w = block.c_proj.merged_weight()?;
+            out.insert(format!("{prefix}.attn.c_proj.weight"), c_proj_w);
+            if let Some(b) = block.c_proj.bias() {
+                out.insert(format!("{prefix}.attn.c_proj.bias"), b.clone());
+            }
+
+            // MLP linears (potentially LoRA-wrapped).
+            let mlp_c_fc_w = block.mlp_c_fc.merged_weight()?;
+            out.insert(format!("{prefix}.mlp.c_fc.weight"), mlp_c_fc_w);
+            if let Some(b) = block.mlp_c_fc.bias() {
+                out.insert(format!("{prefix}.mlp.c_fc.bias"), b.clone());
+            }
+            let mlp_c_proj_w = block.mlp_c_proj.merged_weight()?;
+            out.insert(format!("{prefix}.mlp.c_proj.weight"), mlp_c_proj_w);
+            if let Some(b) = block.mlp_c_proj.bias() {
+                out.insert(format!("{prefix}.mlp.c_proj.bias"), b.clone());
+            }
+        }
+
+        // Final LayerNorm.
+        out.insert("ln_f.weight".into(), self.ln_f.weight().clone());
+        if let Some(b) = self.ln_f.bias() {
+            out.insert("ln_f.bias".into(), b.clone());
+        }
+
+        Ok(out)
+    }
+}
+
 /// Errors from [`Gpt2Model::from_pretrained`].
 ///
 /// Explicit variants so the caller (Lua bridge) can surface an

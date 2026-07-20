@@ -119,6 +119,20 @@ pub(super) fn register_nn_card(
     )?;
     card_ns.set("load_gpt2", load_gpt2)?;
 
+    // Layer 4b §Q3-A arch-neutral LoRA card loader. Accepts either
+    // NnHandle (from `alc.nn.preset("gpt2"/"tinyllama", …)`) or a
+    // typed Handle (from `alc.nn.preset.gpt2` / `.tinyllama`) as
+    // the base. Refuses self-contained cards (full_ft / merged /
+    // distillation) with a directional error pointing at
+    // `alc.nn.card.load_handle`.
+    let load_wrap_store = Arc::clone(&card_store);
+    let load_wrap = lua.create_function(
+        move |_lua, (card_id, base_handle): (String, LuaAnyUserData)| -> LuaResult<NnHandle> {
+            load_wrap_impl(load_wrap_store.as_ref(), &card_id, &base_handle)
+        },
+    )?;
+    card_ns.set("load_wrap", load_wrap)?;
+
     let register_store = Arc::clone(&card_store);
     let register = lua.create_function(
         move |lua, (card_id, model_name): (String, String)| -> LuaResult<()> {
@@ -353,91 +367,147 @@ fn load_gpt2_impl(
     card_id: &str,
     base_handle: &LuaAnyUserData,
 ) -> LuaResult<Gpt2Handle> {
-    // Fetch the Card and locate the [nn.candle.lora] block.
+    // Delegate to the shared LoRA-wrap core so the arch-neutral
+    // load_wrap path (Layer 4b §Q3-A) and this backward-compat
+    // typed shortcut share a single body. The shortcut asserts
+    // `base` is a typed `Gpt2Handle` up front; the neutral path
+    // downcasts through `NnHandle::as_gpt2` for the same effect.
+    //
+    // Ordering: schema + delta-file precheck happens BEFORE
+    // borrowing `base_handle` so callers hitting a schema gap
+    // (missing candle / missing delta_path / missing delta file)
+    // see the specific error rather than a generic "base handle
+    // is not a Gpt2Handle" fallback — this ordering is asserted
+    // by `trainer_tests::load_gpt2_impl_errors_*`.
     let card = store
         .get(card_id)
         .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: {e}")))?
         .ok_or_else(|| {
             LuaError::external(format!("alc.nn.card.load_gpt2: card '{card_id}' not found"))
         })?;
-    let candle_json = card
+    let meta = extract_nn_card_meta("alc.nn.card.load_gpt2", card_id, &card)?;
+    precheck_lora_card_meta("alc.nn.card.load_gpt2", card_id, &meta)?;
+    let base = base_handle
+        .borrow::<Gpt2Handle>()
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: base handle: {e}")))?;
+    wrap_gpt2_lora_from_meta("alc.nn.card.load_gpt2", card_id, &meta, &base)
+}
+
+/// Schema + delta-file precheck for a LoRA card, run before the
+/// base handle is borrowed so callers hitting a schema gap see the
+/// specific error rather than a generic "base handle wrong type"
+/// downstream failure. Called by both `load_gpt2_impl` (typed
+/// shortcut) and `load_wrap_impl` (arch-neutral).
+fn precheck_lora_card_meta(
+    ctx: &str,
+    card_id: &str,
+    meta: &NnCardMeta,
+) -> LuaResult<()> {
+    let candle = meta.candle.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' missing metadata.nn.candle"
+        ))
+    })?;
+    let lora_branch = candle.lora.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' has no metadata.nn.candle.lora block \
+             (use alc.nn.card.load / load_handle for weight-only reload of a non-LoRA card)"
+        ))
+    })?;
+    let delta_path_str = lora_branch.delta_path.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' metadata.nn.candle.lora is missing delta_path \
+             (pre-ST-d cards do not record it; re-save via alc.nn.trainer.lora + \
+             alc.nn.card.save to populate)"
+        ))
+    })?;
+    let delta_path = std::path::Path::new(delta_path_str);
+    if !delta_path.exists() {
+        return Err(LuaError::external(format!(
+            "{ctx}: delta safetensors missing at {delta_path:?} \
+             (expected the file produced by run_lora_ft; ckpt_dir may have been cleaned)"
+        )));
+    }
+    Ok(())
+}
+
+/// Extract + deserialise `metadata.nn` from a Card JSON. Shared by
+/// `load_gpt2_impl` / `load_handle_impl` / `load_wrap_impl` so
+/// they surface identical errors on schema shape violations.
+fn extract_nn_card_meta(
+    ctx: &str,
+    card_id: &str,
+    card: &Json,
+) -> LuaResult<NnCardMeta> {
+    let meta_json = card
         .get("metadata")
         .and_then(|m| m.get("nn"))
-        .and_then(|n| n.get("candle"))
+        .cloned()
         .ok_or_else(|| {
-            LuaError::external(format!(
-                "alc.nn.card.load_gpt2: card '{card_id}' missing metadata.nn.candle"
-            ))
+            LuaError::external(format!("{ctx}: card '{card_id}' missing metadata.nn"))
         })?;
-    let lora_json = candle_json.get("lora").ok_or_else(|| {
+    serde_json::from_value(meta_json).map_err(|e| {
         LuaError::external(format!(
-            "alc.nn.card.load_gpt2: card '{card_id}' has no metadata.nn.candle.lora block \
-             (use alc.nn.card.load for weight-only reload of a non-LoRA card)"
+            "{ctx}: card '{card_id}' invalid metadata.nn: {e}"
+        ))
+    })
+}
+
+/// Core LoRA wrap for GPT-2. Consumes an already-parsed
+/// `NnCardMeta` + a `Gpt2Handle` base; enforces the same schema +
+/// arch-match invariants as the historical `load_gpt2_impl` body.
+/// Shared between the arch-neutral `load_wrap` path
+/// (via `wrap_gpt2_from_card`) and the backward-compat
+/// `load_gpt2` shortcut (via `load_gpt2_impl`).
+fn wrap_gpt2_lora_from_meta(
+    ctx: &str,
+    card_id: &str,
+    meta: &NnCardMeta,
+    base: &Gpt2Handle,
+) -> LuaResult<Gpt2Handle> {
+    let candle = meta.candle.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' missing metadata.nn.candle"
+        ))
+    })?;
+    let lora_branch = candle.lora.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' has no metadata.nn.candle.lora block \
+             (use alc.nn.card.load / load_handle for weight-only reload of a non-LoRA card)"
         ))
     })?;
 
-    // Schema validation happens first — deserialize the lora branch
-    // and require `delta_path` + file existence before we touch the
-    // base handle. This ordering matters for two reasons: (1) tests
-    // that assert schema-level errors (missing `delta_path`, missing
-    // delta file, etc.) can use a placeholder userdata for
-    // `base_handle`; (2) real callers see the most specific error
-    // first (schema gap vs base/architecture pairing).
-    let lora_branch: NnLoraBranch = serde_json::from_value(lora_json.clone()).map_err(|e| {
-        LuaError::external(format!(
-            "alc.nn.card.load_gpt2: invalid metadata.nn.candle.lora: {e}"
-        ))
-    })?;
     let delta_path_str = lora_branch.delta_path.clone().ok_or_else(|| {
         LuaError::external(format!(
-            "alc.nn.card.load_gpt2: card '{card_id}' metadata.nn.candle.lora is missing \
-             delta_path (pre-ST-d cards do not record it; re-save via alc.nn.trainer.lora + \
+            "{ctx}: card '{card_id}' metadata.nn.candle.lora is missing delta_path \
+             (pre-ST-d cards do not record it; re-save via alc.nn.trainer.lora + \
              alc.nn.card.save to populate)"
         ))
     })?;
     let delta_path = PathBuf::from(&delta_path_str);
     if !delta_path.exists() {
         return Err(LuaError::external(format!(
-            "alc.nn.card.load_gpt2: delta safetensors missing at {delta_path:?} \
+            "{ctx}: delta safetensors missing at {delta_path:?} \
              (expected the file produced by run_lora_ft; ckpt_dir may have been cleaned)"
         )));
     }
 
-    let card_arch = card
-        .get("metadata")
-        .and_then(|m| m.get("nn"))
-        .and_then(|n| n.get("architecture"))
-        .and_then(|a| a.as_str())
-        .ok_or_else(|| {
-            LuaError::external(format!(
-                "alc.nn.card.load_gpt2: card '{card_id}' missing metadata.nn.architecture"
-            ))
-        })?;
-    let base_variant_snapshot = {
-        let base_snap = base_handle
-            .borrow::<Gpt2Handle>()
-            .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: base handle: {e}")))?;
-        base_snap.variant.clone()
-    };
-    let base_cfg_id = if base_variant_snapshot.starts_with("gpt2-") {
-        base_variant_snapshot.clone()
+    let card_arch = &meta.architecture;
+    let base_variant = &base.variant;
+    let base_cfg_id = if base_variant.starts_with("gpt2-") {
+        base_variant.clone()
     } else {
-        format!("gpt2-{base_variant_snapshot}")
+        format!("gpt2-{base_variant}")
     };
-    if card_arch != base_cfg_id && card_arch != base_variant_snapshot {
+    if card_arch != &base_cfg_id && card_arch != base_variant {
         return Err(LuaError::external(format!(
-            "alc.nn.card.load_gpt2: architecture mismatch — card '{card_id}' was trained on \
-             '{card_arch}' but base handle is '{base_variant_snapshot}'. Rebuild the base with \
-             `alc.nn.preset.gpt2('{card_arch}', ...)` to match."
+            "{ctx}: architecture mismatch — card '{card_id}' was trained on \
+             '{card_arch}' but base handle is '{base_variant}'. Rebuild the base with \
+             `alc.nn.preset.gpt2('{card_arch}', ...)` (or the neutral \
+             `alc.nn.preset('gpt2', '{card_arch}', ...)`) to match."
         )));
     }
 
-    // Reconstruct the LoraConfig that produced this Δ. `target_modules`
-    // + rank + alpha must match the training-time values verbatim
-    // so `VarMap::load` finds every var by name. `dropout` is set for
-    // provenance only — [`crate::arch::LoraLinear::forward`] does not
-    // apply dropout at inference, so this field does not affect the
-    // element-wise bit-exact merge-equivalence invariant.
     let mut lora_cfg = LoraConfig::with_targets(
         lora_branch.rank as usize,
         lora_branch.alpha as f32,
@@ -445,45 +515,27 @@ fn load_gpt2_impl(
     );
     lora_cfg.dropout = lora_branch.dropout;
 
-    // Snapshot the base handle's identity fields before we borrow its
-    // model for mutation — the returned Gpt2Handle carries the same
-    // shape metadata (variant, layers, etc.) as the base.
-    let base = base_handle
-        .borrow::<Gpt2Handle>()
-        .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: base handle: {e}")))?;
     let model_arc = base.model();
     let variant = base.variant.clone();
     let layers = base.layers;
     let heads = base.heads;
     let dim = base.dim;
-    let ctx = base.ctx;
+    let ctx_len = base.ctx;
     let vocab = base.vocab;
     let device = base.device.clone();
     let dtype = base.dtype.clone();
     let pretrained = base.pretrained;
-    drop(base);
 
-    // Wrap the base in place. `wrap_lora` returns a fresh VarMap
-    // holding only the LoRA A/B parameters; the base weights stay
-    // frozen (invariant #1). Wrong `target_modules` (e.g. an entry
-    // the model does not expose) surface as a Candle error prefixed
-    // with the trainer stage rather than a silent no-op.
     let mut model = model_arc
         .lock()
-        .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: model lock: {e}")))?;
+        .map_err(|e| LuaError::external(format!("{ctx}: model lock: {e}")))?;
     let mut lora_vm = model
         .wrap_lora(&lora_cfg)
-        .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: wrap_lora: {e}")))?;
+        .map_err(|e| LuaError::external(format!("{ctx}: wrap_lora: {e}")))?;
     drop(model);
 
-    // Restore the trained Δ into the freshly-wrapped LoRA vars. Names
-    // registered by wrap_lora must match names in the safetensors
-    // file; a mismatch surfaces via candle-nn's `VarMap::load` error
-    // path (either missing-name or shape-mismatch).
     lora_vm.load(&delta_path).map_err(|e| {
-        LuaError::external(format!(
-            "alc.nn.card.load_gpt2: load delta {delta_path:?}: {e}"
-        ))
+        LuaError::external(format!("{ctx}: load delta {delta_path:?}: {e}"))
     })?;
 
     Ok(Gpt2Handle {
@@ -493,7 +545,104 @@ fn load_gpt2_impl(
         layers,
         heads,
         dim,
-        ctx,
+        ctx: ctx_len,
+        vocab,
+        device,
+        dtype,
+        pretrained,
+    })
+}
+
+/// Core LoRA wrap for TinyLlama. Mirrors
+/// [`wrap_gpt2_lora_from_meta`]; the arch-specific parts are the
+/// `TinyLlamaHandle` field set + the arch prefix used in the
+/// mismatch error message.
+fn wrap_tinyllama_lora_from_meta(
+    ctx: &str,
+    card_id: &str,
+    meta: &NnCardMeta,
+    base: &TinyLlamaHandle,
+) -> LuaResult<TinyLlamaHandle> {
+    let candle = meta.candle.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' missing metadata.nn.candle"
+        ))
+    })?;
+    let lora_branch = candle.lora.as_ref().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' has no metadata.nn.candle.lora block \
+             (use alc.nn.card.load / load_handle for weight-only reload of a non-LoRA card)"
+        ))
+    })?;
+
+    let delta_path_str = lora_branch.delta_path.clone().ok_or_else(|| {
+        LuaError::external(format!(
+            "{ctx}: card '{card_id}' metadata.nn.candle.lora is missing delta_path"
+        ))
+    })?;
+    let delta_path = PathBuf::from(&delta_path_str);
+    if !delta_path.exists() {
+        return Err(LuaError::external(format!(
+            "{ctx}: delta safetensors missing at {delta_path:?}"
+        )));
+    }
+
+    let card_arch = &meta.architecture;
+    let base_variant = &base.variant;
+    let base_cfg_id = if base_variant.starts_with("tinyllama-") {
+        base_variant.clone()
+    } else {
+        format!("tinyllama-{base_variant}")
+    };
+    if card_arch != &base_cfg_id && card_arch != base_variant {
+        return Err(LuaError::external(format!(
+            "{ctx}: architecture mismatch — card '{card_id}' was trained on \
+             '{card_arch}' but base handle is '{base_variant}'. Rebuild the base with \
+             `alc.nn.preset.tinyllama('{card_arch}', ...)` (or the neutral \
+             `alc.nn.preset('tinyllama', '{card_arch}', ...)`) to match."
+        )));
+    }
+
+    let mut lora_cfg = LoraConfig::with_targets(
+        lora_branch.rank as usize,
+        lora_branch.alpha as f32,
+        lora_branch.target_modules.iter().cloned(),
+    );
+    lora_cfg.dropout = lora_branch.dropout;
+
+    let model_arc = base.model();
+    let variant = base.variant.clone();
+    let layers = base.layers;
+    let heads = base.heads;
+    let kv_heads = base.kv_heads;
+    let dim = base.dim;
+    let ctx_len = base.ctx;
+    let vocab = base.vocab;
+    let device = base.device.clone();
+    let dtype = base.dtype.clone();
+    let pretrained = base.pretrained;
+
+    let mut model = model_arc
+        .lock()
+        .map_err(|e| LuaError::external(format!("{ctx}: model lock: {e}")))?;
+    let mut lora_vm = model
+        .wrap_lora(&lora_cfg)
+        .map_err(|e| LuaError::external(format!("{ctx}: wrap_lora: {e}")))?;
+    drop(model);
+
+    lora_vm.load(&delta_path).map_err(|e| {
+        LuaError::external(format!("{ctx}: load delta {delta_path:?}: {e}"))
+    })?;
+
+    Ok(TinyLlamaHandle {
+        inner: model_arc,
+        varmap: Some(Arc::new(lora_vm)),
+        variant,
+        layers,
+        heads,
+        kv_heads,
+        dim,
+        ctx: ctx_len,
         vocab,
         device,
         dtype,
@@ -710,6 +859,7 @@ fn alc_nn_fn(lua: &Lua, key: &str) -> LuaResult<LuaFunction> {
 /// A later trainer follow-up replaces the `Option` with a mutable
 /// trainer wrap; this stage only needs read access for shape
 /// assertions from Lua.
+#[derive(Clone)]
 pub(super) struct Gpt2Handle {
     inner: Arc<Mutex<Gpt2Model>>,
     /// `VarMap` the model's parameters were registered against.
@@ -897,7 +1047,7 @@ const ARCH_OPS: &[(&str, ArchOps)] = &[
         ArchOps {
             build_preset: preset_gpt2_neutral,
             build_from_safetensors: Some(gpt2_from_safetensors),
-            build_from_wrap: None,
+            build_from_wrap: Some(wrap_gpt2_from_card),
         },
     ),
     (
@@ -905,7 +1055,7 @@ const ARCH_OPS: &[(&str, ArchOps)] = &[
         ArchOps {
             build_preset: preset_tinyllama_neutral,
             build_from_safetensors: Some(tinyllama_from_safetensors),
-            build_from_wrap: None,
+            build_from_wrap: Some(wrap_tinyllama_from_card),
         },
     ),
     (
@@ -1112,6 +1262,129 @@ fn device_display(d: &Device) -> String {
     }
 }
 
+// ─── ArchOps.build_from_wrap adapters (Layer 4b S5) ───────────────
+// Arch-neutral LoRA wrap load: downcast NnHandle to the typed
+// handle, delegate to the shared `wrap_<arch>_lora_from_meta`
+// core, wrap the result back in NnHandle.
+
+fn wrap_gpt2_from_card(meta: &NnCardMeta, base: &NnHandle) -> LuaResult<NnHandle> {
+    let gpt2 = base.as_gpt2().ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load_wrap: gpt2 card requires a gpt2 base handle; got '{}'",
+            base.arch()
+        ))
+    })?;
+    // Card id is not carried through the ArchOps signature; the
+    // caller (load_wrap_impl) is responsible for surfacing it in
+    // error context via the meta.name field if it wants a
+    // card-id-specific message.
+    let card_id = meta.name.as_str();
+    let wrapped = wrap_gpt2_lora_from_meta("alc.nn.card.load_wrap", card_id, meta, gpt2)?;
+    Ok(NnHandle::Gpt2(wrapped))
+}
+
+fn wrap_tinyllama_from_card(meta: &NnCardMeta, base: &NnHandle) -> LuaResult<NnHandle> {
+    let tll = base.as_tinyllama().ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load_wrap: tinyllama card requires a tinyllama base handle; got '{}'",
+            base.arch()
+        ))
+    })?;
+    let card_id = meta.name.as_str();
+    let wrapped = wrap_tinyllama_lora_from_meta("alc.nn.card.load_wrap", card_id, meta, tll)?;
+    Ok(NnHandle::TinyLlama(wrapped))
+}
+
+/// Arch-neutral LoRA card loader (Layer 4b §Q3-A `load_wrap`).
+/// Refuses non-LoRA cards with a directional error pointing at
+/// `alc.nn.card.load_handle`.
+///
+/// `base_handle` accepts either a typed handle (`Gpt2Handle` /
+/// `TinyLlamaHandle` — backward compat from existing typed
+/// preset entries) or an `NnHandle` (new arch-neutral preset).
+/// The typed-handle path is lifted into `NnHandle` via Clone.
+fn load_wrap_impl(
+    store: &FileCardStore,
+    card_id: &str,
+    base_handle: &LuaAnyUserData,
+) -> LuaResult<NnHandle> {
+    let card = store
+        .get(card_id)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load_wrap: {e}")))?
+        .ok_or_else(|| {
+            LuaError::external(format!("alc.nn.card.load_wrap: card '{card_id}' not found"))
+        })?;
+    let mut meta = extract_nn_card_meta("alc.nn.card.load_wrap", card_id, &card)?;
+    // Overwrite meta.name with card_id so downstream error
+    // messages from the wrap core reference the caller-visible
+    // id (the meta.name field is user-set at save time and can
+    // diverge from card_id).
+    meta.name = card_id.to_string();
+
+    // training_path 分岐: lora のみ受け付ける。 self-contained
+    // (full_ft / merged / distillation) は load_handle 側に誘導。
+    match meta.training_path.as_str() {
+        "lora" => {}
+        "full_ft" | "merged" | "distillation" => {
+            return Err(LuaError::external(format!(
+                "alc.nn.card.load_wrap: card '{card_id}' has training_path=\"{}\"; \
+                 self-contained cards do not need a base handle — call \
+                 `alc.nn.card.load_handle(card_id)` instead",
+                meta.training_path
+            )));
+        }
+        other => {
+            return Err(LuaError::external(format!(
+                "alc.nn.card.load_wrap: card '{card_id}' has unknown training_path \
+                 {other:?} (expected one of full_ft / lora / merged / distillation)"
+            )));
+        }
+    }
+
+    // Schema + delta-file precheck BEFORE inspecting base_handle so
+    // schema gaps surface as specific errors (parity with the
+    // trainer_tests::load_gpt2_impl_errors_* discipline that also
+    // guards `load_gpt2_impl`).
+    precheck_lora_card_meta("alc.nn.card.load_wrap", card_id, &meta)?;
+
+    let ops = resolve_arch_ops(&meta.architecture).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load_wrap: card '{card_id}' architecture {:?} \
+             has no bridge dispatch (expected one of {})",
+            meta.architecture,
+            registered_arch_names().join(" / ")
+        ))
+    })?;
+    let wrap = ops.build_from_wrap.ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load_wrap: card '{card_id}' architecture {:?} \
+             does not support LoRA wrap load",
+            meta.architecture
+        ))
+    })?;
+
+    // Try to borrow base_handle as NnHandle first (new arch-neutral
+    // preset return); fall back to typed Handle borrow for backward
+    // compat with `alc.nn.preset.gpt2` / `alc.nn.preset.tinyllama`
+    // callers.
+    let base_nn: NnHandle = if let Ok(nn) = base_handle.borrow::<NnHandle>() {
+        (*nn).clone()
+    } else if let Ok(g) = base_handle.borrow::<Gpt2Handle>() {
+        NnHandle::Gpt2(g.clone())
+    } else if let Ok(t) = base_handle.borrow::<TinyLlamaHandle>() {
+        NnHandle::TinyLlama(t.clone())
+    } else if let Ok(l) = base_handle.borrow::<LlamaHandle>() {
+        NnHandle::Llama(l.clone())
+    } else {
+        return Err(LuaError::external(
+            "alc.nn.card.load_wrap: base handle is not a recognised NnHandle / \
+             Gpt2Handle / TinyLlamaHandle / LlamaHandle",
+        ));
+    };
+
+    wrap(&meta, &base_nn)
+}
+
 fn dtype_display(d: DType) -> String {
     match d {
         DType::F32 => "f32".into(),
@@ -1145,6 +1418,7 @@ fn dtype_display(d: DType) -> String {
 /// [`Gpt2Handle`] to refuse from-pretrained handles, and the same
 /// invariant applies to Llama by construction (no `varmap()`
 /// accessor is exposed).
+#[derive(Clone)]
 pub(super) struct LlamaHandle {
     inner: Arc<LlamaAdapter>,
     variant: String,
@@ -1196,6 +1470,7 @@ impl LlamaHandle {
 /// (from-scratch build, trainer bindings can use it), `None` for
 /// `pretrained=true` (mmap-backed VarBuilder load, trainer bindings
 /// that need a `VarMap` error out cleanly).
+#[derive(Clone)]
 pub(super) struct TinyLlamaHandle {
     inner: Arc<Mutex<TinyLlamaModel>>,
     varmap: Option<Arc<VarMap>>,
@@ -2383,6 +2658,7 @@ fn checkpoint_to_lua(
 /// method + register the arch in `ARCH_OPS` (§Q4-A) + add a
 /// per-arch `build_*_handle` helper. Three grep-able edit sites.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(super) enum NnHandle {
     /// GPT-2 (trainable, MHA).
     Gpt2(Gpt2Handle),

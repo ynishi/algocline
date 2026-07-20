@@ -104,11 +104,9 @@ pub(super) fn register_nn_card(
     // deprecation cycle completes.
     let load_handle_store = Arc::clone(&card_store);
     let load_handle_nn_dir = nn_dir.clone();
-    let load_handle = lua.create_function(
-        move |_lua, card_id: String| -> LuaResult<NnHandle> {
-            load_handle_impl(load_handle_store.as_ref(), &card_id, &load_handle_nn_dir)
-        },
-    )?;
+    let load_handle = lua.create_function(move |_lua, card_id: String| -> LuaResult<NnHandle> {
+        load_handle_impl(load_handle_store.as_ref(), &card_id, &load_handle_nn_dir)
+    })?;
     card_ns.set("load_handle", load_handle)?;
 
     let load_gpt2_store = Arc::clone(&card_store);
@@ -257,7 +255,9 @@ fn load_handle_impl(
         .get(card_id)
         .map_err(|e| LuaError::external(format!("alc.nn.card.load_handle: {e}")))?
         .ok_or_else(|| {
-            LuaError::external(format!("alc.nn.card.load_handle: card '{card_id}' not found"))
+            LuaError::external(format!(
+                "alc.nn.card.load_handle: card '{card_id}' not found"
+            ))
         })?;
 
     let meta_json = card
@@ -398,11 +398,7 @@ fn load_gpt2_impl(
 /// specific error rather than a generic "base handle wrong type"
 /// downstream failure. Called by both `load_gpt2_impl` (typed
 /// shortcut) and `load_wrap_impl` (arch-neutral).
-fn precheck_lora_card_meta(
-    ctx: &str,
-    card_id: &str,
-    meta: &NnCardMeta,
-) -> LuaResult<()> {
+fn precheck_lora_card_meta(ctx: &str, card_id: &str, meta: &NnCardMeta) -> LuaResult<()> {
     let candle = meta.candle.as_ref().ok_or_else(|| {
         LuaError::external(format!(
             "{ctx}: card '{card_id}' missing metadata.nn.candle"
@@ -434,11 +430,7 @@ fn precheck_lora_card_meta(
 /// Extract + deserialise `metadata.nn` from a Card JSON. Shared by
 /// `load_gpt2_impl` / `load_handle_impl` / `load_wrap_impl` so
 /// they surface identical errors on schema shape violations.
-fn extract_nn_card_meta(
-    ctx: &str,
-    card_id: &str,
-    card: &Json,
-) -> LuaResult<NnCardMeta> {
+fn extract_nn_card_meta(ctx: &str, card_id: &str, card: &Json) -> LuaResult<NnCardMeta> {
     let meta_json = card
         .get("metadata")
         .and_then(|m| m.get("nn"))
@@ -447,9 +439,7 @@ fn extract_nn_card_meta(
             LuaError::external(format!("{ctx}: card '{card_id}' missing metadata.nn"))
         })?;
     serde_json::from_value(meta_json).map_err(|e| {
-        LuaError::external(format!(
-            "{ctx}: card '{card_id}' invalid metadata.nn: {e}"
-        ))
+        LuaError::external(format!("{ctx}: card '{card_id}' invalid metadata.nn: {e}"))
     })
 }
 
@@ -534,9 +524,9 @@ fn wrap_gpt2_lora_from_meta(
         .map_err(|e| LuaError::external(format!("{ctx}: wrap_lora: {e}")))?;
     drop(model);
 
-    lora_vm.load(&delta_path).map_err(|e| {
-        LuaError::external(format!("{ctx}: load delta {delta_path:?}: {e}"))
-    })?;
+    lora_vm
+        .load(&delta_path)
+        .map_err(|e| LuaError::external(format!("{ctx}: load delta {delta_path:?}: {e}")))?;
 
     Ok(Gpt2Handle {
         inner: model_arc,
@@ -630,9 +620,9 @@ fn wrap_tinyllama_lora_from_meta(
         .map_err(|e| LuaError::external(format!("{ctx}: wrap_lora: {e}")))?;
     drop(model);
 
-    lora_vm.load(&delta_path).map_err(|e| {
-        LuaError::external(format!("{ctx}: load delta {delta_path:?}: {e}"))
-    })?;
+    lora_vm
+        .load(&delta_path)
+        .map_err(|e| LuaError::external(format!("{ctx}: load delta {delta_path:?}: {e}")))?;
 
     Ok(TinyLlamaHandle {
         inner: model_arc,
@@ -978,12 +968,7 @@ fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaRes
     let neutral_nn_dir = nn_dir.clone();
     let preset_call = lua.create_function(
         move |_lua,
-              (_self, arch, variant, opts): (
-            LuaTable,
-            String,
-            String,
-            Option<LuaTable>,
-        )|
+              (_self, arch, variant, opts): (LuaTable, String, String, Option<LuaTable>)|
               -> LuaResult<NnHandle> {
             build_neutral_preset(&arch, &variant, opts.as_ref(), &neutral_nn_dir)
         },
@@ -1034,11 +1019,9 @@ fn build_neutral_preset(
 /// wiring lands in S4/S5).
 struct ArchOps {
     build_preset: fn(&str, Option<&LuaTable>, &std::path::Path) -> LuaResult<NnHandle>,
-    build_from_safetensors:
-        Option<fn(&NnCardMeta, &std::path::Path) -> LuaResult<NnHandle>>,
+    build_from_safetensors: Option<fn(&NnCardMeta, &std::path::Path) -> LuaResult<NnHandle>>,
     #[allow(dead_code)]
-    build_from_wrap:
-        Option<fn(&NnCardMeta, &NnHandle) -> LuaResult<NnHandle>>,
+    build_from_wrap: Option<fn(&NnCardMeta, &NnHandle) -> LuaResult<NnHandle>>,
 }
 
 const ARCH_OPS: &[(&str, ArchOps)] = &[
@@ -1144,10 +1127,7 @@ fn preset_llama_neutral(
 // loaded through an mmap-backed VarBuilder that has no VarMap
 // counterpart (matches `Gpt2Model::from_pretrained` today).
 
-fn gpt2_from_safetensors(
-    meta: &NnCardMeta,
-    path: &std::path::Path,
-) -> LuaResult<NnHandle> {
+fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
     // `Gpt2Config::from_variant` accepts both bare ("medium") and
     // "gpt2-medium" forms — pass the card's architecture string
     // directly.
@@ -1181,10 +1161,7 @@ fn gpt2_from_safetensors(
     }))
 }
 
-fn tinyllama_from_safetensors(
-    meta: &NnCardMeta,
-    path: &std::path::Path,
-) -> LuaResult<NnHandle> {
+fn tinyllama_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
     let mut cfg = TinyLlamaConfig::from_variant(&meta.architecture).ok_or_else(|| {
         LuaError::external(format!(
             "alc.nn.card.load: unknown tinyllama variant {:?} on card {:?}",
@@ -2779,13 +2756,14 @@ impl mlua::UserData for NnHandle {
         // the last-token logits and returns `[batch, vocab]`.
         // Shape difference is arch-visible; Lua callers that care
         // can consult `handle:arch()` first.
-        methods.add_method("forward_shape", |_, this, (batch, seq): (usize, usize)| {
-            match this {
+        methods.add_method(
+            "forward_shape",
+            |_, this, (batch, seq): (usize, usize)| match this {
                 NnHandle::Gpt2(h) => Ok(vec![batch, seq, h.vocab]),
                 NnHandle::TinyLlama(h) => Ok(vec![batch, seq, h.vocab]),
                 NnHandle::Llama(h) => Ok(vec![batch, h.vocab]),
-            }
-        });
+            },
+        );
     }
 }
 
@@ -3424,20 +3402,13 @@ mod load_dispatch_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // pretrained=false to skip HF hub.
         let lua = Lua::new();
-        let opts_val = lua
-            .to_value(&json!({ "pretrained": false }))
-            .unwrap();
+        let opts_val = lua.to_value(&json!({ "pretrained": false })).unwrap();
         let opts_tbl = match opts_val {
             LuaValue::Table(t) => t,
             _ => unreachable!(),
         };
-        let h = build_neutral_preset(
-            "tinyllama",
-            "tinyllama-tiny",
-            Some(&opts_tbl),
-            tmp.path(),
-        )
-        .expect("neutral preset tinyllama-tiny");
+        let h = build_neutral_preset("tinyllama", "tinyllama-tiny", Some(&opts_tbl), tmp.path())
+            .expect("neutral preset tinyllama-tiny");
         assert_eq!(h.arch(), "tinyllama");
         assert!(h.as_tinyllama().is_some());
     }
@@ -3611,8 +3582,7 @@ mod load_dispatch_tests {
             _ => unreachable!(),
         };
         let tll_handle =
-            build_tinyllama_handle("tinyllama-tiny", Some(&opts_tbl), &tll_nn_dir)
-                .unwrap();
+            build_tinyllama_handle("tinyllama-tiny", Some(&opts_tbl), &tll_nn_dir).unwrap();
         let tll_ud = lua.create_userdata(tll_handle).unwrap();
 
         let msg = match load_wrap_impl(&store, &card_id, &tll_ud) {
@@ -3620,8 +3590,7 @@ mod load_dispatch_tests {
             Err(e) => e.to_string(),
         };
         assert!(
-            msg.contains("gpt2 card requires a gpt2 base handle")
-                && msg.contains("tinyllama"),
+            msg.contains("gpt2 card requires a gpt2 base handle") && msg.contains("tinyllama"),
             "arch mismatch message must name both sides: {msg}"
         );
     }

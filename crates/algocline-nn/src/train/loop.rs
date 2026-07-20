@@ -777,4 +777,112 @@ mod tests {
         assert!(!step_files.is_empty(), "at least one step ckpt must exist");
         assert!(step_files.len() <= cfg.ckpt_keep);
     }
+
+    /// Both trainable arch types must implement [`DeviceView`] so the
+    /// generic `run_ft_core` / `run_full_ft` / `run_lora_ft` can pull
+    /// the target device out uniformly. Compile-time bound check
+    /// (the `let _: &Device = ...` line rejects a missing impl at
+    /// compile time) plus a runtime sanity check on the returned
+    /// device value.
+    #[test]
+    fn gpt2_and_tinyllama_impl_device_view() {
+        use crate::arch::{TinyLlamaConfig, TinyLlamaModel};
+
+        let (_gpt_cfg, _gpt_vm, gpt_model) = tiny_cfg_and_model();
+        let gpt_dev: &Device = DeviceView::device(&gpt_model);
+        assert!(matches!(gpt_dev, Device::Cpu));
+
+        let tl_cfg = TinyLlamaConfig::tiny();
+        let tl_vm = VarMap::new();
+        let tl_vs = VarBuilder::from_varmap(&tl_vm, tl_cfg.dtype, &tl_cfg.device);
+        let tl_model = TinyLlamaModel::new(&tl_cfg, tl_vs).unwrap();
+        let tl_dev: &Device = DeviceView::device(&tl_model);
+        assert!(matches!(tl_dev, Device::Cpu));
+    }
+
+    /// Both trainable arch types must implement `candle_nn::Module`
+    /// (via a delegate to the inherent `forward`). Force the trait
+    /// dispatch by binding through `&dyn Module` — if the impl were
+    /// missing, the coercion would fail at compile time; if the impl
+    /// diverged from the inherent forward, output shape or values
+    /// would drift.
+    #[test]
+    fn gpt2_and_tinyllama_impl_module_forward() {
+        use crate::arch::{TinyLlamaConfig, TinyLlamaModel};
+
+        // GPT-2 path.
+        let (gpt_cfg, _gpt_vm, gpt_model) = tiny_cfg_and_model();
+        let gpt_ids = Tensor::from_slice(&[1u32, 2, 3, 4], (1, 4), &gpt_cfg.device).unwrap();
+        let gpt_inherent = gpt_model.forward(&gpt_ids).unwrap();
+        let gpt_module: &dyn Module = &gpt_model;
+        let gpt_via_trait = gpt_module.forward(&gpt_ids).unwrap();
+        assert_eq!(gpt_inherent.dims(), gpt_via_trait.dims());
+        assert_eq!(gpt_inherent.dims(), &[1, 4, gpt_cfg.vocab]);
+        let gpt_inh_vec: Vec<f32> = gpt_inherent.flatten_all().unwrap().to_vec1().unwrap();
+        let gpt_trait_vec: Vec<f32> = gpt_via_trait.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(
+            gpt_inh_vec, gpt_trait_vec,
+            "Gpt2Model Module impl must byte-match inherent forward"
+        );
+
+        // TinyLlama path.
+        let tl_cfg = TinyLlamaConfig::tiny();
+        let tl_vm = VarMap::new();
+        let tl_vs = VarBuilder::from_varmap(&tl_vm, tl_cfg.dtype, &tl_cfg.device);
+        let tl_model = TinyLlamaModel::new(&tl_cfg, tl_vs).unwrap();
+        let tl_ids = Tensor::from_slice(&[1u32, 2, 3, 4], (1, 4), &tl_cfg.device).unwrap();
+        let tl_inherent = tl_model.forward(&tl_ids).unwrap();
+        let tl_module: &dyn Module = &tl_model;
+        let tl_via_trait = tl_module.forward(&tl_ids).unwrap();
+        assert_eq!(tl_inherent.dims(), tl_via_trait.dims());
+        assert_eq!(tl_inherent.dims(), &[1, 4, tl_cfg.vocab]);
+        let tl_inh_vec: Vec<f32> = tl_inherent.flatten_all().unwrap().to_vec1().unwrap();
+        let tl_trait_vec: Vec<f32> = tl_via_trait.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(
+            tl_inh_vec, tl_trait_vec,
+            "TinyLlamaModel Module impl must byte-match inherent forward"
+        );
+    }
+
+    /// Both trainable arch types must implement [`LoraWrappable`] so
+    /// the generic `run_lora_ft` can call `wrap_lora` uniformly.
+    /// Bind through `&mut dyn LoraWrappable` to force trait dispatch;
+    /// verify the returned `VarMap` carries `layers × targets × 2` new
+    /// LoRA vars (matches the freeze invariant test — but here we're
+    /// asserting the trait dispatch itself, not the wrap semantics).
+    #[test]
+    fn gpt2_and_tinyllama_impl_lora_wrappable() {
+        use crate::arch::{TinyLlamaConfig, TinyLlamaModel};
+
+        // GPT-2: 2 layers × 4 wraps × 2 (A+B) = 16 LoRA vars.
+        // Note: the 6 canonical GPT-2 target names (q_proj, k_proj,
+        // v_proj, o_proj, up, down) collapse into 4 physical wraps
+        // because q/k/v share the fused `c_attn` linear (see
+        // `Gpt2Block::wrap_lora`), so any of q/k/v in target_modules
+        // triggers exactly one c_attn wrap.
+        let (_gpt_cfg, _gpt_vm, mut gpt_model) = tiny_cfg_and_model();
+        let gpt_lora_cfg = LoraConfig::new(2, 4.0);
+        let gpt_dyn: &mut dyn LoraWrappable = &mut gpt_model;
+        let gpt_lora_vm = gpt_dyn.wrap_lora(&gpt_lora_cfg).unwrap();
+        assert_eq!(
+            gpt_lora_vm.all_vars().len(),
+            2 * 4 * 2,
+            "GPT-2 wrap_lora via LoraWrappable must register 2 layers × 4 wraps × 2 = 16 vars"
+        );
+
+        // TinyLlama: 2 layers × 7 canonical targets × 2 = 28 LoRA vars.
+        let tl_cfg = TinyLlamaConfig::tiny();
+        let tl_vm = VarMap::new();
+        let tl_vs = VarBuilder::from_varmap(&tl_vm, tl_cfg.dtype, &tl_cfg.device);
+        let mut tl_model = TinyLlamaModel::new(&tl_cfg, tl_vs).unwrap();
+        let tl_lora_cfg =
+            LoraConfig::with_targets(2, 4.0, TinyLlamaModel::default_lora_targets());
+        let tl_dyn: &mut dyn LoraWrappable = &mut tl_model;
+        let tl_lora_vm = tl_dyn.wrap_lora(&tl_lora_cfg).unwrap();
+        assert_eq!(
+            tl_lora_vm.all_vars().len(),
+            2 * 7 * 2,
+            "TinyLlama wrap_lora via LoraWrappable must register 2 layers × 7 targets × 2 = 28 vars"
+        );
+    }
 }

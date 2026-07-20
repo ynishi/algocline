@@ -36,6 +36,7 @@ use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig, TinyLlamaConfig, Tin
 use algocline_nn::card::{
     validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
 };
+use algocline_nn::merged::{export_merged, MergeError, MergedProvenance};
 use algocline_nn::tokenizer::HfTokenizer;
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, Batch, CrossEntropyLoss, Dataset, DatasetOpts,
@@ -138,6 +139,26 @@ pub(super) fn register_nn_card(
         },
     )?;
     card_ns.set("register", register)?;
+
+    // Layer 5a: arch-neutral LoRA merge entry. Consumes a
+    // LoRA-wrapped NnHandle (or typed Gpt2Handle / TinyLlamaHandle
+    // for backward compat) + opts { name, lora_card }, writes a
+    // merged safetensors bundle under nn_dir/nn/<id>.safetensors,
+    // records a Card with training_path="merged", returns the new
+    // card_id.
+    let merge_lora_store = Arc::clone(&card_store);
+    let merge_lora_nn_dir = nn_dir.clone();
+    let merge_lora = lua.create_function(
+        move |_lua, (base_handle, opts): (LuaAnyUserData, LuaTable)| -> LuaResult<String> {
+            merge_lora_impl(
+                merge_lora_store.as_ref(),
+                &merge_lora_nn_dir,
+                &base_handle,
+                opts,
+            )
+        },
+    )?;
+    card_ns.set("merge_lora", merge_lora)?;
 
     nn_table.set("card", card_ns)?;
     // `nn_dir` was cloned into each register_* call above; drop the
@@ -781,7 +802,6 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
 /// The Card envelope shape (pkg / card_id / metadata.kind /
 /// metadata.nn) is identical to [`build_create_payload`]'s output —
 /// only the input side differs (typed struct vs. raw JSON).
-#[allow(dead_code)]
 fn build_create_payload_from_meta(card_id: &str, meta: &NnCardMeta) -> LuaResult<Json> {
     // Defensive re-validation: even though the caller passes a
     // fully-typed struct, the architecture field still must match
@@ -802,6 +822,152 @@ fn build_create_payload_from_meta(card_id: &str, meta: &NnCardMeta) -> LuaResult
             "nn": nn_meta_json,
         }
     }))
+}
+
+/// Translate an [`algocline_nn::merged::MergeError`] into a
+/// `merge_lora`-prefixed Lua error. Kept as a single translation
+/// site to mirror the existing `wrap_gpt2_lora_from_meta` error
+/// wall (§Layer 4b bridge discipline).
+fn merge_error_to_lua(err: MergeError) -> LuaError {
+    let msg = match err {
+        MergeError::Provenance(inner) => format!("alc.nn.card.merge_lora: provenance: {inner}"),
+        MergeError::Merge(inner) => format!("alc.nn.card.merge_lora: merge: {inner}"),
+        MergeError::Io(inner) => format!("alc.nn.card.merge_lora: io: {inner}"),
+        MergeError::Serialize(inner) => format!("alc.nn.card.merge_lora: serialize: {inner}"),
+    };
+    LuaError::external(msg)
+}
+
+/// Layer 5a `alc.nn.card.merge_lora` core.
+///
+/// Accepts a LoRA-wrapped [`NnHandle`] (or a typed handle for
+/// backward-compat with `alc.nn.preset.gpt2` / `.tinyllama`
+/// wrap-side flows) plus a Lua options table carrying `name` +
+/// `lora_card`, and:
+///
+/// 1. Refuses base (non-LoRA) handles with a directional error
+///    pointing at `alc.nn.card.load_wrap`.
+/// 2. Pre-generates the merged card_id (mirrors [`save_impl`]).
+/// 3. Builds [`MergedProvenance`] with `arch` derived from the
+///    handle (never caller-supplied) and `bundle_ref` fixed to
+///    `"nn/<merged_card_id>"` (invariant #1 from `save_impl`).
+/// 4. Dispatches [`export_merged`] on the underlying typed model,
+///    which writes the safetensors bundle under
+///    `<nn_dir>/nn/<merged_card_id>.safetensors` and returns the
+///    projected [`NnCardMeta`].
+/// 5. Persists the Card via [`build_create_payload_from_meta`] +
+///    `FileCardStore::create`, asserting the returned id matches
+///    the pre-generated one.
+///
+/// Returns the freshly-minted merged card_id string.
+fn merge_lora_impl(
+    store: &FileCardStore,
+    nn_dir: &std::path::Path,
+    base_handle: &LuaAnyUserData,
+    opts: LuaTable,
+) -> LuaResult<String> {
+    // 1. Extract + validate opts (name / lora_card).
+    let name: Option<String> = opts.get("name")?;
+    let name = name.filter(|s| !s.is_empty()).ok_or_else(|| {
+        LuaError::external("alc.nn.card.merge_lora: opts.name must be a non-empty string")
+    })?;
+
+    let lora_card: Option<String> = opts.get("lora_card")?;
+    let lora_card = lora_card.filter(|s| !s.is_empty()).ok_or_else(|| {
+        LuaError::external("alc.nn.card.merge_lora: opts.lora_card must be a non-empty string")
+    })?;
+
+    // 2. Borrow the wrapped handle. Accept NnHandle (arch-neutral
+    //    return from card.load_wrap / preset(family, ...)) or a
+    //    typed Handle (from the preset.gpt2 / preset.tinyllama
+    //    entry points once a future L5b wrap adds a Lua-side wrap
+    //    that returns typed). Base / non-wrapped handles are
+    //    refused with a directional error.
+    let handle: NnHandle = if let Ok(nn) = base_handle.borrow::<NnHandle>() {
+        (*nn).clone()
+    } else if let Ok(g) = base_handle.borrow::<Gpt2Handle>() {
+        NnHandle::Gpt2(g.clone())
+    } else if let Ok(t) = base_handle.borrow::<TinyLlamaHandle>() {
+        NnHandle::TinyLlama(t.clone())
+    } else if let Ok(l) = base_handle.borrow::<LlamaHandle>() {
+        NnHandle::Llama(l.clone())
+    } else {
+        return Err(LuaError::external(
+            "alc.nn.card.merge_lora: base handle is not a recognised NnHandle / \
+             Gpt2Handle / TinyLlamaHandle / LlamaHandle",
+        ));
+    };
+
+    if !handle.is_lora_wrapped() {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.merge_lora: handle is not LoRA-wrapped (arch={:?}); \
+             use `alc.nn.card.load_wrap(lora_card_id, base_handle)` to obtain a \
+             wrapped handle before calling merge_lora",
+            handle.arch()
+        )));
+    }
+
+    // 3. Pre-generate merged_card_id + derive arch + bundle_ref.
+    let merged_card_id = generate_card_id(&name);
+    let arch = handle.arch_family_variant();
+    let bundle_ref = format!("nn/{merged_card_id}");
+
+    let provenance = MergedProvenance {
+        lora_card,
+        arch,
+        bundle_ref,
+    };
+
+    // 4. Compute out_path and dispatch export_merged per arch.
+    //    export_merged handles parent-dir mkdir + safetensors save
+    //    + NnCardMeta projection internally.
+    let out_path = nn_dir
+        .join("nn")
+        .join(format!("{merged_card_id}.safetensors"));
+
+    let (_bytes, meta) = match &handle {
+        NnHandle::Gpt2(gpt2) => {
+            let model_arc = gpt2.model();
+            let model_guard = model_arc.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.card.merge_lora: model lock: {e}"))
+            })?;
+            export_merged(&*model_guard, &provenance, &out_path).map_err(merge_error_to_lua)?
+        }
+        NnHandle::TinyLlama(tll) => {
+            let model_arc = tll.model();
+            let model_guard = model_arc.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.card.merge_lora: model lock: {e}"))
+            })?;
+            export_merged(&*model_guard, &provenance, &out_path).map_err(merge_error_to_lua)?
+        }
+        NnHandle::Llama(_) => {
+            // Defensive: is_lora_wrapped returns false for Llama
+            // already, so this arm is unreachable in practice.
+            return Err(LuaError::external(
+                "alc.nn.card.merge_lora: llama adapter path does not support LoRA merge",
+            ));
+        }
+    };
+
+    // 5. Overwrite meta.name to the caller-supplied name (the
+    //    projection defaults to the bundle file stem; keep the
+    //    user-visible name for the Card record instead).
+    let mut meta = meta;
+    meta.name = name.clone();
+
+    let payload = build_create_payload_from_meta(&merged_card_id, &meta)?;
+
+    let (returned_id, _path) = store
+        .create(payload)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: card store: {e}")))?;
+
+    if returned_id != merged_card_id {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.merge_lora: card_id mismatch (expected {merged_card_id}, got {returned_id})"
+        )));
+    }
+
+    Ok(merged_card_id)
 }
 
 fn normalise_object(v: Option<Json>) -> Json {

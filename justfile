@@ -59,13 +59,28 @@ e2e:
     cargo test --test e2e
 
 # Run nn-feature tests (candle wrapper unit tests + feature-gated engine bridge
-# smoke). `just test` does NOT cover nn_bridge_smoke because it lives behind
-# `--features nn`; this recipe closes that gap so nn work can be verified with
-# one command.
+# smoke + feature-gated engine lib unit tests). `just test` does NOT cover the
+# nn-feature layer because it lives behind `--features nn`; this recipe closes
+# that gap so nn work can be verified with one command.
+#
+# The `--lib` line was added for L5b-S1 (`nn_wrap.rs` bridge tests). Inline
+# `#[cfg(test)] mod ..._bridge_tests { ... }` modules under `--features nn`
+# would otherwise be silently skipped by both `just test` and the previous
+# `--test nn_bridge_smoke`-only invocation.
 [group('allow-agent')]
 test-nn:
     cargo test -p algocline-nn
+    cargo test -p algocline-engine --features nn --lib
     cargo test -p algocline-engine --features nn --test nn_bridge_smoke
+
+# Clippy for the nn-feature layer. `just clippy` runs the default (nn off)
+# workspace clippy; this recipe closes the gap for the `--features nn` code
+# paths (`crates/algocline-engine/src/bridge/nn_card.rs` +
+# `crates/algocline-engine/src/bridge/nn_wrap.rs` + `algocline-nn` crate lib).
+[group('allow-agent')]
+clippy-nn:
+    cargo clippy -p algocline-nn --all-targets -- -D warnings
+    cargo clippy -p algocline-engine --features nn --all-targets -- -D warnings
 
 # Install locally with the `nn` feature enabled (alc.nn Lua surface + candle).
 # Same overwrite target as `just install` (~/.cargo/bin/alc); the default

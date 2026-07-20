@@ -663,6 +663,105 @@ fn wrap_tinyllama_lora_from_meta(
     })
 }
 
+/// Wrap a `Gpt2Handle` with LoRA using the given `LoraConfig` and
+/// produce a fresh handle whose `varmap` slot now holds the newly
+/// allocated LoRA delta [`VarMap`].
+///
+/// Consumed by the L5b-S1 `nn_wrap.rs` bridge (`alc.nn.wrap_lora`).
+/// Added as a `pub(super)` helper (rather than widening
+/// [`Gpt2Handle`]'s private fields) so external callers still cannot
+/// build a `has_lora=true` handle without going through the actual
+/// [`Gpt2Model::wrap_lora`] call — the invariant that
+/// `has_lora=true` implies the underlying model has been
+/// LoRA-wrapped in place stays enforced at construction.
+///
+/// The `inner` `Arc<Mutex<Gpt2Model>>` is shared with the caller's
+/// base handle by design: `Gpt2Model::wrap_lora` mutates the model
+/// in place (each block's linears are moved into `LoraLinear`), so
+/// after this call the base handle's `inner` also points at the
+/// (now-wrapped) model. Callers that need the pre-wrap base to
+/// remain untouched must clone the model first — matching the
+/// existing [`wrap_gpt2_lora_from_meta`] discipline.
+pub(super) fn wrap_gpt2_lora_bridge(base: &Gpt2Handle, cfg: &LoraConfig) -> LuaResult<Gpt2Handle> {
+    let model_arc = base.model();
+    let variant = base.variant.clone();
+    let layers = base.layers;
+    let heads = base.heads;
+    let dim = base.dim;
+    let ctx_len = base.ctx;
+    let vocab = base.vocab;
+    let device = base.device.clone();
+    let dtype = base.dtype.clone();
+    let pretrained = base.pretrained;
+
+    let mut model = model_arc
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.wrap_lora: model lock: {e}")))?;
+    let lora_vm = model
+        .wrap_lora(cfg)
+        .map_err(|e| LuaError::external(format!("alc.nn.wrap_lora: candle: {e}")))?;
+    drop(model);
+
+    Ok(Gpt2Handle {
+        inner: model_arc,
+        varmap: Some(Arc::new(lora_vm)),
+        variant,
+        layers,
+        heads,
+        dim,
+        ctx: ctx_len,
+        vocab,
+        device,
+        dtype,
+        pretrained,
+        has_lora: true,
+    })
+}
+
+/// Wrap a `TinyLlamaHandle` with LoRA using the given `LoraConfig`.
+/// Mirrors [`wrap_gpt2_lora_bridge`]; consumed by the L5b-S1
+/// `nn_wrap.rs` bridge (`alc.nn.wrap_lora`).
+pub(super) fn wrap_tinyllama_lora_bridge(
+    base: &TinyLlamaHandle,
+    cfg: &LoraConfig,
+) -> LuaResult<TinyLlamaHandle> {
+    let model_arc = base.model();
+    let variant = base.variant.clone();
+    let layers = base.layers;
+    let heads = base.heads;
+    let kv_heads = base.kv_heads;
+    let dim = base.dim;
+    let ctx_len = base.ctx;
+    let vocab = base.vocab;
+    let device = base.device.clone();
+    let dtype = base.dtype.clone();
+    let pretrained = base.pretrained;
+
+    let mut model = model_arc
+        .lock()
+        .map_err(|e| LuaError::external(format!("alc.nn.wrap_lora: model lock: {e}")))?;
+    let lora_vm = model
+        .wrap_lora(cfg)
+        .map_err(|e| LuaError::external(format!("alc.nn.wrap_lora: candle: {e}")))?;
+    drop(model);
+
+    Ok(TinyLlamaHandle {
+        inner: model_arc,
+        varmap: Some(Arc::new(lora_vm)),
+        variant,
+        layers,
+        heads,
+        kv_heads,
+        dim,
+        ctx: ctx_len,
+        vocab,
+        device,
+        dtype,
+        pretrained,
+        has_lora: true,
+    })
+}
+
 /// Register (or overwrite) a card_id → model_name alias in the
 /// per-VM [`algocline_nn::NnModelRegistry`].
 ///
@@ -1823,7 +1922,11 @@ fn parse_llama_dtype(s: &str) -> LuaResult<DType> {
     parse_dtype_for("alc.nn.preset.llama", s)
 }
 
-fn build_gpt2_handle(
+// Widened to `pub(super)` for L5b-S1 `nn_wrap.rs` test scaffolding
+// (`setup_gpt2_base_scaffold` builds a base handle in-place). Kept
+// module-private otherwise; no production caller outside this module
+// consumes it.
+pub(super) fn build_gpt2_handle(
     variant: &str,
     opts: Option<&LuaTable>,
     nn_dir: &std::path::Path,
@@ -1892,7 +1995,11 @@ fn parse_device(s: &str) -> LuaResult<Device> {
 /// carry over. `pretrained=true` requires a variant with an HF
 /// repo (`tinyllama-1.1b`); the `tinyllama-tiny` smoke variant
 /// only supports `pretrained=false` (mirrors GPT-2's `tiny` case).
-fn build_tinyllama_handle(
+// Widened to `pub(super)` for L5b-S1 `nn_wrap.rs` test scaffolding
+// (`setup_tinyllama_base_scaffold` builds a base handle in-place).
+// Kept module-private otherwise; no production caller outside this
+// module consumes it.
+pub(super) fn build_tinyllama_handle(
     variant: &str,
     opts: Option<&LuaTable>,
     nn_dir: &std::path::Path,

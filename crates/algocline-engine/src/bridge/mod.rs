@@ -24,6 +24,8 @@ mod fuzzy;
 mod llm;
 #[cfg(feature = "nn")]
 mod nn_card;
+#[cfg(feature = "nn")]
+mod nn_wrap;
 mod text;
 
 use crate::card::FileCardStore;
@@ -137,6 +139,8 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
         Arc::clone(&config.card_store),
         config.nn_dir.clone(),
     )?;
+    #[cfg(feature = "nn")]
+    nn_wrap::register_nn_wrap(lua, alc_table)?;
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
     llm::register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {

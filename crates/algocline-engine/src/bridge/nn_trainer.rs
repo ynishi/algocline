@@ -1,21 +1,25 @@
-//! `alc.nn.trainer.run_lora_ft` bridge — Layer 5b S2 Lua bind for the
-//! one-call LoRA fine-tuning surface: wrap the base + train + save Δ
-//! safetensors + write a `training_path="lora"` Card, all in a single
-//! call.
+//! `alc.nn.trainer.{run_lora_ft, run_full_ft}` bridge — Layer 5b S2
+//! and Layer 5c S1 Lua binds for the one-call fine-tuning surfaces
+//! (train + save safetensors + write a Card, all in a single call).
 //!
 //! Extends the pre-existing `alc.nn.trainer` sub-table (populated by
 //! [`super::nn_card::register_nn_card`] with `full_ft` / `lora` /
-//! `distill`) by adding a fourth entry alongside them:
+//! `distill`, which return a raw Checkpoint table) by adding two
+//! sibling entries that return a `card_id` string instead:
 //!
 //! ```text
 //! alc.nn.trainer.run_lora_ft(base_handle, dataset, opts) -> lora_card_id
+//! alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id
 //! ```
 //!
 //! Sibling of Layer 5b S1 [`super::nn_wrap`], which registered the
-//! wrap-only surface (`alc.nn.wrap_lora`). S2 consumes the same LoRA
-//! opts schema (`rank` / `alpha` / `target_modules` / `dropout`) and
-//! layers a training-config schema (`lr` / `batch` / `steps` /
-//! `warmup` / `schedule`) on top.
+//! wrap-only surface (`alc.nn.wrap_lora`). `run_lora_ft` consumes the
+//! LoRA opts schema (`rank` / `alpha` / `target_modules` / `dropout`)
+//! and layers a training-config schema (`lr` / `batch` / `steps` /
+//! `warmup` / `schedule`) on top. `run_full_ft` consumes only the
+//! training-config schema (no LoRA fields) and requires a
+//! `pretrained = false` handle (full-fine-tune needs a `VarMap`; a
+//! mmapped pretrained base does not carry one).
 //!
 //! # Invariants
 //!
@@ -77,7 +81,9 @@ use std::sync::Arc;
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch};
-use algocline_nn::train::{run_lora_ft, CrossEntropyLoss, FullFtConfig, TrainError, TrainingLease};
+use algocline_nn::train::{
+    run_full_ft, run_lora_ft, CrossEntropyLoss, FullFtConfig, TrainError, TrainingLease,
+};
 use mlua::prelude::*;
 use serde_json::json;
 
@@ -88,15 +94,15 @@ use super::nn_card::{
     DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle,
 };
 
-/// Register `alc.nn.trainer.run_lora_ft` onto the pre-existing
-/// `alc.nn.trainer` sub-table.
+/// Register `alc.nn.trainer.{run_lora_ft, run_full_ft}` onto the
+/// pre-existing `alc.nn.trainer` sub-table.
 ///
 /// Must be called after [`super::nn_card::register_nn_card`] (which
 /// creates the `alc.nn.trainer` sub-table populated with `full_ft` /
-/// `lora` / `distill`) — this call extends that sub-table with a
-/// fourth entry rather than creating a fresh one, so subsequent
-/// `run_full_ft` / `run_distill` binds (L5c) can land alongside
-/// without a namespace rename.
+/// `lora` / `distill`) — this call extends that sub-table with two
+/// sibling entries rather than creating a fresh one, so a future
+/// `run_distill` bind (L5c/L5d) can land alongside without a
+/// namespace rename.
 ///
 /// Signature mirrors the sibling [`super::nn_wrap::register_nn_wrap`]:
 /// take the outer `alc` table and reach into the `nn.trainer`
@@ -118,6 +124,20 @@ pub(super) fn register_nn_trainer(
         },
     )?;
     trainer.set("run_lora_ft", run_lora_ft)?;
+
+    // L5c S1 sibling: same shape as run_lora_ft, but no LoRA opts and
+    // returns a `training_path="full_ft"` Card. Fresh per-call
+    // TrainingLease per L5b design §0 discipline (single-lease-per-call
+    // contract; sharing across Lua calls is out of scope).
+    let store_ff = Arc::clone(&card_store);
+    let dir_ff = nn_dir.clone();
+    let run_full_ft = lua.create_function(
+        move |_lua, (base, dataset, opts): (LuaValue, LuaValue, LuaTable)| -> LuaResult<String> {
+            run_full_ft_impl(&store_ff, &dir_ff, &base, &dataset, opts)
+        },
+    )?;
+    trainer.set("run_full_ft", run_full_ft)?;
+
     Ok(())
 }
 
@@ -562,13 +582,370 @@ fn train_err_to_lua(e: TrainError) -> LuaError {
     LuaError::external(msg)
 }
 
+// ─── Layer 5c S1 — `alc.nn.trainer.run_full_ft` ─────────────────────
+//
+// Sibling of [`run_lora_ft_impl`] above. Shares:
+//
+// - The `NnHandle` dispatch shape (Gpt2 / TinyLlama; Llama refused
+//   as inference-only).
+// - The `DatasetHandle` downcast + lock discipline.
+// - The `training_path` field + `NnCardMeta` envelope discipline;
+//   diverges only on the `training_path` value (`"full_ft"` here vs
+//   `"lora"` above) and the presence of the `NnLoraBranch`
+//   sub-table (absent here; present above).
+//
+// Diverges from [`run_lora_ft_impl`] on:
+//
+// - `VarMap` requirement — full-fine-tune drives AdamW against the
+//   full parameter list, which needs the base handle's original
+//   `VarMap`. `pretrained = true` handles are mmap-backed and carry
+//   no `VarMap`; they surface as a loud Lua-side error rather than
+//   silently falling back.
+// - No LoRA-config extraction — the `rank` / `alpha` /
+//   `target_modules` / `dropout` opts fields do not apply. The
+//   config schema shrinks to `lr` / `batch` / `steps` / `warmup` /
+//   `schedule`. Extra LoRA-shaped keys in `opts` are silently
+//   ignored (Lua's untyped table semantics — matches
+//   `run_lora_ft_impl`'s treatment of stray keys).
+// - No `already-wrapped` refusal — a LoRA-wrapped handle carries
+//   only the LoRA delta VarMap on the underlying model, but the
+//   `full_ft` semantics train the *base* parameters. Passing a
+//   wrapped handle would surprise the caller; refuse it up front
+//   with a directional error pointing at
+//   [`super::nn_wrap::register_nn_wrap`] (unwrap first).
+// - Error prefix — every [`LuaError::external`] emitted from this
+//   impl carries the prefix `alc.nn.trainer.run_full_ft:`. Do NOT
+//   share the extractor with [`extract_train_cfg`] above:
+//   design's loud-error contract pins one prefix per surface.
+
+/// L5c S1 core. Mirrors [`run_lora_ft_impl`] structurally; see the
+/// section header above for the design divergence.
+fn run_full_ft_impl(
+    store: &FileCardStore,
+    nn_dir: &std::path::Path,
+    base: &LuaValue,
+    dataset: &LuaValue,
+    opts: LuaTable,
+) -> LuaResult<String> {
+    // 1. Reject non-userdata base up front.
+    let base_ud = match base {
+        LuaValue::UserData(u) => u,
+        _ => {
+            return Err(LuaError::external(format!(
+                "alc.nn.trainer.run_full_ft: expected NnHandle, got {}",
+                base.type_name()
+            )));
+        }
+    };
+
+    // 2. Downcast to NnHandle (arch-neutral) or a typed Handle. Same
+    //    discipline as run_lora_ft_impl / merge_lora_impl.
+    let handle: NnHandle = if let Ok(nn) = base_ud.borrow::<NnHandle>() {
+        (*nn).clone()
+    } else if let Ok(g) = base_ud.borrow::<Gpt2Handle>() {
+        NnHandle::Gpt2(g.clone())
+    } else if let Ok(t) = base_ud.borrow::<TinyLlamaHandle>() {
+        NnHandle::TinyLlama(t.clone())
+    } else if let Ok(l) = base_ud.borrow::<LlamaHandle>() {
+        NnHandle::Llama(l.clone())
+    } else {
+        return Err(LuaError::external(
+            "alc.nn.trainer.run_full_ft: expected NnHandle, got unknown userdata \
+             (Gpt2Handle / TinyLlamaHandle / LlamaHandle also accepted)",
+        ));
+    };
+
+    // 3. Refuse already-wrapped handles — full-fine-tune trains the
+    //    base parameters; a wrapped handle would silently disagree
+    //    with the caller's intent (design divergence bullet above).
+    if handle.is_lora_wrapped() {
+        return Err(LuaError::external(
+            "alc.nn.trainer.run_full_ft: expected base (unwrapped) NnHandle; \
+             drop the wrap first (a LoRA-wrapped handle is a LoRA-training \
+             target, not a full-fine-tune target)",
+        ));
+    }
+
+    // 4. Refuse Llama (inference-only). Directional error, same as
+    //    run_lora_ft_impl.
+    if let NnHandle::Llama(_) = handle {
+        return Err(LuaError::external(format!(
+            "alc.nn.trainer.run_full_ft: architecture {} is not trainable \
+             (only gpt2 / tinyllama families are supported)",
+            handle.arch()
+        )));
+    }
+
+    // 5. Dataset downcast to the shared DatasetHandle userdata.
+    let dataset_ud = match dataset {
+        LuaValue::UserData(u) => u,
+        _ => {
+            return Err(LuaError::external(format!(
+                "alc.nn.trainer.run_full_ft: dataset must be an alc.nn.dataset \
+                 (got {})",
+                dataset.type_name()
+            )));
+        }
+    };
+    if dataset_ud.borrow::<DatasetHandle>().is_err() {
+        return Err(LuaError::external(
+            "alc.nn.trainer.run_full_ft: dataset must be an alc.nn.dataset \
+             (got unknown userdata)",
+        ));
+    }
+
+    // 6. Extract + validate train opts (pre-flight so a misconfigured
+    //    caller sees a Lua-shaped error rather than a candle back-trace).
+    let train_cfg = extract_train_cfg_ff(&opts)?;
+
+    // 7. Pre-generate card_id (mirrors run_lora_ft_impl step 7).
+    let name: Option<String> = opts.get("name")?;
+    let name_base = name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("run_full_ft");
+    let card_id = format!("{}_{}", sanitize_name(name_base), compact_epoch_us());
+
+    // 8. Derive architecture BEFORE any lock (immutable handle field
+    //    lookup outside the training-loop critical section).
+    let architecture = handle.arch_family_variant();
+
+    // 9. Fresh per-call TrainingLease (design §0, matches
+    //    run_lora_ft_impl step 9).
+    let lease = Arc::new(TrainingLease::new());
+
+    // 10. Dispatch on NnHandle variant into the generic
+    //     `run_full_ft::<M>` (Layer 3 S3 surface).
+    //     `save_final` writes to `<ckpt_dir>/<ckpt_prefix>.safetensors`,
+    //     which lines up with `alc.nn.load` (which resolves
+    //     `<nn_dir>/<card_id>.safetensors`).
+    let ckpt = match &handle {
+        NnHandle::Gpt2(gpt2) => {
+            let vm_arc = gpt2.varmap().ok_or_else(|| {
+                LuaError::external(
+                    "alc.nn.trainer.run_full_ft: handle was built with \
+                     pretrained=true; full-fine-tune requires a from-scratch \
+                     handle (pretrained=false)",
+                )
+            })?;
+            let model_arc = gpt2.model();
+            let ds_handle = dataset_ud.borrow_mut::<DatasetHandle>()?;
+            let mut ds_lock = ds_handle.inner_lock()?;
+
+            let loss_fn = CrossEntropyLoss::new();
+            let model = model_arc.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.trainer.run_full_ft: model lock: {e}"))
+            })?;
+
+            let result = run_full_ft(
+                &*model,
+                &vm_arc,
+                ds_lock.as_mut(),
+                &train_cfg,
+                &loss_fn,
+                nn_dir,
+                &card_id,
+                Arc::clone(&lease),
+            );
+            drop(model);
+            drop(ds_lock);
+            drop(ds_handle);
+
+            result.map_err(train_err_to_lua_ff)?
+        }
+        NnHandle::TinyLlama(tll) => {
+            let vm_arc = tll.varmap().ok_or_else(|| {
+                LuaError::external(
+                    "alc.nn.trainer.run_full_ft: handle was built with \
+                     pretrained=true; full-fine-tune requires a from-scratch \
+                     handle (pretrained=false)",
+                )
+            })?;
+            let model_arc = tll.model();
+            let ds_handle = dataset_ud.borrow_mut::<DatasetHandle>()?;
+            let mut ds_lock = ds_handle.inner_lock()?;
+
+            let loss_fn = CrossEntropyLoss::new();
+            let model = model_arc.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.trainer.run_full_ft: model lock: {e}"))
+            })?;
+
+            let result = run_full_ft(
+                &*model,
+                &vm_arc,
+                ds_lock.as_mut(),
+                &train_cfg,
+                &loss_fn,
+                nn_dir,
+                &card_id,
+                Arc::clone(&lease),
+            );
+            drop(model);
+            drop(ds_lock);
+            drop(ds_handle);
+
+            result.map_err(train_err_to_lua_ff)?
+        }
+        NnHandle::Llama(_) => {
+            // Guarded at step 4 above; kept as `unreachable!` so a
+            // future refactor that reorders steps trips the assertion
+            // rather than silently invoking a non-existent train path.
+            unreachable!("Llama variant guarded above")
+        }
+    };
+
+    // 11. Build the typed NnCardMeta payload and persist the Card.
+    //     Full-fine-tune carries NO LoRA branch — that field stays
+    //     `None`, matching `training_path="full_ft"` cards written
+    //     by the sibling `alc.nn.trainer.full_ft` + `alc.nn.card.save`
+    //     flow.
+    let candle = NnCandleBranch {
+        bundle_ref: format!("nn/{card_id}"),
+        device: None,
+        dtype: None,
+        lora: None,
+    };
+
+    let meta = NnCardMeta {
+        name: name_base.to_string(),
+        backend: "candle".into(),
+        task: None,
+        architecture,
+        training_path: "full_ft".into(),
+        lineage: NnLineage::default(),
+        hyperparams: json!({
+            "lr": train_cfg.lr,
+            "batch": train_cfg.batch_size,
+            "steps": train_cfg.steps,
+            "warmup": train_cfg.warmup,
+        }),
+        metrics: json!({
+            "train_loss": ckpt.train_loss,
+            "step": ckpt.step,
+        }),
+        candle: Some(candle),
+    };
+
+    let payload = build_create_payload_from_meta(&card_id, &meta)?;
+
+    let (returned_id, _path) = store
+        .create(payload)
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: card store: {e}")))?;
+
+    if returned_id != card_id {
+        return Err(LuaError::external(format!(
+            "alc.nn.trainer.run_full_ft: card_id mismatch (expected \
+             {card_id}, got {returned_id})"
+        )));
+    }
+
+    // The `ckpt.bundle_ref` field is left unused on purpose: L5c S1
+    // consumers only see the Card id, and the on-disk safetensors
+    // path is fixed by the `<nn_dir>/<card_id>.safetensors`
+    // convention (validated by
+    // `run_full_ft_bridge_tests::run_full_ft_gpt2_happy_path_writes_full_ft_card`
+    // below).
+    let _ = ckpt.bundle_ref;
+
+    Ok(card_id)
+}
+
+/// Extract a validated [`FullFtConfig`] from `opts` for the
+/// `run_full_ft` surface.
+///
+/// Same field-set as [`extract_train_cfg`] (`lr` / `batch` /
+/// `steps` / `warmup` / `schedule`) with the same validation rules,
+/// but every error carries the `alc.nn.trainer.run_full_ft:` prefix
+/// per design's loud-error contract (one prefix per surface). The
+/// two extractors are intentionally duplicated 60-line-for-60-line
+/// so a future divergence of the training-config schema between
+/// LoRA and full-fine-tune surfaces stays local to one extractor.
+fn extract_train_cfg_ff(opts: &LuaTable) -> LuaResult<FullFtConfig> {
+    let lr: Option<f64> = opts.get("lr")?;
+    let lr = lr.filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.run_full_ft: opts.lr must be a positive number")
+    })?;
+
+    let batch: Option<i64> = opts.get("batch")?;
+    let batch = batch.filter(|v| *v > 0).ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.run_full_ft: opts.batch must be a positive integer")
+    })? as usize;
+
+    let steps: Option<i64> = opts.get("steps")?;
+    let steps = steps.filter(|v| *v > 0).ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.run_full_ft: opts.steps must be a positive integer")
+    })? as usize;
+
+    let warmup = match opts.get::<Option<i64>>("warmup")? {
+        Some(v) if v < 0 => {
+            return Err(LuaError::external(
+                "alc.nn.trainer.run_full_ft: opts.warmup must be >= 0",
+            ));
+        }
+        Some(v) => v as usize,
+        None => 0,
+    };
+
+    let schedule_canonical = match opts
+        .get::<Option<String>>("schedule")?
+        .as_deref()
+        .unwrap_or("CosineWithWarmup")
+    {
+        "CosineWithWarmup" => "cosine_with_warmup",
+        "Constant" => "constant",
+        other => {
+            return Err(LuaError::external(format!(
+                "alc.nn.trainer.run_full_ft: opts.schedule must be one of \
+                 \"CosineWithWarmup\" / \"Constant\" (got {other:?})"
+            )));
+        }
+    };
+
+    // Canonicalise design §1.2 field names into the shared
+    // extractor's naming convention, then delegate. Mutating
+    // `opts` in place is safe: the caller-supplied table is a
+    // per-invocation value.
+    opts.set("lr", lr)?;
+    opts.set("batch_size", batch as i64)?;
+    opts.set("steps", steps as i64)?;
+    opts.set("warmup", warmup as i64)?;
+    opts.set("schedule", schedule_canonical.to_string())?;
+
+    extract_full_ft_opts(Some(opts))
+}
+
+/// Translate a [`TrainError`] into a `run_full_ft`-prefixed Lua
+/// error. Mirrors [`train_err_to_lua`] structurally; diverges only
+/// on the surface prefix per design's loud-error contract.
+fn train_err_to_lua_ff(e: TrainError) -> LuaError {
+    let msg = match e {
+        TrainError::ZeroSteps => "alc.nn.trainer.run_full_ft: zero steps".to_string(),
+        TrainError::LeaseHeld => {
+            "alc.nn.trainer.run_full_ft: training lease already active on this VM".to_string()
+        }
+        TrainError::DatasetExhausted { seen, requested } => format!(
+            "alc.nn.trainer.run_full_ft: dataset exhausted after {seen} steps \
+             (requested {requested})"
+        ),
+        TrainError::Ckpt(inner) => {
+            format!("alc.nn.trainer.run_full_ft: checkpoint: {inner}")
+        }
+        TrainError::Candle(inner) => {
+            format!("alc.nn.trainer.run_full_ft: candle: {inner}")
+        }
+        other => format!("alc.nn.trainer.run_full_ft: {other}"),
+    };
+    LuaError::external(msg)
+}
+
 #[cfg(test)]
-mod run_lora_ft_bridge_tests {
-    //! Layer 5b S2 — bridge integration tests for
-    //! `alc.nn.trainer.run_lora_ft`.
+mod run_ft_bridge_tests {
+    //! Layer 5b S2 + Layer 5c S1 — bridge integration tests for
+    //! `alc.nn.trainer.{run_lora_ft, run_full_ft}`.
     //!
-    //! Axis A3/A4 exercise the GPT-2 + TinyLlama happy paths (arch
-    //! dispatch + on-disk Card + Δ safetensors + payload shape).
+    //! run_lora_ft coverage (Axes A3/A4/B6/B7/C1-C3/D1/D2):
+    //! GPT-2 + TinyLlama happy paths (arch dispatch + on-disk Card
+    //! + Δ safetensors + payload shape).
     //! Axis B6/B7 exercise config schema refusals unique to the
     //! trainer (steps / schedule). Axis C1-C3 exercise state
     //! invariants that only become verifiable post-train
@@ -968,5 +1345,178 @@ mod run_lora_ft_bridge_tests {
         let wrapped = load_wrap_impl(&store, &card_id, &fresh_ud).expect("load_wrap");
         assert_eq!(wrapped.arch(), "tinyllama");
         assert!(wrapped.is_lora_wrapped());
+    }
+
+    // ─── L5c S1 — `alc.nn.trainer.run_full_ft` bridge tests ────────
+    //
+    // Axis mirrors the run_lora_ft coverage above:
+    // - A1/A2: GPT-2 + TinyLlama happy paths (arch dispatch,
+    //   on-disk safetensors, Card `training_path="full_ft"` shape).
+    // - B1: config schema refusal unique to run_full_ft
+    //   (`steps == 0`). LoRA-specific refusals do not apply.
+    // - B2: refuse pretrained=true handle (LoRA path is silent
+    //   about this because it wraps the base regardless; full-FT
+    //   needs the base VarMap).
+    // - C1: refuse LoRA-wrapped handle (design divergence
+    //   bullet — a wrapped handle would silently disagree with
+    //   the caller's intent).
+    // - C2: refuse Llama (inference-only, symmetric to run_lora_ft
+    //   Axis handling).
+
+    fn base_full_ft_opts() -> serde_json::Value {
+        json!({
+            "lr": 5e-3,
+            "batch": 1,
+            "steps": 3,
+            "warmup": 0,
+            "schedule": "CosineWithWarmup",
+        })
+    }
+
+    #[test]
+    fn run_full_ft_gpt2_happy_path_writes_full_ft_card() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let card_id = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft");
+
+        // Safetensors on disk at `<nn_dir>/<card_id>.safetensors`
+        // (the `save_final` convention pinned by `run_full_ft`'s
+        // `ckpt_prefix = card_id`).
+        let ckpt_path = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(
+            ckpt_path.exists(),
+            "full-ft safetensors must exist at {ckpt_path:?}"
+        );
+
+        // Card metadata: training_path / architecture / bundle_ref /
+        // no LoRA branch.
+        let card = store.get(&card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(
+            nn.get("training_path").unwrap().as_str().unwrap(),
+            "full_ft"
+        );
+        assert_eq!(
+            nn.get("architecture").unwrap().as_str().unwrap(),
+            "gpt2-tiny"
+        );
+        let candle = nn.get("candle").unwrap();
+        assert_eq!(
+            candle.get("bundle_ref").unwrap().as_str().unwrap(),
+            format!("nn/{card_id}")
+        );
+        // `candle.lora` is either absent (skipped by serde) or `null`
+        // — full-fine-tune must not emit a LoRA branch.
+        let lora = candle.get("lora");
+        assert!(
+            lora.is_none() || lora.unwrap().is_null(),
+            "full-ft Card must not carry a LoRA branch; got: {lora:?}"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_tinyllama_happy_path_writes_full_ft_card() {
+        let (_tmp, store, nn_dir, base, lua) = setup_tinyllama_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let card_id = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft");
+
+        let ckpt_path = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(ckpt_path.exists());
+
+        let card = store.get(&card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(
+            nn.get("training_path").unwrap().as_str().unwrap(),
+            "full_ft"
+        );
+        assert_eq!(
+            nn.get("architecture").unwrap().as_str().unwrap(),
+            "tinyllama-tiny"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_refuses_zero_steps() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(0);
+        let opts = opts_table(&lua, o);
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("opts.steps"),
+            "expected steps error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_refuses_lora_wrapped_handle() {
+        // Wrap a base first via run_lora_ft (the natural way to get
+        // a wrapped handle round-tripped through the bridge). Then
+        // reload as a wrapped handle via load_wrap and confirm
+        // run_full_ft refuses it with the directional error.
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+        let lora_opts = opts_table(&lua, base_train_opts());
+        let lora_card_id = run_lora_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            lora_opts,
+        )
+        .expect("run_lora_ft");
+
+        // Reload the LoRA card as a wrapped handle.
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let fresh_base =
+            build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).expect("fresh gpt2 base");
+        let fresh_ud = lua.create_userdata(fresh_base).unwrap();
+        let wrapped = load_wrap_impl(&store, &lora_card_id, &fresh_ud).expect("load_wrap");
+        assert!(wrapped.is_lora_wrapped());
+
+        // Feed the wrapped handle into run_full_ft; must refuse.
+        let wrapped_ud = lua.create_userdata(wrapped).unwrap();
+        let ds_ud2 = make_dataset_handle(&lua, overfit_row(), 5);
+        let ff_opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(wrapped_ud),
+            &LuaValue::UserData(ds_ud2),
+            ff_opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("drop the wrap first"),
+            "expected wrapped-handle refusal, got: {msg}"
+        );
     }
 }

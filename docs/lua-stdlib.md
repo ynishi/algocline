@@ -1144,6 +1144,122 @@ local base2 = alc.nn.preset("gpt2", "medium", { pretrained = false })
 local wrapped = alc.nn.card.load_wrap(lora_id, base2)
 ```
 
+#### `alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id`
+
+Layer 5c S1 — one-call full-fine-tune surface: train the base
+model + save safetensors + write a `training_path="full_ft"`
+Card, all in a single call. Sibling of
+`alc.nn.trainer.run_lora_ft` — same shape (arch dispatch, card_id
+return, per-call `TrainingLease`), no LoRA config, and requires
+a `pretrained = false` handle because full-fine-tune drives AdamW
+against the full parameter list (which needs the base handle's
+original `VarMap`).
+
+Diverges from the sibling `alc.nn.trainer.full_ft` entry (which
+returns a raw Checkpoint table): `run_full_ft` builds the Card in
+one call rather than requiring a follow-up `alc.nn.card.save`.
+Both entries stay registered; pick `run_full_ft` for Card-first
+Lua flows and `full_ft` for pipelines that need to inspect the
+Checkpoint before assembling the Card.
+
+**Parameters:**
+
+- `base_handle` (userdata) — an `NnHandle` (or typed Handle) from
+  `alc.nn.preset("gpt2", ...)` / `alc.nn.preset("tinyllama", ...)`.
+  Must be:
+  - constructed with `pretrained = false` (a mmapped
+    pretrained base carries no `VarMap`; the trainer refuses
+    it with a directional error).
+  - NOT already LoRA-wrapped. `run_full_ft` trains the *base*
+    parameters, so a wrapped handle would silently disagree
+    with the caller's intent — refused with a directional
+    error pointing at `alc.nn.wrap_lora` (drop the wrap
+    first).
+  - one of the trainable arches (`gpt2` / `tinyllama`).
+    `Llama` is inference-only and refused up front.
+- `dataset` (userdata) — an `alc.nn.dataset` handle (built by
+  `alc.nn.data.synthetic` / `.jsonl` / `.parquet`). Same
+  `DatasetHandle` userdata the sibling `full_ft` / `lora` /
+  `distill` trainer bindings consume.
+- `opts` (table) — training config only:
+  - `lr` (number, required) — positive learning rate.
+  - `batch` (integer, required) — positive batch size.
+  - `steps` (integer, required) — positive step count.
+  - `warmup` (integer, optional, default `0`) — schedule
+    warmup step count; must be `>= 0`.
+  - `schedule` (string, optional, default `"CosineWithWarmup"`)
+    — one of `"CosineWithWarmup"` / `"Constant"`. Any other
+    value is refused with the caller-supplied value in the
+    error.
+  - `name` (string, optional) — user-visible name recorded as
+    `NnCardMeta.name`; also `sanitize`d and used as a prefix
+    to derive `card_id`. Defaults to `"run_full_ft"` when
+    absent or empty.
+
+**Returns:** `card_id` (string). The Card carries
+`training_path="full_ft"` and `candle.bundle_ref="nn/<card_id>"`
+(no LoRA branch). The safetensors bundle lives at
+`<nn_dir>/<card_id>.safetensors` — the file path a subsequent
+`alc.nn.load(card_id)` resolves.
+
+**Errors** (all prefixed `alc.nn.trainer.run_full_ft:`, loud
+per the L5b design's one-prefix-per-surface contract):
+
+- `expected NnHandle, got <type>` — non-userdata / unknown
+  userdata base.
+- `expected base (unwrapped) NnHandle; drop the wrap first`
+  — LoRA-wrapped handle passed in.
+- `architecture <arch> is not trainable (only gpt2 /
+  tinyllama families are supported)` — Llama family.
+- `handle was built with pretrained=true; full-fine-tune
+  requires a from-scratch handle (pretrained=false)` — a
+  pretrained handle carries no `VarMap`.
+- `dataset must be an alc.nn.dataset (got <type>)` — non-
+  DatasetHandle userdata.
+- `opts.lr must be a positive number` / `opts.batch must be
+  a positive integer` / `opts.steps must be a positive
+  integer` / `opts.warmup must be >= 0` — config validation
+  refusals.
+- `opts.schedule must be one of "CosineWithWarmup" /
+  "Constant" (got <value>)` — unknown schedule.
+- `zero steps` — defensive catch mirroring
+  `TrainError::ZeroSteps` (unreachable via the schema check
+  above, but kept as a belt-and-suspenders guard).
+- `training lease already active on this VM` — concurrent
+  training attempt within the same VM.
+- `dataset exhausted after N steps (requested M)` —
+  dataset drained before reaching `opts.steps`.
+- `checkpoint: <msg>` / `candle: <msg>` / `card store: <msg>`
+  — I/O / candle / Card store failures propagated verbatim.
+
+**Concurrency:** identical to `run_lora_ft` — a fresh
+`TrainingLease` per call, not shared with the sibling `lora` /
+`full_ft` / `distill` entries.
+
+**GPU verification status:** CPU F32 fully covered in-tree
+(`bridge::nn_trainer::run_ft_bridge_tests::run_full_ft_*` — 4
+tests: happy paths per arch + zero-steps refusal + LoRA-
+wrapped refusal). A40 GPU smoke inherits the L5b carry list
+(`spike-status.md §7`).
+
+```lua
+-- End-to-end: base handle → full-fine-tune → Card.
+local base = alc.nn.preset("gpt2", "medium", { pretrained = false })
+local ds = alc.nn.data.synthetic(
+    { { 1, 2, 3, 4, 5 }, { 5, 4, 3, 2, 1 } },
+    { batch_size = 1, ctx_len = 16 }
+)
+
+local card_id = alc.nn.trainer.run_full_ft(base, ds, {
+    lr = 3e-4, batch = 1, steps = 100, warmup = 10,
+    schedule = "CosineWithWarmup",
+    name = "my-full-ft-run",
+})
+
+-- Later — reload the trained bundle:
+local vars = alc.nn.card.load(card_id)
+```
+
 #### `alc.nn.card.load_gpt2(card_id, base) -> Gpt2Handle` *(deprecated)*
 
 Arch-pinned typed shortcut for GPT-2 LoRA card load. Delegates to

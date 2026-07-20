@@ -271,6 +271,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     real-scale LoRA (`nn_medium_lora_gpu_smoke.rs` and a future
     `nn_tinyllama_lora_gpu_smoke.rs` follow-up) stays on the
     `spike-status.md §7` carry.
+- `algocline-engine`: `alc.nn.trainer.run_full_ft` Lua binding for
+  the one-call full-fine-tune surface (Layer 5c S1 of GH #10).
+  Sibling of the Layer 5b S2 `alc.nn.trainer.run_lora_ft` — same
+  arch-neutral `NnHandle` dispatch (GPT-2 / TinyLlama arms;
+  `Llama` refused as inference-only), same one-call Card mint
+  discipline (returns a `card_id` string rather than a raw
+  Checkpoint table), same per-call `TrainingLease` isolation.
+  Diverges from `run_lora_ft` on three axes: no LoRA config
+  (only `lr` / `batch` / `steps` / `warmup` / `schedule`);
+  refuses `pretrained = true` handles because full-fine-tune
+  needs the base handle's original `VarMap` for AdamW; refuses
+  LoRA-wrapped handles with a directional error pointing at
+  `alc.nn.wrap_lora` (drop the wrap first — a wrapped handle
+  is a LoRA-training target, not a full-fine-tune target). Also
+  registered alongside the pre-existing `alc.nn.trainer.full_ft`
+  entry (which returns a raw Checkpoint table); pick
+  `run_full_ft` for Card-first Lua flows and `full_ft` for
+  pipelines that need to inspect the Checkpoint before
+  assembling the Card. The trained safetensors bundle lives at
+  `<nn_dir>/<card_id>.safetensors` (the `alc.nn.load(card_id)`
+  resolve path) and the Card records
+  `training_path = "full_ft"` +
+  `candle.bundle_ref = "nn/<card_id>"` (no LoRA branch,
+  matching the sibling `full_ft` + `alc.nn.card.save` flow).
+  All errors surface pre-flight as loud `LuaError::external`
+  with prefix `alc.nn.trainer.run_full_ft:` — no silent
+  fallback, no `warn!` swallow, per the L5b one-prefix-per-
+  surface contract. Verified by 4 integration tests
+  (`bridge::nn_trainer::run_ft_bridge_tests::run_full_ft_*`):
+  happy paths for both GPT-2 and TinyLlama arms + zero-steps
+  refusal + LoRA-wrapped-handle refusal. `run_lora_ft` tests
+  co-located in the same `run_ft_bridge_tests` module continue
+  to pass unchanged (module rename from
+  `run_lora_ft_bridge_tests` → `run_ft_bridge_tests` reflects
+  the shared coverage; test names carry the surface prefix).
+  Follow-up (out of scope): `alc.nn.trainer.run_distill` bind
+  needs the Rust surface `run_distill(&Gpt2Model, ...)` to be
+  generalised to `run_distill<M>` first (currently `Gpt2Model`-
+  hardcoded); tracked on the L5c/L5d carry list in
+  `workspace/tasks/alc-nn-tinyllama/layer-5b-wrap-and-train-lua-design.md`
+  §Follow-ups.
 - `algocline-nn`: TinyLlama-1.1B GPU smoke example suite covering
   the base full-FT, LoRA fine-tune, and LoRA → merge round-trip
   paths on CUDA. Siblings of the existing

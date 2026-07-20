@@ -1,0 +1,517 @@
+//! GPU smoke test — TinyLlama-1.1B LoRA → merge → parity round-trip
+//! on CUDA (end-to-end LoRA lifecycle).
+//!
+//! Sibling of `nn_tinyllama_lora_gpu_smoke.rs`; extends that
+//! example's LoRA fine-tuning path with the Layer 4a merged-export
+//! step and a forward-parity reload check. Concretely, after
+//! `run_lora_ft` returns, the driver:
+//!
+//! 1. Builds a [`MergedProvenance`] pointing at the LoRA card_id
+//!    plus a `nn/<merged_card_id>` bundle_ref.
+//! 2. Calls [`export_merged`] on the still-wrapped `TinyLlamaModel`
+//!    to write a merged safetensors bundle to
+//!    `<ckpt_dir>/nn/<merged_card_id>.safetensors`.
+//! 3. Reloads the merged bundle as a plain `TinyLlamaModel` via
+//!    `TinyLlamaModel::from_safetensors_file`.
+//! 4. Runs a forward pass on both the wrapped and reloaded models
+//!    with a hand-crafted input tensor and asserts the two outputs
+//!    match within f32 tolerance (default `1e-3` on CUDA, tighter
+//!    `1e-4` matches the CPU-side `merged_bundle_tinyllama_forward_matches_wrapped_forward`
+//!    parity test — CUDA fused mul-adds accumulate more numeric
+//!    drift than the CPU AVX2 path so the ceiling is looser here).
+//! 5. Asserts the merged bundle size stays under a full-weight
+//!    ceiling (default `4.5 GB` for TinyLlama-1.1B F32 ≈ base
+//!    weight footprint + safetensors header + small headroom).
+//!
+//! All three LoRA invariants from `nn_tinyllama_lora_gpu_smoke.rs`
+//! remain in force (base weights frozen, Δ size under ceiling,
+//! per-step loss trajectory observable). This example adds two
+//! merge-specific invariants:
+//!
+//! 4. **Merged forward parity** — the merged bundle produces
+//!    numerically-equivalent logits to the wrapped model, so a
+//!    downstream consumer that loads the merged bundle sees the
+//!    same behaviour as the wrapped LoRA runtime.
+//! 5. **Merged bundle size bounded** — the emitted safetensors file
+//!    sits under the F32 base-weight footprint plus headroom, so a
+//!    walker bug that mistakenly re-serialises LoRA tensors or
+//!    duplicates weights surfaces here.
+//!
+//! Usage:
+//!
+//! ```bash
+//! # CUDA (requires nvcc + candle-core/candle-nn cuda features)
+//! RUST_LOG=algocline_nn=info \
+//!   cargo run --release --features nn-cuda --example nn_tinyllama_merge_lora_gpu_smoke
+//!
+//! # CPU fallback (compile check on dev host)
+//! cargo run --release --example nn_tinyllama_merge_lora_gpu_smoke
+//! ```
+//!
+//! Env vars (LoRA subset is identical to
+//! `nn_tinyllama_lora_gpu_smoke.rs`; only the merge-specific keys are
+//! documented at length):
+//!
+//! - `NN_SMOKE_STEPS`             (default `50`)
+//! - `NN_SMOKE_BATCH`             (default `2`)
+//! - `NN_SMOKE_CTX`               (default `64`)
+//! - `NN_SMOKE_LR`                (default `3e-4`)
+//! - `NN_SMOKE_CKPT_DIR`          (default `/tmp`)
+//! - `NN_SMOKE_CARD_ID`           (default `smoke-lora-tinyllama`)
+//!   — LoRA Δ card id (also used to derive the merged card id).
+//! - `NN_SMOKE_MERGED_CARD_ID`    (default `smoke-merged-tinyllama`)
+//!   — merged bundle base name (writes to
+//!   `<ckpt_dir>/nn/<merged_card_id>.safetensors`).
+//! - `NN_SMOKE_VARIANT`           (default `tinyllama-1.1b`)
+//! - `NN_SMOKE_LORA_RANK`         (default `16`)
+//! - `NN_SMOKE_LORA_ALPHA`        (default `32`)
+//! - `NN_SMOKE_LORA_TARGETS`      (default `full`)
+//! - `NN_SMOKE_DELTA_MAX_BYTES`   (default `64 MB`)
+//! - `NN_SMOKE_BASE_FROZEN_CHECK` (default `1`)
+//! - `NN_SMOKE_MERGED_TOLERANCE`  (default `1e-3`) — f32 max_abs_diff
+//!   epsilon for the wrapped-vs-merged forward parity assertion.
+//!   Loosened from the CPU parity test's `1e-4` because CUDA fused
+//!   multiply-add ordering accumulates more numeric drift than the
+//!   CPU AVX2 kernel. Tighten via env when running on CPU.
+//! - `NN_SMOKE_MERGED_MAX_BYTES`  (default `4831838208` ≈ 4.5 GB) —
+//!   hard ceiling for the merged bundle size. Sized against
+//!   TinyLlama-1.1B F32 base weight footprint (≈ 4.4 GB); a
+//!   walker bug that duplicates or re-serialises LoRA tensors
+//!   surfaces above this bound.
+//! - `NN_SMOKE_SKIP_MERGE`        (default `0`) — set to `1` to
+//!   skip the merge + parity + size steps entirely (behaviour then
+//!   matches `nn_tinyllama_lora_gpu_smoke.rs`). Useful when the
+//!   caller wants to isolate a LoRA regression from a merge
+//!   regression.
+//!
+//! Exit 0 = training loop completed, base weights stayed frozen,
+//! the Δ bundle was written under the ceiling, the merged bundle
+//! reloaded parity within tolerance, and its size stayed under
+//! the merged ceiling.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use algocline_nn::arch::{max_abs_diff_f32, LoraConfig, TinyLlamaConfig, TinyLlamaModel};
+use algocline_nn::merged::{export_merged, MergedProvenance};
+use algocline_nn::train::{
+    run_lora_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, ScheduleKind, TokenizedDataset,
+    TrainingLease,
+};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{VarBuilder, VarMap};
+use tracing_subscriber::EnvFilter;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key).ok().as_deref() {
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        Some("1") | Some("true") | Some("yes") | Some("on") => true,
+        Some(_) | None => default,
+    }
+}
+
+fn resolve_device() -> Device {
+    #[cfg(feature = "nn-cuda")]
+    {
+        match Device::new_cuda(0) {
+            Ok(dev) => {
+                eprintln!("[smoke] using CUDA device 0");
+                return dev;
+            }
+            Err(e) => {
+                eprintln!("[smoke] cuda unavailable ({e}); falling back to CPU");
+            }
+        }
+    }
+    eprintln!("[smoke] using CPU device (this will be slow on tinyllama-1.1b)");
+    Device::Cpu
+}
+
+/// Repeating corpus of `rows` sequences drawn from a small palette.
+/// Same shape as `nn_tinyllama_lora_gpu_smoke.rs` so LoRA phase
+/// behaviour is directly comparable between the two examples.
+fn synthetic_corpus(rows: usize, ctx: usize) -> Vec<Vec<u32>> {
+    let palette: Vec<u32> = (100..150).collect();
+    let mut corpus = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        let mut row = Vec::with_capacity(ctx);
+        for pos in 0..ctx {
+            let idx = (row_idx + pos * 7) % palette.len();
+            row.push(palette[idx]);
+        }
+        corpus.push(row);
+    }
+    corpus
+}
+
+/// Parse the target-module preset from env: `attn` (Q/K/V/O only) or
+/// `full` (canonical 7 for TinyLlama).
+fn resolve_targets() -> Vec<String> {
+    match std::env::var("NN_SMOKE_LORA_TARGETS")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "attn" => vec![
+            "q_proj".into(),
+            "k_proj".into(),
+            "v_proj".into(),
+            "o_proj".into(),
+        ],
+        "full" | "" => TinyLlamaModel::default_lora_targets(),
+        other => {
+            eprintln!(
+                "[smoke] unknown NN_SMOKE_LORA_TARGETS={other:?}; falling back to full 7-target set"
+            );
+            TinyLlamaModel::default_lora_targets()
+        }
+    }
+}
+
+/// Byte-exact compare of two files, streaming a shared buffer instead
+/// of loading both into memory (TinyLlama-1.1B base ≈ 4.4 GB each in
+/// F32).
+fn files_bytes_equal(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut fa = std::fs::File::open(a)?;
+    let mut fb = std::fs::File::open(b)?;
+    let la = fa.metadata()?.len();
+    let lb = fb.metadata()?.len();
+    if la != lb {
+        return Ok(false);
+    }
+
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    loop {
+        let na = fa.read(&mut ba)?;
+        let nb = fb.read(&mut bb)?;
+        if na != nb {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+        if ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Build a small deterministic input tensor for the wrapped-vs-merged
+/// forward parity check. `[1, ctx]` shape, tokens drawn from the same
+/// palette-adjacent range as the training corpus so the model exercises
+/// weights that saw non-zero gradients during training.
+fn parity_input(ctx: usize, device: &Device) -> candle_core::Result<Tensor> {
+    let seq: Vec<u32> = (0..ctx).map(|i| 100 + (i as u32 % 50)).collect();
+    Tensor::from_slice(&seq, (1, ctx), device)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("algocline_nn=info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let steps = env_usize("NN_SMOKE_STEPS", 50);
+    let batch = env_usize("NN_SMOKE_BATCH", 2);
+    let ctx = env_usize("NN_SMOKE_CTX", 64);
+    let lr = env_f64("NN_SMOKE_LR", 3e-4);
+    let ckpt_dir: PathBuf = std::env::var("NN_SMOKE_CKPT_DIR")
+        .unwrap_or_else(|_| "/tmp".into())
+        .into();
+    let card_id =
+        std::env::var("NN_SMOKE_CARD_ID").unwrap_or_else(|_| "smoke-lora-tinyllama".into());
+    let merged_card_id = std::env::var("NN_SMOKE_MERGED_CARD_ID")
+        .unwrap_or_else(|_| "smoke-merged-tinyllama".into());
+    let variant = std::env::var("NN_SMOKE_VARIANT").unwrap_or_else(|_| "tinyllama-1.1b".into());
+    let lora_rank = env_usize("NN_SMOKE_LORA_RANK", 16);
+    let lora_alpha = env_f32("NN_SMOKE_LORA_ALPHA", 32.0);
+    let delta_max_bytes = env_u64("NN_SMOKE_DELTA_MAX_BYTES", 64 * 1024 * 1024);
+    let base_frozen_check = env_bool("NN_SMOKE_BASE_FROZEN_CHECK", true);
+    let merged_tolerance = env_f32("NN_SMOKE_MERGED_TOLERANCE", 1e-3);
+    let merged_max_bytes = env_u64("NN_SMOKE_MERGED_MAX_BYTES", 4_831_838_208);
+    let skip_merge = env_bool("NN_SMOKE_SKIP_MERGE", false);
+    let targets = resolve_targets();
+
+    eprintln!(
+        "[smoke] config: variant={variant} steps={steps} batch={batch} ctx={ctx} lr={lr} \
+         ckpt_dir={ckpt_dir:?} card_id={card_id} merged_card_id={merged_card_id} \
+         rank={lora_rank} alpha={lora_alpha} targets={targets:?} \
+         delta_max_bytes={delta_max_bytes} merged_max_bytes={merged_max_bytes} \
+         merged_tolerance={merged_tolerance} base_frozen_check={base_frozen_check} \
+         skip_merge={skip_merge}"
+    );
+
+    let device = resolve_device();
+
+    let mut cfg = TinyLlamaConfig::from_variant(&variant)
+        .ok_or_else(|| format!("unknown TinyLlama variant: {variant:?}"))?;
+    cfg.device = device.clone();
+    cfg.dtype = DType::F32;
+
+    eprintln!(
+        "[smoke] building model layers={} heads={} kv_heads={} dim={} hidden={} vocab={} device={:?}",
+        cfg.layers, cfg.heads, cfg.kv_heads, cfg.dim, cfg.hidden_dim, cfg.vocab, cfg.device
+    );
+    let build_t0 = Instant::now();
+    let base_vm = VarMap::new();
+    let vb = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+    let mut model = TinyLlamaModel::new(&cfg, vb)?;
+    eprintln!("[smoke] model built in {:.2?}", build_t0.elapsed());
+
+    // ---------------- LoRA phase ----------------
+
+    let frozen_dir = ckpt_dir.join("nn").join("base-frozen-check");
+    let base_pre_path = frozen_dir.join(format!("base-pre-{card_id}.safetensors"));
+    let base_post_path = frozen_dir.join(format!("base-post-{card_id}.safetensors"));
+    if base_frozen_check {
+        std::fs::create_dir_all(&frozen_dir)
+            .map_err(|e| format!("mkdir {:?}: {e}", frozen_dir.display()))?;
+        eprintln!(
+            "[smoke] dumping base VarMap pre-train → {:?}",
+            base_pre_path
+        );
+        base_vm.save(&base_pre_path)?;
+        let sz = std::fs::metadata(&base_pre_path)?.len();
+        eprintln!(
+            "[smoke] base pre-dump = {sz} bytes ({:.2} MB)",
+            sz as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    let rows_needed = steps.saturating_mul(batch).saturating_add(batch);
+    let corpus = synthetic_corpus(rows_needed, ctx);
+    let mut dataset = TokenizedDataset::new(
+        corpus,
+        DatasetOpts {
+            batch_size: batch,
+            ctx_len: ctx,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        },
+    );
+
+    let ft_cfg = FullFtConfig {
+        lr,
+        batch_size: batch,
+        grad_accum: 1,
+        steps,
+        warmup: steps.min(5),
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+
+    let lora_cfg = LoraConfig::with_targets(lora_rank, lora_alpha, targets.iter().cloned());
+    let lease = Arc::new(TrainingLease::new());
+    let loss = CrossEntropyLoss::new();
+
+    eprintln!(
+        "[smoke] starting LoRA training… target_modules={:?}",
+        lora_cfg.target_modules
+    );
+    let train_t0 = Instant::now();
+    let ckpt = run_lora_ft(
+        &mut model,
+        &mut dataset,
+        &lora_cfg,
+        &ft_cfg,
+        &loss,
+        &ckpt_dir,
+        &card_id,
+        lease,
+    )?;
+    let elapsed = train_t0.elapsed();
+
+    let min_loss = ckpt
+        .metrics
+        .get("min_train_loss")
+        .copied()
+        .unwrap_or(f32::NAN);
+    let final_lr = ckpt.metrics.get("final_lr").copied().unwrap_or(f32::NAN);
+
+    let delta_path = ckpt_dir
+        .join("nn")
+        .join(format!("lora-{card_id}.safetensors"));
+    let delta_bytes = std::fs::metadata(&delta_path)
+        .map_err(|e| format!("stat {:?}: {e}", delta_path.display()))?
+        .len();
+
+    eprintln!(
+        "[smoke] LoRA done in {:.2?} ({:.2}s/step avg): final_loss={:.4} \
+         min_loss={:.4} final_lr={:.6} delta={:?} delta_bytes={} \
+         (<= {} = {:.2} MB ceiling)",
+        elapsed,
+        elapsed.as_secs_f64() / steps.max(1) as f64,
+        ckpt.train_loss,
+        min_loss,
+        final_lr,
+        delta_path,
+        delta_bytes,
+        delta_max_bytes,
+        delta_max_bytes as f64 / (1024.0 * 1024.0),
+    );
+
+    if delta_bytes > delta_max_bytes {
+        return Err(format!(
+            "LoRA Δ bundle size {} B exceeds ceiling {} B (path={:?}). \
+             Rank {} × alpha {} × {} targets on TinyLlama {}. \
+             Set NN_SMOKE_DELTA_MAX_BYTES to raise the ceiling.",
+            delta_bytes,
+            delta_max_bytes,
+            delta_path,
+            lora_rank,
+            lora_alpha,
+            targets.len(),
+            variant,
+        )
+        .into());
+    }
+
+    if base_frozen_check {
+        eprintln!(
+            "[smoke] dumping base VarMap post-train → {:?}",
+            base_post_path
+        );
+        base_vm.save(&base_post_path)?;
+        let sz = std::fs::metadata(&base_post_path)?.len();
+        eprintln!(
+            "[smoke] base post-dump = {sz} bytes ({:.2} MB)",
+            sz as f64 / (1024.0 * 1024.0)
+        );
+
+        let cmp_t0 = Instant::now();
+        let equal = files_bytes_equal(&base_pre_path, &base_post_path)?;
+        eprintln!(
+            "[smoke] base pre/post byte-compare in {:.2?}: equal={}",
+            cmp_t0.elapsed(),
+            equal
+        );
+        if !equal {
+            return Err(format!(
+                "Base VarMap changed during LoRA training. \
+                 pre={:?} post={:?} — LoRA invariant #1 (base weights frozen) violated.",
+                base_pre_path, base_post_path
+            )
+            .into());
+        }
+    } else {
+        eprintln!("[smoke] base-frozen check skipped (NN_SMOKE_BASE_FROZEN_CHECK=0)");
+    }
+
+    // ---------------- Merge phase ----------------
+
+    if skip_merge {
+        eprintln!("[smoke] merge phase skipped (NN_SMOKE_SKIP_MERGE=1)");
+        return Ok(());
+    }
+
+    let merged_path = ckpt_dir
+        .join("nn")
+        .join(format!("{merged_card_id}.safetensors"));
+    let provenance = MergedProvenance {
+        lora_card: format!("cards/{card_id}"),
+        arch: variant.clone(),
+        bundle_ref: format!("nn/{merged_card_id}"),
+    };
+
+    eprintln!(
+        "[smoke] exporting merged bundle → {:?} (provenance: lora_card={:?} arch={:?} bundle_ref={:?})",
+        merged_path, provenance.lora_card, provenance.arch, provenance.bundle_ref
+    );
+    let merge_t0 = Instant::now();
+    let (merged_bytes, merged_card) = export_merged(&model, &provenance, &merged_path)?;
+    let merge_elapsed = merge_t0.elapsed();
+    eprintln!(
+        "[smoke] export_merged done in {:.2?}: bytes={} ({:.2} MB) \
+         name={:?} training_path={:?} architecture={:?}",
+        merge_elapsed,
+        merged_bytes,
+        merged_bytes as f64 / (1024.0 * 1024.0),
+        merged_card.name,
+        merged_card.training_path,
+        merged_card.architecture,
+    );
+
+    if merged_bytes as u64 > merged_max_bytes {
+        return Err(format!(
+            "Merged bundle size {} B exceeds ceiling {} B (path={:?}). \
+             Expected roughly base weight footprint + safetensors header. \
+             Set NN_SMOKE_MERGED_MAX_BYTES to raise the ceiling.",
+            merged_bytes, merged_max_bytes, merged_path
+        )
+        .into());
+    }
+
+    // Reload the merged bundle as a plain TinyLlama.
+    eprintln!("[smoke] reloading merged bundle as plain TinyLlamaModel…");
+    let reload_t0 = Instant::now();
+    let reloaded = TinyLlamaModel::from_safetensors_file(&cfg, &merged_path)?;
+    eprintln!("[smoke] reload done in {:.2?}", reload_t0.elapsed());
+
+    // Forward parity: wrapped vs reloaded.
+    let input = parity_input(ctx, &device)?;
+    eprintln!(
+        "[smoke] running parity forward on shape {:?}…",
+        input.dims()
+    );
+    let parity_t0 = Instant::now();
+    let wrapped_out = model.forward(&input)?;
+    let reloaded_out = reloaded.forward(&input)?;
+    let diff = max_abs_diff_f32(&wrapped_out, &reloaded_out)?;
+    eprintln!(
+        "[smoke] parity done in {:.2?}: max_abs_diff={:.6e} tolerance={:.6e}",
+        parity_t0.elapsed(),
+        diff,
+        merged_tolerance,
+    );
+    if diff >= merged_tolerance {
+        return Err(format!(
+            "Merged bundle forward diverged from wrapped forward by {diff:.6e} \
+             (tolerance {merged_tolerance:.6e}). \
+             Merge invariant #4 (wrapped-vs-merged parity) violated. \
+             path={:?}",
+            merged_path
+        )
+        .into());
+    }
+
+    eprintln!("[smoke] all invariants satisfied (LoRA #1-3 + merge #4-5)");
+    Ok(())
+}

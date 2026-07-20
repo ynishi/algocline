@@ -185,9 +185,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - GPU verification status: TinyLlama full/LoRA/merge paths are
     exercised only on CPU F32 in-tree so far. A40 smoke examples
     (`nn_tinyllama_gpu_smoke.rs`, `nn_tinyllama_lora_gpu_smoke.rs`,
-    and a TinyLlama merge smoke) are still open follow-ups —
-    tracked in `workspace/tasks/alc-nn-tinyllama/spike-status.md`
-    §7.
+    and `nn_tinyllama_merge_lora_gpu_smoke.rs`) landed as the next
+    entry in this section; actual A40 execution remains the
+    follow-up tracked in
+    `workspace/tasks/alc-nn-tinyllama/spike-status.md` §7.
+- `algocline-nn`: TinyLlama-1.1B GPU smoke example suite covering
+  the base full-FT, LoRA fine-tune, and LoRA → merge round-trip
+  paths on CUDA. Siblings of the existing
+  `nn_medium_gpu_smoke.rs` / `nn_medium_lora_gpu_smoke.rs` GPT-2
+  examples, using the same env-var / stderr-tracing / synthetic-
+  corpus plumbing so behaviour is directly comparable across arches.
+  - `examples/nn_tinyllama_gpu_smoke.rs` — full FT on
+    `TinyLlamaConfig::from_variant` (default `tinyllama-1.1b`;
+    also accepts `1.1b` / `tinyllama-tiny` / `tiny`), calls
+    `run_full_ft` for `NN_SMOKE_STEPS` optimizer steps, dumps a
+    `.safetensors` bundle to `NN_SMOKE_CKPT`, and prints final /
+    min loss + LR. Zero invariant checks beyond exit-code = "the
+    loop didn't panic". Env vars: `NN_SMOKE_STEPS` /
+    `NN_SMOKE_BATCH` / `NN_SMOKE_CTX` / `NN_SMOKE_LR` /
+    `NN_SMOKE_CKPT` / `NN_SMOKE_VARIANT`.
+  - `examples/nn_tinyllama_lora_gpu_smoke.rs` — LoRA fine-tune via
+    `run_lora_ft`, then the three LoRA invariants: (1) base
+    `VarMap` byte-identical before / after `wrap_lora` +
+    `run_lora_ft` (via pre / post `.safetensors` dumps and a
+    streaming byte-compare so TinyLlama-1.1B F32 base ≈ 4.4 GB
+    does not need to be resident twice), (2) Δ bundle size under
+    the `NN_SMOKE_DELTA_MAX_BYTES` ceiling (default 64 MB, sized
+    for rank 16 × 7-target = Q/K/V/O attn + `gate_proj` /
+    `up_proj` / `down_proj` MLP triple at hidden_dim 5632 —
+    versus the GPT-2 medium 32 MB ceiling that assumed only 6
+    targets and hidden_dim ≈ 4·dim), and (3) per-step loss
+    trajectory observable via a `tracing_subscriber` on stderr
+    (`RUST_LOG=algocline_nn=info`). `NN_SMOKE_LORA_TARGETS=attn`
+    switches to the 4-target Q/K/V/O attention-only variant.
+  - `examples/nn_tinyllama_merge_lora_gpu_smoke.rs` — extends the
+    LoRA fine-tune with the Layer 4a merged-export round-trip:
+    `export_merged(&wrapped_model, &MergedProvenance { lora_card,
+    arch, bundle_ref }, merged_path)` after training, then
+    `TinyLlamaModel::from_safetensors_file` to reload the merged
+    bundle, then a `max_abs_diff_f32(wrapped.forward,
+    reloaded.forward)` parity assertion under
+    `NN_SMOKE_MERGED_TOLERANCE` (default `1e-3` — looser than the
+    CPU-side `1e-4` in
+    `merged_bundle_tinyllama_forward_matches_wrapped_forward`
+    because CUDA fused mul-add ordering accumulates more numeric
+    drift than the CPU AVX2 kernel; tighten via env when running
+    on CPU). Also asserts the merged bundle size stays under
+    `NN_SMOKE_MERGED_MAX_BYTES` (default 4.5 GB, sized for
+    TinyLlama-1.1B F32 base weight footprint + safetensors header
+    + headroom). `NN_SMOKE_SKIP_MERGE=1` drops back to the pure
+    LoRA smoke behaviour so a caller can isolate a LoRA
+    regression from a merge regression without changing example.
+    All three LoRA invariants (base frozen, Δ size, loss
+    trajectory) remain in force alongside the two new
+    merge-specific invariants (merged forward parity, merged
+    bundle size bounded) — five invariants total.
+  - Each example is a plain `--example` binary compilable without
+    the `nn-cuda` feature so the dev-host CPU compile check (`cargo
+    check --example …`) exercises it as a regression gate; the
+    actual A40 execution runbook is
+    `workspace/tasks/alc-nn-gpu-smoke/runbook.md` Path A (git push
+    → pod git clone → `cargo build --release --features nn-cuda`
+    → `cargo run --release --features nn-cuda --example
+    nn_tinyllama_merge_lora_gpu_smoke`). GPU execution results
+    themselves are not part of this release entry — they land as
+    a `spike-status.md` §7 verification pass.
 - `algocline-nn`: merged inference checkpoint export (Layer 4a of
   GH #10). A LoRA-wrapped model can now be composed with its base
   into a single safetensors bundle that downstream inference stacks

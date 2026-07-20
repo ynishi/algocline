@@ -1237,10 +1237,10 @@ per the L5b design's one-prefix-per-surface contract):
 `full_ft` / `distill` entries.
 
 **GPU verification status:** CPU F32 fully covered in-tree
-(`bridge::nn_trainer::run_ft_bridge_tests::run_full_ft_*` — 4
+(`bridge::nn_trainer::run_ft_bridge_tests::run_full_ft_*` — 5
 tests: happy paths per arch + zero-steps refusal + LoRA-
-wrapped refusal). A40 GPU smoke inherits the L5b carry list
-(`spike-status.md §7`).
+wrapped refusal + pretrained refusal). A40 GPU smoke inherits
+the L5b carry list (`spike-status.md §7`).
 
 ```lua
 -- End-to-end: base handle → full-fine-tune → Card.
@@ -1258,6 +1258,83 @@ local card_id = alc.nn.trainer.run_full_ft(base, ds, {
 
 -- Later — reload the trained bundle:
 local vars = alc.nn.card.load(card_id)
+```
+
+#### `alc.nn.trainer.run_distill(student_handle, dataset, opts) -> card_id`
+
+Layer 5c S2 — one-call distillation surface: train the student
+model under a distillation loss + save safetensors + write a
+`training_path="distillation"` Card, all in a single call.
+Sibling of `alc.nn.trainer.run_full_ft` — distillation IS a full
+fine-tune under a distillation loss (the teacher signal lives in
+the dataset, typically a teacher-generated token log carrying a
+`loss_mask`, not in a second model instance), so the whole
+validation surface mirrors `run_full_ft`: no LoRA config, a
+`pretrained = false` student handle is required, LoRA-wrapped
+handles and inference-only arches are refused.
+
+Diverges from the sibling `alc.nn.trainer.distill` entry (which
+returns a raw Checkpoint table and only accepts a typed
+`Gpt2Handle`): `run_distill` dispatches arch-neutrally
+(GPT-2 + TinyLlama) and builds the Card in one call. Both
+entries stay registered.
+
+**Parameters:**
+
+- `student_handle` (userdata) — same handle requirements as
+  `run_full_ft` (`pretrained = false`, unwrapped, trainable
+  arch).
+- `dataset` (userdata) — an `alc.nn.dataset` handle. For a real
+  distillation run this carries teacher-emitted tokens with a
+  `loss_mask` scoring only the response region; the surface does
+  not enforce mask presence (an unmasked dataset degrades to a
+  plain full fine-tune, which is well-defined).
+- `opts` (table) — the `run_full_ft` training-config schema
+  (`lr` / `batch` / `steps` / `warmup` / `schedule` / `name`,
+  same validation rules; `name` defaults to `"run_distill"`)
+  plus:
+  - `loss_kind` (string, optional, default `"ce"`) — the
+    distillation loss. Only `"ce"` (hard-label cross-entropy)
+    ships today; unknown values are refused rather than
+    silently falling back.
+
+**Returns:** `card_id` (string). The Card carries
+`training_path="distillation"`, `candle.bundle_ref="nn/<card_id>"`
+(no LoRA branch) and records `loss_kind` under `hyperparams`. The
+safetensors bundle lives at `<nn_dir>/<card_id>.safetensors`.
+
+**Errors** (all prefixed `alc.nn.trainer.run_distill:`, loud per
+the one-prefix-per-surface contract): the full `run_full_ft`
+error surface (handle / dataset / config refusals, lease, dataset
+exhaustion, I/O propagation — with `distillation requires a
+from-scratch student handle` as the pretrained refusal wording)
+plus:
+
+- `unknown loss_kind '<value>' (expected 'ce')` — unknown
+  distillation loss selector.
+
+**Concurrency:** identical to the siblings — a fresh
+`TrainingLease` per call, not shared with the `lora` / `full_ft`
+/ `distill` entries.
+
+**GPU verification status:** CPU F32 fully covered in-tree
+(`bridge::nn_trainer::run_ft_bridge_tests::run_distill_*` — 4
+tests: happy paths per arch + unknown-loss_kind refusal +
+pretrained refusal). A40 GPU smoke inherits the L5b carry list
+(`spike-status.md §7`).
+
+```lua
+-- End-to-end: student handle → distillation → Card.
+local student = alc.nn.preset("gpt2", "medium", { pretrained = false })
+local ds = alc.nn.data.jsonl("teacher_log.jsonl", {
+    batch_size = 1, ctx_len = 128,
+})
+
+local card_id = alc.nn.trainer.run_distill(student, ds, {
+    lr = 3e-4, batch = 1, steps = 100, warmup = 10,
+    loss_kind = "ce",
+    name = "my-distill-run",
+})
 ```
 
 #### `alc.nn.card.load_gpt2(card_id, base) -> Gpt2Handle` *(deprecated)*

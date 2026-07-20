@@ -1238,6 +1238,20 @@ impl Gpt2Handle {
     pub(super) fn varmap(&self) -> Option<Arc<VarMap>> {
         self.varmap.as_ref().map(Arc::clone)
     }
+
+    /// Test-only: strip the `VarMap` off a from-scratch handle so it
+    /// mimics the varmap-less state of a `pretrained = true` handle
+    /// without the HF hub download that [`Gpt2Model::from_pretrained`]
+    /// requires. Lets sibling-module tests (`nn_trainer.rs`) exercise
+    /// the trainer bindings' pretrained-refusal guards through the
+    /// full dispatch path. Same cross-module test-constructor pattern
+    /// as [`DatasetHandle::for_test`].
+    #[cfg(test)]
+    pub(super) fn for_test_pretrained_like(mut self) -> Self {
+        self.varmap = None;
+        self.pretrained = true;
+        self
+    }
 }
 
 fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
@@ -2779,7 +2793,7 @@ fn distill_impl(
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.distill: model lock: {e}")))?;
 
     let result = run_distill(
-        &model,
+        &*model,
         &vm_arc,
         ds_lock.as_mut(),
         &spec,

@@ -306,12 +306,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to pass unchanged (module rename from
   `run_lora_ft_bridge_tests` → `run_ft_bridge_tests` reflects
   the shared coverage; test names carry the surface prefix).
-  Follow-up (out of scope): `alc.nn.trainer.run_distill` bind
-  needs the Rust surface `run_distill(&Gpt2Model, ...)` to be
-  generalised to `run_distill<M>` first (currently `Gpt2Model`-
-  hardcoded); tracked on the L5c/L5d carry list in
-  `workspace/tasks/alc-nn-tinyllama/layer-5b-wrap-and-train-lua-design.md`
-  §Follow-ups.
+  Follow-up: the `alc.nn.trainer.run_distill` bind landed in this
+  same `[Unreleased]` window — see the Layer 5c S2 entry below.
+- `algocline-engine`: `alc.nn.trainer.run_distill` Lua binding for
+  the one-call distillation surface (Layer 5c S2 of GH #10).
+  Sibling of the Layer 5c S1 `alc.nn.trainer.run_full_ft` — same
+  arch-neutral `NnHandle` dispatch (GPT-2 / TinyLlama arms; `Llama`
+  refused as inference-only), same one-call Card mint discipline,
+  same per-call `TrainingLease` isolation, same pretrained /
+  LoRA-wrapped handle refusals (distillation IS a full fine-tune
+  under a distillation loss; the teacher signal lives in the
+  dataset, not in a second model instance). Adds the
+  `opts.loss_kind` field (default `"ce"`, the only
+  `DistillLossKind` variant shipped; unknown values refused rather
+  than silently falling back to CE). The written Card records
+  `training_path = "distillation"` + `candle.bundle_ref =
+  "nn/<card_id>"` (no LoRA branch) and carries `loss_kind` under
+  `hyperparams` so the loss selection is auditable from the Card.
+  Diverges from the pre-existing `alc.nn.trainer.distill` entry
+  (raw Checkpoint return, typed `Gpt2Handle` only); both entries
+  stay registered. All errors surface as loud `LuaError::external`
+  with prefix `alc.nn.trainer.run_distill:` per the
+  one-prefix-per-surface contract. Verified by 4 integration tests
+  (`bridge::nn_trainer::run_ft_bridge_tests::run_distill_*`):
+  happy paths for both arms + unknown-loss_kind refusal +
+  pretrained-handle refusal.
+- `algocline-nn`: `train::run_distill` generalised from the
+  `Gpt2Model`-hardcoded signature to `run_distill<M>` with the same
+  bound as `run_full_ft` (`M: Module + DeviceView`) — distillation
+  places no extra requirement on the student model, and the
+  function already forwarded to the generic `run_full_ft`
+  internally. Existing concrete-type callers (the
+  `alc.nn.trainer.distill` bridge, `tests/distill_synthetic.rs`)
+  resolve through the generic unchanged.
+- `algocline-engine`: pretrained-handle refusal on the
+  `run_full_ft` / `run_distill` bridges is now covered by
+  integration tests through the full dispatch path
+  (`run_full_ft_refuses_pretrained_handle` /
+  `run_distill_refuses_pretrained_handle`), closing the L5c S1
+  coverage gap where the guard was documented but untestable. New
+  test-only constructor `Gpt2Handle::for_test_pretrained_like`
+  (`#[cfg(test)]`, same cross-module pattern as
+  `DatasetHandle::for_test`) strips the `VarMap` off a
+  from-scratch handle to mimic the varmap-less pretrained state
+  without an HF hub download.
 - `algocline-nn`: TinyLlama-1.1B GPU smoke example suite covering
   the base full-FT, LoRA fine-tune, and LoRA → merge round-trip
   paths on CUDA. Siblings of the existing

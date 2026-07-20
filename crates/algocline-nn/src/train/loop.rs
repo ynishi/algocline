@@ -22,7 +22,7 @@ use std::sync::{
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{Gpt2Model, LoraConfig, LoraWrappable};
+use crate::arch::{LoraConfig, LoraWrappable};
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
@@ -228,7 +228,8 @@ where
 /// - `opt_vm` — VarMap whose variables get optimizer updates. In a
 ///   Full FT run this is the same map as the model was constructed
 ///   against; in a LoRA run it is the fresh LoRA-only map returned by
-///   [`Gpt2Model::wrap_lora`] so the base parameters stay frozen.
+///   [`crate::arch::Gpt2Model::wrap_lora`] so the base parameters stay
+///   frozen.
 /// - `save_vm` — VarMap whose contents get written to disk. Same as
 ///   `opt_vm` for both current callers, but kept as a distinct
 ///   parameter so a future full-vs-delta save-side split can flip
@@ -463,16 +464,24 @@ impl DistillSpec {
 /// underlying loop. The named entry exists so downstream callers
 /// (Card metadata, Lua bridge) can encode "this run was a
 /// distillation" without inspecting the training config.
+///
+/// Generic over the student architecture with the same bound as
+/// [`run_full_ft`] (`Module + DeviceView`): distillation places no
+/// extra requirement on the model — the teacher signal lives in the
+/// dataset, not in a second model instance.
 #[allow(clippy::too_many_arguments)]
-pub fn run_distill(
-    student: &Gpt2Model,
+pub fn run_distill<M>(
+    student: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
     spec: &DistillSpec,
     ckpt_dir: &Path,
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
-) -> Result<Checkpoint, TrainError> {
+) -> Result<Checkpoint, TrainError>
+where
+    M: Module + DeviceView,
+{
     match spec.loss_kind {
         DistillLossKind::Ce => {
             let loss = crate::train::HardLabelDistillLoss::new();
@@ -586,6 +595,7 @@ fn batch_to_input_target(
 mod tests {
     use super::*;
     use crate::arch::gpt2::Gpt2Config;
+    use crate::arch::Gpt2Model;
     use crate::train::data::{DatasetOpts, TokenizedDataset};
     use crate::train::loss::CrossEntropyLoss;
     use candle_nn::VarBuilder;

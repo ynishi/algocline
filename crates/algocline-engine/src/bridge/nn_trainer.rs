@@ -1,15 +1,17 @@
-//! `alc.nn.trainer.{run_lora_ft, run_full_ft}` bridge — Layer 5b S2
-//! and Layer 5c S1 Lua binds for the one-call fine-tuning surfaces
-//! (train + save safetensors + write a Card, all in a single call).
+//! `alc.nn.trainer.{run_lora_ft, run_full_ft, run_distill}` bridge —
+//! Layer 5b S2, Layer 5c S1 and Layer 5c S2 Lua binds for the
+//! one-call fine-tuning surfaces (train + save safetensors + write a
+//! Card, all in a single call).
 //!
 //! Extends the pre-existing `alc.nn.trainer` sub-table (populated by
 //! [`super::nn_card::register_nn_card`] with `full_ft` / `lora` /
-//! `distill`, which return a raw Checkpoint table) by adding two
+//! `distill`, which return a raw Checkpoint table) by adding three
 //! sibling entries that return a `card_id` string instead:
 //!
 //! ```text
 //! alc.nn.trainer.run_lora_ft(base_handle, dataset, opts) -> lora_card_id
 //! alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id
+//! alc.nn.trainer.run_distill(student_handle, dataset, opts) -> card_id
 //! ```
 //!
 //! Sibling of Layer 5b S1 [`super::nn_wrap`], which registered the
@@ -82,7 +84,8 @@ use std::sync::Arc;
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch};
 use algocline_nn::train::{
-    run_full_ft, run_lora_ft, CrossEntropyLoss, FullFtConfig, TrainError, TrainingLease,
+    run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss, DistillLossKind, DistillSpec,
+    FullFtConfig, TrainError, TrainingLease,
 };
 use mlua::prelude::*;
 use serde_json::json;
@@ -94,15 +97,13 @@ use super::nn_card::{
     DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle,
 };
 
-/// Register `alc.nn.trainer.{run_lora_ft, run_full_ft}` onto the
-/// pre-existing `alc.nn.trainer` sub-table.
+/// Register `alc.nn.trainer.{run_lora_ft, run_full_ft, run_distill}`
+/// onto the pre-existing `alc.nn.trainer` sub-table.
 ///
 /// Must be called after [`super::nn_card::register_nn_card`] (which
 /// creates the `alc.nn.trainer` sub-table populated with `full_ft` /
-/// `lora` / `distill`) — this call extends that sub-table with two
-/// sibling entries rather than creating a fresh one, so a future
-/// `run_distill` bind (L5c/L5d) can land alongside without a
-/// namespace rename.
+/// `lora` / `distill`) — this call extends that sub-table with three
+/// sibling entries rather than creating a fresh one.
 ///
 /// Signature mirrors the sibling [`super::nn_wrap::register_nn_wrap`]:
 /// take the outer `alc` table and reach into the `nn.trainer`
@@ -137,6 +138,21 @@ pub(super) fn register_nn_trainer(
         },
     )?;
     trainer.set("run_full_ft", run_full_ft)?;
+
+    // L5c S2 sibling: distillation surface. Same shape as run_full_ft
+    // (no LoRA opts, requires a from-scratch student handle) plus the
+    // `loss_kind` opts field; writes a `training_path="distillation"`
+    // Card. Fresh per-call TrainingLease, same as the siblings above.
+    let store_rd = Arc::clone(&card_store);
+    let dir_rd = nn_dir;
+    let run_distill = lua.create_function(
+        move |_lua,
+              (student, dataset, opts): (LuaValue, LuaValue, LuaTable)|
+              -> LuaResult<String> {
+            run_distill_impl(&store_rd, &dir_rd, &student, &dataset, opts)
+        },
+    )?;
+    trainer.set("run_distill", run_distill)?;
 
     Ok(())
 }
@@ -938,20 +954,387 @@ fn train_err_to_lua_ff(e: TrainError) -> LuaError {
     LuaError::external(msg)
 }
 
+// ─── Layer 5c S2 — `alc.nn.trainer.run_distill` ─────────────────────
+//
+// Sibling of [`run_full_ft_impl`] above. Distillation IS a full
+// fine-tune under a distillation loss (the Rust surface
+// [`algocline_nn::train::run_distill`] forwards to `run_full_ft`
+// with the loss selected by [`DistillSpec::loss_kind`]; the teacher
+// signal lives in the dataset, not in a second model instance), so
+// every validation step mirrors `run_full_ft_impl`:
+//
+// - `VarMap` requirement — a `pretrained = true` student is
+//   mmap-backed and carries no `VarMap`; refused with a directional
+//   error.
+// - LoRA-wrapped refusal — distillation trains the *base*
+//   parameters; a wrapped student would silently disagree with the
+//   caller's intent.
+// - Llama refusal — inference-only architecture.
+//
+// Diverges from [`run_full_ft_impl`] on:
+//
+// - `opts.loss_kind` — the distillation-loss selector (`"ce"` today,
+//   the only variant [`DistillLossKind`] exposes). Unknown values
+//   are refused rather than silently falling back to CE.
+// - `training_path = "distillation"` on the written Card (one of
+//   [`algocline_nn::card::SUPPORTED_TRAINING_PATHS`]).
+// - Error prefix `alc.nn.trainer.run_distill:` — one prefix per
+//   surface per design's loud-error contract; extractors are NOT
+//   shared with the siblings above.
+
+/// L5c S2 core. Mirrors [`run_full_ft_impl`] structurally; see the
+/// section header above for the design divergence.
+fn run_distill_impl(
+    store: &FileCardStore,
+    nn_dir: &std::path::Path,
+    student: &LuaValue,
+    dataset: &LuaValue,
+    opts: LuaTable,
+) -> LuaResult<String> {
+    // 1. Reject non-userdata student up front.
+    let student_ud = match student {
+        LuaValue::UserData(u) => u,
+        _ => {
+            return Err(LuaError::external(format!(
+                "alc.nn.trainer.run_distill: expected NnHandle, got {}",
+                student.type_name()
+            )));
+        }
+    };
+
+    // 2. Downcast to NnHandle (arch-neutral) or a typed Handle. Same
+    //    discipline as run_full_ft_impl / run_lora_ft_impl.
+    let handle: NnHandle = if let Ok(nn) = student_ud.borrow::<NnHandle>() {
+        (*nn).clone()
+    } else if let Ok(g) = student_ud.borrow::<Gpt2Handle>() {
+        NnHandle::Gpt2(g.clone())
+    } else if let Ok(t) = student_ud.borrow::<TinyLlamaHandle>() {
+        NnHandle::TinyLlama(t.clone())
+    } else if let Ok(l) = student_ud.borrow::<LlamaHandle>() {
+        NnHandle::Llama(l.clone())
+    } else {
+        return Err(LuaError::external(
+            "alc.nn.trainer.run_distill: expected NnHandle, got unknown userdata \
+             (Gpt2Handle / TinyLlamaHandle / LlamaHandle also accepted)",
+        ));
+    };
+
+    // 3. Refuse already-wrapped handles — distillation trains the
+    //    base parameters (design divergence bullet above).
+    if handle.is_lora_wrapped() {
+        return Err(LuaError::external(
+            "alc.nn.trainer.run_distill: expected base (unwrapped) NnHandle; \
+             drop the wrap first (a LoRA-wrapped handle is a LoRA-training \
+             target, not a distillation student)",
+        ));
+    }
+
+    // 4. Refuse Llama (inference-only). Directional error, same as
+    //    the siblings.
+    if let NnHandle::Llama(_) = handle {
+        return Err(LuaError::external(format!(
+            "alc.nn.trainer.run_distill: architecture {} is not trainable \
+             (only gpt2 / tinyllama families are supported)",
+            handle.arch()
+        )));
+    }
+
+    // 5. Dataset downcast to the shared DatasetHandle userdata.
+    let dataset_ud = match dataset {
+        LuaValue::UserData(u) => u,
+        _ => {
+            return Err(LuaError::external(format!(
+                "alc.nn.trainer.run_distill: dataset must be an alc.nn.dataset \
+                 (got {})",
+                dataset.type_name()
+            )));
+        }
+    };
+    if dataset_ud.borrow::<DatasetHandle>().is_err() {
+        return Err(LuaError::external(
+            "alc.nn.trainer.run_distill: dataset must be an alc.nn.dataset \
+             (got unknown userdata)",
+        ));
+    }
+
+    // 6. Extract + validate train opts and the distillation-loss
+    //    selector (pre-flight so a misconfigured caller sees a
+    //    Lua-shaped error rather than a candle back-trace).
+    let train_cfg = extract_train_cfg_rd(&opts)?;
+    let loss_kind = extract_distill_loss_kind_rd(&opts)?;
+    let spec = DistillSpec {
+        hyperparams: train_cfg,
+        loss_kind,
+    };
+
+    // 7. Pre-generate card_id (mirrors run_full_ft_impl step 7).
+    let name: Option<String> = opts.get("name")?;
+    let name_base = name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("run_distill");
+    let card_id = format!("{}_{}", sanitize_name(name_base), compact_epoch_us());
+
+    // 8. Derive architecture BEFORE any lock (immutable handle field
+    //    lookup outside the training-loop critical section).
+    let architecture = handle.arch_family_variant();
+
+    // 9. Fresh per-call TrainingLease (design §0, matches the
+    //    siblings).
+    let lease = Arc::new(TrainingLease::new());
+
+    // 10. Dispatch on NnHandle variant into the generic
+    //     `run_distill::<M>`. `ckpt_prefix = card_id` pins the final
+    //     safetensors to `<nn_dir>/<card_id>.safetensors`, same as
+    //     run_full_ft (the underlying loop IS run_full_ft).
+    let ckpt = match &handle {
+        NnHandle::Gpt2(gpt2) => {
+            let vm_arc = gpt2.varmap().ok_or_else(|| {
+                LuaError::external(
+                    "alc.nn.trainer.run_distill: handle was built with \
+                     pretrained=true; distillation requires a from-scratch \
+                     student handle (pretrained=false)",
+                )
+            })?;
+            let model_arc = gpt2.model();
+            let ds_handle = dataset_ud.borrow_mut::<DatasetHandle>()?;
+            let mut ds_lock = ds_handle.inner_lock()?;
+
+            let model = model_arc.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.trainer.run_distill: model lock: {e}"))
+            })?;
+
+            let result = run_distill(
+                &*model,
+                &vm_arc,
+                ds_lock.as_mut(),
+                &spec,
+                nn_dir,
+                &card_id,
+                Arc::clone(&lease),
+            );
+            drop(model);
+            drop(ds_lock);
+            drop(ds_handle);
+
+            result.map_err(train_err_to_lua_rd)?
+        }
+        NnHandle::TinyLlama(tll) => {
+            let vm_arc = tll.varmap().ok_or_else(|| {
+                LuaError::external(
+                    "alc.nn.trainer.run_distill: handle was built with \
+                     pretrained=true; distillation requires a from-scratch \
+                     student handle (pretrained=false)",
+                )
+            })?;
+            let model_arc = tll.model();
+            let ds_handle = dataset_ud.borrow_mut::<DatasetHandle>()?;
+            let mut ds_lock = ds_handle.inner_lock()?;
+
+            let model = model_arc.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn.trainer.run_distill: model lock: {e}"))
+            })?;
+
+            let result = run_distill(
+                &*model,
+                &vm_arc,
+                ds_lock.as_mut(),
+                &spec,
+                nn_dir,
+                &card_id,
+                Arc::clone(&lease),
+            );
+            drop(model);
+            drop(ds_lock);
+            drop(ds_handle);
+
+            result.map_err(train_err_to_lua_rd)?
+        }
+        NnHandle::Llama(_) => {
+            // Guarded at step 4 above; kept as `unreachable!` so a
+            // future refactor that reorders steps trips the assertion
+            // rather than silently invoking a non-existent train path.
+            unreachable!("Llama variant guarded above")
+        }
+    };
+
+    // 11. Build the typed NnCardMeta payload and persist the Card.
+    //     Distillation carries NO LoRA branch; `loss_kind` rides on
+    //     `hyperparams` so the run's loss selection is auditable
+    //     from the Card.
+    let candle = NnCandleBranch {
+        bundle_ref: format!("nn/{card_id}"),
+        device: None,
+        dtype: None,
+        lora: None,
+    };
+
+    let loss_kind_str = match spec.loss_kind {
+        DistillLossKind::Ce => "ce",
+    };
+
+    let meta = NnCardMeta {
+        name: name_base.to_string(),
+        backend: "candle".into(),
+        task: None,
+        architecture,
+        training_path: "distillation".into(),
+        lineage: NnLineage::default(),
+        hyperparams: json!({
+            "lr": spec.hyperparams.lr,
+            "batch": spec.hyperparams.batch_size,
+            "steps": spec.hyperparams.steps,
+            "warmup": spec.hyperparams.warmup,
+            "loss_kind": loss_kind_str,
+        }),
+        metrics: json!({
+            "train_loss": ckpt.train_loss,
+            "step": ckpt.step,
+        }),
+        candle: Some(candle),
+    };
+
+    let payload = build_create_payload_from_meta(&card_id, &meta)?;
+
+    let (returned_id, _path) = store
+        .create(payload)
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: card store: {e}")))?;
+
+    if returned_id != card_id {
+        return Err(LuaError::external(format!(
+            "alc.nn.trainer.run_distill: card_id mismatch (expected \
+             {card_id}, got {returned_id})"
+        )));
+    }
+
+    // `ckpt.bundle_ref` unused on purpose — same rationale as
+    // run_full_ft_impl (consumers only see the Card id; the on-disk
+    // path is fixed by the `<nn_dir>/<card_id>.safetensors`
+    // convention).
+    let _ = ckpt.bundle_ref;
+
+    Ok(card_id)
+}
+
+/// Extract a validated [`FullFtConfig`] from `opts` for the
+/// `run_distill` surface.
+///
+/// Same field-set and validation rules as [`extract_train_cfg_ff`],
+/// but every error carries the `alc.nn.trainer.run_distill:` prefix
+/// per design's loud-error contract (one prefix per surface). The
+/// extractors are intentionally duplicated so a future divergence of
+/// the training-config schema between surfaces stays local to one
+/// extractor.
+fn extract_train_cfg_rd(opts: &LuaTable) -> LuaResult<FullFtConfig> {
+    let lr: Option<f64> = opts.get("lr")?;
+    let lr = lr.filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.run_distill: opts.lr must be a positive number")
+    })?;
+
+    let batch: Option<i64> = opts.get("batch")?;
+    let batch = batch.filter(|v| *v > 0).ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.run_distill: opts.batch must be a positive integer")
+    })? as usize;
+
+    let steps: Option<i64> = opts.get("steps")?;
+    let steps = steps.filter(|v| *v > 0).ok_or_else(|| {
+        LuaError::external("alc.nn.trainer.run_distill: opts.steps must be a positive integer")
+    })? as usize;
+
+    let warmup = match opts.get::<Option<i64>>("warmup")? {
+        Some(v) if v < 0 => {
+            return Err(LuaError::external(
+                "alc.nn.trainer.run_distill: opts.warmup must be >= 0",
+            ));
+        }
+        Some(v) => v as usize,
+        None => 0,
+    };
+
+    let schedule_canonical = match opts
+        .get::<Option<String>>("schedule")?
+        .as_deref()
+        .unwrap_or("CosineWithWarmup")
+    {
+        "CosineWithWarmup" => "cosine_with_warmup",
+        "Constant" => "constant",
+        other => {
+            return Err(LuaError::external(format!(
+                "alc.nn.trainer.run_distill: opts.schedule must be one of \
+                 \"CosineWithWarmup\" / \"Constant\" (got {other:?})"
+            )));
+        }
+    };
+
+    // Canonicalise design §1.2 field names into the shared
+    // extractor's naming convention, then delegate. Mutating
+    // `opts` in place is safe: the caller-supplied table is a
+    // per-invocation value.
+    opts.set("lr", lr)?;
+    opts.set("batch_size", batch as i64)?;
+    opts.set("steps", steps as i64)?;
+    opts.set("warmup", warmup as i64)?;
+    opts.set("schedule", schedule_canonical.to_string())?;
+
+    extract_full_ft_opts(Some(opts))
+}
+
+/// Extract the distillation-loss selector from `opts.loss_kind`.
+///
+/// Mirrors the pre-existing `alc.nn.trainer.distill` extractor in
+/// [`super::nn_card`] but under the `run_distill` error prefix (one
+/// prefix per surface). Missing key defaults to `"ce"`; unknown
+/// values are refused rather than silently falling back — silent
+/// fallback would hide a misconfigured caller.
+fn extract_distill_loss_kind_rd(opts: &LuaTable) -> LuaResult<DistillLossKind> {
+    let raw = opts
+        .get::<Option<String>>("loss_kind")?
+        .unwrap_or_else(|| "ce".to_string());
+    match raw.as_str() {
+        "ce" => Ok(DistillLossKind::Ce),
+        other => Err(LuaError::external(format!(
+            "alc.nn.trainer.run_distill: unknown loss_kind '{other}' (expected 'ce')"
+        ))),
+    }
+}
+
+/// Translate a [`TrainError`] into a `run_distill`-prefixed Lua
+/// error. Mirrors [`train_err_to_lua_ff`] structurally; diverges only
+/// on the surface prefix per design's loud-error contract.
+fn train_err_to_lua_rd(e: TrainError) -> LuaError {
+    let msg = match e {
+        TrainError::ZeroSteps => "alc.nn.trainer.run_distill: zero steps".to_string(),
+        TrainError::LeaseHeld => {
+            "alc.nn.trainer.run_distill: training lease already active on this VM".to_string()
+        }
+        TrainError::DatasetExhausted { seen, requested } => format!(
+            "alc.nn.trainer.run_distill: dataset exhausted after {seen} steps \
+             (requested {requested})"
+        ),
+        TrainError::Ckpt(inner) => {
+            format!("alc.nn.trainer.run_distill: checkpoint: {inner}")
+        }
+        TrainError::Candle(inner) => {
+            format!("alc.nn.trainer.run_distill: candle: {inner}")
+        }
+        other => format!("alc.nn.trainer.run_distill: {other}"),
+    };
+    LuaError::external(msg)
+}
+
 #[cfg(test)]
 mod run_ft_bridge_tests {
-    //! Layer 5b S2 + Layer 5c S1 — bridge integration tests for
-    //! `alc.nn.trainer.{run_lora_ft, run_full_ft}`.
+    //! Layer 5b S2 + Layer 5c S1/S2 — bridge integration tests for
+    //! `alc.nn.trainer.{run_lora_ft, run_full_ft, run_distill}`.
     //!
     //! run_lora_ft coverage (Axes A3/A4/B6/B7/C1-C3/D1/D2):
-    //! GPT-2 + TinyLlama happy paths (arch dispatch + on-disk Card
-    //! + Δ safetensors + payload shape).
-    //! Axis B6/B7 exercise config schema refusals unique to the
-    //! trainer (steps / schedule). Axis C1-C3 exercise state
-    //! invariants that only become verifiable post-train
-    //! (base-freeze, Δ var-count, cross-surface `load_wrap`
-    //! consumption). Axis D1/D2 exercise the Card + Δ round-trip
-    //! through `alc.nn.card.load_wrap`.
+    //! GPT-2 + TinyLlama happy paths (arch dispatch + on-disk Card +
+    //! Δ safetensors + payload shape). Axis B6/B7 exercise config
+    //! schema refusals unique to the trainer (steps / schedule).
+    //! Axis C1-C3 exercise state invariants that only become
+    //! verifiable post-train (base-freeze, Δ var-count, cross-surface
+    //! `load_wrap` consumption). Axis D1/D2 exercise the Card + Δ
+    //! round-trip through `alc.nn.card.load_wrap`.
     //!
     //! All tests use the CPU/F32 `gpt2-tiny` / `tinyllama-tiny`
     //! micro shapes — same discipline as `nn_card::merge_lora_bridge_tests`
@@ -1517,6 +1900,175 @@ mod run_ft_bridge_tests {
         assert!(
             msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("drop the wrap first"),
             "expected wrapped-handle refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_refuses_pretrained_handle() {
+        // Axis B2 — a varmap-less handle (the state a
+        // `pretrained = true` build lands in) must be refused with
+        // the directional error through the full dispatch path.
+        // `for_test_pretrained_like` strips the VarMap off a
+        // from-scratch handle so no HF hub download is needed.
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let pretrained_like = base.for_test_pretrained_like();
+        let base_ud = lua
+            .create_userdata(NnHandle::Gpt2(pretrained_like))
+            .unwrap();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("pretrained=true"),
+            "expected pretrained refusal, got: {msg}"
+        );
+    }
+
+    // ─── L5c S2 — `alc.nn.trainer.run_distill` bridge tests ────────
+    //
+    // Axis mirrors the run_full_ft coverage above:
+    // - A1/A2: GPT-2 + TinyLlama happy paths (arch dispatch,
+    //   on-disk safetensors, Card `training_path="distillation"`
+    //   shape + `loss_kind` in hyperparams).
+    // - B1: refuse unknown `loss_kind` (the schema field unique to
+    //   this surface).
+    // - B2: refuse pretrained=true (varmap-less) student handle.
+
+    #[test]
+    fn run_distill_gpt2_happy_path_writes_distillation_card() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let card_id = run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_distill");
+
+        // Safetensors on disk at `<nn_dir>/<card_id>.safetensors`
+        // (run_distill forwards to run_full_ft, same `save_final`
+        // convention).
+        let ckpt_path = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(
+            ckpt_path.exists(),
+            "distill safetensors must exist at {ckpt_path:?}"
+        );
+
+        // Card metadata: training_path / architecture / loss_kind /
+        // no LoRA branch.
+        let card = store.get(&card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(
+            nn.get("training_path").unwrap().as_str().unwrap(),
+            "distillation"
+        );
+        assert_eq!(
+            nn.get("architecture").unwrap().as_str().unwrap(),
+            "gpt2-tiny"
+        );
+        assert_eq!(
+            nn.get("hyperparams")
+                .and_then(|h| h.get("loss_kind"))
+                .and_then(|l| l.as_str())
+                .unwrap(),
+            "ce"
+        );
+        let candle = nn.get("candle").unwrap();
+        assert_eq!(
+            candle.get("bundle_ref").unwrap().as_str().unwrap(),
+            format!("nn/{card_id}")
+        );
+        let lora = candle.get("lora");
+        assert!(
+            lora.is_none() || lora.unwrap().is_null(),
+            "distillation Card must not carry a LoRA branch; got: {lora:?}"
+        );
+    }
+
+    #[test]
+    fn run_distill_tinyllama_happy_path_writes_distillation_card() {
+        let (_tmp, store, nn_dir, base, lua) = setup_tinyllama_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let card_id = run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_distill");
+
+        let ckpt_path = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(ckpt_path.exists());
+
+        let card = store.get(&card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(
+            nn.get("training_path").unwrap().as_str().unwrap(),
+            "distillation"
+        );
+        assert_eq!(
+            nn.get("architecture").unwrap().as_str().unwrap(),
+            "tinyllama-tiny"
+        );
+    }
+
+    #[test]
+    fn run_distill_refuses_unknown_loss_kind() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+        let mut o = base_full_ft_opts();
+        o["loss_kind"] = json!("kl");
+        let opts = opts_table(&lua, o);
+        let msg = expect_err(run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_distill:")
+                && msg.contains("loss_kind")
+                && msg.contains("kl"),
+            "expected loss_kind error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_distill_refuses_pretrained_handle() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let pretrained_like = base.for_test_pretrained_like();
+        let base_ud = lua
+            .create_userdata(NnHandle::Gpt2(pretrained_like))
+            .unwrap();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_distill:") && msg.contains("pretrained=true"),
+            "expected pretrained refusal, got: {msg}"
         );
     }
 }

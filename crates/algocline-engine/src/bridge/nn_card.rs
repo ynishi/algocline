@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{LlamaAdapter, LlamaAdapterConfig};
-use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig};
+use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig, TinyLlamaModel};
 use algocline_nn::card::{
     validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
 };
@@ -736,6 +736,64 @@ impl LlamaHandle {
     #[allow(dead_code)]
     pub(super) fn adapter(&self) -> Arc<LlamaAdapter> {
         Arc::clone(&self.inner)
+    }
+}
+
+/// Trainable Lua-side handle for [`TinyLlamaModel`].
+///
+/// Mirrors [`Gpt2Handle`]'s shape (fields + UserData methods) — the
+/// only structural difference is the extra `kv_heads` field for GQA.
+/// `varmap` semantics are identical: `Some` for `pretrained=false`
+/// (from-scratch build, trainer bindings can use it), `None` for
+/// `pretrained=true` (mmap-backed VarBuilder load, trainer bindings
+/// that need a `VarMap` error out cleanly).
+pub(super) struct TinyLlamaHandle {
+    inner: Arc<Mutex<TinyLlamaModel>>,
+    varmap: Option<Arc<VarMap>>,
+    variant: String,
+    layers: usize,
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+    ctx: usize,
+    vocab: usize,
+    device: String,
+    dtype: String,
+    pretrained: bool,
+}
+
+impl mlua::UserData for TinyLlamaHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("variant", |_, this, ()| Ok(this.variant.clone()));
+        methods.add_method("layers", |_, this, ()| Ok(this.layers));
+        methods.add_method("heads", |_, this, ()| Ok(this.heads));
+        methods.add_method("kv_heads", |_, this, ()| Ok(this.kv_heads));
+        methods.add_method("dim", |_, this, ()| Ok(this.dim));
+        methods.add_method("ctx", |_, this, ()| Ok(this.ctx));
+        methods.add_method("vocab", |_, this, ()| Ok(this.vocab));
+        methods.add_method("device", |_, this, ()| Ok(this.device.clone()));
+        methods.add_method("dtype", |_, this, ()| Ok(this.dtype.clone()));
+        methods.add_method("pretrained", |_, this, ()| Ok(this.pretrained));
+        methods.add_method("forward_shape", |_, this, (batch, seq): (usize, usize)| {
+            Ok(vec![batch, seq, this.vocab])
+        });
+    }
+}
+
+impl TinyLlamaHandle {
+    /// Shared handle to the underlying model; mirrors
+    /// [`Gpt2Handle::model`].
+    #[allow(dead_code)]
+    pub(super) fn model(&self) -> Arc<Mutex<TinyLlamaModel>> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Shared handle to the model's `VarMap`, if constructed from
+    /// scratch. Returns `None` for `pretrained = true` handles;
+    /// mirrors [`Gpt2Handle::varmap`].
+    #[allow(dead_code)]
+    pub(super) fn varmap(&self) -> Option<Arc<VarMap>> {
+        self.varmap.as_ref().map(Arc::clone)
     }
 }
 
@@ -1792,6 +1850,156 @@ fn checkpoint_to_lua(
         out.set("lora", lora)?;
     }
     Ok(out)
+}
+
+/// Arch-neutral handle union (Layer 4b §Q1-A).
+///
+/// Wraps the three per-arch typed handles under a single UserData
+/// so `alc.nn.preset(arch, variant, opts)` /
+/// `alc.nn.card.load(card_id)` / `alc.nn.card.load_wrap(card_id,
+/// base)` can hand Lua a uniform handle regardless of the
+/// underlying arch. Method dispatch inside
+/// `impl mlua::UserData for NnHandle` fans out to the wrapped
+/// typed handle's accessor.
+///
+/// Existing typed entries (`alc.nn.preset.gpt2` /
+/// `alc.nn.card.load_gpt2`) continue to return the typed handle
+/// directly for backward compat — the trainer bindings still
+/// borrow those typed handles from `LuaAnyUserData` and their
+/// migration to accept `NnHandle` is a follow-up (Layer 4b §8).
+///
+/// New arch = add an enum variant + a match arm to every dispatch
+/// method + register the arch in `ARCH_OPS` (§Q4-A) + add a
+/// per-arch `build_*_handle` helper. Three grep-able edit sites.
+#[allow(dead_code)]
+pub(super) enum NnHandle {
+    /// GPT-2 (trainable, MHA).
+    Gpt2(Gpt2Handle),
+    /// TinyLlama (trainable, GQA).
+    TinyLlama(TinyLlamaHandle),
+    /// Llama adapter (inference-only, GQA — different execution
+    /// model, held here for symmetry per §1 non-goal / §8 carry).
+    Llama(LlamaHandle),
+}
+
+impl NnHandle {
+    /// Architecture family prefix (`"gpt2"` / `"tinyllama"` /
+    /// `"llama"`) matching the first-column entries in
+    /// [`algocline_nn::card::SUPPORTED_ARCHITECTURE_FAMILIES`].
+    #[allow(dead_code)]
+    pub(super) fn arch(&self) -> &'static str {
+        match self {
+            Self::Gpt2(_) => "gpt2",
+            Self::TinyLlama(_) => "tinyllama",
+            Self::Llama(_) => "llama",
+        }
+    }
+
+    /// Typed downcast to the underlying [`Gpt2Handle`], if this
+    /// variant is `Gpt2`. Bridge fns that need to reach a
+    /// trainer-compatible typed handle use this.
+    #[allow(dead_code)]
+    pub(super) fn as_gpt2(&self) -> Option<&Gpt2Handle> {
+        match self {
+            Self::Gpt2(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Typed downcast to the underlying [`TinyLlamaHandle`].
+    #[allow(dead_code)]
+    pub(super) fn as_tinyllama(&self) -> Option<&TinyLlamaHandle> {
+        match self {
+            Self::TinyLlama(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Typed downcast to the underlying [`LlamaHandle`].
+    #[allow(dead_code)]
+    pub(super) fn as_llama(&self) -> Option<&LlamaHandle> {
+        match self {
+            Self::Llama(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
+impl mlua::UserData for NnHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("arch", |_, this, ()| Ok(this.arch()));
+
+        methods.add_method("variant", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.variant.clone()),
+            NnHandle::TinyLlama(h) => Ok(h.variant.clone()),
+            NnHandle::Llama(h) => Ok(h.variant.clone()),
+        });
+        methods.add_method("layers", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.layers),
+            NnHandle::TinyLlama(h) => Ok(h.layers),
+            NnHandle::Llama(h) => Ok(h.layers),
+        });
+        methods.add_method("heads", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.heads),
+            NnHandle::TinyLlama(h) => Ok(h.heads),
+            NnHandle::Llama(h) => Ok(h.heads),
+        });
+        // `kv_heads` — GPT-2 is MHA, so `kv_heads == heads`; the two
+        // GQA variants (TinyLlama, Llama) carry the real value.
+        // Returning `heads` for the GPT-2 arm keeps Lua callers from
+        // having to arch-branch when they only want the KV group
+        // count for a shape assertion.
+        methods.add_method("kv_heads", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.heads),
+            NnHandle::TinyLlama(h) => Ok(h.kv_heads),
+            NnHandle::Llama(h) => Ok(h.kv_heads),
+        });
+        methods.add_method("dim", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.dim),
+            NnHandle::TinyLlama(h) => Ok(h.dim),
+            NnHandle::Llama(h) => Ok(h.dim),
+        });
+        methods.add_method("ctx", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.ctx),
+            NnHandle::TinyLlama(h) => Ok(h.ctx),
+            NnHandle::Llama(h) => Ok(h.ctx),
+        });
+        methods.add_method("vocab", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.vocab),
+            NnHandle::TinyLlama(h) => Ok(h.vocab),
+            NnHandle::Llama(h) => Ok(h.vocab),
+        });
+        methods.add_method("device", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.device.clone()),
+            NnHandle::TinyLlama(h) => Ok(h.device.clone()),
+            NnHandle::Llama(h) => Ok(h.device.clone()),
+        });
+        methods.add_method("dtype", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.dtype.clone()),
+            NnHandle::TinyLlama(h) => Ok(h.dtype.clone()),
+            NnHandle::Llama(h) => Ok(h.dtype.clone()),
+        });
+        // `pretrained` — Gpt2 / TinyLlama carry the flag; Llama
+        // adapter is inference-only and always loads pretrained
+        // weights, so `true` is the honest default.
+        methods.add_method("pretrained", |_, this, ()| match this {
+            NnHandle::Gpt2(h) => Ok(h.pretrained),
+            NnHandle::TinyLlama(h) => Ok(h.pretrained),
+            NnHandle::Llama(_) => Ok(true),
+        });
+        // `forward_shape` — trainable arches (Gpt2 / TinyLlama)
+        // return `[batch, seq, vocab]`; the Llama adapter slices
+        // the last-token logits and returns `[batch, vocab]`.
+        // Shape difference is arch-visible; Lua callers that care
+        // can consult `handle:arch()` first.
+        methods.add_method("forward_shape", |_, this, (batch, seq): (usize, usize)| {
+            match this {
+                NnHandle::Gpt2(h) => Ok(vec![batch, seq, h.vocab]),
+                NnHandle::TinyLlama(h) => Ok(vec![batch, seq, h.vocab]),
+                NnHandle::Llama(h) => Ok(vec![batch, h.vocab]),
+            }
+        });
+    }
 }
 
 #[cfg(test)]

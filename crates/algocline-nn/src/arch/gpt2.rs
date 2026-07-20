@@ -22,38 +22,14 @@
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
 use candle_nn::{
-    embedding, layer_norm, linear, ops, Embedding, LayerNorm, Linear, Module, VarBuilder, VarMap,
+    embedding, layer_norm, linear, ops, Embedding, LayerNorm, Module, VarBuilder, VarMap,
 };
 
-use super::lora::{LoraConfig, LoraLinear};
-
-/// A linear projection inside a GPT-2 [`Block`], possibly wrapped with a
-/// LoRA additive update.
-///
-/// The `Plain` variant carries a frozen `candle_nn::Linear` (either the
-/// initial random init built by [`Block::new`] or a pretrained weight
-/// loaded via [`Gpt2Model::from_pretrained`]). The `Lora` variant
-/// wraps the same base linear with two low-rank matrices (see
-/// [`LoraLinear`]).
-///
-/// `LinearVariant` implements [`Module`] via a `match` in `forward`, so
-/// the block's forward code path stays uniform whether or not a LoRA
-/// wrap has been applied.
-pub(crate) enum LinearVariant {
-    /// Plain frozen linear.
-    Plain(Linear),
-    /// Base + rank-r additive update.
-    Lora(LoraLinear),
-}
-
-impl Module for LinearVariant {
-    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        match self {
-            Self::Plain(l) => l.forward(xs),
-            Self::Lora(l) => l.forward(xs),
-        }
-    }
-}
+// `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
+// wrap_lora docs below; the wrap helper itself lives in `arch::lora` since
+// TinyLlama needs the same swap-in-place idiom.
+#[allow(unused_imports)]
+use super::lora::{wrap_variant_in_place, LinearVariant, LoraConfig, LoraLinear};
 
 /// Which projections inside a [`Block`] the caller wants LoRA-wrapped.
 #[derive(Debug, Clone, Copy)]
@@ -68,38 +44,6 @@ struct WrapFlags {
     up: bool,
     /// Wrap the MLP down-projection (`mlp.c_proj`).
     down: bool,
-}
-
-/// Move the `Plain` linear currently in `v` into a fresh
-/// [`LoraLinear::wrap`] and put the resulting wrap back into `v`.
-///
-/// Fails with a clear message when `v` is already `Lora` (double-wrap
-/// is a caller programming error, not a silent no-op).
-fn wrap_variant_in_place(
-    v: &mut LinearVariant,
-    cfg: &LoraConfig,
-    vs: VarBuilder,
-) -> CandleResult<()> {
-    // We need to take ownership of the current `Plain(Linear)` value to
-    // hand it to `LoraLinear::wrap`, which takes the base by value.
-    // `std::mem::replace` with a cheap placeholder Linear achieves this
-    // without requiring `LinearVariant: Default`. The placeholder is
-    // dropped as soon as the new wrap is written back.
-    let placeholder = LinearVariant::Plain(Linear::new(
-        Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
-        None,
-    ));
-    let old = std::mem::replace(v, placeholder);
-    let base = match old {
-        LinearVariant::Plain(l) => l,
-        LinearVariant::Lora(_) => {
-            return Err(candle_core::Error::Msg(
-                "wrap_variant_in_place: layer is already LoRA-wrapped".into(),
-            ));
-        }
-    };
-    *v = LinearVariant::Lora(LoraLinear::wrap(base, cfg.clone(), vs)?);
-    Ok(())
 }
 
 /// Canonical GPT-2 target-module names accepted by

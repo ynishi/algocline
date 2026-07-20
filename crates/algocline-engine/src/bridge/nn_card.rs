@@ -721,33 +721,139 @@ fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaRes
     Ok(())
 }
 
-/// Arch-neutral preset entry — dispatches by family prefix + wraps
-/// the resulting typed handle in `NnHandle`. Layer 4b §Q2-A / §Q4
-/// pre-`ARCH_OPS` shape (S3 folds this dispatch into the static
-/// table).
+/// Arch-neutral preset entry — dispatches via `ARCH_OPS` and wraps
+/// the resulting typed handle in `NnHandle`. Layer 4b §Q2-A / §Q4-A.
 fn build_neutral_preset(
     arch: &str,
     variant: &str,
     opts: Option<&LuaTable>,
     nn_dir: &std::path::Path,
 ) -> LuaResult<NnHandle> {
-    // Match on the arch family prefix. `SUPPORTED_ARCHITECTURE_FAMILIES`
-    // is the canonical list; three of the six have bridge presets
-    // today (gpt2 / tinyllama / llama). The other three (qwen2 /
-    // phi / gemma) return a "not-yet-registered" error until their
-    // per-arch build helper lands.
-    match arch {
-        "gpt2" => build_gpt2_handle(variant, opts, nn_dir).map(NnHandle::Gpt2),
-        "tinyllama" => build_tinyllama_handle(variant, opts, nn_dir).map(NnHandle::TinyLlama),
-        "llama" => build_llama_handle(variant, opts).map(NnHandle::Llama),
-        other => Err(LuaError::external(format!(
-            "alc.nn.preset: arch '{other}' not registered \
-             (expected one of 'gpt2' / 'tinyllama' / 'llama'); \
-             qwen2 / phi / gemma are declared in \
+    let ops = resolve_arch_ops(arch).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.preset: arch '{arch}' not registered \
+             (expected one of {}); qwen2 / phi / gemma are declared in \
              SUPPORTED_ARCHITECTURE_FAMILIES but do not yet have a \
-             bridge preset entry"
-        ))),
+             bridge preset entry",
+            registered_arch_names().join(" / ")
+        ))
+    })?;
+    (ops.build_preset)(variant, opts, nn_dir)
+}
+
+/// Per-arch bridge operations dispatched at runtime by arch family
+/// prefix. Layer 4b §Q4-A: a static `&[(family_prefix, ArchOps)]`
+/// table lives in this file; each entry is a set of function
+/// pointers the neutral Lua entries call.
+///
+/// Adding a new arch = new tuple in [`ARCH_OPS`] + new
+/// `build_<arch>_handle` (preset) + new `load_<arch>_from_card`
+/// (S4 self-contained) + new `wrap_<arch>_lora_from_card` (S5
+/// wrap). All function pointers are `fn`-typed (not `Fn` closures)
+/// so registration stays purely `const` — no dynamic allocation
+/// per invocation.
+///
+/// The `build_from_safetensors` / `build_from_wrap` slots are
+/// `None` for arches without a card-load path yet (currently
+/// `llama-adapter` is preset-only; TinyLlama full card-load
+/// wiring lands in S4/S5).
+struct ArchOps {
+    build_preset: fn(&str, Option<&LuaTable>, &std::path::Path) -> LuaResult<NnHandle>,
+    #[allow(dead_code)]
+    build_from_safetensors:
+        Option<fn(&NnCardMeta, &std::path::Path) -> LuaResult<NnHandle>>,
+    #[allow(dead_code)]
+    build_from_wrap:
+        Option<fn(&NnCardMeta, &NnHandle) -> LuaResult<NnHandle>>,
+}
+
+const ARCH_OPS: &[(&str, ArchOps)] = &[
+    (
+        "gpt2",
+        ArchOps {
+            build_preset: preset_gpt2_neutral,
+            build_from_safetensors: None,
+            build_from_wrap: None,
+        },
+    ),
+    (
+        "tinyllama",
+        ArchOps {
+            build_preset: preset_tinyllama_neutral,
+            build_from_safetensors: None,
+            build_from_wrap: None,
+        },
+    ),
+    (
+        "llama",
+        ArchOps {
+            build_preset: preset_llama_neutral,
+            build_from_safetensors: None,
+            build_from_wrap: None,
+        },
+    ),
+];
+
+/// Resolve `arch` (e.g. `"gpt2"` or `"gpt2-medium"`) to its
+/// [`ArchOps`] entry via family-prefix match against [`ARCH_OPS`].
+/// Layer 4b §Q4-A. Returns `None` for arches not registered on the
+/// bridge yet.
+///
+/// Matching rules mirror
+/// [`algocline_nn::card::validate_architecture`]: bare family name
+/// or `<family>-<variant>` (a `-` boundary) both count. A longer
+/// identifier that merely starts with a family name (e.g.
+/// `"gpt2experimental"`) does NOT match — the namespace stays
+/// partitioned.
+fn resolve_arch_ops(arch: &str) -> Option<&'static ArchOps> {
+    for (family, ops) in ARCH_OPS {
+        if arch == *family {
+            return Some(ops);
+        }
+        if let Some(rest) = arch.strip_prefix(*family) {
+            if rest.starts_with('-') {
+                return Some(ops);
+            }
+        }
     }
+    None
+}
+
+/// Registered arch family names (for error messages).
+fn registered_arch_names() -> Vec<&'static str> {
+    ARCH_OPS.iter().map(|(name, _)| *name).collect()
+}
+
+// ─── ArchOps.build_preset adapters ────────────────────────────────
+// Each adapter converts the arch-specific typed-handle builder into
+// the uniform `fn(&str, Option<&LuaTable>, &Path) -> LuaResult<NnHandle>`
+// signature the static table expects.
+
+fn preset_gpt2_neutral(
+    variant: &str,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    build_gpt2_handle(variant, opts, nn_dir).map(NnHandle::Gpt2)
+}
+
+fn preset_tinyllama_neutral(
+    variant: &str,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    build_tinyllama_handle(variant, opts, nn_dir).map(NnHandle::TinyLlama)
+}
+
+fn preset_llama_neutral(
+    variant: &str,
+    opts: Option<&LuaTable>,
+    _nn_dir: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    // Llama adapter does not consume `nn_dir` (its weights are
+    // resolved from `opts.weights` — see `build_llama_handle`).
+    // Accepted here for signature uniformity.
+    build_llama_handle(variant, opts).map(NnHandle::Llama)
 }
 
 // ─── alc.nn.preset.llama ──────────────────────────────────────────
@@ -2131,6 +2237,65 @@ impl mlua::UserData for NnHandle {
                 NnHandle::Llama(h) => Ok(vec![batch, h.vocab]),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod arch_ops_tests {
+    use super::*;
+    use algocline_nn::card::SUPPORTED_ARCHITECTURE_FAMILIES;
+
+    /// Every entry in [`ARCH_OPS`] must appear in
+    /// [`SUPPORTED_ARCHITECTURE_FAMILIES`] — the bridge cannot
+    /// register an arch the crate-side canonical list does not
+    /// recognise. Layer 4b §Q4-A invariant #6.
+    #[test]
+    fn arch_ops_entries_are_all_canonical_families() {
+        for (name, _) in ARCH_OPS {
+            assert!(
+                SUPPORTED_ARCHITECTURE_FAMILIES.contains(name),
+                "ARCH_OPS entry {name:?} is not in SUPPORTED_ARCHITECTURE_FAMILIES {SUPPORTED_ARCHITECTURE_FAMILIES:?}"
+            );
+        }
+    }
+
+    /// `resolve_arch_ops` accepts both the bare family name
+    /// (`"gpt2"`) and the `<family>-<variant>` form
+    /// (`"gpt2-medium"`), matching
+    /// [`algocline_nn::card::validate_architecture`]'s discipline.
+    /// A longer identifier that merely shares a prefix
+    /// (`"gpt2experimental"`) does NOT match — the namespace stays
+    /// partitioned.
+    #[test]
+    fn resolve_arch_ops_matches_bare_and_variant_forms() {
+        assert!(resolve_arch_ops("gpt2").is_some());
+        assert!(resolve_arch_ops("gpt2-medium").is_some());
+        assert!(resolve_arch_ops("tinyllama").is_some());
+        assert!(resolve_arch_ops("tinyllama-1.1b").is_some());
+        assert!(resolve_arch_ops("llama").is_some());
+        assert!(resolve_arch_ops("llama-7b").is_some());
+    }
+
+    #[test]
+    fn resolve_arch_ops_rejects_prefix_only_matches() {
+        assert!(resolve_arch_ops("gpt2experimental").is_none());
+        assert!(resolve_arch_ops("tinyllamafork").is_none());
+    }
+
+    #[test]
+    fn resolve_arch_ops_rejects_unregistered_families() {
+        // Declared in SUPPORTED_ARCHITECTURE_FAMILIES but no
+        // bridge preset yet — these return None until per-arch
+        // handlers land.
+        assert!(resolve_arch_ops("qwen2").is_none());
+        assert!(resolve_arch_ops("phi").is_none());
+        assert!(resolve_arch_ops("gemma").is_none());
+    }
+
+    #[test]
+    fn registered_arch_names_reports_gpt2_tinyllama_llama_today() {
+        let names = registered_arch_names();
+        assert_eq!(names, vec!["gpt2", "tinyllama", "llama"]);
     }
 }
 

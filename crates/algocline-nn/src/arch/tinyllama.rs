@@ -50,8 +50,14 @@
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
 use candle_nn::{
     embedding, linear_no_bias, ops, rms_norm, rotary_emb, Embedding, Linear, Module, RmsNorm,
-    VarBuilder,
+    VarBuilder, VarMap,
 };
+
+// `LoraLinear` is imported for the intra-doc links in `wrap_lora` /
+// `Block::wrap_lora`; the wrap helper itself lives in `arch::lora` since
+// GPT-2 already uses the same swap-in-place idiom.
+#[allow(unused_imports)]
+use super::lora::{wrap_variant_in_place, LinearVariant, LoraConfig, LoraLinear};
 
 /// RMSNorm forward that always uses the backward-safe basic-op path
 /// (`rms_norm_slow`).
@@ -315,25 +321,57 @@ pub enum PretrainedError {
 /// ```
 ///
 /// `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`,
-/// `down_proj` are all held as plain [`Linear`] (bias-less). The
-/// Layer 2 LoRA wrap will wrap them in a `LinearVariant` in the same
-/// spirit as [`super::gpt2::Block`]; kept plain for now so Layer 1b
-/// stays focused on the forward path only.
+/// `down_proj` are all held as [`LinearVariant`] (bias-less base linears
+/// under `Plain`). A subsequent [`TinyLlamaModel::wrap_lora`] call can
+/// replace individual layers with a LoRA-wrapped variant without
+/// touching the surrounding forward code path (the `Module` impl on
+/// [`LinearVariant`] dispatches to `Plain` or `Lora` internally).
 struct Block {
     input_layernorm: RmsNorm,
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: LinearVariant,
+    k_proj: LinearVariant,
+    v_proj: LinearVariant,
+    o_proj: LinearVariant,
     post_attention_layernorm: RmsNorm,
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: LinearVariant,
+    up_proj: LinearVariant,
+    down_proj: LinearVariant,
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
     n_rep: usize,
 }
+
+/// Which per-block projections the caller wants LoRA-wrapped.
+///
+/// Unlike GPT-2 (fused `c_attn` linear, single `qkv` flag), TinyLlama
+/// keeps `q_proj` / `k_proj` / `v_proj` split, so each projection
+/// carries its own bool. Mirrors the shape of the HF PEFT reference
+/// (`target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj",
+/// "up_proj","down_proj"]`).
+#[derive(Debug, Clone, Copy)]
+struct TinyLlamaWrapFlags {
+    q: bool,
+    k: bool,
+    v: bool,
+    o: bool,
+    gate: bool,
+    up: bool,
+    down: bool,
+}
+
+/// Canonical TinyLlama / HuggingFace-Llama target-module names accepted
+/// by [`TinyLlamaModel::wrap_lora`]. Any name outside this list triggers
+/// an error at wrap time so a typo does not silently degrade to "no-op".
+const KNOWN_TARGET_MODULES_TINYLLAMA: [&str; 7] = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+];
 
 impl Block {
     fn new(cfg: &TinyLlamaConfig, vs: VarBuilder) -> CandleResult<Self> {
@@ -357,19 +395,58 @@ impl Block {
 
         Ok(Self {
             input_layernorm,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
+            q_proj: LinearVariant::Plain(q_proj),
+            k_proj: LinearVariant::Plain(k_proj),
+            v_proj: LinearVariant::Plain(v_proj),
+            o_proj: LinearVariant::Plain(o_proj),
             post_attention_layernorm,
-            gate_proj,
-            up_proj,
-            down_proj,
+            gate_proj: LinearVariant::Plain(gate_proj),
+            up_proj: LinearVariant::Plain(up_proj),
+            down_proj: LinearVariant::Plain(down_proj),
             heads: cfg.heads,
             kv_heads: cfg.kv_heads,
             head_dim,
             n_rep,
         })
+    }
+
+    /// Replace this block's `Plain` linear projections with LoRA-wrapped
+    /// counterparts according to `flags`. Idempotency: a layer already
+    /// in the `Lora` variant errors out (double-wrap is a caller bug).
+    ///
+    /// Callers pass the per-block `VarBuilder` scoped so LoRA parameter
+    /// names line up with the block index, e.g.
+    /// `h.<i>.self_attn.q_proj.lora_a.weight`.
+    fn wrap_lora(
+        &mut self,
+        cfg: &LoraConfig,
+        flags: TinyLlamaWrapFlags,
+        vs: VarBuilder,
+    ) -> CandleResult<()> {
+        let attn_vs = vs.pp("self_attn");
+        let mlp_vs = vs.pp("mlp");
+        if flags.q {
+            wrap_variant_in_place(&mut self.q_proj, cfg, attn_vs.pp("q_proj"))?;
+        }
+        if flags.k {
+            wrap_variant_in_place(&mut self.k_proj, cfg, attn_vs.pp("k_proj"))?;
+        }
+        if flags.v {
+            wrap_variant_in_place(&mut self.v_proj, cfg, attn_vs.pp("v_proj"))?;
+        }
+        if flags.o {
+            wrap_variant_in_place(&mut self.o_proj, cfg, attn_vs.pp("o_proj"))?;
+        }
+        if flags.gate {
+            wrap_variant_in_place(&mut self.gate_proj, cfg, mlp_vs.pp("gate_proj"))?;
+        }
+        if flags.up {
+            wrap_variant_in_place(&mut self.up_proj, cfg, mlp_vs.pp("up_proj"))?;
+        }
+        if flags.down {
+            wrap_variant_in_place(&mut self.down_proj, cfg, mlp_vs.pp("down_proj"))?;
+        }
+        Ok(())
     }
 
     fn attention(
@@ -630,6 +707,94 @@ impl TinyLlamaModel {
         let logits = self.lm_head.forward(&h)?;
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
         Ok(logits)
+    }
+
+    /// Canonical LoRA target-module set for TinyLlama: attention
+    /// Q/K/V/O plus MLP gate/up/down projections. Matches the
+    /// HuggingFace / PEFT convention.
+    ///
+    /// Callers who want a narrower wrap should either pass their own
+    /// list to [`super::lora::LoraConfig::with_targets`] or mutate the
+    /// returned vector before feeding it in.
+    pub fn default_lora_targets() -> Vec<String> {
+        KNOWN_TARGET_MODULES_TINYLLAMA
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// Wrap the model's per-block linear projections with LoRA
+    /// low-rank updates. Mirrors [`super::gpt2::Gpt2Model::wrap_lora`]:
+    /// the base parameters (already registered against the model's
+    /// original `VarMap`) are held frozen inside each new
+    /// [`LoraLinear`]; only the freshly-created `lora_a` / `lora_b`
+    /// matrices are registered against the returned [`VarMap`], which
+    /// the caller hands to the optimizer.
+    ///
+    /// # Errors
+    ///
+    /// - `cfg.target_modules` empty → error (mirrors GPT-2 shape).
+    /// - Any entry outside the canonical TinyLlama set
+    ///   (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
+    ///   `up_proj`, `down_proj`) is rejected with the full list in the
+    ///   error message.
+    /// - `cfg.rank == 0` or `cfg.rank > min(in, out)` for any wrapped
+    ///   layer propagates the underlying [`LoraLinear::wrap`] error.
+    ///   GQA makes `k_proj` / `v_proj` narrower on the output side
+    ///   (`kv_heads * head_dim`); on the 1.1B preset the minimum is
+    ///   256, so any `rank <= 256` config is safe across all 7 targets.
+    ///
+    /// # LoRA VarMap layout
+    ///
+    /// Parameters register under
+    /// `h.<i>.self_attn.q_proj.lora_a.weight`,
+    /// `h.<i>.mlp.gate_proj.lora_b.weight`, etc.
+    /// The `h.<i>` block prefix mirrors
+    /// [`super::gpt2::Gpt2Model::wrap_lora`] so downstream tooling that
+    /// iterates a LoRA VarMap can treat both architectures uniformly.
+    /// The base [`VarMap`] passed to [`Self::new`] is byte-identical
+    /// before / after this call by construction — the returned
+    /// [`VarMap`] is freshly allocated and only `lora_a` / `lora_b`
+    /// tensors register against it, while each base [`Linear`] is
+    /// moved by value into [`LoraLinear::base`] without touching any
+    /// [`VarBuilder`]. End-to-end verification lives in the
+    /// `tinyllama_lora_merge_equivalence` integration test.
+    pub fn wrap_lora(&mut self, cfg: &LoraConfig) -> CandleResult<VarMap> {
+        if cfg.target_modules.is_empty() {
+            return Err(candle_core::Error::Msg(
+                "wrap_lora: target_modules is empty; nothing to wrap".into(),
+            ));
+        }
+        for m in &cfg.target_modules {
+            if !KNOWN_TARGET_MODULES_TINYLLAMA.contains(&m.as_str()) {
+                return Err(candle_core::Error::Msg(format!(
+                    "wrap_lora: unknown target module {m:?} \
+                     (known: {KNOWN_TARGET_MODULES_TINYLLAMA:?})"
+                )));
+            }
+        }
+        let flags = TinyLlamaWrapFlags {
+            q: cfg.target_modules.iter().any(|m| m == "q_proj"),
+            k: cfg.target_modules.iter().any(|m| m == "k_proj"),
+            v: cfg.target_modules.iter().any(|m| m == "v_proj"),
+            o: cfg.target_modules.iter().any(|m| m == "o_proj"),
+            gate: cfg.target_modules.iter().any(|m| m == "gate_proj"),
+            up: cfg.target_modules.iter().any(|m| m == "up_proj"),
+            down: cfg.target_modules.iter().any(|m| m == "down_proj"),
+        };
+
+        // Clone device / dtype up front so the VarBuilder borrows
+        // locals rather than a slice of `self` (would collide with
+        // `self.blocks.iter_mut()` below — same idiom as GPT-2).
+        let device = self.cfg.device.clone();
+        let dtype = self.cfg.dtype;
+        let lora_vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&lora_vm, dtype, &device);
+        let h_vs = vs.pp("h");
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            block.wrap_lora(cfg, flags, h_vs.pp(i.to_string()))?;
+        }
+        Ok(lora_vm)
     }
 }
 
@@ -930,5 +1095,132 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Layer 2 — LoRA wrap machinery
+    //
+    // Tests mirror the GPT-2 counterparts in `crates/algocline-nn/src/
+    // arch/gpt2.rs` (`wrap_lora_rejects_empty_target_modules`,
+    // `wrap_lora_rejects_unknown_target_module`,
+    // `wrap_lora_populates_lora_vm_and_freezes_base`,
+    // `wrap_lora_with_narrow_targets_only_wraps_selected_layers`) so
+    // the two architectures stay behaviourally symmetric. The 5th test
+    // (`default_lora_targets_matches_canonical_seven`) is TinyLlama-
+    // specific: GPT-2 uses `LoraConfig::default_targets()` for its
+    // canonical set, TinyLlama exposes it per-model instead so callers
+    // don't accidentally cross the GPT-2 / Llama vocabulary boundary.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn wrap_lora_rejects_empty_target_modules() {
+        let cfg = TinyLlamaConfig::tiny();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = TinyLlamaModel::new(&cfg, vs).unwrap();
+        let lora = LoraConfig::with_targets(4, 8.0, Vec::<String>::new());
+        let msg = match model.wrap_lora(&lora) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("empty"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn wrap_lora_rejects_unknown_target_module() {
+        let cfg = TinyLlamaConfig::tiny();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = TinyLlamaModel::new(&cfg, vs).unwrap();
+        let lora = LoraConfig::with_targets(4, 8.0, vec!["typo_proj"]);
+        let msg = match model.wrap_lora(&lora) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("unknown"), "unexpected error: {msg}");
+        // The error should surface the full canonical list so a
+        // mistyping caller sees the correct spellings.
+        for name in KNOWN_TARGET_MODULES_TINYLLAMA {
+            assert!(
+                msg.contains(name),
+                "error msg does not mention canonical target {name:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_lora_populates_lora_vm_and_freezes_base() {
+        let cfg = TinyLlamaConfig::tiny();
+        let base_vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+        let mut model = TinyLlamaModel::new(&cfg, vs).unwrap();
+
+        // Snapshot every base tensor before wrap.
+        let base_before: Vec<Vec<f32>> = base_vm
+            .all_vars()
+            .iter()
+            .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+            .collect();
+        let base_var_count = base_vm.all_vars().len();
+
+        // Tiny preset has k/v output dim = kv_heads * head_dim = 1*32 = 32,
+        // so rank must be <= 32 across all 7 targets. Rank 4 is safely
+        // within that on every projection.
+        let lora_cfg = LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
+        let lora_vm = model.wrap_lora(&lora_cfg).expect("wrap_lora ok");
+
+        // 2 layers * 7 wrapped projections * (a + b) = 28 new Vars.
+        assert_eq!(lora_vm.all_vars().len(), 28);
+        // Base var count is unchanged (no new registrations on the base
+        // varmap).
+        assert_eq!(base_vm.all_vars().len(), base_var_count);
+
+        // Base tensor bytes after wrap must match the snapshot.
+        let base_after: Vec<Vec<f32>> = base_vm
+            .all_vars()
+            .iter()
+            .map(|v| v.as_tensor().flatten_all().unwrap().to_vec1().unwrap())
+            .collect();
+        for (before, after) in base_before.iter().zip(base_after.iter()) {
+            assert_eq!(before, after, "wrap_lora perturbed a base tensor");
+        }
+
+        // Forward still runs and returns the right shape after wrap.
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, cfg.vocab]);
+    }
+
+    #[test]
+    fn wrap_lora_with_narrow_targets_only_wraps_selected_layers() {
+        let cfg = TinyLlamaConfig::tiny();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = TinyLlamaModel::new(&cfg, vs).unwrap();
+
+        // Only wrap the MLP down-projection. Attention Q/K/V/O and
+        // MLP gate/up all stay `Plain`.
+        let lora_cfg = LoraConfig::with_targets(2, 4.0, vec!["down_proj"]);
+        let lora_vm = model.wrap_lora(&lora_cfg).unwrap();
+        // 2 layers * 1 wrapped linear * 2 vars (a + b) = 4.
+        assert_eq!(lora_vm.all_vars().len(), 4);
+    }
+
+    #[test]
+    fn default_lora_targets_matches_canonical_seven() {
+        let targets = TinyLlamaModel::default_lora_targets();
+        assert_eq!(targets.len(), 7);
+        assert_eq!(
+            targets,
+            vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+                "o_proj".to_string(),
+                "gate_proj".to_string(),
+                "up_proj".to_string(),
+                "down_proj".to_string(),
+            ]
+        );
     }
 }

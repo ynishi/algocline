@@ -32,6 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     weight layout (`model.embed_tokens.weight`, `model.layers.<i>.*`,
     `model.norm.weight`, `lm_head.weight`). Verified by
     `tests/tinyllama_forward_shape.rs`.
+  - Layer 2 — LoRA wrap surface:
+    `TinyLlamaModel::wrap_lora(&LoraConfig) -> CandleResult<VarMap>` and
+    `TinyLlamaModel::default_lora_targets()` (the 7 canonical HF Llama
+    target names: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`,
+    `up_proj`, `down_proj`). Wrap returns a fresh `VarMap` carrying
+    only `lora_a` / `lora_b` params under `h.<i>.self_attn.<name>` /
+    `h.<i>.mlp.<name>` — the base `VarMap` handed to `Self::new` is
+    byte-identical before / after by construction so a training loop
+    can hand only the returned `VarMap` to AdamW. Refactored
+    `LinearVariant` + `wrap_variant_in_place` out of `arch::gpt2` into
+    `arch::lora` (`pub(crate)`) as the shared substrate now consumed
+    by both architectures. Verified by 5 inline unit tests
+    (`arch::tinyllama::tests::wrap_lora_*` +
+    `default_lora_targets_matches_canonical_seven`) and 2 integration
+    tests (`tests/tinyllama_lora_merge_equivalence.rs`). Layer 3
+    (training loop) tracked as follow-up.
 - `algocline-nn`: arch-neutral prerequisites for the inference-fleet
   expansion tracked in GH #9 (Layer 1 of 3).
   - `algocline_nn::card::validate_architecture` + the

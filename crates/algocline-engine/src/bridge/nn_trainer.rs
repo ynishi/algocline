@@ -2071,4 +2071,110 @@ mod run_ft_bridge_tests {
             "expected pretrained refusal, got: {msg}"
         );
     }
+
+    // ─── L5c S3 — trainer bind test hardening ──────────────────────
+    //
+    // Closes two coverage gaps carried from S2:
+    // - run_distill's LoRA-wrapped refusal guard (nn_trainer.rs
+    //   §3) had no test; the run_full_ft sibling
+    //   (`run_full_ft_refuses_lora_wrapped_handle`) was already
+    //   covered.
+    // - pretrained refusal was only exercised on the GPT-2 arm; the
+    //   TinyLlama arm hits the same guard but lacked a test
+    //   constructor (`TinyLlamaHandle::for_test_pretrained_like`).
+
+    #[test]
+    fn run_distill_refuses_lora_wrapped_handle() {
+        // Mirror of `run_full_ft_refuses_lora_wrapped_handle` swapped
+        // onto the run_distill dispatch: distillation trains the base
+        // parameters, so a LoRA-wrapped handle must be refused with the
+        // directional error.
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+        let lora_opts = opts_table(&lua, base_train_opts());
+        let lora_card_id = run_lora_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            lora_opts,
+        )
+        .expect("run_lora_ft");
+
+        // Reload the LoRA card as a wrapped handle.
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let fresh_base =
+            build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).expect("fresh gpt2 base");
+        let fresh_ud = lua.create_userdata(fresh_base).unwrap();
+        let wrapped = load_wrap_impl(&store, &lora_card_id, &fresh_ud).expect("load_wrap");
+        assert!(wrapped.is_lora_wrapped());
+
+        // Feed the wrapped handle into run_distill; must refuse.
+        let wrapped_ud = lua.create_userdata(wrapped).unwrap();
+        let ds_ud2 = make_dataset_handle(&lua, overfit_row(), 5);
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(wrapped_ud),
+            &LuaValue::UserData(ds_ud2),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_distill:") && msg.contains("drop the wrap first"),
+            "expected wrapped-handle refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_refuses_pretrained_handle_tinyllama() {
+        // TinyLlama mirror of `run_full_ft_refuses_pretrained_handle`
+        // (Axis B2): a varmap-less handle (the state a
+        // `pretrained = true` build lands in) must be refused with the
+        // directional error through the full dispatch path.
+        // `for_test_pretrained_like` strips the VarMap off a
+        // from-scratch handle so no HF hub download is needed.
+        let (_tmp, store, nn_dir, base, lua) = setup_tinyllama_scaffold();
+        let pretrained_like = base.for_test_pretrained_like();
+        let base_ud = lua
+            .create_userdata(NnHandle::TinyLlama(pretrained_like))
+            .unwrap();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("pretrained=true"),
+            "expected pretrained refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_distill_refuses_pretrained_handle_tinyllama() {
+        // TinyLlama mirror of `run_distill_refuses_pretrained_handle`.
+        let (_tmp, store, nn_dir, base, lua) = setup_tinyllama_scaffold();
+        let pretrained_like = base.for_test_pretrained_like();
+        let base_ud = lua
+            .create_userdata(NnHandle::TinyLlama(pretrained_like))
+            .unwrap();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_distill:") && msg.contains("pretrained=true"),
+            "expected pretrained refusal, got: {msg}"
+        );
+    }
 }

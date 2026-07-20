@@ -1849,6 +1849,22 @@ impl TinyLlamaHandle {
     pub(super) fn varmap(&self) -> Option<Arc<VarMap>> {
         self.varmap.as_ref().map(Arc::clone)
     }
+
+    /// Test-only: strip the `VarMap` off a from-scratch handle so it
+    /// mimics the varmap-less state of a `pretrained = true` handle
+    /// without the HF hub download that a real TinyLlama
+    /// `from_pretrained` load requires. Lets sibling-module tests
+    /// (`nn_trainer.rs`) exercise the trainer bindings'
+    /// pretrained-refusal guards through the full dispatch path on the
+    /// TinyLlama arm. Mirror of [`Gpt2Handle::for_test_pretrained_like`]
+    /// — same cross-module test-constructor pattern as
+    /// [`DatasetHandle::for_test`].
+    #[cfg(test)]
+    pub(super) fn for_test_pretrained_like(mut self) -> Self {
+        self.varmap = None;
+        self.pretrained = true;
+        self
+    }
 }
 
 fn build_llama_handle(variant: &str, opts: Option<&LuaTable>) -> LuaResult<LlamaHandle> {

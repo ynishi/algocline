@@ -540,6 +540,7 @@ fn wrap_gpt2_lora_from_meta(
         device,
         dtype,
         pretrained,
+        has_lora: true,
     })
 }
 
@@ -637,6 +638,7 @@ fn wrap_tinyllama_lora_from_meta(
         device,
         dtype,
         pretrained,
+        has_lora: true,
     })
 }
 
@@ -878,6 +880,15 @@ pub(super) struct Gpt2Handle {
     device: String,
     dtype: String,
     pretrained: bool,
+    /// True iff this handle's underlying [`Gpt2Model`] has been
+    /// LoRA-wrapped (via [`wrap_gpt2_lora_from_meta`] or an equivalent
+    /// upcoming Layer 5b Lua-side wrap entry). Base handles from
+    /// `preset.gpt2` / `from_safetensors` carry `false`.
+    ///
+    /// [`NnHandle::is_lora_wrapped`] and the Layer 5a
+    /// `alc.nn.card.merge_lora` bridge consult this to refuse
+    /// merge_lora on a base handle with a directional error.
+    pub(super) has_lora: bool,
 }
 
 impl mlua::UserData for Gpt2Handle {
@@ -1158,6 +1169,7 @@ fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult
         // "pretrained" from the trainer's perspective (VarMap
         // absent means trainer bindings refuse cleanly).
         pretrained: true,
+        has_lora: false,
     }))
 }
 
@@ -1187,6 +1199,7 @@ fn tinyllama_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaR
         device: device_str,
         dtype: dtype_str,
         pretrained: true,
+        has_lora: false,
     }))
 }
 
@@ -1461,6 +1474,12 @@ pub(super) struct TinyLlamaHandle {
     device: String,
     dtype: String,
     pretrained: bool,
+    /// True iff this handle's underlying [`TinyLlamaModel`] has been
+    /// LoRA-wrapped (via [`wrap_tinyllama_lora_from_meta`]). Base
+    /// handles from `preset.tinyllama` / `from_safetensors` carry
+    /// `false`. See [`Gpt2Handle::has_lora`] field docs for the full
+    /// rationale (mirrored discipline).
+    pub(super) has_lora: bool,
 }
 
 impl mlua::UserData for TinyLlamaHandle {
@@ -1659,6 +1678,7 @@ fn build_gpt2_handle(
         device: device_str,
         dtype: dtype_str,
         pretrained,
+        has_lora: false,
     })
 }
 
@@ -1725,6 +1745,7 @@ fn build_tinyllama_handle(
         device: device_str,
         dtype: dtype_str,
         pretrained,
+        has_lora: false,
     })
 }
 
@@ -2687,6 +2708,62 @@ impl NnHandle {
             _ => None,
         }
     }
+
+    /// Architecture family + variant identifier suitable for
+    /// [`algocline_nn::MergedProvenance::arch`] and the projected
+    /// [`algocline_nn::NnCardMeta::architecture`] field.
+    ///
+    /// The underlying handle's `variant` field is stored in one of
+    /// two conventions depending on the construction path:
+    ///
+    /// - `preset.<arch>(variant, ...)` stores the raw `variant`
+    ///   string (e.g. `"medium"` / `"1.1b"`).
+    /// - `card.load_handle` (from a saved card) stores the full
+    ///   `family-variant` form (e.g. `"gpt2-medium"` /
+    ///   `"tinyllama-1.1b"`) because the card's
+    ///   `NnCardMeta.architecture` is already in that shape.
+    ///
+    /// This helper normalises both into the full `family-variant`
+    /// form so the Layer 5a `merge_lora` bridge can hand a
+    /// consistent value to [`MergedProvenance`] regardless of how
+    /// the wrapped handle was obtained. The prefix-strip guard
+    /// matches [`wrap_gpt2_lora_from_meta`]'s existing
+    /// `base_cfg_id` logic (§Layer 4b invariant carry).
+    #[allow(dead_code)]
+    pub(super) fn arch_family_variant(&self) -> String {
+        let (family, variant) = match self {
+            Self::Gpt2(h) => ("gpt2", h.variant.as_str()),
+            Self::TinyLlama(h) => ("tinyllama", h.variant.as_str()),
+            Self::Llama(h) => ("llama", h.variant.as_str()),
+        };
+        let prefix = format!("{family}-");
+        if variant.starts_with(&prefix) {
+            variant.to_string()
+        } else {
+            format!("{prefix}{variant}")
+        }
+    }
+
+    /// True iff the underlying model has been LoRA-wrapped.
+    ///
+    /// Layer 5a `alc.nn.card.merge_lora` consults this to refuse a
+    /// base (non-wrapped) handle with a directional error before
+    /// invoking [`algocline_nn::export_merged`]. A base handle
+    /// would produce a "merged" bundle byte-identical to the base,
+    /// which would silently mis-describe the resulting card's
+    /// provenance — refusing early keeps the Card store honest.
+    ///
+    /// `Llama(_)` always returns `false`: the adapter path does not
+    /// support LoRA wrap in the current codebase (§Layer 2 non-goal,
+    /// carried through Layer 4b).
+    #[allow(dead_code)]
+    pub(super) fn is_lora_wrapped(&self) -> bool {
+        match self {
+            Self::Gpt2(h) => h.has_lora,
+            Self::TinyLlama(h) => h.has_lora,
+            Self::Llama(_) => false,
+        }
+    }
 }
 
 impl mlua::UserData for NnHandle {
@@ -2823,6 +2900,107 @@ mod arch_ops_tests {
     fn registered_arch_names_reports_gpt2_tinyllama_llama_today() {
         let names = registered_arch_names();
         assert_eq!(names, vec!["gpt2", "tinyllama", "llama"]);
+    }
+}
+
+#[cfg(test)]
+mod nn_handle_helper_tests {
+    //! Layer 5a S1 — `NnHandle::arch_family_variant` /
+    //! `is_lora_wrapped` unit coverage.
+    //!
+    //! `arch_family_variant` is tested via a synthetic handle built
+    //! from a from-scratch `preset.gpt2("tiny", ...)` /
+    //! `preset.tinyllama("tinyllama-tiny", ...)` path so no HF
+    //! download is required. `is_lora_wrapped` returns `false` for
+    //! all base handles built via `preset.*`; the wrap-side `true`
+    //! path is covered by the Layer 5a integration test
+    //! (`bridge_nn_card_merge_lora_test`) since it requires a live
+    //! LoRA card + `load_wrap` round-trip.
+    use super::*;
+    use mlua::Lua;
+
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn arch_family_variant_prepends_family_prefix_for_bare_variant() {
+        let dir = tempdir();
+        let lua = Lua::new();
+        // Build a base Gpt2Handle via the bridge helper directly
+        // (bypasses the Lua-facing preset registration; same output
+        // shape).
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+        let gpt2 = build_gpt2_handle("tiny", Some(&opts), dir.path()).expect("build gpt2");
+        let handle = NnHandle::Gpt2(gpt2);
+        assert_eq!(handle.arch_family_variant(), "gpt2-tiny");
+        assert!(!handle.is_lora_wrapped());
+    }
+
+    #[test]
+    fn arch_family_variant_passes_through_prefixed_variant() {
+        // Simulate the `card.load_handle` path where `variant`
+        // already carries the full "family-variant" string
+        // (mmap-backed load uses `meta.architecture` verbatim).
+        let dir = tempdir();
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+        let mut gpt2 = build_gpt2_handle("tiny", Some(&opts), dir.path()).expect("build gpt2");
+        gpt2.variant = "gpt2-tiny".to_string();
+        let handle = NnHandle::Gpt2(gpt2);
+        assert_eq!(handle.arch_family_variant(), "gpt2-tiny");
+    }
+
+    #[test]
+    fn arch_family_variant_prepends_tinyllama_prefix() {
+        let dir = tempdir();
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+        let tll =
+            build_tinyllama_handle("tinyllama-tiny", Some(&opts), dir.path()).expect("build tll");
+        let handle = NnHandle::TinyLlama(tll);
+        // `preset.tinyllama("tinyllama-tiny", ...)` stores the
+        // already-prefixed string verbatim (`variant.to_string()`
+        // in build_tinyllama_handle), so pass-through is expected.
+        assert_eq!(handle.arch_family_variant(), "tinyllama-tiny");
+        assert!(!handle.is_lora_wrapped());
+    }
+
+    #[test]
+    fn is_lora_wrapped_returns_false_for_base_handles() {
+        let dir = tempdir();
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+        let gpt2 = build_gpt2_handle("tiny", Some(&opts), dir.path()).expect("build gpt2");
+        assert!(!NnHandle::Gpt2(gpt2).is_lora_wrapped());
+
+        let tll =
+            build_tinyllama_handle("tinyllama-tiny", Some(&opts), dir.path()).expect("build tll");
+        assert!(!NnHandle::TinyLlama(tll).is_lora_wrapped());
+    }
+
+    #[test]
+    fn is_lora_wrapped_returns_true_when_has_lora_flag_set() {
+        // Direct field-level assertion — the wrap-time flow that
+        // flips `has_lora` to `true` is exercised end-to-end by
+        // the Layer 5a integration test; this unit test guards the
+        // NnHandle::is_lora_wrapped dispatch itself.
+        let dir = tempdir();
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+        let mut gpt2 = build_gpt2_handle("tiny", Some(&opts), dir.path()).expect("build gpt2");
+        gpt2.has_lora = true;
+        assert!(NnHandle::Gpt2(gpt2).is_lora_wrapped());
+
+        let mut tll =
+            build_tinyllama_handle("tinyllama-tiny", Some(&opts), dir.path()).expect("build tll");
+        tll.has_lora = true;
+        assert!(NnHandle::TinyLlama(tll).is_lora_wrapped());
     }
 }
 

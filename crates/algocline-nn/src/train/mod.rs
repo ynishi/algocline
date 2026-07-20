@@ -51,6 +51,27 @@ pub struct Checkpoint {
     pub metrics: HashMap<String, f32>,
 }
 
+/// Access to the [`candle_core::Device`] a trainable model was built
+/// against.
+///
+/// Pairs with `candle_nn::Module` to give a training loop everything
+/// it needs to drive any architecture: `Module::forward` for the pass
+/// itself, `DeviceView::device` for input-tensor placement (the loop
+/// needs to know the target device before it can move a `Batch`'s
+/// input tensor onto it).
+///
+/// Implemented for every trainable model in `arch::` (currently
+/// [`crate::arch::Gpt2Model`] and [`crate::arch::TinyLlamaModel`]) as
+/// a thin delegate to the underlying `Config::device` field. New
+/// architectures pick up training for free once they implement this
+/// plus `candle_nn::Module`.
+pub trait DeviceView {
+    /// The device this model's parameters were built against. All
+    /// input tensors handed to `Module::forward` must reside on the
+    /// same device.
+    fn device(&self) -> &candle_core::Device;
+}
+
 pub use ckpt::{checkpoint_from_path, CheckpointStore};
 pub use data::{
     Batch, Dataset, DatasetError, DatasetOpts, JsonlDataset, ParquetDataset, TeacherCardDataset,

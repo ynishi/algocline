@@ -798,6 +798,20 @@ impl TinyLlamaModel {
     }
 }
 
+/// Delegate to the inherent [`TinyLlamaModel::forward`] so the training
+/// loop can drive any `M: candle_nn::Module` uniformly.
+impl Module for TinyLlamaModel {
+    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        TinyLlamaModel::forward(self, xs)
+    }
+}
+
+impl crate::train::DeviceView for TinyLlamaModel {
+    fn device(&self) -> &Device {
+        &self.cfg.device
+    }
+}
+
 /// Build a causal (lower-triangular) mask `[ctx, ctx]` where valid
 /// (kept) positions are `1` and masked-out are `0`.
 ///

@@ -525,6 +525,20 @@ impl Gpt2Model {
     }
 }
 
+/// Delegate to the inherent [`Gpt2Model::forward`] so the training
+/// loop can drive any `M: candle_nn::Module` uniformly.
+impl Module for Gpt2Model {
+    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        Gpt2Model::forward(self, xs)
+    }
+}
+
+impl crate::train::DeviceView for Gpt2Model {
+    fn device(&self) -> &Device {
+        &self.cfg.device
+    }
+}
+
 /// Errors from [`Gpt2Model::from_pretrained`].
 ///
 /// Explicit variants so the caller (Lua bridge) can surface an

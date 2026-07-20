@@ -771,6 +771,39 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
     }))
 }
 
+/// Assemble the Card create payload directly from an already-built
+/// [`NnCardMeta`], skipping the user-JSON parse + validate round
+/// trip that [`build_create_payload`] performs.
+///
+/// Used by Layer 5a `alc.nn.card.merge_lora`: after
+/// [`MergedProvenance::to_card_meta`] returns a fully-typed
+/// [`NnCardMeta`] there is no user-facing JSON to re-validate.
+/// The Card envelope shape (pkg / card_id / metadata.kind /
+/// metadata.nn) is identical to [`build_create_payload`]'s output —
+/// only the input side differs (typed struct vs. raw JSON).
+#[allow(dead_code)]
+fn build_create_payload_from_meta(card_id: &str, meta: &NnCardMeta) -> LuaResult<Json> {
+    // Defensive re-validation: even though the caller passes a
+    // fully-typed struct, the architecture field still must match
+    // the canonical family list (a mis-constructed MergedProvenance
+    // could carry a stray value). Same guard as build_create_payload
+    // §architecture check.
+    validate_architecture(&meta.architecture)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: {e}")))?;
+
+    let nn_meta_json = serde_json::to_value(meta)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: serialize meta: {e}")))?;
+
+    Ok(json!({
+        "pkg": { "name": NN_PKG },
+        "card_id": card_id,
+        "metadata": {
+            "kind": "nn_model",
+            "nn": nn_meta_json,
+        }
+    }))
+}
+
 fn normalise_object(v: Option<Json>) -> Json {
     match v {
         Some(Json::Object(m)) => Json::Object(m),
@@ -3001,6 +3034,71 @@ mod nn_handle_helper_tests {
             build_tinyllama_handle("tinyllama-tiny", Some(&opts), dir.path()).expect("build tll");
         tll.has_lora = true;
         assert!(NnHandle::TinyLlama(tll).is_lora_wrapped());
+    }
+}
+
+#[cfg(test)]
+mod build_create_payload_from_meta_tests {
+    //! Layer 5a S2 — `build_create_payload_from_meta` unit coverage.
+    //!
+    //! The envelope shape (`pkg.name` / `card_id` /
+    //! `metadata.kind` / `metadata.nn`) must be byte-identical to
+    //! what `build_create_payload` produces from the equivalent
+    //! user-JSON input so `FileCardStore::create` treats both
+    //! entry points uniformly.
+    use super::*;
+    use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage};
+    use serde_json::json;
+
+    fn sample_merged_meta() -> NnCardMeta {
+        NnCardMeta {
+            name: "my-merged".into(),
+            backend: "candle".into(),
+            task: None,
+            architecture: "gpt2-medium".into(),
+            training_path: "merged".into(),
+            lineage: NnLineage {
+                parent: Some("cards/lora-src-001".into()),
+                ..NnLineage::default()
+            },
+            hyperparams: json!({}),
+            metrics: json!({}),
+            candle: Some(NnCandleBranch {
+                bundle_ref: "nn/my-merged-1".into(),
+                device: None,
+                dtype: None,
+                lora: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn envelope_shape_matches_build_create_payload() {
+        let meta = sample_merged_meta();
+        let payload = build_create_payload_from_meta("my-merged-1", &meta).expect("build payload");
+
+        assert_eq!(payload["pkg"]["name"], NN_PKG);
+        assert_eq!(payload["card_id"], "my-merged-1");
+        assert_eq!(payload["metadata"]["kind"], "nn_model");
+
+        let nn = &payload["metadata"]["nn"];
+        assert_eq!(nn["name"], "my-merged");
+        assert_eq!(nn["architecture"], "gpt2-medium");
+        assert_eq!(nn["training_path"], "merged");
+        assert_eq!(nn["lineage"]["parent"], "cards/lora-src-001");
+        assert_eq!(nn["candle"]["bundle_ref"], "nn/my-merged-1");
+    }
+
+    #[test]
+    fn refuses_unknown_architecture_family() {
+        let mut meta = sample_merged_meta();
+        meta.architecture = "nonexistent-arch".into();
+        let err = build_create_payload_from_meta("my-merged-1", &meta)
+            .expect_err("should reject unknown arch");
+        assert!(
+            err.to_string().contains("alc.nn.card.merge_lora"),
+            "expected merge_lora-prefixed error, got: {err}"
+        );
     }
 }
 

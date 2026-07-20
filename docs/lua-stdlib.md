@@ -878,6 +878,70 @@ local base = alc.nn.preset("gpt2", "medium")
 local h = alc.nn.card.load_wrap("cards/domain-lora-042", base)
 ```
 
+#### `alc.nn.card.merge_lora(wrapped_handle, opts) -> merged_card_id`
+
+Layer 5a — export a LoRA-wrapped model as a self-contained
+inference bundle plus a new Card with `training_path == "merged"`.
+The merged Card is a drop-in base: a subsequent
+`alc.nn.card.load_handle(merged_card_id)` returns an unwrapped
+inference handle with no LoRA delta needed at load time.
+
+`wrapped_handle` must be a LoRA-wrapped handle — obtain one from
+`alc.nn.card.load_wrap(lora_card_id, base)`. Accepts either an
+`NnHandle` (arch-neutral) or a typed handle for backward compat,
+same as `load_wrap`. Base (non-wrapped) handles are refused with a
+directional error pointing at `load_wrap`.
+
+`opts` (required, table):
+
+- `name` *(string, required)* — Card name; used to derive the
+  merged `card_id` (same `sanitize_name` + `compact_epoch_us`
+  discipline as `alc.nn.card.save`).
+- `lora_card` *(string, required)* — provenance card_id of the
+  source LoRA training run. Stored in the merged Card's
+  `lineage.parent` field.
+
+`arch` and `bundle_ref` for `MergedProvenance` are derived inside
+the bridge (from the wrapped handle's arch family + variant and
+the pre-generated card_id) — callers only supply `name` +
+`lora_card`.
+
+Returns a single Lua string: the freshly-minted merged
+`card_id`.
+
+**Errors:**
+
+- `alc.nn.card.merge_lora: opts.name must be a non-empty string` — missing or empty `name`.
+- `alc.nn.card.merge_lora: opts.lora_card must be a non-empty string` — missing or empty `lora_card`.
+- `alc.nn.card.merge_lora: handle is not LoRA-wrapped (arch=...); use `alc.nn.card.load_wrap(lora_card_id, base_handle)` ...` — passed a base (non-wrapped) handle; directed to `load_wrap`.
+- `alc.nn.card.merge_lora: base handle is not a recognised NnHandle / Gpt2Handle / TinyLlamaHandle / LlamaHandle` — first arg is not a handle userdata.
+- `alc.nn.card.merge_lora: provenance: ...` — internal provenance-field validation failed (empty `lora_card` / `arch` / `bundle_ref`).
+- `alc.nn.card.merge_lora: merge: ...` — arch-side `export_merged` walker error (tensor shape / device mismatch).
+- `alc.nn.card.merge_lora: io: ...` — filesystem error (mkdir / stat).
+- `alc.nn.card.merge_lora: serialize: ...` — `safetensors::save` rejected the tensor map.
+- `alc.nn.card.merge_lora: card store: ...` — `FileCardStore::create` failure.
+- `alc.nn.card.merge_lora: llama adapter path does not support LoRA merge` — defensive; the `Llama` adapter variant does not support LoRA in the current codebase.
+
+**GPU verification status:** the TinyLlama merge path is
+exercised only on CPU F32 in-tree so far. GPT-2 CPU is fully
+covered. A40 GPU smoke examples for TinyLlama merge are open
+follow-ups; see `workspace/tasks/alc-nn-tinyllama/spike-status.md`
+§7.
+
+```lua
+-- End-to-end: load a LoRA card, merge it into a self-contained
+-- inference bundle, then re-open the merged card at inference time.
+local base = alc.nn.preset("gpt2", "medium")
+local wrapped = alc.nn.card.load_wrap("cards/domain-lora-042", base)
+local merged_id = alc.nn.card.merge_lora(wrapped, {
+    name = "domain-merged-v1",
+    lora_card = "cards/domain-lora-042",
+})
+
+-- Later, at inference time — no base handle, no LoRA delta needed:
+local h = alc.nn.card.load_handle(merged_id)
+```
+
 #### `alc.nn.card.load_gpt2(card_id, base) -> Gpt2Handle` *(deprecated)*
 
 Arch-pinned typed shortcut for GPT-2 LoRA card load. Delegates to

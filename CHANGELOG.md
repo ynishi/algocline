@@ -144,6 +144,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     obvious. Adding one of those arches today is three grep-able
     edits: `ARCH_OPS` tuple + typed `build_<arch>_handle` +
     neutral adapter — no new Lua-visible fn per arch.
+- `algocline-engine`: `alc.nn.card.merge_lora` Lua binding for the
+  Layer 4a merged inference checkpoint export (Layer 5a of GH #10).
+  The Rust-side `export_merged` + `MergedProvenance` surface is now
+  reachable from Lua through the same arch-neutral card bridge as
+  Layer 4b's `load_handle` / `load_wrap`.
+  - `alc.nn.card.merge_lora(wrapped_handle, opts) -> merged_card_id`
+    consumes a LoRA-wrapped `NnHandle` (from
+    `alc.nn.card.load_wrap`) plus `opts = { name, lora_card }`,
+    writes the merged safetensors bundle under
+    `<nn_dir>/<merged_card_id>.safetensors`, records a Card with
+    `training_path == "merged"` + `lineage.parent == opts.lora_card`,
+    and returns the freshly-minted `merged_card_id` string. The
+    merged Card is self-contained: a subsequent
+    `alc.nn.card.load_handle(merged_card_id)` returns an unwrapped
+    inference handle with no LoRA delta needed.
+  - `MergedProvenance.arch` and `bundle_ref` are derived inside the
+    bridge (from the handle's `arch_family_variant()` + the
+    pre-generated `card_id`) rather than caller-supplied, so the
+    resulting Card is structurally correct by construction. The
+    caller only ever supplies `name` + `lora_card`.
+  - Base (non-LoRA-wrapped) handles are refused up front with a
+    directional error pointing at `alc.nn.card.load_wrap`. The
+    `NnHandle::is_lora_wrapped()` guard reads a new
+    `pub(super) has_lora: bool` field on `Gpt2Handle` /
+    `TinyLlamaHandle`, set to `true` only in the two
+    `wrap_*_lora_from_meta` return paths (all other handle
+    constructors default it to `false`).
+  - Backward compat: accepts either an `NnHandle` (arch-neutral
+    from `load_wrap`) or a typed `Gpt2Handle` / `TinyLlamaHandle`
+    (once a future Layer 5b adds a Lua-side wrap that returns
+    typed) as the first argument, same as `load_wrap`.
+  - Verified by 6 integration tests
+    (`bridge::nn_card::merge_lora_bridge_tests`) covering happy
+    paths for both GPT-2 and TinyLlama arms, refuse-base-handle
+    directional error, refuse-missing-opts, refuse-empty-string
+    opts, and end-to-end `load_wrap → merge_lora → load_handle`
+    round-trip against the Card store on `gpt2-tiny` /
+    `tinyllama-tiny` micro shapes (CPU F32).
+  - GPU verification status: TinyLlama full/LoRA/merge paths are
+    exercised only on CPU F32 in-tree so far. A40 smoke examples
+    (`nn_tinyllama_gpu_smoke.rs`, `nn_tinyllama_lora_gpu_smoke.rs`,
+    and a TinyLlama merge smoke) are still open follow-ups —
+    tracked in `workspace/tasks/alc-nn-tinyllama/spike-status.md`
+    §7.
 - `algocline-nn`: merged inference checkpoint export (Layer 4a of
   GH #10). A LoRA-wrapped model can now be composed with its base
   into a single safetensors bundle that downstream inference stacks

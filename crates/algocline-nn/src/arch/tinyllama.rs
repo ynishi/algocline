@@ -632,6 +632,42 @@ impl TinyLlamaModel {
         &self.cfg
     }
 
+    /// Load model weights from an on-disk safetensors bundle whose
+    /// key layout matches the HF Llama convention (`model.*` prefix
+    /// plus top-level `lm_head.weight` — the same layout that
+    /// [`TinyLlamaModel::from_pretrained`] downloads and that
+    /// [`super::lora::MergeableLora::export_merged`] emits).
+    ///
+    /// This is the plain-load path used by (a) the merged-bundle
+    /// parity oracle in `tests/merged_export_parity_tinyllama.rs`
+    /// and (b) future load-side integration that recognises
+    /// `training_path == "merged"` and dispatches here instead of
+    /// re-wrapping the model.
+    ///
+    /// # Errors
+    ///
+    /// `PretrainedError::Load` on safetensors parse failure or
+    /// weight-name mismatch against the model shape.
+    pub fn from_safetensors_file(
+        cfg: &TinyLlamaConfig,
+        path: &std::path::Path,
+    ) -> Result<Self, PretrainedError> {
+        // SAFETY: same discipline as `from_pretrained` — the file
+        // must not be concurrently truncated while the mmap is
+        // active. Callers hold the mmap for the lifetime of this
+        // call.
+        let root = unsafe {
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&path.to_path_buf()),
+                cfg.dtype,
+                &cfg.device,
+            )
+            .map_err(|e| PretrainedError::Load(e.to_string()))?
+        };
+        Self::new_from_split(cfg, root.pp("model"), root)
+            .map_err(|e| PretrainedError::Load(e.to_string()))
+    }
+
     /// Load pretrained TinyLlama weights from HuggingFace on first use
     /// and cache the safetensors bundle at
     /// `cache_dir/base/<repo-basename>.safetensors`.

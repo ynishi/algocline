@@ -225,12 +225,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `TinyLlamaModel::from_safetensors_file` to reload the merged
     bundle, then a `max_abs_diff_f32(wrapped.forward,
     reloaded.forward)` parity assertion under
-    `NN_SMOKE_MERGED_TOLERANCE` (default `1e-3` — looser than the
-    CPU-side `1e-4` in
+    `NN_SMOKE_MERGED_TOLERANCE` (default `1e-4`, aligned with the
+    CPU-side
     `merged_bundle_tinyllama_forward_matches_wrapped_forward`
-    because CUDA fused mul-add ordering accumulates more numeric
-    drift than the CPU AVX2 kernel; tighten via env when running
-    on CPU). Also asserts the merged bundle size stays under
+    parity test). The 2026-07-20 A40 verify measured
+    `max_abs_diff = 2.003e-5` — a 5x margin under this ceiling —
+    so an earlier `1e-3` guess for CUDA fused mul-add drift has
+    been tightened to `1e-4`. Loosen via env only when a wider
+    dtype / higher-rank / larger-corpus configuration surfaces
+    genuine drift above the tighter bound. Also asserts the merged bundle size stays under
     `NN_SMOKE_MERGED_MAX_BYTES` (default 4.5 GB, sized for
     TinyLlama-1.1B F32 base weight footprint + safetensors header
     + headroom). `NN_SMOKE_SKIP_MERGE=1` drops back to the pure

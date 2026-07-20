@@ -15,10 +15,14 @@
 //!    `TinyLlamaModel::from_safetensors_file`.
 //! 4. Runs a forward pass on both the wrapped and reloaded models
 //!    with a hand-crafted input tensor and asserts the two outputs
-//!    match within f32 tolerance (default `1e-3` on CUDA, tighter
-//!    `1e-4` matches the CPU-side `merged_bundle_tinyllama_forward_matches_wrapped_forward`
-//!    parity test — CUDA fused mul-adds accumulate more numeric
-//!    drift than the CPU AVX2 path so the ceiling is looser here).
+//!    match within f32 tolerance (default `1e-4`, same as the
+//!    CPU-side `merged_bundle_tinyllama_forward_matches_wrapped_forward`
+//!    parity test). The initial 2026-07-20 A40 verify measured
+//!    `max_abs_diff = 2.003e-5` — a 5x margin under this ceiling —
+//!    so CUDA fused mul-add drift turned out to be much smaller
+//!    than the earlier `1e-3` guess. Loosen via env when a wider
+//!    dtype / higher-rank / larger-corpus configuration needs
+//!    more headroom.
 //! 5. Asserts the merged bundle size stays under a full-weight
 //!    ceiling (default `4.5 GB` for TinyLlama-1.1B F32 ≈ base
 //!    weight footprint + safetensors header + small headroom).
@@ -68,11 +72,15 @@
 //! - `NN_SMOKE_LORA_TARGETS`      (default `full`)
 //! - `NN_SMOKE_DELTA_MAX_BYTES`   (default `64 MB`)
 //! - `NN_SMOKE_BASE_FROZEN_CHECK` (default `1`)
-//! - `NN_SMOKE_MERGED_TOLERANCE`  (default `1e-3`) — f32 max_abs_diff
-//!   epsilon for the wrapped-vs-merged forward parity assertion.
-//!   Loosened from the CPU parity test's `1e-4` because CUDA fused
-//!   multiply-add ordering accumulates more numeric drift than the
-//!   CPU AVX2 kernel. Tighten via env when running on CPU.
+//! - `NN_SMOKE_MERGED_TOLERANCE`  (default `1e-4`) — f32 max_abs_diff
+//!   epsilon for the wrapped-vs-merged forward parity assertion,
+//!   aligned with the CPU-side
+//!   `merged_bundle_tinyllama_forward_matches_wrapped_forward`
+//!   integration test. Initial 2026-07-20 A40 verify measured
+//!   `2.003e-5` (5x margin), so an earlier `1e-3` default has been
+//!   tightened here. Loosen via env only when a wider dtype /
+//!   higher-rank / larger-corpus configuration surfaces genuine
+//!   CUDA drift above the tighter bound.
 //! - `NN_SMOKE_MERGED_MAX_BYTES`  (default `4831838208` ≈ 4.5 GB) —
 //!   hard ceiling for the merged bundle size. Sized against
 //!   TinyLlama-1.1B F32 base weight footprint (≈ 4.4 GB); a
@@ -262,7 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lora_alpha = env_f32("NN_SMOKE_LORA_ALPHA", 32.0);
     let delta_max_bytes = env_u64("NN_SMOKE_DELTA_MAX_BYTES", 64 * 1024 * 1024);
     let base_frozen_check = env_bool("NN_SMOKE_BASE_FROZEN_CHECK", true);
-    let merged_tolerance = env_f32("NN_SMOKE_MERGED_TOLERANCE", 1e-3);
+    let merged_tolerance = env_f32("NN_SMOKE_MERGED_TOLERANCE", 1e-4);
     let merged_max_bytes = env_u64("NN_SMOKE_MERGED_MAX_BYTES", 4_831_838_208);
     let skip_merge = env_bool("NN_SMOKE_SKIP_MERGE", false);
     let targets = resolve_targets();

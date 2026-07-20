@@ -20,7 +20,7 @@ use algocline_nn::train::{
     TrainingLease,
 };
 use candle_core::Tensor;
-use candle_nn::{Module as _, VarBuilder, VarMap};
+use candle_nn::{VarBuilder, VarMap};
 use std::sync::Arc;
 use tempfile::TempDir;
 

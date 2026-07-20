@@ -225,6 +225,29 @@ pub fn export_merged<M: MergeableLora>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::lora::MergeableLora;
+    use candle_core::Tensor;
+    use std::collections::HashMap;
+
+    /// Minimal `MergeableLora` stub: emits two toy tensors so the
+    /// unit tests can drive `export_merged` without spinning up a
+    /// full arch model.
+    struct StubModel;
+
+    impl MergeableLora for StubModel {
+        fn export_merged(&self) -> candle_core::Result<HashMap<String, Tensor>> {
+            let mut out = HashMap::new();
+            out.insert(
+                "unit.weight".into(),
+                Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), &Device::Cpu)?,
+            );
+            out.insert(
+                "unit.bias".into(),
+                Tensor::from_slice(&[0.5f32, 0.5], 2, &Device::Cpu)?,
+            );
+            Ok(out)
+        }
+    }
 
     #[test]
     fn validate_rejects_empty_fields() {
@@ -277,5 +300,41 @@ mod tests {
         let candle = card.candle.expect("merged card carries candle branch");
         assert_eq!(candle.bundle_ref, "nn/merged-001");
         assert!(candle.lora.is_none());
+    }
+
+    #[test]
+    fn export_merged_writes_readable_safetensors_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nn").join("stub.safetensors");
+        let provenance = MergedProvenance {
+            lora_card: "cards/stub-lora".into(),
+            arch: "stub-arch".into(),
+            bundle_ref: "nn/stub".into(),
+        };
+        let (bytes, card) = export_merged(&StubModel, &provenance, &path).unwrap();
+        assert!(bytes > 0);
+        assert!(path.exists());
+        assert_eq!(card.training_path, "merged");
+
+        // Round-trip: load back and confirm the tensor set matches.
+        let loaded = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains_key("unit.weight"));
+        assert!(loaded.contains_key("unit.bias"));
+    }
+
+    #[test]
+    fn export_merged_reports_bytes_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("stub.safetensors");
+        let provenance = MergedProvenance {
+            lora_card: "cards/stub-lora".into(),
+            arch: "stub-arch".into(),
+            bundle_ref: "nn/stub".into(),
+        };
+        let (reported_bytes, _card) =
+            export_merged(&StubModel, &provenance, &path).unwrap();
+        let actual = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(reported_bytes, actual);
     }
 }

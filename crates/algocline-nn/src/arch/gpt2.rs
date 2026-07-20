@@ -367,18 +367,6 @@ impl Gpt2Model {
         &self.cfg
     }
 
-    /// Load pretrained GPT-2 weights from HuggingFace on first use and
-    /// cache the safetensors bundle at `cache_dir/base/<preset>.safetensors`.
-    ///
-    /// The config selects the HF repo via [`Gpt2Config::hf_repo`]; a
-    /// custom config that is not one of the shipped presets returns an
-    /// error rather than downloading a mismatched bundle.
-    ///
-    /// # Errors
-    ///
-    /// Fails on: unknown preset (no HF repo), network / cache IO error,
-    /// safetensors parse error, or a weight-name mismatch between the
-    /// downloaded bundle and the model shape.
     /// Load model weights from an on-disk safetensors bundle whose
     /// key layout matches the HF GPT-2 convention (same layout that
     /// [`Gpt2Model::from_pretrained`] downloads and that
@@ -413,6 +401,18 @@ impl Gpt2Model {
         Self::new(cfg, vs).map_err(|e| PretrainedError::Load(e.to_string()))
     }
 
+    /// Load pretrained GPT-2 weights from HuggingFace on first use and
+    /// cache the safetensors bundle at `cache_dir/base/<preset>.safetensors`.
+    ///
+    /// The config selects the HF repo via [`Gpt2Config::hf_repo`]; a
+    /// custom config that is not one of the shipped presets returns an
+    /// error rather than downloading a mismatched bundle.
+    ///
+    /// # Errors
+    ///
+    /// Fails on: unknown preset (no HF repo), network / cache IO error,
+    /// safetensors parse error, or a weight-name mismatch between the
+    /// downloaded bundle and the model shape.
     pub fn from_pretrained(
         variant: &str,
         cfg: &Gpt2Config,

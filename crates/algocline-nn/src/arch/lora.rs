@@ -310,6 +310,33 @@ pub(crate) fn wrap_variant_in_place(
     Ok(())
 }
 
+/// A trainable model that can be wrapped with LoRA
+/// (Hu et al. 2021) additive updates.
+///
+/// Every `arch::*` model that participates in LoRA fine-tuning
+/// implements this trait as a thin delegate to its inherent
+/// `wrap_lora` method (see [`crate::arch::Gpt2Model::wrap_lora`],
+/// [`crate::arch::TinyLlamaModel::wrap_lora`]). The trait exists so
+/// the generic training loop `run_lora_ft<M: Module + DeviceView +
+/// LoraWrappable>` can call `wrap_lora` uniformly regardless of arch.
+///
+/// # Invariants (mirrored per arch impl)
+///
+/// - Base `VarMap` handed to `Self::new` is bit-identical before / after
+///   `wrap_lora`; the returned `VarMap` carries only the freshly-created
+///   `lora_a` / `lora_b` tensors so a caller can hand exactly that map
+///   to the optimizer.
+/// - `cfg.target_modules.is_empty()` or unknown entries are rejected
+///   with a clear message.
+/// - Freshly wrapped state is a forward-pass identity (since
+///   [`LoraLinear::wrap`] zero-inits `lora_b` per Hu et al. 2021 §4.1);
+///   only training moves the delta off zero.
+pub trait LoraWrappable {
+    /// Wrap the model's per-block linear projections with LoRA
+    /// low-rank updates and return the fresh LoRA-only `VarMap`.
+    fn wrap_lora(&mut self, cfg: &LoraConfig) -> CandleResult<candle_nn::VarMap>;
+}
+
 /// Snapshot two tensors as flat f32 vectors and return the maximum
 /// element-wise absolute difference. Small utility so tests and
 /// downstream callers can share the same tolerance check.

@@ -812,6 +812,15 @@ impl crate::train::DeviceView for TinyLlamaModel {
     }
 }
 
+/// Delegate to the inherent [`TinyLlamaModel::wrap_lora`] so the generic
+/// [`crate::train::run_lora_ft`] loop can drive LoRA fine-tuning on any
+/// `M: candle_nn::Module + crate::train::DeviceView + LoraWrappable`.
+impl super::lora::LoraWrappable for TinyLlamaModel {
+    fn wrap_lora(&mut self, cfg: &LoraConfig) -> CandleResult<VarMap> {
+        TinyLlamaModel::wrap_lora(self, cfg)
+    }
+}
+
 /// Build a causal (lower-triangular) mask `[ctx, ctx]` where valid
 /// (kept) positions are `1` and masked-out are `0`.
 ///

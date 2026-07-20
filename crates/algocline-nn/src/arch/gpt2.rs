@@ -539,6 +539,15 @@ impl crate::train::DeviceView for Gpt2Model {
     }
 }
 
+/// Delegate to the inherent [`Gpt2Model::wrap_lora`] so the generic
+/// [`crate::train::run_lora_ft`] loop can drive LoRA fine-tuning on any
+/// `M: candle_nn::Module + crate::train::DeviceView + LoraWrappable`.
+impl super::lora::LoraWrappable for Gpt2Model {
+    fn wrap_lora(&mut self, cfg: &LoraConfig) -> CandleResult<VarMap> {
+        Gpt2Model::wrap_lora(self, cfg)
+    }
+}
+
 /// Errors from [`Gpt2Model::from_pretrained`].
 ///
 /// Explicit variants so the caller (Lua bridge) can surface an

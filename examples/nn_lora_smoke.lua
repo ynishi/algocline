@@ -57,9 +57,16 @@ assert(type(ckpt.lora.delta_path) == "string", "delta_path must be string (ST-d)
 -- already lives at `ckpt.lora.delta_path` (written by run_lora_ft
 -- during the trainer call); `load_gpt2` reads from delta_path
 -- directly and does not touch `<nn_dir>/<card_id>.safetensors`.
+-- Value must match the arch-family allowlist introduced in Layer 1
+-- (`gpt2` / `llama` / `tinyllama` / `qwen2` / `phi` / `gemma`),
+-- optionally followed by `-<variant>`. This smoke exercises the
+-- GPT-2 LoRA path (base handle built via `alc.nn.preset.gpt2`), so
+-- `gpt2-tiny` is the correct family + variant tag; the earlier
+-- `"tiny"` value predated the allowlist and `alc.nn.card.save`
+-- rejects it at validation.
 local card_id = alc.nn.card.save({}, "smoke-lora-card", {
     training_path = "lora",
-    architecture = "tiny",
+    architecture = "gpt2-tiny",
     candle = {
         lora = ckpt.lora,
     },

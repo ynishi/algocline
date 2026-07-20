@@ -189,6 +189,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     entry in this section; actual A40 execution remains the
     follow-up tracked in
     `workspace/tasks/alc-nn-tinyllama/spike-status.md` §7.
+- `algocline-engine`: `alc.nn.wrap_lora` +
+  `alc.nn.trainer.run_lora_ft` Lua bindings for the Layer 2 LoRA
+  wrap and the Layer 3 LoRA fine-tuning loop (Layer 5b of GH #10,
+  landed in two sub-phases: S1 = wrap surface, S2 = trainer surface
+  + trailing docs). Both entries dispatch on the arch-neutral
+  `NnHandle` that Layer 4b established (GPT-2 / TinyLlama arms
+  today; `Llama` refused with an arch-directional error). Config
+  schema is wider than Layer 5a and drives most of the added test
+  surface.
+  - `alc.nn.wrap_lora(base_handle, opts) -> NnHandle` (S1) — wrap a
+    base model in-memory with a fresh LoRA layout and return a
+    wrapped handle with `is_lora_wrapped() == true`. Sits at the
+    top level of the `alc.nn` sub-table (not under `card`) because
+    `wrap_lora` writes nothing to disk. Consumes `opts = { rank,
+    alpha, target_modules?, dropout? }`; `target_modules` defaults
+    to the arch's canonical set from `LoraConfig::default_targets`
+    (GPT-2, 6 targets) or `TinyLlamaModel::default_lora_targets`
+    (TinyLlama, 7 targets). Base-freeze invariant: the base
+    `VarMap` is byte-identical before / after wrap (each block's
+    linears are moved into `LoraLinear`, but the base tensors
+    themselves are not touched). Refuses already-wrapped handles
+    with a directional error (double-wrap protection). Verified by
+    7 integration tests
+    (`bridge::nn_wrap::wrap_lora_bridge_tests`) covering happy
+    paths for both GPT-2 and TinyLlama arms (A1/A2) plus 5
+    config-schema refusals (B1-B5: zero rank / missing alpha /
+    empty target array / arch-mismatched target / out-of-range
+    dropout).
+  - `alc.nn.trainer.run_lora_ft(base_handle, dataset, opts) ->
+    lora_card_id` (S2) — one-call LoRA fine-tuning surface: wrap
+    the base, run the training loop, save the Δ safetensors, and
+    write a `training_path="lora"` Card in a single call. Extends
+    the pre-existing `alc.nn.trainer` sub-table alongside
+    `full_ft` / `lora` / `distill` (the sibling `lora` entry
+    returns a Checkpoint table for callers who want to drive Card
+    assembly by hand; `run_lora_ft` is the "batteries-included"
+    path that mints the Card in one call). Consumes `opts = {
+    rank, alpha, target_modules?, dropout?, lr, batch, steps,
+    warmup?, schedule?, name? }`; `grad_accum_steps` and
+    `ckpt_every` are NOT exposed and remain pinned to their crate
+    defaults (design's explicit non-exposure). All config errors
+    surface pre-flight as loud `LuaError::external` with prefix
+    `alc.nn.trainer.run_lora_ft:` — no silent fallback, no
+    `warn!` swallow. The Δ safetensors is written to
+    `<nn_dir>/nn/lora-<lora_card_id>.safetensors` (the Rust
+    surface convention — not caller-configurable); the Card
+    records `candle.bundle_ref = "nn/<lora_card_id>"` and
+    `candle.lora.{rank, alpha, target_modules, dropout,
+    delta_path, base_bundle_ref}` where `base_bundle_ref` is
+    derived from the base handle as `"nn/<family>-<variant>"`. The
+    returned `lora_card_id` is loadable via
+    `alc.nn.card.load_wrap` (Layer 4b) for inference or feedable
+    to `alc.nn.card.merge_lora` (Layer 5a) for merged export.
+    Verified by 9 integration tests
+    (`bridge::nn_trainer::run_lora_ft_bridge_tests`) covering
+    happy paths for both GPT-2 and TinyLlama arms (A3/A4) plus 2
+    config-schema refusals (B6/B7: zero steps / unknown
+    schedule), 3 state invariants (C1: base VarMap byte-identical
+    before / after; C2: Δ safetensors contains exactly `n_layers ×
+    n_targets × 2` LoRA A/B tensors and no base leakage; C3:
+    cross-surface — the freshly-written LoRA Card is consumable by
+    `alc.nn.card.load_wrap` and yields a handle with
+    `is_lora_wrapped() == true`), and 2 Card + Δ round-trips
+    through `load_wrap` (D1/D2: GPT-2 / TinyLlama arms).
+    Concurrency: a fresh `TrainingLease` is constructed per-call
+    and NOT shared with the sibling `full_ft` / `lora` / `distill`
+    entries (documented limitation; sharing across Lua calls is
+    out of scope).
+  - Reused shared helpers (widened to `pub(super)` with
+    justification comments so cross-file reuse is documented
+    at the widening site rather than the consumer): `sanitize_name`,
+    `compact_epoch_us`, `build_create_payload_from_meta`,
+    `extract_full_ft_opts`, `load_wrap_impl`, and a new
+    `DatasetHandle::inner_lock` accessor for cross-module dataset
+    downcast without exposing the underlying `Mutex` field.
+  - CPU verification status: all 16 new bridge tests
+    (`wrap_lora_bridge_tests` + `run_lora_ft_bridge_tests`) pass
+    on `gpt2-tiny` / `tinyllama-tiny` micro shapes with no HF hub
+    download and no > 1s train step per test. GPU smoke for
+    real-scale LoRA (`nn_medium_lora_gpu_smoke.rs` and a future
+    `nn_tinyllama_lora_gpu_smoke.rs` follow-up) stays on the
+    `spike-status.md §7` carry.
 - `algocline-nn`: TinyLlama-1.1B GPU smoke example suite covering
   the base full-FT, LoRA fine-tune, and LoRA → merge round-trip
   paths on CUDA. Siblings of the existing

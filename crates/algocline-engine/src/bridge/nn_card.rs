@@ -901,7 +901,13 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
 /// The Card envelope shape (pkg / card_id / metadata.kind /
 /// metadata.nn) is identical to [`build_create_payload`]'s output —
 /// only the input side differs (typed struct vs. raw JSON).
-fn build_create_payload_from_meta(card_id: &str, meta: &NnCardMeta) -> LuaResult<Json> {
+///
+/// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
+/// which also builds a typed [`NnCardMeta`] (LoRA branch) and needs
+/// the same envelope constructor — no user-JSON re-validation to
+/// perform, so re-using [`build_create_payload`] would force an
+/// unnecessary JSON round-trip.
+pub(super) fn build_create_payload_from_meta(card_id: &str, meta: &NnCardMeta) -> LuaResult<Json> {
     // Defensive re-validation: even though the caller passes a
     // fully-typed struct, the architecture field still must match
     // the canonical family list (a mis-constructed MergedProvenance
@@ -1094,7 +1100,11 @@ fn generate_card_id(name: &str) -> String {
     format!("{sanitized}_{ts}")
 }
 
-fn sanitize_name(name: &str) -> String {
+// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
+// which generates its LoRA card_id via the same
+// `<sanitized_name>_<epoch_us>` convention (mirrors save_impl /
+// merge_lora_impl). Kept module-private otherwise.
+pub(super) fn sanitize_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -1110,7 +1120,11 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-fn compact_epoch_us() -> String {
+// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
+// which generates its LoRA card_id via the same
+// `<sanitized_name>_<epoch_us>` convention (mirrors save_impl /
+// merge_lora_impl). Kept module-private otherwise.
+pub(super) fn compact_epoch_us() -> String {
     // Clock-skew corner (`SystemTime` < `UNIX_EPOCH`) collapses to
     // `Duration::ZERO`; id collision then surfaces loudly through
     // `FileCardStore::write_new_card`'s immutable-card guard, not
@@ -1592,7 +1606,14 @@ fn wrap_tinyllama_from_card(meta: &NnCardMeta, base: &NnHandle) -> LuaResult<NnH
 /// `TinyLlamaHandle` — backward compat from existing typed
 /// preset entries) or an `NnHandle` (new arch-neutral preset).
 /// The typed-handle path is lifted into `NnHandle` via Clone.
-fn load_wrap_impl(
+///
+/// Widened to `pub(super)` so L5b-S2
+/// `nn_trainer::run_lora_ft_bridge_tests` (C3 / D1 / D2) can invoke
+/// the arch-neutral loader on a freshly-written LoRA Card. Kept
+/// module-private to callers otherwise (production callers reach it
+/// via the `alc.nn.card.load_wrap` Lua closure registered in
+/// `register_nn_card`).
+pub(super) fn load_wrap_impl(
     store: &FileCardStore,
     card_id: &str,
     base_handle: &LuaAnyUserData,
@@ -2193,6 +2214,46 @@ pub(super) struct DatasetHandle {
     ctx_len: usize,
 }
 
+impl DatasetHandle {
+    /// Lock the inner dataset for the duration of a training call.
+    ///
+    /// Widened accessor for the L5b-S2 sibling
+    /// [`super::nn_trainer::run_lora_ft_impl`], which cannot reach
+    /// the module-private `inner` field directly. In-module callers
+    /// (`full_ft_impl` / `lora_impl` / `distill_impl`) still use
+    /// `self.inner.lock()` inline; wrapping is unnecessary for
+    /// them.
+    pub(super) fn inner_lock(
+        &self,
+    ) -> LuaResult<std::sync::MutexGuard<'_, Box<dyn Dataset + Send>>> {
+        self.inner.lock().map_err(|e| {
+            LuaError::external(format!(
+                "alc.nn.trainer.run_lora_ft: dataset lock poisoned: {e}"
+            ))
+        })
+    }
+
+    /// Construct a [`DatasetHandle`] from a boxed [`Dataset`] plus
+    /// caller-supplied source / batch / ctx metadata. Test-only
+    /// helper for the L5b-S2 bridge test module, which builds a
+    /// [`TokenizedDataset`] in-process rather than routing through
+    /// the public `alc.nn.data.jsonl` / `.synthetic` Lua entries.
+    #[cfg(test)]
+    pub(super) fn for_test(
+        inner: Box<dyn Dataset + Send>,
+        source: String,
+        batch_size: usize,
+        ctx_len: usize,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(inner),
+            source,
+            batch_size,
+            ctx_len,
+        }
+    }
+}
+
 impl mlua::UserData for DatasetHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("source", |_, this, ()| Ok(this.source.clone()));
@@ -2737,7 +2798,15 @@ fn distill_impl(
 /// Extract [`FullFtConfig`] from an opts table, applying the crate's
 /// defaults for any missing key. Rejects zero-sized values at the
 /// boundary (matches the training-loop's own early exit shape).
-fn extract_full_ft_opts(opts: Option<&LuaTable>) -> LuaResult<FullFtConfig> {
+///
+/// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
+/// which reuses the same train-opts extractor (`lr` / `batch_size` /
+/// `steps` / `warmup` / `schedule` / etc.) and layers the `run_lora_ft`
+/// bind's stricter validation (steps > 0, batch > 0, lr > 0) on top.
+/// Do NOT reimplement the extractor there — keeping one SoT prevents
+/// field-set drift between the pre-existing `alc.nn.trainer.lora`
+/// / `full_ft` / `distill` entries and the new `run_lora_ft`.
+pub(super) fn extract_full_ft_opts(opts: Option<&LuaTable>) -> LuaResult<FullFtConfig> {
     let mut cfg = FullFtConfig::default();
     let Some(t) = opts else {
         return Ok(cfg);

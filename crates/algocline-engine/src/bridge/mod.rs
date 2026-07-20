@@ -25,6 +25,8 @@ mod llm;
 #[cfg(feature = "nn")]
 mod nn_card;
 #[cfg(feature = "nn")]
+mod nn_trainer;
+#[cfg(feature = "nn")]
 mod nn_wrap;
 mod text;
 
@@ -141,6 +143,17 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     )?;
     #[cfg(feature = "nn")]
     nn_wrap::register_nn_wrap(lua, alc_table)?;
+    // MUST run after `register_nn_card` (which creates the
+    // `alc.nn.trainer` sub-table populated with `full_ft` / `lora`
+    // / `distill`) and after `register_nn_wrap`. Design §3.4 pins
+    // the order.
+    #[cfg(feature = "nn")]
+    nn_trainer::register_nn_trainer(
+        lua,
+        alc_table,
+        Arc::clone(&config.card_store),
+        config.nn_dir.clone(),
+    )?;
     llm::register_budget_remaining(lua, alc_table, config.budget.clone())?;
     llm::register_progress(lua, alc_table, config.progress)?;
     if let Some(tx) = config.llm_tx {

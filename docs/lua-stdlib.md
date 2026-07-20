@@ -925,8 +925,7 @@ Returns a single Lua string: the freshly-minted merged
 **GPU verification status:** the TinyLlama merge path is
 exercised only on CPU F32 in-tree so far. GPT-2 CPU is fully
 covered. A40 GPU smoke examples for TinyLlama merge are open
-follow-ups; see `workspace/tasks/alc-nn-tinyllama/spike-status.md`
-§7.
+follow-ups (spike-status §7).
 
 ```lua
 -- End-to-end: load a LoRA card, merge it into a self-contained
@@ -940,6 +939,209 @@ local merged_id = alc.nn.card.merge_lora(wrapped, {
 
 -- Later, at inference time — no base handle, no LoRA delta needed:
 local h = alc.nn.card.load_handle(merged_id)
+```
+
+#### `alc.nn.wrap_lora(base_handle, opts) -> NnHandle`
+
+Layer 5b — wrap a base model in-memory with a fresh LoRA layout and
+return a new `NnHandle` with `is_lora_wrapped() == true`. Sits at the
+top level of the `alc.nn` sub-table (not under `card`) because
+`wrap_lora` writes nothing to disk — the wrap is a memory-only
+operation on the base handle's `Arc<Mutex<Model>>`, so a caller can
+inspect the wrapped forward shape before deciding to train (via
+`alc.nn.trainer.run_lora_ft`) or hand-drive a training loop with
+`alc.nn.trainer.lora`.
+
+`base_handle` must be an unwrapped base handle. Accepts either an
+`NnHandle` (arch-neutral, from `alc.nn.preset(arch, …)`) or a typed
+handle (from `alc.nn.preset.<arch>(…)`) for backward compat.
+Already-wrapped handles are refused with a directional error
+(double-wrap protection). Inference-only architectures (Llama) are
+refused with an arch-directional error.
+
+`opts` (required, table):
+
+- `rank` *(integer, required, > 0)* — `LoraConfig.rank`.
+- `alpha` *(number, required, > 0)* — `LoraConfig.alpha`.
+- `target_modules` *(array of string, optional)* — subset of the
+  arch's canonical target set. Defaults to the arch's full set when
+  `nil`: `["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"]`
+  for `gpt2`, `["q_proj", "k_proj", "v_proj", "o_proj",
+  "gate_proj", "up_proj", "down_proj"]` for `tinyllama`. Empty
+  array rejected. Each entry must be in the arch's canonical set.
+- `dropout` *(number, optional, `[0.0, 1.0)`)* — `LoraConfig.dropout`.
+  Defaults to `0.0`. Validated even though the current LoRA forward
+  path ignores it — schema stability for a future dropout ship.
+
+**Returns:** a wrapped `NnHandle` whose `is_lora_wrapped()` returns
+`true` and whose forward preserves the base's output shape (LoRA
+zero-init invariant: pre-training wrapped forward matches base
+forward within tolerance).
+
+**Errors:**
+
+- `alc.nn.wrap_lora: expected NnHandle, got <type>` — first arg is
+  not a handle userdata.
+- `alc.nn.wrap_lora: handle is already LoRA-wrapped; drop the wrap
+  or start from a base handle` — double-wrap protection.
+- `alc.nn.wrap_lora: architecture <arch> is not LoRA-wrappable
+  (only gpt2 / tinyllama families are supported)` — Llama adapter
+  refused.
+- `alc.nn.wrap_lora: opts.rank must be a positive integer` —
+  missing / zero / negative rank.
+- `alc.nn.wrap_lora: opts.alpha must be a positive number` —
+  missing / non-positive alpha.
+- `alc.nn.wrap_lora: opts.target_modules must be non-empty (or nil
+  for the per-arch default)` — empty array.
+- `alc.nn.wrap_lora: unknown target module "..." for arch <arch>
+  (known: [...])` — entry not in the arch's canonical set.
+- `alc.nn.wrap_lora: opts.dropout must be in [0.0, 1.0)` — out of
+  range.
+- `alc.nn.wrap_lora: candle: <inner>` — underlying
+  `Model::wrap_lora` failed (e.g. rank larger than a target
+  projection's narrowest dim).
+
+```lua
+-- Wrap-only (inspect a LoRA layout without training):
+local base = alc.nn.preset("gpt2", "medium", { pretrained = false })
+local wrapped = alc.nn.wrap_lora(base, { rank = 4, alpha = 8.0 })
+print(wrapped:arch(), wrapped:is_lora_wrapped())  -- gpt2  true
+```
+
+#### `alc.nn.trainer.run_lora_ft(base_handle, dataset, opts) -> lora_card_id`
+
+Layer 5b — one-call LoRA fine-tuning surface: wrap the base model
+in-memory, run the training loop, save the Δ safetensors, and
+write a `training_path="lora"` Card. Returns the freshly-minted
+LoRA `card_id` as a Lua string. Sibling of the pre-existing
+`alc.nn.trainer.lora` (which returns a Checkpoint table for
+callers who want to drive Card assembly by hand); `run_lora_ft`
+is the "batteries-included" path that mints the Card in one call.
+
+`base_handle` must be an unwrapped base `NnHandle` (or typed
+`Gpt2Handle` / `TinyLlamaHandle` for backward compat) — the wrap
+happens inside the training loop, so passing an already-wrapped
+handle is refused with a directional error pointing at "drop the
+wrap first". Inference-only architectures (Llama) refused with an
+arch-directional error.
+
+`dataset` must be a `DatasetHandle` produced by
+`alc.nn.data.jsonl` / `.from_card` / `.synthetic` / `.parquet`.
+
+`opts` (required, table) — LoRA config + train config in one flat
+table:
+
+- LoRA config — same schema as `alc.nn.wrap_lora`:
+  - `rank` *(integer, required, > 0)*
+  - `alpha` *(number, required, > 0)*
+  - `target_modules` *(array of string, optional)* — defaults to
+    the arch's canonical set when `nil`.
+  - `dropout` *(number, optional, `[0.0, 1.0)`)*
+- Train config:
+  - `lr` *(number, required, > 0)* — `FullFtConfig.lr`.
+  - `batch` *(integer, required, > 0)* — `FullFtConfig.batch_size`.
+    Note the field is named `batch` here to match design §1.2
+    (the sibling `alc.nn.trainer.lora` uses `batch_size`).
+  - `steps` *(integer, required, > 0)* — `FullFtConfig.steps`.
+    Zero steps refused pre-flight (design §2.2 defensive catch of
+    `TrainError::ZeroSteps`).
+  - `warmup` *(integer, optional, ≥ 0)* — `FullFtConfig.warmup`.
+    Defaults to `0`.
+  - `schedule` *(string, optional)* — one of `"CosineWithWarmup"` /
+    `"Constant"`. Defaults to `"CosineWithWarmup"`. Anything else
+    refused with the caller-supplied value in the error message.
+- `name` *(string, optional)* — used as the Card name and to
+  derive `lora_card_id`. Defaults to `"run_lora_ft"` when absent
+  or empty.
+
+Not exposed (pinned to `FullFtConfig::default()` values):
+`grad_accum_steps = 1` (multi-step accumulation returns
+`GradAccumUnsupported` today), `ckpt_every = 0` (rotating
+checkpoint is out of scope for the Lua bridge — the Δ safetensors
+is always written once at end-of-run).
+
+The Δ safetensors is written to
+`<nn_dir>/nn/lora-<lora_card_id>.safetensors` (the Rust surface
+convention — not caller-configurable). The Card records:
+
+- `training_path = "lora"`
+- `candle.bundle_ref = "nn/<lora_card_id>"`
+- `candle.lora.{rank, alpha, target_modules, dropout, delta_path,
+  base_bundle_ref}` — `base_bundle_ref` derived from the base
+  handle as `"nn/<family>-<variant>"`.
+
+**Returns:** a single Lua string, the freshly-minted
+`lora_card_id`. The Card is loadable via
+`alc.nn.card.load_wrap(lora_card_id, base)` (Layer 4b) for
+inference, or feedable to `alc.nn.card.merge_lora` (Layer 5a) for
+merged export.
+
+**Errors:**
+
+- `alc.nn.trainer.run_lora_ft: expected NnHandle, got <type>` —
+  first arg is not a handle userdata.
+- `alc.nn.trainer.run_lora_ft: expected base (unwrapped) NnHandle;
+  drop the wrap first` — passed an already-wrapped handle.
+- `alc.nn.trainer.run_lora_ft: architecture <arch> is not
+  LoRA-wrappable (only gpt2 / tinyllama families are supported)`
+  — Llama adapter refused.
+- `alc.nn.trainer.run_lora_ft: dataset must be an alc.nn.dataset
+  (got <type>)` — second arg is not a `DatasetHandle` userdata.
+- `alc.nn.trainer.run_lora_ft: opts.rank must be a positive
+  integer` / `.alpha must be a positive number` /
+  `.target_modules must be non-empty ...` / `unknown target module
+  "..." for arch <arch> ...` / `.dropout must be in [0.0, 1.0)` —
+  LoRA opts validation (same shapes as `alc.nn.wrap_lora`, with
+  the `run_lora_ft:` prefix).
+- `alc.nn.trainer.run_lora_ft: opts.lr must be a positive number`
+  / `.batch must be a positive integer` / `.steps must be a
+  positive integer` / `.warmup must be >= 0` / `.schedule must be
+  one of "CosineWithWarmup" / "Constant" (got ...)` — train opts
+  validation.
+- `alc.nn.trainer.run_lora_ft: zero steps` — defensive catch of
+  `TrainError::ZeroSteps` (should be caught pre-flight; this arm
+  is defence in depth).
+- `alc.nn.trainer.run_lora_ft: training lease already active on
+  this VM` — `TrainError::LeaseHeld`.
+- `alc.nn.trainer.run_lora_ft: dataset exhausted after N steps
+  (requested M)` — `TrainError::DatasetExhausted`.
+- `alc.nn.trainer.run_lora_ft: checkpoint: <msg>` —
+  `TrainError::Ckpt` (filesystem write / safetensors serialize).
+- `alc.nn.trainer.run_lora_ft: candle: <msg>` —
+  `TrainError::Candle` (arch-side wrap / forward / backward
+  failure).
+- `alc.nn.trainer.run_lora_ft: card store: <msg>` —
+  `FileCardStore::create` failure.
+
+**Concurrency:** `run_lora_ft` constructs a fresh
+`TrainingLease` per call. It does NOT share a lease with the
+sibling `alc.nn.trainer.lora` / `.full_ft` / `.distill` entries
+(those share one lease per VM lifetime). Mixing `run_lora_ft` and
+the sibling entries in parallel would see two independent leases.
+
+**GPU verification status:** CPU F32 fully covered in-tree
+(`bridge::nn_trainer::run_lora_ft_bridge_tests` — 9 tests: happy
+path + config refusals + state invariants + Card round-trip). A40
+GPU smoke is a separate carry (spike-status §7).
+
+```lua
+-- End-to-end: base handle → train → LoRA Card → load_wrap for inference.
+local base = alc.nn.preset("gpt2", "medium", { pretrained = false })
+local ds = alc.nn.data.synthetic(
+    { { 1, 2, 3, 4, 5 }, { 5, 4, 3, 2, 1 } },
+    { batch_size = 1, ctx_len = 16 }
+)
+
+local lora_id = alc.nn.trainer.run_lora_ft(base, ds, {
+    rank = 4, alpha = 8.0,
+    lr = 3e-4, batch = 1, steps = 100, warmup = 10,
+    schedule = "CosineWithWarmup",
+    name = "my-lora-run",
+})
+
+-- Later — reload the LoRA on a fresh base for inference:
+local base2 = alc.nn.preset("gpt2", "medium", { pretrained = false })
+local wrapped = alc.nn.card.load_wrap(lora_id, base2)
 ```
 
 #### `alc.nn.card.load_gpt2(card_id, base) -> Gpt2Handle` *(deprecated)*

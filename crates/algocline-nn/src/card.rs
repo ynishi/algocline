@@ -212,8 +212,7 @@ pub const SUPPORTED_ARCHITECTURE_FAMILIES: &[&str] =
 /// [`NnCandleBranch`]. `"merged"` (Layer 4a) has no sub-branch —
 /// its provenance rides on `NnLineage.parent` per the Q0
 /// Model-side struct + projection pattern.
-pub const SUPPORTED_TRAINING_PATHS: &[&str] =
-    &["full_ft", "lora", "distillation", "merged"];
+pub const SUPPORTED_TRAINING_PATHS: &[&str] = &["full_ft", "lora", "distillation", "merged"];
 
 /// Validate that `training_path` is one of
 /// [`SUPPORTED_TRAINING_PATHS`].

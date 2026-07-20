@@ -56,8 +56,7 @@ fn wrap_and_train_briefly() -> (TinyLlamaModel, VarMap, TinyLlamaConfig) {
         ckpt_every: 0,
         ckpt_keep: 1,
     };
-    let lora_cfg =
-        LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
+    let lora_cfg = LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
     let _ = run_lora_ft(
@@ -80,8 +79,7 @@ fn wrap_and_train_briefly() -> (TinyLlamaModel, VarMap, TinyLlamaConfig) {
 fn merged_bundle_tinyllama_forward_matches_wrapped_forward() {
     let (wrapped_model, _base_vm, cfg) = wrap_and_train_briefly();
 
-    let input =
-        Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 0], (1, 8), &cfg.device).unwrap();
+    let input = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 0], (1, 8), &cfg.device).unwrap();
     let wrapped_out = wrapped_model.forward(&input).unwrap();
 
     let tmp = TempDir::new().unwrap();
@@ -98,8 +96,8 @@ fn merged_bundle_tinyllama_forward_matches_wrapped_forward() {
     assert_eq!(card.architecture, "tinyllama-tiny");
 
     // Reload merged as plain TinyLlama.
-    let loaded_model = TinyLlamaModel::from_safetensors_file(&cfg, &out_path)
-        .expect("reload merged as plain tll");
+    let loaded_model =
+        TinyLlamaModel::from_safetensors_file(&cfg, &out_path).expect("reload merged as plain tll");
     let loaded_out = loaded_model.forward(&input).unwrap();
 
     let diff = max_abs_diff_f32(&wrapped_out, &loaded_out).unwrap();

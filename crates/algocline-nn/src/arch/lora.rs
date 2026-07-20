@@ -553,10 +553,7 @@ mod tests {
         let vm = VarMap::new();
         let vs = VarBuilder::from_varmap(&vm, DType::F32, &device);
         let base = candle_nn::linear(4, 3, vs.pp("base")).unwrap();
-        let base_ref = candle_nn::Linear::new(
-            base.weight().clone(),
-            base.bias().cloned(),
-        );
+        let base_ref = candle_nn::Linear::new(base.weight().clone(), base.bias().cloned());
 
         let lora = LoraLinear::wrap(base, LoraConfig::new(2, 4.0), vs.pp("lora")).unwrap();
 
@@ -581,8 +578,20 @@ mod tests {
             &device,
         )
         .unwrap();
-        let y_lora: Vec<f32> = lora.forward(&xs).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let y_base: Vec<f32> = base_ref.forward(&xs).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let y_lora: Vec<f32> = lora
+            .forward(&xs)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let y_base: Vec<f32> = base_ref
+            .forward(&xs)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         assert_eq!(
             y_lora, y_base,
             "canonical zero-init B must make wrapped forward bit-identical to base"

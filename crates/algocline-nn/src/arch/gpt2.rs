@@ -592,8 +592,7 @@ impl super::lora::LoraWrappable for Gpt2Model {
 /// Layer 4a §3 Q2 — HF-native layout keys.
 impl super::lora::MergeableLora for Gpt2Model {
     fn export_merged(&self) -> CandleResult<std::collections::HashMap<String, Tensor>> {
-        let mut out: std::collections::HashMap<String, Tensor> =
-            std::collections::HashMap::new();
+        let mut out: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
 
         // Top-level: token + positional embeddings (LM head is tied
         // to `wte`, so no separate `lm_head.weight` — matches

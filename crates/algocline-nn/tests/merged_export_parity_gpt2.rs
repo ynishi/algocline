@@ -104,8 +104,7 @@ fn wrap_and_train_briefly() -> (Gpt2Model, VarMap, Gpt2Config) {
 fn merged_bundle_forward_matches_wrapped_forward() {
     let (wrapped_model, _base_vm, cfg) = wrap_and_train_briefly();
 
-    let input =
-        Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 0], (1, 8), &cfg.device).unwrap();
+    let input = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6, 7, 0], (1, 8), &cfg.device).unwrap();
     let wrapped_out = wrapped_model.forward(&input).unwrap();
 
     let tmp = TempDir::new().unwrap();
@@ -121,8 +120,8 @@ fn merged_bundle_forward_matches_wrapped_forward() {
     assert_eq!(card.training_path, "merged");
 
     // Reload the merged file as if it were a plain pretrained base.
-    let loaded_model = Gpt2Model::from_safetensors_file(&cfg, &out_path)
-        .expect("reload merged as plain gpt2");
+    let loaded_model =
+        Gpt2Model::from_safetensors_file(&cfg, &out_path).expect("reload merged as plain gpt2");
     let loaded_out = loaded_model.forward(&input).unwrap();
 
     let diff = max_abs_diff_f32(&wrapped_out, &loaded_out).unwrap();

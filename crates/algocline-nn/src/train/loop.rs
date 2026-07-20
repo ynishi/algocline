@@ -23,12 +23,12 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
 use crate::arch::{Gpt2Model, LoraConfig, LoraWrappable};
-use crate::train::DeviceView;
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
 use crate::train::scheduler::{ScheduleKind, Scheduler};
 use crate::train::Checkpoint;
+use crate::train::DeviceView;
 
 /// Hyperparameters for [`run_full_ft`].
 ///
@@ -875,8 +875,7 @@ mod tests {
         let tl_vm = VarMap::new();
         let tl_vs = VarBuilder::from_varmap(&tl_vm, tl_cfg.dtype, &tl_cfg.device);
         let mut tl_model = TinyLlamaModel::new(&tl_cfg, tl_vs).unwrap();
-        let tl_lora_cfg =
-            LoraConfig::with_targets(2, 4.0, TinyLlamaModel::default_lora_targets());
+        let tl_lora_cfg = LoraConfig::with_targets(2, 4.0, TinyLlamaModel::default_lora_targets());
         let tl_dyn: &mut dyn LoraWrappable = &mut tl_model;
         let tl_lora_vm = tl_dyn.wrap_lora(&tl_lora_cfg).unwrap();
         assert_eq!(

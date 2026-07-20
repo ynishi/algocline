@@ -16,9 +16,7 @@
 //!    training_path = "merged"). A silent field-mapping change
 //!    would break downstream consumers filtering by these paths.
 
-use algocline_nn::card::{
-    validate_training_path, NnCardMeta, SUPPORTED_TRAINING_PATHS,
-};
+use algocline_nn::card::{validate_training_path, NnCardMeta, SUPPORTED_TRAINING_PATHS};
 use algocline_nn::merged::MergedProvenance;
 
 fn sample_provenance() -> MergedProvenance {

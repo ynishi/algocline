@@ -89,19 +89,16 @@ impl MergedProvenance {
     ///
     /// Mapping:
     ///
-    /// - `NnCardMeta.name`             ← `name` argument
-    /// - `NnCardMeta.backend`          ← `"candle"` (Layer 4a is
-    ///                                    Rust-side candle only)
-    /// - `NnCardMeta.architecture`     ← `self.arch`
-    /// - `NnCardMeta.training_path`    ← `"merged"` (accepted after
-    ///                                    S4 lands)
-    /// - `NnCardMeta.lineage.parent`   ← `Some(self.lora_card)`
-    /// - `NnCandleBranch.bundle_ref`   ← `self.bundle_ref`
-    /// - `NnCandleBranch.lora`         ← `None` (merged card no
-    ///                                    longer needs a wrap block)
-    /// - `hyperparams` / `metrics`     ← empty JSON objects (SoT
-    ///                                    remains on the referenced
-    ///                                    LoRA card)
+    /// - `NnCardMeta.name` ← `name` argument
+    /// - `NnCardMeta.backend` ← `"candle"` (Layer 4a is Rust-side candle only)
+    /// - `NnCardMeta.architecture` ← `self.arch`
+    /// - `NnCardMeta.training_path` ← `"merged"` (accepted after S4 lands)
+    /// - `NnCardMeta.lineage.parent` ← `Some(self.lora_card)`
+    /// - `NnCandleBranch.bundle_ref` ← `self.bundle_ref`
+    /// - `NnCandleBranch.lora` ← `None` (merged card no longer needs a wrap
+    ///   block)
+    /// - `hyperparams` / `metrics` ← empty JSON objects (SoT remains on the
+    ///   referenced LoRA card)
     pub fn to_card_meta(&self, name: String) -> NnCardMeta {
         NnCardMeta {
             name,
@@ -198,9 +195,8 @@ pub fn export_merged<M: MergeableLora>(
     // mkdir separately.
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                MergeError::Io(format!("mkdir {:?}: {e}", parent))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MergeError::Io(format!("mkdir {:?}: {e}", parent)))?;
         }
     }
 
@@ -332,8 +328,7 @@ mod tests {
             arch: "stub-arch".into(),
             bundle_ref: "nn/stub".into(),
         };
-        let (reported_bytes, _card) =
-            export_merged(&StubModel, &provenance, &path).unwrap();
+        let (reported_bytes, _card) = export_merged(&StubModel, &provenance, &path).unwrap();
         let actual = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(reported_bytes, actual);
     }

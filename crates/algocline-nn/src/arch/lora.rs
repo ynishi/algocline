@@ -20,9 +20,19 @@
 //! matrix so a caller can construct a plain `Linear` that produces
 //! identical outputs for the same input. This is what the merge-
 //! equivalence integration test asserts within 1e-4 element-wise.
+//!
+//! # Initialisation
+//!
+//! [`LoraLinear::wrap`] follows the canonical LoRA init from
+//! Hu et al. 2021 §4.1: `lora_a` gets candle-nn's default (Kaiming
+//! uniform) random weights, while `lora_b` is initialised to **zero**.
+//! Because `ΔW = scaling * (B · A)` and `B = 0` at `t=0`, the wrap is
+//! effectively an identity map at construction — `wrap(base).forward(x)`
+//! equals `base.forward(x)` bit-for-bit. Only training moves `B` off
+//! zero, at which point `ΔW` starts contributing.
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{Init, Linear, Module, VarBuilder};
 
 /// LoRA rank + scaling + wrap-target configuration.
 ///
@@ -137,6 +147,12 @@ impl LoraLinear {
     /// separate `VarBuilder`; passing an untrained base here is
     /// legal but the merge-equivalence guarantee holds against
     /// whatever weights `base` currently carries.
+    ///
+    /// Init follows Hu et al. 2021 §4.1: `lora_a` receives candle-nn's
+    /// default (Kaiming uniform) random init, `lora_b` is zero-init so
+    /// that `ΔW = B · A = 0` at `t=0`. Under this init the wrapped
+    /// forward exactly matches the un-wrapped base forward until
+    /// training moves `B` off zero.
     pub fn wrap(base: Linear, cfg: LoraConfig, vs: VarBuilder) -> CandleResult<Self> {
         if cfg.rank == 0 {
             return Err(candle_core::Error::Msg(
@@ -155,8 +171,17 @@ impl LoraLinear {
         // No biases on the LoRA legs — the additive contribution
         // conceptually shifts only the weight of the base linear, not
         // its bias.
+        //
+        // `lora_a` uses candle-nn's default Kaiming random init via
+        // `linear_no_bias`. `lora_b` is zero-init per Hu et al. 2021
+        // §4.1 so `ΔW = B · A = 0` at construction; the Var is still
+        // registered under `vs.pp("lora_b").weight` so the optimizer
+        // sees it during training.
         let lora_a = candle_nn::linear_no_bias(in_features, cfg.rank, vs.pp("lora_a"))?;
-        let lora_b = candle_nn::linear_no_bias(cfg.rank, out_features, vs.pp("lora_b"))?;
+        let lora_b_weight =
+            vs.pp("lora_b")
+                .get_with_hints((out_features, cfg.rank), "weight", Init::Const(0.0))?;
+        let lora_b = Linear::new(lora_b_weight, None);
         Ok(Self {
             base,
             lora_a,
@@ -426,5 +451,53 @@ mod tests {
         let xs = Tensor::zeros((3, 8), DType::F32, &device).unwrap();
         let out = lora.forward(&xs).unwrap();
         assert_eq!(out.dims(), &[3, 5]);
+    }
+
+    /// Canonical Hu et al. 2021 §4.1 init: `lora_b` weight must be
+    /// exactly zero after `wrap`, so `ΔW = scaling * (B · A) = 0` at
+    /// construction. Verified two ways:
+    /// (1) direct byte-check of `lora_b.weight()`,
+    /// (2) `wrap(base).forward(x) == base.forward(x)` bit-for-bit on
+    ///     a fresh (un-trained) wrap.
+    #[test]
+    fn wrap_zero_inits_lora_b_and_matches_base_forward() {
+        let device = Device::Cpu;
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let base = candle_nn::linear(4, 3, vs.pp("base")).unwrap();
+        let base_ref = candle_nn::Linear::new(
+            base.weight().clone(),
+            base.bias().cloned(),
+        );
+
+        let lora = LoraLinear::wrap(base, LoraConfig::new(2, 4.0), vs.pp("lora")).unwrap();
+
+        // (1) lora_b weight is exactly zero.
+        let b_flat: Vec<f32> = lora
+            .lora_b()
+            .weight()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!(
+            b_flat.iter().all(|v| *v == 0.0),
+            "lora_b weight must be zero-init per Hu et al. 2021 §4.1; \
+             got non-zero entries in {b_flat:?}"
+        );
+
+        // (2) Forward matches base exactly on a fresh wrap.
+        let xs = Tensor::from_slice(
+            &[1.0f32, -1.0, 0.5, 0.25, 2.0, -2.0, 0.0, 3.0],
+            (2, 4),
+            &device,
+        )
+        .unwrap();
+        let y_lora: Vec<f32> = lora.forward(&xs).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let y_base: Vec<f32> = base_ref.forward(&xs).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(
+            y_lora, y_base,
+            "canonical zero-init B must make wrapped forward bit-identical to base"
+        );
     }
 }

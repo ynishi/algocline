@@ -1,34 +1,27 @@
 //! Integration test — TinyLlama LoRA wrap freeze + dispatch.
 //!
-//! Design source: `workspace/tasks/alc-nn-tinyllama/layer-2-lora-design.md`
-//! §6.1. Two deviations from that spec are called out below.
+//! Design source: TinyLlama LoRA Layer 2 design §6.1, plus the Layer 3
+//! prep S0 fix that adopted canonical Hu et al. 2021 §4.1 init in
+//! `LoraLinear::wrap` (`lora_a` random, `lora_b` zero).
 //!
-//! **Deviation 1** — Design step 6 ("forward with fresh `lora_a=0` init
-//! matches pre-wrap snapshot") has the LoRA init direction reversed.
-//! Canonical LoRA per Hu et al. 2021 §4.1 zeros **B**, not A, so
-//! `ΔW = B·A = 0` at t=0. `LoraLinear::wrap` currently uses candle-nn's
-//! default (`xavier` / `kaiming`) for both legs, so neither is zero at
-//! init and no natural "wrap is identity at init" property exists to
-//! verify from integration scope. That property lives one of two ways
-//! as a follow-up:
-//!   (a) change `LoraLinear::wrap` to zero-init `lora_b` per the paper
-//!       (scope expansion — affects GPT-2 too), or
-//!   (b) expose a public accessor so a test can reach the wrapped
-//!       `LoraLinear` legs and manually zero `lora_b` post-wrap.
-//! Neither is landed here; the freeze invariant + dispatch divergence
-//! together cover the wrap semantics that Layer 2 promises.
+//! Under canonical init `ΔW = scaling * (B · A) = 0` at construction,
+//! so the wrap is an identity map at `t=0`. Two properties get their
+//! own test:
 //!
-//! **Deviation 2** — Design step 7 ("manually set `lora_a` = nonzero →
-//! forward diverges") requires reaching into private `Block` fields.
-//! Achieved here without private-state access by observing that
-//! `LoraLinear::wrap`'s default init already leaves A and B non-zero,
-//! so `wrap_lora` → `forward` diverges from the baseline forward at
-//! initialisation. That covers the underlying hypothesis
-//! (`LinearVariant::Lora` actually dispatches through the low-rank leg
-//! — not a silent no-op) via a bare `wrap → forward` round-trip.
+//!   1. **Identity at init** — `wrap → forward` matches the pre-wrap
+//!      baseline forward bit-for-bit (design §6.1 step 6, now with the
+//!      init direction restored to the paper).
+//!   2. **Dispatch reaches the LoRA leg** — after `wrap`, manually
+//!      overwrite every `lora_b.weight` Var in the returned LoRA
+//!      `VarMap` with a small non-zero constant, re-forward, and
+//!      assert the output diverges from the baseline (design §6.1
+//!      step 7). Poking through `VarMap::data()` keeps the test
+//!      independent of `Block`'s private field layout — the mechanism
+//!      is the same one Layer 3's training loop will use (both walk
+//!      the LoRA `VarMap`).
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaConfig, TinyLlamaModel};
-use candle_core::Tensor;
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 /// Steps 1, 3, 4, 5 of design §6.1: build tiny model, wrap, assert
@@ -79,14 +72,14 @@ fn wrap_lora_registers_28_vars_and_freezes_base() {
     }
 }
 
-/// Design §6.1 steps 2 + 7 (adapted, see deviation 2 in the module
-/// doc): capture the baseline forward, apply `wrap_lora` with default
-/// init (non-zero A and B), then re-forward on the same input. The
-/// wrapped output MUST differ from the baseline — otherwise
-/// `LinearVariant::Lora`'s `Module::forward` is silently dispatching
-/// only to the base and the low-rank leg never contributes.
+/// Design §6.1 step 6 — canonical property post-S0: with `lora_b`
+/// zero-init per Hu et al. 2021 §4.1, `ΔW = B · A = 0` at construction
+/// so `wrap → forward` must match the pre-wrap baseline bit-for-bit.
+/// A regression here would either mean (a) `lora_b` init drifted off
+/// zero, or (b) `LinearVariant::Lora::forward` mixes in something other
+/// than `base(x) + scaling * B(A(x))` even with `B = 0`.
 #[test]
-fn wrap_lora_alters_forward_through_linear_variant_dispatch() {
+fn wrap_lora_initial_delta_is_zero_matches_baseline() {
     let cfg = TinyLlamaConfig::tiny();
     let base_vm = VarMap::new();
     let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
@@ -103,7 +96,7 @@ fn wrap_lora_alters_forward_through_linear_variant_dispatch() {
         .to_vec1()
         .unwrap();
 
-    // Wrap and re-forward on the same input.
+    // Wrap. `lora_a` gets Kaiming random weights, `lora_b` is zero.
     let lora_cfg = LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
     let _lora_vm = model.wrap_lora(&lora_cfg).expect("wrap_lora ok");
 
@@ -115,17 +108,79 @@ fn wrap_lora_alters_forward_through_linear_variant_dispatch() {
         .to_vec1()
         .unwrap();
 
-    // Shape unchanged: `[1, 5, vocab]` flattened.
     assert_eq!(y_baseline.len(), y_wrapped.len());
     assert_eq!(y_baseline.len(), 5 * cfg.vocab);
+    assert_eq!(
+        y_baseline, y_wrapped,
+        "canonical zero-init B must make wrapped forward bit-identical \
+         to baseline; observed a divergence — either lora_b drifted off \
+         zero or LinearVariant::Lora::forward has an extra additive term"
+    );
+}
 
-    // Something must differ. If every element matches bit-for-bit, either
-    // (a) the wrap is not being threaded through Block::attention / mlp
-    //     (silent no-op via a LinearVariant Module dispatch bug), or
-    // (b) candle-nn's default `Linear` init produced exactly-zero weights
-    //     (impossible with kaiming / xavier).
+/// Design §6.1 step 7 — dispatch verification. With `B = 0` at init the
+/// wrap is silent, so we can't tell from a bare `wrap → forward` round-
+/// trip whether `LinearVariant::Lora::forward` actually threads through
+/// the LoRA leg or is a hidden no-op that just calls the base. Force
+/// the question by overwriting every `lora_b.weight` Var in the LoRA
+/// `VarMap` with a small non-zero constant (this is exactly the
+/// mechanism Layer 3's optimizer will use) and asserting the re-
+/// forwarded output diverges. The mutation is deterministic (0.01·1)
+/// so a bit-for-bit match here can only mean dispatch is broken.
+#[test]
+fn wrap_lora_dispatch_reaches_lora_leg_via_lora_b_poke() {
+    let cfg = TinyLlamaConfig::tiny();
+    let base_vm = VarMap::new();
+    let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
+    let mut model = TinyLlamaModel::new(&cfg, vs).unwrap();
+
+    let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+    let y_baseline: Vec<f32> = model
+        .forward(&ids)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    let lora_cfg = LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
+    let lora_vm = model.wrap_lora(&lora_cfg).expect("wrap_lora ok");
+
+    // Overwrite every lora_b.weight Var with 0.01. All other LoRA
+    // vars (lora_a.weight) keep their random init.
+    let data = lora_vm.data();
+    let guard = data.lock().unwrap();
+    let mut poked = 0usize;
+    for (name, var) in guard.iter() {
+        if name.ends_with(".lora_b.weight") || name == "lora_b.weight" {
+            let shape = var.as_tensor().shape().clone();
+            let nonzero = Tensor::ones(shape, DType::F32, &Device::Cpu)
+                .unwrap()
+                .affine(0.01, 0.0)
+                .unwrap();
+            var.set(&nonzero).expect("Var::set on lora_b must succeed");
+            poked += 1;
+        }
+    }
+    drop(guard);
+    // 2 layers * 7 wrapped modules = 14 lora_b Vars expected.
+    assert_eq!(
+        poked, 14,
+        "expected to overwrite 14 lora_b.weight Vars (2 layers * 7 targets); \
+         name filter drift?"
+    );
+
+    let y_poked: Vec<f32> = model
+        .forward(&ids)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
+
+    assert_eq!(y_baseline.len(), y_poked.len());
     let mut max_abs_diff = 0.0_f32;
-    for (a, b) in y_baseline.iter().zip(y_wrapped.iter()) {
+    for (a, b) in y_baseline.iter().zip(y_poked.iter()) {
         let d = (a - b).abs();
         if d > max_abs_diff {
             max_abs_diff = d;
@@ -133,8 +188,8 @@ fn wrap_lora_alters_forward_through_linear_variant_dispatch() {
     }
     assert!(
         max_abs_diff > 1e-6,
-        "wrapped forward matched baseline exactly (max_abs_diff = {max_abs_diff}) \
-         — LoRA dispatch through LinearVariant::Lora may be a silent no-op or \
-         default init is unexpectedly zero"
+        "post-poke wrapped forward matched baseline exactly \
+         (max_abs_diff = {max_abs_diff}) — LinearVariant::Lora::forward \
+         is not routing through the low-rank leg"
     );
 }

@@ -125,6 +125,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `algocline-nn`: `LoraLinear::wrap` now follows the canonical LoRA
+  init from Hu et al. 2021 §4.1 — `lora_a` keeps candle-nn's default
+  (Kaiming uniform) random init, but `lora_b` is now zero-init via
+  `VarBuilder::get_with_hints(..., Init::Const(0.0))`. Under this init
+  `ΔW = scaling * (B · A) = 0` at construction, so a freshly-wrapped
+  model produces bit-identical forward output to the un-wrapped base;
+  training moves `B` off zero first (step 1 gradient reaches only `B`,
+  since `dL/dA` flows through `B^T`), then `A` at step 2+. Prep for
+  the Layer 3 (GH #10) fine-tuning loop, which relies on this
+  canonical "wrap is identity at `t=0`" property to reason about the
+  additive update. Affects both `Gpt2Model::wrap_lora` and
+  `TinyLlamaModel::wrap_lora` since they share the same low-level
+  wrap helper. Behavior-only — no API signature change; downstream
+  callers that manually inspected pre-training LoRA weights and
+  assumed a non-zero `lora_b` will now see zeros.
+
 ### Deprecated
 
 ### Removed

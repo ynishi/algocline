@@ -920,10 +920,11 @@ fn merge_lora_impl(
 
     // 4. Compute out_path and dispatch export_merged per arch.
     //    export_merged handles parent-dir mkdir + safetensors save
-    //    + NnCardMeta projection internally.
-    let out_path = nn_dir
-        .join("nn")
-        .join(format!("{merged_card_id}.safetensors"));
+    //    + NnCardMeta projection internally. The on-disk layout
+    //    matches load_handle_impl's resolution — `nn_dir/<id>
+    //    .safetensors` directly (the "nn/" bundle_ref prefix is a
+    //    logical Card reference, not a filesystem subdir).
+    let out_path = nn_dir.join(format!("{merged_card_id}.safetensors"));
 
     let (_bytes, meta) = match &handle {
         NnHandle::Gpt2(gpt2) => {
@@ -4072,5 +4073,331 @@ mod load_dispatch_tests {
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("delta_path"), "message: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod merge_lora_bridge_tests {
+    //! Layer 5a S4 — bridge integration tests for
+    //! `alc.nn.card.merge_lora`.
+    //!
+    //! Exercised end-to-end from the LoRA card write → base handle
+    //! build → `load_wrap_impl` → `merge_lora_impl` chain, then
+    //! re-opens the merged card via `load_handle_impl` to verify
+    //! shape + on-disk artifacts.
+    //!
+    //! All tests use the CPU/F32 `gpt2-tiny` / `tinyllama-tiny`
+    //! micro shapes so they stay under `cargo test` friendly (no HF
+    //! hub download, no >1s train step).
+    use super::*;
+    use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig, TinyLlamaConfig, TinyLlamaModel};
+    use candle_nn::{VarBuilder, VarMap};
+    use mlua::Lua;
+    use serde_json::json;
+
+    fn write_test_card(store: &FileCardStore, nn_meta: serde_json::Value) -> String {
+        let payload = json!({
+            "pkg": { "name": "alc_nn" },
+            "metadata": { "kind": "nn_model", "nn": nn_meta }
+        });
+        let (card_id, _path) = store.create(payload).expect("create test card");
+        card_id
+    }
+
+    fn opts_table(lua: &Lua, v: serde_json::Value) -> LuaTable {
+        let val = lua.to_value(&v).expect("to_value");
+        match val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!("json object must serialise to Lua table"),
+        }
+    }
+
+    /// Build a `gpt2-tiny` base handle, wrap-and-save a LoRA delta,
+    /// then write a `training_path=lora` Card pointing at the delta.
+    /// Returns `(store, nn_dir, lora_card_id, lua)`; the caller keeps
+    /// the returned tempdir alive for the duration of the test.
+    fn setup_gpt2_lora_scaffold() -> (tempfile::TempDir, FileCardStore, PathBuf, String, Lua) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        let cfg = Gpt2Config::from_variant("tiny").unwrap();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = Gpt2Model::new(&cfg, vs).unwrap();
+        let lora_cfg = LoraConfig::new(4, 8.0);
+        let lora_vm = model.wrap_lora(&lora_cfg).unwrap();
+        let delta_path = tmp.path().join("gpt2-lora-delta.safetensors");
+        lora_vm.save(&delta_path).unwrap();
+
+        let lora_card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-lora-src",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "lora",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "lora": {
+                        "rank": 4, "alpha": 8,
+                        "base_bundle_ref": "nn/base-gpt2-tiny",
+                        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"],
+                        "dropout": 0.0,
+                        "delta_path": delta_path.to_str().unwrap()
+                    }
+                }
+            }),
+        );
+
+        let lua = Lua::new();
+        (tmp, store, nn_dir, lora_card_id, lua)
+    }
+
+    fn setup_tinyllama_lora_scaffold() -> (tempfile::TempDir, FileCardStore, PathBuf, String, Lua) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        let cfg = TinyLlamaConfig::from_variant("tinyllama-tiny").unwrap();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let mut model = TinyLlamaModel::new(&cfg, vs).unwrap();
+        let lora_cfg = LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
+        let lora_vm = model.wrap_lora(&lora_cfg).unwrap();
+        let delta_path = tmp.path().join("tinyllama-lora-delta.safetensors");
+        lora_vm.save(&delta_path).unwrap();
+
+        let lora_card_id = write_test_card(
+            &store,
+            json!({
+                "name": "tinyllama-lora-src",
+                "backend": "candle",
+                "architecture": "tinyllama-tiny",
+                "training_path": "lora",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "lora": {
+                        "rank": 4, "alpha": 8,
+                        "base_bundle_ref": "nn/base-tinyllama-tiny",
+                        "target_modules": TinyLlamaModel::default_lora_targets(),
+                        "dropout": 0.0,
+                        "delta_path": delta_path.to_str().unwrap()
+                    }
+                }
+            }),
+        );
+
+        let lua = Lua::new();
+        (tmp, store, nn_dir, lora_card_id, lua)
+    }
+
+    #[test]
+    fn merge_lora_gpt2_happy_path_produces_merged_card_and_bundle() {
+        let (_tmp, store, nn_dir, lora_card_id, lua) = setup_gpt2_lora_scaffold();
+
+        // Build a matching base handle + wrap it.
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let gpt2_base = build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).unwrap();
+        let gpt2_ud = lua.create_userdata(gpt2_base).unwrap();
+        let wrapped_nn = load_wrap_impl(&store, &lora_card_id, &gpt2_ud).unwrap();
+        assert!(wrapped_nn.is_lora_wrapped(), "wrap must set has_lora=true");
+        let wrapped_ud = lua.create_userdata(wrapped_nn).unwrap();
+
+        // Merge.
+        let merge_opts = opts_table(
+            &lua,
+            json!({
+                "name": "my-merged-gpt2",
+                "lora_card": lora_card_id.clone(),
+            }),
+        );
+        let merged_card_id =
+            merge_lora_impl(&store, &nn_dir, &wrapped_ud, merge_opts).expect("merge_lora");
+
+        // Verify: safetensors bundle exists on disk.
+        let bundle_path = nn_dir.join(format!("{merged_card_id}.safetensors"));
+        assert!(
+            bundle_path.exists(),
+            "merged safetensors must exist at {bundle_path:?}"
+        );
+
+        // Verify: Card metadata (training_path / architecture /
+        // lineage / bundle_ref / name).
+        let card = store.get(&merged_card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(nn.get("training_path").unwrap().as_str().unwrap(), "merged");
+        assert_eq!(
+            nn.get("architecture").unwrap().as_str().unwrap(),
+            "gpt2-tiny"
+        );
+        assert_eq!(
+            nn.get("lineage")
+                .and_then(|l| l.get("parent"))
+                .and_then(|p| p.as_str())
+                .unwrap(),
+            lora_card_id
+        );
+        assert_eq!(
+            nn.get("candle")
+                .and_then(|c| c.get("bundle_ref"))
+                .and_then(|b| b.as_str())
+                .unwrap(),
+            format!("nn/{merged_card_id}")
+        );
+        assert_eq!(nn.get("name").unwrap().as_str().unwrap(), "my-merged-gpt2");
+
+        // Verify: the merged card is self-contained (loadable via
+        // load_handle, no wrap needed).
+        let merged_handle = load_handle_impl(&store, &merged_card_id, &nn_dir).unwrap();
+        assert_eq!(merged_handle.arch(), "gpt2");
+        assert!(!merged_handle.is_lora_wrapped());
+    }
+
+    #[test]
+    fn merge_lora_tinyllama_happy_path_produces_merged_card_and_bundle() {
+        let (_tmp, store, nn_dir, lora_card_id, lua) = setup_tinyllama_lora_scaffold();
+
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let tll_base = build_tinyllama_handle("tinyllama-tiny", Some(&base_opts), &nn_dir).unwrap();
+        let tll_ud = lua.create_userdata(tll_base).unwrap();
+        let wrapped_nn = load_wrap_impl(&store, &lora_card_id, &tll_ud).unwrap();
+        assert!(wrapped_nn.is_lora_wrapped());
+        let wrapped_ud = lua.create_userdata(wrapped_nn).unwrap();
+
+        let merge_opts = opts_table(
+            &lua,
+            json!({
+                "name": "my-merged-tinyllama",
+                "lora_card": lora_card_id.clone(),
+            }),
+        );
+        let merged_card_id =
+            merge_lora_impl(&store, &nn_dir, &wrapped_ud, merge_opts).expect("merge_lora");
+
+        let bundle_path = nn_dir.join(format!("{merged_card_id}.safetensors"));
+        assert!(bundle_path.exists());
+
+        let card = store.get(&merged_card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(nn.get("training_path").unwrap().as_str().unwrap(), "merged");
+        assert_eq!(
+            nn.get("architecture").unwrap().as_str().unwrap(),
+            "tinyllama-tiny"
+        );
+
+        // Self-contained load.
+        let merged_handle = load_handle_impl(&store, &merged_card_id, &nn_dir).unwrap();
+        assert_eq!(merged_handle.arch(), "tinyllama");
+        assert!(!merged_handle.is_lora_wrapped());
+    }
+
+    #[test]
+    fn merge_lora_refuses_unwrapped_base_handle_with_directional_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        let lua = Lua::new();
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let gpt2_base = build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).unwrap();
+        // Do NOT wrap. Feed the base NnHandle directly.
+        let base_nn = NnHandle::Gpt2(gpt2_base);
+        let base_ud = lua.create_userdata(base_nn).unwrap();
+
+        let merge_opts = opts_table(
+            &lua,
+            json!({ "name": "should-fail", "lora_card": "cards/whatever" }),
+        );
+        let msg = match merge_lora_impl(&store, &nn_dir, &base_ud, merge_opts) {
+            Ok(id) => panic!("base handle must be refused; got merged card {id:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("is not LoRA-wrapped") && msg.contains("load_wrap"),
+            "directional error must mention load_wrap: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_lora_refuses_missing_opts_name() {
+        let (_tmp, store, nn_dir, lora_card_id, lua) = setup_gpt2_lora_scaffold();
+
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let gpt2_base = build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).unwrap();
+        let gpt2_ud = lua.create_userdata(gpt2_base).unwrap();
+        let wrapped_nn = load_wrap_impl(&store, &lora_card_id, &gpt2_ud).unwrap();
+        let wrapped_ud = lua.create_userdata(wrapped_nn).unwrap();
+
+        // opts.name absent.
+        let merge_opts = opts_table(&lua, json!({ "lora_card": lora_card_id.clone() }));
+        let msg = match merge_lora_impl(&store, &nn_dir, &wrapped_ud, merge_opts) {
+            Ok(_) => panic!("missing name must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("opts.name must be a non-empty string"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_lora_refuses_missing_opts_lora_card() {
+        let (_tmp, store, nn_dir, lora_card_id, lua) = setup_gpt2_lora_scaffold();
+
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let gpt2_base = build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).unwrap();
+        let gpt2_ud = lua.create_userdata(gpt2_base).unwrap();
+        let wrapped_nn = load_wrap_impl(&store, &lora_card_id, &gpt2_ud).unwrap();
+        let wrapped_ud = lua.create_userdata(wrapped_nn).unwrap();
+
+        let merge_opts = opts_table(&lua, json!({ "name": "no-lora-card" }));
+        let msg = match merge_lora_impl(&store, &nn_dir, &wrapped_ud, merge_opts) {
+            Ok(_) => panic!("missing lora_card must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("opts.lora_card must be a non-empty string"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn merge_lora_refuses_empty_string_opts() {
+        let (_tmp, store, nn_dir, lora_card_id, lua) = setup_gpt2_lora_scaffold();
+
+        let base_opts = opts_table(&lua, json!({ "pretrained": false }));
+        let gpt2_base = build_gpt2_handle("tiny", Some(&base_opts), &nn_dir).unwrap();
+        let gpt2_ud = lua.create_userdata(gpt2_base).unwrap();
+        let wrapped_nn = load_wrap_impl(&store, &lora_card_id, &gpt2_ud).unwrap();
+        let wrapped_ud = lua.create_userdata(wrapped_nn).unwrap();
+
+        // Empty name.
+        let merge_opts = opts_table(
+            &lua,
+            json!({ "name": "", "lora_card": lora_card_id.clone() }),
+        );
+        let msg = match merge_lora_impl(&store, &nn_dir, &wrapped_ud, merge_opts) {
+            Ok(_) => panic!("empty name must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("opts.name must be a non-empty string"),
+            "message: {msg}"
+        );
+
+        // Empty lora_card. Need a fresh wrapped_ud since the
+        // previous userdata was consumed by borrow inside the
+        // failing call (userdata is still owned by lua so we can
+        // reuse it).
+        let merge_opts_2 = opts_table(&lua, json!({ "name": "ok", "lora_card": "" }));
+        let msg2 = match merge_lora_impl(&store, &nn_dir, &wrapped_ud, merge_opts_2) {
+            Ok(_) => panic!("empty lora_card must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg2.contains("opts.lora_card must be a non-empty string"),
+            "message: {msg2}"
+        );
     }
 }

@@ -37,7 +37,17 @@ pub struct NnCardMeta {
     /// Architecture preset id (e.g. `"gpt2-medium"`).
     pub architecture: String,
 
-    /// Training path taken: `"full_ft"` / `"lora"` / `"distillation"`.
+    /// Training path taken: `"full_ft"` / `"lora"` / `"distillation"` /
+    /// `"merged"`. Callers can opt in to validation via
+    /// [`validate_training_path`]; the field itself remains a free
+    /// `String` at deserialisation time so foundation-era cards with
+    /// non-listed values still deserialise (mirrors the
+    /// [`validate_architecture`] pattern).
+    ///
+    /// `"merged"` (Layer 4a) marks a bundle produced by
+    /// [`crate::merged::export_merged`] — base + LoRA delta
+    /// composed into a single safetensors file, loadable as a plain
+    /// base with the same `<Arch>Config`.
     pub training_path: String,
 
     /// Lineage back-references (parent / teacher / data / tokenizer).
@@ -192,6 +202,38 @@ fn empty_object() -> Json {
 /// to populate the same prefix.
 pub const SUPPORTED_ARCHITECTURE_FAMILIES: &[&str] =
     &["gpt2", "llama", "tinyllama", "qwen2", "phi", "gemma"];
+
+/// Training paths accepted for [`NnCardMeta::training_path`].
+///
+/// Values written by the engine bridge or by
+/// [`crate::merged::export_merged`] must match one of these strings.
+/// Extend this list when a new training-path is added; the
+/// corresponding sub-branch (if any) is registered alongside on
+/// [`NnCandleBranch`]. `"merged"` (Layer 4a) has no sub-branch —
+/// its provenance rides on `NnLineage.parent` per the Q0
+/// Model-side struct + projection pattern.
+pub const SUPPORTED_TRAINING_PATHS: &[&str] =
+    &["full_ft", "lora", "distillation", "merged"];
+
+/// Validate that `training_path` is one of
+/// [`SUPPORTED_TRAINING_PATHS`].
+///
+/// Callers opt in to this check (mirrors [`validate_architecture`]);
+/// [`NnCardMeta`] itself deserialises any string so foundation-era
+/// cards with non-listed values still round-trip.
+pub fn validate_training_path(training_path: &str) -> Result<(), String> {
+    if training_path.is_empty() {
+        return Err("training_path must not be empty".into());
+    }
+    for accepted in SUPPORTED_TRAINING_PATHS {
+        if training_path == *accepted {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "unknown training_path {training_path:?} (expected one of {SUPPORTED_TRAINING_PATHS:?})"
+    ))
+}
 
 /// Validate that `arch` starts with a known family prefix from
 /// [`SUPPORTED_ARCHITECTURE_FAMILIES`].

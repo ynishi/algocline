@@ -29,6 +29,7 @@
 
 pub mod arch;
 pub mod card;
+pub mod merged;
 pub mod tokenizer;
 pub mod train;
 

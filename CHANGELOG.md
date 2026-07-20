@@ -82,6 +82,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     API surface is additive; the trainer entry-point signature change
     is only breaking for a downstream that spelled the concrete
     `Gpt2Model` type in a `fn` pointer or `type` alias (none known).
+- `algocline-nn`: merged inference checkpoint export (Layer 4a of
+  GH #10). A LoRA-wrapped model can now be composed with its base
+  into a single safetensors bundle that downstream inference stacks
+  load as if it were a plain pretrained model — no more carrying
+  `<base>.safetensors` plus a `<delta>.safetensors` and re-running
+  `wrap_lora` at load time.
+  - New `pub trait algocline_nn::arch::lora::MergeableLora` with a
+    single `export_merged(&self) -> CandleResult<HashMap<String,
+    Tensor>>` method. Both `Gpt2Model` and `TinyLlamaModel` impl
+    the trait as thin walkers: every `LinearVariant::Lora`
+    projection collapses via `LoraLinear::merged_weight()`; every
+    `Plain` projection passes through unchanged. Emitted keys
+    match the HF-native safetensors layout the same arch's
+    `from_pretrained` reads (GPT-2: `wte.weight` / `wpe.weight` /
+    `h.<i>.{ln_1,ln_2,attn.c_attn,attn.c_proj,mlp.c_fc,mlp.c_proj}.{weight,bias}`
+    / `ln_f.{weight,bias}`; TinyLlama:
+    `model.embed_tokens.weight` /
+    `model.layers.<i>.{input_layernorm,post_attention_layernorm,self_attn.{q,k,v,o}_proj,mlp.{gate,up,down}_proj}.weight`
+    / `model.norm.weight` / `lm_head.weight`). TinyLlama's GQA
+    K/V projections retain their `[kv_heads * head_dim, dim]`
+    shape — never broadcast up to Q's shape (guarded by
+    `merged_bundle_tinyllama_preserves_gqa_kv_shape`).
+  - New `algocline_nn::merged` module with the `MergedProvenance
+    { lora_card, arch, bundle_ref }` struct + `MergeError` enum
+    (`Provenance` / `Merge` / `Io` / `Serialize`) + free fn
+    `export_merged<M: MergeableLora>(model, provenance, out_path)
+    -> Result<(usize, NnCardMeta), MergeError>`. The entry point
+    walks the model on its live device, moves each tensor to CPU,
+    writes safetensors via `candle_core::safetensors::save`,
+    stats the file for bytes-written, and returns both the byte
+    count and the projected `NnCardMeta`.
+  - New `Gpt2Model::from_safetensors_file` and
+    `TinyLlamaModel::from_safetensors_file` constructors — plain
+    on-disk safetensors load without touching the HF hub. Both
+    read the same HF-native layout `from_pretrained` reads
+    (GPT-2 root-scoped; TinyLlama routes through
+    `new_from_split(cfg, root.pp("model"), root)` to honour the
+    `model.*` + top-level `lm_head` split). These are what the
+    parity oracle uses to reload a merged bundle and what a wide
+    4b load-side integration will dispatch to when it recognises
+    `training_path == "merged"`.
+  - Card provenance follows the new **Model-side struct +
+    `to_card_*` projection** pattern (workspace design
+    `layer-4-merged-ckpt-design.md` §Q0): `MergedProvenance` is
+    the SoT for what a merged card carries; `to_card_meta(name)`
+    projects into existing `NnCardMeta` slots only
+    (`lineage.parent` ← `lora_card`, `architecture` ← `arch`,
+    `candle.bundle_ref` ← `bundle_ref`, `training_path` ←
+    `"merged"`). No `NnCandleBranch.merged` sub-branch, no new
+    lineage field, no denormalisation of LoRA hyperparams. The
+    base model reference is transitively reachable via the LoRA
+    card's `NnLoraBranch.base_bundle_ref` (single SoT for LoRA
+    hyperparams stays on the LoRA card). Future training paths
+    are expected to adopt the same pattern so per-branch Card
+    schema negotiations become local to the Model side rather
+    than re-opening the Card schema each time.
+  - `algocline_nn::card::SUPPORTED_TRAINING_PATHS` const +
+    `validate_training_path` fn. `"merged"` joins `"full_ft"` /
+    `"lora"` / `"distillation"` as an accepted `training_path`
+    value. `NnCardMeta.training_path` remains a free `String` at
+    deserialisation time (mirrors the `validate_architecture`
+    opt-in pattern) so foundation-era cards with non-listed
+    values still round-trip.
+  - Wire shape: additive across the board. Existing
+    `alc.nn.card.load_gpt2` / `alc.nn.card.save` bridges continue
+    to work; the load-side path that dispatches
+    `training_path == "merged"` to `from_safetensors_file`
+    without re-wrapping the model is a Layer 4b follow-up (not
+    in this release).
 - `algocline-nn`: arch-neutral prerequisites for the inference-fleet
   expansion tracked in GH #9 (Layer 1 of 3).
   - `algocline_nn::card::validate_architecture` + the

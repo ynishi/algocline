@@ -82,6 +82,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     API surface is additive; the trainer entry-point signature change
     is only breaking for a downstream that spelled the concrete
     `Gpt2Model` type in a `fn` pointer or `type` alias (none known).
+- `algocline-engine`: arch-neutral bridge for the `alc.nn.preset.*`
+  / `alc.nn.card.load*` surface (Layer 4b of GH #10). Adding a new
+  trainable arch used to require a full preset + load fn per arch
+  on the Lua bridge (`alc.nn.preset.<arch>` + `alc.nn.card.load_<arch>`),
+  driving an N×M proliferation across arch × training_path. Layer
+  4b introduces a single dispatch registry so:
+  - `alc.nn.preset(arch, variant, opts?) -> NnHandle` — arch-neutral
+    trainable/inference preset entry, dispatched via the new
+    `ARCH_OPS: &[(family_prefix, ArchOps)]` static table. Callers
+    who want an arch-pinned entry keep using the typed aliases
+    (`alc.nn.preset.gpt2` / `.tinyllama` / `.llama`); they remain
+    callable and return the same typed Handle they did pre-4b.
+  - `alc.nn.preset.tinyllama(variant, opts?)` — new typed alias,
+    fills the missing entry that made TinyLlama unreachable from
+    Lua pre-4b (Layer 4a shipped `TinyLlamaModel::wrap_lora` on
+    the Rust side, but the Lua bridge had no way to build a
+    trainable TinyLlama handle).
+  - `alc.nn.card.load_handle(card_id) -> NnHandle` — arch-neutral
+    self-contained card loader (`training_path == "full_ft" /
+    "merged" / "distillation"`). Reads the card's `architecture`,
+    dispatches through `ARCH_OPS.build_from_safetensors`, mmaps
+    the bundle at `<nn_dir>/<card_id>.safetensors`. Refuses LoRA
+    cards with a directional error pointing at `load_wrap`.
+  - `alc.nn.card.load_wrap(card_id, base) -> NnHandle` —
+    arch-neutral LoRA card loader. Accepts either an `NnHandle`
+    (from `alc.nn.preset(arch, ...)`) or a typed handle (from
+    `alc.nn.preset.<arch>`) as `base`; enforces arch-match
+    between the card and the base. Refuses self-contained cards
+    with a directional error pointing at `load_handle`.
+  - `alc.nn.card.load_gpt2` continues to work as a deprecated
+    typed shortcut, delegating to the shared
+    `wrap_gpt2_lora_from_meta` core. Migration: call
+    `alc.nn.card.load_wrap(card_id, base)` instead.
+  - `alc.nn.card.load` continues to return raw vars (backward
+    compat alias for `alc.nn.card.load_vars`); the arch-neutral
+    handle-returning entry is registered as
+    `alc.nn.card.load_handle` during the deprecation window and
+    will take over the `load` slot in a future minor release.
+  - New `pub(super) enum NnHandle { Gpt2, TinyLlama, Llama }` with
+    a single UserData impl that fans method calls (`:arch()`,
+    `:variant()`, `:layers()`, `:kv_heads()`, `:forward_shape()`,
+    etc.) out to the wrapped typed handle. `:kv_heads()` returns
+    `heads` on GPT-2 for a uniform Lua surface. `NnHandle`
+    variants + typed handles now `derive(Clone)` so backward-compat
+    load_wrap callers can pass a typed base and have it lifted
+    into `NnHandle`.
+  - New arch-neutral card-load discipline (Layer 4b §Q3-A): two
+    load surfaces (`load` = self-contained, `load_wrap` = LoRA)
+    reflect the base-handle contract in the signature rather than
+    hiding it behind an `Option<base>` argument. Directional
+    errors on each surface point the caller at the correct
+    sibling entry.
+  - Follow-ups called out in `workspace/tasks/alc-nn-tinyllama/layer-4b-arch-neutral-bridge-design.md`
+    §8: `alc.nn.trainer.*` bindings migrating from typed
+    `Gpt2Handle` to `NnHandle` (mechanical once §Q1 lands, still
+    breaks-only-if-you-borrow-Gpt2Handle-directly); `LlamaAdapter`
+    unification into `NnHandle` beyond the current symmetry
+    wrap; `NnLoadable` trait extraction from `ARCH_OPS` once a
+    third trainable arch (qwen2 / phi / gemma) makes the shape
+    obvious. Adding one of those arches today is three grep-able
+    edits: `ARCH_OPS` tuple + typed `build_<arch>_handle` +
+    neutral adapter — no new Lua-visible fn per arch.
 - `algocline-nn`: merged inference checkpoint export (Layer 4a of
   GH #10). A LoRA-wrapped model can now be composed with its base
   into a single safetensors bundle that downstream inference stacks

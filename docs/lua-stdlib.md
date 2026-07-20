@@ -685,6 +685,80 @@ Notes:
   under the algocline app dir); tests and alternate Hosts can inject their
   own store without changing the Lua-visible API.
 
+#### `alc.nn.preset(arch, variant, opts?)`
+
+Arch-neutral trainable/inference preset entry point. Dispatches to
+the arch's per-arch builder and hands back an `NnHandle` UserData
+that behaves the same regardless of arch (see method table below).
+New arches added to `algocline_nn::card::SUPPORTED_ARCHITECTURE_FAMILIES`
+get their bridge preset registration through the same fn (no new
+Lua-visible entry per arch).
+
+**Parameters:**
+
+| name    | type   | required | notes                                         |
+|---------|--------|----------|-----------------------------------------------|
+| arch    | string | yes      | family name (`"gpt2"` / `"tinyllama"` / `"llama"`) |
+| variant | string | yes      | arch-specific variant (e.g. `"medium"` for gpt2, `"tinyllama-1.1b"` for tinyllama) |
+| opts    | table  | no       | same shape as the typed alias's `opts`        |
+
+**Returns:** `NnHandle` UserData. Methods (dispatched by arch):
+`:arch()` — family name; `:variant()`, `:layers()`, `:heads()`,
+`:kv_heads()`, `:dim()`, `:ctx()`, `:vocab()`, `:device()`,
+`:dtype()`, `:pretrained()`, `:forward_shape(batch, seq) -> {…}`.
+`:kv_heads()` returns `heads` for GPT-2 (MHA collapse) and the real
+value for the two GQA archs. `:forward_shape` returns
+`{batch, seq, vocab}` for trainable arches; the Llama adapter
+returns `{batch, vocab}` (slices last-token logits).
+
+**Errors:**
+
+- `alc.nn.preset: arch 'X' not registered (expected one of gpt2 / tinyllama / llama)` — arch is declared in `SUPPORTED_ARCHITECTURE_FAMILIES` but has no bridge preset entry yet (qwen2 / phi / gemma).
+- Any per-arch error from the underlying builder (variant unknown, device unsupported, etc.).
+
+```lua
+-- Arch-neutral form:
+local h = alc.nn.preset("tinyllama", "tinyllama-tiny", { pretrained = false })
+print(h:arch(), h:layers(), h:kv_heads())  -- "tinyllama"  2  1
+local h2 = alc.nn.preset("gpt2", "medium")
+print(h2:arch(), h2:layers())  -- "gpt2"  24
+
+-- Typed aliases (backward compat):
+local h3 = alc.nn.preset.gpt2("medium")        -- returns Gpt2Handle
+local h4 = alc.nn.preset.tinyllama("tinyllama-1.1b")  -- returns TinyLlamaHandle
+```
+
+The typed aliases (`alc.nn.preset.gpt2` / `.tinyllama` / `.llama`)
+remain callable and return their typed handles directly — use them
+when arch-pinning at call time reads more naturally. The neutral
+entry is preferred when writing arch-agnostic code (e.g. `local h
+= alc.nn.preset(cfg.arch, cfg.variant)`).
+
+#### `alc.nn.preset.tinyllama(variant, opts?)`
+
+Build a trainable TinyLlama handle. Mirrors `alc.nn.preset.gpt2`:
+same `opts` (device / dtype / pretrained), same VarMap `Some` /
+`None` semantics. `pretrained=true` requires an HF-mapped variant
+(`tinyllama-1.1b`); the `tinyllama-tiny` smoke variant only
+supports `pretrained=false` (no HF bundle at that size).
+
+**Parameters:**
+
+| name    | type   | required | notes                                        |
+|---------|--------|----------|----------------------------------------------|
+| variant | string | yes      | `"tinyllama-1.1b"` / `"1.1b"` / `"tinyllama-tiny"` / `"tiny"` |
+| opts    | table  | no       | `device` / `dtype` / `pretrained` — same shape as gpt2 preset |
+
+**Returns:** `TinyLlamaHandle` UserData (adds `:kv_heads()` on top
+of the Gpt2Handle method set).
+
+```lua
+local h = alc.nn.preset.tinyllama("tinyllama-1.1b", {
+    device = "cuda:0",
+    dtype = "bf16",
+})
+```
+
 #### `alc.nn.preset.llama(variant, opts?)`
 
 Build an inference-only Llama-family handle by wrapping
@@ -754,6 +828,81 @@ Notes:
 - Wrap the returned handle in a Lua closure and pass it to
   `alc.nn.register(name, forward)` to expose the model through
   `alc.llm(prompt, { role = "nn", model = name })`.
+
+#### `alc.nn.card.load_handle(card_id) -> NnHandle`
+
+Arch-neutral loader for **self-contained** cards (`training_path`
+= `full_ft` / `merged` / `distillation`). Reads the Card, resolves
+the arch via `card.metadata.nn.architecture`, dispatches through
+the bridge's arch registry, mmaps the safetensors bundle at
+`<nn_dir>/<card_id>.safetensors`, and returns an `NnHandle`
+UserData whose variant matches the card's arch.
+
+**Errors:**
+
+- `alc.nn.card.load_handle: card '...' not found`.
+- `alc.nn.card.load_handle: card '...' has training_path="lora"; ... call `alc.nn.card.load_wrap(card_id, base)` instead` — LoRA cards need a base handle; directed to `load_wrap`.
+- `alc.nn.card.load_handle: card '...' has unknown training_path "..."` — training_path is not one of the accepted values.
+- `alc.nn.card.load_handle: card '...' architecture '...' has no bridge dispatch` — arch family is not registered on the bridge.
+- `alc.nn.card.load_handle: card '...' architecture '...' does not support self-contained card load` — arch is registered but its `build_from_safetensors` slot is `None` (adapter-style archs like the current Llama adapter).
+- `alc.nn.card.load_handle: bundle missing at ...` — bundle file has been cleaned or the Card's `bundle_ref` diverges from `nn/<card_id>`.
+
+```lua
+-- Load a merged (or full_ft / distillation) card as a fresh handle:
+local h = alc.nn.card.load_handle("cards/domain-merged-042")
+print(h:arch(), h:layers(), h:vocab())
+```
+
+#### `alc.nn.card.load_wrap(card_id, base) -> NnHandle`
+
+Arch-neutral loader for **LoRA** cards (`training_path == "lora"`).
+Takes a base handle (matching the card's arch), wraps the base
+model in-place with a fresh LoRA layout that reproduces the
+training-time `LoraConfig`, loads the recorded delta safetensors
+into the wrap's fresh `VarMap`, and returns a new `NnHandle`
+sharing the mutated base's Arc.
+
+`base` accepts either an `NnHandle` (from `alc.nn.preset(arch,
+…)`) or a typed handle (from `alc.nn.preset.<arch>(…)`) for
+backward compat. Arch must match the card's arch.
+
+**Errors:**
+
+- `alc.nn.card.load_wrap: card '...' has training_path="..."; self-contained cards do not need a base handle — call `alc.nn.card.load_handle(card_id)` instead` — non-LoRA cards; directed to `load_handle`.
+- `alc.nn.card.load_wrap: <arch> card requires a <arch> base handle; got '<other>'` — arch mismatch between card and base.
+- Same schema-shape errors as `load_gpt2` (missing candle / lora / delta_path / delta file).
+
+```lua
+-- Load a LoRA card on top of a fresh base:
+local base = alc.nn.preset("gpt2", "medium")
+local h = alc.nn.card.load_wrap("cards/domain-lora-042", base)
+```
+
+#### `alc.nn.card.load_gpt2(card_id, base) -> Gpt2Handle` *(deprecated)*
+
+Arch-pinned typed shortcut for GPT-2 LoRA card load. Delegates to
+the shared `wrap_gpt2_lora_from_meta` core; identical observable
+behaviour to `alc.nn.card.load_wrap(card_id, base)` when `base` is
+a `Gpt2Handle`, but the returned handle is typed as `Gpt2Handle`
+(not `NnHandle`) so callers can pass it into
+`alc.nn.trainer.full_ft` / `.distill` etc. that still borrow the
+typed handle directly.
+
+**Migration:** call `alc.nn.card.load_wrap(card_id, base)` instead.
+The trainer bindings that require a typed `Gpt2Handle` are
+scheduled to accept `NnHandle` in a follow-up release; until they
+do, `load_gpt2` stays as a working shim.
+
+#### `alc.nn.card.load_vars(card_id) -> table`
+
+Legacy raw-vars loader — returns a Lua table of `alc.nn.var`
+tensors keyed by the safetensors names. Historically named
+`alc.nn.card.load`; renamed to `load_vars` to free the `load`
+slot for the arch-neutral handle-returning entry (currently exposed
+as `load_handle` during the deprecation window). The old `load`
+name continues to work as an alias for `load_vars` until the
+deprecation cycle closes; new callers should use `load_vars`
+explicitly.
 
 ---
 

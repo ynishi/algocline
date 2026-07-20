@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{LlamaAdapter, LlamaAdapterConfig};
-use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig, TinyLlamaModel};
+use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig, TinyLlamaConfig, TinyLlamaModel};
 use algocline_nn::card::{
     validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
 };
@@ -654,6 +654,10 @@ impl Gpt2Handle {
 fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
     let preset = lua.create_table()?;
 
+    // Typed aliases (kept as backward-compat entry points; Layer 4b
+    // §Q2-A). Each returns its typed Handle directly so existing
+    // callers + the trainer bindings that borrow the typed Handle
+    // continue to work unchanged.
     let gpt2_nn_dir = nn_dir.clone();
     let gpt2 = lua.create_function(
         move |_lua, (variant, opts): (String, Option<LuaTable>)| -> LuaResult<Gpt2Handle> {
@@ -661,6 +665,17 @@ fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaRes
         },
     )?;
     preset.set("gpt2", gpt2)?;
+
+    // TinyLlama-family trainable preset (Layer 4b S2). Mirrors
+    // `alc.nn.preset.gpt2` — returns a `TinyLlamaHandle` directly
+    // for callers that want an arch-pinned entry point.
+    let tinyllama_nn_dir = nn_dir.clone();
+    let tinyllama = lua.create_function(
+        move |_lua, (variant, opts): (String, Option<LuaTable>)| -> LuaResult<TinyLlamaHandle> {
+            build_tinyllama_handle(&variant, opts.as_ref(), &tinyllama_nn_dir)
+        },
+    )?;
+    preset.set("tinyllama", tinyllama)?;
 
     // Llama-family inference preset (GH #9 Layer 2). Wraps
     // `candle_transformers::models::llama` through
@@ -676,8 +691,63 @@ fn register_preset_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaRes
     )?;
     preset.set("llama", llama)?;
 
+    // Arch-neutral entry (Layer 4b §Q2-A): `alc.nn.preset(arch,
+    // variant, opts)` — dispatches to the arch's build helper +
+    // wraps the result in `NnHandle` for uniform Lua-side surface.
+    // Implemented via a `__call` metamethod on the preset table so
+    // `alc.nn.preset("gpt2", "medium")` reads naturally alongside
+    // `alc.nn.preset.gpt2("medium")` (both live under the same
+    // name). Callers that need the typed handle keep using the
+    // typed alias; callers that want arch-agnostic code get an
+    // `NnHandle` back.
+    let neutral_nn_dir = nn_dir.clone();
+    let preset_call = lua.create_function(
+        move |_lua,
+              (_self, arch, variant, opts): (
+            LuaTable,
+            String,
+            String,
+            Option<LuaTable>,
+        )|
+              -> LuaResult<NnHandle> {
+            build_neutral_preset(&arch, &variant, opts.as_ref(), &neutral_nn_dir)
+        },
+    )?;
+    let preset_meta = lua.create_table()?;
+    preset_meta.set("__call", preset_call)?;
+    preset.set_metatable(Some(preset_meta))?;
+
     nn_table.set("preset", preset)?;
     Ok(())
+}
+
+/// Arch-neutral preset entry — dispatches by family prefix + wraps
+/// the resulting typed handle in `NnHandle`. Layer 4b §Q2-A / §Q4
+/// pre-`ARCH_OPS` shape (S3 folds this dispatch into the static
+/// table).
+fn build_neutral_preset(
+    arch: &str,
+    variant: &str,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    // Match on the arch family prefix. `SUPPORTED_ARCHITECTURE_FAMILIES`
+    // is the canonical list; three of the six have bridge presets
+    // today (gpt2 / tinyllama / llama). The other three (qwen2 /
+    // phi / gemma) return a "not-yet-registered" error until their
+    // per-arch build helper lands.
+    match arch {
+        "gpt2" => build_gpt2_handle(variant, opts, nn_dir).map(NnHandle::Gpt2),
+        "tinyllama" => build_tinyllama_handle(variant, opts, nn_dir).map(NnHandle::TinyLlama),
+        "llama" => build_llama_handle(variant, opts).map(NnHandle::Llama),
+        other => Err(LuaError::external(format!(
+            "alc.nn.preset: arch '{other}' not registered \
+             (expected one of 'gpt2' / 'tinyllama' / 'llama'); \
+             qwen2 / phi / gemma are declared in \
+             SUPPORTED_ARCHITECTURE_FAMILIES but do not yet have a \
+             bridge preset entry"
+        ))),
+    }
 }
 
 // ─── alc.nn.preset.llama ──────────────────────────────────────────
@@ -963,6 +1033,68 @@ fn build_gpt2_handle(
 
 fn parse_device(s: &str) -> LuaResult<Device> {
     parse_device_for("alc.nn.preset.gpt2", s)
+}
+
+/// Build a trainable TinyLlama handle. Mirrors
+/// [`build_gpt2_handle`] — same option shape (`device` / `dtype` /
+/// `pretrained`) and the same VarMap `Some` / `None` semantics
+/// carry over. `pretrained=true` requires a variant with an HF
+/// repo (`tinyllama-1.1b`); the `tinyllama-tiny` smoke variant
+/// only supports `pretrained=false` (mirrors GPT-2's `tiny` case).
+fn build_tinyllama_handle(
+    variant: &str,
+    opts: Option<&LuaTable>,
+    nn_dir: &std::path::Path,
+) -> LuaResult<TinyLlamaHandle> {
+    let mut cfg = TinyLlamaConfig::from_variant(variant).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.preset.tinyllama: unknown variant '{variant}' \
+             (expected 'tinyllama-1.1b' / '1.1b' / 'tinyllama-tiny' / 'tiny')"
+        ))
+    })?;
+
+    let device_str = opts
+        .and_then(|t| t.get::<Option<String>>("device").ok().flatten())
+        .unwrap_or_else(|| "cpu".to_string());
+    let dtype_str = opts
+        .and_then(|t| t.get::<Option<String>>("dtype").ok().flatten())
+        .unwrap_or_else(|| default_dtype_for_device(&device_str).to_string());
+    let pretrained = opts
+        .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
+        .unwrap_or(true);
+
+    cfg.device = parse_device_for("alc.nn.preset.tinyllama", &device_str)?;
+    cfg.dtype = parse_dtype_for("alc.nn.preset.tinyllama", &dtype_str)?;
+
+    guard_device_dtype_matrix("alc.nn.preset.tinyllama", &cfg.device, cfg.dtype)?;
+
+    let (model, varmap) = if pretrained {
+        let cache_dir = nn_dir.to_path_buf();
+        let m = TinyLlamaModel::from_pretrained(variant, &cfg, &cache_dir)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.tinyllama: {e}")))?;
+        (m, None)
+    } else {
+        let vm = VarMap::new();
+        let vs = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let m = TinyLlamaModel::new(&cfg, vs)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.tinyllama: {e}")))?;
+        (m, Some(Arc::new(vm)))
+    };
+
+    Ok(TinyLlamaHandle {
+        inner: Arc::new(Mutex::new(model)),
+        varmap,
+        variant: variant.to_string(),
+        layers: cfg.layers,
+        heads: cfg.heads,
+        kv_heads: cfg.kv_heads,
+        dim: cfg.dim,
+        ctx: cfg.ctx,
+        vocab: cfg.vocab,
+        device: device_str,
+        dtype: dtype_str,
+        pretrained,
+    })
 }
 
 /// Resolve the default dtype for a caller-provided device string when

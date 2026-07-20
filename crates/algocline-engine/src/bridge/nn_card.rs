@@ -1406,8 +1406,12 @@ fn full_ft_impl(
         .lock()
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.full_ft: model lock: {e}")))?;
 
+    // `run_full_ft` is now generic over `M: Module + DeviceView`; the
+    // trait bounds are not satisfied by `MutexGuard<Gpt2Model>` itself
+    // (they are on the guarded `Gpt2Model`), so deref through the
+    // guard explicitly before handing the reference off.
     let result = run_full_ft(
-        &model,
+        &*model,
         &vm_arc,
         ds_lock.as_mut(),
         &cfg,
@@ -1477,8 +1481,11 @@ fn lora_impl(
         .lock()
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.lora: model lock: {e}")))?;
 
+    // `run_lora_ft` is now generic over `M: Module + DeviceView +
+    // LoraWrappable`; deref through the guard explicitly so the trait
+    // bounds resolve against `Gpt2Model`, not `MutexGuard<Gpt2Model>`.
     let result = run_lora_ft(
-        &mut model,
+        &mut *model,
         ds_lock.as_mut(),
         &lora_cfg,
         &train_cfg,

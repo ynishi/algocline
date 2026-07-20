@@ -20,9 +20,10 @@ use std::sync::{
 };
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarMap};
+use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{Gpt2Model, LoraConfig};
+use crate::arch::{Gpt2Model, LoraConfig, LoraWrappable};
+use crate::train::DeviceView;
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
@@ -191,8 +192,8 @@ impl From<candle_core::Error> for TrainError {
 /// dedicated `<card_id>` prefix keeps concurrent (or historical) runs
 /// from colliding on filenames.
 #[allow(clippy::too_many_arguments)]
-pub fn run_full_ft(
-    model: &Gpt2Model,
+pub fn run_full_ft<M>(
+    model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
     cfg: &FullFtConfig,
@@ -200,7 +201,10 @@ pub fn run_full_ft(
     ckpt_dir: &Path,
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
-) -> Result<Checkpoint, TrainError> {
+) -> Result<Checkpoint, TrainError>
+where
+    M: Module + DeviceView,
+{
     // `run_full_ft` optimises every variable registered against
     // `varmap` — the full-fine-tune baseline. It shares its inner
     // step/save loop with `run_lora_ft` via `run_ft_core`; the only
@@ -230,8 +234,8 @@ pub fn run_full_ft(
 ///   parameter so a future full-vs-delta save-side split can flip
 ///   independently.
 #[allow(clippy::too_many_arguments)]
-fn run_ft_core(
-    model: &Gpt2Model,
+fn run_ft_core<M>(
+    model: &M,
     opt_vm: &VarMap,
     save_vm: &VarMap,
     dataset: &mut dyn Dataset,
@@ -240,7 +244,10 @@ fn run_ft_core(
     ckpt_dir: &Path,
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
-) -> Result<Checkpoint, TrainError> {
+) -> Result<Checkpoint, TrainError>
+where
+    M: Module + DeviceView,
+{
     if cfg.steps == 0 {
         return Err(TrainError::ZeroSteps);
     }
@@ -276,7 +283,7 @@ fn run_ft_core(
     let ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
 
-    let device = model.config().device.clone();
+    let device = model.device().clone();
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
 
@@ -347,13 +354,13 @@ fn run_ft_core(
 ///
 /// - [`TrainError::ZeroSteps`] / [`TrainError::GradAccumUnsupported`]
 ///   / [`TrainError::LeaseHeld`] mirror the Full FT path.
-/// - Any error raised by [`Gpt2Model::wrap_lora`] surfaces as
+/// - Any error raised by [`LoraWrappable::wrap_lora`] surfaces as
 ///   [`TrainError::Candle`] (unknown `target_modules`, oversized
 ///   rank, etc.).
 /// - Checkpoint I/O failures surface as [`TrainError::Ckpt`].
 #[allow(clippy::too_many_arguments)]
-pub fn run_lora_ft(
-    base: &mut Gpt2Model,
+pub fn run_lora_ft<M>(
+    base: &mut M,
     dataset: &mut dyn Dataset,
     lora_cfg: &LoraConfig,
     train_cfg: &FullFtConfig,
@@ -361,13 +368,19 @@ pub fn run_lora_ft(
     ckpt_dir: &Path,
     card_id: &str,
     lease: Arc<TrainingLease>,
-) -> Result<Checkpoint, TrainError> {
+) -> Result<Checkpoint, TrainError>
+where
+    M: Module + DeviceView + LoraWrappable,
+{
     if card_id.is_empty() {
         return Err(TrainError::Candle("run_lora_ft: card_id is empty".into()));
     }
 
     // Wrap first so we surface `LoraConfig` validation errors (unknown
     // target module, oversized rank) before the lease is acquired.
+    // `M: LoraWrappable` routes this call through the trait; on a
+    // concrete `Gpt2Model` / `TinyLlamaModel` the trait impl delegates
+    // to the inherent `wrap_lora` method.
     let lora_vm = base.wrap_lora(lora_cfg)?;
 
     let nn_dir = ckpt_dir.join("nn");

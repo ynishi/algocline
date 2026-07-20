@@ -80,11 +80,36 @@ pub(super) fn register_nn_card(
     )?;
     card_ns.set("save", save)?;
 
-    let load_store = Arc::clone(&card_store);
-    let load = lua.create_function(move |lua, card_id: String| -> LuaResult<LuaTable> {
-        load_impl(lua, load_store.as_ref(), &card_id)
+    // Legacy raw-vars loader (returns a Lua table of tensor Vars).
+    // Layer 4b S4 renames the entry from `load` to `load_vars` so
+    // the neutral handle-returning `load` entry can occupy the
+    // `load` slot. The old `load` name stays as a deprecated
+    // alias for one release cycle (Layer 4b §8 open question).
+    let load_vars_store = Arc::clone(&card_store);
+    let load_vars = lua.create_function(move |lua, card_id: String| -> LuaResult<LuaTable> {
+        load_impl(lua, load_vars_store.as_ref(), &card_id)
     })?;
-    card_ns.set("load", load)?;
+    card_ns.set("load_vars", load_vars.clone())?;
+    // Deprecated: `alc.nn.card.load` still returns raw vars for
+    // backward compat. NEW callers should use `load_vars` for the
+    // raw-vars path, and the new handle-returning `alc.nn.card.load`
+    // will be added in a future minor release once the deprecation
+    // window closes. In the interim, the neutral handle-returning
+    // path is registered as `load_handle` (Layer 4b S4).
+    card_ns.set("load", load_vars)?;
+
+    // New arch-neutral handle-returning entry (Layer 4b §Q3-A).
+    // Named `load_handle` during the deprecation window; the
+    // shorter `load` slot flips over to this once the raw-vars
+    // deprecation cycle completes.
+    let load_handle_store = Arc::clone(&card_store);
+    let load_handle_nn_dir = nn_dir.clone();
+    let load_handle = lua.create_function(
+        move |_lua, card_id: String| -> LuaResult<NnHandle> {
+            load_handle_impl(load_handle_store.as_ref(), &card_id, &load_handle_nn_dir)
+        },
+    )?;
+    card_ns.set("load_handle", load_handle)?;
 
     let load_gpt2_store = Arc::clone(&card_store);
     let load_gpt2 = lua.create_function(
@@ -199,6 +224,106 @@ fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTa
     let nn_load: LuaFunction = alc_nn_fn(lua, "load")?;
     let vars: LuaTable = nn_load.call(card_id.to_string())?;
     Ok(vars)
+}
+
+/// Arch-neutral self-contained card loader (Layer 4b §Q3-A `load`).
+///
+/// Reads the Card, extracts `architecture` + `training_path`,
+/// resolves the arch's [`ArchOps::build_from_safetensors`], and
+/// dispatches. Refuses LoRA cards with a directional error
+/// pointing at `alc.nn.card.load_wrap` (Layer 4b §Q3-A invariant
+/// #2). Refuses arches whose `build_from_safetensors` slot is
+/// `None` (currently `llama-adapter`).
+fn load_handle_impl(
+    store: &FileCardStore,
+    card_id: &str,
+    nn_dir: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    let card = store
+        .get(card_id)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load_handle: {e}")))?
+        .ok_or_else(|| {
+            LuaError::external(format!("alc.nn.card.load_handle: card '{card_id}' not found"))
+        })?;
+
+    let meta_json = card
+        .get("metadata")
+        .and_then(|m| m.get("nn"))
+        .cloned()
+        .ok_or_else(|| {
+            LuaError::external(format!(
+                "alc.nn.card.load_handle: card '{card_id}' missing metadata.nn"
+            ))
+        })?;
+    let meta: NnCardMeta = serde_json::from_value(meta_json).map_err(|e| {
+        LuaError::external(format!(
+            "alc.nn.card.load_handle: card '{card_id}' invalid metadata.nn: {e}"
+        ))
+    })?;
+
+    // training_path 分岐: self-contained (full_ft / merged /
+    // distillation) のみ受け付ける。 lora card は load_wrap 側に
+    // 誘導 (Layer 4b §Q3-A invariant #2)。
+    match meta.training_path.as_str() {
+        "full_ft" | "merged" | "distillation" => {}
+        "lora" => {
+            return Err(LuaError::external(format!(
+                "alc.nn.card.load_handle: card '{card_id}' has training_path=\"lora\"; \
+                 LoRA cards need a base handle — call `alc.nn.card.load_wrap(card_id, base)` \
+                 instead"
+            )));
+        }
+        other => {
+            return Err(LuaError::external(format!(
+                "alc.nn.card.load_handle: card '{card_id}' has unknown training_path \
+                 {other:?} (expected one of full_ft / lora / merged / distillation)"
+            )));
+        }
+    }
+
+    // Enforce the bundle_ref = "nn/<card_id>" invariant that
+    // load_impl also asserts (save_impl writes this shape).
+    let bundle_ref = meta
+        .candle
+        .as_ref()
+        .map(|c| c.bundle_ref.as_str())
+        .ok_or_else(|| {
+            LuaError::external(format!(
+                "alc.nn.card.load_handle: card '{card_id}' missing metadata.nn.candle"
+            ))
+        })?;
+    let expected = format!("nn/{card_id}");
+    if bundle_ref != expected {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.load_handle: bundle_ref '{bundle_ref}' does not match card_id \
+             '{card_id}' (expected '{expected}')"
+        )));
+    }
+
+    let ops = resolve_arch_ops(&meta.architecture).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load_handle: card '{card_id}' architecture {:?} \
+             has no bridge dispatch (expected one of {})",
+            meta.architecture,
+            registered_arch_names().join(" / ")
+        ))
+    })?;
+    let build = ops.build_from_safetensors.ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load_handle: card '{card_id}' architecture {:?} \
+             does not support self-contained card load (adapter-style archs \
+             need a different entry point — Layer 4b §8 carry)",
+            meta.architecture
+        ))
+    })?;
+
+    let path = nn_dir.join(format!("{card_id}.safetensors"));
+    if !path.exists() {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.load_handle: bundle missing at {path:?} for card '{card_id}'"
+        )));
+    }
+    build(&meta, &path)
 }
 
 /// Reconstruct a LoRA-wrapped [`Gpt2Handle`] from a Card + a fresh
@@ -759,7 +884,6 @@ fn build_neutral_preset(
 /// wiring lands in S4/S5).
 struct ArchOps {
     build_preset: fn(&str, Option<&LuaTable>, &std::path::Path) -> LuaResult<NnHandle>,
-    #[allow(dead_code)]
     build_from_safetensors:
         Option<fn(&NnCardMeta, &std::path::Path) -> LuaResult<NnHandle>>,
     #[allow(dead_code)]
@@ -772,7 +896,7 @@ const ARCH_OPS: &[(&str, ArchOps)] = &[
         "gpt2",
         ArchOps {
             build_preset: preset_gpt2_neutral,
-            build_from_safetensors: None,
+            build_from_safetensors: Some(gpt2_from_safetensors),
             build_from_wrap: None,
         },
     ),
@@ -780,13 +904,18 @@ const ARCH_OPS: &[(&str, ArchOps)] = &[
         "tinyllama",
         ArchOps {
             build_preset: preset_tinyllama_neutral,
-            build_from_safetensors: None,
+            build_from_safetensors: Some(tinyllama_from_safetensors),
             build_from_wrap: None,
         },
     ),
     (
         "llama",
         ArchOps {
+            // Adapter-style inference arch: card load path uses
+            // GGUF / sharded safetensors + a different construction
+            // flow than the trainable arches; no
+            // `build_from_safetensors` slot until that lands (§8
+            // carry).
             build_preset: preset_llama_neutral,
             build_from_safetensors: None,
             build_from_wrap: None,
@@ -854,6 +983,150 @@ fn preset_llama_neutral(
     // resolved from `opts.weights` — see `build_llama_handle`).
     // Accepted here for signature uniformity.
     build_llama_handle(variant, opts).map(NnHandle::Llama)
+}
+
+// ─── ArchOps.build_from_safetensors adapters (Layer 4b S4) ────────
+// Self-contained card load: read the card's architecture +
+// candle-branch overrides, resolve the bundle path (bridge already
+// resolved it and passes as `&Path`), call the arch's
+// `from_safetensors_file`, wrap the result in a typed Handle +
+// NnHandle. `VarMap` is always `None` on this path — the file is
+// loaded through an mmap-backed VarBuilder that has no VarMap
+// counterpart (matches `Gpt2Model::from_pretrained` today).
+
+fn gpt2_from_safetensors(
+    meta: &NnCardMeta,
+    path: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    // `Gpt2Config::from_variant` accepts both bare ("medium") and
+    // "gpt2-medium" forms — pass the card's architecture string
+    // directly.
+    let mut cfg = Gpt2Config::from_variant(&meta.architecture).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load: unknown gpt2 variant {:?} on card {:?}",
+            meta.architecture, meta.name
+        ))
+    })?;
+    apply_candle_branch_device_dtype("alc.nn.card.load", meta, &mut cfg.device, &mut cfg.dtype)?;
+    guard_device_dtype_matrix("alc.nn.card.load", &cfg.device, cfg.dtype)?;
+
+    let model = Gpt2Model::from_safetensors_file(&cfg, path)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))?;
+    let (device_str, dtype_str) = candle_branch_device_dtype_strings(meta, &cfg.device, cfg.dtype);
+    Ok(NnHandle::Gpt2(Gpt2Handle {
+        inner: Arc::new(Mutex::new(model)),
+        varmap: None,
+        variant: meta.architecture.clone(),
+        layers: cfg.layers,
+        heads: cfg.heads,
+        dim: cfg.dim,
+        ctx: cfg.ctx,
+        vocab: cfg.vocab,
+        device: device_str,
+        dtype: dtype_str,
+        // mmap-backed load = weights come from the file, treat as
+        // "pretrained" from the trainer's perspective (VarMap
+        // absent means trainer bindings refuse cleanly).
+        pretrained: true,
+    }))
+}
+
+fn tinyllama_from_safetensors(
+    meta: &NnCardMeta,
+    path: &std::path::Path,
+) -> LuaResult<NnHandle> {
+    let mut cfg = TinyLlamaConfig::from_variant(&meta.architecture).ok_or_else(|| {
+        LuaError::external(format!(
+            "alc.nn.card.load: unknown tinyllama variant {:?} on card {:?}",
+            meta.architecture, meta.name
+        ))
+    })?;
+    apply_candle_branch_device_dtype("alc.nn.card.load", meta, &mut cfg.device, &mut cfg.dtype)?;
+    guard_device_dtype_matrix("alc.nn.card.load", &cfg.device, cfg.dtype)?;
+
+    let model = TinyLlamaModel::from_safetensors_file(&cfg, path)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))?;
+    let (device_str, dtype_str) = candle_branch_device_dtype_strings(meta, &cfg.device, cfg.dtype);
+    Ok(NnHandle::TinyLlama(TinyLlamaHandle {
+        inner: Arc::new(Mutex::new(model)),
+        varmap: None,
+        variant: meta.architecture.clone(),
+        layers: cfg.layers,
+        heads: cfg.heads,
+        kv_heads: cfg.kv_heads,
+        dim: cfg.dim,
+        ctx: cfg.ctx,
+        vocab: cfg.vocab,
+        device: device_str,
+        dtype: dtype_str,
+        pretrained: true,
+    }))
+}
+
+/// Apply `meta.candle.device` / `meta.candle.dtype` overrides on
+/// top of the arch's default device/dtype. Absent fields leave the
+/// arch default unchanged.
+fn apply_candle_branch_device_dtype(
+    ctx: &str,
+    meta: &NnCardMeta,
+    device: &mut Device,
+    dtype: &mut DType,
+) -> LuaResult<()> {
+    if let Some(candle) = &meta.candle {
+        if let Some(device_str) = &candle.device {
+            *device = parse_device_for(ctx, device_str)?;
+        }
+        if let Some(dtype_str) = &candle.dtype {
+            *dtype = parse_dtype_for(ctx, dtype_str)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the string-form device / dtype for a Handle's metadata
+/// slots. Prefers explicit values from the card's candle branch;
+/// falls back to the effective device / dtype used for load.
+fn candle_branch_device_dtype_strings(
+    meta: &NnCardMeta,
+    effective_device: &Device,
+    effective_dtype: DType,
+) -> (String, String) {
+    let device_str = meta
+        .candle
+        .as_ref()
+        .and_then(|c| c.device.clone())
+        .unwrap_or_else(|| device_display(effective_device));
+    let dtype_str = meta
+        .candle
+        .as_ref()
+        .and_then(|c| c.dtype.clone())
+        .unwrap_or_else(|| dtype_display(effective_dtype));
+    (device_str, dtype_str)
+}
+
+fn device_display(d: &Device) -> String {
+    match d {
+        Device::Cpu => "cpu".into(),
+        Device::Cuda(_) => "cuda".into(),
+        Device::Metal(_) => "metal".into(),
+    }
+}
+
+fn dtype_display(d: DType) -> String {
+    match d {
+        DType::F32 => "f32".into(),
+        DType::F16 => "f16".into(),
+        DType::BF16 => "bf16".into(),
+        DType::U8 => "u8".into(),
+        DType::U32 => "u32".into(),
+        DType::I64 => "i64".into(),
+        DType::F64 => "f64".into(),
+        // candle_core::DType is `#[non_exhaustive]`; unknown
+        // future variants surface with a placeholder rather than
+        // panicking. The trainable arches only exercise the
+        // f32/f16/bf16 subset today.
+        _ => format!("{d:?}"),
+    }
 }
 
 // ─── alc.nn.preset.llama ──────────────────────────────────────────

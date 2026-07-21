@@ -944,7 +944,7 @@ local h = alc.nn.card.load_handle(merged_id)
 #### `alc.nn.wrap_lora(base_handle, opts) -> NnHandle`
 
 Layer 5b — wrap a base model in-memory with a fresh LoRA layout and
-return a new `NnHandle` with `is_lora_wrapped() == true`. Sits at the
+return a new LoRA-wrapped `NnHandle`. Sits at the
 top level of the `alc.nn` sub-table (not under `card`) because
 `wrap_lora` writes nothing to disk — the wrap is a memory-only
 operation on the base handle's `Arc<Mutex<Model>>`, so a caller can
@@ -973,10 +973,13 @@ refused with an arch-directional error.
   Defaults to `0.0`. Validated even though the current LoRA forward
   path ignores it — schema stability for a future dropout ship.
 
-**Returns:** a wrapped `NnHandle` whose `is_lora_wrapped()` returns
-`true` and whose forward preserves the base's output shape (LoRA
-zero-init invariant: pre-training wrapped forward matches base
-forward within tolerance).
+**Returns:** a LoRA-wrapped `NnHandle` whose forward preserves the
+base's output shape (LoRA zero-init invariant: pre-training wrapped
+forward matches base forward within tolerance). The wrap state is
+tracked engine-side (asserted by the bridge tests and enforced by the
+double-wrap / trainer refusals); it is not exposed as a Lua method —
+calling `wrap_lora` again on the wrapped handle erroring out is the
+observable Lua-side signal.
 
 **Errors:**
 
@@ -1005,7 +1008,7 @@ forward within tolerance).
 -- Wrap-only (inspect a LoRA layout without training):
 local base = alc.nn.preset("gpt2", "medium", { pretrained = false })
 local wrapped = alc.nn.wrap_lora(base, { rank = 4, alpha = 8.0 })
-print(wrapped:arch(), wrapped:is_lora_wrapped())  -- gpt2  true
+print(wrapped:arch())  -- gpt2
 ```
 
 #### `alc.nn.trainer.run_lora_ft(base_handle, dataset, opts) -> lora_card_id`

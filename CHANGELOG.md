@@ -200,7 +200,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface.
   - `alc.nn.wrap_lora(base_handle, opts) -> NnHandle` (S1) — wrap a
     base model in-memory with a fresh LoRA layout and return a
-    wrapped handle with `is_lora_wrapped() == true`. Sits at the
+    LoRA-wrapped handle (wrap state tracked engine-side and enforced
+    by the double-wrap / trainer refusals; not a Lua method). Sits at the
     top level of the `alc.nn` sub-table (not under `card`) because
     `wrap_lora` writes nothing to disk. Consumes `opts = { rank,
     alpha, target_modules?, dropout? }`; `target_modules` defaults
@@ -264,13 +265,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `extract_full_ft_opts`, `load_wrap_impl`, and a new
     `DatasetHandle::inner_lock` accessor for cross-module dataset
     downcast without exposing the underlying `Mutex` field.
-  - CPU verification status: all 16 new bridge tests
+  - Verification status: all 16 new bridge tests
     (`wrap_lora_bridge_tests` + `run_lora_ft_bridge_tests`) pass
     on `gpt2-tiny` / `tinyllama-tiny` micro shapes with no HF hub
-    download and no > 1s train step per test. GPU smoke for
-    real-scale LoRA (`nn_medium_lora_gpu_smoke.rs` and a future
-    `nn_tinyllama_lora_gpu_smoke.rs` follow-up) stays on the
-    `spike-status.md §7` carry.
+    download and no > 1s train step per test (CPU). Real-scale GPU
+    verification landed in the same `[Unreleased]` window: the Rust
+    route via `nn_tinyllama_lora_gpu_smoke.rs` (see the GPU smoke
+    example suite entry below) and the Lua-bridge route via
+    `nn_bridge_gpu_smoke.rs` (see the Layer 5c S4 entry), both run
+    end-to-end on an A40.
 - `algocline-engine`: `alc.nn.trainer.run_full_ft` Lua binding for
   the one-call full-fine-tune surface (Layer 5c S1 of GH #10).
   Sibling of the Layer 5b S2 `alc.nn.trainer.run_lora_ft` — same
@@ -350,6 +353,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DatasetHandle::for_test`) strips the `VarMap` off a
   from-scratch handle to mimic the varmap-less pretrained state
   without an HF hub download.
+- `algocline-engine`: trainer-bind refusal coverage extended to
+  both arms (Layer 5c S3 of GH #10, test-only).
+  `run_distill_refuses_lora_wrapped_handle` exercises the
+  `run_distill` LoRA-wrapped refusal through the full dispatch
+  path (building a real wrapped handle via `run_lora_ft` →
+  `load_wrap` first), and the pretrained-handle refusals gain
+  TinyLlama-arm mirrors
+  (`run_full_ft_refuses_pretrained_handle_tinyllama` /
+  `run_distill_refuses_pretrained_handle_tinyllama`) backed by
+  the new test-only constructor
+  `TinyLlamaHandle::for_test_pretrained_like` (`#[cfg(test)]`,
+  mirror of the `Gpt2Handle` sibling).
+- `algocline-engine`: `nn-cuda` cargo feature — the CUDA variant
+  of `nn`. Enables candle's CUDA backend across `candle-core`
+  AND `candle-nn` in lockstep (candle-nn 0.11's `LayerNorm` is a
+  `CustomOp3` whose `cuda_fwd` is `#[cfg(feature = "cuda")]`-
+  gated, so a core-only CUDA build still dispatches LayerNorm on
+  CPU and fails at forward time) plus `algocline-nn/nn-cuda` for
+  the model layer (Layer 5c S4 of GH #10).
+- `algocline-engine`: `examples/nn_bridge_gpu_smoke.rs` —
+  Lua-bridge GPU smoke driver (Layer 5c S4 of GH #10). Exercises
+  the full `alc.nn` bridge chain (`preset.tinyllama` →
+  `data.synthetic` → `wrap_lora` → `trainer.run_lora_ft` →
+  `card.load_wrap` round-trip → `trainer.run_full_ft` →
+  `trainer.run_distill`) through a single Lua VM bootstrapped
+  with `install_for_pkg_test`, on CUDA (`--features nn-cuda`) or
+  CPU (`--features nn`); gated behind
+  `required-features = ["nn"]` so default builds never compile
+  it. `NN_SMOKE_DTYPE` defaults to `"f32"`: the CUDA preset
+  default dtype (bf16) is rejected deep inside the f32 trainer
+  paths ("unexpected dtype, expected: F32, got: BF16"), so the
+  smoke pins f32 the same way the Rust GPU smoke examples do.
+  Verified end-to-end on an A40 (TinyLlama-1.1B random-init,
+  50 steps each: LoRA FT 9.8s / full FT 28.5s / distill 28.5s).
 - `algocline-nn`: TinyLlama-1.1B GPU smoke example suite covering
   the base full-FT, LoRA fine-tune, and LoRA → merge round-trip
   paths on CUDA. Siblings of the existing

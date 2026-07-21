@@ -52,6 +52,10 @@
 //!
 //! - `NN_SMOKE_DEVICE`  (default `"cuda"`) — `"cpu"` / `"cuda"` /
 //!   `"cuda:N"`. `"cuda"` requires a `--features nn-cuda` build.
+//! - `NN_SMOKE_DTYPE`   (default `"f32"`) — parameter dtype. Pinned to
+//!   f32 because the trainer / LoRA paths train in f32; the CUDA
+//!   preset default (bf16) fails at `run_lora_ft` with a dtype
+//!   mismatch. Mirrors the Rust GPU smoke examples.
 //! - `NN_SMOKE_VARIANT` (default `"1.1b"`) — TinyLlama variant:
 //!   `"1.1b"` / `"tinyllama-1.1b"` (random-init 1.1B) or `"tiny"` /
 //!   `"tinyllama-tiny"` (2-layer CPU smoke shape, vocab 32, ctx 16).
@@ -103,7 +107,15 @@ local function log(phase, desc, t0)
 end
 
 local function make_base()
-    return alc.nn.preset.tinyllama(S.variant, { pretrained = false, device = S.device })
+    -- dtype is pinned explicitly: on CUDA the preset default dtype is
+    -- bf16 (`default_dtype_for_device`), but the trainer / LoRA paths
+    -- train in f32 (delta VarMap + optimizer state) and fail with
+    -- "unexpected dtype, expected: F32, got: BF16" on a bf16 base.
+    -- Mirrors `nn_tinyllama_lora_gpu_smoke.rs` (`cfg.dtype = DType::F32`).
+    return alc.nn.preset.tinyllama(
+        S.variant,
+        { pretrained = false, device = S.device, dtype = S.dtype }
+    )
 end
 
 -- Phase 1: base handle (random init, no HF download).
@@ -227,14 +239,15 @@ collectgarbage()
 log(7, "run_distill card_id=" .. rd_id, t)
 
 print(string.format(
-    "[bridge-smoke] summary: all 7 phases ok (variant=%s device=%s steps=%d batch=%d ctx=%d)",
-    S.variant, S.device, S.steps, S.batch, eff_ctx
+    "[bridge-smoke] summary: all 7 phases ok (variant=%s device=%s dtype=%s steps=%d batch=%d ctx=%d)",
+    S.variant, S.device, S.dtype, S.steps, S.batch, eff_ctx
 ))
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = env_string("NN_SMOKE_DEVICE", "cuda");
     let variant = env_string("NN_SMOKE_VARIANT", "1.1b");
+    let dtype = env_string("NN_SMOKE_DTYPE", "f32");
     let steps = env_usize("NN_SMOKE_STEPS", 50);
     let batch = env_usize("NN_SMOKE_BATCH", 2);
     let ctx = env_usize("NN_SMOKE_CTX", 64);
@@ -244,8 +257,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warmup = env_usize("NN_SMOKE_WARMUP", steps.min(5));
 
     eprintln!(
-        "[bridge-smoke] config: device={device} variant={variant} steps={steps} \
-         batch={batch} ctx={ctx} rank={rank} alpha={alpha} lr={lr} warmup={warmup}"
+        "[bridge-smoke] config: device={device} variant={variant} dtype={dtype} \
+         steps={steps} batch={batch} ctx={ctx} rank={rank} alpha={alpha} lr={lr} \
+         warmup={warmup}"
     );
 
     let boot_t0 = Instant::now();
@@ -259,6 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = lua.create_table()?;
     cfg.set("device", device)?;
     cfg.set("variant", variant)?;
+    cfg.set("dtype", dtype)?;
     cfg.set("steps", steps)?;
     cfg.set("batch", batch)?;
     cfg.set("ctx", ctx)?;

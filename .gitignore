@@ -11,3 +11,4 @@ workspace
 !.env.sample
 !.env.template
 !.env.dist
+.codex

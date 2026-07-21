@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.47.0] - 2026-07-22
+
+### Added
+
 - `algocline-nn`: TinyLlama-1.1B trainable architecture (Layer 1 of GH
   #10, landed in two sub-phases).
   - Layer 1a — backward-safe primitives in `arch::tinyllama`:
@@ -134,7 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     hiding it behind an `Option<base>` argument. Directional
     errors on each surface point the caller at the correct
     sibling entry.
-  - Follow-ups called out in `workspace/tasks/alc-nn-tinyllama/layer-4b-arch-neutral-bridge-design.md`
+  - Follow-ups called out in the Layer 4b design notes
     §8: `alc.nn.trainer.*` bindings migrating from typed
     `Gpt2Handle` to `NnHandle` (mechanical once §Q1 lands, still
     breaks-only-if-you-borrow-Gpt2Handle-directly); `LlamaAdapter`
@@ -187,8 +201,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`nn_tinyllama_gpu_smoke.rs`, `nn_tinyllama_lora_gpu_smoke.rs`,
     and `nn_tinyllama_merge_lora_gpu_smoke.rs`) landed as the next
     entry in this section; actual A40 execution remains the
-    follow-up tracked in
-    `workspace/tasks/alc-nn-tinyllama/spike-status.md` §7.
+    follow-up tracked in the spike notes (spike-status §7).
 - `algocline-engine`: `alc.nn.wrap_lora` +
   `alc.nn.trainer.run_lora_ft` Lua bindings for the Layer 2 LoRA
   wrap and the Layer 3 LoRA fine-tuning loop (Layer 5b of GH #10,
@@ -444,8 +457,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each example is a plain `--example` binary compilable without
     the `nn-cuda` feature so the dev-host CPU compile check (`cargo
     check --example …`) exercises it as a regression gate; the
-    actual A40 execution runbook is
-    `workspace/tasks/alc-nn-gpu-smoke/runbook.md` Path A (git push
+    actual A40 execution follows the GPU smoke runbook Path A (git push
     → pod git clone → `cargo build --release --features nn-cuda`
     → `cargo run --release --features nn-cuda --example
     nn_tinyllama_merge_lora_gpu_smoke`). GPU execution results

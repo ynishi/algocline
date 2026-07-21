@@ -21,8 +21,8 @@
 //! so the "which Card field do we invent?" negotiation stays local
 //! to each branch's Model-side struct.
 //!
-//! See `workspace/tasks/alc-nn-tinyllama/layer-4-merged-ckpt-design.md`
-//! §3 Q0 for the full pattern rationale.
+//! See the Layer 4 merged-checkpoint design notes §3 Q0 for the
+//! full pattern rationale.
 
 use std::collections::HashMap;
 use std::path::Path;

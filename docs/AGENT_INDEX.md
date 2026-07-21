@@ -28,8 +28,8 @@ want one.
 - Service-layer error propagation — see `CLAUDE.md` §Service 層の Error 伝播規律
   (private; summary: `Result` must propagate to MCP wire, no `warn!`-and-drop)
 - Doc language — all repo-committed docs are English (this file included)
-- `.gitignore` — do not edit programmatically; `workspace` / `.worktrees` /
-  `.claude` are mandatory entries
+- `.gitignore` — do not edit programmatically; the ignored local-infrastructure
+  entries are mandatory and maintainer-managed
 
 ## MCP Surface
 

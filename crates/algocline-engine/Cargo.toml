@@ -54,3 +54,23 @@ test-support = []
 # Opt-in neural-network bridge (`alc.nn`). Default off: the default build does
 # not link candle. Enable with `--features nn`.
 nn = ["dep:algocline-nn", "dep:candle-core", "dep:candle-nn"]
+
+# GPU (CUDA) variant of the `nn` feature. Enables candle's CUDA backend
+# across candle-core AND candle-nn in lockstep: candle-nn 0.11's
+# LayerNorm is a `CustomOp3` whose `cuda_fwd` is
+# `#[cfg(feature = "cuda")]`-gated, so a `candle-core/cuda`-only build
+# still dispatches LayerNorm on CPU and fails at forward time with
+# `Candle("no cuda implementation for layer-norm")`. Keep
+# candle-core/cuda + candle-nn/cuda flipped together (and matched to
+# algocline-nn/nn-cuda) when bumping candle.
+nn-cuda = ["nn", "algocline-nn/nn-cuda", "candle-core/cuda", "candle-nn/cuda"]
+
+# Lua-bridge GPU smoke driver — drives alc.nn.{preset, data, wrap_lora,
+# trainer.run_lora_ft / run_full_ft / run_distill} through the engine
+# bridge (`install_for_pkg_test`) on CUDA (device="cuda", built with
+# `--features nn-cuda`) or CPU (device="cpu", built with `--features nn`).
+# Gated behind `nn` so the default `cargo check --workspace` never
+# compiles it.
+[[example]]
+name = "nn_bridge_gpu_smoke"
+required-features = ["nn"]

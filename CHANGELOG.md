@@ -19,6 +19,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.47.1] - 2026-07-23
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+- `BUNDLED_SOURCES` (`src/init.rs`) and `AUTO_INSTALL_SOURCES`
+  (`crates/algocline-app/src/service/resolve.rs`) no longer include
+  `algocline-swarm-frame`. The upstream repo moved to a `packages/`
+  nesting layout (v0.9.0+) that is incompatible with the Collection-
+  layout contract in `discover_packages`, so `alc update` / `alc init`
+  were emitting a non-fatal `No packages found ... Expected
+  subdirectories with init.lua` warning for it on every run. The
+  swarm-frame V3 stack is deprecated in favor of the flow.ir + mse
+  successor, so retaining the entry no longer justified the warning
+  cost. Users still relying on swarm-frame V3 can install it manually
+  via `alc_pkg_install <url>` once `discover_packages` grows nested-
+  layout support (tracked in issue a31ad3ca).
+
+### Fixed
+
+### Security
+
 ## [0.47.0] - 2026-07-22
 
 ### Added

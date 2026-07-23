@@ -177,7 +177,6 @@ meta.type_source = "auto_detected_" .. meta.type"#;
 pub(super) const AUTO_INSTALL_SOURCES: &[&str] = &[
     "https://github.com/ynishi/algocline-bundled-packages",
     "https://github.com/ynishi/evalframe",
-    "https://github.com/ynishi/algocline-swarm-frame",
 ];
 
 /// System packages: installed alongside user packages but not user-facing strategies.

@@ -1,6 +1,6 @@
 ---
 source: tests/e2e.rs
-assertion_line: 236
+assertion_line: 306
 expression: redacted
 ---
 {
@@ -26,13 +26,17 @@ expression: redacted
     }
   },
   "log_dir": {
-    "resolved": "<HOME>/.algocline/logs",
+    "resolved": "<ALC_HOME>/logs",
     "source": "~/.algocline/logs"
   },
   "log_enabled": true,
-  "packages_dir": "<HOME>/.algocline/packages",
+  "packages_dir": "<ALC_HOME>/packages",
   "preset_catalog_version": "preset-catalog@2026-04-23",
   "search_paths": [
+    {
+      "path": "<ALC_HOME>/packages",
+      "source": "ALC_PACKAGES_PATH"
+    },
     {
       "path": "<HOME>/.algocline/packages",
       "source": "default"
@@ -43,5 +47,5 @@ expression: redacted
     "sources": "<REDACTED>"
   },
   "tracing": "file + stderr",
-  "version": "0.47.1"
+  "version": "0.47.2"
 }

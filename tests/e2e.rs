@@ -22,6 +22,9 @@ use tokio::time::{sleep, timeout};
 
 use algocline_app::PRESET_CATALOG_VERSION;
 
+mod common;
+use common::TempAlcHome;
+
 // ─── Helpers ─────────────────────────────────────────────────────
 
 /// Build `CallToolRequestParams` from a tool name and a JSON value.
@@ -79,6 +82,20 @@ fn redact_paths(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Redact both an `ALC_HOME` tempdir prefix and the developer's home
+/// directory. The tempdir is replaced **first** so that stable
+/// placeholders survive later `<HOME>` substitution — on macOS the
+/// tempdir lives under `/var/folders/...` and does not overlap with
+/// `/Users/...`, so ordering is safety-guard rather than strict need.
+fn redact_paths_with_alc_home(text: &str, alc_home: &std::path::Path) -> String {
+    let text = if let Some(prefix) = alc_home.to_str() {
+        text.replace(prefix, "<ALC_HOME>")
+    } else {
+        text.to_string()
+    };
+    redact_paths(&text)
 }
 
 /// Redact environment-specific values inside the `gh_credentials` block
@@ -166,11 +183,6 @@ fn redact_gh_credentials(text: &str) -> String {
         .replace_all(&text, r#""sources": "<REDACTED>""#)
         .into_owned();
     text
-}
-
-/// Apply all redactions.
-fn redact(text: &str) -> String {
-    redact_gh_credentials(&redact_paths(&redact_uuids(text)))
 }
 
 /// Connect with a specific ALC_HOME directory.
@@ -271,18 +283,24 @@ async fn test_list_tools() {
 
 #[tokio::test]
 async fn test_alc_info() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
 
-    let result = client
+    let result = harness
+        .client
         .call_tool(call_params_empty("alc_info"))
         .await
         .expect("call_tool failed");
     let text = extract_text(&result);
-    let redacted = redact(text);
+    // Redact ALC_HOME (tempdir) first, then the developer's home dir, so
+    // both stable placeholders coexist in the snapshot.
+    let redacted = redact_gh_credentials(&redact_paths_with_alc_home(
+        &redact_uuids(text),
+        harness.home_path(),
+    ));
 
     insta::assert_snapshot!("alc_info", redacted);
 
-    client.cancel().await.expect("cancel failed");
+    harness.cancel().await;
 }
 
 #[tokio::test]
@@ -772,7 +790,8 @@ async fn test_alc_parallel_roundtrip() {
 
 #[tokio::test]
 async fn test_alc_fork_roundtrip() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
 
     // 1. Create temp packages in collection layout (<coll>/<name>/init.lua) and install them.
     let tmp_dir = tempfile::tempdir().expect("failed to create tempdir");
@@ -811,13 +830,13 @@ return M"#
 
     // Install via MCP (pass collection roots)
     call_json(
-        &client,
+        client,
         "alc_pkg_install",
         json!({ "url": coll_a.to_string_lossy() }),
     )
     .await;
     call_json(
-        &client,
+        client,
         "alc_pkg_install",
         json!({ "url": coll_b.to_string_lossy() }),
     )
@@ -829,7 +848,7 @@ return M"#
         return results
     "#;
     let resp = call_json(
-        &client,
+        client,
         "alc_run",
         json!({ "code": code, "ctx": { "task": "test" } }),
     )
@@ -874,7 +893,7 @@ return M"#
                     })
                     .collect();
                 final_resp = call_json(
-                    &client,
+                    client,
                     "alc_continue",
                     json!({ "session_id": session, "responses": responses }),
                 )
@@ -888,7 +907,7 @@ return M"#
                     "Answer B"
                 };
                 final_resp = call_json(
-                    &client,
+                    client,
                     "alc_continue",
                     json!({ "session_id": session, "response": answer }),
                 )
@@ -916,19 +935,14 @@ return M"#
     assert_eq!(strategy_b["ok"], true);
     assert_eq!(strategy_b["result"], "Answer B");
 
-    // 3. Cleanup packages (physical delete from cache — pkg_remove no longer does this)
-    if let Some(home) = dirs::home_dir() {
-        let pkg_cache = home.join(".algocline").join("packages");
-        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_fork_a"));
-        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_fork_b"));
-    }
-
-    client.cancel().await.expect("cancel failed");
+    // Cleanup is handled by TempAlcHome::Drop; the real ~/.algocline/ is untouched.
+    harness.cancel().await;
 }
 
 #[tokio::test]
 async fn test_pkg_install_returns_types_path() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
 
     // Create a temporary package in collection layout: <coll>/<name>/init.lua
     let tmp_dir = tempfile::tempdir().expect("tempdir");
@@ -946,7 +960,7 @@ return M"#,
 
     // Install and check response (pass collection root)
     let resp = call_json(
-        &client,
+        client,
         "alc_pkg_install",
         json!({ "url": coll_dir.to_string_lossy() }),
     )
@@ -963,17 +977,14 @@ return M"#,
         "types_path should end with types/alc.d.lua, got: {types_path}"
     );
 
-    // Cleanup (physical delete from cache — pkg_remove no longer does this)
-    if let Some(home) = dirs::home_dir() {
-        let pkg_cache = home.join(".algocline").join("packages");
-        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_types_test"));
-    }
-    client.cancel().await.expect("cancel failed");
+    // Cleanup is handled by TempAlcHome::Drop; the real ~/.algocline/ is untouched.
+    harness.cancel().await;
 }
 
 #[tokio::test]
 async fn test_pkg_install_returns_alc_shapes_types_path() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
 
     // Create a temporary package in collection layout: <coll>/<name>/init.lua
     let tmp_dir = tempfile::tempdir().expect("tempdir");
@@ -991,7 +1002,7 @@ return M"#,
 
     // Install and check response (pass collection root)
     let resp = call_json(
-        &client,
+        client,
         "alc_pkg_install",
         json!({ "url": coll_dir.to_string_lossy() }),
     )
@@ -1019,12 +1030,8 @@ return M"#,
         );
     }
 
-    // Cleanup (physical delete from cache — pkg_remove no longer does this)
-    if let Some(home) = dirs::home_dir() {
-        let pkg_cache = home.join(".algocline").join("packages");
-        let _ = std::fs::remove_dir_all(pkg_cache.join("e2e_alc_shapes_types_test"));
-    }
-    client.cancel().await.expect("cancel failed");
+    // Cleanup is handled by TempAlcHome::Drop; the real ~/.algocline/ is untouched.
+    harness.cancel().await;
 }
 
 /// `alc_pkg_remove` with `scope = "global"` deletes the entry from the
@@ -1034,7 +1041,8 @@ return M"#,
 /// that motivated the scope reintroduction (CHANGELOG).
 #[tokio::test]
 async fn test_pkg_remove_scope_global_cleans_manifest_not_files() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
 
     // Install a unique package so we don't collide with real user state.
     let tmp_dir = tempfile::tempdir().expect("tempdir");
@@ -1053,15 +1061,14 @@ return M"#,
     .expect("write init.lua");
 
     call_json(
-        &client,
+        client,
         "alc_pkg_install",
         json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
-    let home = dirs::home_dir().expect("home");
-    let manifest_path = home.join(".algocline").join("installed.json");
-    let cache_dir = home.join(".algocline").join("packages").join(pkg_name);
+    let manifest_path = harness.installed_json();
+    let cache_dir = harness.packages_dir().join(pkg_name);
 
     // Precondition: manifest has the entry, cache dir exists.
     let before: Value =
@@ -1075,7 +1082,7 @@ return M"#,
 
     // scope=global removal.
     let resp = call_json(
-        &client,
+        client,
         "alc_pkg_remove",
         json!({ "name": pkg_name, "scope": "global" }),
     )
@@ -1096,9 +1103,8 @@ return M"#,
         "scope=global must not delete ~/.algocline/packages/{pkg_name}/"
     );
 
-    // Cleanup the cache dir (scope=global deliberately leaves it).
-    let _ = std::fs::remove_dir_all(&cache_dir);
-    client.cancel().await.expect("cancel failed");
+    // Cleanup is handled by TempAlcHome::Drop; the real ~/.algocline/ is untouched.
+    harness.cancel().await;
 }
 
 /// Variant scope link → require: `alc_pkg_link --scope=variant` writes
@@ -1192,9 +1198,10 @@ async fn test_variant_scope_link_then_run_require() {
 /// Covers the (B) installed-dir-missing class of `alc_pkg_repair`.
 #[tokio::test]
 async fn test_pkg_repair_reinstalls_deleted_dir() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
 
-    // Source pkg dir outside HOME (collection layout: <coll>/<name>/init.lua).
+    // Source pkg dir outside ALC_HOME (collection layout: <coll>/<name>/init.lua).
     let tmp = tempfile::tempdir().expect("tempdir");
     let coll_dir = tmp.path().join("e2e_repair_coll");
     let source = coll_dir.join("e2e_repair_pkg");
@@ -1210,25 +1217,22 @@ return M"#,
 
     // Install (pass collection root).
     call_json(
-        &client,
+        client,
         "alc_pkg_install",
         json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
     // Simulate breakage: remove the installed dest.
-    let dest = dirs::home_dir()
-        .expect("home")
-        .join(".algocline")
-        .join("packages")
-        .join("e2e_repair_pkg");
+    // dest lives under the harness ALC_HOME tempdir, NOT the real home.
+    let dest = harness.packages_dir().join("e2e_repair_pkg");
     assert!(dest.exists(), "dest should exist after install");
     std::fs::remove_dir_all(&dest).expect("rm dest");
     assert!(!dest.exists());
 
     // Repair.
     let resp = call_json(
-        &client,
+        client,
         "alc_pkg_repair",
         json!({ "name": "e2e_repair_pkg" }),
     )
@@ -1240,9 +1244,8 @@ return M"#,
     assert_eq!(repaired[0]["kind"], "installed_missing");
     assert!(dest.exists(), "dest should be restored after repair");
 
-    // Cleanup.
-    let _ = std::fs::remove_dir_all(&dest);
-    client.cancel().await.expect("cancel failed");
+    // Cleanup is handled by TempAlcHome::Drop; the real ~/.algocline/ is untouched.
+    harness.cancel().await;
 }
 
 /// Install → remove dest dir → doctor: diagnose without side effects.
@@ -1250,9 +1253,9 @@ return M"#,
 /// directory is NOT resurrected (this is the doctor-vs-repair distinction).
 #[tokio::test]
 async fn test_pkg_doctor_reports_installed_missing() {
-    let client = connect().await;
+    let harness = TempAlcHome::connect().await;
 
-    // Source pkg dir outside HOME (collection layout: <coll>/<name>/init.lua).
+    // Source pkg dir outside ALC_HOME (collection layout: <coll>/<name>/init.lua).
     let tmp = tempfile::tempdir().expect("tempdir");
     let coll_dir = tmp.path().join("e2e_doctor_coll");
     let source = coll_dir.join("e2e_doctor_pkg");
@@ -1268,25 +1271,22 @@ return M"#,
 
     // Install (pass collection root).
     call_json(
-        &client,
+        &harness.client,
         "alc_pkg_install",
         json!({ "url": coll_dir.to_string_lossy() }),
     )
     .await;
 
     // Simulate breakage: remove the installed dest.
-    let dest = dirs::home_dir()
-        .expect("home")
-        .join(".algocline")
-        .join("packages")
-        .join("e2e_doctor_pkg");
+    // dest lives under the harness ALC_HOME tempdir, NOT the real home.
+    let dest = harness.packages_dir().join("e2e_doctor_pkg");
     assert!(dest.exists(), "dest should exist after install");
     std::fs::remove_dir_all(&dest).expect("rm dest");
     assert!(!dest.exists());
 
     // Doctor (read-only diagnose).
     let resp = call_json(
-        &client,
+        &harness.client,
         "alc_pkg_doctor",
         json!({ "name": "e2e_doctor_pkg" }),
     )
@@ -1307,16 +1307,10 @@ return M"#,
         "dest must not be resurrected by doctor (read-only)"
     );
 
-    // Cleanup: doctor didn't create anything; remove the manifest entry via repair
-    // to keep installed.json clean for subsequent runs.
-    let _ = call_json(
-        &client,
-        "alc_pkg_repair",
-        json!({ "name": "e2e_doctor_pkg" }),
-    )
-    .await;
-    let _ = std::fs::remove_dir_all(&dest);
-    client.cancel().await.expect("cancel failed");
+    // No manual cleanup needed: TempAlcHome::Drop removes the tempdir tree,
+    // which contains both `installed.json` and `packages/`. The
+    // developer's real `~/.algocline/` is not touched by this test.
+    harness.cancel().await;
 }
 
 /// Unknown pkg name → Err with a "not found in installed.json" message.

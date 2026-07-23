@@ -19,6 +19,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.47.2] - 2026-07-24
+
+### Added
+
+- `tests/common/mod.rs`: `TempAlcHome` RAII harness with per-child
+  `Command::env("ALC_HOME", <tempdir>)` + `ALC_PACKAGES_PATH` injection.
+  Guard exposes `client` / `home_path()` / `installed_json()` /
+  `packages_dir()` / `cancel()`. Field-declaration-ordered drop
+  (`client` → `_tmp` → `home`, per Rust Reference §5.8.1) guarantees
+  the alc child terminates before the tempdir is removed. No
+  `serial_test` crate / global `Mutex` is required because
+  `std::process::Command::env` sets the variable only in the child
+  process — parallel `cargo test` threads never race on parent-process
+  env state.
+
+### Changed
+
+- `tests/e2e.rs`: seven e2e tests that used to leak into the developer's
+  real `~/.algocline/` are now routed through `TempAlcHome::connect()`,
+  eliminating the recurring pollution first documented in issue
+  `213cad4a` (`installed.json` via pkg-family tests) and issue
+  `efd45582` (`config.toml` via `test_alc_info` snapshot).
+  Migrated tests: `test_alc_info` /
+  `test_pkg_doctor_reports_installed_missing` /
+  `test_alc_fork_roundtrip` / `test_pkg_install_returns_types_path` /
+  `test_pkg_install_returns_alc_shapes_types_path` /
+  `test_pkg_remove_scope_global_cleans_manifest_not_files` /
+  `test_pkg_repair_reinstalls_deleted_dir`. Each `dirs::home_dir()`
+  based cleanup / assertion path in these tests is replaced with the
+  harness accessors (`harness.installed_json()` /
+  `harness.packages_dir()`), and the `<tempdir>` prefix is stably
+  redacted in the `alc_info` snapshot via the new
+  `redact_paths_with_alc_home` helper. No production code changed.
+
+### Fixed
+
+- e2e test isolation: `cargo test --workspace` (and by extension
+  `just ci` / `@alc-pre-push mode=full`) no longer adds
+  `e2e_alc_shapes_types_test` / `e2e_doctor_pkg` / `e2e_fork_a` /
+  `e2e_fork_b` / `e2e_repair_pkg` / `e2e_types_test` entries to the
+  developer's real `~/.algocline/installed.json`. Previously each test
+  run would re-introduce these six entries even after manual
+  `alc_pkg_remove --scope=global` cleanup, requiring per-release
+  cleanup ceremony (documented in the 2026-07-23 v0.47.1 release
+  journal chapter).
+
 ## [0.47.1] - 2026-07-23
 
 ### Added

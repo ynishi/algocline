@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Return a directional Lua error when a bf16 base handle is passed to
+  any of the four nn trainer entrypoints (`alc.nn.wrap_lora` /
+  `alc.nn.trainer.run_lora_ft` / `run_full_ft` / `run_distill`),
+  instructing users to rebuild the preset with `dtype="f32"`. Previously
+  such calls surfaced an opaque candle
+  `unexpected dtype, expected: F32, got: BF16` error deep inside a
+  backward pass. bf16 remains supported for the inference path
+  (`alc.nn.preset.*` on CUDA and downstream inference bindings are
+  unchanged).
+
 ### Security
 
 ## [0.47.2] - 2026-07-24

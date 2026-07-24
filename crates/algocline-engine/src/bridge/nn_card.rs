@@ -2229,6 +2229,57 @@ fn guard_device_dtype_matrix(preset: &str, device: &Device, dtype: DType) -> Lua
     }
 }
 
+/// Reject bf16 base handles at the trainer entrypoints.
+///
+/// Sibling to [`guard_device_dtype_matrix`] — that guard rejects bf16
+/// at preset build time on non-CUDA devices; this guard rejects bf16
+/// at trainer entry regardless of device (bf16 is inference-only on
+/// the current trainer path). Called from the four L5b/L5c trainer
+/// impl fns (`wrap_lora_impl` / `run_lora_ft_impl` / `run_full_ft_impl`
+/// / `run_distill_impl`) between the Llama refusal (step 4) and the
+/// opts / dataset processing (step 5), so a bf16 base surfaces a
+/// directional Lua error rather than an opaque candle
+/// `unexpected dtype, expected: F32, got: BF16` raised deep inside a
+/// backward pass.
+pub(super) fn guard_base_dtype_for_training(fn_name: &str, handle: &NnHandle) -> LuaResult<()> {
+    let dtype = match handle {
+        NnHandle::Gpt2(h) => h.dtype.as_str(),
+        NnHandle::TinyLlama(h) => h.dtype.as_str(),
+        NnHandle::Llama(h) => h.dtype.as_str(),
+    };
+    if dtype.eq_ignore_ascii_case("bf16") {
+        return Err(LuaError::external(format!(
+            "{fn_name}: training requires an f32 base (got bf16); \
+             build the preset with dtype=\"f32\" (bf16 base is \
+             inference-only, not supported by the trainer path)"
+        )));
+    }
+    Ok(())
+}
+
+/// Test-only helper: swap the recorded `dtype` string on a
+/// [`Gpt2Handle`] without rebuilding the underlying model. Used by the
+/// L5b/L5c bridge tests to exercise the bf16 handle-time guard
+/// (`guard_base_dtype_for_training`) without needing a working bf16
+/// build path on CPU (which [`guard_device_dtype_matrix`] would refuse
+/// up front at preset construction time).
+#[cfg(test)]
+pub(super) fn gpt2_handle_with_dtype(mut base: Gpt2Handle, dtype: &str) -> Gpt2Handle {
+    base.dtype = dtype.to_string();
+    base
+}
+
+/// Test-only helper: sibling of [`gpt2_handle_with_dtype`] for
+/// [`TinyLlamaHandle`].
+#[cfg(test)]
+pub(super) fn tinyllama_handle_with_dtype(
+    mut base: TinyLlamaHandle,
+    dtype: &str,
+) -> TinyLlamaHandle {
+    base.dtype = dtype.to_string();
+    base
+}
+
 // ─── alc.nn.data ──────────────────────────────────────────────────
 
 /// Lua userdata handle around a `Box<dyn Dataset>`.

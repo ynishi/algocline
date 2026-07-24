@@ -38,8 +38,8 @@ use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use mlua::prelude::*;
 
 use super::nn_card::{
-    wrap_gpt2_lora_bridge, wrap_tinyllama_lora_bridge, Gpt2Handle, LlamaHandle, NnHandle,
-    TinyLlamaHandle,
+    guard_base_dtype_for_training, wrap_gpt2_lora_bridge, wrap_tinyllama_lora_bridge, Gpt2Handle,
+    LlamaHandle, NnHandle, TinyLlamaHandle,
 };
 
 /// Register `alc.nn.wrap_lora` onto the pre-existing `alc.nn` table.
@@ -114,6 +114,11 @@ fn wrap_lora_impl(base: &LuaValue, opts: LuaTable) -> LuaResult<NnHandle> {
             handle.arch()
         )));
     }
+
+    // 4.5. Reject bf16 base handles at the trainer entrypoint (bf16 is
+    //      inference-only on the current trainer path). Sibling to the
+    //      preset-build-time `guard_device_dtype_matrix` guard.
+    guard_base_dtype_for_training("alc.nn.wrap_lora", &handle)?;
 
     let arch = handle.arch();
 
@@ -253,7 +258,10 @@ mod wrap_lora_bridge_tests {
     //! All tests use the CPU/F32 `gpt2-tiny` / `tinyllama-tiny`
     //! micro shapes — same discipline as `nn_card::merge_lora_bridge_tests`
     //! (no HF hub download, no >1s train step).
-    use super::super::nn_card::{build_gpt2_handle, build_tinyllama_handle};
+    use super::super::nn_card::{
+        build_gpt2_handle, build_tinyllama_handle, gpt2_handle_with_dtype,
+        tinyllama_handle_with_dtype,
+    };
     use super::*;
     use mlua::Lua;
     use serde_json::json;
@@ -447,6 +455,53 @@ mod wrap_lora_bridge_tests {
                 && msg.contains("tinyllama"),
             "expected per-arch unknown-target error, got: {msg}"
         );
+    }
+
+    // ─── bf16 base handle guard (step 4.5) ─────────────────────────
+
+    #[test]
+    fn wrap_lora_rejects_bf16_base_gpt2() {
+        let (_tmp, base, lua) = setup_gpt2_base_scaffold();
+        let base_bf16 = gpt2_handle_with_dtype(base, "bf16");
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_bf16)).unwrap();
+        let opts = opts_table(&lua, json!({ "rank": 4, "alpha": 8.0 }));
+        let msg = expect_err(wrap_lora_impl(&LuaValue::UserData(base_ud), opts));
+        assert!(
+            msg.contains("alc.nn.wrap_lora:")
+                && msg.contains("training requires an f32 base (got bf16)")
+                && msg.contains(r#"dtype="f32""#),
+            "expected bf16 refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn wrap_lora_rejects_bf16_base_tinyllama_case_insensitive() {
+        let (_tmp, base, lua) = setup_tinyllama_base_scaffold();
+        // Case-insensitive match ensures upstream stringifications like
+        // `"BF16"` / `"Bf16"` are also caught.
+        let base_bf16 = tinyllama_handle_with_dtype(base, "BF16");
+        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base_bf16)).unwrap();
+        let opts = opts_table(&lua, json!({ "rank": 4, "alpha": 8.0 }));
+        let msg = expect_err(wrap_lora_impl(&LuaValue::UserData(base_ud), opts));
+        assert!(
+            msg.contains("alc.nn.wrap_lora:")
+                && msg.contains("training requires an f32 base (got bf16)"),
+            "expected bf16 refusal (case-insensitive), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn wrap_lora_f32_base_passes_dtype_guard() {
+        // Regression witness: the f32 happy path must not be affected
+        // by the new bf16 handle-time guard.
+        // `setup_gpt2_base_scaffold` builds a `pretrained=false` base
+        // which resolves to `default_dtype_for_device("cpu") = "f32"`;
+        // the guard must pass and the wrap succeed.
+        let (_tmp, base, lua) = setup_gpt2_base_scaffold();
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+        let opts = opts_table(&lua, json!({ "rank": 4, "alpha": 8.0 }));
+        let wrapped = wrap_lora_impl(&LuaValue::UserData(base_ud), opts).expect("wrap_lora f32");
+        assert!(wrapped.is_lora_wrapped());
     }
 
     #[test]

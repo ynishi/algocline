@@ -41,7 +41,7 @@ use algocline_nn::tokenizer::HfTokenizer;
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, Batch, CrossEntropyLoss, Dataset, DatasetOpts,
     DistillLossKind, DistillSpec, FullFtConfig, JsonlDataset, ParquetDataset, ScheduleKind,
-    TokenizedDataset, TrainError, TrainingLease,
+    TeacherCardDataset, TokenizedDataset, TrainError, TrainingLease,
 };
 use candle_core::{DType, Device};
 use candle_nn::VarMap;
@@ -2379,6 +2379,106 @@ fn batch_to_lua(lua: &Lua, batch: Batch) -> LuaResult<LuaTable> {
     Ok(out)
 }
 
+/// Loss-mask mode declared by a teacher-log Card under `[metadata]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LossMaskDecl {
+    /// Mask out the `prompt` region; score only the `response` region.
+    Response,
+}
+
+/// Read the `metadata.loss_mask` declaration from a Tier 1 Card JSON.
+///
+/// `Ok(None)` = the Card carries no declaration (legacy, mask-free path).
+/// `Err(_)`   = a declaration is present but not recognized.
+pub(super) fn loss_mask_decl_from_card(card: &Json) -> Result<Option<LossMaskDecl>, String> {
+    let value = match card
+        .get("metadata")
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.get("loss_mask"))
+    {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    match value.as_str() {
+        Some("response") => Ok(Some(LossMaskDecl::Response)),
+        Some(other) => Err(format!(
+            "unknown metadata.loss_mask value {other:?} (expected \"response\")"
+        )),
+        None => Err(format!(
+            "metadata.loss_mask must be a string (expected \"response\"), got {value}"
+        )),
+    }
+}
+
+/// One `(input_ids, loss_mask)` row of a mask-carrying teacher dataset,
+/// shaped for [`TeacherCardDataset::from_rows`].
+pub(super) type TeacherRow = (Vec<u32>, Vec<f32>);
+
+/// Build `(input_ids, loss_mask)` rows for a mask-declaring teacher Card.
+///
+/// `encode` is injected so unit tests can exercise the boundary rules
+/// without constructing a tokenizer (and therefore without network
+/// access). Row `i` of the result pairs the joint `"{prompt}\n{response}"`
+/// token ids with a same-length mask that is `0.0` across the prompt
+/// tokens and `1.0` across the response tokens.
+///
+/// The prompt token boundary is derived by encoding the `prompt` field
+/// on its own and verifying that its ids are a prefix of the joint
+/// encoding — never by a character offset or a delimiter search over
+/// the concatenated token stream.
+pub(super) fn build_teacher_rows<F>(samples: &[Json], encode: F) -> Result<Vec<TeacherRow>, String>
+where
+    F: Fn(&str) -> Result<Vec<u32>, String>,
+{
+    let mut rows: Vec<TeacherRow> = Vec::with_capacity(samples.len());
+    for (idx, sample) in samples.iter().enumerate() {
+        let prompt = match sample.get("prompt").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                return Err(format!(
+                    "sample {idx}: metadata.loss_mask is declared but 'prompt' is missing or empty"
+                ))
+            }
+        };
+        let response = match sample.get("response").and_then(|v| v.as_str()) {
+            Some(r) if !r.is_empty() => r,
+            _ => {
+                return Err(format!(
+                    "sample {idx}: metadata.loss_mask is declared but 'response' is missing or \
+                     empty"
+                ))
+            }
+        };
+
+        let prompt_ids = encode(prompt).map_err(|e| format!("sample {idx}: {e}"))?;
+        if prompt_ids.is_empty() {
+            return Err(format!("sample {idx}: prompt encodes to zero tokens"));
+        }
+        let joint_ids =
+            encode(&format!("{prompt}\n{response}")).map_err(|e| format!("sample {idx}: {e}"))?;
+        if joint_ids.len() <= prompt_ids.len() {
+            return Err(format!(
+                "sample {idx}: no response tokens after the prompt boundary (prompt={} joint={})",
+                prompt_ids.len(),
+                joint_ids.len()
+            ));
+        }
+        if joint_ids[..prompt_ids.len()] != prompt_ids[..] {
+            return Err(format!(
+                "sample {idx}: prompt token prefix mismatch (prompt={} joint={}) — the tokenizer \
+                 merged the prompt/response boundary",
+                prompt_ids.len(),
+                joint_ids.len()
+            ));
+        }
+
+        let mut mask = vec![0.0f32; prompt_ids.len()];
+        mask.resize(joint_ids.len(), 1.0f32);
+        rows.push((joint_ids, mask));
+    }
+    Ok(rows)
+}
+
 fn register_data_ns(
     lua: &Lua,
     nn_table: &LuaTable,
@@ -2440,6 +2540,37 @@ fn register_data_ns(
                 .unwrap_or_else(|| "gpt2".to_string());
             let tok = HfTokenizer::load_cached(&tokenizer_name, &from_card_tok_dir)
                 .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?;
+
+            // Tier 1 `[metadata] loss_mask = "response"` switches this
+            // producer to a mask-carrying teacher dataset. Absent
+            // declaration falls through to the legacy path below with
+            // bit-identical token ids.
+            let decl = from_card_store
+                .get(&card_id)
+                .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?
+                .as_ref()
+                .map(loss_mask_decl_from_card)
+                .transpose()
+                .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?
+                .flatten();
+
+            if decl == Some(LossMaskDecl::Response) {
+                let samples = from_card_store
+                    .read_samples(&card_id, SamplesQuery::default())
+                    .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?;
+                let rows = build_teacher_rows(&samples, |text| {
+                    tok.encode(text).map_err(|e| e.to_string())
+                })
+                .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?;
+                let ds = TeacherCardDataset::from_rows(rows, dopts.clone())
+                    .map_err(|e| LuaError::external(format!("alc.nn.data.from_card: {e}")))?;
+                return Ok(DatasetHandle {
+                    inner: Mutex::new(Box::new(ds)),
+                    source: format!("card:{card_id}"),
+                    batch_size: dopts.batch_size,
+                    ctx_len: dopts.ctx_len,
+                });
+            }
 
             let samples = from_card_store
                 .read_samples(&card_id, SamplesQuery::default())
@@ -4656,5 +4787,269 @@ mod merge_lora_bridge_tests {
             msg2.contains("opts.lora_card must be a non-empty string"),
             "message: {msg2}"
         );
+    }
+}
+
+#[cfg(test)]
+mod loss_mask_from_card_tests {
+    //! Metadata-gated loss-mask branch of `alc.nn.data.from_card`.
+    //!
+    //! Two layers, both network-free:
+    //!
+    //! 1. Unit tests for `loss_mask_decl_from_card` / `build_teacher_rows`
+    //!    with an injected encoder (no tokenizer object at all).
+    //! 2. Bridge tests that drive the real `from_card` closure through
+    //!    `register_data_ns`. A hand-authored WordLevel tokenizer is
+    //!    seeded at `<nn_dir>/tokenizers/gpt2.json` first, so
+    //!    `HfTokenizer::load_cached` takes its cache-hit branch and
+    //!    never reaches the HuggingFace hub.
+    use super::*;
+    use mlua::Lua;
+    use serde_json::json;
+
+    /// Deterministic whitespace-splitting encoder used by the unit
+    /// tests: every known word maps to a fixed id, unknown words to 0.
+    fn split_encode(text: &str) -> Result<Vec<u32>, String> {
+        Ok(text
+            .split_whitespace()
+            .map(|w| match w {
+                "alpha" => 1,
+                "beta" => 2,
+                "gamma" => 3,
+                "delta" => 4,
+                "epsilon" => 5,
+                _ => 0,
+            })
+            .collect())
+    }
+
+    // ─── Unit: declaration parsing ────────────────────────────────
+
+    #[test]
+    fn loss_mask_decl_absent_is_none() {
+        let no_metadata = json!({ "card_id": "c1" });
+        assert_eq!(loss_mask_decl_from_card(&no_metadata), Ok(None));
+
+        let empty_metadata = json!({ "card_id": "c1", "metadata": {} });
+        assert_eq!(loss_mask_decl_from_card(&empty_metadata), Ok(None));
+
+        let unrelated = json!({ "metadata": { "prior_card_id": "c0" } });
+        assert_eq!(loss_mask_decl_from_card(&unrelated), Ok(None));
+    }
+
+    #[test]
+    fn loss_mask_decl_response_is_parsed() {
+        let card = json!({ "metadata": { "loss_mask": "response" } });
+        assert_eq!(
+            loss_mask_decl_from_card(&card),
+            Ok(Some(LossMaskDecl::Response))
+        );
+    }
+
+    #[test]
+    fn loss_mask_decl_unknown_value_errors() {
+        let wrong_string = json!({ "metadata": { "loss_mask": "prompt" } });
+        let msg = loss_mask_decl_from_card(&wrong_string).expect_err("unknown value must error");
+        assert!(msg.contains("metadata.loss_mask"), "message: {msg}");
+
+        let wrong_type = json!({ "metadata": { "loss_mask": 42 } });
+        let msg2 = loss_mask_decl_from_card(&wrong_type).expect_err("non-string must error");
+        assert!(msg2.contains("metadata.loss_mask"), "message: {msg2}");
+    }
+
+    // ─── Unit: row + mask construction ────────────────────────────
+
+    #[test]
+    fn build_teacher_rows_zeroes_prompt_region() {
+        let samples = vec![json!({ "prompt": "alpha beta", "response": "gamma delta" })];
+        let rows = build_teacher_rows(&samples, split_encode).expect("rows");
+        assert_eq!(rows.len(), 1);
+        let (ids, mask) = &rows[0];
+        assert_eq!(ids, &vec![1, 2, 3, 4]);
+        assert_eq!(ids.len(), mask.len());
+        assert_eq!(mask, &vec![0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn build_teacher_rows_missing_prompt_errors() {
+        let samples = vec![
+            json!({ "prompt": "alpha", "response": "beta" }),
+            json!({ "response": "gamma" }),
+        ];
+        let msg = build_teacher_rows(&samples, split_encode).expect_err("missing prompt errors");
+        assert!(msg.contains("sample 1"), "message: {msg}");
+        assert!(msg.contains("prompt"), "message: {msg}");
+    }
+
+    #[test]
+    fn build_teacher_rows_missing_response_errors() {
+        let samples = vec![
+            json!({ "prompt": "alpha", "response": "beta" }),
+            json!({ "prompt": "gamma", "response": "" }),
+        ];
+        let msg = build_teacher_rows(&samples, split_encode).expect_err("missing response errors");
+        assert!(msg.contains("sample 1"), "message: {msg}");
+        assert!(msg.contains("response"), "message: {msg}");
+    }
+
+    #[test]
+    fn build_teacher_rows_prefix_mismatch_errors() {
+        // Joint encoding does not start with the prompt encoding —
+        // the boundary cannot be trusted, so the row must fail loudly
+        // instead of being masked by guess.
+        let encode = |text: &str| -> Result<Vec<u32>, String> {
+            if text.contains('\n') {
+                Ok(vec![7, 8, 9])
+            } else {
+                Ok(vec![1])
+            }
+        };
+        let samples = vec![json!({ "prompt": "alpha", "response": "beta" })];
+        let msg = build_teacher_rows(&samples, encode).expect_err("prefix mismatch must error");
+        assert!(msg.contains("prompt token prefix"), "message: {msg}");
+        assert!(msg.contains("sample 0"), "message: {msg}");
+    }
+
+    #[test]
+    fn build_teacher_rows_empty_samples_is_ok() {
+        let rows = build_teacher_rows(&[], split_encode).expect("empty rows");
+        assert!(rows.is_empty());
+    }
+
+    // ─── Bridge: full `from_card` closure, no network ─────────────
+
+    /// Hand-authored `tokenizers` fixture (WordLevel + WhitespaceSplit).
+    /// Seeded on disk so `HfTokenizer::load_cached("gpt2", ..)` finds a
+    /// cache hit and never calls the hub.
+    const FIXTURE_TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,
+ "added_tokens":[{"id":0,"content":"[UNK]","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+ "normalizer":null,
+ "pre_tokenizer":{"type":"WhitespaceSplit"},
+ "post_processor":null,"decoder":null,
+ "model":{"type":"WordLevel","vocab":{"[UNK]":0,"alpha":1,"beta":2,"gamma":3,"delta":4,"epsilon":5},"unk_token":"[UNK]"}}"#;
+
+    fn opts_table(lua: &Lua, v: serde_json::Value) -> LuaTable {
+        let val = lua.to_value(&v).expect("to_value");
+        match val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!("json object must serialise to Lua table"),
+        }
+    }
+
+    /// Build a tempdir-backed store + nn_dir with the fixture tokenizer
+    /// already on disk, create a Card (optionally declaring the mask)
+    /// with one teacher-log sample, and return the registered Lua VM.
+    fn setup_from_card(declare_mask: bool) -> (tempfile::TempDir, Lua, LuaTable, String) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nn_dir = tmp.path().join("nn");
+        std::fs::create_dir_all(nn_dir.join("tokenizers")).unwrap();
+        std::fs::write(nn_dir.join("tokenizers/gpt2.json"), FIXTURE_TOKENIZER).unwrap();
+
+        let store = Arc::new(FileCardStore::new(tmp.path().join("cards")));
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("kind".to_string(), json!("teacher_log"));
+        if declare_mask {
+            metadata.insert("loss_mask".to_string(), json!("response"));
+        }
+        let (card_id, _path) = store
+            .create(json!({
+                "pkg": { "name": "alc_nn" },
+                "metadata": Json::Object(metadata),
+            }))
+            .expect("create card");
+        store
+            .write_samples(
+                &card_id,
+                vec![json!({ "prompt": "alpha beta", "response": "gamma delta" })],
+            )
+            .expect("write samples");
+
+        let lua = Lua::new();
+        let nn_table = lua.create_table().unwrap();
+        register_data_ns(&lua, &nn_table, Arc::clone(&store), nn_dir).expect("register data ns");
+        (tmp, lua, nn_table, card_id)
+    }
+
+    fn call_from_card(lua: &Lua, nn_table: &LuaTable, card_id: &str) -> LuaAnyUserData {
+        let data: LuaTable = nn_table.get("data").expect("data ns");
+        let from_card: LuaFunction = data.get("from_card").expect("from_card entry");
+        let opts = opts_table(
+            lua,
+            json!({ "batch_size": 1, "ctx_len": 8, "pad_id": 0, "tokenizer": "gpt2" }),
+        );
+        from_card
+            .call::<LuaAnyUserData>((card_id.to_string(), opts))
+            .expect("from_card call")
+    }
+
+    #[test]
+    fn from_card_with_loss_mask_declaration_returns_masked_batch() {
+        let (_tmp, lua, nn_table, card_id) = setup_from_card(true);
+        let ud = call_from_card(&lua, &nn_table, &card_id);
+        let handle = ud.borrow::<DatasetHandle>().expect("dataset handle");
+        assert_eq!(handle.source, format!("card:{card_id}"));
+
+        let mut ds = handle.inner_lock().expect("lock");
+        let batch = ds
+            .next_batch()
+            .expect("next_batch")
+            .expect("one batch available");
+        assert_eq!(batch.input_ids, vec![vec![1, 2, 3, 4, 0, 0, 0, 0]]);
+        let mask = batch.loss_mask.expect("declared card carries a loss mask");
+        assert_eq!(mask, vec![vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn from_card_without_declaration_matches_legacy_ids() {
+        let (_tmp_masked, lua_masked, nn_masked, masked_id) = setup_from_card(true);
+        let masked_ud = call_from_card(&lua_masked, &nn_masked, &masked_id);
+        let masked_ids = {
+            let handle = masked_ud.borrow::<DatasetHandle>().expect("handle");
+            let mut ds = handle.inner_lock().expect("lock");
+            ds.next_batch()
+                .expect("next_batch")
+                .expect("batch")
+                .input_ids
+        };
+
+        let (_tmp, lua, nn_table, card_id) = setup_from_card(false);
+        let ud = call_from_card(&lua, &nn_table, &card_id);
+        let handle = ud.borrow::<DatasetHandle>().expect("dataset handle");
+        let mut ds = handle.inner_lock().expect("lock");
+        let batch = ds.next_batch().expect("next_batch").expect("batch");
+
+        // Crux 1 evidence: identical token ids, mask-free legacy path.
+        assert_eq!(batch.input_ids, masked_ids);
+        assert!(batch.loss_mask.is_none());
+    }
+
+    #[test]
+    fn from_card_unknown_declaration_errors_with_surface_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nn_dir = tmp.path().join("nn");
+        std::fs::create_dir_all(nn_dir.join("tokenizers")).unwrap();
+        std::fs::write(nn_dir.join("tokenizers/gpt2.json"), FIXTURE_TOKENIZER).unwrap();
+
+        let store = Arc::new(FileCardStore::new(tmp.path().join("cards")));
+        let (card_id, _path) = store
+            .create(json!({
+                "pkg": { "name": "alc_nn" },
+                "metadata": { "loss_mask": "resp" },
+            }))
+            .expect("create card");
+
+        let lua = Lua::new();
+        let nn_table = lua.create_table().unwrap();
+        register_data_ns(&lua, &nn_table, Arc::clone(&store), nn_dir).expect("register data ns");
+
+        let data: LuaTable = nn_table.get("data").expect("data ns");
+        let from_card: LuaFunction = data.get("from_card").expect("from_card entry");
+        let opts = opts_table(&lua, json!({ "batch_size": 1, "ctx_len": 8 }));
+        let msg = match from_card.call::<LuaAnyUserData>((card_id, opts)) {
+            Ok(_) => panic!("unknown declaration must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("alc.nn.data.from_card:"), "message: {msg}");
+        assert!(msg.contains("metadata.loss_mask"), "message: {msg}");
     }
 }

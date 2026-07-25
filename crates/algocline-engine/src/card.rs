@@ -65,7 +65,7 @@
 //! | `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |
 //! | `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |
 //! | `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |
-//! | `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`) |
+//! | `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`). Recognized training convention: `loss_mask` (`"response"` = `alc.nn.data.from_card` masks the prompt region and returns a mask-carrying teacher dataset) |
 //!
 //! ## Lua API (`alc.card.*`)
 //!

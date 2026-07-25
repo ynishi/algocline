@@ -1292,6 +1292,23 @@ entries stay registered.
   `loss_mask` scoring only the response region; the surface does
   not enforce mask presence (an unmasked dataset degrades to a
   plain full fine-tune, which is well-defined).
+
+  The mask is declared on the teacher-log Card, never as a call
+  argument. When a Card's Tier 1 `[metadata]` carries
+  `loss_mask = "response"`, `alc.nn.data.from_card` tokenizes the
+  sample's `prompt` field separately to locate the token boundary
+  and returns a mask-carrying dataset whose per-token mask is
+  `0.0` over the prompt region and `1.0` over the response
+  region, so only the response is scored. A Card without that
+  declaration returns the mask-free dataset exactly as before —
+  the token ids are identical and `run_distill` still accepts it
+  (the documented full-fine-tune degrade above). An unrecognized
+  `metadata.loss_mask` value is refused loudly by `from_card`
+  rather than silently ignored. `alc.nn.data.jsonl` /
+  `.synthetic` / `.parquet` never carry a mask, so `from_card` is
+  the canonical masked path. The mask itself is consumed inside
+  the training loop and is not projected onto the Lua batch table
+  (`ds:next_batch()` returns `input_ids` / `is_last` only).
 - `opts` (table) — the `run_full_ft` training-config schema
   (`lr` / `batch` / `steps` / `warmup` / `schedule` / `name`,
   same validation rules; `name` defaults to `"run_distill"`)
@@ -1327,10 +1344,14 @@ pretrained refusal). A40 GPU smoke inherits the L5b carry list
 (`spike-status.md §7`).
 
 ```lua
--- End-to-end: student handle → distillation → Card.
+-- End-to-end: teacher-log Card → masked dataset → distillation → Card.
+-- The teacher log lives in the Card samples sidecar
+-- (`alc.card.write_samples`), and the Card's Tier 1 metadata declares
+-- `loss_mask = "response"`, so `from_card` scores only the response
+-- region.
 local student = alc.nn.preset("gpt2", "medium", { pretrained = false })
-local ds = alc.nn.data.jsonl("teacher_log.jsonl", {
-    batch_size = 1, ctx_len = 128,
+local ds = alc.nn.data.from_card(teacher_card_id, {
+    tokenizer = "gpt2", batch_size = 1, ctx_len = 128,
 })
 
 local card_id = alc.nn.trainer.run_distill(student, ds, {

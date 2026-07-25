@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.data.from_card` now recognizes the Tier 1 Card convention
+  `[metadata] loss_mask = "response"`. For a declaring Card the sample's
+  `prompt` field is tokenized separately to locate the token boundary,
+  and the entry returns a `TeacherCardDataset` whose per-token loss mask
+  is `0.0` over the prompt region and `1.0` over the response region, so
+  `alc.nn.trainer.run_distill` scores only the response. Cards without
+  the declaration are unchanged — same token ids, same mask-free
+  `TokenizedDataset`, and `run_distill` still accepts them (an unmasked
+  dataset degrades to a plain full fine-tune). An unrecognized
+  `metadata.loss_mask` value is refused loudly instead of being ignored.
+  The function signature and argument set are unchanged: the declaration
+  travels with the Card, and the teacher log itself lives in the Card
+  samples sidecar (`alc.card.write_samples`), so no raw corpus is
+  committed to the repository. The mask stays internal to the training
+  loop — the Lua batch table still exposes `input_ids` / `is_last` only.
+- `crates/algocline-engine/tests/nn_distill_teacher_card_e2e.rs`: opt-in
+  end-to-end test of the supply loop (`alc.card.write_samples` →
+  `alc.nn.data.from_card` → `alc.nn.trainer.run_distill`) with the real
+  gpt2 tokenizer, gated behind `NN_SMOKE_DISTILL_CARD=1`. Without the
+  variable it prints a skip message and returns, so the default test run
+  stays network-free.
+
 ### Changed
 
 ### Deprecated
@@ -26,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backward pass. bf16 remains supported for the inference path
   (`alc.nn.preset.*` on CUDA and downstream inference bindings are
   unchanged).
+- Documentation drift around distillation datasets: the 0.46.0 entry
+  advertised a `TeacherCardDataset` teacher adapter that no Lua caller
+  could reach, and the `alc.nn.trainer.run_distill` example in
+  `docs/lua-stdlib.md` built its dataset with `alc.nn.data.jsonl`, a
+  path that provably cannot carry a loss mask. Both now describe the
+  actual masked path.
 
 ### Security
 
@@ -823,8 +851,11 @@ is either CI plumbing or an internal invariant repair.
   - `alc.nn.trainer.lora` — LoRA wrap + `run_lora_ft` with delta-only
     checkpoint (`alc_shapes` `Gpt2Model::wrap_lora`), merge-equivalence
     guarantee (wrapped forward matches merged linear within tolerance)
-  - `alc.nn.trainer.distill` — Hard-label distillation loop with
-    `TeacherCardDataset` teacher adapter
+  - `alc.nn.trainer.distill` — Hard-label distillation loop.
+    `TeacherCardDataset` shipped alongside it as a Rust-side teacher
+    adapter; no Lua-reachable constructor produced a mask-carrying
+    dataset at this release (see the `[Unreleased]` entry for the
+    `alc.nn.data.from_card` path that makes it reachable)
   - `alc.nn.data.synthetic` — CPU-scale synthetic corpus binding for
     smoke tests without HuggingFace hub network calls
   - `alc.nn.card.*` — Card-backed model metadata schema for

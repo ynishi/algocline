@@ -57,13 +57,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the two projections that write back into the residual stream
   (`attn.c_proj`, `mlp.c_proj`) scaled to `0.02 / sqrt(2 * n_layer)` so
   the variance the stream accumulates does not grow with depth. Unlike
-  the `wte` / `wpe` fix above this is a conformance change rather than a
-  measured one: the final LayerNorm normalizes the residual before the
-  tied head, so the step-0 loss is unchanged (still `ln(vocab)`) and the
-  short smoke runs land in the same wide spread they did before. The
-  payoff it targets — residual conditioning over a long training
-  horizon on a deep stack — is not something this repository's test
-  budget can observe. Random-init only, as above.
+  the `wte` / `wpe` fix above this is a conformance change, and it is
+  not a measured improvement — the one A/B available here points the
+  other way. On a 12-layer / dim-384 / vocab-50257 stack cycling 8
+  sequences for 120 steps at lr 3e-4, both initializations start at
+  `ln(vocab)` (10.85 vs 10.98, the final LayerNorm normalizes the
+  residual before the tied head) but the previous Kaiming draw
+  converges faster: 5.36 / 2.82 / 1.45 at steps 40 / 80 / 119 against
+  6.69 / 4.66 / 4.23 for the reference draw. That is the expected
+  trade — the `1/sqrt(2 * n_layer)` scaling starts each block closer to
+  the identity — and a 120-step memorization task is precisely the
+  regime where the larger draw wins. The regime the scaling is for,
+  long-horizon training of a deep stack, is not something this
+  repository measures, so the justification for shipping it is
+  conformance with the reference the module documents, not an observed
+  gain. Reproduce with `examples/init_loss_probe.rs`. Random-init only,
+  as above.
 
 ### Changed
 

@@ -136,6 +136,83 @@ fn trajectory(label: &str, cfg: &Gpt2Config, wte_stdev: Option<f64>, seq: usize,
     }
 }
 
+/// Overwrite the four per-block projections with candle-nn's `linear()`
+/// default draw — Kaiming-normal weight (`stdev = sqrt(2 / fan_in)`)
+/// and uniform bias (`+-1 / sqrt(fan_in)`) — reproducing the crate's
+/// pre-fix initialization on a model that was built with the GPT-2
+/// reference one.
+fn revert_block_linears_to_kaiming(vm: &mut VarMap, cfg: &Gpt2Config) {
+    let dev = &cfg.device;
+    let mut draw = |name: &str, out_dim: usize, fan_in: usize| {
+        let std = (2.0f32 / fan_in as f32).sqrt();
+        let w = Tensor::randn(0f32, std, (out_dim, fan_in), dev).unwrap();
+        vm.set_one(format!("{name}.weight"), &w).unwrap();
+        let bound = 1.0f32 / (fan_in as f32).sqrt();
+        let b = ((Tensor::rand(0f32, 1f32, out_dim, dev).unwrap() * 2.0).unwrap() - 1.0).unwrap();
+        vm.set_one(format!("{name}.bias"), (b * bound as f64).unwrap())
+            .unwrap();
+    };
+    for i in 0..cfg.layers {
+        draw(&format!("h.{i}.attn.c_attn"), 3 * cfg.dim, cfg.dim);
+        draw(&format!("h.{i}.attn.c_proj"), cfg.dim, cfg.dim);
+        draw(&format!("h.{i}.mlp.c_fc"), 4 * cfg.dim, cfg.dim);
+        draw(&format!("h.{i}.mlp.c_proj"), cfg.dim, 4 * cfg.dim);
+    }
+}
+
+/// Train the same corpus twice — once with the shipped GPT-2 reference
+/// init, once with the pre-fix Kaiming draw restored — and print both
+/// loss curves. This is the A/B the residual-scaling claim needs: the
+/// step-0 loss is identical either way (the final LayerNorm normalizes
+/// the residual before the tied head), so any difference here is the
+/// training-time conditioning the scaling exists for.
+fn residual_ab(cfg: &Gpt2Config, steps: usize, rows: usize, seq: usize) {
+    for label in ["reference init (shipped)", "kaiming init (pre-fix)"] {
+        let mut vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(cfg, vb).expect("build model");
+        if label.starts_with("kaiming") {
+            revert_block_linears_to_kaiming(&mut vm, cfg);
+        }
+
+        // A handful of distinct sequences, cycled — memorizable, but not
+        // in a single step the way one repeated row would be.
+        let corpus: Vec<Vec<u32>> = (0..rows)
+            .map(|r| {
+                (0..seq)
+                    .map(|i| ((r * 7919 + i * 977) % cfg.vocab) as u32)
+                    .collect()
+            })
+            .collect();
+
+        let mut opt = AdamW::new(
+            vm.all_vars(),
+            ParamsAdamW {
+                lr: 3e-4,
+                weight_decay: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        println!("--- {label} ---");
+        for step in 0..steps {
+            let ids = &corpus[step % rows];
+            let inputs = Tensor::from_slice(&ids[..seq - 1], (1, seq - 1), &cfg.device).unwrap();
+            let targets = Tensor::from_slice(&ids[1..seq], (1, seq - 1), &cfg.device).unwrap();
+            let logits = model.forward(&inputs).unwrap();
+            let loss = HardLabelDistillLoss::new()
+                .compute(&logits, &targets, None)
+                .unwrap();
+            let val: f32 = loss.to_scalar().unwrap();
+            if step % 10 == 0 || step == steps - 1 {
+                println!("  step {step:>3}: loss={val:.4}");
+            }
+            opt.backward_step(&loss).unwrap();
+        }
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -167,4 +244,22 @@ fn main() {
     println!("\n[trajectory] layers=2 (vocab/dim unchanged), E2E hyperparams\n");
     trajectory("wte stdev=0.02 (crate)", &small, None, seq, resp);
     trajectory("wte stdev=1.0 (candle def)", &small, Some(1.0), seq, resp);
+
+    // Phase 3 — reference vs pre-fix linear init on a deep-enough stack
+    // for the residual scaling (1/sqrt(2*n_layer)) to bite.
+    let deep = Gpt2Config {
+        layers: 12,
+        heads: 6,
+        dim: 384,
+        ctx: 64,
+        vocab: cfg.vocab,
+        dtype: DType::F32,
+        device: Device::Cpu,
+        eps: 1e-5,
+    };
+    println!(
+        "\n[residual A/B] layers={} dim={} vocab={}, 8 rows cycled, lr 3e-4\n",
+        deep.layers, deep.dim, deep.vocab
+    );
+    residual_ab(&deep, 120, 8, seq);
 }

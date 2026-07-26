@@ -21,6 +21,8 @@
 //! `rms_norm_autograd_gate.rs` (TinyLlama side), but scoped to the whole
 //! GPT-2 parameter inventory rather than a single op.
 
+mod common;
+
 use algocline_nn::arch::{Gpt2Config, Gpt2Model};
 use algocline_nn::train::{HardLabelDistillLoss, Loss};
 use candle_core::{DType, Device, Tensor};
@@ -38,6 +40,7 @@ fn masked_backward_reaches_every_base_var() {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
@@ -64,38 +67,10 @@ fn masked_backward_reaches_every_base_var() {
 
     // Parameter inventory: wte + wpe + 2 blocks × (ln_1 w/b + c_attn w/b
     // + c_proj w/b + ln_2 w/b + mlp.c_fc w/b + mlp.c_proj w/b = 12) +
-    // ln_f w/b = 28 Vars. Pinned so the per-Var loop below cannot go
-    // vacuous if the arch registration changes shape.
-    let data = vm.data().lock().unwrap();
-    assert_eq!(
-        data.len(),
-        28,
-        "GPT-2 tiny VarMap inventory drifted; update the count in this test"
-    );
+    // ln_f w/b = 28 Vars.
+    common::assert_full_grad_coverage(&vm, &grads, 28);
 
-    let mut missing: Vec<String> = Vec::new();
-    let mut zero: Vec<String> = Vec::new();
-    for (name, var) in data.iter() {
-        match grads.get(var.as_tensor()) {
-            None => missing.push(name.clone()),
-            Some(g) => {
-                let mag: f32 = g.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
-                // The explicit NaN arm keeps a NaN gradient from slipping
-                // through the `<=` comparison.
-                if mag.is_nan() || mag <= 0.0 {
-                    zero.push(format!("{name} (sum|g|={mag})"));
-                }
-            }
-        }
-    }
-    missing.sort();
-    zero.sort();
-    assert!(
-        missing.is_empty() && zero.is_empty(),
-        "autograd coverage hole — the loss can still descend head-only while \
-         these parameters never learn.\n  missing from GradStore: {missing:?}\n  \
-         zero/NaN gradient: {zero:?}"
-    );
+    let data = vm.data().lock().unwrap();
 
     // Fused-projection blind spot: the whole-Var check above cannot see
     // a severed attention-scores path, because the V slice of the fused

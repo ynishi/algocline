@@ -33,6 +33,7 @@ fn tiny_model() -> (Gpt2Config, VarMap, Gpt2Model) {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);

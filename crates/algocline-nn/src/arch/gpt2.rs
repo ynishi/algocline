@@ -21,7 +21,12 @@
 //! #1. Attention uses a causal (lower-triangular) mask.
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, Embedding, Init, LayerNorm, Module, VarBuilder, VarMap};
+use candle_nn::{
+    layer_norm, rms_norm, Embedding, Init, LayerNorm, Module, RmsNorm, VarBuilder, VarMap,
+};
+
+use super::custom::{Activation, Gpt2Custom, NormKind, ResidualKind};
+use super::tinyllama::apply_slow_rms_norm;
 
 // `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
 // wrap_lora docs below; the wrap helper itself lives in `arch::lora` since
@@ -179,6 +184,13 @@ pub struct Gpt2Config {
     /// are random-init only — the pretrained loaders reject configs
     /// that set this.
     pub moe: Option<MoeConfig>,
+    /// Architecture customization spec ([`Gpt2Custom`]: activation /
+    /// norm kind / residual topology / MLP ratio). `None` (all shipped
+    /// presets) is the GPT-2 reference. Custom models are random-init
+    /// only, and combining `custom` with `moe` is not supported yet
+    /// (the dense-MLP knobs `act` / `mlp_ratio` would silently not
+    /// apply to the experts).
+    pub custom: Option<Gpt2Custom>,
 }
 
 impl Gpt2Config {
@@ -194,6 +206,7 @@ impl Gpt2Config {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         }
     }
 
@@ -209,6 +222,7 @@ impl Gpt2Config {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         }
     }
 
@@ -239,6 +253,7 @@ impl Gpt2Config {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         }
     }
 
@@ -275,24 +290,67 @@ impl Gpt2Config {
 /// `mlp_c_proj`) are held as [`LinearVariant`] so a subsequent
 /// [`Gpt2Model::wrap_lora`] call can replace individual layers with a
 /// LoRA wrap without changing the surrounding forward code path.
+/// Block / final normalization — the seam [`Gpt2Custom::norm`]
+/// switches. Both variants keep the `ln_*` VarBuilder scope, so the
+/// weight name is stable (`ln_1.weight` etc.); RMSNorm simply has no
+/// bias entry. Both apply through the backward-safe slow shims.
+enum Norm {
+    Ln(LayerNorm),
+    Rms(RmsNorm),
+}
+
+impl Norm {
+    fn new(kind: NormKind, dim: usize, eps: f64, vs: VarBuilder) -> CandleResult<Self> {
+        Ok(match kind {
+            NormKind::LayerNorm => Self::Ln(layer_norm(dim, eps, vs)?),
+            NormKind::RmsNorm => Self::Rms(rms_norm(dim, eps, vs)?),
+        })
+    }
+
+    fn apply(&self, x: &Tensor) -> CandleResult<Tensor> {
+        match self {
+            Self::Ln(ln) => apply_slow_layer_norm(ln, x),
+            Self::Rms(rn) => apply_slow_rms_norm(rn, x),
+        }
+    }
+
+    /// LayerNorm accessor for the HF-layout export path (which only
+    /// runs on non-custom models — RMSNorm has no HF-GPT-2 layout).
+    fn as_layer_norm(&self) -> CandleResult<&LayerNorm> {
+        match self {
+            Self::Ln(ln) => Ok(ln),
+            Self::Rms(_) => Err(candle_core::Error::Msg(
+                "export_merged: RMSNorm reached the HF-layout export path (guard bug)".into(),
+            )),
+        }
+    }
+}
+
 struct Block {
-    ln_1: LayerNorm,
+    ln_1: Norm,
     c_attn: LinearVariant,
     c_proj: LinearVariant,
-    ln_2: LayerNorm,
+    ln_2: Norm,
     ff: FeedForward,
+    residual: ResidualKind,
     heads: usize,
     head_dim: usize,
 }
 
-/// The block's feed-forward half — the seam [`Gpt2Config::moe`]
-/// switches. `Dense` is the stock GPT-2 MLP (`c_fc → GELU → c_proj`,
-/// LoRA-wrappable); `Moe` is the dense mixture-of-experts
-/// ([`MoeMlp`], random-init only, LoRA out of scope).
+/// The block's feed-forward half — the seam [`Gpt2Config::moe`] /
+/// [`Gpt2Custom::act`] switch. `Dense` is the GPT-2-shaped MLP with a
+/// configurable activation (`c_fc → act → c_proj`; gated activations
+/// add the plain `c_gate` projection and compute
+/// `act(c_gate(x)) * c_fc(x)`); `Moe` is the dense mixture-of-experts
+/// ([`MoeMlp`], random-init only, LoRA out of scope). LoRA `up` /
+/// `down` wrap `c_fc` / `c_proj` on any Dense variant; `c_gate` stays
+/// plain (not a LoRA target).
 enum FeedForward {
     Dense {
         c_fc: LinearVariant,
+        c_gate: Option<candle_nn::Linear>,
         c_proj: LinearVariant,
+        act: Activation,
     },
     Moe(MoeMlp),
 }
@@ -300,21 +358,35 @@ enum FeedForward {
 impl Block {
     fn new(cfg: &Gpt2Config, vs: VarBuilder) -> CandleResult<Self> {
         let head_dim = cfg.dim / cfg.heads;
-        let ln_1 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_1"))?;
+        let custom = cfg.custom.clone().unwrap_or_default();
+        let norm_kind = custom.norm;
+        let ln_1 = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_1"))?;
         let resid_stdev = residual_init_stdev(cfg.layers);
         let attn_vs = vs.pp("attn");
         let c_attn = gpt2_linear(cfg.dim, 3 * cfg.dim, INIT_STDEV, attn_vs.pp("c_attn"))?;
         let c_proj = gpt2_linear(cfg.dim, cfg.dim, resid_stdev, attn_vs.pp("c_proj"))?;
-        let ln_2 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_2"))?;
+        let ln_2 = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_2"))?;
         let ff = match &cfg.moe {
             None => {
+                let hidden = custom.mlp_hidden(cfg.dim);
                 let mlp_vs = vs.pp("mlp");
-                let mlp_c_fc = gpt2_linear(cfg.dim, 4 * cfg.dim, INIT_STDEV, mlp_vs.pp("c_fc"))?;
-                let mlp_c_proj =
-                    gpt2_linear(4 * cfg.dim, cfg.dim, resid_stdev, mlp_vs.pp("c_proj"))?;
+                let mlp_c_fc = gpt2_linear(cfg.dim, hidden, INIT_STDEV, mlp_vs.pp("c_fc"))?;
+                let c_gate = if custom.act.is_gated() {
+                    Some(gpt2_linear(
+                        cfg.dim,
+                        hidden,
+                        INIT_STDEV,
+                        mlp_vs.pp("c_gate"),
+                    )?)
+                } else {
+                    None
+                };
+                let mlp_c_proj = gpt2_linear(hidden, cfg.dim, resid_stdev, mlp_vs.pp("c_proj"))?;
                 FeedForward::Dense {
                     c_fc: LinearVariant::Plain(mlp_c_fc),
+                    c_gate,
                     c_proj: LinearVariant::Plain(mlp_c_proj),
+                    act: custom.act,
                 }
             }
             Some(moe) => FeedForward::Moe(MoeMlp::new(cfg, moe, vs.pp("moe"))?),
@@ -325,6 +397,7 @@ impl Block {
             c_proj: LinearVariant::Plain(c_proj),
             ln_2,
             ff,
+            residual: custom.residual,
             heads: cfg.heads,
             head_dim,
         })
@@ -351,7 +424,7 @@ impl Block {
         }
         if flags.up || flags.down {
             match &mut self.ff {
-                FeedForward::Dense { c_fc, c_proj } => {
+                FeedForward::Dense { c_fc, c_proj, .. } => {
                     let mlp_vs = vs.pp("mlp");
                     if flags.up {
                         wrap_variant_in_place(c_fc, cfg, mlp_vs.pp("c_fc"))?;
@@ -423,11 +496,36 @@ impl Block {
         probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
         match &self.ff {
-            FeedForward::Dense { c_fc, c_proj } => {
-                let h = c_fc.forward(x)?;
-                // GELU (approximate variant matches HF GPT-2). `gelu` is the
-                // exact form; both are within 1e-3 for our purposes.
-                let h = h.gelu()?;
+            FeedForward::Dense {
+                c_fc,
+                c_gate,
+                c_proj,
+                act,
+            } => {
+                // Non-gated: `act(c_fc(x))`. Gated (Shazeer 2020):
+                // `act(c_gate(x)) * c_fc(x)` — the activated branch is
+                // `c_gate`, the linear branch keeps the `c_fc` name
+                // (Llama's `up_proj`). GELU stays the exact form; the
+                // HF approximate variant is within 1e-3 for our
+                // purposes.
+                let h = match (act, c_gate) {
+                    (Activation::Gelu, None) => c_fc.forward(x)?.gelu()?,
+                    (Activation::Relu, None) => c_fc.forward(x)?.relu()?,
+                    (Activation::Silu, None) => c_fc.forward(x)?.silu()?,
+                    (Activation::SwiGlu, Some(gate)) => {
+                        gate.forward(x)?.silu()?.mul(&c_fc.forward(x)?)?
+                    }
+                    (Activation::GeGlu, Some(gate)) => {
+                        gate.forward(x)?.gelu()?.mul(&c_fc.forward(x)?)?
+                    }
+                    (act, gate) => {
+                        return Err(candle_core::Error::Msg(format!(
+                            "gpt2 mlp: activation {act:?} / gate presence {} mismatch \
+                             (builder bug)",
+                            gate.is_some()
+                        )))
+                    }
+                };
                 Ok((c_proj.forward(&h)?, None))
             }
             FeedForward::Moe(moe) => {
@@ -446,12 +544,24 @@ impl Block {
         mask: &Tensor,
         probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
-        let n = apply_slow_layer_norm(&self.ln_1, x)?;
-        let a = self.attention(&n, mask)?;
-        let x = (x + a)?;
-        let n = apply_slow_layer_norm(&self.ln_2, &x)?;
-        let (m, aux) = self.feed_forward(&n, probs_sink)?;
-        Ok(((x + m)?, aux))
+        match self.residual {
+            // GPT-2 reference: two sequential residual writes.
+            ResidualKind::Sequential => {
+                let n = self.ln_1.apply(x)?;
+                let a = self.attention(&n, mask)?;
+                let x = (x + a)?;
+                let n = self.ln_2.apply(&x)?;
+                let (m, aux) = self.feed_forward(&n, probs_sink)?;
+                Ok(((x + m)?, aux))
+            }
+            // GPT-J / PaLM: both halves read the block input; one
+            // combined residual write.
+            ResidualKind::Parallel => {
+                let a = self.attention(&self.ln_1.apply(x)?, mask)?;
+                let (m, aux) = self.feed_forward(&self.ln_2.apply(x)?, probs_sink)?;
+                Ok((((x + a)? + m)?, aux))
+            }
+        }
     }
 }
 
@@ -465,7 +575,7 @@ pub struct Gpt2Model {
     wte: Embedding,
     wpe: Embedding,
     blocks: Vec<Block>,
-    ln_f: LayerNorm,
+    ln_f: Norm,
     /// Cached causal mask (`1.0` below the diagonal, `0.0` above) sized
     /// to [`Gpt2Config::ctx`] so per-forward mask allocation is avoided.
     causal_mask: Tensor,
@@ -487,6 +597,17 @@ impl Gpt2Model {
         if let Some(moe) = &cfg.moe {
             moe.validate()?;
         }
+        if let Some(custom) = &cfg.custom {
+            custom.validate()?;
+            if cfg.moe.is_some() {
+                return Err(candle_core::Error::Msg(
+                    "gpt2: combining `custom` with `moe` is not supported yet — the \
+                     dense-MLP knobs (act / mlp_ratio) would silently not apply to the \
+                     experts"
+                        .into(),
+                ));
+            }
+        }
         let wte = gpt2_embedding(cfg.vocab, cfg.dim, vs.pp("wte"))?;
         let wpe = gpt2_embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?;
         let h_vs = vs.pp("h");
@@ -494,7 +615,8 @@ impl Gpt2Model {
         for i in 0..cfg.layers {
             blocks.push(Block::new(cfg, h_vs.pp(i.to_string()))?);
         }
-        let ln_f = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_f"))?;
+        let norm_kind = cfg.custom.as_ref().map(|c| c.norm).unwrap_or_default();
+        let ln_f = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_f"))?;
         let causal_mask = build_causal_mask(cfg.ctx, &cfg.device, cfg.dtype)?;
         Ok(Self {
             wte,
@@ -537,6 +659,13 @@ impl Gpt2Model {
                     .into(),
             ));
         }
+        if cfg.custom.is_some() {
+            return Err(PretrainedError::Load(
+                "custom configs are random-init only; safetensors bundles carry the \
+                 GPT-2 reference layout"
+                    .into(),
+            ));
+        }
         // SAFETY: same discipline as `from_pretrained` — the file
         // must not be concurrently truncated while the mmap is
         // active. Callers hold the mmap for the lifetime of this
@@ -573,6 +702,13 @@ impl Gpt2Model {
             return Err(PretrainedError::Load(
                 "MoE configs are random-init only; pretrained GPT-2 bundles have no \
                  router / expert weights"
+                    .into(),
+            ));
+        }
+        if cfg.custom.is_some() {
+            return Err(PretrainedError::Load(
+                "custom configs are random-init only; pretrained GPT-2 bundles carry \
+                 the reference architecture"
                     .into(),
             ));
         }
@@ -672,8 +808,8 @@ impl Gpt2Model {
                 });
             }
         }
-        let h = apply_slow_layer_norm(&self.ln_f, &h)?; // [B, T, D]
-                                                        // Tied LM head: logits = h @ wte.weight^T.
+        let h = self.ln_f.apply(&h)?; // [B, T, D]
+                                      // Tied LM head: logits = h @ wte.weight^T.
         let w = self.wte.embeddings(); // [V, D]
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
@@ -781,6 +917,16 @@ impl super::lora::LoraWrappable for Gpt2Model {
 /// Layer 4a §3 Q2 — HF-native layout keys.
 impl super::lora::MergeableLora for Gpt2Model {
     fn export_merged(&self) -> CandleResult<std::collections::HashMap<String, Tensor>> {
+        // Custom architectures have no HF-layout equivalent — the
+        // merged bundle contract is "drop-in base for from_pretrained",
+        // which a custom model can never satisfy (random-init only).
+        if self.cfg.custom.is_some() {
+            return Err(candle_core::Error::Msg(
+                "export_merged: custom architectures have no HF-layout merged-bundle \
+                 representation (custom is random-init only)"
+                    .into(),
+            ));
+        }
         let mut out: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
 
         // Top-level: token + positional embeddings (LM head is tied
@@ -796,12 +942,14 @@ impl super::lora::MergeableLora for Gpt2Model {
             let prefix = format!("h.{i}");
 
             // LayerNorms carry both weight and bias.
-            out.insert(format!("{prefix}.ln_1.weight"), block.ln_1.weight().clone());
-            if let Some(b) = block.ln_1.bias() {
+            let ln_1 = block.ln_1.as_layer_norm()?;
+            out.insert(format!("{prefix}.ln_1.weight"), ln_1.weight().clone());
+            if let Some(b) = ln_1.bias() {
                 out.insert(format!("{prefix}.ln_1.bias"), b.clone());
             }
-            out.insert(format!("{prefix}.ln_2.weight"), block.ln_2.weight().clone());
-            if let Some(b) = block.ln_2.bias() {
+            let ln_2 = block.ln_2.as_layer_norm()?;
+            out.insert(format!("{prefix}.ln_2.weight"), ln_2.weight().clone());
+            if let Some(b) = ln_2.bias() {
                 out.insert(format!("{prefix}.ln_2.bias"), b.clone());
             }
 
@@ -823,7 +971,7 @@ impl super::lora::MergeableLora for Gpt2Model {
             // never satisfy (random-init only), so exporting one is an
             // error rather than a silently incomplete bundle.
             match &block.ff {
-                FeedForward::Dense { c_fc, c_proj } => {
+                FeedForward::Dense { c_fc, c_proj, .. } => {
                     let mlp_c_fc_w = c_fc.merged_weight()?;
                     out.insert(format!("{prefix}.mlp.c_fc.weight"), mlp_c_fc_w);
                     if let Some(b) = c_fc.bias() {
@@ -846,8 +994,9 @@ impl super::lora::MergeableLora for Gpt2Model {
         }
 
         // Final LayerNorm.
-        out.insert("ln_f.weight".into(), self.ln_f.weight().clone());
-        if let Some(b) = self.ln_f.bias() {
+        let ln_f = self.ln_f.as_layer_norm()?;
+        out.insert("ln_f.weight".into(), ln_f.weight().clone());
+        if let Some(b) = ln_f.bias() {
             out.insert("ln_f.bias".into(), b.clone());
         }
 
@@ -941,6 +1090,7 @@ mod tests {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -965,6 +1115,7 @@ mod tests {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -986,6 +1137,7 @@ mod tests {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -1007,6 +1159,7 @@ mod tests {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -1031,6 +1184,7 @@ mod tests {
             device: Device::Cpu,
             eps: 1e-5,
             moe: None,
+            custom: None,
         }
     }
 
@@ -1234,6 +1388,122 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(msg.contains("export_merged"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn custom_default_matches_reference_varmap_names() {
+        // `custom: Some(default)` must register exactly the same Var
+        // names as `custom: None` — the spec's defaults are the
+        // reference architecture.
+        let names = |custom: Option<Gpt2Custom>| -> Vec<String> {
+            let cfg = Gpt2Config {
+                custom,
+                ..tiny_cfg()
+            };
+            let vm = VarMap::new();
+            let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+            let _model = Gpt2Model::new(&cfg, vs).unwrap();
+            let data = vm.data().lock().unwrap();
+            let mut n: Vec<String> = data.keys().cloned().collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(None), names(Some(Gpt2Custom::default())));
+    }
+
+    #[test]
+    fn custom_forward_shape_across_activations() {
+        for act in [
+            Activation::Gelu,
+            Activation::Relu,
+            Activation::Silu,
+            Activation::SwiGlu,
+            Activation::GeGlu,
+        ] {
+            let cfg = Gpt2Config {
+                custom: Some(Gpt2Custom {
+                    act,
+                    ..Default::default()
+                }),
+                ..tiny_cfg()
+            };
+            let vm = VarMap::new();
+            let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+            let model = Gpt2Model::new(&cfg, vs).unwrap();
+            let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+            let logits = model.forward(&ids).unwrap();
+            assert_eq!(logits.dims(), &[1, 5, cfg.vocab], "act={act:?}");
+
+            let data = vm.data().lock().unwrap();
+            let has_gate = data.keys().any(|n| n.contains(".c_gate."));
+            assert_eq!(has_gate, act.is_gated(), "act={act:?}");
+        }
+    }
+
+    #[test]
+    fn custom_rmsnorm_parallel_ratio_forward_shape() {
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                norm: NormKind::RmsNorm,
+                residual: ResidualKind::Parallel,
+                mlp_ratio: 2,
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, cfg.vocab]);
+
+        // RMSNorm keeps the ln_* names but registers no biases.
+        let data = vm.data().lock().unwrap();
+        assert!(data.keys().any(|n| n == "h.0.ln_1.weight"));
+        assert!(!data.keys().any(|n| n.starts_with("h.0.ln_1.bias")));
+        assert!(!data.keys().any(|n| n == "ln_f.bias"));
+    }
+
+    #[test]
+    fn custom_rejects_pretrained_load_and_export() {
+        use crate::arch::lora::MergeableLora;
+        let mut cfg = Gpt2Config::medium();
+        cfg.custom = Some(Gpt2Custom::default());
+        let msg = match Gpt2Model::from_pretrained("medium", &cfg, &std::env::temp_dir()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("random-init"), "unexpected error: {msg}");
+
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom::default()),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let msg = match model.export_merged() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("export_merged"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn custom_rejects_moe_combination() {
+        let cfg = Gpt2Config {
+            moe: Some(MoeConfig::new(2)),
+            custom: Some(Gpt2Custom::default()),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let msg = match Gpt2Model::new(&cfg, vs) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("not supported yet"), "unexpected error: {msg}");
     }
 
     #[test]

@@ -143,6 +143,7 @@ fn run_lora_ft_leaves_base_weights_bit_identical() {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let base_vm = VarMap::new();
     let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
@@ -258,6 +259,7 @@ fn run_lora_ft_reduces_loss_on_overfit_corpus() {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let base_vm = VarMap::new();
     let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);
@@ -378,6 +380,7 @@ fn run_lora_ft_updates_lora_weights() {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let base_vm = VarMap::new();
     let vs = VarBuilder::from_varmap(&base_vm, cfg.dtype, &cfg.device);

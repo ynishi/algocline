@@ -267,6 +267,7 @@ mod tests {
             device: Device::Cpu,
             eps: 1e-5,
             moe,
+            custom: None,
         }
     }
 

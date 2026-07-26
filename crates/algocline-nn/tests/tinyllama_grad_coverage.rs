@@ -12,6 +12,8 @@
 //! router hit it; the gate pins the fix (`arch::softmax_last_dim_slow`)
 //! against future candle bumps and forward refactors.
 
+mod common;
+
 use algocline_nn::arch::{TinyLlamaConfig, TinyLlamaModel};
 use algocline_nn::train::{HardLabelDistillLoss, Loss};
 use candle_core::Tensor;
@@ -41,35 +43,6 @@ fn masked_backward_reaches_every_base_var() {
 
     // Parameter inventory: embed_tokens + lm_head + final norm +
     // 2 blocks × (input_layernorm + post_attention_layernorm +
-    // q/k/v/o_proj + gate/up/down_proj = 9) = 21 Vars. Pinned so the
-    // per-Var loop below cannot go vacuous if the arch registration
-    // changes shape.
-    let data = vm.data().lock().unwrap();
-    assert_eq!(
-        data.len(),
-        21,
-        "TinyLlama tiny VarMap inventory drifted; update the count in this test"
-    );
-
-    let mut missing: Vec<String> = Vec::new();
-    let mut zero: Vec<String> = Vec::new();
-    for (name, var) in data.iter() {
-        match grads.get(var.as_tensor()) {
-            None => missing.push(name.clone()),
-            Some(g) => {
-                let mag: f32 = g.abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
-                if mag.is_nan() || mag <= 0.0 {
-                    zero.push(format!("{name} (sum|g|={mag})"));
-                }
-            }
-        }
-    }
-    missing.sort();
-    zero.sort();
-    assert!(
-        missing.is_empty() && zero.is_empty(),
-        "autograd coverage hole — the loss can still descend while these \
-         parameters never learn.\n  missing from GradStore: {missing:?}\n  \
-         zero/NaN gradient: {zero:?}"
-    );
+    // q/k/v/o_proj + gate/up/down_proj = 9) = 21 Vars.
+    common::assert_full_grad_coverage(&vm, &grads, 21);
 }

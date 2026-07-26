@@ -49,6 +49,7 @@ fn probe_cfg(alpha: f64) -> Gpt2Config {
             alpha,
             ..MoeConfig::new(N_EXPERTS)
         }),
+        custom: None,
     }
 }
 

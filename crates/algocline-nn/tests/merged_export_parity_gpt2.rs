@@ -45,6 +45,7 @@ fn tiny_gpt2_cfg() -> Gpt2Config {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     }
 }
 

@@ -33,6 +33,7 @@ fn tiny_model() -> (Gpt2Config, VarMap, Gpt2Model) {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
@@ -175,6 +176,7 @@ fn fully_masked_teacher_batch_yields_zero_loss() {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     let model = Gpt2Model::new(&cfg, vb).unwrap();
     let ids: Vec<u32> = vec![1, 2, 3, 4];

@@ -77,6 +77,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attention softmax as their only gradient path, so this gate sees a
   severed scores path directly instead of through the fused-projection
   blind spot described below.
+- Spec-driven architecture customization for the GPT-2 stack
+  (`arch/custom.rs`, wired through the new `Gpt2Config::custom:
+  Option<Gpt2Custom>` field) — the generalization of the seam the MoE
+  block opened. Phase 1 axes, all built from ops with proper backwards:
+  MLP activation (GELU reference / ReLU / SiLU, plus the gated SwiGLU /
+  GeGLU from Shazeer 2020, which add a plain `mlp.c_gate` projection
+  for the activated branch), normalization kind (LayerNorm reference /
+  RMSNorm per Zhang & Sennrich 2019 — keeps the `ln_*.weight` names,
+  registers no bias, and runs through the same backward-safe
+  `rms_norm_slow` shim as TinyLlama), residual topology (sequential
+  reference / parallel attention + MLP per GPT-J / PaLM), and the MLP
+  expansion ratio. `custom: None` (all shipped presets) is bit-for-bit
+  the reference architecture, and `Gpt2Custom::default()` registers
+  exactly the same VarMap names as `None` (pinned by a test). Custom
+  models are random-init only — the pretrained loaders and
+  `export_merged` refuse them — and combining `custom` with `moe` is
+  rejected at build time for now (the dense-MLP knobs would silently
+  not apply to the experts). LoRA keeps working on custom models
+  (`up` / `down` wrap `c_fc` / `c_proj` as usual; `c_gate` is not a
+  LoRA target). Positional encodings, GQA, sliding-window attention,
+  untied head and Post-LN are the declared Phase 2 axes.
+- `tests/custom_grad_coverage.rs`: "kitchen sink" gradient-coverage
+  gate — one config turns every Phase 1 axis away from the reference
+  at once (SwiGLU + RMSNorm + parallel residual + ratio 2) and one
+  masked-CE backward must reach all 27 Vars, exercising the gated
+  branch, the RMSNorm shim and the parallel-residual reconvergence in
+  a single pinned inventory. The per-Var walk itself moved to
+  `tests/common/mod.rs` (`assert_full_grad_coverage`), shared by the
+  GPT-2 / MoE / TinyLlama gates, so a future axis gets coverage by
+  building a config and pinning a count instead of re-deriving the
+  loop.
+- `examples/arch_probe.rs`: generic architecture A/B probe — takes a
+  list of `(label, Gpt2Config)` arms and reports checkpoint CE
+  min/median/max over n independent draws plus each arm's trainable
+  parameter count (param mismatches between arms stay visible). First
+  measurement (4 layers / dim 256 / vocab 50257, 8 cycled rows, 120
+  steps, lr 3e-4, n=5 per arm), recorded as-is: SwiGLU at ratio 3
+  (16.31M params, +1.6% over the 16.04M baseline) ends at median CE
+  2.252 (min–max 1.861–2.348) against the GELU baseline's 2.304
+  (2.179–3.228) — the direction matches Shazeer 2020 and the SwiGLU
+  arm's worst draw beats the baseline's by a wide margin, but the
+  ranges overlap, so at this scale the result is "mildly favorable,
+  not separated". RMSNorm (GELU, ratio 4, 16.04M params) ends at
+  median 2.277 (2.196–2.491) — parity with LayerNorm within noise,
+  consistent with the Zhang & Sennrich claim that RMSNorm trades
+  nothing for its lower cost.
 - `examples/moe_router_probe.rs`: router-behaviour probe in the
   `init_loss_probe` mold (n=5 independent draws per arm, checkpoint
   min/median/max) A/B-ing the load-balancing coefficient — `α = 0.01`

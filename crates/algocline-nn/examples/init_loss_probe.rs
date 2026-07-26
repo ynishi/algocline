@@ -287,6 +287,7 @@ fn main() {
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
+        custom: None,
     };
     println!(
         "\n[residual A/B] layers={} dim={} vocab={}, 8 rows cycled, lr 3e-4, 5 draws\n",

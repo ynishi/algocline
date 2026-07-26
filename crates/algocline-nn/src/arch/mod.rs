@@ -44,7 +44,7 @@ pub(crate) fn softmax_last_dim_slow(
     candle_nn::ops::softmax(xs, candle_core::D::Minus1)
 }
 
-pub use custom::{Activation, Gpt2Custom, NormKind, ResidualKind};
+pub use custom::{Activation, Gpt2Custom, NormKind, NormPlacement, PosKind, ResidualKind};
 pub use gpt2::{Gpt2Config, Gpt2Model};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear, LoraWrappable};
 pub use moe::MoeConfig;

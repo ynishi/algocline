@@ -23,9 +23,26 @@
 //!   `y = x + attn(ln_1(x)) + ff(ln_2(x))`.
 //! - **mlp_ratio** — the MLP expansion factor (reference 4).
 //!
-//! Phase 2 (positional encodings, GQA, sliding-window attention,
-//! untied head, Post-LN) extends this struct; `Default` lets existing
-//! constructions survive field additions.
+//! Phase 2 axes (VarMap entries move or the attention wiring changes):
+//!
+//! - **position** — learned `wpe` (reference) / RoPE (Su 2021,
+//!   arXiv:2104.09864) / ALiBi (Press 2022, arXiv:2108.12409) / NoPE
+//!   (Kazemnejad 2023, arXiv:2305.19466). Every non-learned variant
+//!   drops the `wpe` Var; RoPE reuses TinyLlama's backward-safe
+//!   `apply_rope` shim, ALiBi adds a constant per-head score bias.
+//! - **GQA** — `kv_heads` shrinks the fused `c_attn` projection to
+//!   `[dim + 2·kv·head_dim, dim]` and shares each KV head across
+//!   `heads / kv_heads` query heads via `repeat_kv` (Ainslie 2023,
+//!   arXiv:2305.13245).
+//! - **sliding-window attention** — `window` bands the causal mask so
+//!   position `i` attends to `(i - w, i]` (Mistral 2023).
+//! - **untied head** — an independent `lm_head.weight` Var instead of
+//!   reusing `wte`.
+//! - **Post-LN** — norm after the sublayer + residual add (Xiong et
+//!   al. 2020, arXiv:2002.04745) instead of the Pre-LN reference. Its
+//!   known training instability is a probe subject, not a defect.
+//!   Post-LN combined with the parallel residual topology has no
+//!   canonical wiring and is rejected at build time.
 //!
 //! All axes are experiment equipment, so a config that sets `custom`
 //! is **random-init only**: the pretrained loaders and the merged
@@ -78,6 +95,37 @@ pub enum ResidualKind {
     Parallel,
 }
 
+/// Where the block norms sit relative to the sublayers (Xiong et al.
+/// 2020, arXiv:2002.04745).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NormPlacement {
+    /// GPT-2 reference: norm the sublayer *input*
+    /// (`x + attn(ln_1(x))`).
+    #[default]
+    PreLn,
+    /// Original-Transformer placement: norm the residual *sum*
+    /// (`ln_1(x + attn(x))`). Known to be harder to train at depth —
+    /// observing that instability is the point of shipping it.
+    PostLn,
+}
+
+/// How the model injects position information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PosKind {
+    /// GPT-2 reference: learned absolute embedding (`wpe`), added to
+    /// the token embedding.
+    #[default]
+    Learned,
+    /// Rotary embedding applied to Q / K inside every attention
+    /// (Su 2021). No `wpe` Var.
+    Rope,
+    /// Constant per-head linear score bias (Press 2022). No `wpe` Var.
+    Alibi,
+    /// No positional information at all (Kazemnejad 2023's NoPE). The
+    /// causal mask is the only order signal. No `wpe` Var.
+    NoPos,
+}
+
 /// Architecture customization spec. `Default` reproduces the GPT-2
 /// reference on every axis, so `custom: Some(Gpt2Custom::default())`
 /// builds the same network shape as `custom: None` (it still trips the
@@ -95,6 +143,24 @@ pub struct Gpt2Custom {
     /// `0` means "reference" and is normalized to 4 by
     /// [`Self::mlp_hidden`] — but prefer writing 4 explicitly.
     pub mlp_ratio: usize,
+    /// Norm placement relative to the sublayers.
+    pub placement: NormPlacement,
+    /// Positional-information kind.
+    pub pos: PosKind,
+    /// `Some(k)` = grouped-query attention with `k` KV heads
+    /// (`heads % k == 0` required, checked at build where `heads` is
+    /// known). `None` = MHA (reference). `Some(heads)` is
+    /// shape-identical to MHA; `Some(1)` is MQA.
+    pub kv_heads: Option<usize>,
+    /// `Some(w)` = sliding-window causal mask (`w ≥ 1`): position `i`
+    /// attends to `(i - w, i]`. `None` = full causal (reference).
+    /// `w ≥ ctx` degenerates to full causal.
+    pub window: Option<usize>,
+    /// `true` = independent `lm_head.weight` Var. `false` (reference)
+    /// = LM head tied to `wte`. (Design §4 sketched this as
+    /// `tied_head: bool`; inverted so `Default` stays the reference on
+    /// every axis.)
+    pub untied_head: bool,
 }
 
 impl Gpt2Custom {
@@ -108,11 +174,31 @@ impl Gpt2Custom {
         ratio * dim
     }
 
-    /// Validate the invariants the builder assumes.
+    /// Validate the invariants the builder assumes. Checks that need
+    /// the surrounding [`super::gpt2::Gpt2Config`] (GQA divisibility,
+    /// RoPE even head_dim) live in `Gpt2Model::new`.
     pub fn validate(&self) -> CandleResult<()> {
-        // All Phase 1 axes are closed enums; only the numeric knob can
-        // go out of range, and `0` is normalized rather than rejected
-        // so `Gpt2Custom::default()` stays a valid spec.
+        // Phase 1 axes are closed enums; `mlp_ratio == 0` is
+        // normalized rather than rejected so `Gpt2Custom::default()`
+        // stays a valid spec.
+        if self.kv_heads == Some(0) {
+            return Err(candle_core::Error::Msg(
+                "gpt2 custom: kv_heads must be ≥ 1 (use None for MHA)".into(),
+            ));
+        }
+        if self.window == Some(0) {
+            return Err(candle_core::Error::Msg(
+                "gpt2 custom: window must be ≥ 1 (use None for full causal)".into(),
+            ));
+        }
+        if self.placement == NormPlacement::PostLn && self.residual == ResidualKind::Parallel {
+            return Err(candle_core::Error::Msg(
+                "gpt2 custom: Post-LN with the parallel residual topology has no \
+                 canonical wiring (the two norms cannot both sit on the single \
+                 residual write); pick one axis"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -128,6 +214,37 @@ mod tests {
         assert_eq!(c.norm, NormKind::LayerNorm);
         assert_eq!(c.residual, ResidualKind::Sequential);
         assert_eq!(c.mlp_hidden(16), 64); // ratio 0 normalizes to 4
+        assert_eq!(c.placement, NormPlacement::PreLn);
+        assert_eq!(c.pos, PosKind::Learned);
+        assert_eq!(c.kv_heads, None);
+        assert_eq!(c.window, None);
+        assert!(!c.untied_head);
+        c.validate().expect("default spec is valid");
+    }
+
+    #[test]
+    fn validate_rejects_zero_knobs() {
+        let kv0 = Gpt2Custom {
+            kv_heads: Some(0),
+            ..Default::default()
+        };
+        assert!(kv0.validate().unwrap_err().to_string().contains("kv_heads"));
+        let w0 = Gpt2Custom {
+            window: Some(0),
+            ..Default::default()
+        };
+        assert!(w0.validate().unwrap_err().to_string().contains("window"));
+    }
+
+    #[test]
+    fn validate_rejects_post_ln_parallel() {
+        let c = Gpt2Custom {
+            placement: NormPlacement::PostLn,
+            residual: ResidualKind::Parallel,
+            ..Default::default()
+        };
+        let msg = c.validate().unwrap_err().to_string();
+        assert!(msg.contains("Post-LN"), "unexpected error: {msg}");
     }
 
     #[test]

@@ -25,8 +25,8 @@ use candle_nn::{
     layer_norm, rms_norm, Embedding, Init, LayerNorm, Module, RmsNorm, VarBuilder, VarMap,
 };
 
-use super::custom::{Activation, Gpt2Custom, NormKind, ResidualKind};
-use super::tinyllama::apply_slow_rms_norm;
+use super::custom::{Activation, Gpt2Custom, NormKind, NormPlacement, PosKind, ResidualKind};
+use super::tinyllama::{apply_rope, apply_slow_rms_norm, build_rope_cache, repeat_kv};
 
 // `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
 // wrap_lora docs below; the wrap helper itself lives in `arch::lora` since
@@ -185,11 +185,14 @@ pub struct Gpt2Config {
     /// that set this.
     pub moe: Option<MoeConfig>,
     /// Architecture customization spec ([`Gpt2Custom`]: activation /
-    /// norm kind / residual topology / MLP ratio). `None` (all shipped
-    /// presets) is the GPT-2 reference. Custom models are random-init
-    /// only, and combining `custom` with `moe` is not supported yet
-    /// (the dense-MLP knobs `act` / `mlp_ratio` would silently not
-    /// apply to the experts).
+    /// norm kind + placement / residual topology / MLP ratio /
+    /// position / GQA / sliding window / untied head). `None` (all
+    /// shipped presets) is the GPT-2 reference. Custom models are
+    /// random-init only. Combining `custom` with `moe` is allowed as
+    /// long as the dense-MLP knobs (`act` / `mlp_ratio`) stay at the
+    /// reference — those two do not apply to the experts and a
+    /// non-default value would silently not take effect, so the build
+    /// rejects that combination.
     pub custom: Option<Gpt2Custom>,
 }
 
@@ -333,8 +336,21 @@ struct Block {
     ln_2: Norm,
     ff: FeedForward,
     residual: ResidualKind,
+    placement: NormPlacement,
     heads: usize,
+    /// KV heads (= `heads` for MHA; fewer for GQA / MQA).
+    kv_heads: usize,
     head_dim: usize,
+}
+
+/// Per-forward positional context threaded from [`Gpt2Model`] into
+/// every block: the RoPE cos/sin cache and/or the ALiBi score bias.
+/// Both are `None` on the reference (learned `wpe`) and NoPos paths.
+struct PosContext<'a> {
+    /// `[ctx, head_dim/2]` cos / sin tables ([`build_rope_cache`]).
+    rope: Option<(&'a Tensor, &'a Tensor)>,
+    /// `[heads, t, t]` additive score bias (already negated).
+    alibi: Option<&'a Tensor>,
 }
 
 /// The block's feed-forward half — the seam [`Gpt2Config::moe`] /
@@ -360,10 +376,15 @@ impl Block {
         let head_dim = cfg.dim / cfg.heads;
         let custom = cfg.custom.clone().unwrap_or_default();
         let norm_kind = custom.norm;
+        let kv_heads = custom.kv_heads.unwrap_or(cfg.heads);
         let ln_1 = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_1"))?;
         let resid_stdev = residual_init_stdev(cfg.layers);
         let attn_vs = vs.pp("attn");
-        let c_attn = gpt2_linear(cfg.dim, 3 * cfg.dim, INIT_STDEV, attn_vs.pp("c_attn"))?;
+        // Fused QKV: `[dim + 2·kv·head_dim, dim]`. MHA (`kv == heads`)
+        // reduces to the reference `[3·dim, dim]`; the VarMap name
+        // stays `attn.c_attn` either way.
+        let qkv_out = cfg.dim + 2 * kv_heads * head_dim;
+        let c_attn = gpt2_linear(cfg.dim, qkv_out, INIT_STDEV, attn_vs.pp("c_attn"))?;
         let c_proj = gpt2_linear(cfg.dim, cfg.dim, resid_stdev, attn_vs.pp("c_proj"))?;
         let ln_2 = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_2"))?;
         let ff = match &cfg.moe {
@@ -398,7 +419,9 @@ impl Block {
             ln_2,
             ff,
             residual: custom.residual,
+            placement: custom.placement,
             heads: cfg.heads,
+            kv_heads,
             head_dim,
         })
     }
@@ -448,22 +471,58 @@ impl Block {
         Ok(())
     }
 
-    fn attention(&self, x: &Tensor, mask: &Tensor) -> CandleResult<Tensor> {
+    fn attention(&self, x: &Tensor, mask: &Tensor, pos: &PosContext<'_>) -> CandleResult<Tensor> {
         // x: [B, T, D]
         let (b, t, _d) = x.dims3()?;
-        let qkv = self.c_attn.forward(x)?; // [B, T, 3D]
-        let qkv = qkv.reshape((b, t, 3, self.heads, self.head_dim))?;
-        // Split into Q/K/V — each [B, T, H, Dh]. Then transpose to [B, H, T, Dh].
-        let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?;
-        let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
-        let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
+        let qkv = self.c_attn.forward(x)?; // [B, T, D + 2·kv·Dh]
+                                           // Split into Q [B,T,H·Dh] / K,V [B,T,kv·Dh]. For MHA
+                                           // (kv == heads) this is byte-identical to the reference
+                                           // `reshape(b,t,3,H,Dh)` + index split.
+        let d = self.heads * self.head_dim;
+        let kv_d = self.kv_heads * self.head_dim;
+        let q = qkv.narrow(D::Minus1, 0, d)?;
+        let k = qkv.narrow(D::Minus1, d, kv_d)?;
+        let v = qkv.narrow(D::Minus1, d + kv_d, kv_d)?;
+        // [B, T, H, Dh] → [B, H, T, Dh].
+        let q = q
+            .reshape((b, t, self.heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((b, t, self.kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape((b, t, self.kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // RoPE rotates Q and K in-place (backward-safe slow shim; the
+        // cache is narrowed to the active prefix inside `rope_slow`).
+        let (q, k) = match pos.rope {
+            Some((cos, sin)) => (apply_rope(&q, cos, sin)?, apply_rope(&k, cos, sin)?),
+            None => (q, k),
+        };
+
+        // GQA: share each KV head across `heads / kv_heads` query
+        // heads. `n_rep == 1` (MHA) is a pass-through.
+        let n_rep = self.heads / self.kv_heads;
+        let k = repeat_kv(&k, n_rep)?;
+        let v = repeat_kv(&v, n_rep)?;
 
         // Scaled dot-product: [B, H, T, T].
         let scale = (self.head_dim as f64).sqrt();
         let mut scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         scores = (scores / scale)?;
 
-        // Causal mask: keep positions j <= i.
+        // ALiBi: constant additive bias, applied before the mask (the
+        // masked positions get overwritten with -inf below anyway).
+        if let Some(bias) = pos.alibi {
+            scores = scores.broadcast_add(&bias.unsqueeze(0)?)?;
+        }
+
+        // Causal mask: keep positions j <= i (banded when the sliding
+        // window is on — see `build_causal_mask`).
         let mask = mask.i((..t, ..t))?; // [T, T]
         let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
             .to_dtype(scores.dtype())?
@@ -542,13 +601,15 @@ impl Block {
         &self,
         x: &Tensor,
         mask: &Tensor,
+        pos: &PosContext<'_>,
         probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
-        match self.residual {
-            // GPT-2 reference: two sequential residual writes.
-            ResidualKind::Sequential => {
+        match (self.placement, self.residual) {
+            // GPT-2 reference: norm the input, two sequential residual
+            // writes.
+            (NormPlacement::PreLn, ResidualKind::Sequential) => {
                 let n = self.ln_1.apply(x)?;
-                let a = self.attention(&n, mask)?;
+                let a = self.attention(&n, mask, pos)?;
                 let x = (x + a)?;
                 let n = self.ln_2.apply(&x)?;
                 let (m, aux) = self.feed_forward(&n, probs_sink)?;
@@ -556,11 +617,24 @@ impl Block {
             }
             // GPT-J / PaLM: both halves read the block input; one
             // combined residual write.
-            ResidualKind::Parallel => {
-                let a = self.attention(&self.ln_1.apply(x)?, mask)?;
+            (NormPlacement::PreLn, ResidualKind::Parallel) => {
+                let a = self.attention(&self.ln_1.apply(x)?, mask, pos)?;
                 let (m, aux) = self.feed_forward(&self.ln_2.apply(x)?, probs_sink)?;
                 Ok((((x + a)? + m)?, aux))
             }
+            // Original Transformer: norm the residual sum after each
+            // sublayer.
+            (NormPlacement::PostLn, ResidualKind::Sequential) => {
+                let a = self.attention(x, mask, pos)?;
+                let x = self.ln_1.apply(&(x + a)?)?;
+                let (m, aux) = self.feed_forward(&x, probs_sink)?;
+                Ok((self.ln_2.apply(&(x + m)?)?, aux))
+            }
+            // Rejected in `Gpt2Custom::validate`; reaching it here is a
+            // builder bug, not a user error.
+            (NormPlacement::PostLn, ResidualKind::Parallel) => Err(candle_core::Error::Msg(
+                "gpt2 block: Post-LN × parallel residual survived validation (builder bug)".into(),
+            )),
         }
     }
 }
@@ -573,12 +647,28 @@ impl Block {
 /// ships the forward path only.
 pub struct Gpt2Model {
     wte: Embedding,
-    wpe: Embedding,
+    /// Learned positional embedding. `None` when [`Gpt2Custom::pos`]
+    /// is a non-learned kind (RoPE / ALiBi / NoPos) — the `wpe` Var
+    /// then never exists in the VarMap.
+    wpe: Option<Embedding>,
     blocks: Vec<Block>,
     ln_f: Norm,
-    /// Cached causal mask (`1.0` below the diagonal, `0.0` above) sized
-    /// to [`Gpt2Config::ctx`] so per-forward mask allocation is avoided.
+    /// Cached causal mask (`1` kept, `0` masked) sized to
+    /// [`Gpt2Config::ctx`] so per-forward mask allocation is avoided.
+    /// Banded when the sliding window is on.
     causal_mask: Tensor,
+    /// RoPE cos / sin cache (`[ctx, head_dim/2]` each), present iff
+    /// `pos == Rope`.
+    rope: Option<(Tensor, Tensor)>,
+    /// ALiBi constants, present iff `pos == Alibi`: per-head slopes
+    /// `[heads, 1, 1]` and the signed distance table `i - j`
+    /// `[ctx, ctx]`. Combined into the `[heads, t, t]` score bias per
+    /// forward (both are constants — no Vars, no gradient tracking).
+    alibi: Option<(Tensor, Tensor)>,
+    /// Untied LM head weight (`[vocab, dim]`, VarMap name
+    /// `lm_head.weight`), present iff `untied_head`. `None` = head
+    /// tied to `wte` (reference).
+    lm_head: Option<Tensor>,
     cfg: Gpt2Config,
 }
 
@@ -597,33 +687,94 @@ impl Gpt2Model {
         if let Some(moe) = &cfg.moe {
             moe.validate()?;
         }
-        if let Some(custom) = &cfg.custom {
-            custom.validate()?;
-            if cfg.moe.is_some() {
+        let custom = cfg.custom.clone().unwrap_or_default();
+        if let Some(spec) = &cfg.custom {
+            spec.validate()?;
+            if cfg.moe.is_some()
+                && (spec.act != Activation::Gelu || !matches!(spec.mlp_ratio, 0 | 4))
+            {
+                // Every other custom axis (norm / placement / residual /
+                // pos / GQA / window / untied head) composes with MoE;
+                // only the dense-MLP knobs address a module the MoE
+                // seam replaces.
                 return Err(candle_core::Error::Msg(
-                    "gpt2: combining `custom` with `moe` is not supported yet — the \
-                     dense-MLP knobs (act / mlp_ratio) would silently not apply to the \
-                     experts"
+                    "gpt2: `custom.act` / `custom.mlp_ratio` do not apply to the MoE \
+                     experts — keep them at the reference (Gelu / 4) when combining \
+                     `custom` with `moe`"
                         .into(),
                 ));
             }
+            if let Some(kv) = spec.kv_heads {
+                if !cfg.heads.is_multiple_of(kv) {
+                    return Err(candle_core::Error::Msg(format!(
+                        "gpt2: heads {} must be divisible by kv_heads {kv}",
+                        cfg.heads
+                    )));
+                }
+            }
+            if spec.pos == PosKind::Rope && !(cfg.dim / cfg.heads).is_multiple_of(2) {
+                return Err(candle_core::Error::Msg(format!(
+                    "gpt2: RoPE needs an even head_dim (got {})",
+                    cfg.dim / cfg.heads
+                )));
+            }
         }
         let wte = gpt2_embedding(cfg.vocab, cfg.dim, vs.pp("wte"))?;
-        let wpe = gpt2_embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?;
+        let wpe = match custom.pos {
+            PosKind::Learned => Some(gpt2_embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?),
+            PosKind::Rope | PosKind::Alibi | PosKind::NoPos => None,
+        };
+        let rope = match custom.pos {
+            // TinyLlama's canonical cache; base 10000 is the standard
+            // GPT-NeoX / Llama rope_theta and is not a knob here (a
+            // theta sweep would be a trainer-side probe, not an arch
+            // axis).
+            PosKind::Rope => Some(build_rope_cache(
+                cfg.ctx,
+                cfg.dim / cfg.heads,
+                10_000.0,
+                cfg.dtype,
+                &cfg.device,
+            )?),
+            _ => None,
+        };
+        let alibi = match custom.pos {
+            PosKind::Alibi => Some(build_alibi_consts(
+                cfg.heads,
+                cfg.ctx,
+                cfg.dtype,
+                &cfg.device,
+            )?),
+            _ => None,
+        };
         let h_vs = vs.pp("h");
         let mut blocks = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             blocks.push(Block::new(cfg, h_vs.pp(i.to_string()))?);
         }
-        let norm_kind = cfg.custom.as_ref().map(|c| c.norm).unwrap_or_default();
-        let ln_f = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_f"))?;
-        let causal_mask = build_causal_mask(cfg.ctx, &cfg.device, cfg.dtype)?;
+        let ln_f = Norm::new(custom.norm, cfg.dim, cfg.eps, vs.pp("ln_f"))?;
+        let lm_head = if custom.untied_head {
+            Some(vs.pp("lm_head").get_with_hints(
+                (cfg.vocab, cfg.dim),
+                "weight",
+                Init::Randn {
+                    mean: 0.0,
+                    stdev: INIT_STDEV,
+                },
+            )?)
+        } else {
+            None
+        };
+        let causal_mask = build_causal_mask(cfg.ctx, custom.window, &cfg.device, cfg.dtype)?;
         Ok(Self {
             wte,
             wpe,
             blocks,
             ln_f,
             causal_mask,
+            rope,
+            alibi,
+            lm_head,
             cfg: cfg.clone(),
         })
     }
@@ -793,13 +944,34 @@ impl Gpt2Model {
             )));
         }
         let tok_emb = self.wte.forward(xs)?; // [B, T, D]
-        let pos_ids = Tensor::arange(0u32, t as u32, xs.device())?; // [T]
-        let pos_emb = self.wpe.forward(&pos_ids)?; // [T, D]
-        let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(tok_emb.shape())?;
-        let mut h = (tok_emb + pos_emb)?;
+        let mut h = match &self.wpe {
+            Some(wpe) => {
+                let pos_ids = Tensor::arange(0u32, t as u32, xs.device())?; // [T]
+                let pos_emb = wpe.forward(&pos_ids)?; // [T, D]
+                let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(tok_emb.shape())?;
+                (tok_emb + pos_emb)?
+            }
+            // RoPE / ALiBi position information enters inside the
+            // attention; NoPos has none by design.
+            None => tok_emb,
+        };
+        // ALiBi score bias for the active prefix: [H, t, t] =
+        // -slopes ⊙ (i - j). Constant tensors — no gradient tracking.
+        let alibi_bias = match &self.alibi {
+            Some((slopes, dist)) => {
+                let dist_t = dist.i((..t, ..t))?.unsqueeze(0)?; // [1, t, t]
+                Some(slopes.broadcast_mul(&dist_t)?.neg()?)
+            }
+            None => None,
+        };
+        let pos_ctx = PosContext {
+            rope: self.rope.as_ref().map(|(c, s)| (c, s)),
+            alibi: alibi_bias.as_ref(),
+        };
         let mut aux_sum: Option<Tensor> = None;
         for block in &self.blocks {
-            let (next, aux) = block.forward(&h, &self.causal_mask, probs_sink.as_deref_mut())?;
+            let (next, aux) =
+                block.forward(&h, &self.causal_mask, &pos_ctx, probs_sink.as_deref_mut())?;
             h = next;
             if let Some(a) = aux {
                 aux_sum = Some(match aux_sum {
@@ -809,8 +981,11 @@ impl Gpt2Model {
             }
         }
         let h = self.ln_f.apply(&h)?; // [B, T, D]
-                                      // Tied LM head: logits = h @ wte.weight^T.
-        let w = self.wte.embeddings(); // [V, D]
+                                      // LM head: tied reuses wte; untied has its own Var.
+        let w = match &self.lm_head {
+            Some(w) => w,
+            None => self.wte.embeddings(), // [V, D]
+        };
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
         Ok((logits, aux_sum))
@@ -931,9 +1106,16 @@ impl super::lora::MergeableLora for Gpt2Model {
 
         // Top-level: token + positional embeddings (LM head is tied
         // to `wte`, so no separate `lm_head.weight` — matches
-        // Gpt2Model::new which uses wte for both).
+        // Gpt2Model::new which uses wte for both). `wpe` is only
+        // `None` on custom (non-learned-pos) models, which the guard
+        // above already rejected.
+        let wpe = self.wpe.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "export_merged: wpe missing on a non-custom model (guard bug)".into(),
+            )
+        })?;
         out.insert("wte.weight".into(), self.wte.embeddings().clone());
-        out.insert("wpe.weight".into(), self.wpe.embeddings().clone());
+        out.insert("wpe.weight".into(), wpe.embeddings().clone());
 
         // Per-block: ln_1, attn.c_attn, attn.c_proj, ln_2,
         // mlp.c_fc, mlp.c_proj. Naming mirrors Block::new's
@@ -1028,19 +1210,64 @@ pub enum PretrainedError {
 /// Build a causal (lower-triangular) mask `[ctx, ctx]` where valid
 /// (kept) positions are `1` and masked-out are `0`.
 ///
+/// `window = Some(w)` bands the triangle: position `i` keeps only
+/// `j ∈ (i - w, i]` (the last `w` positions including itself —
+/// Mistral's sliding-window convention). `w ≥ ctx` is the full
+/// triangle again.
+///
 /// Returned as `u8` because candle's `Tensor::where_cond` only accepts
 /// unsigned-integer condition tensors; the attention path never uses
 /// the mask as a numeric multiplier (it drives `where_cond` between
 /// the scaled scores and `-inf`), so the concrete `dtype` of the model
 /// weights is irrelevant here.
-fn build_causal_mask(ctx: usize, device: &Device, _dtype: DType) -> CandleResult<Tensor> {
+fn build_causal_mask(
+    ctx: usize,
+    window: Option<usize>,
+    device: &Device,
+    _dtype: DType,
+) -> CandleResult<Tensor> {
     let mut data = vec![0u8; ctx * ctx];
     for i in 0..ctx {
-        for j in 0..=i {
+        let lo = match window {
+            Some(w) => i.saturating_sub(w - 1),
+            None => 0,
+        };
+        for j in lo..=i {
             data[i * ctx + j] = 1;
         }
     }
     Tensor::from_vec(data, (ctx, ctx), device)
+}
+
+/// Build the ALiBi constants: per-head slopes `[heads, 1, 1]` and the
+/// signed distance table `dist[i, j] = i - j` `[ctx, ctx]`.
+///
+/// Slopes follow Press 2022's geometric sequence
+/// `m_h = 2^(-8·(h+1)/H)` for `h ∈ [0, H)`. The paper's power-of-two
+/// head counts get the exact published values; other counts get the
+/// same closed form (the paper's interpolation scheme reduces to it
+/// for our purposes). The forward pass combines the two into the
+/// additive score bias `-m_h · (i - j)`; positions `j > i` produce a
+/// positive bias there but are overwritten by the causal `-inf` mask,
+/// so only the `j ≤ i` half is ever read.
+fn build_alibi_consts(
+    heads: usize,
+    ctx: usize,
+    dtype: DType,
+    device: &Device,
+) -> CandleResult<(Tensor, Tensor)> {
+    let slopes: Vec<f32> = (0..heads)
+        .map(|h| 2f32.powf(-8.0 * (h + 1) as f32 / heads as f32))
+        .collect();
+    let slopes = Tensor::from_vec(slopes, (heads, 1, 1), device)?.to_dtype(dtype)?;
+    let mut dist = vec![0f32; ctx * ctx];
+    for i in 0..ctx {
+        for j in 0..ctx {
+            dist[i * ctx + j] = i as f32 - j as f32;
+        }
+    }
+    let dist = Tensor::from_vec(dist, (ctx, ctx), device)?.to_dtype(dtype)?;
+    Ok((slopes, dist))
 }
 
 #[cfg(test)]
@@ -1491,10 +1718,58 @@ mod tests {
     }
 
     #[test]
-    fn custom_rejects_moe_combination() {
+    fn custom_moe_combination_rejects_dense_mlp_knobs_only() {
+        // Non-default dense-MLP knobs address a module the MoE seam
+        // replaces — rejected.
+        for custom in [
+            Gpt2Custom {
+                act: Activation::SwiGlu,
+                ..Default::default()
+            },
+            Gpt2Custom {
+                mlp_ratio: 2,
+                ..Default::default()
+            },
+        ] {
+            let cfg = Gpt2Config {
+                moe: Some(MoeConfig::new(2)),
+                custom: Some(custom),
+                ..tiny_cfg()
+            };
+            let vm = VarMap::new();
+            let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+            let msg = match Gpt2Model::new(&cfg, vs) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected an error"),
+            };
+            assert!(msg.contains("experts"), "unexpected error: {msg}");
+        }
+
+        // Every other axis composes with MoE (Phase 2 integration —
+        // grad coverage of the composition lives in
+        // tests/custom_grad_coverage.rs).
         let cfg = Gpt2Config {
             moe: Some(MoeConfig::new(2)),
-            custom: Some(Gpt2Custom::default()),
+            custom: Some(Gpt2Custom {
+                norm: NormKind::RmsNorm,
+                pos: PosKind::Rope,
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        Gpt2Model::new(&cfg, vs).expect("custom (non-MLP axes) + moe builds");
+    }
+
+    #[test]
+    fn custom_rejects_gqa_indivisible_and_odd_rope_head_dim() {
+        // heads 2 % kv_heads 0/indivisible.
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                kv_heads: Some(3), // 2 % 3 != 0
+                ..Default::default()
+            }),
             ..tiny_cfg()
         };
         let vm = VarMap::new();
@@ -1503,7 +1778,100 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected an error"),
         };
-        assert!(msg.contains("not supported yet"), "unexpected error: {msg}");
+        assert!(msg.contains("kv_heads"), "unexpected error: {msg}");
+
+        // dim 6 / heads 2 → head_dim 3 (odd) — RoPE bisects the head.
+        let cfg = Gpt2Config {
+            dim: 6,
+            custom: Some(Gpt2Custom {
+                pos: PosKind::Rope,
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let msg = match Gpt2Model::new(&cfg, vs) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("even head_dim"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn custom_pos_variants_forward_shape_and_wpe_presence() {
+        for pos in [
+            PosKind::Learned,
+            PosKind::Rope,
+            PosKind::Alibi,
+            PosKind::NoPos,
+        ] {
+            let cfg = Gpt2Config {
+                custom: Some(Gpt2Custom {
+                    pos,
+                    ..Default::default()
+                }),
+                ..tiny_cfg()
+            };
+            let vm = VarMap::new();
+            let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+            let model = Gpt2Model::new(&cfg, vs).unwrap();
+            let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+            let logits = model.forward(&ids).unwrap();
+            assert_eq!(logits.dims(), &[1, 5, cfg.vocab], "pos={pos:?}");
+
+            let data = vm.data().lock().unwrap();
+            let has_wpe = data.keys().any(|n| n.starts_with("wpe."));
+            assert_eq!(has_wpe, pos == PosKind::Learned, "pos={pos:?}");
+        }
+    }
+
+    #[test]
+    fn custom_untied_head_registers_lm_head_var() {
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                untied_head: true,
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 3, cfg.vocab]);
+        let data = vm.data().lock().unwrap();
+        assert!(data.keys().any(|n| n == "lm_head.weight"));
+    }
+
+    #[test]
+    fn sliding_window_mask_bands_the_triangle() {
+        // ctx 5, window 2: row i keeps j ∈ {max(0, i-1), .., i}.
+        let mask = build_causal_mask(5, Some(2), &Device::Cpu, DType::F32).unwrap();
+        let rows: Vec<Vec<u8>> = mask.to_vec2().unwrap();
+        assert_eq!(rows[0], vec![1, 0, 0, 0, 0]);
+        assert_eq!(rows[1], vec![1, 1, 0, 0, 0]);
+        assert_eq!(rows[2], vec![0, 1, 1, 0, 0]);
+        assert_eq!(rows[4], vec![0, 0, 0, 1, 1]);
+        // window ≥ ctx degenerates to the full triangle.
+        let full = build_causal_mask(3, Some(8), &Device::Cpu, DType::F32).unwrap();
+        let rows: Vec<Vec<u8>> = full.to_vec2().unwrap();
+        assert_eq!(rows[2], vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn alibi_slopes_match_press_2022_for_8_heads() {
+        // H = 8 → m_h = 2^-(h+1) (the paper's canonical example).
+        let (slopes, dist) = build_alibi_consts(8, 4, DType::F32, &Device::Cpu).unwrap();
+        let s: Vec<f32> = slopes.flatten_all().unwrap().to_vec1().unwrap();
+        for (h, v) in s.iter().enumerate() {
+            let expected = 2f32.powi(-(h as i32 + 1));
+            assert!((v - expected).abs() < 1e-7, "h={h}: {v} vs {expected}");
+        }
+        let d: Vec<Vec<f32>> = dist.to_vec2().unwrap();
+        assert_eq!(d[2][0], 2.0);
+        assert_eq!(d[2][2], 0.0);
     }
 
     #[test]

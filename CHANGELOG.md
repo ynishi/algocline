@@ -92,18 +92,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reference architecture, and `Gpt2Custom::default()` registers
   exactly the same VarMap names as `None` (pinned by a test). Custom
   models are random-init only — the pretrained loaders and
-  `export_merged` refuse them — and combining `custom` with `moe` is
-  rejected at build time for now (the dense-MLP knobs would silently
-  not apply to the experts). LoRA keeps working on custom models
+  `export_merged` refuse them. LoRA keeps working on custom models
   (`up` / `down` wrap `c_fc` / `c_proj` as usual; `c_gate` is not a
-  LoRA target). Positional encodings, GQA, sliding-window attention,
-  untied head and Post-LN are the declared Phase 2 axes.
+  LoRA target).
+- Phase 2 customization axes for the same `Gpt2Custom` spec — the
+  VarMap-moving / attention-rewiring group: **position**
+  (`pos`: learned `wpe` reference / RoPE per Su 2021 via TinyLlama's
+  backward-safe `apply_rope` shim and the canonical θ=10000 cache /
+  ALiBi per Press 2022 as a constant per-head additive score bias with
+  the geometric slopes `2^(-8(h+1)/H)` / NoPE per Kazemnejad 2023 —
+  every non-learned kind drops the `wpe` Var), **grouped-query
+  attention** (`kv_heads`: the fused `c_attn` shrinks to
+  `[dim + 2·kv·head_dim, dim]` under its unchanged name and KV heads
+  are shared across query heads via the TinyLlama `repeat_kv` helper;
+  `heads % kv_heads == 0` enforced at build), **sliding-window
+  attention** (`window`: the cached causal mask is banded to the last
+  `w` positions, Mistral convention), **untied LM head**
+  (`untied_head`: independent `lm_head.weight` Var instead of reusing
+  `wte`; design §4 sketched this axis as `tied_head` and the field is
+  inverted so `Gpt2Custom::default()` stays the reference on every
+  axis), and **norm placement** (`placement`: Pre-LN reference /
+  Post-LN per Xiong et al. 2020 — norm the residual sum after each
+  sublayer; its training instability is a probe subject, and Post-LN ×
+  parallel residual is rejected at validation because the combination
+  has no canonical wiring). RoPE requires an even head_dim (checked at
+  build). The Phase-1 blanket rejection of `custom` + `moe` is relaxed
+  to exactly the conflicting knobs: the combination now builds unless
+  `act` / `mlp_ratio` are non-default (those address the dense MLP the
+  MoE seam replaces), so norm / pos / GQA / window / untied-head /
+  placement experiments compose with the MoE feed-forward.
 - `tests/custom_grad_coverage.rs`: "kitchen sink" gradient-coverage
-  gate — one config turns every Phase 1 axis away from the reference
-  at once (SwiGLU + RMSNorm + parallel residual + ratio 2) and one
-  masked-CE backward must reach all 27 Vars, exercising the gated
-  branch, the RMSNorm shim and the parallel-residual reconvergence in
-  a single pinned inventory. The per-Var walk itself moved to
+  gates — sink A turns every legally-combinable axis away from the
+  reference at once (SwiGLU + RMSNorm + parallel residual + ratio 2 +
+  RoPE + MQA + sliding window + untied head, 27 Vars), sink B covers
+  the axes A cannot carry (Post-LN + ALiBi, 27 Vars), and a third gate
+  certifies the custom × MoE composition (RMSNorm + RoPE + MQA over
+  the expert mixture, 32 Vars including the router path via the aux
+  term). Each is one masked-CE backward that must reach every Var in a
+  pinned inventory. The per-Var walk itself moved to
   `tests/common/mod.rs` (`assert_full_grad_coverage`), shared by the
   GPT-2 / MoE / TinyLlama gates, so a future axis gets coverage by
   building a config and pinning a count instead of re-deriving the
@@ -122,7 +148,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not separated". RMSNorm (GELU, ratio 4, 16.04M params) ends at
   median 2.277 (2.196–2.491) — parity with LayerNorm within noise,
   consistent with the Zhang & Sennrich claim that RMSNorm trades
-  nothing for its lower cost.
+  nothing for its lower cost. Phase 2 arms (fresh n=5 run, same
+  recipe; that run's own baseline: median 2.369, 2.188–2.620),
+  recorded as-is: **RoPE** (16.03M params — no wpe) ends at median
+  2.695 (2.579–2.931), *behind* learned wpe with barely-overlapping
+  ranges — Su 2021's advantage does not reproduce on this
+  fixed-length memorization task, where an absolute learned embedding
+  is evidently the easier fit. **NoPE** ends at median 2.674
+  (2.567–2.747), indistinguishable from RoPE here — consistent with
+  Kazemnejad 2023 in the weak sense that the causal mask alone
+  supports learning, and the gap to learned wpe shows position info
+  still pays at this scale. **Post-LN** reproduces Xiong et al. 2020's
+  instability claim in a readable form: it *leads* the Pre-LN baseline
+  mid-run (median CE 3.457 vs 3.806 at step 80) and then destabilizes
+  late — every draw finishes behind the baseline (median 2.908) and
+  the worst draw diverges from 3.44 at step 80 up to 5.26 at step 119,
+  exactly the no-warmup failure mode the paper predicts.
 - `examples/moe_router_probe.rs`: router-behaviour probe in the
   `init_loss_probe` mold (n=5 independent draws per arm, checkpoint
   min/median/max) A/B-ing the load-balancing coefficient — `α = 0.01`

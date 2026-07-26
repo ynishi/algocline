@@ -19,12 +19,25 @@
 //!   - RMSNorm vs LayerNorm — Zhang & Sennrich 2019 (arXiv:1910.07467)
 //!     reports parity-or-better quality at lower cost.
 //!
+//! Phase 2 pairs (position / norm-placement axes; design §5 initial
+//! candidates):
+//!
+//!   - RoPE vs learned wpe — Su 2021 (arXiv:2104.09864). Param count
+//!     drops by ctx·dim (no wpe Var).
+//!   - NoPE vs learned wpe — Kazemnejad 2023 (arXiv:2305.19466)
+//!     reports causal-mask-only decoders still learn order.
+//!   - Post-LN vs Pre-LN — Xiong et al. 2020 (arXiv:2002.04745)
+//!     predicts Post-LN trains worse without warmup; the instability
+//!     itself is the observation target.
+//!
 //! As with the sibling probes, a claim that does not reproduce at
 //! this tiny scale is recorded as-is, not massaged.
 //!
 //! Run: cargo run -p algocline-nn --example arch_probe --release
 
-use algocline_nn::arch::{Activation, Gpt2Config, Gpt2Custom, Gpt2Model, NormKind};
+use algocline_nn::arch::{
+    Activation, Gpt2Config, Gpt2Custom, Gpt2Model, NormKind, NormPlacement, PosKind,
+};
 use algocline_nn::train::{HardLabelDistillLoss, Loss};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
@@ -146,6 +159,27 @@ fn main() {
             base_cfg(Some(Gpt2Custom {
                 norm: NormKind::RmsNorm,
                 mlp_ratio: 4,
+                ..Default::default()
+            })),
+        ),
+        (
+            "RoPE (no wpe)",
+            base_cfg(Some(Gpt2Custom {
+                pos: PosKind::Rope,
+                ..Default::default()
+            })),
+        ),
+        (
+            "NoPE (no position info)",
+            base_cfg(Some(Gpt2Custom {
+                pos: PosKind::NoPos,
+                ..Default::default()
+            })),
+        ),
+        (
+            "Post-LN (learned wpe)",
+            base_cfg(Some(Gpt2Custom {
+                placement: NormPlacement::PostLn,
                 ..Default::default()
             })),
         ),

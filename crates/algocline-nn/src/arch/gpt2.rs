@@ -21,7 +21,7 @@
 //! #1. Attention uses a causal (lower-triangular) mask.
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, linear, ops, Embedding, Init, LayerNorm, Module, VarBuilder, VarMap};
+use candle_nn::{layer_norm, ops, Embedding, Init, LayerNorm, Module, VarBuilder, VarMap};
 
 // `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
 // wrap_lora docs below; the wrap helper itself lives in `arch::lora` since
@@ -80,6 +80,43 @@ fn gpt2_embedding(rows: usize, dim: usize, vs: VarBuilder) -> CandleResult<Embed
         },
     )?;
     Ok(Embedding::new(ws, dim))
+}
+
+/// Linear projection drawn from `N(0, stdev)` with a zero bias, per the
+/// GPT-2 reference, instead of candle-nn's Kaiming weight + uniform
+/// bias default.
+///
+/// `stdev` is [`INIT_STDEV`] for the two "reading" projections
+/// (`c_attn`, `mlp.c_fc`) and [`residual_init_stdev`] for the two that
+/// write back into the residual stream (`attn.c_proj`, `mlp.c_proj`).
+///
+/// Like [`gpt2_embedding`], the hint only takes effect on the
+/// random-init path; a safetensors-backed `vs` loads stored weights.
+fn gpt2_linear(
+    in_dim: usize,
+    out_dim: usize,
+    stdev: f64,
+    vs: VarBuilder,
+) -> CandleResult<candle_nn::Linear> {
+    let ws = vs.get_with_hints(
+        (out_dim, in_dim),
+        "weight",
+        Init::Randn { mean: 0.0, stdev },
+    )?;
+    let bs = vs.get_with_hints(out_dim, "bias", Init::Const(0.0))?;
+    Ok(candle_nn::Linear::new(ws, Some(bs)))
+}
+
+/// Standard deviation for the projections that write into the residual
+/// stream (`attn.c_proj` and `mlp.c_proj`).
+///
+/// GPT-2 scales these by `1/sqrt(2 * n_layer)` — two residual writes per
+/// block — so the variance the stream accumulates stays independent of
+/// depth instead of growing with it. Without the scaling a 24-layer
+/// `gpt2-medium` enters `ln_f` with a residual whose magnitude is set by
+/// depth rather than by content.
+fn residual_init_stdev(layers: usize) -> f64 {
+    INIT_STDEV / ((2 * layers.max(1)) as f64).sqrt()
 }
 
 /// LayerNorm forward that always uses the backward-safe basic-op path
@@ -243,13 +280,14 @@ impl Block {
     fn new(cfg: &Gpt2Config, vs: VarBuilder) -> CandleResult<Self> {
         let head_dim = cfg.dim / cfg.heads;
         let ln_1 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_1"))?;
+        let resid_stdev = residual_init_stdev(cfg.layers);
         let attn_vs = vs.pp("attn");
-        let c_attn = linear(cfg.dim, 3 * cfg.dim, attn_vs.pp("c_attn"))?;
-        let c_proj = linear(cfg.dim, cfg.dim, attn_vs.pp("c_proj"))?;
+        let c_attn = gpt2_linear(cfg.dim, 3 * cfg.dim, INIT_STDEV, attn_vs.pp("c_attn"))?;
+        let c_proj = gpt2_linear(cfg.dim, cfg.dim, resid_stdev, attn_vs.pp("c_proj"))?;
         let ln_2 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_2"))?;
         let mlp_vs = vs.pp("mlp");
-        let mlp_c_fc = linear(cfg.dim, 4 * cfg.dim, mlp_vs.pp("c_fc"))?;
-        let mlp_c_proj = linear(4 * cfg.dim, cfg.dim, mlp_vs.pp("c_proj"))?;
+        let mlp_c_fc = gpt2_linear(cfg.dim, 4 * cfg.dim, INIT_STDEV, mlp_vs.pp("c_fc"))?;
+        let mlp_c_proj = gpt2_linear(4 * cfg.dim, cfg.dim, resid_stdev, mlp_vs.pp("c_proj"))?;
         Ok(Self {
             ln_1,
             c_attn: LinearVariant::Plain(c_attn),

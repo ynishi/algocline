@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the corrected baseline: its model is widened to `dim = 64` because
   LoRA cannot touch the tied head, and the threshold moved from
   `0.7 * baseline` to `0.75 * baseline`.
+- `Gpt2Model`'s four per-block linear projections now follow the same
+  GPT-2 reference initialization: weights from `N(0, 0.02)` and a zero
+  bias, replacing candle-nn's Kaiming weight + uniform bias default,
+  with the two projections that write back into the residual stream
+  (`attn.c_proj`, `mlp.c_proj`) scaled to `0.02 / sqrt(2 * n_layer)` so
+  the variance the stream accumulates does not grow with depth. Unlike
+  the `wte` / `wpe` fix above this is a conformance change rather than a
+  measured one: the final LayerNorm normalizes the residual before the
+  tied head, so the step-0 loss is unchanged (still `ln(vocab)`) and the
+  short smoke runs land in the same wide spread they did before. The
+  payoff it targets — residual conditioning over a long training
+  horizon on a deep stack — is not something this repository's test
+  budget can observe. Random-init only, as above.
 
 ### Changed
 

@@ -54,6 +54,24 @@ pub enum DatasetError {
     /// Feature not implemented yet (e.g. Parquet body).
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    /// A teacher row's loss mask retains no scored position once the
+    /// row is truncated to `ctx_len` and shifted against the targets
+    /// (mask position 0 gates no target token). Training on such a row
+    /// is a silent no-op: the loss is exactly 0.0, no gradient flows,
+    /// and `min_train_loss` records 0.0 as if learning had completed.
+    #[error(
+        "row {index}: loss_mask has no scored position within ctx_len {ctx_len} \
+         (mask length {row_len}) — the response region was fully truncated or \
+         the mask is all-zero"
+    )]
+    FullyMaskedRow {
+        /// 0-based row index within the input rows.
+        index: usize,
+        /// Configured sequence length the row is truncated to.
+        ctx_len: usize,
+        /// Untruncated mask length of the offending row.
+        row_len: usize,
+    },
 }
 
 /// Iterator config shared across dataset kinds.
@@ -409,6 +427,10 @@ fn pad_or_truncate(row: &[u32], ctx: usize, pad: u32) -> Vec<u32> {
 
 /// Pad `mask` up to `ctx` with `0.0` (positions past the real content
 /// contribute nothing to the loss), or truncate to `ctx` when longer.
+///
+/// Truncation here can only trim a *partially* scored tail:
+/// [`TeacherCardDataset::from_rows`] has already refused any row whose
+/// mask would come out of this truncation with no scored position left.
 fn pad_or_truncate_mask(mask: &[f32], ctx: usize) -> Vec<f32> {
     if mask.len() >= ctx {
         mask[..ctx].to_vec()
@@ -435,6 +457,7 @@ fn pad_or_truncate_mask(mask: &[f32], ctx: usize) -> Vec<f32> {
 /// keeps the dataset trivially testable with hand-picked deterministic
 /// rows here, and lets the bridge decide the exact prompt / response
 /// split rule.
+#[derive(Debug)]
 pub struct TeacherCardDataset {
     rows: Vec<Vec<u32>>,
     masks: Vec<Vec<f32>>,
@@ -449,6 +472,13 @@ impl TeacherCardDataset {
     /// `input_ids` row — otherwise the caller has broken the
     /// per-position-mask invariant and the constructor refuses rather
     /// than silently truncating.
+    ///
+    /// Additionally, every row must keep at least one scored (non-zero)
+    /// mask position after truncation to `opts.ctx_len` and the training
+    /// loop's input/target shift (mask position 0 gates no target).
+    /// A row failing this — a response fully cut off by `ctx_len`, or an
+    /// all-zero mask — surfaces as [`DatasetError::FullyMaskedRow`]
+    /// instead of training as a silent zero-loss no-op step.
     pub fn from_rows(
         rows: Vec<(Vec<u32>, Vec<f32>)>,
         opts: DatasetOpts,
@@ -464,6 +494,25 @@ impl TeacherCardDataset {
                         row_ids.len()
                     ),
                     index: idx,
+                });
+            }
+            // Refuse rows that would train as a silent no-op. `next_batch`
+            // truncates to `ctx_len` and the loop's input/target shift drops
+            // mask position 0 (it gates no target token); if the surviving
+            // mask is all-zero the loss is exactly 0.0, no gradient flows,
+            // and the step still advances — `min_train_loss` would record
+            // 0.0 as if the model had learned perfectly.
+            let scored = row_mask
+                .iter()
+                .take(opts.ctx_len)
+                .skip(1)
+                .filter(|m| **m != 0.0)
+                .count();
+            if scored == 0 {
+                return Err(DatasetError::FullyMaskedRow {
+                    index: idx,
+                    ctx_len: opts.ctx_len,
+                    row_len: row_mask.len(),
                 });
             }
             ids.push(row_ids);
@@ -565,6 +614,76 @@ mod tests {
         let err = ds.next_batch().unwrap_err();
         assert!(matches!(err, DatasetError::NotImplemented(_)));
         assert!(ds.len_hint().is_none());
+    }
+
+    fn teacher_opts(ctx_len: usize) -> DatasetOpts {
+        DatasetOpts {
+            batch_size: 1,
+            ctx_len,
+            ..DatasetOpts::default()
+        }
+    }
+
+    #[test]
+    fn teacher_rows_reject_mask_fully_truncated_by_ctx() {
+        // The response region (mask = 1) lives at positions 6..8;
+        // ctx_len = 4 cuts it off entirely, leaving a row that would
+        // train as a silent zero-loss no-op.
+        let rows = vec![(
+            vec![1u32, 2, 3, 4, 5, 6, 7, 8],
+            vec![0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        )];
+        let err = TeacherCardDataset::from_rows(rows, teacher_opts(4)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DatasetError::FullyMaskedRow {
+                    index: 0,
+                    ctx_len: 4,
+                    row_len: 8
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn teacher_rows_reject_all_zero_mask() {
+        let rows = vec![(vec![1u32, 2, 3, 4], vec![0.0f32, 0.0, 0.0, 0.0])];
+        let err = TeacherCardDataset::from_rows(rows, teacher_opts(4)).unwrap_err();
+        assert!(
+            matches!(err, DatasetError::FullyMaskedRow { index: 0, .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn teacher_rows_reject_mask_scored_only_at_position_zero() {
+        // Mask position 0 gates no target after the input/target shift
+        // (`batch_to_input_target` drops it), so a row scored only there
+        // is a no-op too.
+        let rows = vec![(vec![1u32, 2, 3, 4], vec![1.0f32, 0.0, 0.0, 0.0])];
+        let err = TeacherCardDataset::from_rows(rows, teacher_opts(4)).unwrap_err();
+        assert!(
+            matches!(err, DatasetError::FullyMaskedRow { index: 0, .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn teacher_rows_accept_partially_truncated_response() {
+        // ctx_len = 5 keeps scored positions 3..5; trimming the rest of
+        // the response tail is allowed as long as at least one scored
+        // position survives, and the emitted batch mask reflects the
+        // lockstep truncation.
+        let rows = vec![(
+            vec![1u32, 2, 3, 4, 5, 6, 7, 8],
+            vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        )];
+        let mut ds = TeacherCardDataset::from_rows(rows, teacher_opts(5)).expect("row accepted");
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.input_ids, vec![vec![1, 2, 3, 4, 5]]);
+        assert_eq!(batch.loss_mask, Some(vec![vec![0.0, 0.0, 0.0, 1.0, 1.0]]));
     }
 
     #[test]

@@ -30,9 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gpt2 tokenizer, gated behind `NN_SMOKE_DISTILL_CARD=1`. Without the
   variable it prints a skip message and returns, so the default test run
   stays network-free.
+- `crates/algocline-nn/tests/gpt2_grad_coverage.rs`: gradient-coverage
+  gate for the GPT-2 trainable path. One masked-CE backward pass on a
+  tiny from-scratch model must yield a non-zero gradient for every Var
+  in the VarMap (28 on the tiny shape). The loss-threshold tests cannot
+  localize which parameters learned: with the autograd graph severed
+  inside the blocks (the candle-nn 0.11 LayerNorm fast-path cliff), the
+  tied `wte` head still receives gradient through the logits matmul and
+  can memorize a repeated corpus on its own. This gate fails with the
+  offending parameter names instead, and doubles as the pin against a
+  future candle bump routing around `apply_slow_layer_norm`.
 
 ### Fixed
 
+- `TeacherCardDataset::from_rows` now refuses (new
+  `DatasetError::FullyMaskedRow`, carrying row index / `ctx_len` / mask
+  length) any row whose loss mask keeps no scored position after the row
+  is truncated to `ctx_len` and shifted against the targets (mask
+  position 0 gates no target token). Previously such a row — a response
+  fully cut off by `ctx_len`, a prompt long enough to fill the context
+  on its own, or an all-zero mask — trained as a silent no-op: the
+  fully-masked batch produces a loss of exactly 0.0 with no gradient,
+  the step counter still advances, and `min_train_loss` records 0.0 as
+  if the model had learned perfectly (a value that also trivially passes
+  the `< ln(vocab)` E2E threshold). Rows where truncation trims only
+  part of the response region remain accepted.
 - `Gpt2Model::new` now draws `wte` / `wpe` from `N(0, 0.02)` — the GPT-2
   reference initialization — instead of inheriting candle-nn's
   `embedding()` default of `N(0, 1)`. The scale matters more here than

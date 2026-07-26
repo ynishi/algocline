@@ -160,55 +160,85 @@ fn revert_block_linears_to_kaiming(vm: &mut VarMap, cfg: &Gpt2Config) {
     }
 }
 
-/// Train the same corpus twice — once with the shipped GPT-2 reference
-/// init, once with the pre-fix Kaiming draw restored — and print both
-/// loss curves. This is the A/B the residual-scaling claim needs: the
-/// step-0 loss is identical either way (the final LayerNorm normalizes
-/// the residual before the tied head), so any difference here is the
-/// training-time conditioning the scaling exists for.
-fn residual_ab(cfg: &Gpt2Config, steps: usize, rows: usize, seq: usize) {
+/// Train the same corpus with the shipped GPT-2 reference init and with
+/// the pre-fix Kaiming draw restored — `draws` independent draws each —
+/// and print min/median/max of the loss at fixed checkpoint steps. This
+/// is the A/B the residual-scaling claim needs: the step-0 loss is
+/// identical either way (the final LayerNorm normalizes the residual
+/// before the tied head), so any difference here is the training-time
+/// conditioning the scaling exists for. A single draw is not enough:
+/// the teacher-card E2E showed a 3-orders-of-magnitude spread across
+/// draws of the same config, so point estimates from one run overstate
+/// their precision.
+fn residual_ab(cfg: &Gpt2Config, steps: usize, rows: usize, seq: usize, draws: usize) {
+    let checkpoints = [0, 40, 80, steps - 1];
     for label in ["reference init (shipped)", "kaiming init (pre-fix)"] {
-        let mut vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
-        let model = Gpt2Model::new(cfg, vb).expect("build model");
-        if label.starts_with("kaiming") {
-            revert_block_linears_to_kaiming(&mut vm, cfg);
+        println!("--- {label}: {draws} draws ---");
+        let mut per_draw: Vec<Vec<f32>> = Vec::with_capacity(draws);
+        for draw in 0..draws {
+            let mut vm = VarMap::new();
+            let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+            let model = Gpt2Model::new(cfg, vb).expect("build model");
+            if label.starts_with("kaiming") {
+                revert_block_linears_to_kaiming(&mut vm, cfg);
+            }
+
+            // A handful of distinct sequences, cycled — memorizable, but
+            // not in a single step the way one repeated row would be.
+            let corpus: Vec<Vec<u32>> = (0..rows)
+                .map(|r| {
+                    (0..seq)
+                        .map(|i| ((r * 7919 + i * 977) % cfg.vocab) as u32)
+                        .collect()
+                })
+                .collect();
+
+            let mut opt = AdamW::new(
+                vm.all_vars(),
+                ParamsAdamW {
+                    lr: 3e-4,
+                    weight_decay: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let mut picked = Vec::with_capacity(checkpoints.len());
+            for step in 0..steps {
+                let ids = &corpus[step % rows];
+                let inputs =
+                    Tensor::from_slice(&ids[..seq - 1], (1, seq - 1), &cfg.device).unwrap();
+                let targets = Tensor::from_slice(&ids[1..seq], (1, seq - 1), &cfg.device).unwrap();
+                let logits = model.forward(&inputs).unwrap();
+                let loss = HardLabelDistillLoss::new()
+                    .compute(&logits, &targets, None)
+                    .unwrap();
+                let val: f32 = loss.to_scalar().unwrap();
+                if checkpoints.contains(&step) {
+                    picked.push(val);
+                }
+                opt.backward_step(&loss).unwrap();
+            }
+
+            let line: Vec<String> = checkpoints
+                .iter()
+                .zip(&picked)
+                .map(|(s, v)| format!("s{s}={v:.4}"))
+                .collect();
+            println!("  draw {draw}: {}", line.join("  "));
+            per_draw.push(picked);
         }
 
-        // A handful of distinct sequences, cycled — memorizable, but not
-        // in a single step the way one repeated row would be.
-        let corpus: Vec<Vec<u32>> = (0..rows)
-            .map(|r| {
-                (0..seq)
-                    .map(|i| ((r * 7919 + i * 977) % cfg.vocab) as u32)
-                    .collect()
-            })
-            .collect();
-
-        let mut opt = AdamW::new(
-            vm.all_vars(),
-            ParamsAdamW {
-                lr: 3e-4,
-                weight_decay: 0.0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        println!("--- {label} ---");
-        for step in 0..steps {
-            let ids = &corpus[step % rows];
-            let inputs = Tensor::from_slice(&ids[..seq - 1], (1, seq - 1), &cfg.device).unwrap();
-            let targets = Tensor::from_slice(&ids[1..seq], (1, seq - 1), &cfg.device).unwrap();
-            let logits = model.forward(&inputs).unwrap();
-            let loss = HardLabelDistillLoss::new()
-                .compute(&logits, &targets, None)
-                .unwrap();
-            let val: f32 = loss.to_scalar().unwrap();
-            if step % 10 == 0 || step == steps - 1 {
-                println!("  step {step:>3}: loss={val:.4}");
-            }
-            opt.backward_step(&loss).unwrap();
+        println!("  min/median/max over {draws} draws:");
+        for (i, step) in checkpoints.iter().enumerate() {
+            let mut vals: Vec<f32> = per_draw.iter().map(|d| d[i]).collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "    step {step:>3}: min={:.4} median={:.4} max={:.4}",
+                vals[0],
+                vals[vals.len() / 2],
+                vals[vals.len() - 1]
+            );
         }
     }
 }
@@ -258,8 +288,8 @@ fn main() {
         eps: 1e-5,
     };
     println!(
-        "\n[residual A/B] layers={} dim={} vocab={}, 8 rows cycled, lr 3e-4\n",
+        "\n[residual A/B] layers={} dim={} vocab={}, 8 rows cycled, lr 3e-4, 5 draws\n",
         deep.layers, deep.dim, deep.vocab
     );
-    residual_ab(&deep, 120, 8, seq);
+    residual_ab(&deep, 120, 8, seq, 5);
 }

@@ -80,13 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`attn.c_proj`, `mlp.c_proj`) scaled to `0.02 / sqrt(2 * n_layer)` so
   the variance the stream accumulates does not grow with depth. Unlike
   the `wte` / `wpe` fix above this is a conformance change, and it is
-  not a measured improvement — the one A/B available here points the
-  other way. On a 12-layer / dim-384 / vocab-50257 stack cycling 8
-  sequences for 120 steps at lr 3e-4, both initializations start at
-  `ln(vocab)` (10.85 vs 10.98, the final LayerNorm normalizes the
-  residual before the tied head) but the previous Kaiming draw
-  converges faster: 5.36 / 2.82 / 1.45 at steps 40 / 80 / 119 against
-  6.69 / 4.66 / 4.23 for the reference draw. That is the expected
+  not a measured improvement — the A/B available here points the other
+  way. On a 12-layer / dim-384 / vocab-50257 stack cycling 8 sequences
+  for 120 steps at lr 3e-4, measured over `n = 5` independent draws per
+  arm, both initializations start at `ln(vocab)` (median 10.92 vs
+  10.97, the final LayerNorm normalizes the residual before the tied
+  head) but the previous Kaiming draw converges faster: median 5.38 /
+  2.92 / 1.32 (min–max 5.24–5.49 / 2.56–3.29 / 0.97–1.66) at steps
+  40 / 80 / 119 against median 6.41 / 4.87 / 4.18 (min–max 6.18–7.13 /
+  3.76–5.75 / 2.98–5.50) for the reference draw — the two arms' ranges
+  do not overlap at any of the three checkpoints. That is the expected
   trade — the `1/sqrt(2 * n_layer)` scaling starts each block closer to
   the identity — and a 120-step memorization task is precisely the
   regime where the larger draw wins. The regime the scaling is for,

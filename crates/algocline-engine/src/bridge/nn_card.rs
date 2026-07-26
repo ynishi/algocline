@@ -5018,7 +5018,7 @@ mod loss_mask_from_card_tests {
         let mut ds = handle.inner_lock().expect("lock");
         let batch = ds.next_batch().expect("next_batch").expect("batch");
 
-        // Crux 1 evidence: identical token ids, mask-free legacy path.
+        // Invariant: identical token ids, mask-free legacy path.
         assert_eq!(batch.input_ids, masked_ids);
         assert!(batch.loss_mask.is_none());
     }

@@ -8,7 +8,7 @@ _default:
 
 # Run all checks (fmt, clippy, test, V0 invariants) — CI equivalent
 [group('allow-agent')]
-ci: fmt-check lua-fmt-check clippy test check-invariants check-agent-index
+ci: fmt-check lua-fmt-check clippy clippy-nn test test-nn check-invariants check-agent-index
 
 # Lint with clippy (warnings = errors)
 [group('allow-agent')]
@@ -72,6 +72,7 @@ test-nn:
     cargo test -p algocline-nn
     cargo test -p algocline-engine --features nn --lib
     cargo test -p algocline-engine --features nn --test nn_bridge_smoke
+    cargo test -p algocline-engine --features nn --test nn_distill_teacher_card_e2e
 
 # Clippy for the nn-feature layer. `just clippy` runs the default (nn off)
 # workspace clippy; this recipe closes the gap for the `--features nn` code

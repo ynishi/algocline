@@ -21,9 +21,7 @@
 //! #1. Attention uses a causal (lower-triangular) mask.
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{
-    embedding, layer_norm, linear, ops, Embedding, LayerNorm, Module, VarBuilder, VarMap,
-};
+use candle_nn::{layer_norm, linear, ops, Embedding, Init, LayerNorm, Module, VarBuilder, VarMap};
 
 // `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
 // wrap_lora docs below; the wrap helper itself lives in `arch::lora` since
@@ -50,6 +48,39 @@ struct WrapFlags {
 /// [`Gpt2Model::wrap_lora`]. Any name outside this list triggers an
 /// error at wrap time so a typo does not silently degrade to "no-op".
 const KNOWN_TARGET_MODULES: [&str; 6] = ["q_proj", "k_proj", "v_proj", "o_proj", "up", "down"];
+
+/// Standard deviation of the normal distribution the GPT-2 reference
+/// implementation draws `wte` / `wpe` from.
+///
+/// candle-nn's [`candle_nn::embedding`] helper defaults to
+/// `Randn { mean: 0.0, stdev: 1.0 }`, which is 50× too wide here. It
+/// matters more for GPT-2 than for a model with an untied head because
+/// [`Gpt2Model::forward`] reuses `wte` as the LM head: the logit scale
+/// is `sqrt(dim) * stdev(wte)`, so a `stdev = 1.0` draw puts
+/// `gpt2-medium` logits at `std ~= 32` and a from-scratch masked
+/// cross-entropy at ~140 instead of the `ln(vocab) ~= 10.82` a uniform
+/// softmax gives. Training from there saturates the softmax rather than
+/// descending. Measured on `examples/init_loss_probe.rs`.
+const INIT_STDEV: f64 = 0.02;
+
+/// Embedding table drawn from `N(0, INIT_STDEV)` instead of candle-nn's
+/// `N(0, 1)` default.
+///
+/// Only the random-init path is affected: when `vs` is backed by a
+/// safetensors mmap ([`Gpt2Model::from_pretrained`] /
+/// [`Gpt2Model::from_safetensors_file`]) the hint is ignored and the
+/// stored tensor is loaded as-is.
+fn gpt2_embedding(rows: usize, dim: usize, vs: VarBuilder) -> CandleResult<Embedding> {
+    let ws = vs.get_with_hints(
+        (rows, dim),
+        "weight",
+        Init::Randn {
+            mean: 0.0,
+            stdev: INIT_STDEV,
+        },
+    )?;
+    Ok(Embedding::new(ws, dim))
+}
 
 /// LayerNorm forward that always uses the backward-safe basic-op path
 /// (`layer_norm_slow`).
@@ -343,8 +374,8 @@ impl Gpt2Model {
                 cfg.dim, cfg.heads
             )));
         }
-        let wte = embedding(cfg.vocab, cfg.dim, vs.pp("wte"))?;
-        let wpe = embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?;
+        let wte = gpt2_embedding(cfg.vocab, cfg.dim, vs.pp("wte"))?;
+        let wpe = gpt2_embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?;
         let h_vs = vs.pp("h");
         let mut blocks = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
@@ -436,15 +467,8 @@ impl Gpt2Model {
                 cache = %cache_path.display(),
                 "downloading gpt-2 pretrained weights"
             );
-            let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| PretrainedError::HubApi(e.to_string()))?;
-            let downloaded = api
-                .model(repo.to_string())
-                .get("model.safetensors")
+            crate::hub::download_to(repo, "model.safetensors", &cache_path)
                 .map_err(|e| PretrainedError::Download(e.to_string()))?;
-            std::fs::copy(&downloaded, &cache_path).map_err(|e| {
-                PretrainedError::CacheIo(format!("copy {:?} -> {:?}: {e}", downloaded, cache_path))
-            })?;
         }
 
         // Load through candle's mmap-safetensors VarBuilder.
@@ -661,11 +685,8 @@ pub enum PretrainedError {
     /// Requested variant has no known HuggingFace mapping.
     #[error("unknown pretrained preset: {0}")]
     UnknownPreset(String),
-    /// hf-hub client construction failure.
-    #[error("hf-hub api: {0}")]
-    HubApi(String),
     /// Weight download failure.
-    #[error("hf-hub download: {0}")]
+    #[error("hub download: {0}")]
     Download(String),
     /// Local cache IO failure.
     #[error("cache io: {0}")]

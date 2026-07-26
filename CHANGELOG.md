@@ -31,14 +31,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable it prints a skip message and returns, so the default test run
   stays network-free.
 
+### Fixed
+
+- `Gpt2Model::new` now draws `wte` / `wpe` from `N(0, 0.02)` — the GPT-2
+  reference initialization — instead of inheriting candle-nn's
+  `embedding()` default of `N(0, 1)`. The scale matters more here than
+  in an untied model because the forward pass reuses `wte` as the LM
+  head, so the logit scale is `sqrt(dim) * stdev(wte)`: at `stdev = 1.0`
+  a from-scratch `gpt2-medium` produced logits with `std ~= 32` and a
+  masked cross-entropy of ~140 at step 0, against the `ln(50257) ~=
+  10.82` a uniform softmax gives. Training from that point saturated the
+  softmax — on a repeated-token corpus the masked loss dropped to
+  exactly `0.0` after one step and stayed there while the logits kept
+  drifting on optimizer momentum. With the reference scale the same
+  model starts at ~11 and descends normally. Only the random-init path
+  changes; `from_pretrained` / `from_safetensors_file` load stored
+  weights as before, and warm-started runs are unaffected.
+  `run_lora_ft_reduces_loss_on_overfit_corpus` was recalibrated against
+  the corrected baseline: its model is widened to `dim = 64` because
+  LoRA cannot touch the tied head, and the threshold moved from
+  `0.7 * baseline` to `0.75 * baseline`.
+
 ### Changed
+
+- `algocline-nn` fetches HuggingFace artifacts through a small internal
+  `ureq` client instead of `hf-hub`. Every call site already copied the
+  downloaded file into its own cache directory and ignored the hub
+  client's cache layout, so the dependency only provided a single-file
+  HTTP GET. The new path also writes to `<dest>.partial` and renames on
+  completion, so an interrupted download no longer leaves a truncated
+  file that the `dest.exists()` first-use guard would accept as
+  complete. `HF_ENDPOINT` and `HF_TOKEN` are honoured as before;
+  `hf-hub`'s reuse of a pre-existing `~/.cache/huggingface` download is
+  not (artifacts are re-fetched into the algocline cache on first use).
 
 ### Deprecated
 
 ### Removed
 
+- **BREAKING** (matchers only): the `HubApi` variant of
+  `algocline_nn::tokenizer::TokenizerError`,
+  `algocline_nn::arch::gpt2::PretrainedError`, and
+  `algocline_nn::arch::tinyllama::PretrainedError`. It reported hub
+  *client construction* failure, which no longer has a failure mode
+  after the `hf-hub` removal above; keeping an unconstructible variant
+  would misdescribe the error surface. Transport failures continue to
+  surface as `Download(String)`. Migration: fold any `HubApi` match arm
+  into the `Download` arm. The `Download` / `HubApi` display strings
+  also lost their `hf-hub ` prefix (`hf-hub download: …` →
+  `hub download: …`).
+
 ### Fixed
 
+- Downloading a tokenizer or pretrained weights from the HuggingFace hub
+  failed outright on any machine without a warm cache, with
+  `hub download: Bad URL: failed to parse URL: RelativeUrlWithoutBase`.
+  The hub answers `/resolve/<rev>/<file>` with `307` and a *relative*
+  `Location` (`/api/resolve-cache/models/...`); `hf-hub` 0.3–0.5 follow
+  that redirect by handing the raw header value to the HTTP client
+  without resolving it against the request URI, so the fetch aborted
+  before reading a byte. Affected `HfTokenizer::load_cached` and both
+  `Gpt2Model::from_pretrained` / `TinyLlamaModel::from_pretrained` — in
+  practice every first-use path of `alc.nn` presets and
+  `alc.nn.data.from_card`. Now handled by letting `ureq` follow its own
+  redirects (see the Changed entry above).
 - Return a directional Lua error when a bf16 base handle is passed to
   any of the four nn trainer entrypoints (`alc.nn.wrap_lora` /
   `alc.nn.trainer.run_lora_ft` / `run_full_ft` / `run_distill`),

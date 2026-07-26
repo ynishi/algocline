@@ -29,11 +29,8 @@ pub enum TokenizerError {
     /// Preset name is not known to this crate.
     #[error("unknown tokenizer preset: {0}")]
     UnknownPreset(String),
-    /// hf-hub client construction failure.
-    #[error("hf-hub api: {0}")]
-    HubApi(String),
     /// Tokenizer JSON download failure.
-    #[error("hf-hub download: {0}")]
+    #[error("hub download: {0}")]
     Download(String),
     /// Local cache IO failure (create-dir / copy / read).
     #[error("cache io: {0}")]
@@ -73,15 +70,8 @@ impl HfTokenizer {
                 cache = %cache_path.display(),
                 "downloading tokenizer"
             );
-            let api =
-                hf_hub::api::sync::Api::new().map_err(|e| TokenizerError::HubApi(e.to_string()))?;
-            let downloaded = api
-                .model(repo.to_string())
-                .get("tokenizer.json")
+            crate::hub::download_to(repo, "tokenizer.json", &cache_path)
                 .map_err(|e| TokenizerError::Download(e.to_string()))?;
-            std::fs::copy(&downloaded, &cache_path).map_err(|e| {
-                TokenizerError::CacheIo(format!("copy {:?} -> {:?}: {e}", downloaded, cache_path))
-            })?;
         }
 
         Self::load_from_file(preset, &cache_path)

@@ -297,11 +297,8 @@ pub enum PretrainedError {
     /// Requested variant has no known HuggingFace mapping.
     #[error("unknown pretrained preset: {0}")]
     UnknownPreset(String),
-    /// hf-hub client construction failure.
-    #[error("hf-hub api: {0}")]
-    HubApi(String),
     /// Weight download failure.
-    #[error("hf-hub download: {0}")]
+    #[error("hub download: {0}")]
     Download(String),
     /// Local cache IO failure.
     #[error("cache io: {0}")]
@@ -696,15 +693,8 @@ impl TinyLlamaModel {
                 cache = %cache_path.display(),
                 "downloading tinyllama pretrained weights"
             );
-            let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| PretrainedError::HubApi(e.to_string()))?;
-            let downloaded = api
-                .model(repo.to_string())
-                .get("model.safetensors")
+            crate::hub::download_to(repo, "model.safetensors", &cache_path)
                 .map_err(|e| PretrainedError::Download(e.to_string()))?;
-            std::fs::copy(&downloaded, &cache_path).map_err(|e| {
-                PretrainedError::CacheIo(format!("copy {:?} -> {:?}: {e}", downloaded, cache_path))
-            })?;
         }
 
         // SAFETY: candle exposes `from_mmaped_safetensors` as unsafe

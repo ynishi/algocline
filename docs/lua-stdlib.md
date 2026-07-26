@@ -734,6 +734,55 @@ when arch-pinning at call time reads more naturally. The neutral
 entry is preferred when writing arch-agnostic code (e.g. `local h
 = alc.nn.preset(cfg.arch, cfg.variant)`).
 
+#### `alc.nn.preset.gpt2("custom", opts?)`
+
+Build a from-scratch GPT-2 whose architecture axes deviate from the
+reference (`algocline_nn::arch::Gpt2Custom`, nn arch Phase 3). The
+base shape is the `tiny` preset (2 layers / 2 heads / dim 32 / ctx 16
+/ vocab 64); shape keys override it. Custom models are **random-init
+only** — `pretrained = false` is required (the default `true` is
+rejected with a directional error), and cards saved from a custom
+training run cannot be re-loaded through the pretrained loaders
+(same guard family as MoE).
+
+**opts (all optional except `pretrained = false`):**
+
+| key | type | values / notes |
+|-----|------|----------------|
+| `act` | string | `"gelu"` (ref) / `"relu"` / `"silu"` / `"swiglu"` / `"geglu"` |
+| `norm` | string | `"layernorm"` (ref) / `"rmsnorm"` |
+| `residual` | string | `"sequential"` (ref) / `"parallel"` |
+| `mlp_ratio` | integer | MLP expansion factor (ref 4) |
+| `placement` | string | `"preln"` (ref) / `"postln"` |
+| `pos` | string | `"learned"` (ref) / `"rope"` / `"alibi"` / `"nope"` |
+| `kv_heads` | integer | GQA KV-head count (omit for MHA; `heads % kv_heads == 0`) |
+| `window` | integer | sliding-window size `w ≥ 1` (omit for full causal) |
+| `untied_head` | boolean | `true` = independent `lm_head.weight` |
+| `moe` | table | `{ n_experts, top_k?, alpha? }` — dense-MoE MLP (defaults: Mixtral top-2, α 0.01) |
+| `layers` / `heads` / `dim` / `ctx` / `vocab` | integer | shape overrides on the tiny base |
+| `device` / `dtype` / `pretrained` | — | same as the stock variants |
+
+**Errors (all actionable strings, propagated from the Rust
+validators):** unknown enum value (lists the valid set), wrong Lua
+type (`option 'X' must be …` — never silently ignored),
+`postln` × `parallel` (no canonical wiring), `heads` not divisible by
+`kv_heads`, RoPE with an odd head_dim, `moe` combined with a
+non-reference `act` / `mlp_ratio` (the dense-MLP knobs do not apply
+to the experts), custom keys passed to a stock variant
+(`'medium'` etc. — rejected instead of silently not taking effect),
+and `pretrained` resolving `true`.
+
+```lua
+local h = alc.nn.preset.gpt2("custom", {
+    pretrained = false,
+    act = "swiglu", norm = "rmsnorm", residual = "parallel",
+    mlp_ratio = 3, pos = "rope", kv_heads = 1, untied_head = true,
+    vocab = 50257,  -- match the real tokenizer when training on text
+})
+-- trains through the existing bindings unchanged:
+local ckpt = alc.nn.trainer.full_ft(h, ds, { lr = 3e-4, steps = 100, ... })
+```
+
 #### `alc.nn.preset.tinyllama(variant, opts?)`
 
 Build a trainable TinyLlama handle. Mirrors `alc.nn.preset.gpt2`:

@@ -320,3 +320,207 @@ fn alc_nn_preset_llama_bf16_on_metal_errors() {
         "expected bf16-on-Metal guard or metal-unavailable error, got: {err}"
     );
 }
+
+// ─── alc.nn.preset.gpt2("custom", ...) — nn arch Phase 3 ─────────────
+//
+// Lua-facing regression fence for the Gpt2Custom expose (issue
+// 9218e983). tests/e2e.rs cannot exercise this surface: the default
+// `alc` binary is built without the `nn` feature, so the canonical
+// "normal / representative-error / shape-mismatch" trio lives here,
+// on the same engine bridge path `alc_run` executes when the feature
+// is on (`just test-nn` runs this file in CI).
+
+/// Normal path: a kitchen-sink custom spec (every Phase 1+2 axis off
+/// the reference, Post-LN left out because it excludes Parallel)
+/// builds a handle on the tiny base shape with a `vocab` override,
+/// then completes a short `full_ft` run — the issue's definition of
+/// done is "rewire from Lua AND train through the existing trainer
+/// binding".
+#[test]
+fn alc_nn_preset_gpt2_custom_builds_and_trains() {
+    let (lua, _tmp) = production_vm();
+    let step: usize = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.gpt2("custom", {
+                pretrained = false,
+                device = "cpu",
+                act = "swiglu",
+                norm = "rmsnorm",
+                residual = "parallel",
+                mlp_ratio = 3,
+                pos = "rope",
+                kv_heads = 1,
+                window = 4,
+                untied_head = true,
+                vocab = 96,
+            })
+            assert(h:variant() == "custom", "variant mismatch: " .. h:variant())
+            assert(h:layers() == 2, "layers must stay at the tiny base (2)")
+            assert(h:heads() == 2, "heads must stay at the tiny base (2)")
+            assert(h:dim() == 32, "dim must stay at the tiny base (32)")
+            assert(h:vocab() == 96, "vocab override must apply")
+            assert(h:pretrained() == false, "custom is random-init only")
+
+            local rows = {
+                { 1, 5, 12, 20, 33, 44, 51, 60 },
+                { 2, 8, 15, 22, 30, 40, 55, 63 },
+            }
+            local ds = alc.nn.data.synthetic(rows, {
+                batch_size = 1,
+                ctx_len = 8,
+                shuffle = false,
+                pad_id = 0,
+            })
+            local ckpt = alc.nn.trainer.full_ft(h, ds, {
+                lr = 3e-4,
+                batch_size = 1,
+                steps = 2,
+                warmup = 0,
+                schedule = "cosine",
+                weight_decay = 0.0,
+                ckpt_every = 0,
+                card_id = "smoke_custom_full_ft",
+            })
+            assert(type(ckpt.train_loss) == "number", "train_loss must be a number")
+            return ckpt.step
+        "#,
+        )
+        .eval()
+        .expect("custom preset build + full_ft");
+    assert_eq!(step, 2);
+}
+
+/// MoE co-placement: `moe = {...}` composes with the non-dense axes
+/// (build succeeds), while the dense-MLP knobs (`act` / `mlp_ratio`)
+/// combined with `moe` are rejected Rust-side with the message
+/// steering back to the reference values.
+#[test]
+fn alc_nn_preset_gpt2_custom_moe_composes_and_rejects_dense_knobs() {
+    let lua = nn_vm();
+
+    lua.load(
+        r#"
+        local h = alc.nn.preset.gpt2("custom", {
+            pretrained = false,
+            norm = "rmsnorm",
+            moe = { n_experts = 2 },
+        })
+        assert(h:variant() == "custom", "variant mismatch")
+    "#,
+    )
+    .exec()
+    .expect("custom + moe (non-dense axes) must build");
+
+    let err = lua
+        .load(
+            r#"alc.nn.preset.gpt2("custom", {
+                pretrained = false, act = "swiglu", moe = { n_experts = 2 } })"#,
+        )
+        .exec()
+        .expect_err("dense-MLP knob + moe must be rejected")
+        .to_string();
+    assert!(
+        err.contains("do not apply to the MoE experts"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Representative errors: Rust-side validation messages propagate to
+/// Lua as actionable strings (Service-layer error discipline) — the
+/// PostLN×Parallel exclusion, the GQA divisibility check, the
+/// random-init-only pretrained guard, and the custom-keys-on-stock-
+/// variant rejection.
+#[test]
+fn alc_nn_preset_gpt2_custom_validation_errors_propagate() {
+    let lua = nn_vm();
+
+    let err = lua
+        .load(
+            r#"alc.nn.preset.gpt2("custom", {
+                pretrained = false, placement = "postln", residual = "parallel" })"#,
+        )
+        .exec()
+        .expect_err("PostLN x Parallel must be rejected")
+        .to_string();
+    assert!(err.contains("Post-LN"), "unexpected error: {err}");
+
+    let err = lua
+        .load(
+            r#"alc.nn.preset.gpt2("custom", {
+                pretrained = false, kv_heads = 3 })"#, // tiny base: heads = 2
+        )
+        .exec()
+        .expect_err("non-divisible kv_heads must be rejected")
+        .to_string();
+    assert!(err.contains("divisible"), "unexpected error: {err}");
+
+    let err = lua
+        .load(r#"alc.nn.preset.gpt2("custom", { act = "swiglu" })"#)
+        .exec()
+        .expect_err("default pretrained=true must be rejected for custom")
+        .to_string();
+    assert!(
+        err.contains("random-init only") && err.contains("pretrained = false"),
+        "unexpected error: {err}"
+    );
+
+    let err = lua
+        .load(r#"alc.nn.preset.gpt2("medium", { act = "swiglu", pretrained = false })"#)
+        .exec()
+        .expect_err("custom axis on a stock variant must be rejected, not ignored")
+        .to_string();
+    assert!(
+        err.contains("only applies to the 'custom' variant"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Shape mismatches: a present key of the wrong Lua type is a hard
+/// error naming the key and the expected type — never a silently
+/// ignored option (the legacy `.ok()`-swallow pattern is explicitly
+/// not carried into the custom parse).
+#[test]
+fn alc_nn_preset_gpt2_custom_type_mismatches_error() {
+    let lua = nn_vm();
+
+    let err = lua
+        .load(r#"alc.nn.preset.gpt2("custom", { pretrained = false, act = true })"#)
+        .exec()
+        .expect_err("boolean act must be a type error")
+        .to_string();
+    assert!(
+        err.contains("'act' must be a string"),
+        "unexpected error: {err}"
+    );
+
+    let err = lua
+        .load(r#"alc.nn.preset.gpt2("custom", { pretrained = false, mlp_ratio = "three" })"#)
+        .exec()
+        .expect_err("string mlp_ratio must be a type error")
+        .to_string();
+    assert!(
+        err.contains("'mlp_ratio' must be an integer"),
+        "unexpected error: {err}"
+    );
+
+    let err = lua
+        .load(r#"alc.nn.preset.gpt2("custom", { pretrained = false, moe = { top_k = 2 } })"#)
+        .exec()
+        .expect_err("moe without n_experts must error")
+        .to_string();
+    assert!(
+        err.contains("moe.n_experts is required"),
+        "unexpected error: {err}"
+    );
+
+    let err = lua
+        .load(r#"alc.nn.preset.gpt2("custom", { pretrained = false, act = "swiglue" })"#)
+        .exec()
+        .expect_err("typo'd enum value must list the valid set")
+        .to_string();
+    assert!(
+        err.contains("unknown act 'swiglue'") && err.contains("'swiglu'"),
+        "unexpected error: {err}"
+    );
+}

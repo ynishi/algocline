@@ -32,7 +32,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{LlamaAdapter, LlamaAdapterConfig};
-use algocline_nn::arch::{Gpt2Config, Gpt2Model, LoraConfig, TinyLlamaConfig, TinyLlamaModel};
+use algocline_nn::arch::{
+    Activation, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig, MoeConfig, NormKind, NormPlacement,
+    PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
+};
 use algocline_nn::card::{
     validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
 };
@@ -1982,11 +1985,19 @@ pub(super) fn build_gpt2_handle(
     opts: Option<&LuaTable>,
     nn_dir: &std::path::Path,
 ) -> LuaResult<Gpt2Handle> {
-    let mut cfg = Gpt2Config::from_variant(variant).ok_or_else(|| {
-        LuaError::external(format!(
-            "alc.nn.preset.gpt2: unknown variant '{variant}' (expected 'medium' or 'large')"
-        ))
-    })?;
+    let mut cfg = if variant == "custom" || variant == "gpt2-custom" {
+        build_custom_gpt2_config(opts)?
+    } else {
+        if let Some(t) = opts {
+            reject_custom_only_keys(variant, t)?;
+        }
+        Gpt2Config::from_variant(variant).ok_or_else(|| {
+            LuaError::external(format!(
+                "alc.nn.preset.gpt2: unknown variant '{variant}' \
+                 (expected 'medium', 'large', 'tiny', or 'custom')"
+            ))
+        })?
+    };
 
     let device_str = opts
         .and_then(|t| t.get::<Option<String>>("device").ok().flatten())
@@ -2002,6 +2013,18 @@ pub(super) fn build_gpt2_handle(
     cfg.dtype = parse_dtype(&dtype_str)?;
 
     guard_device_dtype_matrix("alc.nn.preset.gpt2", &cfg.device, cfg.dtype)?;
+
+    // Custom specs are random-init only (same guard family as MoE —
+    // `Gpt2Model::from_pretrained` also refuses downstream, but the
+    // bridge-level check turns it into an actionable message instead
+    // of a failed hub lookup for a bundle that cannot exist).
+    if cfg.custom.is_some() && pretrained {
+        return Err(LuaError::external(
+            "alc.nn.preset.gpt2('custom'): custom architectures are random-init \
+             only (no pretrained bundle exists for a customized GPT-2) — pass \
+             pretrained = false",
+        ));
+    }
 
     let (model, varmap) = if pretrained {
         let cache_dir = nn_dir.to_path_buf();
@@ -2038,6 +2061,192 @@ pub(super) fn build_gpt2_handle(
 
 fn parse_device(s: &str) -> LuaResult<Device> {
     parse_device_for("alc.nn.preset.gpt2", s)
+}
+
+/// Option keys that only make sense on the `custom` variant. On any
+/// other variant they would silently not take effect (the stock
+/// presets never set `Gpt2Config::custom` / `moe` and their shape is
+/// fixed), so [`build_gpt2_handle`] rejects them up front instead of
+/// shipping a config that looks customized but is not.
+const GPT2_CUSTOM_ONLY_KEYS: &[&str] = &[
+    "act",
+    "norm",
+    "residual",
+    "mlp_ratio",
+    "placement",
+    "pos",
+    "kv_heads",
+    "window",
+    "untied_head",
+    "moe",
+    "layers",
+    "heads",
+    "dim",
+    "ctx",
+    "vocab",
+];
+
+fn reject_custom_only_keys(variant: &str, t: &LuaTable) -> LuaResult<()> {
+    for key in GPT2_CUSTOM_ONLY_KEYS {
+        if t.contains_key(*key)? {
+            return Err(LuaError::external(format!(
+                "alc.nn.preset.gpt2: option '{key}' only applies to the 'custom' \
+                 variant (got '{variant}') and would silently not take effect \
+                 here — use alc.nn.preset.gpt2('custom', {{ ... }}) for \
+                 architecture experiments"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Typed option getter for the `custom` opts table. Unlike the legacy
+/// `device` / `dtype` reads (which predate the Service-layer error
+/// discipline and swallow type errors via `.ok()`), a present key of
+/// the wrong Lua type is a hard, actionable error — a silently
+/// ignored `mlp_ratio = "3"` would build the reference MLP while the
+/// caller believes they are running a ratio-3 experiment.
+fn custom_opt<T: mlua::FromLua>(t: &LuaTable, key: &str, expected: &str) -> LuaResult<Option<T>> {
+    t.get::<Option<T>>(key).map_err(|_| {
+        LuaError::external(format!(
+            "alc.nn.preset.gpt2('custom'): option '{key}' must be {expected}"
+        ))
+    })
+}
+
+fn custom_bad_value(key: &str, got: &str, expected: &str) -> LuaError {
+    LuaError::external(format!(
+        "alc.nn.preset.gpt2('custom'): unknown {key} '{got}' (expected {expected})"
+    ))
+}
+
+/// Parse the flat `custom` opts table into a [`Gpt2Config`] carrying
+/// `custom: Some(spec)` (and optionally `moe`). Base shape is
+/// [`Gpt2Config::tiny`]; `layers` / `heads` / `dim` / `ctx` / `vocab`
+/// override it so an experiment can match a real tokenizer's vocab or
+/// the arch_probe scale. Axis semantics and cross-axis validation
+/// (PostLN×Parallel, GQA divisibility, RoPE even head_dim, MoE
+/// dense-knob combination) live Rust-side in `Gpt2Custom::validate` /
+/// `Gpt2Model::new`; their messages propagate to Lua verbatim.
+fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
+    let mut cfg = Gpt2Config::tiny();
+    let mut spec = Gpt2Custom::default();
+    let Some(t) = opts else {
+        cfg.custom = Some(spec);
+        return Ok(cfg);
+    };
+
+    if let Some(v) = custom_opt::<usize>(t, "layers", "an integer")? {
+        cfg.layers = v;
+    }
+    if let Some(v) = custom_opt::<usize>(t, "heads", "an integer")? {
+        cfg.heads = v;
+    }
+    if let Some(v) = custom_opt::<usize>(t, "dim", "an integer")? {
+        cfg.dim = v;
+    }
+    if let Some(v) = custom_opt::<usize>(t, "ctx", "an integer")? {
+        cfg.ctx = v;
+    }
+    if let Some(v) = custom_opt::<usize>(t, "vocab", "an integer")? {
+        cfg.vocab = v;
+    }
+
+    if let Some(s) = custom_opt::<String>(t, "act", "a string")? {
+        spec.act = match s.as_str() {
+            "gelu" => Activation::Gelu,
+            "relu" => Activation::Relu,
+            "silu" => Activation::Silu,
+            "swiglu" => Activation::SwiGlu,
+            "geglu" => Activation::GeGlu,
+            other => {
+                return Err(custom_bad_value(
+                    "act",
+                    other,
+                    "'gelu' / 'relu' / 'silu' / 'swiglu' / 'geglu'",
+                ))
+            }
+        };
+    }
+    if let Some(s) = custom_opt::<String>(t, "norm", "a string")? {
+        spec.norm = match s.as_str() {
+            "layernorm" => NormKind::LayerNorm,
+            "rmsnorm" => NormKind::RmsNorm,
+            other => return Err(custom_bad_value("norm", other, "'layernorm' / 'rmsnorm'")),
+        };
+    }
+    if let Some(s) = custom_opt::<String>(t, "residual", "a string")? {
+        spec.residual = match s.as_str() {
+            "sequential" => ResidualKind::Sequential,
+            "parallel" => ResidualKind::Parallel,
+            other => {
+                return Err(custom_bad_value(
+                    "residual",
+                    other,
+                    "'sequential' / 'parallel'",
+                ))
+            }
+        };
+    }
+    if let Some(s) = custom_opt::<String>(t, "placement", "a string")? {
+        spec.placement = match s.as_str() {
+            "preln" => NormPlacement::PreLn,
+            "postln" => NormPlacement::PostLn,
+            other => return Err(custom_bad_value("placement", other, "'preln' / 'postln'")),
+        };
+    }
+    if let Some(s) = custom_opt::<String>(t, "pos", "a string")? {
+        spec.pos = match s.as_str() {
+            "learned" => PosKind::Learned,
+            "rope" => PosKind::Rope,
+            "alibi" => PosKind::Alibi,
+            "nope" => PosKind::NoPos,
+            other => {
+                return Err(custom_bad_value(
+                    "pos",
+                    other,
+                    "'learned' / 'rope' / 'alibi' / 'nope'",
+                ))
+            }
+        };
+    }
+    if let Some(v) = custom_opt::<usize>(t, "mlp_ratio", "an integer")? {
+        spec.mlp_ratio = v;
+    }
+    if let Some(v) = custom_opt::<usize>(t, "kv_heads", "an integer")? {
+        spec.kv_heads = Some(v);
+    }
+    if let Some(v) = custom_opt::<usize>(t, "window", "an integer")? {
+        spec.window = Some(v);
+    }
+    if let Some(b) = custom_opt::<bool>(t, "untied_head", "a boolean")? {
+        spec.untied_head = b;
+    }
+
+    cfg.moe = parse_custom_moe(t)?;
+    cfg.custom = Some(spec);
+    Ok(cfg)
+}
+
+/// Parse the optional nested `moe = { n_experts, top_k?, alpha? }`
+/// table. Defaults mirror [`MoeConfig::new`] (Mixtral top-2 routing,
+/// Switch α = 0.01); `MoeConfig::validate` runs at build time in
+/// `Gpt2Model::new`.
+fn parse_custom_moe(t: &LuaTable) -> LuaResult<Option<MoeConfig>> {
+    let Some(m) = custom_opt::<LuaTable>(t, "moe", "a table")? else {
+        return Ok(None);
+    };
+    let n_experts = custom_opt::<usize>(&m, "n_experts", "an integer")?.ok_or_else(|| {
+        LuaError::external("alc.nn.preset.gpt2('custom'): moe.n_experts is required (integer ≥ 1)")
+    })?;
+    let mut moe = MoeConfig::new(n_experts);
+    if let Some(k) = custom_opt::<usize>(&m, "top_k", "an integer")? {
+        moe.top_k = k;
+    }
+    if let Some(a) = custom_opt::<f64>(&m, "alpha", "a number")? {
+        moe.alpha = a;
+    }
+    Ok(Some(moe))
 }
 
 /// Build a trainable TinyLlama handle. Mirrors

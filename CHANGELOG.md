@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.preset.gpt2("custom", { ... })` — Lua expose of the
+  `Gpt2Custom` architecture spec (nn arch Phase 3). All Phase 1+2 axes
+  are settable from a flat opts table (`act` / `norm` / `residual` /
+  `mlp_ratio` / `placement` / `pos` / `kv_heads` / `window` /
+  `untied_head`), a nested `moe = { n_experts, top_k?, alpha? }` table
+  co-places the dense-MoE MLP, and `layers` / `heads` / `dim` / `ctx` /
+  `vocab` override the tiny base shape (e.g. to match a real
+  tokenizer's vocab). Custom models are random-init only: `pretrained =
+  false` is required and the default `true` is rejected with a
+  directional message. Every Rust-side validation error (PostLN ×
+  Parallel, GQA divisibility, RoPE odd head_dim, MoE dense-knob
+  combination) propagates to Lua as an actionable string; a present
+  opts key of the wrong Lua type is a hard error naming the key and
+  expected type, and custom-only keys passed to a stock variant
+  (`"medium"` etc.) are rejected instead of silently not taking
+  effect. The resulting handle trains through the existing
+  `alc.nn.trainer.*` bindings unchanged. Regression fence:
+  `nn_bridge_smoke.rs` gains the normal / representative-error /
+  type-mismatch / MoE-composition quartet (the default `alc` binary is
+  built without the `nn` feature, so the fence lives at the engine
+  bridge layer that `alc_run` executes when the feature is on).
 - `alc.nn.data.from_card` now recognizes the Tier 1 Card convention
   `[metadata] loss_mask = "response"`. For a declaring Card the sample's
   `prompt` field is tokenized separately to locate the token boundary,

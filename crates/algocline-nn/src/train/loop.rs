@@ -611,6 +611,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         };
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);

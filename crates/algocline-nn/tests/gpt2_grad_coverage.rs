@@ -37,6 +37,7 @@ fn masked_backward_reaches_every_base_var() {
         dtype: DType::F32,
         device: Device::Cpu,
         eps: 1e-5,
+        moe: None,
     };
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
@@ -95,4 +96,36 @@ fn masked_backward_reaches_every_base_var() {
          these parameters never learn.\n  missing from GradStore: {missing:?}\n  \
          zero/NaN gradient: {zero:?}"
     );
+
+    // Fused-projection blind spot: the whole-Var check above cannot see
+    // a severed attention-scores path, because the V slice of the fused
+    // `c_attn` keeps the Var's total gradient non-zero even when Q and
+    // K receive nothing (the candle-nn 0.11 `softmax_last_dim`
+    // no-backward cliff hid here until the MoE router — whose only
+    // gradient path is its softmax — exposed it). Row layout of
+    // `c_attn.weight` is `[3·dim, dim]` = Q rows, K rows, V rows, so
+    // slice-level magnitudes pin the scores path directly.
+    let dim = 16;
+    for (name, var) in data.iter() {
+        if !name.ends_with("attn.c_attn.weight") {
+            continue;
+        }
+        let g = grads.get(var.as_tensor()).expect("checked above");
+        for (slice, label) in [(0usize, "Q"), (1, "K")] {
+            let mag: f32 = g
+                .narrow(0, slice * dim, dim)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+            assert!(
+                mag > 0.0 && mag.is_finite(),
+                "{name}: {label} rows of the fused c_attn gradient are zero \
+                 (sum|g|={mag}) — the attention-scores softmax path is severed"
+            );
+        }
+    }
 }

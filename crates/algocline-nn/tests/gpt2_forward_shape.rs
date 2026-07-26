@@ -21,6 +21,7 @@ fn tiny_cfg(layers: usize, heads: usize, dim: usize, ctx: usize, vocab: usize) -
         dtype: DType::F32,
         device: Device::Cpu,
         eps: 1e-5,
+        moe: None,
     }
 }
 

@@ -40,10 +40,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can memorize a repeated corpus on its own. This gate fails with the
   offending parameter names instead, and doubles as the pin against a
   future candle bump routing around `apply_slow_layer_norm`.
+- Dense mixture-of-experts feed-forward for the GPT-2 stack
+  (`arch/moe.rs`, wired through the new `Gpt2Config::moe:
+  Option<MoeConfig>` field). Every block's MLP can be swapped for a
+  router + `n_experts` GPT-2-shaped experts with standard top-k routing
+  (softmax the router logits, keep the top-k probabilities per token,
+  renormalize, mix expert outputs; Switch Transformer for top-1,
+  Mixtral for the top-2 default) plus the Switch §2.2 load-balancing
+  aux term, exposed unscaled through the additive
+  `Gpt2Model::forward_with_aux` / `forward_with_router_probs` methods —
+  `forward` and every existing caller are unchanged, and a dense model
+  returns `None` / no probs from the new methods. Compute is dense by
+  design (every expert runs on every token): candle has no
+  expert-dispatch kernel and a scatter/gather custom op would sit in
+  the same no-backward `CustomOp` trap the LayerNorm / RMSNorm / RoPE
+  slow-path shims exist for, while the dense mixture composes only ops
+  with proper backwards. Expert parameters live under the new
+  `h.<i>.moe.*` names (disjoint from `h.<i>.mlp.*`), initialized
+  exactly like the stock MLP including the `1/sqrt(2·n_layer)`
+  residual-write scaling per expert. MoE models are random-init only:
+  `from_pretrained` / `from_safetensors_file` refuse a `MoeConfig`
+  loudly, `export_merged` errors instead of emitting an incomplete
+  bundle, and `wrap_lora` rejects the `up` / `down` targets on a MoE
+  model (attention targets stay available) rather than silently
+  training fewer parameters than requested.
+- `tests/moe_grad_coverage.rs`: MoE version of the gradient-coverage
+  gate, run in dense-mixture mode (`top_k = n_experts`) so structural
+  reachability is separated from the legitimate sparsity of top-k
+  routing — an unselected expert receiving no gradient in a step is
+  routing, not a severed graph. One backward over `masked-CE + α·aux`
+  must reach all 38 Vars of the tiny 2-layer / 2-expert shape, router
+  included. Its first run caught the `softmax_last_dim` cliff below.
+- `tests/tinyllama_grad_coverage.rs`: same full-inventory gate for
+  TinyLlama (21 Vars on the tiny shape). Architecture-specific reason
+  to exist: TinyLlama's standalone `q_proj` / `k_proj` have the
+  attention softmax as their only gradient path, so this gate sees a
+  severed scores path directly instead of through the fused-projection
+  blind spot described below.
+- `examples/moe_router_probe.rs`: router-behaviour probe in the
+  `init_loss_probe` mold (n=5 independent draws per arm, checkpoint
+  min/median/max) A/B-ing the load-balancing coefficient — `α = 0.01`
+  (Switch §2.2) vs `α = 0` — on a 2-layer / 4-expert / top-2 / dim-256
+  stack memorizing 8 cycled rows for 120 steps on CPU. Observed per
+  checkpoint: CE, expert utilization (top-1 share per expert), routing
+  entropy, and the raw aux value. Measured result, recorded as-is: the
+  "no aux ⇒ router collapse" direction does **not** reproduce at this
+  scale. The `α = 0` arm stays spread — median max-expert share 0.34
+  (uniform = 0.25, collapse = 1.0) and median routing entropy 1.151
+  (uniform = ln 4 ≈ 1.386, collapse = 0) at step 119 — and the
+  `α = 0.01` arm is indistinguishable from it (median 0.32 / 1.099,
+  ranges overlapping at every checkpoint; CE identical). A 120-step
+  memorization run on a 2-layer stack evidently is not the regime where
+  collapse develops; the aux term ships as standard equipment with the
+  claim's small-scale test honestly negative, not as a measured
+  improvement.
 
 ### Fixed
 
-- `TeacherCardDataset::from_rows` now refuses (new
+- The attention-scores softmax no longer severs the autograd graph.
+  candle-nn 0.11's `ops::softmax_last_dim` is a `CustomOp1` registered
+  via `apply_op1_no_bwd`: its output carries `BackpropOp::none()`, so
+  backward silently treats it as a constant — the same cliff family as
+  the LayerNorm / RMSNorm fast paths this crate already shims around.
+  Both attention paths (`arch/gpt2.rs`, `arch/tinyllama.rs`) used it,
+  which zeroed the Q/K gradient everywhere: on TinyLlama the standalone
+  `q_proj` / `k_proj` (and any LoRA legs wrapped onto them) never
+  learned at all, and on GPT-2 the Q and K rows of the fused `c_attn`
+  never learned while the V rows kept the whole-Var gradient non-zero —
+  which is exactly why the existing per-Var coverage gate could not see
+  it. The hole surfaced the moment a parameter had the softmax as its
+  *only* gradient path: the new MoE router failed
+  `tests/moe_grad_coverage.rs` with `h.<i>.moe.router.weight` missing
+  from the GradStore. All three sites (GPT-2 attention, TinyLlama
+  attention, MoE router) now go through `arch::softmax_last_dim_slow`,
+  the backward-safe `ops::softmax` basic-op composition; the GPT-2 gate
+  additionally pins Q-row / K-row slice magnitudes of the fused
+  `c_attn` gradient, and the new TinyLlama gate pins the standalone
+  projections, so a future candle bump or forward refactor that routes
+  back through a no-backward kernel fails loudly.
   `DatasetError::FullyMaskedRow`, carrying row index / `ctx_len` / mask
   length) any row whose loss mask keeps no scored position after the row
   is truncated to `ctx_len` and shifted against the targets (mask

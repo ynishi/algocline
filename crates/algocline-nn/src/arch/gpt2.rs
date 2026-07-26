@@ -21,13 +21,14 @@
 //! #1. Attention uses a causal (lower-triangular) mask.
 
 use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{layer_norm, ops, Embedding, Init, LayerNorm, Module, VarBuilder, VarMap};
+use candle_nn::{layer_norm, Embedding, Init, LayerNorm, Module, VarBuilder, VarMap};
 
 // `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
 // wrap_lora docs below; the wrap helper itself lives in `arch::lora` since
 // TinyLlama needs the same swap-in-place idiom.
 #[allow(unused_imports)]
 use super::lora::{wrap_variant_in_place, LinearVariant, LoraConfig, LoraLinear};
+use super::moe::{MoeConfig, MoeMlp};
 
 /// Which projections inside a [`Block`] the caller wants LoRA-wrapped.
 #[derive(Debug, Clone, Copy)]
@@ -61,7 +62,7 @@ const KNOWN_TARGET_MODULES: [&str; 6] = ["q_proj", "k_proj", "v_proj", "o_proj",
 /// cross-entropy at ~140 instead of the `ln(vocab) ~= 10.82` a uniform
 /// softmax gives. Training from there saturates the softmax rather than
 /// descending. Measured on `examples/init_loss_probe.rs`.
-const INIT_STDEV: f64 = 0.02;
+pub(crate) const INIT_STDEV: f64 = 0.02;
 
 /// Embedding table drawn from `N(0, INIT_STDEV)` instead of candle-nn's
 /// `N(0, 1)` default.
@@ -92,7 +93,7 @@ fn gpt2_embedding(rows: usize, dim: usize, vs: VarBuilder) -> CandleResult<Embed
 ///
 /// Like [`gpt2_embedding`], the hint only takes effect on the
 /// random-init path; a safetensors-backed `vs` loads stored weights.
-fn gpt2_linear(
+pub(crate) fn gpt2_linear(
     in_dim: usize,
     out_dim: usize,
     stdev: f64,
@@ -115,7 +116,7 @@ fn gpt2_linear(
 /// depth instead of growing with it. Without the scaling a 24-layer
 /// `gpt2-medium` enters `ln_f` with a residual whose magnitude is set by
 /// depth rather than by content.
-fn residual_init_stdev(layers: usize) -> f64 {
+pub(crate) fn residual_init_stdev(layers: usize) -> f64 {
     INIT_STDEV / ((2 * layers.max(1)) as f64).sqrt()
 }
 
@@ -172,6 +173,12 @@ pub struct Gpt2Config {
     pub device: Device,
     /// LayerNorm epsilon (HuggingFace GPT-2 default = 1e-5).
     pub eps: f64,
+    /// Dense-MoE feed-forward configuration. `None` (all shipped
+    /// presets) keeps the stock GPT-2 MLP; `Some` swaps every block's
+    /// MLP for a router + experts mixture ([`MoeConfig`]). MoE models
+    /// are random-init only — the pretrained loaders reject configs
+    /// that set this.
+    pub moe: Option<MoeConfig>,
 }
 
 impl Gpt2Config {
@@ -186,6 +193,7 @@ impl Gpt2Config {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         }
     }
 
@@ -200,6 +208,7 @@ impl Gpt2Config {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         }
     }
 
@@ -229,6 +238,7 @@ impl Gpt2Config {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         }
     }
 
@@ -270,10 +280,21 @@ struct Block {
     c_attn: LinearVariant,
     c_proj: LinearVariant,
     ln_2: LayerNorm,
-    mlp_c_fc: LinearVariant,
-    mlp_c_proj: LinearVariant,
+    ff: FeedForward,
     heads: usize,
     head_dim: usize,
+}
+
+/// The block's feed-forward half — the seam [`Gpt2Config::moe`]
+/// switches. `Dense` is the stock GPT-2 MLP (`c_fc → GELU → c_proj`,
+/// LoRA-wrappable); `Moe` is the dense mixture-of-experts
+/// ([`MoeMlp`], random-init only, LoRA out of scope).
+enum FeedForward {
+    Dense {
+        c_fc: LinearVariant,
+        c_proj: LinearVariant,
+    },
+    Moe(MoeMlp),
 }
 
 impl Block {
@@ -285,16 +306,25 @@ impl Block {
         let c_attn = gpt2_linear(cfg.dim, 3 * cfg.dim, INIT_STDEV, attn_vs.pp("c_attn"))?;
         let c_proj = gpt2_linear(cfg.dim, cfg.dim, resid_stdev, attn_vs.pp("c_proj"))?;
         let ln_2 = layer_norm(cfg.dim, cfg.eps, vs.pp("ln_2"))?;
-        let mlp_vs = vs.pp("mlp");
-        let mlp_c_fc = gpt2_linear(cfg.dim, 4 * cfg.dim, INIT_STDEV, mlp_vs.pp("c_fc"))?;
-        let mlp_c_proj = gpt2_linear(4 * cfg.dim, cfg.dim, resid_stdev, mlp_vs.pp("c_proj"))?;
+        let ff = match &cfg.moe {
+            None => {
+                let mlp_vs = vs.pp("mlp");
+                let mlp_c_fc = gpt2_linear(cfg.dim, 4 * cfg.dim, INIT_STDEV, mlp_vs.pp("c_fc"))?;
+                let mlp_c_proj =
+                    gpt2_linear(4 * cfg.dim, cfg.dim, resid_stdev, mlp_vs.pp("c_proj"))?;
+                FeedForward::Dense {
+                    c_fc: LinearVariant::Plain(mlp_c_fc),
+                    c_proj: LinearVariant::Plain(mlp_c_proj),
+                }
+            }
+            Some(moe) => FeedForward::Moe(MoeMlp::new(cfg, moe, vs.pp("moe"))?),
+        };
         Ok(Self {
             ln_1,
             c_attn: LinearVariant::Plain(c_attn),
             c_proj: LinearVariant::Plain(c_proj),
             ln_2,
-            mlp_c_fc: LinearVariant::Plain(mlp_c_fc),
-            mlp_c_proj: LinearVariant::Plain(mlp_c_proj),
+            ff,
             heads: cfg.heads,
             head_dim,
         })
@@ -313,18 +343,34 @@ impl Block {
         vs: VarBuilder,
     ) -> CandleResult<()> {
         let attn_vs = vs.pp("attn");
-        let mlp_vs = vs.pp("mlp");
         if flags.qkv {
             wrap_variant_in_place(&mut self.c_attn, cfg, attn_vs.pp("c_attn"))?;
         }
         if flags.o {
             wrap_variant_in_place(&mut self.c_proj, cfg, attn_vs.pp("c_proj"))?;
         }
-        if flags.up {
-            wrap_variant_in_place(&mut self.mlp_c_fc, cfg, mlp_vs.pp("c_fc"))?;
-        }
-        if flags.down {
-            wrap_variant_in_place(&mut self.mlp_c_proj, cfg, mlp_vs.pp("c_proj"))?;
+        if flags.up || flags.down {
+            match &mut self.ff {
+                FeedForward::Dense { c_fc, c_proj } => {
+                    let mlp_vs = vs.pp("mlp");
+                    if flags.up {
+                        wrap_variant_in_place(c_fc, cfg, mlp_vs.pp("c_fc"))?;
+                    }
+                    if flags.down {
+                        wrap_variant_in_place(c_proj, cfg, mlp_vs.pp("c_proj"))?;
+                    }
+                }
+                FeedForward::Moe(_) => {
+                    // Refuse rather than silently skipping: a caller who
+                    // asked for `up` / `down` on a MoE model would
+                    // otherwise train fewer parameters than requested.
+                    return Err(candle_core::Error::Msg(
+                        "wrap_lora: `up` / `down` target the dense MLP; the MoE feed-forward \
+                         is out of LoRA scope (attention targets remain available)"
+                            .into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -354,7 +400,10 @@ impl Block {
             .unsqueeze(0)?
             .broadcast_as(scores.shape())?;
         scores = mask4.where_cond(&scores, &neg_inf)?;
-        let probs = ops::softmax_last_dim(&scores)?;
+        // Backward-safe softmax (see `super::softmax_last_dim_slow`):
+        // the fused kernel severs the autograd graph, silently zeroing
+        // the Q/K gradient (the V path masks it on the fused c_attn).
+        let probs = super::softmax_last_dim_slow(&scores)?;
 
         // [B, H, T, Dh] then merge back to [B, T, D].
         let ctx = probs.matmul(&v)?;
@@ -365,21 +414,44 @@ impl Block {
         self.c_proj.forward(&ctx)
     }
 
-    fn mlp(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let h = self.mlp_c_fc.forward(x)?;
-        // GELU (approximate variant matches HF GPT-2). `gelu` is the
-        // exact form; both are within 1e-3 for our purposes.
-        let h = h.gelu()?;
-        self.mlp_c_proj.forward(&h)
+    /// Feed-forward half. Dense returns no byproducts; MoE returns the
+    /// unscaled load-balancing aux term and, when `probs_sink` is
+    /// supplied, pushes the router probabilities for probing.
+    fn feed_forward(
+        &self,
+        x: &Tensor,
+        probs_sink: Option<&mut Vec<Tensor>>,
+    ) -> CandleResult<(Tensor, Option<Tensor>)> {
+        match &self.ff {
+            FeedForward::Dense { c_fc, c_proj } => {
+                let h = c_fc.forward(x)?;
+                // GELU (approximate variant matches HF GPT-2). `gelu` is the
+                // exact form; both are within 1e-3 for our purposes.
+                let h = h.gelu()?;
+                Ok((c_proj.forward(&h)?, None))
+            }
+            FeedForward::Moe(moe) => {
+                let out = moe.forward(x)?;
+                if let Some(sink) = probs_sink {
+                    sink.push(out.probs);
+                }
+                Ok((out.y, Some(out.aux)))
+            }
+        }
     }
 
-    fn forward(&self, x: &Tensor, mask: &Tensor) -> CandleResult<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        probs_sink: Option<&mut Vec<Tensor>>,
+    ) -> CandleResult<(Tensor, Option<Tensor>)> {
         let n = apply_slow_layer_norm(&self.ln_1, x)?;
         let a = self.attention(&n, mask)?;
         let x = (x + a)?;
         let n = apply_slow_layer_norm(&self.ln_2, &x)?;
-        let m = self.mlp(&n)?;
-        x + m
+        let (m, aux) = self.feed_forward(&n, probs_sink)?;
+        Ok(((x + m)?, aux))
     }
 }
 
@@ -411,6 +483,9 @@ impl Gpt2Model {
                 "gpt2: dim {} must be divisible by heads {}",
                 cfg.dim, cfg.heads
             )));
+        }
+        if let Some(moe) = &cfg.moe {
+            moe.validate()?;
         }
         let wte = gpt2_embedding(cfg.vocab, cfg.dim, vs.pp("wte"))?;
         let wpe = gpt2_embedding(cfg.ctx, cfg.dim, vs.pp("wpe"))?;
@@ -455,6 +530,13 @@ impl Gpt2Model {
         cfg: &Gpt2Config,
         path: &std::path::Path,
     ) -> Result<Self, PretrainedError> {
+        if cfg.moe.is_some() {
+            return Err(PretrainedError::Load(
+                "MoE configs are random-init only; no safetensors bundle carries the \
+                 h.<i>.moe.* layout"
+                    .into(),
+            ));
+        }
         // SAFETY: same discipline as `from_pretrained` — the file
         // must not be concurrently truncated while the mmap is
         // active. Callers hold the mmap for the lifetime of this
@@ -487,6 +569,13 @@ impl Gpt2Model {
         cfg: &Gpt2Config,
         cache_dir: &std::path::Path,
     ) -> Result<Self, PretrainedError> {
+        if cfg.moe.is_some() {
+            return Err(PretrainedError::Load(
+                "MoE configs are random-init only; pretrained GPT-2 bundles have no \
+                 router / expert weights"
+                    .into(),
+            ));
+        }
         let repo = cfg
             .hf_repo()
             .ok_or_else(|| PretrainedError::UnknownPreset(variant.to_string()))?;
@@ -530,6 +619,36 @@ impl Gpt2Model {
     /// output is `[batch, seq, vocab]` — the raw logits (softmax is left
     /// to the training loss / sampling caller).
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        self.forward_inner(xs, None).map(|(logits, _)| logits)
+    }
+
+    /// Forward pass that also returns the summed MoE load-balancing
+    /// aux term (unscaled — multiply by [`MoeConfig::alpha`] when
+    /// composing the total loss). `None` on a dense (non-MoE) model,
+    /// so existing callers of [`Self::forward`] see no change.
+    pub fn forward_with_aux(&self, xs: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
+        self.forward_inner(xs, None)
+    }
+
+    /// Probe variant of [`Self::forward_with_aux`] that additionally
+    /// returns each MoE layer's router probabilities `[B, S, E]`
+    /// (bottom layer first; empty on a dense model). Backing for
+    /// `examples/moe_router_probe.rs`'s utilization / entropy
+    /// observations — not a training API.
+    pub fn forward_with_router_probs(
+        &self,
+        xs: &Tensor,
+    ) -> CandleResult<(Tensor, Option<Tensor>, Vec<Tensor>)> {
+        let mut probs = Vec::new();
+        let (logits, aux) = self.forward_inner(xs, Some(&mut probs))?;
+        Ok((logits, aux, probs))
+    }
+
+    fn forward_inner(
+        &self,
+        xs: &Tensor,
+        mut probs_sink: Option<&mut Vec<Tensor>>,
+    ) -> CandleResult<(Tensor, Option<Tensor>)> {
         let (b, t) = xs.dims2()?;
         if t > self.cfg.ctx {
             return Err(candle_core::Error::Msg(format!(
@@ -542,15 +661,23 @@ impl Gpt2Model {
         let pos_emb = self.wpe.forward(&pos_ids)?; // [T, D]
         let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(tok_emb.shape())?;
         let mut h = (tok_emb + pos_emb)?;
+        let mut aux_sum: Option<Tensor> = None;
         for block in &self.blocks {
-            h = block.forward(&h, &self.causal_mask)?;
+            let (next, aux) = block.forward(&h, &self.causal_mask, probs_sink.as_deref_mut())?;
+            h = next;
+            if let Some(a) = aux {
+                aux_sum = Some(match aux_sum {
+                    None => a,
+                    Some(acc) => (acc + a)?,
+                });
+            }
         }
         let h = apply_slow_layer_norm(&self.ln_f, &h)?; // [B, T, D]
                                                         // Tied LM head: logits = h @ wte.weight^T.
         let w = self.wte.embeddings(); // [V, D]
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
-        Ok(logits)
+        Ok((logits, aux_sum))
     }
 
     /// Wrap the model's per-block linear projections with LoRA
@@ -690,16 +817,31 @@ impl super::lora::MergeableLora for Gpt2Model {
                 out.insert(format!("{prefix}.attn.c_proj.bias"), b.clone());
             }
 
-            // MLP linears (potentially LoRA-wrapped).
-            let mlp_c_fc_w = block.mlp_c_fc.merged_weight()?;
-            out.insert(format!("{prefix}.mlp.c_fc.weight"), mlp_c_fc_w);
-            if let Some(b) = block.mlp_c_fc.bias() {
-                out.insert(format!("{prefix}.mlp.c_fc.bias"), b.clone());
-            }
-            let mlp_c_proj_w = block.mlp_c_proj.merged_weight()?;
-            out.insert(format!("{prefix}.mlp.c_proj.weight"), mlp_c_proj_w);
-            if let Some(b) = block.mlp_c_proj.bias() {
-                out.insert(format!("{prefix}.mlp.c_proj.bias"), b.clone());
+            // MLP linears (potentially LoRA-wrapped). MoE blocks have
+            // no HF-layout equivalent — the merged bundle contract is
+            // "drop-in base for from_pretrained", which a MoE model can
+            // never satisfy (random-init only), so exporting one is an
+            // error rather than a silently incomplete bundle.
+            match &block.ff {
+                FeedForward::Dense { c_fc, c_proj } => {
+                    let mlp_c_fc_w = c_fc.merged_weight()?;
+                    out.insert(format!("{prefix}.mlp.c_fc.weight"), mlp_c_fc_w);
+                    if let Some(b) = c_fc.bias() {
+                        out.insert(format!("{prefix}.mlp.c_fc.bias"), b.clone());
+                    }
+                    let mlp_c_proj_w = c_proj.merged_weight()?;
+                    out.insert(format!("{prefix}.mlp.c_proj.weight"), mlp_c_proj_w);
+                    if let Some(b) = c_proj.bias() {
+                        out.insert(format!("{prefix}.mlp.c_proj.bias"), b.clone());
+                    }
+                }
+                FeedForward::Moe(_) => {
+                    return Err(candle_core::Error::Msg(
+                        "export_merged: MoE blocks have no HF-layout merged-bundle \
+                         representation (MoE is random-init only)"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -798,6 +940,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -821,6 +964,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -841,6 +985,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -861,6 +1006,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         };
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
@@ -884,6 +1030,7 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
             eps: 1e-5,
+            moe: None,
         }
     }
 
@@ -973,5 +1120,138 @@ mod tests {
         let lora_vm = model.wrap_lora(&lora_cfg).unwrap();
         // 2 layers * 1 wrapped linear * 2 vars (a + b) = 4.
         assert_eq!(lora_vm.all_vars().len(), 4);
+    }
+
+    fn tiny_moe_cfg() -> Gpt2Config {
+        Gpt2Config {
+            moe: Some(MoeConfig::new(2)),
+            ..tiny_cfg()
+        }
+    }
+
+    fn build_moe_model() -> (VarMap, Gpt2Model) {
+        let cfg = tiny_moe_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        (vm, model)
+    }
+
+    #[test]
+    fn moe_forward_shape_and_aux() {
+        let cfg = tiny_moe_cfg();
+        let (_vm, model) = build_moe_model();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).unwrap();
+
+        // Plain forward keeps the [B, S, V] contract.
+        let logits = model.forward(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, cfg.vocab]);
+
+        // forward_with_aux returns a finite scalar aux on the MoE path.
+        let (logits, aux) = model.forward_with_aux(&ids).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, cfg.vocab]);
+        let aux: f32 = aux.expect("moe aux").to_scalar().unwrap();
+        assert!(aux.is_finite() && aux > 0.0, "aux={aux}");
+
+        // Probe variant exposes one probs tensor per layer.
+        let (_, _, probs) = model.forward_with_router_probs(&ids).unwrap();
+        assert_eq!(probs.len(), cfg.layers);
+        assert_eq!(probs[0].dims(), &[1, 5, 2]);
+    }
+
+    #[test]
+    fn dense_forward_with_aux_returns_none() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let (_, aux) = model.forward_with_aux(&ids).unwrap();
+        assert!(aux.is_none());
+        let (_, _, probs) = model.forward_with_router_probs(&ids).unwrap();
+        assert!(probs.is_empty());
+    }
+
+    #[test]
+    fn moe_varmap_uses_disjoint_names() {
+        let (vm, _model) = build_moe_model();
+        let data = vm.data().lock().unwrap();
+        let names: Vec<&String> = data.keys().collect();
+        assert!(
+            names.iter().any(|n| *n == "h.0.moe.router.weight"),
+            "missing router name in {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| *n == "h.1.moe.experts.1.c_proj.bias"),
+            "missing expert name in {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains(".mlp.")),
+            "stock mlp names must not appear on the MoE path: {names:?}"
+        );
+    }
+
+    #[test]
+    fn moe_wrap_lora_rejects_mlp_targets_but_allows_attention() {
+        let (_vm, mut model) = build_moe_model();
+        let msg = match model.wrap_lora(&LoraConfig::with_targets(2, 4.0, vec!["down"])) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("out of LoRA scope"), "unexpected error: {msg}");
+
+        let (_vm2, mut model2) = build_moe_model();
+        let lora_vm = model2
+            .wrap_lora(&LoraConfig::with_targets(2, 4.0, vec!["q_proj"]))
+            .unwrap();
+        // 2 layers * c_attn * (a + b) = 4.
+        assert_eq!(lora_vm.all_vars().len(), 4);
+    }
+
+    #[test]
+    fn moe_rejects_pretrained_load() {
+        let mut cfg = Gpt2Config::medium();
+        cfg.moe = Some(MoeConfig::new(4));
+        let msg = match Gpt2Model::from_pretrained("medium", &cfg, &std::env::temp_dir()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("random-init"), "unexpected error: {msg}");
+        let msg = match Gpt2Model::from_safetensors_file(&cfg, std::path::Path::new("/nonexistent"))
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("random-init"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn moe_rejects_merged_export() {
+        use crate::arch::lora::MergeableLora;
+        let (_vm, model) = build_moe_model();
+        let msg = match model.export_merged() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("export_merged"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn moe_rejects_invalid_config_at_build() {
+        let cfg = Gpt2Config {
+            moe: Some(MoeConfig {
+                n_experts: 2,
+                top_k: 3,
+                alpha: 0.01,
+            }),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let msg = match Gpt2Model::new(&cfg, vs) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("top_k"), "unexpected error: {msg}");
     }
 }

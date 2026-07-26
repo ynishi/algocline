@@ -499,7 +499,12 @@ impl Block {
             .unsqueeze(0)?
             .broadcast_as(scores.shape())?;
         scores = mask4.where_cond(&scores, &neg_inf)?;
-        let probs = ops::softmax_last_dim(&scores)?;
+        // Backward-safe softmax (see `super::softmax_last_dim_slow`):
+        // the fused kernel severs the autograd graph. Unlike GPT-2's
+        // fused c_attn, TinyLlama's q_proj / k_proj are standalone
+        // parameters whose ONLY gradient path is this softmax — with
+        // the fused kernel they silently never learn.
+        let probs = super::softmax_last_dim_slow(&scores)?;
 
         // Weighted values → merge heads back to [B, T, D].
         let ctx = probs.matmul(&v)?;

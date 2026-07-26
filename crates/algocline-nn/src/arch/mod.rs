@@ -17,8 +17,33 @@
 pub mod adapter;
 pub mod gpt2;
 pub mod lora;
+pub mod moe;
 pub mod tinyllama;
+
+/// Softmax over the last dimension through the backward-safe basic-op
+/// composition (`candle_nn::ops::softmax`), never the fused
+/// `ops::softmax_last_dim`.
+///
+/// Rationale: candle-nn 0.11's `softmax_last_dim` is a `CustomOp1`
+/// registered via `apply_op1_no_bwd` — its output carries
+/// `BackpropOp::none()`, so backward silently treats it as a constant
+/// and every parameter whose only gradient path runs through it
+/// receives no gradient. Same cliff family as the LayerNorm fast path
+/// (`gpt2::apply_slow_layer_norm`) and the TinyLlama RMSNorm / RoPE
+/// shims. Discovered by `tests/moe_grad_coverage.rs`: the MoE router's
+/// only gradient path is its softmax, so the severing that attention
+/// masks (the fused / parallel V path keeps projection gradients
+/// non-zero) showed up as a hard "missing from GradStore".
+///
+/// `ops::softmax` composes `max_keepdim` / `broadcast_sub` / `exp` /
+/// `sum_keepdim` / `broadcast_div`, each with a proper backward.
+pub(crate) fn softmax_last_dim_slow(
+    xs: &candle_core::Tensor,
+) -> candle_core::Result<candle_core::Tensor> {
+    candle_nn::ops::softmax(xs, candle_core::D::Minus1)
+}
 
 pub use gpt2::{Gpt2Config, Gpt2Model};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear, LoraWrappable};
+pub use moe::MoeConfig;
 pub use tinyllama::{TinyLlamaConfig, TinyLlamaModel};

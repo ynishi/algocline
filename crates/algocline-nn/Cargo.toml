@@ -45,6 +45,12 @@ tokenizers = "0.19"
 # See `src/hub.rs` for why hf-hub 0.3/0.4/0.5 cannot fetch from the Hub
 # at all any more (relative-redirect handling).
 ureq = "3"
+# Parquet dataset reader (`train/data.rs::ParquetDataset`). Row API only
+# (default-features off keeps the arrow-* tree out); codec features cover
+# the compressions HF-hosted datasets actually ship (snappy default,
+# zstd increasingly, gzip occasionally, lz4 cheap to include — a file
+# using an unlisted codec fails loudly with the codec name).
+parquet = { version = "59", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs", "lz4"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 

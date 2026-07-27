@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.data.parquet` now reads for real (the scaffold that surfaced
+  `NotImplemented` on iteration is gone). The reader goes through the
+  `parquet` crate's row API with `default-features = false` — no
+  arrow-* tree — with codec features for snappy / zstd / gzip / lz4
+  (a file using another codec fails loudly with the codec name). The
+  column named `text_field` (default `"text"`) is tokenized exactly
+  like the JSONL adapter (`tokenizer` opt, default `"gpt2"`), rows
+  stream row-group by row-group, `shuffle = true` materialises rows
+  first (same deterministic placeholder as JSONL), and `len_hint`
+  reports the footer row count even when streaming. A wrong
+  `text_field` fails at construction naming the available top-level
+  fields; a present-but-non-string column errors with the column kind.
+  Breaking for library consumers of `algocline-nn` only:
+  `ParquetDataset::new` now takes the tokenizer and returns `Result`,
+  and `DatasetError::NotImplemented` was replaced by
+  `DatasetError::Parquet` (the Lua wire surface is unchanged —
+  `alc.nn.data.parquet(path, opts)` keeps its signature and now also
+  accepts the `tokenizer` opt the JSONL entry already had).
 - `alc.nn.preset.gpt2("custom", { ... })` — Lua expose of the
   `Gpt2Custom` architecture spec (nn arch Phase 3). All Phase 1+2 axes
   are settable from a flat opts table (`act` / `norm` / `residual` /

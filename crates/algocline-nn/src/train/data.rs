@@ -17,10 +17,10 @@
 //!   #5); the `algocline-nn` crate does no filesystem access itself.
 //!   The bridge builds a [`TokenizedDataset`] from the pre-tokenized
 //!   rows and hands it back to the trainer.
-//! - Parquet reading is scaffolded (see [`ParquetDataset`]); a later
-//!   stage picks up the concrete reader implementation. Constructing the
-//!   handle is legal, `next_batch` returns an error so no silent
-//!   empty iterator is exposed (Rust exception-free discipline).
+//! - Parquet adapter (see [`ParquetDataset`]) reads the column named
+//!   [`DatasetOpts::text_field`] through the `parquet` crate's row API
+//!   (no arrow dependency) and tokenizes it exactly like the JSONL
+//!   adapter — same field-name convention, same shuffle semantics.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -51,9 +51,10 @@ pub enum DatasetError {
     /// Tokenizer failure while encoding a row.
     #[error("tokenize: {0}")]
     Tokenize(#[from] TokenizerError),
-    /// Feature not implemented yet (e.g. Parquet body).
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
+    /// Parquet schema / decode failure on a Parquet source (open,
+    /// footer parse, row decode, missing or non-string text column).
+    #[error("parquet: {0}")]
+    Parquet(String),
     /// A teacher row's loss mask retains no scored position once the
     /// row is truncated to `ctx_len` and shifted against the targets
     /// (mask position 0 gates no target token). Training on such a row
@@ -365,51 +366,243 @@ impl Dataset for JsonlDataset {
     }
 }
 
-/// Parquet-backed dataset (scaffold).
+/// Parquet-backed dataset.
 ///
-/// A later stage lands the concrete Apache Arrow / Parquet reader
-/// wiring. The current stage exposes the constructor so the Lua
-/// bridge surface is stable — a
-/// `next_batch` call surfaces [`DatasetError::NotImplemented`] instead
-/// of silently returning an empty iterator (Rust exception-free
-/// discipline — no silent drop, per the crate's Service-layer
-/// error-propagation discipline).
+/// Reads the column named [`DatasetOpts::text_field`] via the
+/// `parquet` crate's row API (`SerializedFileReader` → `RowIter`, no
+/// arrow dependency) and tokenizes it like [`JsonlDataset`]. Rows are
+/// streamed row-group by row-group unless [`DatasetOpts::shuffle`] is
+/// set, in which case all rows are materialised first (same semantics
+/// as the JSONL adapter, including its deterministic reverse-order
+/// shuffle placeholder). The text column must exist at the top level
+/// of the file schema — that is checked at construction so a wrong
+/// `text_field` fails before the first training step, not mid-epoch.
 pub struct ParquetDataset {
-    path: PathBuf,
+    rows_iter: Option<parquet::record::reader::RowIter<'static>>,
+    buffer: Vec<Vec<u32>>,
+    buffer_cursor: usize,
     opts: DatasetOpts,
+    tokenizer: HfTokenizer,
+    path: PathBuf,
+    row_index: usize,
+    total_rows: usize,
+}
+
+impl std::fmt::Debug for ParquetDataset {
+    // Manual impl: `RowIter` / `HfTokenizer` carry no `Debug`, and the
+    // useful state for a failure message is the source + progress.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetDataset")
+            .field("path", &self.path)
+            .field("total_rows", &self.total_rows)
+            .field("row_index", &self.row_index)
+            .field("shuffle", &self.opts.shuffle)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ParquetDataset {
-    /// Record the source path + iteration opts; defer the reader open
-    /// to a later stage.
-    pub fn new(path: &Path, opts: DatasetOpts) -> Self {
-        Self {
-            path: path.to_path_buf(),
+    /// Open `path`, verify the schema carries `opts.text_field` as a
+    /// top-level field, and set up row iteration. When `opts.shuffle`
+    /// is `true` the full file is parsed and tokenized eagerly so rows
+    /// can be re-ordered; otherwise the row iterator is retained and
+    /// batches stream.
+    pub fn new(
+        path: &Path,
+        opts: DatasetOpts,
+        tokenizer: HfTokenizer,
+    ) -> Result<Self, DatasetError> {
+        use parquet::file::reader::FileReader;
+
+        let file =
+            File::open(path).map_err(|e| DatasetError::Io(format!("open {:?}: {e}", path)))?;
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(file)
+            .map_err(|e| DatasetError::Parquet(format!("open {:?}: {e}", path)))?;
+
+        let file_meta = reader.metadata().file_metadata();
+        let total_rows = usize::try_from(file_meta.num_rows()).unwrap_or(0);
+        let schema = file_meta.schema();
+        if !schema
+            .get_fields()
+            .iter()
+            .any(|f| f.name() == opts.text_field)
+        {
+            let available: Vec<&str> = schema.get_fields().iter().map(|f| f.name()).collect();
+            return Err(DatasetError::Parquet(format!(
+                "text field '{}' not found in the schema of {:?} (top-level fields: {})",
+                opts.text_field,
+                path,
+                available.join(", ")
+            )));
+        }
+
+        let rows_iter = parquet::record::reader::RowIter::from_file_into(Box::new(reader));
+        let mut this = Self {
+            rows_iter: Some(rows_iter),
+            buffer: Vec::new(),
+            buffer_cursor: 0,
             opts,
+            tokenizer,
+            path: path.to_path_buf(),
+            row_index: 0,
+            total_rows,
+        };
+        if this.opts.shuffle {
+            this.materialize_all()?;
+        }
+        Ok(this)
+    }
+
+    fn materialize_all(&mut self) -> Result<(), DatasetError> {
+        let Some(iter) = self.rows_iter.take() else {
+            return Ok(());
+        };
+        let mut rows: Vec<Vec<u32>> = Vec::new();
+        for (idx, row) in iter.enumerate() {
+            let row = row.map_err(|e| {
+                DatasetError::Parquet(format!("record {idx} in {:?}: {e}", self.path))
+            })?;
+            let text = row_text(&row, &self.opts.text_field, idx)?;
+            rows.push(self.tokenizer.encode(text)?);
+        }
+        // Reverse ordering as a deterministic "shuffle" placeholder;
+        // a later stage wires a real RNG seed once the trainer opts
+        // land (same placeholder as `JsonlDataset::materialize_all`).
+        rows.reverse();
+        self.total_rows = rows.len();
+        self.buffer = rows;
+        self.buffer_cursor = 0;
+        Ok(())
+    }
+
+    fn fill_batch_streaming(&mut self) -> Result<Vec<Vec<u32>>, DatasetError> {
+        let mut rows = Vec::with_capacity(self.opts.batch_size);
+        let Some(iter) = self.rows_iter.as_mut() else {
+            return Ok(rows);
+        };
+        while rows.len() < self.opts.batch_size {
+            match iter.next() {
+                None => break,
+                Some(Err(e)) => {
+                    return Err(DatasetError::Parquet(format!(
+                        "record {} in {:?}: {e}",
+                        self.row_index, self.path
+                    )))
+                }
+                Some(Ok(row)) => {
+                    let idx = self.row_index;
+                    self.row_index += 1;
+                    let text = row_text(&row, &self.opts.text_field, idx)?;
+                    rows.push(self.tokenizer.encode(text)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// Extract the text column value from a decoded row. Field lookup is
+/// by name (row column order follows the file schema, not
+/// `DatasetOpts`); a present-but-non-string value is a schema error,
+/// reported by kind so a multi-megabyte binary cell never lands in the
+/// error string.
+fn row_text<'a>(
+    row: &'a parquet::record::Row,
+    text_field: &str,
+    idx: usize,
+) -> Result<&'a str, DatasetError> {
+    for (name, field) in row.get_column_iter() {
+        if name == text_field {
+            return match field {
+                parquet::record::Field::Str(s) => Ok(s.as_str()),
+                parquet::record::Field::Null => Err(DatasetError::Parquet(format!(
+                    "record {idx}: column '{text_field}' is null"
+                ))),
+                other => Err(DatasetError::Parquet(format!(
+                    "record {idx}: column '{text_field}' is not a UTF-8 string \
+                     (found {})",
+                    field_kind(other)
+                ))),
+            };
         }
     }
+    // The constructor verified the schema, so a decoded row missing the
+    // column indicates file corruption rather than caller error.
+    Err(DatasetError::MissingField {
+        field: text_field.to_string(),
+        index: idx,
+    })
+}
 
-    /// Requested batch size (accessor for the bridge surface).
-    pub fn batch_size(&self) -> usize {
-        self.opts.batch_size
-    }
-
-    /// Source path (accessor for the bridge surface).
-    pub fn path(&self) -> &Path {
-        &self.path
+/// Short kind label for a decoded Parquet field, for error messages.
+fn field_kind(field: &parquet::record::Field) -> &'static str {
+    use parquet::record::Field;
+    match field {
+        Field::Null => "null",
+        Field::Bool(_) => "bool",
+        Field::Byte(_) | Field::Short(_) | Field::Int(_) | Field::Long(_) => "int",
+        Field::UByte(_) | Field::UShort(_) | Field::UInt(_) | Field::ULong(_) => "uint",
+        Field::Float16(_) | Field::Float(_) | Field::Double(_) => "float",
+        Field::Decimal(_) => "decimal",
+        Field::Str(_) => "string",
+        Field::Bytes(_) => "bytes",
+        Field::Date(_)
+        | Field::TimeMillis(_)
+        | Field::TimeMicros(_)
+        | Field::TimestampMillis(_)
+        | Field::TimestampMicros(_) => "timestamp",
+        Field::Group(_) => "group",
+        Field::ListInternal(_) => "list",
+        Field::MapInternal(_) => "map",
     }
 }
 
 impl Dataset for ParquetDataset {
     fn next_batch(&mut self) -> Result<Option<Batch>, DatasetError> {
-        Err(DatasetError::NotImplemented(format!(
-            "parquet reader for {:?} — deferred to a later stage",
-            self.path
-        )))
+        // Shuffle path — everything is in `buffer`.
+        if self.opts.shuffle {
+            if self.buffer_cursor >= self.buffer.len() {
+                return Ok(None);
+            }
+            let start = self.buffer_cursor;
+            let end = (start + self.opts.batch_size).min(self.buffer.len());
+            self.buffer_cursor = end;
+            let ctx = self.opts.ctx_len;
+            let pad = self.opts.pad_id;
+            let input_ids = self.buffer[start..end]
+                .iter()
+                .map(|row| pad_or_truncate(row, ctx, pad))
+                .collect();
+            return Ok(Some(Batch {
+                input_ids,
+                loss_mask: None,
+                is_last: end == self.buffer.len(),
+            }));
+        }
+
+        // Streaming path — pull the next `batch_size` rows.
+        let rows = self.fill_batch_streaming()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let ctx = self.opts.ctx_len;
+        let pad = self.opts.pad_id;
+        let short_batch = rows.len() < self.opts.batch_size;
+        let input_ids = rows
+            .iter()
+            .map(|row| pad_or_truncate(row, ctx, pad))
+            .collect();
+        Ok(Some(Batch {
+            input_ids,
+            loss_mask: None,
+            is_last: short_batch,
+        }))
     }
 
     fn len_hint(&self) -> Option<usize> {
-        None
+        // Row count comes from the file footer at open time, so it is
+        // known even on the streaming path (unlike JSONL).
+        Some(self.total_rows)
     }
 }
 
@@ -605,16 +798,9 @@ mod tests {
         assert_eq!(b.input_ids[0], vec![1, 2, 3]);
     }
 
-    #[test]
-    fn parquet_scaffold_errors_on_iteration() {
-        let mut ds = ParquetDataset::new(
-            Path::new("/does/not/matter.parquet"),
-            DatasetOpts::default(),
-        );
-        let err = ds.next_batch().unwrap_err();
-        assert!(matches!(err, DatasetError::NotImplemented(_)));
-        assert!(ds.len_hint().is_none());
-    }
+    // ParquetDataset coverage lives in `tests/dataset_iter.rs`, which
+    // writes real parquet fixtures + a WordLevel tokenizer fixture and
+    // exercises the full read → tokenize → batch path offline.
 
     fn teacher_opts(ctx_len: usize) -> DatasetOpts {
         DatasetOpts {

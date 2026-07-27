@@ -2719,12 +2719,21 @@ fn register_data_ns(
     )?;
     data.set("jsonl", jsonl)?;
 
-    // parquet(path, opts) — scaffold only; iteration surfaces
-    // NotImplemented until a later stage wires the reader.
+    // parquet(path, opts) — reads the `text_field` column via the
+    // parquet row API, tokenizing each row. Same opts shape as jsonl
+    // (`tokenizer` defaults to "gpt2").
+    let parquet_tok_dir = nn_dir.join("tokenizers");
     let parquet = lua.create_function(
         move |_lua, (path, opts): (String, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
             let dopts = extract_dataset_opts(opts.as_ref())?;
-            let ds = ParquetDataset::new(std::path::Path::new(&path), dopts.clone());
+            let tokenizer_name = opts
+                .as_ref()
+                .and_then(|t| t.get::<Option<String>>("tokenizer").ok().flatten())
+                .unwrap_or_else(|| "gpt2".to_string());
+            let tok = HfTokenizer::load_cached(&tokenizer_name, &parquet_tok_dir)
+                .map_err(|e| LuaError::external(format!("alc.nn.data.parquet: {e}")))?;
+            let ds = ParquetDataset::new(std::path::Path::new(&path), dopts.clone(), tok)
+                .map_err(|e| LuaError::external(format!("alc.nn.data.parquet: {e}")))?;
             Ok(DatasetHandle {
                 inner: Mutex::new(Box::new(ds)),
                 source: format!("parquet:{path}"),

@@ -221,9 +221,8 @@ fn run_lora_ft_impl(
         )));
     }
 
-    // 4.5. Reject bf16 base handles (bf16 is inference-only on the
-    //      current trainer path; candle would otherwise fail deep in a
-    //      backward pass with a raw dtype error).
+    // 4.5. Reject f16 base handles (no loss scaling ships; f32 and
+    //      bf16 both train — bf16 through the FP32-master MixedAdamW).
     guard_base_dtype_for_training("alc.nn.trainer.run_lora_ft", &handle)?;
 
     // 5. Downcast dataset to the shared DatasetHandle userdata that
@@ -698,8 +697,8 @@ fn run_full_ft_impl(
         )));
     }
 
-    // 4.5. Reject bf16 base handles (see `run_lora_ft_impl` for
-    //      rationale — bf16 trainer path is not supported).
+    // 4.5. Reject f16 base handles (see `run_lora_ft_impl` for
+    //      rationale — f32 / bf16 train, f16 has no loss scaler).
     guard_base_dtype_for_training("alc.nn.trainer.run_full_ft", &handle)?;
 
     // 5. Dataset downcast to the shared DatasetHandle userdata.
@@ -1049,8 +1048,8 @@ fn run_distill_impl(
         )));
     }
 
-    // 4.5. Reject bf16 student handles (see `run_lora_ft_impl` for
-    //      rationale — bf16 trainer path is not supported).
+    // 4.5. Reject f16 student handles (see `run_lora_ft_impl` for
+    //      rationale — f32 / bf16 train, f16 has no loss scaler).
     guard_base_dtype_for_training("alc.nn.trainer.run_distill", &handle)?;
 
     // 5. Dataset downcast to the shared DatasetHandle userdata.
@@ -2195,28 +2194,30 @@ mod run_ft_bridge_tests {
         );
     }
 
-    // ─── bf16 base handle guard (step 4.5) ────────────────────────
+    // ─── f16 base handle guard (step 4.5) ─────────────────────────
     //
-    // Sibling coverage to `wrap_lora_bridge_tests::wrap_lora_rejects_bf16_base_*`.
-    // The bf16 guard fires between the Llama refusal (step 4) and
+    // Sibling coverage to `wrap_lora_bridge_tests::wrap_lora_rejects_f16_base_*`.
+    // The f16 guard fires between the Llama refusal (step 4) and
     // the dataset downcast (step 5), so these tests pass
     // `LuaValue::Nil` for the dataset — the guard errors before the
-    // dataset is even inspected.
+    // dataset is even inspected. BF16 passes this guard (the mixed-
+    // precision trainer path handles it) — pinned by the bf16 test
+    // below, which must fail *later* than the dtype guard.
 
-    fn assert_bf16_refusal(prefix: &str, msg: &str) {
+    fn assert_f16_refusal(prefix: &str, msg: &str) {
         assert!(
             msg.contains(prefix)
-                && msg.contains("training requires an f32 base (got bf16)")
-                && msg.contains(r#"dtype="f32""#),
-            "expected bf16 refusal from {prefix}, got: {msg}"
+                && msg.contains("training does not support an f16 base")
+                && msg.contains(r#"dtype="bf16""#),
+            "expected f16 refusal from {prefix}, got: {msg}"
         );
     }
 
     #[test]
-    fn run_lora_ft_rejects_bf16_base() {
+    fn run_lora_ft_rejects_f16_base() {
         let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
-        let base_bf16 = gpt2_handle_with_dtype(base, "bf16");
-        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_bf16)).unwrap();
+        let base_f16 = gpt2_handle_with_dtype(base, "f16");
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_f16)).unwrap();
         let opts = opts_table(&lua, base_train_opts());
         let msg = expect_err(run_lora_ft_impl(
             &store,
@@ -2225,16 +2226,16 @@ mod run_ft_bridge_tests {
             &LuaValue::Nil,
             opts,
         ));
-        assert_bf16_refusal("alc.nn.trainer.run_lora_ft:", &msg);
+        assert_f16_refusal("alc.nn.trainer.run_lora_ft:", &msg);
     }
 
     #[test]
-    fn run_lora_ft_rejects_bf16_base_case_insensitive_tinyllama() {
+    fn run_lora_ft_rejects_f16_base_case_insensitive_tinyllama() {
         let (_tmp, store, nn_dir, base, lua) = setup_tinyllama_scaffold();
-        // Upstream may stringify bf16 as `"BF16"` (uppercase). The
+        // Upstream may stringify f16 as `"F16"` (uppercase). The
         // guard must fire regardless of case.
-        let base_bf16 = tinyllama_handle_with_dtype(base, "BF16");
-        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base_bf16)).unwrap();
+        let base_f16 = tinyllama_handle_with_dtype(base, "F16");
+        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base_f16)).unwrap();
         let opts = opts_table(&lua, base_train_opts());
         let msg = expect_err(run_lora_ft_impl(
             &store,
@@ -2243,11 +2244,46 @@ mod run_ft_bridge_tests {
             &LuaValue::Nil,
             opts,
         ));
-        assert_bf16_refusal("alc.nn.trainer.run_lora_ft:", &msg);
+        assert_f16_refusal("alc.nn.trainer.run_lora_ft:", &msg);
     }
 
     #[test]
-    fn run_full_ft_rejects_bf16_base() {
+    fn run_full_ft_rejects_f16_base() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let base_f16 = gpt2_handle_with_dtype(base, "f16");
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_f16)).unwrap();
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::Nil,
+            opts,
+        ));
+        assert_f16_refusal("alc.nn.trainer.run_full_ft:", &msg);
+    }
+
+    #[test]
+    fn run_distill_rejects_f16_base() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let base_f16 = gpt2_handle_with_dtype(base, "f16");
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_f16)).unwrap();
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let msg = expect_err(run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::Nil,
+            opts,
+        ));
+        assert_f16_refusal("alc.nn.trainer.run_distill:", &msg);
+    }
+
+    /// BF16 must pass the dtype guard: with a `Nil` dataset the run
+    /// proceeds past step 4.5 and fails at the dataset downcast
+    /// (step 5) instead — proving the guard no longer fires on bf16.
+    #[test]
+    fn run_full_ft_bf16_base_passes_dtype_guard() {
         let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
         let base_bf16 = gpt2_handle_with_dtype(base, "bf16");
         let base_ud = lua.create_userdata(NnHandle::Gpt2(base_bf16)).unwrap();
@@ -2259,22 +2295,9 @@ mod run_ft_bridge_tests {
             &LuaValue::Nil,
             opts,
         ));
-        assert_bf16_refusal("alc.nn.trainer.run_full_ft:", &msg);
-    }
-
-    #[test]
-    fn run_distill_rejects_bf16_base() {
-        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
-        let base_bf16 = gpt2_handle_with_dtype(base, "bf16");
-        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_bf16)).unwrap();
-        let opts = opts_table(&lua, base_full_ft_opts());
-        let msg = expect_err(run_distill_impl(
-            &store,
-            &nn_dir,
-            &LuaValue::UserData(base_ud),
-            &LuaValue::Nil,
-            opts,
-        ));
-        assert_bf16_refusal("alc.nn.trainer.run_distill:", &msg);
+        assert!(
+            !msg.contains("f16 base") && !msg.contains("f32 base"),
+            "bf16 must not trip the dtype guard, got: {msg}"
+        );
     }
 }

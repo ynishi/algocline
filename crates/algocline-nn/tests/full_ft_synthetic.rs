@@ -23,13 +23,23 @@ use tempfile::TempDir;
 /// Build a tiny GPT-2 model on CPU together with the VarMap that owns
 /// its parameters.
 fn tiny_model() -> (Gpt2Config, VarMap, Gpt2Model) {
+    tiny_model_with_dtype(DType::F32)
+}
+
+/// Same tiny shape with a caller-picked parameter dtype. Note that
+/// candle 0.11's CPU backend has no BF16 matmul, so a BF16 GPT-2 only
+/// forwards on CUDA (which is what the bridge's device/dtype matrix
+/// guard enforces at the preset entrypoints); the F16 shape below is
+/// buildable on CPU and exists to exercise the trainer's up-front
+/// refusal.
+fn tiny_model_with_dtype(dtype: DType) -> (Gpt2Config, VarMap, Gpt2Model) {
     let cfg = Gpt2Config {
         layers: 2,
         heads: 2,
         dim: 16,
         ctx: 8,
         vocab: 24,
-        dtype: DType::F32,
+        dtype,
         device: Device::Cpu,
         eps: 1e-5,
         moe: None,
@@ -159,6 +169,154 @@ fn synthetic_run_reduces_loss_and_saves_final_bundle() {
         .expect("final_lr metric must be recorded");
     assert!(final_lr.is_finite());
     assert!(final_lr >= 0.0);
+}
+
+/// Toy learnable-unigram model for the offline BF16 loop fence.
+///
+/// candle 0.11's CPU backend has no BF16 matmul, so a real GPT-2
+/// cannot forward in BF16 off-GPU (the A40 smoke runbook covers that
+/// half). What CAN be fenced offline is everything the mixed path
+/// adds around the model: the dtype-driven optimizer dispatch in
+/// `run_ft_core`, the F32 loss cast, `MixedAdamW`'s master-weight
+/// updates through a real `loss.backward()`, and the BF16 checkpoint
+/// save. This model produces `[b, t, vocab]` logits by broadcasting a
+/// single BF16 bias vector — `broadcast_add` / sum-reduction are BF16-
+/// supported on CPU — and overfits toward the corpus marginal.
+struct UnigramModel {
+    /// `[vocab]` bias, registered against the test's VarMap (BF16).
+    bias: Tensor,
+    vocab: usize,
+    device: Device,
+}
+
+impl candle_nn::Module for UnigramModel {
+    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        let (b, t) = xs.dims2()?;
+        let zeros = Tensor::zeros((b, t, self.vocab), self.bias.dtype(), &self.device)?;
+        zeros.broadcast_add(&self.bias)
+    }
+}
+
+impl algocline_nn::train::DeviceView for UnigramModel {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+/// Mixed-precision loop fence (design §7.1): BF16 parameters train
+/// through `run_full_ft` → `MixedAdamW` on CPU. Loss must drop toward
+/// the corpus marginal entropy, the parameter must stay BF16, and the
+/// terminal bundle must carry BF16 tensors.
+#[test]
+fn bf16_synthetic_run_reduces_loss_through_mixed_adamw() {
+    let device = Device::Cpu;
+    let vocab = 24usize;
+    let vm = VarMap::new();
+    let vb = VarBuilder::from_varmap(&vm, DType::BF16, &device);
+    let bias = vb
+        .get_with_hints(vocab, "bias", candle_nn::Init::Const(0.0))
+        .expect("register bf16 bias");
+    let model = UnigramModel {
+        bias,
+        vocab,
+        device: device.clone(),
+    };
+
+    // Uniform logits at init: CE = ln(vocab) ≈ 3.178. The repeated
+    // corpus row has 7 distinct target tokens uniformly, so the
+    // optimum sits near ln(7) ≈ 1.946 — a big, assertable gap.
+    let baseline = (vocab as f32).ln();
+
+    let mut dataset = TokenizedDataset::new(synthetic_corpus(500), dataset_opts_for_seq(8));
+    let loss = CrossEntropyLoss::new();
+    let ft_cfg = FullFtConfig {
+        lr: 5e-2,
+        batch_size: 1,
+        grad_accum: 1,
+        steps: 200,
+        warmup: 5,
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+
+    let ckpt = run_full_ft(
+        &model,
+        &vm,
+        &mut dataset,
+        &ft_cfg,
+        &loss,
+        tmp.path(),
+        "bf16_synthetic",
+        lease,
+    )
+    .expect("bf16 training must complete");
+
+    let min_loss = *ckpt
+        .metrics
+        .get("min_train_loss")
+        .expect("min_train_loss metric must be recorded");
+    assert!(
+        min_loss < baseline * 0.8,
+        "expected bf16 training to drive loss under 0.8 * ln(vocab); got \
+         min_train_loss={min_loss}, baseline={baseline}"
+    );
+
+    // Parameters stayed BF16 (MixedAdamW writes the downcast master
+    // back), and the saved bundle carries BF16 tensors.
+    for var in vm.all_vars() {
+        assert_eq!(var.dtype(), DType::BF16, "var drifted off bf16");
+    }
+    let final_path = tmp.path().join("bf16_synthetic.safetensors");
+    let loaded =
+        candle_core::safetensors::load(&final_path, &Device::Cpu).expect("load terminal bundle");
+    let (name, tensor) = loaded.iter().next().expect("bundle has tensors");
+    assert_eq!(
+        tensor.dtype(),
+        DType::BF16,
+        "bundle tensor '{name}' must be bf16"
+    );
+}
+
+/// F16 parameters are refused before the first forward pass — no loss
+/// scaler ships, so accepting them would train into silent gradient
+/// underflow instead of erroring.
+#[test]
+fn f16_params_refused_before_training_starts() {
+    let (_cfg, vm, model) = tiny_model_with_dtype(DType::F16);
+    let mut dataset = TokenizedDataset::new(synthetic_corpus(10), dataset_opts_for_seq(8));
+    let loss = CrossEntropyLoss::new();
+    let ft_cfg = FullFtConfig {
+        steps: 5,
+        warmup: 1,
+        lr: 1e-3,
+        ..FullFtConfig::default()
+    };
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+
+    let err = match run_full_ft(
+        &model,
+        &vm,
+        &mut dataset,
+        &ft_cfg,
+        &loss,
+        tmp.path(),
+        "f16_refused",
+        lease,
+    ) {
+        Ok(_) => panic!("expected f16 refusal"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("f16") && msg.contains("loss scaling"),
+        "unexpected error: {msg}"
+    );
+    assert!(!tmp.path().join("f16_refused.safetensors").exists());
 }
 
 #[test]

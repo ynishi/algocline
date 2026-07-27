@@ -22,6 +22,7 @@ use std::collections::HashMap;
 pub mod ckpt;
 pub mod data;
 pub mod loss;
+pub mod mixed;
 pub mod scheduler;
 
 #[path = "loop.rs"]
@@ -82,4 +83,5 @@ pub use fullft::{
     TrainingLease, TrainingLeaseGuard,
 };
 pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};
+pub use mixed::MixedAdamW;
 pub use scheduler::{ScheduleKind, Scheduler};

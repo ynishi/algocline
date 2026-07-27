@@ -115,8 +115,8 @@ fn wrap_lora_impl(base: &LuaValue, opts: LuaTable) -> LuaResult<NnHandle> {
         )));
     }
 
-    // 4.5. Reject bf16 base handles at the trainer entrypoint (bf16 is
-    //      inference-only on the current trainer path). Sibling to the
+    // 4.5. Reject f16 base handles at the trainer entrypoint (no loss
+    //      scaling ships; f32 / bf16 both train). Sibling to the
     //      preset-build-time `guard_device_dtype_matrix` guard.
     guard_base_dtype_for_training("alc.nn.wrap_lora", &handle)?;
 
@@ -457,36 +457,36 @@ mod wrap_lora_bridge_tests {
         );
     }
 
-    // ─── bf16 base handle guard (step 4.5) ─────────────────────────
+    // ─── f16 base handle guard (step 4.5) ──────────────────────────
 
     #[test]
-    fn wrap_lora_rejects_bf16_base_gpt2() {
+    fn wrap_lora_rejects_f16_base_gpt2() {
         let (_tmp, base, lua) = setup_gpt2_base_scaffold();
-        let base_bf16 = gpt2_handle_with_dtype(base, "bf16");
-        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_bf16)).unwrap();
+        let base_f16 = gpt2_handle_with_dtype(base, "f16");
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base_f16)).unwrap();
         let opts = opts_table(&lua, json!({ "rank": 4, "alpha": 8.0 }));
         let msg = expect_err(wrap_lora_impl(&LuaValue::UserData(base_ud), opts));
         assert!(
             msg.contains("alc.nn.wrap_lora:")
-                && msg.contains("training requires an f32 base (got bf16)")
-                && msg.contains(r#"dtype="f32""#),
-            "expected bf16 refusal, got: {msg}"
+                && msg.contains("training does not support an f16 base")
+                && msg.contains(r#"dtype="bf16""#),
+            "expected f16 refusal, got: {msg}"
         );
     }
 
     #[test]
-    fn wrap_lora_rejects_bf16_base_tinyllama_case_insensitive() {
+    fn wrap_lora_rejects_f16_base_tinyllama_case_insensitive() {
         let (_tmp, base, lua) = setup_tinyllama_base_scaffold();
         // Case-insensitive match ensures upstream stringifications like
-        // `"BF16"` / `"Bf16"` are also caught.
-        let base_bf16 = tinyllama_handle_with_dtype(base, "BF16");
-        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base_bf16)).unwrap();
+        // `"F16"` are also caught.
+        let base_f16 = tinyllama_handle_with_dtype(base, "F16");
+        let base_ud = lua.create_userdata(NnHandle::TinyLlama(base_f16)).unwrap();
         let opts = opts_table(&lua, json!({ "rank": 4, "alpha": 8.0 }));
         let msg = expect_err(wrap_lora_impl(&LuaValue::UserData(base_ud), opts));
         assert!(
             msg.contains("alc.nn.wrap_lora:")
-                && msg.contains("training requires an f32 base (got bf16)"),
-            "expected bf16 refusal (case-insensitive), got: {msg}"
+                && msg.contains("training does not support an f16 base"),
+            "expected f16 refusal (case-insensitive), got: {msg}"
         );
     }
 

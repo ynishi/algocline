@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Mixed-precision BF16 training (design §7.1): the trainer entrypoints
+  (`alc.nn.trainer.full_ft` / `.lora` / `run_lora_ft` / `run_distill` /
+  `alc.nn.wrap_lora`) now accept a BF16 base handle. The training loop
+  picks its optimizer by parameter dtype — F32 keeps the stock
+  candle-nn AdamW bit-identical, BF16 routes through the new
+  `MixedAdamW` (FP32 master weights + FP32 moments, gradients upcast
+  per step, updated master cast back into the live parameters), and
+  the loss (log_softmax + NLL) is always scored in F32. LoRA adapters
+  inherit the base dtype, so a BF16 LoRA / distill run goes through
+  the same mixed path. BF16 checkpoints save as BF16 safetensors.
+  Behavior changes: the trainer-entry guard that refused bf16
+  (`training requires an f32 base`) is gone, and an **f16** base —
+  previously unguarded at trainer entry — is now refused up front with
+  a directional message (f16 needs loss scaling, which does not ship;
+  bf16 shares f32's exponent range and trains without a scaler).
+  Note candle 0.11 has no CPU BF16 matmul, so BF16 runs are CUDA-side
+  in practice (the preset device/dtype matrix already enforces bf16 →
+  CUDA); the offline regression fence covers the optimizer math
+  (F32-parity vs stock AdamW, master-precision retention) and the
+  full `run_full_ft` BF16 loop on a matmul-free toy model.
+  Gradient checkpointing (the other half of design §7.1) is NOT
+  included: candle 0.11 has no recompute-in-backward hook, so it is
+  deferred to its own issue rather than shipped as a fragile autograd
+  workaround.
 - `alc.nn.data.parquet` now reads for real (the scaffold that surfaced
   `NotImplemented` on iteration is gone). The reader goes through the
   `parquet` crate's row API with `default-features = false` — no

@@ -26,9 +26,60 @@ use crate::arch::{LoraConfig, LoraWrappable};
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
+use crate::train::mixed::MixedAdamW;
 use crate::train::scheduler::{ScheduleKind, Scheduler};
 use crate::train::Checkpoint;
 use crate::train::DeviceView;
+
+/// Optimizer flavour selected by the parameter dtype (design §7.1).
+///
+/// - All-F32 vars → the stock [`candle_nn::AdamW`], keeping the
+///   established baseline bit-identical.
+/// - All-BF16 vars → [`MixedAdamW`] (FP32 master weights + FP32
+///   moments; gradients upcast per step).
+/// - Anything else (F16, F64, a mixed set) is a loud
+///   [`TrainError::Candle`]: stock AdamW on BF16 keeps its moments in
+///   BF16 and stalls silently, and F16 needs a loss scaler that does
+///   not ship here.
+enum FtOptimizer {
+    Stock(AdamW),
+    Mixed(MixedAdamW),
+}
+
+impl FtOptimizer {
+    fn for_vars(vars: Vec<candle_core::Var>, params: ParamsAdamW) -> Result<Self, TrainError> {
+        let mut dtypes: Vec<DType> = vars.iter().map(|v| v.dtype()).collect();
+        dtypes.sort_by_key(|d| format!("{d:?}"));
+        dtypes.dedup();
+        match dtypes.as_slice() {
+            [DType::F32] => Ok(Self::Stock(AdamW::new(vars, params)?)),
+            [DType::BF16] => Ok(Self::Mixed(MixedAdamW::new(vars, params)?)),
+            [DType::F16] => Err(TrainError::Candle(
+                "run_ft_core: f16 parameters need loss scaling, which is not \
+                 implemented — build the model with dtype bf16 (CUDA) or f32"
+                    .into(),
+            )),
+            other => Err(TrainError::Candle(format!(
+                "run_ft_core: unsupported parameter dtype set {other:?} \
+                 (expected all-f32 or all-bf16)"
+            ))),
+        }
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        match self {
+            Self::Stock(o) => o.set_learning_rate(lr),
+            Self::Mixed(o) => o.set_learning_rate(lr),
+        }
+    }
+
+    fn backward_step(&mut self, loss: &Tensor) -> CandleResult<()> {
+        match self {
+            Self::Stock(o) => o.backward_step(loss),
+            Self::Mixed(o) => o.backward_step(loss),
+        }
+    }
+}
 
 /// Hyperparameters for [`run_full_ft`].
 ///
@@ -266,15 +317,19 @@ where
     }
 
     // AdamW picks up its `lr` from the config once and then follows
-    // `set_learning_rate` at each step.
-    let mut opt = AdamW::new(
-        vars,
-        ParamsAdamW {
-            lr: cfg.lr,
-            weight_decay: cfg.weight_decay,
-            ..Default::default()
-        },
-    )?;
+    // `set_learning_rate` at each step. The optimizer flavour is
+    // driven by the parameter dtype (design §7.1): F32 keeps the
+    // stock candle-nn AdamW (bit-identical baseline), BF16 routes
+    // through the FP32-master [`MixedAdamW`]. Anything else is a
+    // loud error — stock AdamW on BF16 vars would keep its moments
+    // in BF16 and stall silently, and F16 needs a loss scaler that
+    // does not ship here.
+    let adamw_params = ParamsAdamW {
+        lr: cfg.lr,
+        weight_decay: cfg.weight_decay,
+        ..Default::default()
+    };
+    let mut opt = FtOptimizer::for_vars(vars, adamw_params)?;
 
     let scheduler = Scheduler::new(cfg.schedule, cfg.lr, 0.0, cfg.warmup, cfg.steps);
 
@@ -299,6 +354,17 @@ where
 
         let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
         let logits = model.forward(&inputs)?;
+        // Mixed precision: the loss (log_softmax + NLL reduction) is
+        // always scored in F32 — BF16's 8 mantissa bits are too coarse
+        // for a mean over thousands of log-probs. `to_dtype` is
+        // differentiable, so the backward pass crosses back into the
+        // model's dtype at this boundary. F32 logits pass through
+        // untouched.
+        let logits = if logits.dtype() == DType::F32 {
+            logits
+        } else {
+            logits.to_dtype(DType::F32)?
+        };
         let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
 
         let loss_val: f32 = loss.to_scalar()?;

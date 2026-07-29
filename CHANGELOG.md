@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema / regex) and Layer 3 (schedule / mid-generation sampler swap
   from Lua) attach later as additional `impl Sampler` types (including
   a Lua-callback bridge on the engine side) without changing the trait.
+- Sampler Layer 2 scaffold (`sampling::constraint`): a `Constraint`
+  trait (`mask(prefix)` + `is_terminal(prefix)`) and a
+  `ConstrainedSampler<S, C>` wrapper that masks logits before
+  delegating to any Layer 1 sampler. Masks are sparse
+  (`TokenMask::AllowAll` / `Deny(ids)` / `Allow(ids)`) so the common
+  no-masking step passes the caller's tensor through untouched instead
+  of materialising a vocab-sized mask per token. A mask that leaves no
+  valid token (`Allow` of an empty set, `Deny` covering the full
+  vocab) and out-of-range token ids are refused loudly rather than
+  falling back to argmax. First constraint shipped:
+  `StopTokensConstraint`, which never masks (the stop token itself is
+  sampled, matching llama.cpp semantics) and flips `is_terminal` once
+  the generated prefix ends on a stop token.
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

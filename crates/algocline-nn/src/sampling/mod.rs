@@ -5,15 +5,16 @@
 //! loop — the sampler holds no cache, no state beyond its own RNG, and
 //! no dependency on the specific adapter that produced the logits.
 //!
-//! # Layer 1 of the Sampler 3-layer plan
+//! # The Sampler 3-layer plan
 //!
 //! - **Layer 1 (this module)** — [`Sampler`] trait + Rust default
-//!   implementations (`GreedySampler` / `TemperatureSampler` /
-//!   `TopKTopPSampler`). Every consumer starts here.
-//! - **Layer 2 (constraint DSL, future)** — grammar / JSON schema /
-//!   regex / stop-token filters that mask logits before this layer
-//!   picks. Composes as a wrapper `Sampler` that mutates logits and
-//!   delegates.
+//!   implementations ([`GreedySampler`] / [`TemperatureSampler`] /
+//!   [`TopKTopPSampler`]). Every consumer starts here.
+//! - **Layer 2 ([`constraint`])** — filters that mask logits before a
+//!   Layer 1 sampler picks, wired in through [`ConstrainedSampler`],
+//!   itself a `Sampler`. [`StopTokensConstraint`] is the first
+//!   [`Constraint`] to land; regex / JSON schema / GBNF grammars are
+//!   future additions behind the same trait.
 //! - **Layer 3 (schedule / mid-generation swap, future)** — Lua-side
 //!   state machines that swap the active `Sampler` per token position.
 //!   Requires the generation loop to be reified before it lands.
@@ -35,10 +36,14 @@
 //! given the state semantics) is expected to serialise access
 //! themselves.
 
+pub mod constraint;
+
 use candle_core::{DType, Result as CandleResult, Tensor};
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::StdRng;
+
+pub use constraint::{ConstrainedSampler, Constraint, StopTokensConstraint, TokenMask};
 
 /// Next-token sampler.
 ///
@@ -54,8 +59,9 @@ use rand::rngs::StdRng;
 ///   split by the caller (one `sample` call per batch row).
 /// - The returned `u32` MUST be a valid vocab index (`0..vocab`). Every
 ///   impl here upholds this by construction; a Layer-2 constraint that
-///   masks *every* logit to `-inf` would produce NaNs on softmax and is
-///   a caller error.
+///   masks *every* logit to `-inf` would produce NaNs on softmax, so
+///   [`ConstrainedSampler`] rejects such a mask before it reaches an
+///   inner sampler.
 pub trait Sampler {
     /// Sample a single token id from `logits`.
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32>;

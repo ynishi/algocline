@@ -57,7 +57,7 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 
 pub mod llama;
 
-pub use llama::{LlamaAdapter, LlamaAdapterConfig};
+pub use llama::{LlamaAdapter, LlamaAdapterConfig, LlamaCache};
 
 /// Caller-visible shape of the logits an adapter's `forward` returns.
 ///

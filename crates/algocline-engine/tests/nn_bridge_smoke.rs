@@ -66,6 +66,54 @@ fn production_vm() -> (Lua, tempfile::TempDir) {
     (lua, tmp)
 }
 
+/// Hand-authored `tokenizers` fixture (WordLevel + WhitespaceSplit),
+/// mirroring the one `bridge/nn_card.rs` tests use. Seeded on disk under
+/// the VM's `nn_dir` so `HfTokenizer::load_cached("gpt2", ..)` takes its
+/// cache-hit branch and the test never reaches the HuggingFace hub.
+const FIXTURE_TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,
+ "added_tokens":[{"id":0,"content":"[UNK]","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+ "normalizer":null,
+ "pre_tokenizer":{"type":"WhitespaceSplit"},
+ "post_processor":null,"decoder":null,
+ "model":{"type":"WordLevel","vocab":{"[UNK]":0,"alpha":1,"beta":2,"gamma":3,"delta":4,"epsilon":5},"unk_token":"[UNK]"}}"#;
+
+/// VM whose `nn_dir` already holds the fixture tokenizer, so
+/// `alc.nn.tokenize` / `alc.nn.detokenize` resolve offline. The
+/// `install_for_pkg_test` path cannot be used here: it owns its tempdir
+/// internally, leaving no place to seed the cache before registration.
+fn tokenizer_vm() -> (Lua, tempfile::TempDir) {
+    let lua = Lua::new();
+    let metrics = ExecutionMetrics::new();
+    let tmp = tempfile::tempdir().expect("test tempdir");
+    let root: PathBuf = tmp.path().to_path_buf();
+    let nn_dir = root.join("nn");
+    std::fs::create_dir_all(nn_dir.join("tokenizers")).expect("seed tokenizer dir");
+    std::fs::write(nn_dir.join("tokenizers/gpt2.json"), FIXTURE_TOKENIZER)
+        .expect("seed tokenizer fixture");
+
+    let config = BridgeConfig {
+        llm_tx: None,
+        ns: "default".into(),
+        custom_metrics: metrics.custom_metrics_handle(),
+        stats: metrics.stats_handle(),
+        budget: metrics.budget_handle(),
+        progress: metrics.progress_handle(),
+        lib_paths: vec![],
+        variant_pkgs: vec![],
+        state_store: Arc::new(JsonFileStore::new(root.join("state"))),
+        card_store: Arc::new(FileCardStore::new(root.join("cards"))),
+        card_run_enabled: false,
+        scenarios_dir: root.join("scenarios"),
+        nn_dir,
+        log_sink: None,
+    };
+
+    let alc_table = lua.create_table().expect("create alc table");
+    bridge::register(&lua, &alc_table, config).expect("register");
+    lua.globals().set("alc", alc_table).expect("set alc global");
+    (lua, tmp)
+}
+
 #[test]
 fn alc_nn_tensor_add_roundtrips_through_engine_bridge() {
     let lua = nn_vm();
@@ -574,6 +622,199 @@ fn neutral_and_typed_llama_handles_agree_on_shared_accessors() {
         .eval()
         .expect("neutral and typed llama handles agree");
     assert_eq!(checked, 10);
+}
+
+// ─── generation sessions (Sampler plan Step 4) ───────────────────────
+//
+// The Lua-facing decode surface: `handle:generate_session(prompt)` plus
+// `next_logits` / `append` / `tokens` / `position`. Value-level claims
+// about the logits row (shape, dtype, two-session isolation) live in
+// `bridge/nn_gen.rs`'s in-crate tests, because `LogitsHandle` is opaque
+// by design and this crate cannot read it.
+
+/// The decode loop runs from Lua and the session's bookkeeping stays
+/// consistent: `position` counts every token (prompt included),
+/// `tokens` returns the full history in order, and `next_logits`
+/// answers with a `[vocab]`-wide row after each committed token.
+#[test]
+fn alc_nn_generate_session_loop_runs_from_lua() {
+    let lua = nn_vm();
+    let position: usize = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            local s = h:generate_session({ 1, 2, 3 })
+            assert(s:position() == 3, "prompt tokens must count toward position")
+
+            local first = s:next_logits()
+            assert(first:vocab() == 64, "logits row must span the vocabulary")
+
+            s:append(7)
+            assert(s:position() == 4, "append must advance position")
+            local second = s:next_logits()
+            assert(second:vocab() == 64, "incremental step must return a full row")
+
+            s:append(9)
+            local t = s:tokens()
+            assert(#t == 5, "tokens() must return prompt + appended")
+            assert(t[1] == 1 and t[2] == 2 and t[3] == 3, "prompt must be preserved in order")
+            assert(t[4] == 7 and t[5] == 9, "appended tokens must be preserved in order")
+
+            return s:position()
+        "#,
+        )
+        .eval()
+        .expect("generation session loop");
+    assert_eq!(position, 5);
+}
+
+/// Two sessions built from the same handle keep separate histories. The
+/// weights are shared through an `Arc`; the KV cache and the token list
+/// are not, which is the whole reason the bare adapter `forward` is not
+/// exposed to Lua.
+#[test]
+fn alc_nn_two_sessions_from_one_handle_keep_separate_state() {
+    let lua = nn_vm();
+    lua.load(
+        r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            local a = h:generate_session({ 1, 2, 3 })
+            local b = h:generate_session({ 10, 11 })
+
+            a:next_logits()
+            b:next_logits()
+            a:append(20)
+            b:append(30)
+            a:next_logits()
+            b:next_logits()
+
+            assert(a:position() == 4, "session A position: " .. a:position())
+            assert(b:position() == 3, "session B position: " .. b:position())
+            local ta, tb = a:tokens(), b:tokens()
+            assert(ta[1] == 1 and ta[4] == 20, "session A history leaked")
+            assert(tb[1] == 10 and tb[3] == 30, "session B history leaked")
+        "#,
+    )
+    .exec()
+    .expect("two independent sessions");
+}
+
+/// Calling `next_logits` twice without an intervening `append` is a
+/// loud error: there is nothing new to forward, and silently repeating
+/// the previous row would let a decode loop that forgot to commit its
+/// sampled token spin forever.
+#[test]
+fn alc_nn_next_logits_without_append_errors() {
+    let lua = nn_vm();
+    let err = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            local s = h:generate_session({ 1, 2, 3 })
+            s:next_logits()
+            s:next_logits()
+        "#,
+        )
+        .exec()
+        .expect_err("second next_logits without append must error")
+        .to_string();
+    assert!(err.contains("no pending tokens"), "unexpected error: {err}");
+}
+
+/// An empty prompt has nothing to forward, so the session is refused at
+/// construction rather than failing on the first `next_logits`.
+#[test]
+fn alc_nn_generate_session_empty_prompt_errors() {
+    let lua = nn_vm();
+    let err = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            h:generate_session({})
+        "#,
+        )
+        .exec()
+        .expect_err("empty prompt must error")
+        .to_string();
+    assert!(
+        err.contains("prompt_tokens is empty"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Token ids are checked against the model's vocabulary at the bridge
+/// boundary, so an out-of-range id names itself and the bound instead of
+/// surfacing as a candle index failure inside the embedding lookup.
+#[test]
+fn alc_nn_append_out_of_range_token_errors() {
+    let lua = nn_vm();
+    let err = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            local s = h:generate_session({ 1, 2, 3 })
+            s:append(64)   -- tiny variant vocab is 64, so 64 is one past the end
+        "#,
+        )
+        .exec()
+        .expect_err("out-of-range token must error")
+        .to_string();
+    assert!(
+        err.contains("outside the model vocabulary"),
+        "unexpected error: {err}"
+    );
+
+    let err = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            h:generate_session({ 1, 999 })
+        "#,
+        )
+        .exec()
+        .expect_err("out-of-range prompt token must error")
+        .to_string();
+    assert!(
+        err.contains("prompt_tokens[2]") && err.contains("outside the model vocabulary"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `alc.nn.tokenize` / `alc.nn.detokenize` round-trip through the same
+/// `<nn_dir>/tokenizers` cache the `alc.nn.data.*` producers use. The
+/// fixture is seeded on disk first, so the tokenizer resolves from cache
+/// and the test stays offline.
+#[test]
+fn alc_nn_tokenize_detokenize_roundtrip() {
+    let (lua, _tmp) = tokenizer_vm();
+    let text: String = lua
+        .load(
+            r#"
+            local ids = alc.nn.tokenize("gpt2", "alpha beta gamma")
+            assert(#ids == 3, "expected three ids, got " .. #ids)
+            assert(ids[1] == 1 and ids[2] == 2 and ids[3] == 3, "unexpected ids")
+            return alc.nn.detokenize("gpt2", ids)
+        "#,
+        )
+        .eval()
+        .expect("tokenize / detokenize roundtrip");
+    assert_eq!(text, "alpha beta gamma");
+}
+
+/// An unknown preset is rejected by the tokenizer layer with the preset
+/// named, rather than falling through to a hub download attempt.
+#[test]
+fn alc_nn_tokenize_unknown_preset_errors() {
+    let (lua, _tmp) = tokenizer_vm();
+    let err = lua
+        .load(r#"alc.nn.tokenize("nonsense-preset-xyz", "alpha")"#)
+        .exec()
+        .expect_err("unknown preset must error")
+        .to_string();
+    assert!(
+        err.contains("alc.nn.tokenize") && err.contains("nonsense-preset-xyz"),
+        "unexpected error: {err}"
+    );
 }
 
 /// `kv_heads` and `pretrained` are now part of the shared accessor

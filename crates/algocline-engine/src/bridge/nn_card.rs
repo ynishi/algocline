@@ -76,6 +76,11 @@ pub(super) fn register_nn_card(
     register_preset_ns(lua, &nn_table, nn_dir.clone())?;
     register_data_ns(lua, &nn_table, Arc::clone(&card_store), nn_dir.clone())?;
     register_trainer_ns(lua, &nn_table, nn_dir.clone())?;
+    // `alc.nn.tokenize` / `alc.nn.detokenize` — the token <-> text edge
+    // of the generation path owned by `nn_gen.rs` (the rest of that
+    // surface hangs off the Llama handle rather than the `alc.nn`
+    // table).
+    super::nn_gen::register_gen_ns(lua, &nn_table, nn_dir.clone())?;
     let card_ns = lua.create_table()?;
 
     let save_store = Arc::clone(&card_store);
@@ -1909,6 +1914,11 @@ pub(super) struct LlamaHandle {
 impl mlua::UserData for LlamaHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         add_meta_methods(methods, LlamaHandle::meta);
+        // Inference-only extra: `handle:generate_session(prompt)`. The
+        // adapter's own `forward` stays unbound — see `nn_gen.rs` for
+        // why a session (with its own KV cache) is the only decode
+        // entry point exposed to Lua.
+        super::nn_gen::add_generate_session_method(methods);
     }
 }
 
@@ -1945,7 +1955,10 @@ impl LlamaHandle {
 
     /// Shared handle to the underlying adapter, for callers who want
     /// to drive `forward` from Rust-side helper code.
-    #[allow(dead_code)]
+    ///
+    /// Consumed by `nn_gen::add_generate_session_method`, which clones
+    /// the `Arc` into each generation session: the weights are shared,
+    /// the KV cache is not.
     pub(super) fn adapter(&self) -> Arc<LlamaAdapter> {
         Arc::clone(&self.inner)
     }

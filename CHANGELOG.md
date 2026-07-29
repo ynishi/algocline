@@ -71,6 +71,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crate could flip, silently changing which documents the compiled
   DFA accepts. Depth (32) and compiled-regex size (1 MiB) guards turn
   would-be stack overflows on pathological schemas into errors.
+- Token-by-token generation from Lua: `handle:generate_session(
+  prompt_tokens)` on Llama adapter handles returns a `GenSession`
+  that owns its own fresh KV cache — the model weights stay shared
+  behind the existing `Arc`, but cache state is per-session, so two
+  sessions over one handle cannot corrupt each other's attention
+  history (the handle itself deliberately does not expose a raw
+  `forward`; the session is the only way in). The session drives the
+  loop from Lua: `session:next_logits()` forwards the pending tokens
+  and returns an opaque `[vocab]` f32 `LogitsHandle`,
+  `session:append(id)` records the sampled token,
+  `session:tokens()` / `session:position()` report progress. Calling
+  `next_logits` twice without an `append`, an empty prompt, and
+  out-of-range token ids all error loudly. On the crate side,
+  `LlamaAdapter` gained `new_cache()` and `forward_with_cache()`; the
+  built-in-cache `forward` is unchanged and now documented as the
+  single-loop legacy path.
+- `alc.nn.tokenize(preset, text)` and `alc.nn.detokenize(preset,
+  ids)`: the HuggingFace tokenizer wrapper (first-use download,
+  cached under the app dir) is now reachable from Lua, closing the
+  text → token ids → generation loop → text circle that
+  `generate_session` needs.
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

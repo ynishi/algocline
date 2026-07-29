@@ -10,6 +10,26 @@
 //! caller who threads through the same handle across successive
 //! `forward` calls (e.g. token-by-token generation) reuses the same
 //! cache without exposing candle-transformers types to Lua.
+//!
+//! # Built-in cache vs caller-owned cache
+//!
+//! Two forward entries exist, and the difference is a concurrency
+//! invariant rather than a convenience:
+//!
+//! - [`LlamaAdapter::forward`] drives the adapter's **built-in** cache.
+//!   Correct for exactly one generation loop at a time — two loops
+//!   sharing the handle would interleave their keys and values into the
+//!   same cache and silently produce cross-contaminated logits.
+//! - [`LlamaAdapter::forward_with_cache`] drives a **caller-owned**
+//!   cache obtained from [`LlamaAdapter::new_cache`]. Each generation
+//!   session holds its own cache, so concurrent sessions over one
+//!   `Arc<LlamaAdapter>` (weights are read-only and shared) cannot mix
+//!   state at all — the mixing is prevented structurally rather than by
+//!   a caller-side convention.
+//!
+//! The built-in path is kept as the single-loop legacy entry so existing
+//! callers keep working unchanged; new multi-session callers (the engine
+//! bridge's Lua-facing generation session) use the caller-owned path.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -19,6 +39,12 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::llama::{Cache, Config, Llama};
 
 use super::{AdapterMeta, InferenceAdapter, LogitsShape};
+
+/// The upstream KV cache type, re-exported so a downstream crate can
+/// hold a caller-owned cache (see [`LlamaAdapter::new_cache`]) without
+/// taking its own direct `candle-transformers` dependency just to name
+/// the type.
+pub use candle_transformers::models::llama::Cache as LlamaCache;
 
 /// Build-time configuration for a [`LlamaAdapter`].
 ///
@@ -144,6 +170,12 @@ pub struct LlamaAdapter {
     variant: String,
     device: Device,
     dtype: DType,
+    /// Cache mode the built-in cache was constructed with, retained so
+    /// [`Self::new_cache`] can hand out caches that behave identically
+    /// to the built-in one. Without it a session-owned cache would
+    /// silently differ from the adapter's own when a caller built the
+    /// adapter with `use_kv_cache = false`.
+    use_kv_cache: bool,
 }
 
 impl LlamaAdapter {
@@ -169,6 +201,7 @@ impl LlamaAdapter {
             variant,
             device,
             dtype,
+            use_kv_cache,
         })
     }
 
@@ -194,7 +227,8 @@ impl LlamaAdapter {
         Self::load(vb, cfg)
     }
 
-    /// Forward `tokens` (shape `[batch, seq]`) through the Llama stack.
+    /// Forward `tokens` (shape `[batch, seq]`) through the Llama stack
+    /// using the adapter's **built-in** KV cache.
     ///
     /// `index_pos` is the position of the *first* token in this batch
     /// within the ongoing generation (`0` for the initial prompt,
@@ -203,11 +237,51 @@ impl LlamaAdapter {
     /// last-token logits before returning, so callers doing
     /// token-by-token generation get the next-token distribution
     /// directly.
+    ///
+    /// This is the single-loop legacy path: the built-in cache is one
+    /// piece of mutable state shared by every caller of this method, so
+    /// two generation loops running against the same adapter would
+    /// corrupt each other's context. A caller that needs more than one
+    /// concurrent loop takes a cache of its own from
+    /// [`Self::new_cache`] and drives [`Self::forward_with_cache`].
     pub fn forward(&self, tokens: &Tensor, index_pos: usize) -> CandleResult<Tensor> {
         let mut cache = self.cache.lock().map_err(|e| {
             candle_core::Error::Msg(format!("alc.nn adapter::llama: cache lock poisoned: {e}"))
         })?;
-        self.model.forward(tokens, index_pos, &mut cache)
+        self.forward_with_cache(tokens, index_pos, &mut cache)
+    }
+
+    /// Build a fresh, empty KV cache for a new generation session.
+    ///
+    /// Constructed with the same `use_kv_cache` / dtype / config /
+    /// device the adapter itself was built with, so a session-owned
+    /// cache is behaviourally identical to the built-in one — it only
+    /// differs in *who owns it*.
+    ///
+    /// Ownership is the point: weights stay shared (an
+    /// `Arc<LlamaAdapter>` is read-only during inference) while the
+    /// per-session mutable state is separate, which is what makes two
+    /// concurrent generation loops structurally unable to mix contexts.
+    pub fn new_cache(&self) -> CandleResult<Cache> {
+        Cache::new(self.use_kv_cache, self.dtype, &self.config, &self.device)
+    }
+
+    /// Forward `tokens` (shape `[batch, seq]`) through the stack using a
+    /// caller-owned `cache` instead of the adapter's built-in one.
+    ///
+    /// Same contract as [`Self::forward`] for `index_pos` and the
+    /// returned `[batch, vocab]` logits; the only difference is which
+    /// cache accumulates the keys and values. `index_pos` must be the
+    /// number of tokens already forwarded *through this cache* — mixing
+    /// positions from another session's stream is what the per-session
+    /// cache exists to prevent.
+    pub fn forward_with_cache(
+        &self,
+        tokens: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> CandleResult<Tensor> {
+        self.model.forward(tokens, index_pos, cache)
     }
 
     /// Caller-facing preset id (e.g. `"tinyllama-1.1b"`).
@@ -385,6 +459,173 @@ mod tests {
 
         let meta = InferenceAdapter::meta(&adapter);
         assert_eq!(logits.dims(), meta.logits.dims(batch, seq, meta.vocab));
+    }
+
+    // ─── caller-owned cache (generation sessions) ─────────────────
+
+    /// Tiny adapter over random weights. The weights are fixed for the
+    /// lifetime of the returned adapter, which is what lets the
+    /// generation tests below compare token streams for equality.
+    fn tiny_adapter() -> LlamaAdapter {
+        let cfg = LlamaAdapterConfig::tiny();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        LlamaAdapter::load(vb, cfg).expect("load tiny Llama")
+    }
+
+    /// Argmax over a `[1, vocab]` logits row — a greedy decode step,
+    /// deterministic so two runs over the same weights must agree.
+    fn greedy(logits: &Tensor) -> u32 {
+        let row: Vec<f32> = logits.squeeze(0).unwrap().to_vec1().unwrap();
+        let mut best = 0usize;
+        for (i, v) in row.iter().enumerate() {
+            if *v > row[best] {
+                best = i;
+            }
+        }
+        u32::try_from(best).unwrap()
+    }
+
+    /// One in-flight greedy generation over a caller-owned cache,
+    /// mirroring what the engine bridge's session does.
+    struct Stream<'a> {
+        adapter: &'a LlamaAdapter,
+        cache: Cache,
+        tokens: Vec<u32>,
+        forwarded: usize,
+    }
+
+    impl<'a> Stream<'a> {
+        fn new(adapter: &'a LlamaAdapter, prompt: &[u32]) -> Self {
+            Self {
+                adapter,
+                cache: adapter.new_cache().expect("new_cache"),
+                tokens: prompt.to_vec(),
+                forwarded: 0,
+            }
+        }
+
+        /// Advance one greedy step, returning both the chosen token and
+        /// the logits row it came from. The row is what the mixing test
+        /// compares: two prompts can argmax to the same id under
+        /// random-init weights, but their full distributions cannot
+        /// coincide, so the row keeps the comparison non-vacuous.
+        fn step(&mut self) -> (u32, Vec<f32>) {
+            let pending = &self.tokens[self.forwarded..];
+            let input =
+                Tensor::from_slice(pending, (1, pending.len()), self.adapter.device()).unwrap();
+            let logits = self
+                .adapter
+                .forward_with_cache(&input, self.forwarded, &mut self.cache)
+                .expect("forward_with_cache");
+            self.forwarded = self.tokens.len();
+            let next = greedy(&logits);
+            self.tokens.push(next);
+            (next, logits.squeeze(0).unwrap().to_vec1().unwrap())
+        }
+    }
+
+    /// Largest absolute element-wise gap between two logits streams.
+    fn max_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+        assert_eq!(a.len(), b.len(), "stream length mismatch");
+        let mut worst = 0.0f32;
+        for (ra, rb) in a.iter().zip(b) {
+            assert_eq!(ra.len(), rb.len(), "vocab mismatch");
+            for (x, y) in ra.iter().zip(rb) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        worst
+    }
+
+    /// A caller-owned cache reproduces the built-in cache's generation
+    /// exactly: same weights, same prompt, same greedy decisions. Both
+    /// caches start empty, so any divergence would mean
+    /// `forward_with_cache` is not driving the same computation (or that
+    /// the fresh cache inherited built-in state).
+    #[test]
+    fn caller_owned_cache_reproduces_builtin_cache_generation() {
+        let adapter = tiny_adapter();
+        let prompt = [1u32, 2, 3];
+
+        // Built-in cache path (the legacy single-loop entry).
+        let mut tokens = prompt.to_vec();
+        let mut forwarded = 0usize;
+        let mut builtin = Vec::new();
+        for _ in 0..4 {
+            let pending = &tokens[forwarded..];
+            let input = Tensor::from_slice(pending, (1, pending.len()), adapter.device()).unwrap();
+            let logits = adapter.forward(&input, forwarded).expect("builtin forward");
+            assert_eq!(logits.dims(), &[1, adapter.vocab()]);
+            forwarded = tokens.len();
+            let next = greedy(&logits);
+            tokens.push(next);
+            builtin.push(next);
+        }
+
+        // Caller-owned cache path over the same adapter.
+        let mut stream = Stream::new(&adapter, &prompt);
+        let owned: Vec<u32> = (0..4).map(|_| stream.step().0).collect();
+
+        assert_eq!(owned, builtin);
+    }
+
+    /// Two caller-owned caches advanced in lockstep must produce exactly
+    /// what each produces on its own. This is the structural claim the
+    /// session-owned cache exists to make: interleaving two generation
+    /// loops over one set of weights cannot contaminate either context.
+    #[test]
+    fn interleaved_caches_match_their_solo_runs() {
+        let adapter = tiny_adapter();
+        let prompt_a = [1u32, 2, 3];
+        let prompt_b = [10u32, 11, 12];
+
+        let solo_a: Vec<(u32, Vec<f32>)> = {
+            let mut s = Stream::new(&adapter, &prompt_a);
+            (0..4).map(|_| s.step()).collect()
+        };
+        let solo_b: Vec<(u32, Vec<f32>)> = {
+            let mut s = Stream::new(&adapter, &prompt_b);
+            (0..4).map(|_| s.step()).collect()
+        };
+
+        let mut a = Stream::new(&adapter, &prompt_a);
+        let mut b = Stream::new(&adapter, &prompt_b);
+        let mut mixed_a = Vec::new();
+        let mut mixed_b = Vec::new();
+        for _ in 0..4 {
+            mixed_a.push(a.step());
+            mixed_b.push(b.step());
+        }
+
+        let tokens = |run: &[(u32, Vec<f32>)]| run.iter().map(|(t, _)| *t).collect::<Vec<_>>();
+        let rows = |run: &[(u32, Vec<f32>)]| run.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+
+        assert_eq!(
+            tokens(&mixed_a),
+            tokens(&solo_a),
+            "stream A drifted when interleaved with B"
+        );
+        assert_eq!(
+            tokens(&mixed_b),
+            tokens(&solo_b),
+            "stream B drifted when interleaved with A"
+        );
+        assert!(
+            max_gap(&rows(&mixed_a), &rows(&solo_a)) < 1e-5,
+            "stream A logits drifted when interleaved with B"
+        );
+        assert!(
+            max_gap(&rows(&mixed_b), &rows(&solo_b)) < 1e-5,
+            "stream B logits drifted when interleaved with A"
+        );
+        // Guard against the assertions above holding vacuously: if both
+        // prompts produced the same distributions, contamination would
+        // be undetectable and the test would prove nothing.
+        assert!(
+            max_gap(&rows(&solo_a), &rows(&solo_b)) > 1e-4,
+            "test prompts must produce different logits for the mixing claim to mean anything"
+        );
     }
 
     /// Every constructor defaults `use_kv_cache` to `true` so a Rust

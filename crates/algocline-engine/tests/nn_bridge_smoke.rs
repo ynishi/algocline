@@ -445,7 +445,7 @@ fn alc_nn_preset_gpt2_custom_builds_and_trains() {
                 schedule = "cosine",
                 weight_decay = 0.0,
                 ckpt_every = 0,
-                card_id = "smoke_custom_full_ft",
+                ckpt_prefix = "smoke_custom_full_ft",
             })
             assert(type(ckpt.train_loss) == "number", "train_loss must be a number")
             return ckpt.step
@@ -463,8 +463,10 @@ fn alc_nn_preset_gpt2_custom_builds_and_trains() {
 /// dispatch all have to line up across the two modules. The per-module
 /// unit tests each assert their own half; this is the only place the
 /// whole chain runs from Lua. Motivated by the 2026-07-30 eval iter,
-/// where the raw-Checkpoint surface's `ckpt.card_id` (a checkpoint
-/// filename prefix, not a Card id) was mistaken for a loadable Card id.
+/// where the raw-Checkpoint surface's then-named `ckpt.card_id` (a
+/// checkpoint filename prefix, not a Card id — renamed to
+/// `ckpt.ckpt_prefix` in the Card-domain refactor) was mistaken for a
+/// loadable Card id.
 #[test]
 fn alc_nn_run_full_ft_card_load_handle_roundtrip() {
     let (lua, _tmp) = production_vm();

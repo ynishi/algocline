@@ -82,20 +82,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
-use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch};
+use algocline_nn::card::{bundle_ref_for, CardId, NnLoraBranch, NnModelCard, TrainingPath};
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss, DistillLossKind, DistillSpec,
     FullFtConfig, TrainError, TrainingLease,
 };
 use mlua::prelude::*;
-use serde_json::json;
 
+use crate::card::nn::persist;
 use crate::card::FileCardStore;
 
 use super::nn_card::{
-    build_create_payload_from_meta, compact_epoch_us, extract_full_ft_opts,
-    guard_base_dtype_for_training, sanitize_name, DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle,
-    TinyLlamaHandle,
+    extract_full_ft_opts, guard_base_dtype_for_training, DatasetHandle, Gpt2Handle, LlamaHandle,
+    NnHandle, TinyLlamaHandle,
 };
 
 /// Register `alc.nn.trainer.{run_lora_ft, run_full_ft, run_distill}`
@@ -254,21 +253,21 @@ fn run_lora_ft_impl(
     let lora_cfg = extract_lora_cfg(&opts, arch)?;
     let train_cfg = extract_train_cfg(&opts)?;
 
-    // 7. Pre-generate lora_card_id (mirrors save_impl /
-    //    merge_lora_impl). Sanitize the user-supplied name if
-    //    provided; otherwise use "run_lora_ft" as the base.
+    // 7. Pre-mint the Card id (mirrors save_impl / merge_lora_impl).
+    //    Minted before training because the id doubles as the delta
+    //    checkpoint filename stem (`lora-<id>.safetensors`).
     let name: Option<String> = opts.get("name")?;
     let name_base = name
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or("run_lora_ft");
-    let lora_card_id = format!("{}_{}", sanitize_name(name_base), compact_epoch_us());
+    let lora_card_id = CardId::mint(name_base);
 
     // 8. Derive base_bundle_ref BEFORE any lock is acquired —
     //    `arch_family_variant()` needs only immutable handle
     //    fields, and threading it through here keeps the field
     //    lookup outside the training-loop critical section.
-    let base_bundle_ref = format!("nn/{}", handle.arch_family_variant());
+    let base_bundle_ref = bundle_ref_for(&handle.arch_family_variant());
     let architecture = handle.arch_family_variant();
 
     // 9. Fresh per-call TrainingLease. Design §0: single-lease-per
@@ -305,7 +304,7 @@ fn run_lora_ft_impl(
                 &train_cfg,
                 &loss_fn,
                 nn_dir,
-                &lora_card_id,
+                lora_card_id.as_str(),
                 Arc::clone(&lease),
             );
             drop(model);
@@ -331,7 +330,7 @@ fn run_lora_ft_impl(
                 &train_cfg,
                 &loss_fn,
                 nn_dir,
-                &lora_card_id,
+                lora_card_id.as_str(),
                 Arc::clone(&lease),
             );
             drop(model);
@@ -349,10 +348,13 @@ fn run_lora_ft_impl(
         }
     };
 
-    // 11. Build the typed NnCardMeta payload and persist the Card.
+    // 11. Build the typed Card aggregate and persist it.
     //     `ckpt.bundle_ref` is the trailing filename
     //     `"lora-<card_id>.safetensors"` (Layer 3 convention); the
-    //     absolute path is `<nn_dir>/nn/<ckpt.bundle_ref>`.
+    //     absolute path is `<nn_dir>/nn/<ckpt.bundle_ref>`. Envelope
+    //     assembly + returned-id coherence live in
+    //     [`crate::card::nn::persist`]; the aggregate constructor
+    //     enforces bundle_ref = "nn/<id>" at build time.
     let delta_path = nn_dir.join("nn").join(&ckpt.bundle_ref);
     let delta_path_string = delta_path.to_string_lossy().to_string();
 
@@ -363,53 +365,24 @@ fn run_lora_ft_impl(
     let lora_branch = NnLoraBranch {
         rank: lora_cfg.rank as u32,
         alpha: lora_cfg.alpha as u32,
-        base_bundle_ref: base_bundle_ref.clone(),
+        base_bundle_ref,
         target_modules: lora_cfg.target_modules.clone(),
         dropout: lora_cfg.dropout,
-        delta_path: Some(delta_path_string.clone()),
+        delta_path: Some(delta_path_string),
     };
 
-    let candle = NnCandleBranch {
-        bundle_ref: format!("nn/{lora_card_id}"),
-        device: None,
-        dtype: None,
-        lora: Some(lora_branch),
-    };
-
-    let meta = NnCardMeta {
-        name: name_base.to_string(),
-        backend: "candle".into(),
-        task: None,
+    let card = NnModelCard::from_training(
+        lora_card_id,
+        name_base,
         architecture,
-        training_path: "lora".into(),
-        lineage: NnLineage::default(),
-        hyperparams: json!({
-            "lr": train_cfg.lr,
-            "batch": train_cfg.batch_size,
-            "steps": train_cfg.steps,
-            "warmup": train_cfg.warmup,
-        }),
-        metrics: json!({
-            "train_loss": ckpt.train_loss,
-            "step": ckpt.step,
-        }),
-        candle: Some(candle),
-    };
+        TrainingPath::Lora(lora_branch),
+        &ckpt,
+        &train_cfg,
+    )
+    .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_lora_ft: {e}")))?;
 
-    let payload = build_create_payload_from_meta(&lora_card_id, &meta)?;
-
-    let (returned_id, _path) = store
-        .create(payload)
-        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_lora_ft: card store: {e}")))?;
-
-    if returned_id != lora_card_id {
-        return Err(LuaError::external(format!(
-            "alc.nn.trainer.run_lora_ft: card_id mismatch (expected \
-             {lora_card_id}, got {returned_id})"
-        )));
-    }
-
-    Ok(lora_card_id)
+    persist(store, &card)
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_lora_ft: {e}")))
 }
 
 /// Extract a validated [`LoraConfig`] from `opts`. Mirrors the S1
@@ -723,13 +696,15 @@ fn run_full_ft_impl(
     //    caller sees a Lua-shaped error rather than a candle back-trace).
     let train_cfg = extract_train_cfg_ff(&opts)?;
 
-    // 7. Pre-generate card_id (mirrors run_lora_ft_impl step 7).
+    // 7. Pre-mint the Card id (mirrors run_lora_ft_impl step 7).
+    //    Minted before training because the id doubles as the
+    //    checkpoint filename stem (`<nn_dir>/<id>.safetensors`).
     let name: Option<String> = opts.get("name")?;
     let name_base = name
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or("run_full_ft");
-    let card_id = format!("{}_{}", sanitize_name(name_base), compact_epoch_us());
+    let card_id = CardId::mint(name_base);
 
     // 8. Derive architecture BEFORE any lock (immutable handle field
     //    lookup outside the training-loop critical section).
@@ -769,7 +744,7 @@ fn run_full_ft_impl(
                 &train_cfg,
                 &loss_fn,
                 nn_dir,
-                &card_id,
+                card_id.as_str(),
                 Arc::clone(&lease),
             );
             drop(model);
@@ -802,7 +777,7 @@ fn run_full_ft_impl(
                 &train_cfg,
                 &loss_fn,
                 nn_dir,
-                &card_id,
+                card_id.as_str(),
                 Arc::clone(&lease),
             );
             drop(model);
@@ -819,50 +794,20 @@ fn run_full_ft_impl(
         }
     };
 
-    // 11. Build the typed NnCardMeta payload and persist the Card.
-    //     Full-fine-tune carries NO LoRA branch — that field stays
-    //     `None`, matching `training_path="full_ft"` cards written
-    //     by the sibling `alc.nn.trainer.full_ft` + `alc.nn.card.save`
-    //     flow.
-    let candle = NnCandleBranch {
-        bundle_ref: format!("nn/{card_id}"),
-        device: None,
-        dtype: None,
-        lora: None,
-    };
-
-    let meta = NnCardMeta {
-        name: name_base.to_string(),
-        backend: "candle".into(),
-        task: None,
+    // 11. Build the typed Card aggregate and persist it.
+    //     Full-fine-tune carries NO LoRA branch — the aggregate's
+    //     `TrainingPath::FullFt` arm leaves that field `None`,
+    //     matching `training_path="full_ft"` cards written by the
+    //     sibling `alc.nn.trainer.full_ft` + `alc.nn.card.save` flow.
+    let card = NnModelCard::from_training(
+        card_id,
+        name_base,
         architecture,
-        training_path: "full_ft".into(),
-        lineage: NnLineage::default(),
-        hyperparams: json!({
-            "lr": train_cfg.lr,
-            "batch": train_cfg.batch_size,
-            "steps": train_cfg.steps,
-            "warmup": train_cfg.warmup,
-        }),
-        metrics: json!({
-            "train_loss": ckpt.train_loss,
-            "step": ckpt.step,
-        }),
-        candle: Some(candle),
-    };
-
-    let payload = build_create_payload_from_meta(&card_id, &meta)?;
-
-    let (returned_id, _path) = store
-        .create(payload)
-        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: card store: {e}")))?;
-
-    if returned_id != card_id {
-        return Err(LuaError::external(format!(
-            "alc.nn.trainer.run_full_ft: card_id mismatch (expected \
-             {card_id}, got {returned_id})"
-        )));
-    }
+        TrainingPath::FullFt,
+        &ckpt,
+        &train_cfg,
+    )
+    .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))?;
 
     // The `ckpt.bundle_ref` field is left unused on purpose: L5c S1
     // consumers only see the Card id, and the on-disk safetensors
@@ -872,7 +817,8 @@ fn run_full_ft_impl(
     // below).
     let _ = ckpt.bundle_ref;
 
-    Ok(card_id)
+    persist(store, &card)
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))
 }
 
 /// Extract a validated [`FullFtConfig`] from `opts` for the
@@ -1080,13 +1026,13 @@ fn run_distill_impl(
         loss_kind,
     };
 
-    // 7. Pre-generate card_id (mirrors run_full_ft_impl step 7).
+    // 7. Pre-mint the Card id (mirrors run_full_ft_impl step 7).
     let name: Option<String> = opts.get("name")?;
     let name_base = name
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or("run_distill");
-    let card_id = format!("{}_{}", sanitize_name(name_base), compact_epoch_us());
+    let card_id = CardId::mint(name_base);
 
     // 8. Derive architecture BEFORE any lock (immutable handle field
     //    lookup outside the training-loop critical section).
@@ -1123,7 +1069,7 @@ fn run_distill_impl(
                 ds_lock.as_mut(),
                 &spec,
                 nn_dir,
-                &card_id,
+                card_id.as_str(),
                 Arc::clone(&lease),
             );
             drop(model);
@@ -1154,7 +1100,7 @@ fn run_distill_impl(
                 ds_lock.as_mut(),
                 &spec,
                 nn_dir,
-                &card_id,
+                card_id.as_str(),
                 Arc::clone(&lease),
             );
             drop(model);
@@ -1171,54 +1117,25 @@ fn run_distill_impl(
         }
     };
 
-    // 11. Build the typed NnCardMeta payload and persist the Card.
+    // 11. Build the typed Card aggregate and persist it.
     //     Distillation carries NO LoRA branch; `loss_kind` rides on
-    //     `hyperparams` so the run's loss selection is auditable
-    //     from the Card.
-    let candle = NnCandleBranch {
-        bundle_ref: format!("nn/{card_id}"),
-        device: None,
-        dtype: None,
-        lora: None,
-    };
-
+    //     `hyperparams` (via `TrainingPath::Distillation`) so the
+    //     run's loss selection is auditable from the Card.
     let loss_kind_str = match spec.loss_kind {
         DistillLossKind::Ce => "ce",
     };
 
-    let meta = NnCardMeta {
-        name: name_base.to_string(),
-        backend: "candle".into(),
-        task: None,
+    let card = NnModelCard::from_training(
+        card_id,
+        name_base,
         architecture,
-        training_path: "distillation".into(),
-        lineage: NnLineage::default(),
-        hyperparams: json!({
-            "lr": spec.hyperparams.lr,
-            "batch": spec.hyperparams.batch_size,
-            "steps": spec.hyperparams.steps,
-            "warmup": spec.hyperparams.warmup,
-            "loss_kind": loss_kind_str,
-        }),
-        metrics: json!({
-            "train_loss": ckpt.train_loss,
-            "step": ckpt.step,
-        }),
-        candle: Some(candle),
-    };
-
-    let payload = build_create_payload_from_meta(&card_id, &meta)?;
-
-    let (returned_id, _path) = store
-        .create(payload)
-        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: card store: {e}")))?;
-
-    if returned_id != card_id {
-        return Err(LuaError::external(format!(
-            "alc.nn.trainer.run_distill: card_id mismatch (expected \
-             {card_id}, got {returned_id})"
-        )));
-    }
+        TrainingPath::Distillation {
+            loss_kind: loss_kind_str.into(),
+        },
+        &ckpt,
+        &spec.hyperparams,
+    )
+    .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: {e}")))?;
 
     // `ckpt.bundle_ref` unused on purpose — same rationale as
     // run_full_ft_impl (consumers only see the Card id; the on-disk
@@ -1226,7 +1143,8 @@ fn run_distill_impl(
     // convention).
     let _ = ckpt.bundle_ref;
 
-    Ok(card_id)
+    persist(store, &card)
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: {e}")))
 }
 
 /// Extract a validated [`FullFtConfig`] from `opts` for the

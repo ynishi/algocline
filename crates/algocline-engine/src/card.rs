@@ -83,6 +83,9 @@
 //! | `read_samples(card_id, opts?)` | Read Tier 2 with `where` filtering + offset/limit paging |
 //! | `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |
 
+#[cfg(feature = "nn")]
+pub mod nn;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};

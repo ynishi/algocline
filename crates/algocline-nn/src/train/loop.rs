@@ -240,7 +240,7 @@ impl From<candle_core::Error> for TrainError {
 /// short-run.
 ///
 /// `ckpt_dir` is the directory the rotating checkpoints live in. A
-/// dedicated `<card_id>` prefix keeps concurrent (or historical) runs
+/// dedicated `<ckpt_prefix>` keeps concurrent (or historical) runs
 /// from colliding on filenames.
 #[allow(clippy::too_many_arguments)]
 pub fn run_full_ft<M>(
@@ -413,9 +413,12 @@ where
 /// base parameters are frozen).
 ///
 /// The Δ checkpoint is written to
-/// `<ckpt_dir>/nn/lora-<card_id>.safetensors` — a filename convention
-/// that keeps LoRA bundles clearly separated from full-model bundles
-/// on disk. The `nn/` subdirectory is created if missing.
+/// `<ckpt_dir>/nn/lora-<ckpt_stem>.safetensors` — a filename
+/// convention that keeps LoRA bundles clearly separated from
+/// full-model bundles on disk. The `nn/` subdirectory is created if
+/// missing. `ckpt_stem` is a filename stem only — callers that also
+/// record a Card conventionally pass the Card id here, but this loop
+/// has no Card concept.
 ///
 /// # Errors
 ///
@@ -433,14 +436,14 @@ pub fn run_lora_ft<M>(
     train_cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
-    card_id: &str,
+    ckpt_stem: &str,
     lease: Arc<TrainingLease>,
 ) -> Result<Checkpoint, TrainError>
 where
     M: Module + DeviceView + LoraWrappable,
 {
-    if card_id.is_empty() {
-        return Err(TrainError::Candle("run_lora_ft: card_id is empty".into()));
+    if ckpt_stem.is_empty() {
+        return Err(TrainError::Candle("run_lora_ft: ckpt_stem is empty".into()));
     }
 
     // Wrap first so we surface `LoraConfig` validation errors (unknown
@@ -453,7 +456,7 @@ where
     let nn_dir = ckpt_dir.join("nn");
     std::fs::create_dir_all(&nn_dir)
         .map_err(|e| TrainError::Ckpt(format!("run_lora_ft: mkdir {:?}: {e}", nn_dir.display())))?;
-    let ckpt_prefix = format!("lora-{card_id}");
+    let ckpt_prefix = format!("lora-{ckpt_stem}");
 
     // `run_ft_core` uses `lora_vm` for both the optimizer and the
     // checkpoint save: the optimizer only sees LoRA A/B parameters

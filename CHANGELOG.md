@@ -7,7 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — **BREAKING**: `alc.nn.trainer.{full_ft,lora,distill}` Checkpoint field `ckpt.card_id` renamed to `ckpt.ckpt_prefix`
+
+The raw-Checkpoint trainer surfaces returned a `card_id` field that
+was never a Card store id — it is the checkpoint filename prefix
+(`<prefix>.safetensors`), and `alc.nn.card.load(ckpt.card_id)` did not
+resolve. The field is now named for what it is.
+
+Before:
+
+```lua
+local ckpt = alc.nn.trainer.full_ft(h, ds, { steps = 100, card_id = "my-run" })
+print(ckpt.card_id)      -- checkpoint filename prefix (misleading name)
+```
+
+After:
+
+```lua
+local ckpt = alc.nn.trainer.full_ft(h, ds, { steps = 100, ckpt_prefix = "my-run" })
+print(ckpt.ckpt_prefix)  -- same value, honest name
+```
+
+Migrate steps:
+
+1. Replace reads of `ckpt.card_id` with `ckpt.ckpt_prefix`.
+2. Prefer the `ckpt_prefix` opts key for overriding the checkpoint
+   filename; the old `card_id` opts key is still accepted as a
+   deprecated alias.
+3. If you need a loadable Card id, use the return value of
+   `alc.nn.card.save` (or the `run_lora_ft` / `run_full_ft` /
+   `run_distill` surfaces, which persist the Card and return its id).
+
+Additional strictness (breaking only for hand-authored cards):
+`alc.nn.card.save` now validates `meta.training_path` against the
+supported set (`full_ft` / `lora` / `distillation` / `merged`), card
+ids are validated against the store-safe alphabet (`[A-Za-z0-9_.-]`)
+on every load surface, and `alc.nn.card.load_gpt2` /
+`alc.nn.card.load_wrap` now enforce the `bundle_ref == "nn/<card_id>"`
+invariant that `load` / `load_handle` already asserted. Cards written
+by the bridge itself always satisfied all three.
+
 ### Added
+
+- `algocline-nn` gains a `card::CardId` value type (minting via
+  `CardId::mint`, validation via `CardId::parse` / `TryFrom<&str>`,
+  bundle reference derivation via `CardId::bundle_ref`) and an
+  `card::NnModelCard` aggregate whose constructors
+  (`new` / `from_training` / `from_merge`) enforce the Card
+  invariants — architecture family, supported training_path, and
+  `bundle_ref == "nn/<id>"` — at build time. `algocline-engine` gains
+  `card::nn::persist` as the single projection point from the
+  aggregate onto the card store (envelope shape + returned-id
+  coherence). The Lua bridge no longer hand-assembles Card envelopes,
+  mints ids inline, or asserts `bundle_ref` shapes per call site; the
+  `run_lora_ft` training-loop parameter formerly named `card_id` is
+  now `ckpt_stem` (the loop has no Card concept).
 
 - `algocline-nn` gains a `sampling` module carrying the Layer 1 of the
   Sampler 3-layer plan: a `Sampler` trait (`sample(&mut self, logits:

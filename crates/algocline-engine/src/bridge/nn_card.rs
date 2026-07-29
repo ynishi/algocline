@@ -39,7 +39,8 @@ use algocline_nn::arch::{
     PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
 };
 use algocline_nn::card::{
-    validate_architecture, NnCandleBranch, NnCardMeta, NnLineage, NnLoraBranch,
+    bundle_ref_for, sanitize_stem, unique_stem, validate_training_path, CardId, NnCandleBranch,
+    NnCardMeta, NnLineage, NnLoraBranch, NnModelCard,
 };
 use algocline_nn::merged::{export_merged, MergeError, MergedProvenance};
 use algocline_nn::tokenizer::HfTokenizer;
@@ -52,13 +53,10 @@ use candle_core::{DType, Device};
 use candle_nn::VarMap;
 use mlua::prelude::*;
 use mlua::LuaSerdeExt;
-use serde_json::{json, Value as Json};
+use serde_json::Value as Json;
 
+use crate::card::nn::persist;
 use crate::card::{FileCardStore, SamplesQuery};
-
-/// Pkg name under which nn Cards are stored
-/// (`<cards_root>/alc_nn/<card_id>.toml`).
-const NN_PKG: &str = "alc_nn";
 
 /// Register `alc.nn.card.*` onto the pre-existing `alc.nn` table.
 ///
@@ -198,34 +196,28 @@ fn save_impl(
 ) -> LuaResult<String> {
     let meta_json: Json = lua.from_value(LuaValue::Table(meta))?;
 
-    // Pre-generate card_id so bundle_ref = "nn/<card_id>" is known
-    // before we build the Card (invariant #1).
-    let card_id = generate_card_id(name);
+    // Pre-mint the id so bundle_ref = "nn/<card_id>" is known before
+    // we build the Card (invariant #1) — the aggregate derives it
+    // from this id at construction.
+    let card_id = CardId::mint(name);
 
     // Delegate safetensors serialization to the existing alc.nn.save
     // path. Any store-side write failure propagates loudly through the
     // call chain (invariant #2).
     let nn_save: LuaFunction = alc_nn_fn(lua, "save")?;
-    nn_save.call::<()>((vars, card_id.clone()))?;
+    nn_save.call::<()>((vars, card_id.as_str().to_string()))?;
 
-    // Assemble the Card create payload with pkg + card_id + full
-    // [metadata.nn] block already populated.
-    let payload = build_create_payload(&card_id, name, &meta_json)?;
-
-    // Store write — propagate error loudly (invariant #2).
-    let (returned_id, _path) = store
-        .create(payload)
+    // Parse the user-facing meta into the typed schema, then let the
+    // aggregate constructor enforce the architecture / training_path
+    // / bundle_ref invariants (invariant #1, now at build time).
+    let nn_meta = build_nn_meta(&card_id, name, &meta_json)?;
+    let card = NnModelCard::new(card_id, nn_meta)
         .map_err(|e| LuaError::external(format!("alc.nn.card.save: {e}")))?;
 
-    // Sanity: the pre-generated id must match what create returned. A
-    // divergence would silently break the safetensors ↔ Card 1:1
-    // mapping (invariant #1) — surface it instead.
-    if returned_id != card_id {
-        return Err(LuaError::external(format!(
-            "alc.nn.card.save: card_id mismatch (expected {card_id}, got {returned_id})"
-        )));
-    }
-    Ok(card_id)
+    // Envelope assembly + store write + returned-id coherence live in
+    // `crate::card::nn::persist` — propagate errors loudly
+    // (invariant #2).
+    persist(store, &card).map_err(|e| LuaError::external(format!("alc.nn.card.save: {e}")))
 }
 
 /// Load the safetensors bundle referenced by a Card and return the
@@ -235,16 +227,19 @@ fn save_impl(
 /// `metadata.nn.candle.bundle_ref` or with a bundle-not-on-disk
 /// surfaces as a Lua error (invariant #4).
 fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTable> {
+    let card_id =
+        CardId::parse(card_id).map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))?;
     let card = store
-        .get(card_id)
+        .get(card_id.as_str())
         .map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))?
         .ok_or_else(|| {
             LuaError::external(format!("alc.nn.card.load: card '{card_id}' not found"))
         })?;
 
-    // Extract bundle_ref and enforce the "nn/<card_id>" shape imposed
-    // by save_impl. A mismatch means the Card was hand-edited or built
-    // by a different pipeline — refuse rather than guess the bundle.
+    // Extract bundle_ref and enforce the "nn/<card_id>" shape the
+    // aggregate guarantees at save time. A mismatch means the Card
+    // was hand-edited or built by a different pipeline — refuse
+    // rather than guess the bundle.
     let bundle_ref = card
         .get("metadata")
         .and_then(|m| m.get("nn"))
@@ -256,7 +251,7 @@ fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTa
                 "alc.nn.card.load: card '{card_id}' missing metadata.nn.candle.bundle_ref"
             ))
         })?;
-    let expected = format!("nn/{card_id}");
+    let expected = card_id.bundle_ref();
     if bundle_ref != expected {
         return Err(LuaError::external(format!(
             "alc.nn.card.load: bundle_ref '{bundle_ref}' does not match card_id \
@@ -268,7 +263,7 @@ fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTa
     // reads via the installed `NnStoreHandle` and errors clearly if the
     // bundle is missing on disk (invariant #4).
     let nn_load: LuaFunction = alc_nn_fn(lua, "load")?;
-    let vars: LuaTable = nn_load.call(card_id.to_string())?;
+    let vars: LuaTable = nn_load.call(card_id.as_str().to_string())?;
     Ok(vars)
 }
 
@@ -285,8 +280,10 @@ fn load_handle_impl(
     card_id: &str,
     nn_dir: &std::path::Path,
 ) -> LuaResult<NnHandle> {
+    let card_id = CardId::parse(card_id)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load_handle: {e}")))?;
     let card = store
-        .get(card_id)
+        .get(card_id.as_str())
         .map_err(|e| LuaError::external(format!("alc.nn.card.load_handle: {e}")))?
         .ok_or_else(|| {
             LuaError::external(format!(
@@ -311,7 +308,8 @@ fn load_handle_impl(
 
     // training_path 分岐: self-contained (full_ft / merged /
     // distillation) のみ受け付ける。 lora card は load_wrap 側に
-    // 誘導 (Layer 4b §Q3-A invariant #2)。
+    // 誘導 (Layer 4b §Q3-A invariant #2)。 未知値の accepted list は
+    // `validate_training_path` (crate::card) が単一 SoT。
     match meta.training_path.as_str() {
         "full_ft" | "merged" | "distillation" => {}
         "lora" => {
@@ -322,31 +320,22 @@ fn load_handle_impl(
             )));
         }
         other => {
+            let msg = match validate_training_path(other) {
+                Err(e) => e,
+                // A value the schema accepts but this dispatcher has
+                // no route for — a new SUPPORTED_TRAINING_PATHS entry
+                // whose load arm has not landed yet.
+                Ok(()) => format!("training_path {other:?} has no load_handle route"),
+            };
             return Err(LuaError::external(format!(
-                "alc.nn.card.load_handle: card '{card_id}' has unknown training_path \
-                 {other:?} (expected one of full_ft / lora / merged / distillation)"
+                "alc.nn.card.load_handle: card '{card_id}': {msg}"
             )));
         }
     }
 
-    // Enforce the bundle_ref = "nn/<card_id>" invariant that
-    // load_impl also asserts (save_impl writes this shape).
-    let bundle_ref = meta
-        .candle
-        .as_ref()
-        .map(|c| c.bundle_ref.as_str())
-        .ok_or_else(|| {
-            LuaError::external(format!(
-                "alc.nn.card.load_handle: card '{card_id}' missing metadata.nn.candle"
-            ))
-        })?;
-    let expected = format!("nn/{card_id}");
-    if bundle_ref != expected {
-        return Err(LuaError::external(format!(
-            "alc.nn.card.load_handle: bundle_ref '{bundle_ref}' does not match card_id \
-             '{card_id}' (expected '{expected}')"
-        )));
-    }
+    // Enforce the bundle_ref = "nn/<card_id>" invariant that the
+    // NnModelCard aggregate guarantees at save time.
+    assert_bundle_ref_matches("alc.nn.card.load_handle", &card_id, &meta)?;
 
     let ops = resolve_arch_ops(&meta.architecture).ok_or_else(|| {
         LuaError::external(format!(
@@ -413,18 +402,47 @@ fn load_gpt2_impl(
     // see the specific error rather than a generic "base handle
     // is not a Gpt2Handle" fallback — this ordering is asserted
     // by `trainer_tests::load_gpt2_impl_errors_*`.
+    let card_id = CardId::parse(card_id)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: {e}")))?;
     let card = store
-        .get(card_id)
+        .get(card_id.as_str())
         .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: {e}")))?
         .ok_or_else(|| {
             LuaError::external(format!("alc.nn.card.load_gpt2: card '{card_id}' not found"))
         })?;
-    let meta = extract_nn_card_meta("alc.nn.card.load_gpt2", card_id, &card)?;
-    precheck_lora_card_meta("alc.nn.card.load_gpt2", card_id, &meta)?;
+    let meta = extract_nn_card_meta("alc.nn.card.load_gpt2", card_id.as_str(), &card)?;
+    precheck_lora_card_meta("alc.nn.card.load_gpt2", card_id.as_str(), &meta)?;
+    assert_bundle_ref_matches("alc.nn.card.load_gpt2", &card_id, &meta)?;
     let base = base_handle
         .borrow::<Gpt2Handle>()
         .map_err(|e| LuaError::external(format!("alc.nn.card.load_gpt2: base handle: {e}")))?;
-    wrap_gpt2_lora_from_meta("alc.nn.card.load_gpt2", card_id, &meta, &base)
+    wrap_gpt2_lora_from_meta("alc.nn.card.load_gpt2", card_id.as_str(), &meta, &base)
+}
+
+/// Enforce the `bundle_ref == "nn/<card_id>"` invariant on a loaded
+/// card (design §5). Save paths cannot write a divergent shape any
+/// more (the [`NnModelCard`] aggregate derives `bundle_ref` from the
+/// id at construction), so a mismatch here means the Card was
+/// hand-edited or written by a foreign pipeline — refuse rather than
+/// guess. Shared by every card-load surface.
+fn assert_bundle_ref_matches(ctx: &str, card_id: &CardId, meta: &NnCardMeta) -> LuaResult<()> {
+    let bundle_ref = meta
+        .candle
+        .as_ref()
+        .map(|c| c.bundle_ref.as_str())
+        .ok_or_else(|| {
+            LuaError::external(format!(
+                "{ctx}: card '{card_id}' missing metadata.nn.candle"
+            ))
+        })?;
+    let expected = card_id.bundle_ref();
+    if bundle_ref != expected {
+        return Err(LuaError::external(format!(
+            "{ctx}: bundle_ref '{bundle_ref}' does not match card_id \
+             '{card_id}' (expected '{expected}')"
+        )));
+    }
+    Ok(())
 }
 
 /// Schema + delta-file precheck for a LoRA card, run before the
@@ -819,7 +837,7 @@ fn register_impl(
 /// Build the JSON payload for `FileCardStore::create`. Required
 /// fields from `meta` are `training_path` and `architecture`; the
 /// rest are optional pass-through.
-fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResult<Json> {
+fn build_nn_meta(card_id: &CardId, name: &str, user_meta: &Json) -> LuaResult<NnCardMeta> {
     let training_path = user_meta
         .get("training_path")
         .and_then(|v| v.as_str())
@@ -830,8 +848,6 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
         .and_then(|v| v.as_str())
         .ok_or_else(|| LuaError::external("alc.nn.card.save: meta.architecture is required"))?
         .to_string();
-    validate_architecture(&architecture)
-        .map_err(|e| LuaError::external(format!("alc.nn.card.save: {e}")))?;
     let task = user_meta
         .get("task")
         .and_then(|v| v.as_str())
@@ -867,7 +883,7 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
     };
 
     let candle = NnCandleBranch {
-        bundle_ref: format!("nn/{card_id}"),
+        bundle_ref: card_id.bundle_ref(),
         device: candle_in
             .and_then(|c| c.get("device"))
             .and_then(|v| v.as_str())
@@ -879,7 +895,7 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
         lora,
     };
 
-    let nn_meta = NnCardMeta {
+    Ok(NnCardMeta {
         name: name.to_string(),
         backend: "candle".into(),
         task,
@@ -889,57 +905,7 @@ fn build_create_payload(card_id: &str, name: &str, user_meta: &Json) -> LuaResul
         hyperparams,
         metrics,
         candle: Some(candle),
-    };
-
-    let nn_meta_json = serde_json::to_value(&nn_meta)
-        .map_err(|e| LuaError::external(format!("alc.nn.card.save: serialize meta: {e}")))?;
-
-    Ok(json!({
-        "pkg": { "name": NN_PKG },
-        "card_id": card_id,
-        "metadata": {
-            "kind": "nn_model",
-            "nn": nn_meta_json,
-        }
-    }))
-}
-
-/// Assemble the Card create payload directly from an already-built
-/// [`NnCardMeta`], skipping the user-JSON parse + validate round
-/// trip that [`build_create_payload`] performs.
-///
-/// Used by Layer 5a `alc.nn.card.merge_lora`: after
-/// [`MergedProvenance::to_card_meta`] returns a fully-typed
-/// [`NnCardMeta`] there is no user-facing JSON to re-validate.
-/// The Card envelope shape (pkg / card_id / metadata.kind /
-/// metadata.nn) is identical to [`build_create_payload`]'s output —
-/// only the input side differs (typed struct vs. raw JSON).
-///
-/// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
-/// which also builds a typed [`NnCardMeta`] (LoRA branch) and needs
-/// the same envelope constructor — no user-JSON re-validation to
-/// perform, so re-using [`build_create_payload`] would force an
-/// unnecessary JSON round-trip.
-pub(super) fn build_create_payload_from_meta(card_id: &str, meta: &NnCardMeta) -> LuaResult<Json> {
-    // Defensive re-validation: even though the caller passes a
-    // fully-typed struct, the architecture field still must match
-    // the canonical family list (a mis-constructed MergedProvenance
-    // could carry a stray value). Same guard as build_create_payload
-    // §architecture check.
-    validate_architecture(&meta.architecture)
-        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: {e}")))?;
-
-    let nn_meta_json = serde_json::to_value(meta)
-        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: serialize meta: {e}")))?;
-
-    Ok(json!({
-        "pkg": { "name": NN_PKG },
-        "card_id": card_id,
-        "metadata": {
-            "kind": "nn_model",
-            "nn": nn_meta_json,
-        }
-    }))
+    })
 }
 
 /// Translate an [`algocline_nn::merged::MergeError`] into a
@@ -973,9 +939,10 @@ fn merge_error_to_lua(err: MergeError) -> LuaError {
 ///    which writes the safetensors bundle under
 ///    `<nn_dir>/nn/<merged_card_id>.safetensors` and returns the
 ///    projected [`NnCardMeta`].
-/// 5. Persists the Card via [`build_create_payload_from_meta`] +
-///    `FileCardStore::create`, asserting the returned id matches
-///    the pre-generated one.
+/// 5. Persists the Card via [`NnModelCard::from_merge`] +
+///    [`crate::card::nn::persist`], which re-checks the
+///    bundle_ref ↔ id coherence and asserts the store echoes the
+///    pre-minted id back.
 ///
 /// Returns the freshly-minted merged card_id string.
 fn merge_lora_impl(
@@ -1025,10 +992,12 @@ fn merge_lora_impl(
         )));
     }
 
-    // 3. Pre-generate merged_card_id + derive arch + bundle_ref.
-    let merged_card_id = generate_card_id(&name);
+    // 3. Pre-mint merged card id + derive arch; bundle_ref is derived
+    //    from the id (invariant #1 — same guarantee the aggregate
+    //    re-checks at construction below).
+    let merged_card_id = CardId::mint(&name);
     let arch = handle.arch_family_variant();
-    let bundle_ref = format!("nn/{merged_card_id}");
+    let bundle_ref = merged_card_id.bundle_ref();
 
     let provenance = MergedProvenance {
         lora_card,
@@ -1042,7 +1011,7 @@ fn merge_lora_impl(
     //    matches load_handle_impl's resolution — `nn_dir/<id>
     //    .safetensors` directly (the "nn/" bundle_ref prefix is a
     //    logical Card reference, not a filesystem subdir).
-    let out_path = nn_dir.join(format!("{merged_card_id}.safetensors"));
+    let out_path = nn_dir.join(format!("{}.safetensors", merged_card_id.as_str()));
 
     let (_bytes, meta) = match &handle {
         NnHandle::Gpt2(gpt2) => {
@@ -1068,25 +1037,15 @@ fn merge_lora_impl(
         }
     };
 
-    // 5. Overwrite meta.name to the caller-supplied name (the
-    //    projection defaults to the bundle file stem; keep the
-    //    user-visible name for the Card record instead).
-    let mut meta = meta;
-    meta.name = name.clone();
+    // 5. Wrap into the typed aggregate — `from_merge` overrides the
+    //    projection's default name (bundle file stem) with the
+    //    caller-supplied one and re-checks the bundle_ref ↔ id
+    //    coherence — then persist (envelope + returned-id check live
+    //    in `crate::card::nn::persist`).
+    let card = NnModelCard::from_merge(merged_card_id, name, meta)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: {e}")))?;
 
-    let payload = build_create_payload_from_meta(&merged_card_id, &meta)?;
-
-    let (returned_id, _path) = store
-        .create(payload)
-        .map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: card store: {e}")))?;
-
-    if returned_id != merged_card_id {
-        return Err(LuaError::external(format!(
-            "alc.nn.card.merge_lora: card_id mismatch (expected {merged_card_id}, got {returned_id})"
-        )));
-    }
-
-    Ok(merged_card_id)
+    persist(store, &card).map_err(|e| LuaError::external(format!("alc.nn.card.merge_lora: {e}")))
 }
 
 fn normalise_object(v: Option<Json>) -> Json {
@@ -1100,55 +1059,6 @@ fn normalise_object(v: Option<Json>) -> Json {
         Some(other) => other,
         None => Json::Object(serde_json::Map::new()),
     }
-}
-
-/// Deterministic Card id derived from `name` + wall-clock microseconds.
-///
-/// Format: `<sanitized_name>_<epoch_us>`. Satisfies both
-/// `FileCardStore::validate_name` (no `/` / `\` / `..` / `\0`) and
-/// [`algocline_nn::FsStore`]'s stricter `[A-Za-z0-9_.-]` alphabet.
-fn generate_card_id(name: &str) -> String {
-    let ts = compact_epoch_us();
-    let sanitized = sanitize_name(name);
-    format!("{sanitized}_{ts}")
-}
-
-// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
-// which generates its LoRA card_id via the same
-// `<sanitized_name>_<epoch_us>` convention (mirrors save_impl /
-// merge_lora_impl). Kept module-private otherwise.
-pub(super) fn sanitize_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "nn".into()
-    } else {
-        out
-    }
-}
-
-// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
-// which generates its LoRA card_id via the same
-// `<sanitized_name>_<epoch_us>` convention (mirrors save_impl /
-// merge_lora_impl). Kept module-private otherwise.
-pub(super) fn compact_epoch_us() -> String {
-    // Clock-skew corner (`SystemTime` < `UNIX_EPOCH`) collapses to
-    // `Duration::ZERO`; id collision then surfaces loudly through
-    // `FileCardStore::write_new_card`'s immutable-card guard, not
-    // silently, so the safety net is downstream rather than in this
-    // helper's signature.
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    // Microsecond-resolution suffix; keeps rapid successive save() calls
-    // unique without pulling in a UUID crate.
-    format!("{}{:06}", d.as_secs(), d.subsec_micros())
 }
 
 /// Fetch a function from the (already-registered) `alc.nn.*` table.
@@ -1800,21 +1710,25 @@ pub(super) fn load_wrap_impl(
     card_id: &str,
     base_handle: &LuaAnyUserData,
 ) -> LuaResult<NnHandle> {
+    let card_id = CardId::parse(card_id)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load_wrap: {e}")))?;
     let card = store
-        .get(card_id)
+        .get(card_id.as_str())
         .map_err(|e| LuaError::external(format!("alc.nn.card.load_wrap: {e}")))?
         .ok_or_else(|| {
             LuaError::external(format!("alc.nn.card.load_wrap: card '{card_id}' not found"))
         })?;
-    let mut meta = extract_nn_card_meta("alc.nn.card.load_wrap", card_id, &card)?;
+    let mut meta = extract_nn_card_meta("alc.nn.card.load_wrap", card_id.as_str(), &card)?;
     // Overwrite meta.name with card_id so downstream error
     // messages from the wrap core reference the caller-visible
     // id (the meta.name field is user-set at save time and can
     // diverge from card_id).
-    meta.name = card_id.to_string();
+    meta.name = card_id.as_str().to_string();
 
     // training_path 分岐: lora のみ受け付ける。 self-contained
     // (full_ft / merged / distillation) は load_handle 側に誘導。
+    // 未知値の accepted list は `validate_training_path`
+    // (crate::card) が単一 SoT。
     match meta.training_path.as_str() {
         "lora" => {}
         "full_ft" | "merged" | "distillation" => {
@@ -1826,9 +1740,12 @@ pub(super) fn load_wrap_impl(
             )));
         }
         other => {
+            let msg = match validate_training_path(other) {
+                Err(e) => e,
+                Ok(()) => format!("training_path {other:?} has no load_wrap route"),
+            };
             return Err(LuaError::external(format!(
-                "alc.nn.card.load_wrap: card '{card_id}' has unknown training_path \
-                 {other:?} (expected one of full_ft / lora / merged / distillation)"
+                "alc.nn.card.load_wrap: card '{card_id}': {msg}"
             )));
         }
     }
@@ -1837,7 +1754,12 @@ pub(super) fn load_wrap_impl(
     // schema gaps surface as specific errors (parity with the
     // trainer_tests::load_gpt2_impl_errors_* discipline that also
     // guards `load_gpt2_impl`).
-    precheck_lora_card_meta("alc.nn.card.load_wrap", card_id, &meta)?;
+    precheck_lora_card_meta("alc.nn.card.load_wrap", card_id.as_str(), &meta)?;
+
+    // bundle_ref ↔ id coherence (design §5) — previously unchecked on
+    // this surface; the write side can no longer produce a divergent
+    // shape, so a mismatch means hand-editing.
+    assert_bundle_ref_matches("alc.nn.card.load_wrap", &card_id, &meta)?;
 
     let ops = resolve_arch_ops(&meta.architecture).ok_or_else(|| {
         LuaError::external(format!(
@@ -3246,7 +3168,6 @@ fn full_ft_impl(
 ) -> LuaResult<LuaTable> {
     let cfg = extract_full_ft_opts(opts)?;
     let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "full_ft")?;
-    let card_id = ckpt_prefix.clone();
 
     let gpt2 = handle.borrow::<Gpt2Handle>()?;
     let model_arc = gpt2.model();
@@ -3289,7 +3210,7 @@ fn full_ft_impl(
     drop(ds_guard);
 
     let ckpt = result.map_err(train_err_to_lua)?;
-    checkpoint_to_lua(lua, &ckpt, &card_id, None)
+    checkpoint_to_lua(lua, &ckpt, &ckpt_prefix, None)
 }
 
 /// `alc.nn.trainer.lora(handle, dataset, opts) -> Checkpoint`.
@@ -3315,7 +3236,7 @@ fn lora_impl(
 ) -> LuaResult<LuaTable> {
     let train_cfg = extract_full_ft_opts(opts)?;
     let lora_cfg = extract_lora_cfg(opts)?;
-    let (ckpt_dir, card_id) = resolve_ckpt_dest(opts, nn_dir, "lora")?;
+    let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "lora")?;
 
     let gpt2 = handle.borrow::<Gpt2Handle>()?;
     let model_arc = gpt2.model();
@@ -3329,8 +3250,8 @@ fn lora_impl(
     let base_bundle_ref = match opts {
         Some(t) => t
             .get::<Option<String>>("base_bundle_ref")?
-            .unwrap_or_else(|| format!("nn/{}", gpt2.variant)),
-        None => format!("nn/{}", gpt2.variant),
+            .unwrap_or_else(|| bundle_ref_for(&gpt2.variant)),
+        None => bundle_ref_for(&gpt2.variant),
     };
     drop(gpt2);
 
@@ -3355,7 +3276,7 @@ fn lora_impl(
         &train_cfg,
         &loss_fn,
         &ckpt_dir,
-        &card_id,
+        &ckpt_prefix,
         lease,
     );
     drop(model);
@@ -3365,13 +3286,13 @@ fn lora_impl(
     let ckpt = result.map_err(train_err_to_lua)?;
 
     // Attach the LoRA branch descriptor. The Card foundation reads
-    // this back through `meta.candle.lora` in `build_create_payload`.
+    // this back through `meta.candle.lora` in `build_nn_meta`.
     //
     // ST-d additions: `target_modules` / `dropout` / `delta_path` are
     // required by `alc.nn.card.load_gpt2` to reconstruct the same
     // `LoraConfig` on reload and locate the delta safetensors. The
     // delta lives at `<ckpt_dir>/nn/<ckpt.bundle_ref>` — `run_lora_ft`
-    // writes `nn/lora-<card_id>.safetensors` under the caller's
+    // writes `nn/lora-<ckpt_prefix>.safetensors` under the caller's
     // `ckpt_dir`, and `ckpt.bundle_ref` is the trailing filename.
     let lora_tbl = lua.create_table()?;
     lora_tbl.set("rank", lora_cfg.rank as u32)?;
@@ -3386,7 +3307,7 @@ fn lora_impl(
     let delta_path = ckpt_dir.join("nn").join(&ckpt.bundle_ref);
     lora_tbl.set("delta_path", delta_path.to_string_lossy().to_string())?;
 
-    checkpoint_to_lua(lua, &ckpt, &card_id, Some(lora_tbl))
+    checkpoint_to_lua(lua, &ckpt, &ckpt_prefix, Some(lora_tbl))
 }
 
 /// `alc.nn.trainer.distill(handle, dataset, opts?) -> Checkpoint`.
@@ -3409,7 +3330,6 @@ fn distill_impl(
         loss_kind,
     };
     let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "distill")?;
-    let card_id = ckpt_prefix.clone();
 
     let gpt2 = handle.borrow::<Gpt2Handle>()?;
     let model_arc = gpt2.model();
@@ -3446,7 +3366,7 @@ fn distill_impl(
     drop(ds_guard);
 
     let ckpt = result.map_err(train_err_to_lua)?;
-    checkpoint_to_lua(lua, &ckpt, &card_id, None)
+    checkpoint_to_lua(lua, &ckpt, &ckpt_prefix, None)
 }
 
 /// Extract [`FullFtConfig`] from an opts table, applying the crate's
@@ -3584,19 +3504,21 @@ fn extract_distill_loss_kind(opts: Option<&LuaTable>) -> LuaResult<DistillLossKi
 ///
 /// - `opts.ckpt_dir` overrides the default (`<nn_dir>/ckpt`) when the
 ///   caller wants a scenario-specific location.
-/// - `opts.card_id` overrides the default `<path>_<epoch_us>` prefix
-///   when the caller wants the ckpt filename to match a Card id they
-///   already own (`run_lora_ft` in particular expects this to line up
-///   with the `nn/lora-<card_id>.safetensors` bundle name).
+/// - `opts.ckpt_prefix` overrides the default `<path>_<epoch_us>`
+///   prefix when the caller wants the ckpt filename to line up with a
+///   name they already own (`run_lora_ft` in particular expects this
+///   to match the `nn/lora-<prefix>.safetensors` bundle name).
+///   `opts.card_id` is accepted as a deprecated alias of the same
+///   knob (pre-refactor name; the value never was a Card store id).
 fn resolve_ckpt_dest(
     opts: Option<&LuaTable>,
     nn_dir: &std::path::Path,
     stage: &str,
 ) -> LuaResult<(PathBuf, String)> {
-    // Both `ckpt_dir` and `card_id` are read strictly: wrong-type input
-    // surfaces as a Lua error rather than silently falling back to the
-    // default (which would write the checkpoint to an unexpected
-    // location without diagnostic).
+    // Both `ckpt_dir` and `ckpt_prefix` are read strictly: wrong-type
+    // input surfaces as a Lua error rather than silently falling back
+    // to the default (which would write the checkpoint to an
+    // unexpected location without diagnostic).
     let ckpt_dir = match opts {
         Some(t) => t
             .get::<Option<String>>("ckpt_dir")?
@@ -3610,12 +3532,21 @@ fn resolve_ckpt_dest(
             ckpt_dir.display()
         ))
     })?;
+    // `opts.ckpt_prefix` is the canonical override key; `opts.card_id`
+    // is accepted as a deprecated alias (the value was never a Card
+    // store id — it is the checkpoint filename stem).
     let ckpt_prefix = match opts {
-        Some(t) => match t.get::<Option<String>>("card_id")? {
-            Some(id) => sanitize_name(&id),
-            None => generate_card_id(stage),
-        },
-        None => generate_card_id(stage),
+        Some(t) => {
+            let explicit = match t.get::<Option<String>>("ckpt_prefix")? {
+                Some(p) => Some(p),
+                None => t.get::<Option<String>>("card_id")?,
+            };
+            match explicit {
+                Some(p) => sanitize_stem(&p),
+                None => unique_stem(stage),
+            }
+        }
+        None => unique_stem(stage),
     };
     Ok((ckpt_dir, ckpt_prefix))
 }
@@ -3631,24 +3562,24 @@ fn train_err_to_lua(e: TrainError) -> LuaError {
 /// Optional `lora_branch` sub-table is attached under `ckpt.lora` for
 /// the LoRA binding; `full_ft` / `distill` pass `None`.
 ///
-/// **On `ckpt.card_id`**: this is the *checkpoint filename prefix*
-/// (matches the safetensors bundle `<prefix>.safetensors`), NOT the
-/// Card store's card_id. `alc.nn.card.save` currently generates its
-/// own Card id internally (`generate_card_id(name)`) rather than
-/// accepting a caller-provided value, so `alc.nn.card.load(ckpt.card_id)`
-/// will not resolve. Callers who need to correlate the trainer output
-/// with a saved Card should use the return value of `alc.nn.card.save`
-/// directly. Renaming this field to `ckpt_prefix` is deferred pending
-/// a Phase 2 follow-up that threads the prefix through to `save_impl`.
+/// **On `ckpt.ckpt_prefix`**: this is the *checkpoint filename
+/// prefix* (matches the safetensors bundle `<prefix>.safetensors`),
+/// NOT a Card store id — `alc.nn.card.save` mints its own Card id
+/// ([`CardId::mint`]). Callers who need a loadable Card id should use
+/// the return value of `alc.nn.card.save` (or the `run_*` trainer
+/// surfaces, which persist the Card themselves). The field was named
+/// `card_id` before the 2026-07-30 Card-domain refactor; the rename
+/// closes the eval-iter confusion where the prefix was mistaken for a
+/// loadable Card id.
 fn checkpoint_to_lua(
     lua: &Lua,
     ckpt: &algocline_nn::train::Checkpoint,
-    card_id: &str,
+    ckpt_prefix: &str,
     lora_branch: Option<LuaTable>,
 ) -> LuaResult<LuaTable> {
     let out = lua.create_table()?;
     out.set("bundle_ref", ckpt.bundle_ref.clone())?;
-    out.set("card_id", card_id.to_string())?;
+    out.set("ckpt_prefix", ckpt_prefix.to_string())?;
     out.set("step", ckpt.step)?;
     out.set("train_loss", ckpt.train_loss)?;
     match ckpt.val_loss {
@@ -3953,16 +3884,16 @@ mod nn_handle_helper_tests {
 }
 
 #[cfg(test)]
-mod build_create_payload_from_meta_tests {
-    //! Layer 5a S2 — `build_create_payload_from_meta` unit coverage.
-    //!
-    //! The envelope shape (`pkg.name` / `card_id` /
-    //! `metadata.kind` / `metadata.nn`) must be byte-identical to
-    //! what `build_create_payload` produces from the equivalent
-    //! user-JSON input so `FileCardStore::create` treats both
-    //! entry points uniformly.
+mod nn_model_card_persist_tests {
+    //! Layer 5a S2 successor — the former
+    //! `build_create_payload_from_meta` unit coverage, retargeted at
+    //! the [`NnModelCard`] aggregate + [`crate::card::nn::persist`]
+    //! pair that replaced it. The envelope shape (`pkg.name` /
+    //! `card_id` / `metadata.kind` / `metadata.nn`) is now assembled
+    //! in exactly one place (`persist`), so the shape assertion runs
+    //! against what actually lands in the store.
     use super::*;
-    use algocline_nn::card::{NnCandleBranch, NnCardMeta, NnLineage};
+    use crate::card::nn::NN_PKG;
     use serde_json::json;
 
     fn sample_merged_meta() -> NnCardMeta {
@@ -3988,10 +3919,19 @@ mod build_create_payload_from_meta_tests {
     }
 
     #[test]
-    fn envelope_shape_matches_build_create_payload() {
-        let meta = sample_merged_meta();
-        let payload = build_create_payload_from_meta("my-merged-1", &meta).expect("build payload");
+    fn persisted_envelope_shape_is_canonical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileCardStore::new(dir.path().to_path_buf());
+        let id = CardId::parse("my-merged-1").expect("valid id");
+        let card = NnModelCard::new(id, sample_merged_meta()).expect("aggregate");
 
+        let returned = persist(&store, &card).expect("persist");
+        assert_eq!(returned, "my-merged-1");
+
+        let payload = store
+            .get("my-merged-1")
+            .expect("get")
+            .expect("card present");
         assert_eq!(payload["pkg"]["name"], NN_PKG);
         assert_eq!(payload["card_id"], "my-merged-1");
         assert_eq!(payload["metadata"]["kind"], "nn_model");
@@ -4005,14 +3945,27 @@ mod build_create_payload_from_meta_tests {
     }
 
     #[test]
-    fn refuses_unknown_architecture_family() {
+    fn aggregate_refuses_unknown_architecture_family() {
         let mut meta = sample_merged_meta();
         meta.architecture = "nonexistent-arch".into();
-        let err = build_create_payload_from_meta("my-merged-1", &meta)
+        let err = NnModelCard::new(CardId::parse("my-merged-1").expect("valid id"), meta)
             .expect_err("should reject unknown arch");
         assert!(
-            err.to_string().contains("alc.nn.card.merge_lora"),
-            "expected merge_lora-prefixed error, got: {err}"
+            err.contains("unknown architecture family"),
+            "expected architecture-family error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_refuses_bundle_ref_id_mismatch() {
+        let err = NnModelCard::new(
+            CardId::parse("someone-else").expect("valid id"),
+            sample_merged_meta(),
+        )
+        .expect_err("bundle_ref/id divergence must be rejected");
+        assert!(
+            err.contains("does not match card_id"),
+            "expected coherence error, got: {err}"
         );
     }
 }
@@ -4021,6 +3974,18 @@ mod build_create_payload_from_meta_tests {
 mod trainer_tests {
     use super::*;
     use mlua::Lua;
+    use serde_json::json;
+
+    /// Parse a literal test id (all fixtures use store-safe names).
+    fn cid(s: &str) -> CardId {
+        CardId::parse(s).expect("test card id")
+    }
+
+    /// Serialize a typed meta back to JSON so the shape assertions
+    /// keep exercising exactly what `persist` will serialize.
+    fn meta_json(meta: &NnCardMeta) -> Json {
+        serde_json::to_value(meta).expect("serialize meta")
+    }
 
     fn opts_from(lua: &Lua, pairs: &[(&str, LuaValue)]) -> LuaTable {
         let t = lua.create_table().expect("create opts table");
@@ -4236,7 +4201,7 @@ mod trainer_tests {
     }
 
     #[test]
-    fn build_create_payload_populates_lora_branch_when_meta_provides_it() {
+    fn build_nn_meta_populates_lora_branch_when_meta_provides_it() {
         let user_meta = json!({
             "training_path": "lora",
             "architecture": "gpt2-medium",
@@ -4250,11 +4215,9 @@ mod trainer_tests {
                 }
             }
         });
-        let payload =
-            build_create_payload("card-abc", "my-model", &user_meta).expect("payload with lora");
-        let lora = payload
-            .pointer("/metadata/nn/candle/lora")
-            .expect("lora sub-object");
+        let meta = build_nn_meta(&cid("card-abc"), "my-model", &user_meta).expect("meta with lora");
+        let nn = meta_json(&meta);
+        let lora = nn.pointer("/candle/lora").expect("lora sub-object");
         assert_eq!(lora.get("rank"), Some(&json!(8)));
         assert_eq!(lora.get("alpha"), Some(&json!(16)));
         assert_eq!(
@@ -4264,13 +4227,13 @@ mod trainer_tests {
     }
 
     #[test]
-    fn build_create_payload_omits_lora_when_meta_absent_or_null() {
+    fn build_nn_meta_omits_lora_when_meta_absent_or_null() {
         let no_candle = json!({
             "training_path": "full_ft",
             "architecture": "gpt2-medium",
         });
-        let p = build_create_payload("c1", "m", &no_candle).unwrap();
-        let candle = p.pointer("/metadata/nn/candle").expect("candle present");
+        let p = meta_json(&build_nn_meta(&cid("c1"), "m", &no_candle).unwrap());
+        let candle = p.pointer("/candle").expect("candle present");
         assert!(
             candle.get("lora").is_none() || candle.get("lora") == Some(&Json::Null),
             "lora must be absent: {candle}"
@@ -4281,8 +4244,8 @@ mod trainer_tests {
             "architecture": "gpt2-medium",
             "candle": { "device": "cpu" }
         });
-        let p2 = build_create_payload("c2", "m", &candle_only).unwrap();
-        let candle2 = p2.pointer("/metadata/nn/candle").expect("candle present");
+        let p2 = meta_json(&build_nn_meta(&cid("c2"), "m", &candle_only).unwrap());
+        let candle2 = p2.pointer("/candle").expect("candle present");
         assert!(candle2.get("lora").is_none() || candle2.get("lora") == Some(&Json::Null));
 
         let explicit_null = json!({
@@ -4290,13 +4253,13 @@ mod trainer_tests {
             "architecture": "gpt2-medium",
             "candle": { "lora": Json::Null }
         });
-        let p3 = build_create_payload("c3", "m", &explicit_null).unwrap();
-        let candle3 = p3.pointer("/metadata/nn/candle").expect("candle present");
+        let p3 = meta_json(&build_nn_meta(&cid("c3"), "m", &explicit_null).unwrap());
+        let candle3 = p3.pointer("/candle").expect("candle present");
         assert!(candle3.get("lora").is_none() || candle3.get("lora") == Some(&Json::Null));
     }
 
     #[test]
-    fn build_create_payload_preserves_lora_target_modules_dropout_delta_path() {
+    fn build_nn_meta_preserves_lora_target_modules_dropout_delta_path() {
         // ST-d extension: the extra fields `target_modules` /
         // `dropout` / `delta_path` populated by
         // `alc.nn.trainer.lora` must round-trip verbatim through the
@@ -4319,11 +4282,10 @@ mod trainer_tests {
                 }
             }
         });
-        let payload = build_create_payload("card-lora", "m", &user_meta)
-            .expect("payload with full lora branch");
-        let lora = payload
-            .pointer("/metadata/nn/candle/lora")
-            .expect("lora sub-object");
+        let meta =
+            build_nn_meta(&cid("card-lora"), "m", &user_meta).expect("meta with full lora branch");
+        let nn = meta_json(&meta);
+        let lora = nn.pointer("/candle/lora").expect("lora sub-object");
         assert_eq!(
             lora.get("target_modules"),
             Some(&json!(["q_proj", "v_proj"]))
@@ -4336,7 +4298,7 @@ mod trainer_tests {
     }
 
     #[test]
-    fn build_create_payload_defaults_lora_target_modules_when_meta_omits_them() {
+    fn build_nn_meta_defaults_lora_target_modules_when_meta_omits_them() {
         // Backwards compat: a caller providing only the pre-ST-d
         // trio (rank / alpha / base_bundle_ref) still produces a
         // valid Card — the payload fills `target_modules` with the
@@ -4352,11 +4314,10 @@ mod trainer_tests {
                 }
             }
         });
-        let payload =
-            build_create_payload("card-legacy", "m", &user_meta).expect("payload with legacy lora");
-        let lora = payload
-            .pointer("/metadata/nn/candle/lora")
-            .expect("lora sub-object");
+        let meta =
+            build_nn_meta(&cid("card-legacy"), "m", &user_meta).expect("meta with legacy lora");
+        let nn = meta_json(&meta);
+        let lora = nn.pointer("/candle/lora").expect("lora sub-object");
         // NnLoraBranch::target_modules defaults via serde to the
         // canonical six on deserialize; re-serialization emits the
         // full list.
@@ -4400,8 +4361,7 @@ mod trainer_tests {
 
     /// Test helper: write a Card with a caller-controlled
     /// `metadata.nn` shape into a fresh [`FileCardStore`] and return
-    /// the generated `card_id`. Uses `create_with_store`'s auto id
-    /// generation so tests don't have to know the exact format.
+    /// its `card_id`.
     fn write_test_card(store: &FileCardStore, nn_meta: serde_json::Value) -> String {
         let payload = json!({
             "pkg": { "name": "alc_nn" },
@@ -4523,7 +4483,7 @@ mod trainer_tests {
     }
 
     #[test]
-    fn build_create_payload_reports_invalid_lora_shape() {
+    fn build_nn_meta_reports_invalid_lora_shape() {
         // Missing required NnLoraBranch fields (`rank` / `alpha` /
         // `base_bundle_ref`) surfaces as a clear error rather than a
         // silently half-populated Card.
@@ -4532,7 +4492,7 @@ mod trainer_tests {
             "architecture": "gpt2-medium",
             "candle": { "lora": { "rank": 8 } }
         });
-        let err = build_create_payload("cx", "m", &bad).expect_err("invalid lora");
+        let err = build_nn_meta(&cid("cx"), "m", &bad).expect_err("invalid lora");
         let msg = err.to_string();
         assert!(msg.contains("invalid meta.candle.lora"), "message: {msg}");
     }
@@ -4561,9 +4521,20 @@ mod load_dispatch_tests {
     use mlua::Lua;
     use serde_json::json;
 
-    fn write_test_card(store: &FileCardStore, nn_meta: serde_json::Value) -> String {
+    fn write_test_card(store: &FileCardStore, mut nn_meta: serde_json::Value) -> String {
+        // Mint the id up front and rewrite `candle.bundle_ref` (when
+        // present) to the matching "nn/<id>" — the invariant every
+        // production writer now guarantees via `NnModelCard`, and
+        // which the load surfaces assert since the S-refactor.
+        let card_id = unique_stem("testcard");
+        if let Some(candle) = nn_meta.get_mut("candle") {
+            if candle.is_object() {
+                candle["bundle_ref"] = json!(bundle_ref_for(&card_id));
+            }
+        }
         let payload = json!({
             "pkg": { "name": "alc_nn" },
+            "card_id": card_id,
             "metadata": { "kind": "nn_model", "nn": nn_meta }
         });
         let (card_id, _path) = store.create(payload).expect("create test card");
@@ -4843,9 +4814,20 @@ mod merge_lora_bridge_tests {
     use mlua::Lua;
     use serde_json::json;
 
-    fn write_test_card(store: &FileCardStore, nn_meta: serde_json::Value) -> String {
+    fn write_test_card(store: &FileCardStore, mut nn_meta: serde_json::Value) -> String {
+        // Mint the id up front and rewrite `candle.bundle_ref` (when
+        // present) to the matching "nn/<id>" — the invariant every
+        // production writer now guarantees via `NnModelCard`, and
+        // which the load surfaces assert since the S-refactor.
+        let card_id = unique_stem("testcard");
+        if let Some(candle) = nn_meta.get_mut("candle") {
+            if candle.is_object() {
+                candle["bundle_ref"] = json!(bundle_ref_for(&card_id));
+            }
+        }
         let payload = json!({
             "pkg": { "name": "alc_nn" },
+            "card_id": card_id,
             "metadata": { "kind": "nn_model", "nn": nn_meta }
         });
         let (card_id, _path) = store.create(payload).expect("create test card");

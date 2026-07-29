@@ -152,6 +152,7 @@ dependencies = [
  "candle-transformers",
  "mlua",
  "parquet",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",

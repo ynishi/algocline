@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `algocline-nn` gains a `sampling` module carrying the Layer 1 of the
+  Sampler 3-layer plan: a `Sampler` trait (`sample(&mut self, logits:
+  &Tensor) -> Result<u32>`) plus three Rust default implementations —
+  `GreedySampler` (argmax), `TemperatureSampler` (temperature-scaled
+  multinomial), and `TopKTopPSampler` (top-k + nucleus + temperature).
+  Every stochastic sampler carries its own `StdRng` seeded at
+  construction, so a fixed seed + fixed logits stream reproduces the
+  same tokens (save/load reproducibility). `temperature <= 0` degrades
+  to greedy on both stochastic samplers to avoid dividing by zero.
+  `top_k = Some(0)` and `top_p` outside `[0.0, 1.0]` are refused at
+  `sample` time — a caller programming error, not something to hide
+  behind a silent fallback. Layer 2 (constraint DSL — grammar / JSON
+  schema / regex) and Layer 3 (schedule / mid-generation sampler swap
+  from Lua) attach later as additional `impl Sampler` types (including
+  a Lua-callback bridge on the engine side) without changing the trait.
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

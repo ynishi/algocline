@@ -51,6 +51,11 @@ ureq = "3"
 # zstd increasingly, gzip occasionally, lz4 cheap to include — a file
 # using an unlisted codec fails loudly with the codec name).
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "flate2-zlib-rs", "lz4"] }
+# Multinomial sampling for `sampling::TemperatureSampler` / `TopKTopPSampler`.
+# `StdRng` is used for reproducibility (seed-driven so save/load replays land
+# on the same token stream); the workspace pin matches the version the engine
+# bridge already uses.
+rand = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 

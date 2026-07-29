@@ -18,6 +18,8 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::llama::{Cache, Config, Llama};
 
+use super::{AdapterMeta, InferenceAdapter, LogitsShape};
+
 /// Build-time configuration for a [`LlamaAdapter`].
 ///
 /// `variant` is the caller-facing preset id (e.g. `"tinyllama-1.1b"`,
@@ -39,8 +41,17 @@ pub struct LlamaAdapterConfig {
     /// the mlua boundary.
     pub config: Config,
     /// Whether the KV cache is populated across successive `forward`
-    /// calls. Set to `false` for one-shot forward benchmarks; `true`
-    /// for token-by-token generation.
+    /// calls. `true` for token-by-token generation; set to `false` for
+    /// one-shot forward benchmarks that never revisit a position.
+    ///
+    /// Every constructor here defaults this to `true`, matching the
+    /// engine bridge's `opts.use_kv_cache` default
+    /// (`bridge/nn_card.rs`, `build_llama_handle`). The two used to
+    /// disagree — the bridge defaulted to `true` while `from_variant` /
+    /// [`Self::tiny`] returned `false` — so a Rust caller constructing
+    /// a config directly got different behaviour from a Lua caller
+    /// reaching the same adapter through the preset. Keep both defaults
+    /// in lockstep when changing either.
     pub use_kv_cache: bool,
 }
 
@@ -68,14 +79,14 @@ impl LlamaAdapterConfig {
                 device: Device::Cpu,
                 dtype: DType::F32,
                 config: Config::config_7b_v1(flash_attn),
-                use_kv_cache: false,
+                use_kv_cache: true,
             }),
             "7b-v2" | "llama-7b-v2" => Some(Self {
                 variant: variant.to_string(),
                 device: Device::Cpu,
                 dtype: DType::F32,
                 config: Config::config_7b_v2(flash_attn),
-                use_kv_cache: false,
+                use_kv_cache: true,
             }),
             _ => None,
         }
@@ -109,7 +120,7 @@ impl LlamaAdapterConfig {
             device: Device::Cpu,
             dtype: DType::F32,
             config,
-            use_kv_cache: false,
+            use_kv_cache: true,
         }
     }
 }
@@ -246,6 +257,41 @@ impl LlamaAdapter {
     }
 }
 
+impl InferenceAdapter for LlamaAdapter {
+    /// Describe the loaded stack for the engine bridge.
+    ///
+    /// Every field is derived from the upstream `Config` captured at
+    /// load time, so this is the single place the bridge needs to read
+    /// to build its Lua-facing handle — it never reaches into
+    /// `candle_transformers`' config itself.
+    ///
+    /// `logits` is [`LogitsShape::LastToken`]: upstream `Llama::forward`
+    /// slices the final position before returning, so a `[batch, seq]`
+    /// input yields `[batch, vocab]`.
+    fn meta(&self) -> AdapterMeta {
+        AdapterMeta {
+            family: "llama",
+            variant: self.variant.clone(),
+            layers: self.layers(),
+            heads: self.heads(),
+            kv_heads: self.kv_heads(),
+            dim: self.dim(),
+            ctx: self.ctx(),
+            vocab: self.vocab(),
+            device: self.device.clone(),
+            dtype: self.dtype,
+            logits: LogitsShape::LastToken,
+        }
+    }
+
+    /// Delegates to the inherent [`LlamaAdapter::forward`], spelled with
+    /// the fully-qualified form so the call cannot be read as recursing
+    /// through this trait method.
+    fn forward(&self, tokens: &Tensor, index_pos: usize) -> CandleResult<Tensor> {
+        LlamaAdapter::forward(self, tokens, index_pos)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +342,64 @@ mod tests {
         let next = Tensor::new(&[[4u32]], adapter.device()).unwrap();
         let out2 = adapter.forward(&next, 3).expect("cached second forward");
         assert_eq!(out2.dims(), &[1, adapter.vocab()]);
+    }
+
+    /// [`InferenceAdapter::meta`] must agree with the inherent
+    /// accessors it is derived from. The bridge builds its Lua-facing
+    /// handle from `meta()` alone, so a drift between the two would
+    /// silently mis-report shape parameters to a Lua caller.
+    #[test]
+    fn meta_agrees_with_inherent_accessors() {
+        let cfg = LlamaAdapterConfig::tiny();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let adapter = LlamaAdapter::load(vb, cfg).expect("load tiny Llama");
+
+        let meta = InferenceAdapter::meta(&adapter);
+        assert_eq!(meta.family, "llama");
+        assert_eq!(meta.variant, adapter.variant());
+        assert_eq!(meta.layers, adapter.layers());
+        assert_eq!(meta.heads, adapter.heads());
+        assert_eq!(meta.kv_heads, adapter.kv_heads());
+        assert_eq!(meta.dim, adapter.dim());
+        assert_eq!(meta.ctx, adapter.ctx());
+        assert_eq!(meta.vocab, adapter.vocab());
+        assert_eq!(meta.dtype, adapter.dtype());
+        assert_eq!(meta.logits, LogitsShape::LastToken);
+    }
+
+    /// The declared [`LogitsShape`] must predict the real `forward`
+    /// output dims. This is the invariant the bridge's `forward_shape`
+    /// binding relies on once it computes shapes from `meta()` instead
+    /// of an arch-specific `match`.
+    #[test]
+    fn declared_logits_shape_predicts_forward_dims() {
+        let cfg = LlamaAdapterConfig::tiny();
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let adapter = LlamaAdapter::load(vb, cfg).expect("load tiny Llama");
+
+        let (batch, seq) = (1usize, 4usize);
+        let tokens = Tensor::new(&[[1u32, 2, 3, 4]], adapter.device()).unwrap();
+        let logits = InferenceAdapter::forward(&adapter, &tokens, 0).expect("forward");
+
+        let meta = InferenceAdapter::meta(&adapter);
+        assert_eq!(logits.dims(), meta.logits.dims(batch, seq, meta.vocab));
+    }
+
+    /// Every constructor defaults `use_kv_cache` to `true` so a Rust
+    /// caller matches the engine bridge's `opts.use_kv_cache` default.
+    /// The two disagreed before (`false` here, `true` on the bridge).
+    #[test]
+    fn kv_cache_defaults_to_enabled_across_constructors() {
+        assert!(LlamaAdapterConfig::tiny().use_kv_cache);
+        for variant in ["tiny", "7b-v1", "7b-v2"] {
+            let cfg = LlamaAdapterConfig::from_variant(variant, false)
+                .unwrap_or_else(|| panic!("variant {variant} should resolve"));
+            assert!(
+                cfg.use_kv_cache,
+                "variant {variant} must default use_kv_cache to true"
+            );
+        }
     }
 }

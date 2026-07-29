@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `algocline-nn` inference adapters now have a typed contract:
+  `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
+  index_pos)`), `AdapterMeta` (family / variant / shape parameters /
+  device / dtype / logits shape), and `LogitsShape`
+  (`LastToken` | `FullSeq`). The contract was previously prose in the
+  module doc, which meant a second adapter had nothing to implement
+  against. Construction stays outside the trait — the `VarBuilder`
+  origin differs per arch (single file / sharded mmap / GGUF) and a
+  `Self: Sized` constructor would rule out `dyn InferenceAdapter` — so
+  a new adapter is one `InferenceAdapter` impl plus one `ARCH_OPS`
+  entry on the bridge side.
+- `LogitsShape` makes the adapter-vs-trainable output-shape difference
+  a value instead of per-arch prose: trainable arches return
+  `[batch, seq, vocab]`, the Llama adapter slices the final position
+  and returns `[batch, vocab]`. `alc.nn` handles compute
+  `forward_shape` from this rather than branching on the architecture.
+- The typed `alc.nn` handles (`preset.gpt2` / `preset.tinyllama` /
+  `preset.llama`) now expose the same accessor set as the arch-neutral
+  `alc.nn.preset(arch, ...)` handle. Concretely, GPT-2 handles gained
+  `kv_heads()` (mirrors `heads()`, since GPT-2 is multi-head attention)
+  and Llama adapter handles gained `pretrained()` (always `true`, the
+  adapter path being inference-only). Previously the available methods
+  depended on which entry point built the handle. Additive: no existing
+  accessor changed its name, arity, or value.
 - Mixed-precision BF16 training (design §7.1): the trainer entrypoints
   (`alc.nn.trainer.full_ft` / `.lora` / `run_lora_ft` / `run_distill` /
   `alc.nn.wrap_lora`) now accept a BF16 base handle. The training loop
@@ -325,6 +349,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behavior change**: `LlamaAdapterConfig::use_kv_cache` now defaults to
+  `true` in every constructor (`from_variant` for each variant, and
+  `tiny()`). It previously defaulted to `false` while the engine bridge's
+  `opts.use_kv_cache` defaulted to `true`, so a Rust caller building a
+  config directly got different behaviour from a Lua caller reaching the
+  same adapter through `alc.nn.preset.llama`. Lua callers see no change
+  (the bridge default already won). A Rust caller relying on the old
+  `false` default should set the field explicitly.
+- `alc.nn` handle accessors are dispatched through a single arch-neutral
+  projection (`HandleMeta`) instead of each accessor carrying its own
+  match over the architecture arms, and `LlamaHandle` is built from the
+  adapter's `InferenceAdapter::meta()` rather than from a clone of the
+  upstream `candle_transformers` config. No caller-visible change; this
+  removes the transcription step that a new architecture previously had
+  to repeat across the adapter, its handle, and the neutral union.
 - `algocline-nn` fetches HuggingFace artifacts through a small internal
   `ureq` client instead of `hf-hub`. Every call site already copied the
   downloaded file into its own cache directory and ignored the hub

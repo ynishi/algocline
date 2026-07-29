@@ -31,7 +31,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use algocline_nn::arch::adapter::{LlamaAdapter, LlamaAdapterConfig};
+use algocline_nn::arch::adapter::{
+    InferenceAdapter, LlamaAdapter, LlamaAdapterConfig, LogitsShape,
+};
 use algocline_nn::arch::{
     Activation, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig, MoeConfig, NormKind, NormPlacement,
     PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
@@ -1160,6 +1162,131 @@ fn alc_nn_fn(lua: &Lua, key: &str) -> LuaResult<LuaFunction> {
 
 // ─── alc.nn.preset ────────────────────────────────────────────────
 
+/// Arch-neutral description of a Lua-facing handle.
+///
+/// Every per-arch handle in this module (`Gpt2Handle` /
+/// `TinyLlamaHandle` / `LlamaHandle`) answers `meta()` with this shape,
+/// and [`NnHandle`] fans out to the wrapped handle's implementation.
+/// The Lua-facing accessors then read fields off the returned value
+/// instead of each one carrying its own three-arm `match`.
+///
+/// Sibling of `algocline_nn::arch::adapter::AdapterMeta`, which is the
+/// crate-side equivalent an [`InferenceAdapter`] produces. The two are
+/// deliberately separate types: this one carries the *Lua projection*
+/// (`device` / `dtype` as the caller-supplied strings, plus the
+/// bridge-only `pretrained` / `lora_wrapped` flags), while `AdapterMeta`
+/// carries candle's own `Device` / `DType`. `build_llama_handle`
+/// converts one into the other at construction time.
+///
+/// Borrows from the handle (`&'a str` rather than `String`) so an
+/// accessor as cheap as `handle:layers()` does not allocate two strings
+/// just to read a `usize`.
+pub(super) struct HandleMeta<'a> {
+    /// Architecture family prefix, matching an entry in
+    /// [`algocline_nn::card::SUPPORTED_ARCHITECTURE_FAMILIES`].
+    family: &'static str,
+    /// Caller-facing variant id. May be the bare variant (`"medium"`)
+    /// or the full `family-variant` form depending on the construction
+    /// path — see [`HandleMeta::arch_family_variant`].
+    variant: &'a str,
+    layers: usize,
+    heads: usize,
+    /// Equal to `heads` for multi-head arches (GPT-2); the real
+    /// grouped-query count for TinyLlama / Llama.
+    kv_heads: usize,
+    dim: usize,
+    ctx: usize,
+    vocab: usize,
+    device: &'a str,
+    dtype: &'a str,
+    /// Whether the weights came from a pretrained bundle. The
+    /// inference-only adapter arches are always `true` by construction.
+    pretrained: bool,
+    /// Whether the underlying model has been LoRA-wrapped. Always
+    /// `false` for adapter arches, which do not support wrapping.
+    lora_wrapped: bool,
+    /// Caller-visible logits shape, which drives `forward_shape`.
+    logits: LogitsShape,
+}
+
+impl HandleMeta<'_> {
+    /// Dimensions a forward over `[batch, seq]` token ids produces.
+    ///
+    /// Trainable arches return `[batch, seq, vocab]`; the Llama adapter
+    /// slices the final position and returns `[batch, vocab]`. The
+    /// difference is carried by [`Self::logits`] rather than by an
+    /// arch-specific branch here.
+    fn forward_shape(&self, batch: usize, seq: usize) -> Vec<usize> {
+        self.logits.dims(batch, seq, self.vocab)
+    }
+
+    /// Full `family-variant` identifier suitable for
+    /// [`algocline_nn::MergedProvenance::arch`] and the projected
+    /// [`algocline_nn::NnCardMeta::architecture`] field.
+    ///
+    /// The underlying handle's `variant` is stored in one of two
+    /// conventions depending on the construction path:
+    ///
+    /// - `preset.<arch>(variant, ...)` stores the raw `variant` string
+    ///   (e.g. `"medium"` / `"1.1b"`).
+    /// - `card.load_handle` (from a saved card) stores the full
+    ///   `family-variant` form (e.g. `"gpt2-medium"`) because the card's
+    ///   `NnCardMeta.architecture` is already in that shape.
+    ///
+    /// This normalises both into the full form so the Layer 5a
+    /// `merge_lora` bridge hands a consistent value to
+    /// [`algocline_nn::MergedProvenance`] regardless of how the handle
+    /// was obtained. The prefix-strip guard matches
+    /// [`wrap_gpt2_lora_from_meta`]'s `base_cfg_id` logic (§Layer 4b
+    /// invariant carry).
+    fn arch_family_variant(&self) -> String {
+        let prefix = format!("{}-", self.family);
+        if self.variant.starts_with(&prefix) {
+            self.variant.to_string()
+        } else {
+            format!("{prefix}{}", self.variant)
+        }
+    }
+}
+
+/// Register the shared Lua-facing accessors every `alc.nn` handle
+/// exposes, reading each value off [`HandleMeta`].
+///
+/// Called from `impl UserData` for each per-arch handle and for
+/// [`NnHandle`], so the accessor surface stays identical across all of
+/// them by construction — adding an accessor here reaches every handle
+/// at once. Previously each handle spelled out its own nine to eleven
+/// `add_method` closures, and `NnHandle` additionally carried a
+/// three-arm `match` inside every one of them.
+fn add_meta_methods<T, M>(methods: &mut M, meta: fn(&T) -> HandleMeta<'_>)
+where
+    // `T: 'static` is what `mlua::UserData` already requires of every
+    // handle type registered here; naming it explicitly lets the
+    // borrow checker see that a `HandleMeta<'_>` borrowed from `this`
+    // never outlives the method call.
+    T: 'static,
+    M: mlua::UserDataMethods<T>,
+{
+    methods.add_method("variant", move |_, this, ()| {
+        Ok(meta(this).variant.to_string())
+    });
+    methods.add_method("layers", move |_, this, ()| Ok(meta(this).layers));
+    methods.add_method("heads", move |_, this, ()| Ok(meta(this).heads));
+    methods.add_method("kv_heads", move |_, this, ()| Ok(meta(this).kv_heads));
+    methods.add_method("dim", move |_, this, ()| Ok(meta(this).dim));
+    methods.add_method("ctx", move |_, this, ()| Ok(meta(this).ctx));
+    methods.add_method("vocab", move |_, this, ()| Ok(meta(this).vocab));
+    methods.add_method("device", move |_, this, ()| {
+        Ok(meta(this).device.to_string())
+    });
+    methods.add_method("dtype", move |_, this, ()| Ok(meta(this).dtype.to_string()));
+    methods.add_method("pretrained", move |_, this, ()| Ok(meta(this).pretrained));
+    methods.add_method(
+        "forward_shape",
+        move |_, this, (batch, seq): (usize, usize)| Ok(meta(this).forward_shape(batch, seq)),
+    );
+}
+
 /// Opaque handle exposed to Lua for a constructed GPT-2 model.
 ///
 /// Wrapped in `Arc<Mutex<...>>` so `#[cfg(feature = "nn")]` builds can
@@ -1209,22 +1336,36 @@ pub(super) struct Gpt2Handle {
 
 impl mlua::UserData for Gpt2Handle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("variant", |_, this, ()| Ok(this.variant.clone()));
-        methods.add_method("layers", |_, this, ()| Ok(this.layers));
-        methods.add_method("heads", |_, this, ()| Ok(this.heads));
-        methods.add_method("dim", |_, this, ()| Ok(this.dim));
-        methods.add_method("ctx", |_, this, ()| Ok(this.ctx));
-        methods.add_method("vocab", |_, this, ()| Ok(this.vocab));
-        methods.add_method("device", |_, this, ()| Ok(this.device.clone()));
-        methods.add_method("dtype", |_, this, ()| Ok(this.dtype.clone()));
-        methods.add_method("pretrained", |_, this, ()| Ok(this.pretrained));
-        methods.add_method("forward_shape", |_, this, (batch, seq): (usize, usize)| {
-            Ok(vec![batch, seq, this.vocab])
-        });
+        add_meta_methods(methods, Gpt2Handle::meta);
     }
 }
 
 impl Gpt2Handle {
+    /// Arch-neutral projection of this handle. See [`HandleMeta`].
+    ///
+    /// `kv_heads` mirrors `heads`: GPT-2 is multi-head attention, so
+    /// every query head has its own key/value head. Reporting the
+    /// mirrored value (rather than omitting the accessor) keeps Lua
+    /// callers from having to branch on `handle:arch()` when they only
+    /// want the KV group count for a shape assertion.
+    fn meta(&self) -> HandleMeta<'_> {
+        HandleMeta {
+            family: "gpt2",
+            variant: &self.variant,
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.heads,
+            dim: self.dim,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            device: &self.device,
+            dtype: &self.dtype,
+            pretrained: self.pretrained,
+            lora_wrapped: self.has_lora,
+            logits: LogitsShape::FullSeq,
+        }
+    }
+
     /// Shared handle to the underlying model. The trainer bindings
     /// lock this for the duration of a `run_full_ft` / `run_lora_ft` /
     /// `run_distill` call; concurrent access is barred one layer up by
@@ -1757,30 +1898,51 @@ pub(super) struct LlamaHandle {
     vocab: usize,
     device: String,
     dtype: String,
+    /// Caller-visible logits shape, copied from the adapter's
+    /// [`InferenceAdapter::meta`] at construction. Carried as a field
+    /// rather than hard-coded in [`Self::meta`] so a future adapter
+    /// arch with a different convention drops in without editing this
+    /// handle.
+    logits: LogitsShape,
 }
 
 impl mlua::UserData for LlamaHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("variant", |_, this, ()| Ok(this.variant.clone()));
-        methods.add_method("layers", |_, this, ()| Ok(this.layers));
-        methods.add_method("heads", |_, this, ()| Ok(this.heads));
-        methods.add_method("kv_heads", |_, this, ()| Ok(this.kv_heads));
-        methods.add_method("dim", |_, this, ()| Ok(this.dim));
-        methods.add_method("ctx", |_, this, ()| Ok(this.ctx));
-        methods.add_method("vocab", |_, this, ()| Ok(this.vocab));
-        methods.add_method("device", |_, this, ()| Ok(this.device.clone()));
-        methods.add_method("dtype", |_, this, ()| Ok(this.dtype.clone()));
-        methods.add_method("forward_shape", |_, this, (batch, _seq): (usize, usize)| {
-            // Llama forward slices the last-token logits before
-            // returning, so the caller-visible output shape is
-            // `[batch, vocab]` regardless of the input sequence
-            // length.
-            Ok(vec![batch, this.vocab])
-        });
+        add_meta_methods(methods, LlamaHandle::meta);
     }
 }
 
 impl LlamaHandle {
+    /// Arch-neutral projection of this handle. See [`HandleMeta`].
+    ///
+    /// `pretrained` is `true` unconditionally: the adapter path is
+    /// inference-only and its weights always come from a bundle the
+    /// caller supplied (the random-init `tiny` smoke build exists only
+    /// to assert shapes and never reaches a Card). `lora_wrapped` is
+    /// `false` unconditionally: the adapter path does not support LoRA
+    /// wrapping (§Layer 2 non-goal, carried through Layer 4b).
+    ///
+    /// The shape numbers come from the adapter's
+    /// [`InferenceAdapter::meta`] at construction time, so this handle
+    /// never re-reads the upstream `candle_transformers` config.
+    fn meta(&self) -> HandleMeta<'_> {
+        HandleMeta {
+            family: "llama",
+            variant: &self.variant,
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dim: self.dim,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            device: &self.device,
+            dtype: &self.dtype,
+            pretrained: true,
+            lora_wrapped: false,
+            logits: self.logits,
+        }
+    }
+
     /// Shared handle to the underlying adapter, for callers who want
     /// to drive `forward` from Rust-side helper code.
     #[allow(dead_code)]
@@ -1821,23 +1983,30 @@ pub(super) struct TinyLlamaHandle {
 
 impl mlua::UserData for TinyLlamaHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("variant", |_, this, ()| Ok(this.variant.clone()));
-        methods.add_method("layers", |_, this, ()| Ok(this.layers));
-        methods.add_method("heads", |_, this, ()| Ok(this.heads));
-        methods.add_method("kv_heads", |_, this, ()| Ok(this.kv_heads));
-        methods.add_method("dim", |_, this, ()| Ok(this.dim));
-        methods.add_method("ctx", |_, this, ()| Ok(this.ctx));
-        methods.add_method("vocab", |_, this, ()| Ok(this.vocab));
-        methods.add_method("device", |_, this, ()| Ok(this.device.clone()));
-        methods.add_method("dtype", |_, this, ()| Ok(this.dtype.clone()));
-        methods.add_method("pretrained", |_, this, ()| Ok(this.pretrained));
-        methods.add_method("forward_shape", |_, this, (batch, seq): (usize, usize)| {
-            Ok(vec![batch, seq, this.vocab])
-        });
+        add_meta_methods(methods, TinyLlamaHandle::meta);
     }
 }
 
 impl TinyLlamaHandle {
+    /// Arch-neutral projection of this handle. See [`HandleMeta`].
+    fn meta(&self) -> HandleMeta<'_> {
+        HandleMeta {
+            family: "tinyllama",
+            variant: &self.variant,
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dim: self.dim,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            device: &self.device,
+            dtype: &self.dtype,
+            pretrained: self.pretrained,
+            lora_wrapped: self.has_lora,
+            logits: LogitsShape::FullSeq,
+        }
+    }
+
     /// Shared handle to the underlying model; mirrors
     /// [`Gpt2Handle::model`].
     #[allow(dead_code)]
@@ -1908,13 +2077,10 @@ fn build_llama_handle(variant: &str, opts: Option<&LuaTable>) -> LuaResult<Llama
     // smoke variant; caller can still `forward` for shape assertions).
     let weights_paths = extract_weights_paths(opts)?;
 
-    let (adapter, cfg_snapshot) = if let Some(paths) = weights_paths {
-        let cfg_snapshot = cfg.clone();
-        let adapter = LlamaAdapter::from_safetensors_files(&paths, cfg)
-            .map_err(|e| LuaError::external(format!("alc.nn.preset.llama: {e}")))?;
-        (adapter, cfg_snapshot)
+    let adapter = if let Some(paths) = weights_paths {
+        LlamaAdapter::from_safetensors_files(&paths, cfg)
+            .map_err(|e| LuaError::external(format!("alc.nn.preset.llama: {e}")))?
     } else {
-        let cfg_snapshot = cfg.clone();
         let vm = VarMap::new();
         let vb = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
         let adapter = LlamaAdapter::load(vb, cfg)
@@ -1924,20 +2090,33 @@ fn build_llama_handle(variant: &str, opts: Option<&LuaTable>) -> LuaResult<Llama
         // guarantees the mmap-less handle stays valid because the
         // adapter now owns the tensor snapshots.
         drop(vm);
-        (adapter, cfg_snapshot)
+        adapter
     };
+
+    // Shape parameters come from the adapter's own `InferenceAdapter`
+    // projection rather than from a clone of the config we just moved
+    // into it. That keeps this bridge from re-reading
+    // `candle_transformers`' `Config` field names, so a future adapter
+    // arch needs no new field-by-field transcription here.
+    let meta = InferenceAdapter::meta(&adapter);
 
     Ok(LlamaHandle {
         inner: Arc::new(adapter),
+        // The caller-supplied `variant` is kept verbatim rather than
+        // taking `meta.variant`: `LlamaAdapterConfig::from_variant`
+        // canonicalises aliases (`"tiny"` becomes `"llama-tiny"`), and
+        // the Lua-visible `handle:variant()` has always echoed back
+        // exactly what the caller passed.
         variant: variant.to_string(),
-        layers: cfg_snapshot.config.num_hidden_layers,
-        heads: cfg_snapshot.config.num_attention_heads,
-        kv_heads: cfg_snapshot.config.num_key_value_heads,
-        dim: cfg_snapshot.config.hidden_size,
-        ctx: cfg_snapshot.config.max_position_embeddings,
-        vocab: cfg_snapshot.config.vocab_size,
+        layers: meta.layers,
+        heads: meta.heads,
+        kv_heads: meta.kv_heads,
+        dim: meta.dim,
+        ctx: meta.ctx,
+        vocab: meta.vocab,
         device: device_str,
         dtype: dtype_str,
+        logits: meta.logits,
     })
 }
 
@@ -3475,16 +3654,26 @@ pub(super) enum NnHandle {
 }
 
 impl NnHandle {
+    /// Arch-neutral projection of the wrapped handle.
+    ///
+    /// This is the enum's single dispatch point: every other accessor
+    /// here and every Lua-facing method reads fields off the returned
+    /// [`HandleMeta`], so adding an architecture means adding one arm
+    /// to this method rather than one arm to each of a dozen.
+    fn meta(&self) -> HandleMeta<'_> {
+        match self {
+            Self::Gpt2(h) => h.meta(),
+            Self::TinyLlama(h) => h.meta(),
+            Self::Llama(h) => h.meta(),
+        }
+    }
+
     /// Architecture family prefix (`"gpt2"` / `"tinyllama"` /
     /// `"llama"`) matching the first-column entries in
     /// [`algocline_nn::card::SUPPORTED_ARCHITECTURE_FAMILIES`].
     #[allow(dead_code)]
     pub(super) fn arch(&self) -> &'static str {
-        match self {
-            Self::Gpt2(_) => "gpt2",
-            Self::TinyLlama(_) => "tinyllama",
-            Self::Llama(_) => "llama",
-        }
+        self.meta().family
     }
 
     /// Typed downcast to the underlying [`Gpt2Handle`], if this
@@ -3520,35 +3709,11 @@ impl NnHandle {
     /// [`algocline_nn::MergedProvenance::arch`] and the projected
     /// [`algocline_nn::NnCardMeta::architecture`] field.
     ///
-    /// The underlying handle's `variant` field is stored in one of
-    /// two conventions depending on the construction path:
-    ///
-    /// - `preset.<arch>(variant, ...)` stores the raw `variant`
-    ///   string (e.g. `"medium"` / `"1.1b"`).
-    /// - `card.load_handle` (from a saved card) stores the full
-    ///   `family-variant` form (e.g. `"gpt2-medium"` /
-    ///   `"tinyllama-1.1b"`) because the card's
-    ///   `NnCardMeta.architecture` is already in that shape.
-    ///
-    /// This helper normalises both into the full `family-variant`
-    /// form so the Layer 5a `merge_lora` bridge can hand a
-    /// consistent value to [`MergedProvenance`] regardless of how
-    /// the wrapped handle was obtained. The prefix-strip guard
-    /// matches [`wrap_gpt2_lora_from_meta`]'s existing
-    /// `base_cfg_id` logic (§Layer 4b invariant carry).
+    /// Thin delegate to [`HandleMeta::arch_family_variant`], which
+    /// documents the two storage conventions this normalises between.
     #[allow(dead_code)]
     pub(super) fn arch_family_variant(&self) -> String {
-        let (family, variant) = match self {
-            Self::Gpt2(h) => ("gpt2", h.variant.as_str()),
-            Self::TinyLlama(h) => ("tinyllama", h.variant.as_str()),
-            Self::Llama(h) => ("llama", h.variant.as_str()),
-        };
-        let prefix = format!("{family}-");
-        if variant.starts_with(&prefix) {
-            variant.to_string()
-        } else {
-            format!("{prefix}{variant}")
-        }
+        self.meta().arch_family_variant()
     }
 
     /// True iff the underlying model has been LoRA-wrapped.
@@ -3560,94 +3725,23 @@ impl NnHandle {
     /// which would silently mis-describe the resulting card's
     /// provenance — refusing early keeps the Card store honest.
     ///
-    /// `Llama(_)` always returns `false`: the adapter path does not
+    /// `Llama` always reports `false`: the adapter path does not
     /// support LoRA wrap in the current codebase (§Layer 2 non-goal,
     /// carried through Layer 4b).
     #[allow(dead_code)]
     pub(super) fn is_lora_wrapped(&self) -> bool {
-        match self {
-            Self::Gpt2(h) => h.has_lora,
-            Self::TinyLlama(h) => h.has_lora,
-            Self::Llama(_) => false,
-        }
+        self.meta().lora_wrapped
     }
 }
 
 impl mlua::UserData for NnHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // `arch` is the one accessor unique to the union — a typed
+        // handle's caller already knows its architecture statically.
         methods.add_method("arch", |_, this, ()| Ok(this.arch()));
-
-        methods.add_method("variant", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.variant.clone()),
-            NnHandle::TinyLlama(h) => Ok(h.variant.clone()),
-            NnHandle::Llama(h) => Ok(h.variant.clone()),
-        });
-        methods.add_method("layers", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.layers),
-            NnHandle::TinyLlama(h) => Ok(h.layers),
-            NnHandle::Llama(h) => Ok(h.layers),
-        });
-        methods.add_method("heads", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.heads),
-            NnHandle::TinyLlama(h) => Ok(h.heads),
-            NnHandle::Llama(h) => Ok(h.heads),
-        });
-        // `kv_heads` — GPT-2 is MHA, so `kv_heads == heads`; the two
-        // GQA variants (TinyLlama, Llama) carry the real value.
-        // Returning `heads` for the GPT-2 arm keeps Lua callers from
-        // having to arch-branch when they only want the KV group
-        // count for a shape assertion.
-        methods.add_method("kv_heads", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.heads),
-            NnHandle::TinyLlama(h) => Ok(h.kv_heads),
-            NnHandle::Llama(h) => Ok(h.kv_heads),
-        });
-        methods.add_method("dim", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.dim),
-            NnHandle::TinyLlama(h) => Ok(h.dim),
-            NnHandle::Llama(h) => Ok(h.dim),
-        });
-        methods.add_method("ctx", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.ctx),
-            NnHandle::TinyLlama(h) => Ok(h.ctx),
-            NnHandle::Llama(h) => Ok(h.ctx),
-        });
-        methods.add_method("vocab", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.vocab),
-            NnHandle::TinyLlama(h) => Ok(h.vocab),
-            NnHandle::Llama(h) => Ok(h.vocab),
-        });
-        methods.add_method("device", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.device.clone()),
-            NnHandle::TinyLlama(h) => Ok(h.device.clone()),
-            NnHandle::Llama(h) => Ok(h.device.clone()),
-        });
-        methods.add_method("dtype", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.dtype.clone()),
-            NnHandle::TinyLlama(h) => Ok(h.dtype.clone()),
-            NnHandle::Llama(h) => Ok(h.dtype.clone()),
-        });
-        // `pretrained` — Gpt2 / TinyLlama carry the flag; Llama
-        // adapter is inference-only and always loads pretrained
-        // weights, so `true` is the honest default.
-        methods.add_method("pretrained", |_, this, ()| match this {
-            NnHandle::Gpt2(h) => Ok(h.pretrained),
-            NnHandle::TinyLlama(h) => Ok(h.pretrained),
-            NnHandle::Llama(_) => Ok(true),
-        });
-        // `forward_shape` — trainable arches (Gpt2 / TinyLlama)
-        // return `[batch, seq, vocab]`; the Llama adapter slices
-        // the last-token logits and returns `[batch, vocab]`.
-        // Shape difference is arch-visible; Lua callers that care
-        // can consult `handle:arch()` first.
-        methods.add_method(
-            "forward_shape",
-            |_, this, (batch, seq): (usize, usize)| match this {
-                NnHandle::Gpt2(h) => Ok(vec![batch, seq, h.vocab]),
-                NnHandle::TinyLlama(h) => Ok(vec![batch, seq, h.vocab]),
-                NnHandle::Llama(h) => Ok(vec![batch, h.vocab]),
-            },
-        );
+        // Everything else is the shared surface, resolved through
+        // `NnHandle::meta`'s single three-arm match.
+        add_meta_methods(methods, NnHandle::meta);
     }
 }
 

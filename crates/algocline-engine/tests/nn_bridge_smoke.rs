@@ -524,3 +524,81 @@ fn alc_nn_preset_gpt2_custom_type_mismatches_error() {
         "unexpected error: {err}"
     );
 }
+
+/// The arch-neutral `alc.nn.preset(arch, variant, opts)` handle and the
+/// typed `alc.nn.preset.llama(variant, opts)` handle must answer every
+/// shared accessor identically.
+///
+/// Both project through the bridge's `HandleMeta` now, instead of the
+/// union carrying its own per-accessor `match` over the three arch
+/// arms. A divergence here means one of the two paths stopped
+/// delegating — exactly the drift the old duplicated dispatch was prone
+/// to, since adding an accessor meant remembering to add it in both
+/// places.
+#[test]
+fn neutral_and_typed_llama_handles_agree_on_shared_accessors() {
+    let lua = nn_vm();
+    let checked: usize = lua
+        .load(
+            r#"
+            local opts    = { device = "cpu", dtype = "f32" }
+            local typed   = alc.nn.preset.llama("tiny", opts)
+            local neutral = alc.nn.preset("llama", "tiny", opts)
+
+            local scalar_accessors = {
+                "variant", "layers", "heads", "kv_heads", "dim",
+                "ctx", "vocab", "device", "dtype", "pretrained",
+            }
+            for _, name in ipairs(scalar_accessors) do
+                local a = typed[name](typed)
+                local b = neutral[name](neutral)
+                assert(a == b, name .. " mismatch: " .. tostring(a) .. " vs " .. tostring(b))
+            end
+
+            local a = typed:forward_shape(2, 5)
+            local b = neutral:forward_shape(2, 5)
+            assert(#a == #b, "forward_shape rank mismatch")
+            for i = 1, #a do
+                assert(a[i] == b[i], "forward_shape[" .. i .. "] mismatch")
+            end
+            -- Adapter arch slices the last-token logits, so seq drops out.
+            assert(#a == 2 and a[1] == 2 and a[2] == 64, "adapter logits shape must be [batch, vocab]")
+
+            -- `arch` is the one accessor unique to the neutral union.
+            assert(neutral:arch() == "llama", "arch mismatch")
+            assert(typed.arch == nil, "typed handle must not grow an arch accessor")
+
+            return #scalar_accessors
+        "#,
+        )
+        .eval()
+        .expect("neutral and typed llama handles agree");
+    assert_eq!(checked, 10);
+}
+
+/// `kv_heads` and `pretrained` are now part of the shared accessor
+/// surface every handle exposes, so the typed handles answer them too.
+///
+/// Previously `Gpt2Handle` had no `kv_heads` and `LlamaHandle` had no
+/// `pretrained` — both were reachable only after wrapping the handle in
+/// the neutral union, which meant a Lua caller's available methods
+/// depended on which entry point built the handle. GPT-2 is multi-head
+/// attention, so its `kv_heads` mirrors `heads`; the Llama adapter is
+/// inference-only, so its `pretrained` is `true`.
+#[test]
+fn typed_handles_expose_the_full_shared_accessor_surface() {
+    let lua = nn_vm();
+    lua.load(
+        r#"
+            local g = alc.nn.preset.gpt2("custom", { pretrained = false, device = "cpu" })
+            assert(g:kv_heads() == g:heads(), "gpt2 is MHA: kv_heads must mirror heads")
+            assert(g:pretrained() == false, "random-init handle must report pretrained=false")
+
+            local l = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            assert(l:pretrained() == true, "adapter handles always report pretrained=true")
+            assert(l:kv_heads() == 2, "llama tiny kv_heads mismatch")
+        "#,
+    )
+    .exec()
+    .expect("typed handles expose the shared accessor surface");
+}

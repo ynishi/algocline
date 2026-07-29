@@ -27,6 +27,8 @@ mod nn_card;
 #[cfg(feature = "nn")]
 mod nn_gen;
 #[cfg(feature = "nn")]
+mod nn_sampler;
+#[cfg(feature = "nn")]
 mod nn_trainer;
 #[cfg(feature = "nn")]
 mod nn_wrap;

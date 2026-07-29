@@ -19,11 +19,16 @@
 //!   regex and enforced through the previous one). GBNF grammars are a
 //!   future addition behind the same trait — and the one that unlocks
 //!   recursive schemas, which no regular language can express.
-//! - **Layer 3 (schedule / mid-generation swap, future)** — Lua-side
-//!   state machines that swap the active `Sampler` per token position.
-//!   Requires the generation loop to be reified before it lands.
+//! - **Layer 3 (engine side: `alc.nn.sampler` / `alc.nn.constraint`)** —
+//!   Lua factories that build the types above, compose them, and let a
+//!   Lua function *be* a `Sampler`. No scheduling primitive lives here:
+//!   the generation loop is already Lua-side, so swapping the active
+//!   sampler per position is plain Lua control flow over two handles.
+//!   The only thing this layer needed from Layer 1 was the ability to
+//!   erase the sampler's concrete type — see the
+//!   `impl Sampler for Box<dyn Sampler + Send>` below.
 //!
-//! Layer 2 / 3 attach as additional `impl Sampler` types (including a
+//! Layer 2 / 3 attach as additional `impl Sampler` types (including the
 //! Lua-callback bridge on the engine side) without changing the trait.
 //! That is the entire point of Layer 1.
 //!
@@ -73,6 +78,28 @@ pub use json_schema::JsonSchemaConstraint;
 pub trait Sampler {
     /// Sample a single token id from `logits`.
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32>;
+}
+
+/// A boxed, type-erased sampler is still a [`Sampler`].
+///
+/// Layer 3 picks the concrete sampler at runtime (a Lua caller chooses
+/// `greedy` / `temperature` / a callback of their own), while
+/// [`ConstrainedSampler`] is generic over `S: Sampler` rather than taking
+/// a trait object. Without this impl the engine could not name the type
+/// `ConstrainedSampler<Box<dyn Sampler + Send>, _>` and would need a
+/// parallel erasure enum with one arm per concrete sampler — a list that
+/// would have to grow with every impl added here, which is precisely what
+/// the trait exists to avoid.
+///
+/// `Send` sits in the bound rather than in a separate `Box<dyn Sampler>`
+/// impl because the only consumer is mlua's `send` feature, which
+/// requires the `UserData` holding a sampler to be `Send`. Adding the
+/// unbounded impl too would make `Box<dyn Sampler + Send>` ambiguous at
+/// no benefit.
+impl Sampler for Box<dyn Sampler + Send> {
+    fn sample(&mut self, logits: &Tensor) -> CandleResult<u32> {
+        (**self).sample(logits)
+    }
 }
 
 /// Argmax: pick the highest-scoring token.

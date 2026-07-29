@@ -92,6 +92,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached under the app dir) is now reachable from Lua, closing the
   text → token ids → generation loop → text circle that
   `generate_session` needs.
+- Layer 3 of the sampler plan: samplers and constraints are now Lua
+  values. `alc.nn.sampler.greedy()` / `.temperature(t, seed)` /
+  `.top_k_top_p(k, p, t, seed)` build the Rust Layer 1 samplers;
+  `alc.nn.sampler.lua(fn)` wraps a Lua function as a sampler (return
+  values are validated — non-integers and out-of-vocab ids error);
+  `alc.nn.sampler.constrained(inner, constraint)` composes with
+  `alc.nn.constraint.stop_tokens(ids)` / `.regex(pattern, vocab)` /
+  `.json_schema(schema, vocab)` (vocab is a tokenizer preset name or
+  a plain table of strings). Composition is move semantics: the
+  inner sampler and the constraint are consumed, and using a moved
+  handle errors loudly — sharing one seeded sampler across two
+  compositions would interleave its RNG stream. `LogitsHandle`
+  gained `:top(n)` and `:argmax()` so a custom Lua sampler can read
+  the distribution without marshalling the full vocab row per token.
+  There is deliberately no schedule primitive: the generation loop
+  already lives in Lua, so mid-generation sampler swaps are plain
+  Lua control flow (`local s = pos < 20 and greedy or temp`).
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

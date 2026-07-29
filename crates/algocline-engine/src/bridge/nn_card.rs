@@ -81,6 +81,9 @@ pub(super) fn register_nn_card(
     // surface hangs off the Llama handle rather than the `alc.nn`
     // table).
     super::nn_gen::register_gen_ns(lua, &nn_table, nn_dir.clone())?;
+    // `alc.nn.sampler.*` / `alc.nn.constraint.*` — the token-choosing
+    // half of the same generation path (Sampler plan Layer 3).
+    super::nn_sampler::register_sampler_ns(lua, &nn_table, nn_dir.clone())?;
     let card_ns = lua.create_table()?;
 
     let save_store = Arc::clone(&card_store);

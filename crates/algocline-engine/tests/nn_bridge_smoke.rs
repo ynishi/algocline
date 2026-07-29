@@ -817,6 +817,425 @@ fn alc_nn_tokenize_unknown_preset_errors() {
     );
 }
 
+// ─── samplers and constraints (Sampler plan Step 5) ──────────────────
+//
+// The Lua-facing token-choosing surface: `alc.nn.sampler.*`,
+// `alc.nn.constraint.*`, and the two ranking accessors on a logits
+// handle. Every test drives a real `tiny` Llama session, so the claims
+// hold on the same path a strategy takes. Value-level claims that need a
+// `Tensor` (callback return validation, move semantics at the Rust
+// boundary) live in `bridge/nn_sampler.rs`'s in-crate tests.
+
+/// Lua preamble: a `tiny` Llama handle in `h`. The variant is
+/// random-init and CPU-only, so every test below stays offline.
+const TINY_HANDLE: &str = r#"
+    local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+"#;
+
+fn eval_with_handle<T: mlua::FromLuaMulti>(lua: &Lua, body: &str, what: &str) -> T {
+    lua.load(format!("{TINY_HANDLE}\n{body}"))
+        .eval()
+        .unwrap_or_else(|e| panic!("{what}: {e}"))
+}
+
+/// Every factory produces a sampler a decode loop can drive: each draws
+/// an in-vocabulary token, and an unconstrained sampler never reports
+/// itself done (termination is the constraint layer's business).
+#[test]
+fn alc_nn_sampler_factories_drive_a_session_loop() {
+    let lua = nn_vm();
+    let positions: Vec<usize> = eval_with_handle(
+        &lua,
+        r#"
+        local samplers = {
+            alc.nn.sampler.greedy(),
+            alc.nn.sampler.temperature(0.8, 42),
+            alc.nn.sampler.top_k_top_p(8, 0.9, 1.0, 7),
+            -- both truncations disabled: the sampler reduces to plain
+            -- temperature sampling, which is the documented nil handling.
+            alc.nn.sampler.top_k_top_p(nil, nil, 1.0, 7),
+        }
+        local out = {}
+        for i, s in ipairs(samplers) do
+            local session = h:generate_session({ 1, 2, 3 })
+            for _ = 1, 3 do
+                local id = s:sample(session:next_logits())
+                assert(id >= 0 and id < 64, "sampler " .. i .. " returned " .. tostring(id))
+                assert(not s:is_done(), "an unconstrained sampler is never done")
+                session:append(id)
+            end
+            out[i] = session:position()
+        end
+        return out
+    "#,
+        "sampler factories drive a session loop",
+    );
+    assert_eq!(positions, vec![6, 6, 6, 6], "3 prompt + 3 sampled tokens");
+}
+
+/// The seed reproducibility guarantee survives the Lua boundary: two
+/// temperature samplers built from one seed and fed the same logits
+/// stream produce the same tokens.
+///
+/// That the stream is stochastic at all (different seeds diverge) is
+/// asserted in `algocline_nn::sampling`'s unit tests, where the logits
+/// are fixed and the claim is not left to a random-init model.
+#[test]
+fn alc_nn_temperature_sampler_is_reproducible_by_seed_through_lua() {
+    let lua = nn_vm();
+    let streams: Vec<Vec<u32>> = eval_with_handle(
+        &lua,
+        r#"
+        local function stream(seed)
+            local session = h:generate_session({ 1, 2, 3 })
+            local s = alc.nn.sampler.temperature(1.0, seed)
+            local out = {}
+            for i = 1, 5 do
+                out[i] = s:sample(session:next_logits())
+                session:append(out[i])
+            end
+            return out
+        end
+
+        local a, b = stream(4242), stream(4242)
+        for i = 1, 5 do
+            assert(a[i] == b[i],
+                "seeded streams diverged at " .. i .. ": " .. a[i] .. " vs " .. b[i])
+        end
+        return { a, b }
+    "#,
+        "seeded temperature streams",
+    );
+    assert_eq!(streams[0], streams[1]);
+    assert_eq!(streams[0].len(), 5);
+}
+
+/// A stop-token constraint terminates the loop: the stop token is
+/// sampled like any other (it is never masked away) and `is_done` flips
+/// the moment it lands in the prefix.
+///
+/// The stop set is discovered by probing what greedy emits first, so the
+/// test asserts the termination *mechanism* rather than a token id that
+/// depends on random-init weights.
+#[test]
+fn alc_nn_constrained_stop_tokens_terminate_the_loop() {
+    let lua = nn_vm();
+    let steps: usize = eval_with_handle(
+        &lua,
+        r#"
+        local probe = h:generate_session({ 1, 2, 3 })
+        local first = alc.nn.sampler.greedy():sample(probe:next_logits())
+
+        local s = alc.nn.sampler.constrained(
+            alc.nn.sampler.greedy(),
+            alc.nn.constraint.stop_tokens({ first })
+        )
+        assert(not s:is_done(), "an empty prefix is not terminal")
+
+        local session = h:generate_session({ 1, 2, 3 })
+        local steps = 0
+        for _ = 1, 8 do
+            local id = s:sample(session:next_logits())
+            session:append(id)
+            steps = steps + 1
+            if s:is_done() then break end
+        end
+        assert(steps == 1, "the stop token was drawn first but the loop ran " .. steps .. " steps")
+        return steps
+    "#,
+        "stop-token termination",
+    );
+    assert_eq!(steps, 1);
+}
+
+/// Composition moves the inner sampler out of its handle. Using the
+/// spent handle afterwards is a loud error, not a second alias onto one
+/// RNG — two handles driving one sampler would interleave draws and
+/// quietly break the seed reproducibility both of them promise.
+#[test]
+fn alc_nn_moved_inner_sampler_cannot_be_reused() {
+    let lua = nn_vm();
+    let err: String = eval_with_handle(
+        &lua,
+        r#"
+        local inner = alc.nn.sampler.greedy()
+        alc.nn.sampler.constrained(inner, alc.nn.constraint.stop_tokens({ 0 }))
+
+        local session = h:generate_session({ 1, 2, 3 })
+        local logits = session:next_logits()
+        local ok, err = pcall(function() return inner:sample(logits) end)
+        assert(not ok, "a moved-from sampler must refuse to sample")
+        return tostring(err)
+    "#,
+        "moved inner sampler",
+    );
+    assert!(err.contains("moved"), "unexpected error: {err}");
+}
+
+/// Same move semantics on the constraint side: a constraint carries the
+/// prefix-matching state of one generation, so handing it to a second
+/// `constrained` call is refused rather than silently shared.
+#[test]
+fn alc_nn_moved_constraint_cannot_be_reused() {
+    let lua = nn_vm();
+    let err: String = eval_with_handle(
+        &lua,
+        r#"
+        local c = alc.nn.constraint.stop_tokens({ 0 })
+        alc.nn.sampler.constrained(alc.nn.sampler.greedy(), c)
+
+        local ok, err = pcall(alc.nn.sampler.constrained, alc.nn.sampler.greedy(), c)
+        assert(not ok, "a moved-from constraint must be refused")
+        return tostring(err)
+    "#,
+        "moved constraint",
+    );
+    assert!(err.contains("moved"), "unexpected error: {err}");
+}
+
+/// A Lua function is a sampler. The callback here reimplements greedy
+/// through `logits:top(1)`, so its stream must match
+/// `alc.nn.sampler.greedy()` token for token — which is what makes this
+/// an assertion about the bridge rather than about the model.
+#[test]
+fn alc_nn_lua_callback_sampler_drives_a_loop() {
+    let lua = nn_vm();
+    let (custom, greedy): (Vec<u32>, Vec<u32>) = eval_with_handle(
+        &lua,
+        r#"
+        local function stream(sampler)
+            local session = h:generate_session({ 1, 2, 3 })
+            local out = {}
+            for i = 1, 4 do
+                out[i] = sampler:sample(session:next_logits())
+                session:append(out[i])
+            end
+            return out
+        end
+
+        local custom = alc.nn.sampler.lua(function(logits)
+            assert(logits:vocab() == 64, "the callback sees the full row")
+            return logits:top(1)[1].id
+        end)
+        return stream(custom), stream(alc.nn.sampler.greedy())
+    "#,
+        "lua callback sampler",
+    );
+    assert_eq!(custom.len(), 4);
+    assert_eq!(
+        custom, greedy,
+        "a top(1) callback must reproduce the greedy stream"
+    );
+}
+
+/// The callback's answer is checked, never absorbed: a fractional
+/// number, an out-of-range id and a non-number are all caller bugs that
+/// surface at the call site instead of as a stray token in the output.
+#[test]
+fn alc_nn_lua_callback_bad_return_values_error() {
+    let lua = nn_vm();
+    let errors: Vec<String> = eval_with_handle(
+        &lua,
+        r#"
+        local session = h:generate_session({ 1, 2, 3 })
+        local logits = session:next_logits()
+
+        local function fails(fn)
+            local s = alc.nn.sampler.lua(fn)
+            local ok, err = pcall(function() return s:sample(logits) end)
+            assert(not ok, "callback must be rejected")
+            return tostring(err)
+        end
+
+        return {
+            fails(function() return 1.5 end),
+            fails(function() return 64 end),     -- tiny vocab is 64: one past the end
+            fails(function() return -1 end),
+            fails(function() return "seven" end),
+            fails(function() return nil end),
+        }
+    "#,
+        "lua callback validation",
+    );
+    assert_eq!(errors.len(), 5);
+    assert!(
+        errors[0].contains("integer token id"),
+        "fractional: {}",
+        errors[0]
+    );
+    assert!(
+        errors[1].contains("outside the vocabulary"),
+        "out of range: {}",
+        errors[1]
+    );
+    assert!(
+        errors[2].contains("outside the vocabulary"),
+        "negative: {}",
+        errors[2]
+    );
+    for err in &errors[3..] {
+        assert!(err.contains("integer token id"), "non-number: {err}");
+    }
+}
+
+/// `logits:top(n)` ranks descending and agrees with `logits:argmax()`,
+/// which in turn agrees with `alc.nn.sampler.greedy()` — the three
+/// answers are the same question asked from three places, and a
+/// disagreement would make a hand-written Lua sampler subtly differ from
+/// the Rust one it is meant to replace.
+#[test]
+fn alc_nn_logits_top_and_argmax_agree_with_greedy() {
+    let lua = nn_vm();
+    let checked: usize = eval_with_handle(
+        &lua,
+        r#"
+        local session = h:generate_session({ 1, 2, 3 })
+        local logits = session:next_logits()
+
+        local top = logits:top(5)
+        assert(#top == 5, "top(5) must return five entries, got " .. #top)
+        for i = 2, #top do
+            assert(top[i - 1].value >= top[i].value,
+                "top() is not descending at " .. i)
+        end
+        assert(logits:argmax() == top[1].id, "argmax must be the top-ranked id")
+        assert(alc.nn.sampler.greedy():sample(logits) == logits:argmax(),
+            "greedy must pick the argmax")
+
+        assert(#logits:top(64) == 64, "top(vocab) must return the whole ranking")
+
+        -- Out-of-band n errors rather than clamping: a shortened list
+        -- would hide the caller's off-by-one until it indexed past the end.
+        assert(not pcall(function() return logits:top(0) end), "top(0) must error")
+        assert(not pcall(function() return logits:top(65) end), "top(vocab + 1) must error")
+
+        return #top
+    "#,
+        "logits ranking accessors",
+    );
+    assert_eq!(checked, 5);
+}
+
+/// A regex constraint composed into the loop keeps every drawn token on
+/// the pattern. The vocabulary is supplied as a table (a hand-rolled
+/// tokenizer, one entry per model token id) so the test needs no
+/// tokenizer download, and a saturated pattern fails loudly rather than
+/// emitting an off-pattern token.
+#[test]
+fn alc_nn_regex_constraint_shapes_the_generated_tokens() {
+    let lua = nn_vm();
+    let drawn: Vec<u32> = eval_with_handle(
+        &lua,
+        r#"
+        -- ids 0-9 are the digits, id 10 is the separator, and every
+        -- remaining id spells a letter no digit pattern can accept.
+        -- The table must cover the model's whole vocabulary: the
+        -- constraint reasons about the ids it was given, so a short
+        -- table would leave the tail of the row unconstrained.
+        local vocab = {}
+        for id = 0, 9 do vocab[id + 1] = tostring(id) end
+        vocab[11] = "-"
+        for id = 11, 63 do vocab[id + 1] = "z" end
+
+        local s = alc.nn.sampler.constrained(
+            alc.nn.sampler.greedy(),
+            alc.nn.constraint.regex([[\d{3}-\d{4}]], vocab)
+        )
+
+        local session = h:generate_session({ 1, 2, 3 })
+        local out = {}
+        for i = 1, 8 do
+            out[i] = s:sample(session:next_logits())
+            session:append(out[i])
+        end
+        for i = 1, 3 do assert(out[i] < 10, "position " .. i .. " must be a digit") end
+        assert(out[4] == 10, "position 4 must be the separator, got " .. out[4])
+        for i = 5, 8 do assert(out[i] < 10, "position " .. i .. " must be a digit") end
+        assert(s:is_done(), "a complete match must be terminal")
+
+        local ok = pcall(function() return s:sample(session:next_logits()) end)
+        assert(not ok, "a saturated pattern must error rather than emit")
+
+        return out
+    "#,
+        "regex-constrained generation",
+    );
+    assert_eq!(drawn.len(), 8);
+    assert_eq!(drawn[3], 10);
+    assert!(drawn[..3].iter().all(|id| *id < 10));
+    assert!(drawn[4..].iter().all(|id| *id < 10));
+}
+
+/// `reset` returns a constrained sampler to its pre-generation state so
+/// one sampler can drive several generations — the prefix is dropped and
+/// the terminal flag with it.
+#[test]
+fn alc_nn_constrained_sampler_is_reusable_after_reset() {
+    let lua = nn_vm();
+    let (first, second): (u32, u32) = eval_with_handle(
+        &lua,
+        r#"
+        local probe = h:generate_session({ 1, 2, 3 })
+        local stop = alc.nn.sampler.greedy():sample(probe:next_logits())
+
+        local s = alc.nn.sampler.constrained(
+            alc.nn.sampler.greedy(),
+            alc.nn.constraint.stop_tokens({ stop })
+        )
+
+        local a = h:generate_session({ 1, 2, 3 })
+        local first = s:sample(a:next_logits())
+        assert(s:is_done(), "the stop token must terminate the first generation")
+
+        s:reset()
+        assert(not s:is_done(), "reset must clear the terminal state")
+
+        local b = h:generate_session({ 1, 2, 3 })
+        local second = s:sample(b:next_logits())
+        assert(s:is_done(), "the reused sampler must still detect the stop token")
+        return first, second
+    "#,
+        "reset then reuse",
+    );
+    assert_eq!(
+        first, second,
+        "the same prompt through the same greedy sampler must repeat"
+    );
+}
+
+/// The JSON-schema constraint is reachable from Lua and rejects a schema
+/// it cannot translate at construction — before a single token is
+/// generated, which is the whole point of compiling the pattern up
+/// front.
+#[test]
+fn alc_nn_json_schema_constraint_builds_and_rejects_bad_schemas() {
+    let lua = nn_vm();
+    let err: String = eval_with_handle(
+        &lua,
+        r#"
+        local vocab = { "{", "}", "\"", "a", ":", "1", "," }
+
+        -- A translatable schema composes into a sampler like any other
+        -- constraint.
+        local c = alc.nn.constraint.json_schema(
+            { type = "object", properties = { a = { type = "integer" } }, required = { "a" } },
+            vocab
+        )
+        local s = alc.nn.sampler.constrained(alc.nn.sampler.greedy(), c)
+        assert(not s:is_done(), "an empty prefix is not a complete document")
+
+        local ok, err = pcall(alc.nn.constraint.json_schema, { type = "widget" }, vocab)
+        assert(not ok, "an untranslatable schema must be rejected at construction")
+        return tostring(err)
+    "#,
+        "json schema constraint",
+    );
+    assert!(
+        err.contains("json_schema") && err.contains("widget"),
+        "unexpected error: {err}"
+    );
+}
+
 /// `kv_heads` and `pretrained` are now part of the shared accessor
 /// surface every handle exposes, so the typed handles answer them too.
 ///

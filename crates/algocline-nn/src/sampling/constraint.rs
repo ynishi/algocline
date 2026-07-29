@@ -98,6 +98,26 @@ pub trait Constraint {
     fn is_terminal(&self, prefix: &[u32]) -> bool;
 }
 
+/// A boxed, type-erased constraint is still a [`Constraint`].
+///
+/// The counterpart of `impl Sampler for Box<dyn Sampler + Send>`: Layer 3
+/// picks the constraint at runtime from Lua, so the engine needs to name
+/// `ConstrainedSampler<_, Box<dyn Constraint + Send>>`. `Send` is in the
+/// bound for the same reason as there — mlua's `send` feature requires
+/// the `UserData` holding a constraint to be `Send`.
+///
+/// Delegation preserves the trait's purity contract: the box adds an
+/// indirection, not state.
+impl Constraint for Box<dyn Constraint + Send> {
+    fn mask(&self, prefix: &[u32]) -> TokenMask {
+        (**self).mask(prefix)
+    }
+
+    fn is_terminal(&self, prefix: &[u32]) -> bool {
+        (**self).is_terminal(prefix)
+    }
+}
+
 /// A [`Sampler`] that masks logits through a [`Constraint`] before
 /// delegating the actual draw to an inner sampler.
 ///
@@ -606,6 +626,36 @@ mod tests {
         s.reset();
         assert!(s.prefix().is_empty(), "reset must clear the prefix");
         assert!(!s.is_done(), "reset must clear the terminal state");
+    }
+
+    /// The type-erased composition Layer 3 actually builds — a boxed
+    /// sampler wrapped by a boxed constraint — must behave exactly like
+    /// the statically typed one. Guards both blanket impls at once: a
+    /// delegation that dropped the mask or the terminal signal would
+    /// show up here and nowhere else, since no Rust caller has a reason
+    /// to erase these types.
+    #[test]
+    fn boxed_sampler_and_constraint_compose_like_their_concrete_types() {
+        let inner: Box<dyn Sampler + Send> = Box::new(GreedySampler);
+        let constraint: Box<dyn Constraint + Send> = Box::new(FixedMask(TokenMask::Deny(vec![1])));
+        let mut erased = ConstrainedSampler::new(inner, constraint);
+        assert_eq!(
+            erased.sample(&fixture()).unwrap(),
+            3,
+            "the boxed constraint must still mask the argmax away"
+        );
+
+        // Stacking: a constrained sampler is itself boxable as the inner
+        // sampler of another one, which is how `alc.nn.sampler.constrained`
+        // composes twice.
+        let stacked_inner: Box<dyn Sampler + Send> = Box::new(erased);
+        let stop: Box<dyn Constraint + Send> = Box::new(StopTokensConstraint::new(vec![3]));
+        let mut stacked = ConstrainedSampler::new(stacked_inner, stop);
+        assert_eq!(stacked.sample(&fixture()).unwrap(), 3);
+        assert!(
+            stacked.is_done(),
+            "the outer constraint must see the token the inner one produced"
+        );
     }
 
     // ─── RegexConstraint ──────────────────────────────────────────────

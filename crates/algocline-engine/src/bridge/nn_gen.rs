@@ -10,9 +10,15 @@
 //! session:append(token_id)
 //! session:tokens()                       -> { id, ... }
 //! session:position()                     -> n
+//! logits:vocab()                         -> n
+//! logits:top(n)                          -> { { id = i, value = v }, ... }
+//! logits:argmax()                        -> id
 //! alc.nn.tokenize(preset, text)          -> { id, ... }
 //! alc.nn.detokenize(preset, ids)         -> string
 //! ```
+//!
+//! The samplers that consume a `LogitsHandle` live next door in
+//! `nn_sampler.rs`.
 //!
 //! # Why a session rather than a bare `forward`
 //!
@@ -39,9 +45,12 @@
 //! # Why logits are opaque
 //!
 //! [`LogitsHandle`] wraps the `[vocab]` f32 row without exposing its
-//! values to Lua. Materialising a vocab-sized float table per token
-//! would cost more than the forward itself for a real vocabulary; the
-//! sampler bindings consume the tensor Rust-side instead.
+//! values wholesale to Lua. Materialising a vocab-sized float table per
+//! token would cost more than the forward itself for a real vocabulary;
+//! the sampler bindings consume the tensor Rust-side instead. What Lua
+//! can ask for is the *ranking* — `top(n)` and `argmax()` — which is what
+//! a hand-written sampler actually reads and which costs one pass over
+//! the row.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -194,25 +203,100 @@ impl mlua::UserData for GenSession {
     }
 }
 
-/// Opaque `[vocab]` f32 logits row.
+/// Mostly opaque `[vocab]` f32 logits row.
 ///
-/// Deliberately without value accessors — see the module doc. The
-/// sampler bindings read [`Self::tensor`] Rust-side.
+/// The values are never marshalled to Lua wholesale — see the module
+/// doc. What Lua does get are the two *ranking* answers a hand-written
+/// sampler needs ([`Self::top`], [`Self::argmax`]), each of which costs
+/// one pass over the row instead of a vocab-sized table allocation. The
+/// Rust-side sampler bindings read [`Self::tensor`] directly.
 pub(super) struct LogitsHandle {
     inner: Tensor,
 }
 
 impl LogitsHandle {
+    /// Wrap a `[vocab]` f32 row.
+    ///
+    /// Used by the sampler bridge to hand a *masked* row to a Lua
+    /// callback: the callback must see what the constraint left standing,
+    /// not the untouched row the session produced.
+    pub(super) fn from_tensor(inner: Tensor) -> Self {
+        Self { inner }
+    }
+
     /// The wrapped `[vocab]` f32 row, in the shape
     /// `algocline_nn::sampling::Sampler` expects.
     ///
-    /// Unused until the sampler bindings land; kept here (rather than
-    /// reaching into the field from a sibling module later) so the
-    /// invariant "a `LogitsHandle` is always a valid sampler input"
-    /// stays stated where the value is produced.
-    #[allow(dead_code)]
+    /// Kept as an accessor (rather than letting a sibling module reach
+    /// into the field) so the invariant "a `LogitsHandle` is always a
+    /// valid sampler input" stays stated where the value is produced.
     pub(super) fn tensor(&self) -> &Tensor {
         &self.inner
+    }
+
+    /// The `n` highest-scoring tokens, best first, as
+    /// `{ { id = <token id>, value = <logit> }, ... }`.
+    ///
+    /// # Ordering
+    ///
+    /// Sorted by descending logit with the lower token id winning ties,
+    /// so the answer is stable across runs. Comparison is `f32::total_cmp`
+    /// rather than `partial_cmp`: a constraint mask writes `-inf` into the
+    /// row, and a total order keeps those entries at the bottom instead of
+    /// leaving their placement to an `unwrap_or(Equal)` fallback.
+    ///
+    /// # Errors
+    ///
+    /// `n == 0` and `n > vocab` both error rather than clamping. A caller
+    /// asking for zero candidates, or for more than exist, has a bug that
+    /// a silently shortened list would hide — `top(k)` feeding a sampler
+    /// that then indexes `[k]` would fail somewhere else entirely.
+    fn top(&self, lua: &Lua, n: usize) -> LuaResult<LuaTable> {
+        let values: Vec<f32> = self
+            .inner
+            .to_vec1()
+            .map_err(|e| LuaError::external(format!("alc.nn logits:top: {e}")))?;
+        let vocab = values.len();
+        if n == 0 {
+            return Err(LuaError::external(
+                "alc.nn logits:top: n must be at least 1",
+            ));
+        }
+        if n > vocab {
+            return Err(LuaError::external(format!(
+                "alc.nn logits:top: n = {n} exceeds the vocabulary size {vocab}"
+            )));
+        }
+
+        let mut ranked: Vec<(usize, f32)> = values.into_iter().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let out = lua.create_table_with_capacity(n, 0)?;
+        for (rank, (id, value)) in ranked.into_iter().take(n).enumerate() {
+            let entry = lua.create_table_with_capacity(0, 2)?;
+            let id = u32::try_from(id).map_err(|e| {
+                LuaError::external(format!(
+                    "alc.nn logits:top: token id {id} is not a u32: {e}"
+                ))
+            })?;
+            entry.set("id", id)?;
+            entry.set("value", value)?;
+            out.set(rank + 1, entry)?;
+        }
+        Ok(out)
+    }
+
+    /// The highest-scoring token id.
+    ///
+    /// Delegates to the same candle `argmax` the Rust-side
+    /// `GreedySampler` uses, so a Lua sampler built on this agrees with
+    /// `alc.nn.sampler.greedy()` token for token — including on the
+    /// tie-breaking rule, which is candle's to define.
+    fn argmax(&self) -> LuaResult<u32> {
+        self.inner
+            .argmax(0)
+            .and_then(|idx| idx.to_scalar::<u32>())
+            .map_err(|e| LuaError::external(format!("alc.nn logits:argmax: {e}")))
     }
 }
 
@@ -223,6 +307,8 @@ impl mlua::UserData for LogitsHandle {
                 .dims1()
                 .map_err(|e| LuaError::external(format!("alc.nn logits: {e}")))
         });
+        methods.add_method("top", |lua, this, n: usize| this.top(lua, n));
+        methods.add_method("argmax", |_, this, ()| this.argmax());
     }
 }
 
@@ -277,7 +363,16 @@ pub(super) fn register_gen_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -
 /// (`BridgeConfig::nn_dir` doc). Refuse up front instead of letting
 /// `load_cached` create a relative `tokenizers/` directory next to
 /// whatever the process CWD happens to be.
-fn load_tokenizer(entry: &str, preset: &str, nn_dir: &std::path::Path) -> LuaResult<HfTokenizer> {
+///
+/// Shared with `nn_sampler.rs`, whose constraints resolve a vocabulary
+/// from the same preset names and must land in the same cache directory
+/// — a constraint built against a different tokenizer than the one that
+/// produced the prompt would mask the wrong ids.
+pub(super) fn load_tokenizer(
+    entry: &str,
+    preset: &str,
+    nn_dir: &std::path::Path,
+) -> LuaResult<HfTokenizer> {
     if nn_dir.as_os_str().is_empty() {
         return Err(LuaError::external(format!(
             "{entry}: this session has no nn directory configured, \

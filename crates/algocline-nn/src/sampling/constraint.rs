@@ -26,8 +26,22 @@
 //! logits would emit a token the constraint explicitly forbade — the one
 //! outcome constrained decoding exists to prevent. Both cases return
 //! `Err` instead.
+//!
+//! # Constraints that have landed
+//!
+//! [`StopTokensConstraint`] is the termination-only case: it masks
+//! nothing and only answers [`Constraint::is_terminal`].
+//! [`RegexConstraint`] is the first structural one — it drives an
+//! anchored DFA over the tokenizer's surface strings so every sampled
+//! token keeps the output on a path towards a full pattern match. JSON
+//! schema and GBNF grammars are future additions behind the same trait.
 
 use candle_core::{Result as CandleResult, Tensor};
+use regex_automata::{
+    dfa::{dense, Automaton, StartKind},
+    util::primitives::StateID,
+    Anchored, Input, MatchKind,
+};
 
 use super::{validate_logits, Sampler};
 
@@ -197,6 +211,199 @@ impl Constraint for StopTokensConstraint {
     fn is_terminal(&self, prefix: &[u32]) -> bool {
         match prefix.last() {
             Some(last) => self.stop_tokens.contains(last),
+            None => false,
+        }
+    }
+}
+
+/// Restrict generation to token sequences that spell a full match of a
+/// regular expression.
+///
+/// # Semantics
+///
+/// The pattern is compiled as `^(?:pattern)$` — the wrapping is literal,
+/// not a figure of speech, and both halves are load-bearing. Without the
+/// leading anchor the DFA would look for a match starting anywhere;
+/// without the *trailing* one an anchored DFA stops caring about the rest
+/// of the input the moment a match exists, so `\d{3}` would happily
+/// accept `123abc` and report every prefix of it as terminal. A caller
+/// may still write `^` / `$` explicitly; they are redundant, not wrong.
+///
+/// `vocab` is the surface string of every token id, indexed by id — the
+/// shape [`crate::tokenizer::HfTokenizer::vocab_strings`] produces. It is
+/// the piece that turns a byte-level automaton into a token-level filter:
+/// a candidate token is admitted when walking its bytes from the current
+/// DFA state does not land in a dead state, i.e. when the pattern can
+/// still be completed after emitting it. That is strictly stronger than
+/// "the token matches so far" — it also rules out tokens that would paint
+/// generation into a corner one step later.
+///
+/// # Cost
+///
+/// [`Constraint::mask`] re-walks the prefix from the start state and then
+/// trial-walks every vocab entry, so a step costs
+/// `O(prefix_bytes + vocab * token_bytes)`. The re-walk is deliberate:
+/// [`Constraint`] promises purity with respect to the prefix (`&self`, no
+/// interior mutation), which is what keeps seeded generation
+/// reproducible and makes a constraint safe to share. The known
+/// optimisation — precomputing a state → permitted-token-set index at
+/// construction time, the way Outlines does — is deferred until a
+/// per-step measurement shows this loop is the bottleneck; it trades a
+/// vocab × states build cost and a large resident index for the walk.
+///
+/// # Empty tokens
+///
+/// A vocab entry that is the empty string is denied at every position. It
+/// consumes no bytes, so it cannot advance the DFA, and a generation loop
+/// that kept drawing it would never terminate. Those entries are exactly
+/// the special / surface-less ids `vocab_strings` reports as empty.
+///
+/// # Impossible positions
+///
+/// When the prefix itself is unreachable (a token walked into a dead
+/// state, or an id past the end of `vocab`), and when no token can
+/// continue a viable prefix, `mask` returns [`TokenMask::Allow`] with an
+/// empty list. [`Constraint::mask`] cannot return an error — but an empty
+/// `Allow` is rejected by [`apply_mask`], so the condition surfaces as a
+/// loud `Err` from [`Sampler::sample`] instead of quietly emitting an
+/// off-pattern token.
+#[derive(Debug, Clone)]
+pub struct RegexConstraint {
+    dfa: dense::DFA<Vec<u32>>,
+    /// Anchored start state, resolved once at construction so the
+    /// per-step walk cannot fail.
+    start: StateID,
+    vocab: Vec<String>,
+}
+
+impl RegexConstraint {
+    /// Compile `pattern` into an anchored full-match DFA over `vocab`.
+    ///
+    /// Returns `Err` on an invalid pattern. Compiling up front rather
+    /// than lazily is the point: a typo in a pattern is a caller bug that
+    /// should surface where the constraint is configured, not mid-stream
+    /// on some later token.
+    ///
+    /// The DFA is built with [`MatchKind::All`] rather than the default
+    /// leftmost-first semantics. Leftmost-first stops exploring once it
+    /// has committed to a match, which would make `a|ab` reject the `b`
+    /// in `ab`; `All` keeps every alternative alive, which is the
+    /// question a constraint actually asks ("can *any* match still be
+    /// reached from here?").
+    pub fn new(pattern: &str, vocab: Vec<String>) -> CandleResult<Self> {
+        // Full-match wrapping (see the type doc): the trailing anchor is
+        // what makes a state past the end of the pattern *dead* rather
+        // than merely "already matched", which is the difference between
+        // rejecting an off-pattern token and waving it through.
+        let full_match = format!("^(?:{pattern})$");
+        let dfa = dense::Builder::new()
+            .configure(
+                dense::Config::new()
+                    .start_kind(StartKind::Anchored)
+                    .match_kind(MatchKind::All),
+            )
+            .build(&full_match)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "RegexConstraint: cannot compile pattern {pattern:?}: {e}"
+                ))
+            })?;
+        let start = dfa
+            .start_state_forward(&Input::new("").anchored(Anchored::Yes))
+            .map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "RegexConstraint: no anchored start state for pattern {pattern:?}: {e}"
+                ))
+            })?;
+        Ok(Self { dfa, start, vocab })
+    }
+
+    /// Whether the DFA can still reach a match from `state`.
+    ///
+    /// A quit state counts as unusable alongside a dead one: it means the
+    /// automaton refused to keep going (a byte outside what the pattern's
+    /// look-around support can handle), and treating that as "alive"
+    /// would admit a token whose acceptance is unknown.
+    fn alive(&self, state: StateID) -> bool {
+        !self.dfa.is_dead_state(state) && !self.dfa.is_quit_state(state)
+    }
+
+    /// Walk `bytes` from `state`, bailing out as soon as the walk dies.
+    fn step(&self, mut state: StateID, bytes: &[u8]) -> StateID {
+        for &byte in bytes {
+            state = self.dfa.next_state(state, byte);
+            if !self.alive(state) {
+                break;
+            }
+        }
+        state
+    }
+
+    /// DFA state after consuming the whole prefix, or `None` when the
+    /// prefix cannot be part of any match (including the case of an id
+    /// that is not in `vocab` at all).
+    fn state_for(&self, prefix: &[u32]) -> Option<StateID> {
+        let mut state = self.start;
+        for &id in prefix {
+            let piece = self.vocab.get(id as usize)?;
+            state = self.step(state, piece.as_bytes());
+            if !self.alive(state) {
+                return None;
+            }
+        }
+        Some(state)
+    }
+}
+
+impl Constraint for RegexConstraint {
+    fn mask(&self, prefix: &[u32]) -> TokenMask {
+        let Some(state) = self.state_for(prefix) else {
+            // Unreachable prefix. Permitting nothing routes this into the
+            // loud-failure path rather than letting the sampler improvise.
+            return TokenMask::Allow(Vec::new());
+        };
+
+        let vocab = self.vocab.len();
+        let mut allowed: Vec<u32> = Vec::new();
+        for (id, piece) in self.vocab.iter().enumerate() {
+            if piece.is_empty() {
+                continue;
+            }
+            if self.alive(self.step(state, piece.as_bytes())) {
+                allowed.push(id as u32);
+            }
+        }
+
+        // Pick whichever variant stays sparse. Mid-pattern the permitted
+        // set is usually tiny (`Allow`), but at a position where the
+        // pattern is permissive — `.*`, a wide character class — the
+        // *denied* set is the small one and `Deny` avoids materialising a
+        // near-full-vocab list on every single token.
+        if allowed.len() == vocab {
+            return TokenMask::AllowAll;
+        }
+        if allowed.len() * 2 > vocab {
+            let mut denied = Vec::with_capacity(vocab - allowed.len());
+            let mut survivors = allowed.iter().copied().peekable();
+            for id in 0..vocab {
+                let id = id as u32;
+                if survivors.peek() == Some(&id) {
+                    survivors.next();
+                } else {
+                    denied.push(id);
+                }
+            }
+            return TokenMask::Deny(denied);
+        }
+        TokenMask::Allow(allowed)
+    }
+
+    fn is_terminal(&self, prefix: &[u32]) -> bool {
+        match self.state_for(prefix) {
+            // The end-of-input transition applies the pattern's trailing
+            // look-around (`$`, `\b`) before the match is read off, which
+            // is what makes this a *full* match rather than a prefix one.
+            Some(state) => self.dfa.is_match_state(self.dfa.next_eoi_state(state)),
             None => false,
         }
     }
@@ -399,6 +606,245 @@ mod tests {
         s.reset();
         assert!(s.prefix().is_empty(), "reset must clear the prefix");
         assert!(!s.is_done(), "reset must clear the terminal state");
+    }
+
+    // ─── RegexConstraint ──────────────────────────────────────────────
+
+    /// Single-character vocab for the regex tests: ids `0..=9` are the
+    /// digits, id 10 is `-`, id 11 is `a` (the one token no digit pattern
+    /// can ever accept).
+    fn digit_vocab() -> Vec<String> {
+        let mut v: Vec<String> = (0..10).map(|d| d.to_string()).collect();
+        v.push("-".to_string());
+        v.push("a".to_string());
+        v
+    }
+
+    /// Logits over `digit_vocab()` whose argmax is `a` (11) and whose
+    /// runner-up is `-` (10), so an unconstrained greedy sampler would
+    /// produce nothing but off-pattern tokens. Among the digits, 9 wins.
+    fn digit_logits() -> Tensor {
+        cpu_logits(&[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 5.0, 9.0])
+    }
+
+    /// Project a mask onto the concrete id set it permits, so the tests
+    /// assert on semantics instead of on which sparse variant the
+    /// heuristic happened to choose.
+    fn allowed_ids(mask: &TokenMask, vocab: usize) -> Vec<u32> {
+        let all = (0..vocab as u32).collect::<Vec<u32>>();
+        match mask {
+            TokenMask::AllowAll => all,
+            TokenMask::Allow(ids) => {
+                let mut ids = ids.clone();
+                ids.sort_unstable();
+                ids
+            }
+            TokenMask::Deny(ids) => all.into_iter().filter(|i| !ids.contains(i)).collect(),
+        }
+    }
+
+    /// End-to-end shape enforcement: only digits may open the pattern,
+    /// only the separator may follow three of them, and the completed
+    /// eight-token sequence is terminal. The greedy inner sampler makes
+    /// the mask's effect unambiguous — every draw would be `a` (11)
+    /// without it.
+    #[test]
+    fn regex_forces_the_pattern_shape() {
+        let vocab = digit_vocab();
+        let c = RegexConstraint::new(r"^\d{3}-\d{4}$", vocab.clone()).unwrap();
+
+        let opening = c.mask(&[]);
+        assert_eq!(
+            allowed_ids(&opening, vocab.len()),
+            (0..10u32).collect::<Vec<_>>(),
+            "only digits may open the pattern"
+        );
+        assert!(
+            matches!(opening, TokenMask::Deny(_)),
+            "10 of 12 survivors must ride the Deny complement, got {opening:?}"
+        );
+        assert_eq!(
+            allowed_ids(&c.mask(&[1, 2, 3]), vocab.len()),
+            vec![10],
+            "the separator is the only legal continuation after three digits"
+        );
+
+        let mut s = ConstrainedSampler::new(GreedySampler, c);
+        let drawn: Vec<u32> = (0..8).map(|_| s.sample(&digit_logits()).unwrap()).collect();
+        assert_eq!(drawn, vec![9, 9, 9, 10, 9, 9, 9, 9]);
+        assert!(s.is_done(), "a complete match must be terminal");
+    }
+
+    /// A viable prefix is not a match. Without this the terminal check
+    /// could be "the prefix has not died yet" and the phone-number test
+    /// above would still pass.
+    #[test]
+    fn partial_match_is_not_terminal() {
+        let c = RegexConstraint::new(r"^\d{3}-\d{4}$", digit_vocab()).unwrap();
+        for prefix in [
+            vec![],
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            vec![1, 2, 3, 10],
+            vec![1, 2, 3, 10, 4, 5, 6],
+        ] {
+            assert!(
+                !c.is_terminal(&prefix),
+                "prefix {prefix:?} is only a partial match"
+            );
+        }
+        assert!(c.is_terminal(&[1, 2, 3, 10, 4, 5, 6, 7]));
+    }
+
+    /// A token may carry several characters, so one draw can advance the
+    /// DFA by more than one byte. Also covers the implicit anchoring: the
+    /// pattern here carries no `^` / `$` of its own.
+    #[test]
+    fn multi_character_tokens_advance_several_bytes() {
+        let vocab = vec![
+            "1".to_string(),
+            "23".to_string(),
+            "4".to_string(),
+            "x".to_string(),
+        ];
+        let c = RegexConstraint::new(r"\d{3}", vocab.clone()).unwrap();
+
+        assert_eq!(
+            allowed_ids(&c.mask(&[0]), vocab.len()),
+            vec![0, 1, 2],
+            "every digit token survives after one digit; only \"x\" is denied"
+        );
+        assert!(
+            c.is_terminal(&[0, 1]),
+            "\"1\" + \"23\" is three digits in two tokens"
+        );
+        assert!(!c.is_terminal(&[0, 2]), "\"1\" + \"4\" is only two digits");
+        assert!(
+            allowed_ids(&c.mask(&[0, 1]), vocab.len()).is_empty(),
+            "a saturated pattern admits no continuation"
+        );
+    }
+
+    /// An empty surface string consumes no bytes, so it can never move
+    /// the DFA. Permitting it would let a generation loop draw it forever
+    /// without the constraint ever advancing.
+    #[test]
+    fn empty_surface_tokens_are_never_allowed() {
+        let vocab = vec![String::new(), "1".to_string(), "2".to_string()];
+        let c = RegexConstraint::new(r"\d{2}", vocab.clone()).unwrap();
+        for prefix in [vec![], vec![1], vec![1, 2]] {
+            assert!(
+                !allowed_ids(&c.mask(&prefix), vocab.len()).contains(&0),
+                "prefix {prefix:?} allowed the empty token"
+            );
+        }
+    }
+
+    /// A shorter alternative must not shadow a longer one. This is the
+    /// concrete reason the DFA is built with `MatchKind::All`: under
+    /// leftmost-first semantics the automaton commits to `a` and stops
+    /// exploring, which would deny the `b` that completes `ab`.
+    #[test]
+    fn a_shorter_alternative_does_not_shadow_a_longer_one() {
+        let vocab = vec!["a".to_string(), "b".to_string()];
+        let c = RegexConstraint::new("a|ab", vocab.clone()).unwrap();
+
+        assert!(c.is_terminal(&[0]), "\"a\" is a complete match");
+        assert_eq!(
+            allowed_ids(&c.mask(&[0]), vocab.len()),
+            vec![1],
+            "\"ab\" must still be reachable after \"a\""
+        );
+        assert!(c.is_terminal(&[0, 1]), "\"ab\" is a complete match too");
+    }
+
+    /// An invalid pattern is a caller bug and must surface where the
+    /// constraint is configured, not on some later token.
+    #[test]
+    fn invalid_pattern_fails_at_construction() {
+        for pattern in ["(", "[a-z", "a{2,1}"] {
+            assert!(
+                RegexConstraint::new(pattern, digit_vocab()).is_err(),
+                "pattern {pattern:?} must be rejected at construction"
+            );
+        }
+    }
+
+    /// Positions where nothing can be emitted — an unreachable prefix, an
+    /// id outside the vocab, a pattern already saturated — all collapse
+    /// to an empty `Allow`, which is what makes the sampler fail loudly
+    /// rather than emit an off-pattern token.
+    #[test]
+    fn impossible_positions_error_loudly() {
+        let vocab = digit_vocab();
+        let c = RegexConstraint::new(r"\d{3}", vocab.clone()).unwrap();
+
+        assert_eq!(
+            c.mask(&[11]),
+            TokenMask::Allow(Vec::new()),
+            "\"a\" can never start the pattern"
+        );
+        assert_eq!(
+            c.mask(&[99]),
+            TokenMask::Allow(Vec::new()),
+            "an id outside the vocab is a caller bug, not a skippable token"
+        );
+        assert_eq!(
+            c.mask(&[1, 2, 3]),
+            TokenMask::Allow(Vec::new()),
+            "three digits saturate the pattern"
+        );
+
+        // Regression guard for the trailing anchor. An anchored DFA whose
+        // pattern is not end-anchored stops discriminating once a match
+        // exists, so `\d{3}` would accept a fourth digit and call every
+        // longer prefix terminal.
+        assert!(c.is_terminal(&[1, 2, 3]));
+        assert!(
+            !c.is_terminal(&[1, 2, 3, 4]),
+            "an over-long prefix is not a full match"
+        );
+
+        let mut s = ConstrainedSampler::new(GreedySampler, c);
+        for _ in 0..3 {
+            s.sample(&digit_logits()).unwrap();
+        }
+        assert!(
+            s.sample(&digit_logits()).is_err(),
+            "a saturated pattern must error rather than emit"
+        );
+    }
+
+    /// Masking through a stochastic sampler keeps both guarantees at
+    /// once: the seed still reproduces the stream, and every token the
+    /// stream contains is on-pattern.
+    #[test]
+    fn regex_composed_with_top_k_top_p_stays_reproducible() {
+        let logits = cpu_logits(&[1.0, 2.0, 3.0, 2.0, 1.0, 0.5, 0.5, 2.5, 1.5, 2.2, 4.0, 9.0]);
+        let build = || {
+            ConstrainedSampler::new(
+                TopKTopPSampler::new(Some(4), Some(0.95), 1.0, 24601),
+                RegexConstraint::new(r"^\d{3}-\d{4}$", digit_vocab()).unwrap(),
+            )
+        };
+        let mut a = build();
+        let mut b = build();
+
+        let seq_a: Vec<u32> = (0..8).map(|_| a.sample(&logits).unwrap()).collect();
+        let seq_b: Vec<u32> = (0..8).map(|_| b.sample(&logits).unwrap()).collect();
+        assert_eq!(seq_a, seq_b, "constrained sampler diverged on shared seed");
+
+        assert!(
+            seq_a[..3].iter().all(|t| *t < 10),
+            "positions 0-2 must be digits: {seq_a:?}"
+        );
+        assert_eq!(seq_a[3], 10, "position 3 must be the separator: {seq_a:?}");
+        assert!(
+            seq_a[4..].iter().all(|t| *t < 10),
+            "positions 4-7 must be digits: {seq_a:?}"
+        );
+        assert!(a.is_done(), "the completed pattern must be terminal");
     }
 
     /// `StopTokensConstraint` never masks — it only terminates. Asserted

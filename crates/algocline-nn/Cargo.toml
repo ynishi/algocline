@@ -56,6 +56,17 @@ parquet = { version = "59", default-features = false, features = ["snap", "zstd"
 # on the same token stream); the workspace pin matches the version the engine
 # bridge already uses.
 rand = { workspace = true }
+# Anchored DFA behind `sampling::constraint::RegexConstraint`. The plain
+# `regex` crate cannot answer the question constrained decoding asks —
+# "can this partial string still be extended into a full match?" — because
+# it only reports completed matches. `regex-automata` exposes the DFA
+# state machine itself, so a candidate token is walked byte by byte from
+# the prefix's state and rejected the moment it lands in a dead state.
+# `default-features = false` keeps the meta / hybrid / backtrack engines
+# out of the build; `syntax` + `dfa-build` are exactly what compiling a
+# pattern string into a dense DFA needs, and `unicode` is what makes
+# `\d` / `\w` / `\b` mean what a caller writing a pattern expects.
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "unicode"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 

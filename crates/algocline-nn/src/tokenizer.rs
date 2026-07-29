@@ -123,6 +123,42 @@ impl HfTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }
+
+    /// Decode every token id in `0..vocab_size()` to its surface string.
+    ///
+    /// Built for [`crate::sampling::RegexConstraint`], which needs to know
+    /// the bytes each token contributes in order to walk a DFA one
+    /// candidate token at a time. The returned vector is indexed by token
+    /// id and always has exactly [`Self::vocab_size`] entries, so a caller
+    /// can index it with a raw id without a bounds dance.
+    ///
+    /// # Empty entries
+    ///
+    /// An entry is the empty string when the id decodes to nothing:
+    /// special tokens (dropped because [`Self::decode`] passes
+    /// `skip_special_tokens = true`) and ids the model has no surface form
+    /// for. `tokenizers` filters those ids out *before* the decoder runs
+    /// and returns `Ok("")`, so an empty entry is the expected outcome for
+    /// them rather than a swallowed failure. Consumers read an empty entry
+    /// as "never emit this token" — a token contributing zero bytes cannot
+    /// advance a state machine, so permitting it would let a constrained
+    /// generation loop spin forever.
+    ///
+    /// A decode error therefore means something structurally wrong (a
+    /// broken decoder configuration), which is a different condition
+    /// entirely, and it propagates instead of collapsing into an empty
+    /// entry.
+    pub fn vocab_strings(&self) -> Result<Vec<String>, TokenizerError> {
+        let vocab = self.vocab_size();
+        let mut out = Vec::with_capacity(vocab);
+        for raw_id in 0..vocab {
+            let id = u32::try_from(raw_id).map_err(|_| {
+                TokenizerError::Tokenizer(format!("token id {raw_id} does not fit in u32"))
+            })?;
+            out.push(self.decode(&[id])?);
+        }
+        Ok(out)
+    }
 }
 
 /// Map a preset name to its HuggingFace repo. Returns `None` when the
@@ -148,6 +184,43 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(matches!(err, TokenizerError::UnknownPreset(_)));
+    }
+
+    /// Smallest tokenizer artifact that still round-trips through
+    /// `tokenizers`: a WordLevel model with four ids and no decoder. Kept
+    /// inline so the test never reaches the network.
+    const WORD_LEVEL_FIXTURE: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": { "hello": 0, "world": 1, "!": 2, "[UNK]": 3 },
+    "unk_token": "[UNK]"
+  }
+}"#;
+
+    /// `vocab_strings` must cover the whole id space with no gaps —
+    /// `RegexConstraint` indexes the result by raw token id, so a short
+    /// vector would silently deny every id past its end.
+    #[test]
+    fn vocab_strings_covers_every_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, WORD_LEVEL_FIXTURE).unwrap();
+
+        let tok = HfTokenizer::load_from_file("fixture", &path).unwrap();
+        let vocab = tok.vocab_strings().unwrap();
+
+        assert_eq!(vocab.len(), tok.vocab_size(), "one entry per token id");
+        assert_eq!(vocab[0], "hello");
+        assert_eq!(vocab[1], "world");
+        assert_eq!(vocab[2], "!");
     }
 
     #[test]

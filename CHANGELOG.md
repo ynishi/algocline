@@ -37,6 +37,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StopTokensConstraint`, which never masks (the stop token itself is
   sampled, matching llama.cpp semantics) and flips `is_terminal` once
   the generated prefix ends on a stop token.
+- `RegexConstraint`: constrained decoding against a regex pattern.
+  The pattern is compiled once into a `regex-automata` dense DFA with
+  full-match semantics (wrapped as `^(?:pattern)$` — `Anchored::Yes`
+  alone only anchors the start, so an unanchored tail would keep every
+  token alive after the first match) and `MatchKind::All` (leftmost-
+  first would commit `a|ab` to `a` and deny the `b`). Each step walks
+  the generated prefix to the current DFA state and keeps exactly the
+  tokens whose surface bytes do not drive the DFA into a dead state;
+  the mask picks whichever sparse representation is smaller.
+  `is_terminal` fires once the prefix is a full match. Tokens that
+  decode to an empty string are always denied (they cannot advance
+  the DFA, so permitting them would loop forever). The vocabulary is
+  supplied as plain `Vec<String>` — decoupled from any tokenizer type
+  — and `HfTokenizer` gained `vocab_strings()` to produce it (one
+  surface string per token id; empty entries are the tokenizers-crate
+  normal case for special / gap ids, real decode failures propagate).
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

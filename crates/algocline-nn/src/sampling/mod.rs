@@ -12,9 +12,11 @@
 //!   [`TopKTopPSampler`]). Every consumer starts here.
 //! - **Layer 2 ([`constraint`])** — filters that mask logits before a
 //!   Layer 1 sampler picks, wired in through [`ConstrainedSampler`],
-//!   itself a `Sampler`. [`StopTokensConstraint`] is the first
-//!   [`Constraint`] to land; regex / JSON schema / GBNF grammars are
-//!   future additions behind the same trait.
+//!   itself a `Sampler`. Two [`Constraint`]s have landed:
+//!   [`StopTokensConstraint`] (termination only) and
+//!   [`RegexConstraint`] (anchored full-match over a tokenizer's surface
+//!   strings). JSON schema and GBNF grammars are future additions behind
+//!   the same trait.
 //! - **Layer 3 (schedule / mid-generation swap, future)** — Lua-side
 //!   state machines that swap the active `Sampler` per token position.
 //!   Requires the generation loop to be reified before it lands.
@@ -43,7 +45,9 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
-pub use constraint::{ConstrainedSampler, Constraint, StopTokensConstraint, TokenMask};
+pub use constraint::{
+    ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint, TokenMask,
+};
 
 /// Next-token sampler.
 ///

@@ -53,6 +53,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — and `HfTokenizer` gained `vocab_strings()` to produce it (one
   surface string per token id; empty entries are the tokenizers-crate
   normal case for special / gap ids, real decode failures propagate).
+- `JsonSchemaConstraint`: constrained decoding against a JSON Schema
+  subset, compiled schema → regex → the same `regex-automata` DFA
+  machinery `RegexConstraint` uses (the two-stage design Outlines
+  ships). Supported: `object` / `properties` / `required`, `string`,
+  `integer`, `number`, `boolean`, `null`, `enum` (members
+  type-checked when `type` is declared alongside), and `array` /
+  `items` including nesting. Every unsupported keyword (`$ref`,
+  `anyOf`, `pattern`, `additionalProperties`, annotations like
+  `description`, …) is rejected loudly by allowlist — silently
+  ignoring a keyword would emit output the schema author believes is
+  impossible. Known limitations, by design of the v1: all properties
+  must be `required` (optional-property comma placement is deferred),
+  output is compact JSON (no inter-token whitespace), and object keys
+  are emitted in sorted order — sorted explicitly, because
+  serde_json's `preserve_order` is an additive feature any transitive
+  crate could flip, silently changing which documents the compiled
+  DFA accepts. Depth (32) and compiled-regex size (1 MiB) guards turn
+  would-be stack overflows on pathological schemas into errors.
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

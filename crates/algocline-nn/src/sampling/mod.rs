@@ -10,13 +10,15 @@
 //! - **Layer 1 (this module)** — [`Sampler`] trait + Rust default
 //!   implementations ([`GreedySampler`] / [`TemperatureSampler`] /
 //!   [`TopKTopPSampler`]). Every consumer starts here.
-//! - **Layer 2 ([`constraint`])** — filters that mask logits before a
-//!   Layer 1 sampler picks, wired in through [`ConstrainedSampler`],
-//!   itself a `Sampler`. Two [`Constraint`]s have landed:
-//!   [`StopTokensConstraint`] (termination only) and
+//! - **Layer 2 ([`constraint`] / [`json_schema`])** — filters that mask
+//!   logits before a Layer 1 sampler picks, wired in through
+//!   [`ConstrainedSampler`], itself a `Sampler`. Three [`Constraint`]s
+//!   have landed: [`StopTokensConstraint`] (termination only),
 //!   [`RegexConstraint`] (anchored full-match over a tokenizer's surface
-//!   strings). JSON schema and GBNF grammars are future additions behind
-//!   the same trait.
+//!   strings) and [`JsonSchemaConstraint`] (a JSON schema compiled to a
+//!   regex and enforced through the previous one). GBNF grammars are a
+//!   future addition behind the same trait — and the one that unlocks
+//!   recursive schemas, which no regular language can express.
 //! - **Layer 3 (schedule / mid-generation swap, future)** — Lua-side
 //!   state machines that swap the active `Sampler` per token position.
 //!   Requires the generation loop to be reified before it lands.
@@ -39,6 +41,7 @@
 //! themselves.
 
 pub mod constraint;
+pub mod json_schema;
 
 use candle_core::{DType, Result as CandleResult, Tensor};
 use rand::distr::weighted::WeightedIndex;
@@ -48,6 +51,7 @@ use rand::rngs::StdRng;
 pub use constraint::{
     ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint, TokenMask,
 };
+pub use json_schema::JsonSchemaConstraint;
 
 /// Next-token sampler.
 ///

@@ -1345,6 +1345,10 @@ pub(super) struct Gpt2Handle {
 impl mlua::UserData for Gpt2Handle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         add_meta_methods(methods, Gpt2Handle::meta);
+        // `handle:generate_session(prompt)` — stateless full-history
+        // backend (no KV cache on the trainable arch); see nn_gen's
+        // module doc §"Sessions over trainable arches".
+        super::nn_gen::add_gpt2_generate_session_method(methods);
     }
 }
 
@@ -1389,6 +1393,18 @@ impl Gpt2Handle {
     /// panic or silently no-op.
     pub(super) fn varmap(&self) -> Option<Arc<VarMap>> {
         self.varmap.as_ref().map(Arc::clone)
+    }
+
+    /// Vocabulary size, for sibling modules (`nn_gen`) that bound-check
+    /// token ids without borrowing a full [`HandleMeta`].
+    pub(super) fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// Context window, for sibling modules (`nn_gen`) that cap the
+    /// stateless session history.
+    pub(super) fn ctx(&self) -> usize {
+        self.ctx
     }
 
     /// Test-only: strip the `VarMap` off a from-scratch handle so it
@@ -2000,6 +2016,8 @@ pub(super) struct TinyLlamaHandle {
 impl mlua::UserData for TinyLlamaHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         add_meta_methods(methods, TinyLlamaHandle::meta);
+        // Stateless-session mirror of the Gpt2Handle registration.
+        super::nn_gen::add_tinyllama_generate_session_method(methods);
     }
 }
 
@@ -2036,6 +2054,16 @@ impl TinyLlamaHandle {
     #[allow(dead_code)]
     pub(super) fn varmap(&self) -> Option<Arc<VarMap>> {
         self.varmap.as_ref().map(Arc::clone)
+    }
+
+    /// Vocabulary size; mirrors [`Gpt2Handle::vocab`].
+    pub(super) fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// Context window; mirrors [`Gpt2Handle::ctx`].
+    pub(super) fn ctx(&self) -> usize {
+        self.ctx
     }
 
     /// Test-only: strip the `VarMap` off a from-scratch handle so it
@@ -3758,6 +3786,9 @@ impl mlua::UserData for NnHandle {
         // Everything else is the shared surface, resolved through
         // `NnHandle::meta`'s single three-arm match.
         add_meta_methods(methods, NnHandle::meta);
+        // `handle:generate_session(prompt)` on the union — this is what
+        // lets a Card reloaded via `alc.nn.card.load_handle` generate.
+        super::nn_gen::add_nn_handle_generate_session_method(methods);
     }
 }
 

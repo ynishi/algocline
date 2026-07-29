@@ -393,6 +393,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse develops; the aux term ships as standard equipment with the
   claim's small-scale test honestly negative, not as a measured
   improvement.
+- `generate_session` is now exposed on the trainable handles
+  (`Gpt2Handle` / `TinyLlamaHandle`) and on the arch-neutral `NnHandle`
+  union that `alc.nn.card.load_handle` returns, closing the Lua-only
+  loop: train (`alc.nn.trainer.run_full_ft`) → Card →
+  `alc.nn.card.load_handle` → generate. Trainable arches run the
+  session on a stateless backend — each `next_logits` re-forwards the
+  full token history and slices the final position's row, because the
+  training stacks carry no KV cache (O(n²) over the generation length,
+  acceptable at the tiny/small preset sizes the train side targets) —
+  while the Llama adapter path keeps its per-session KV cache
+  unchanged. The stateless history is capped at the model context
+  window with a loud session-level error instead of a candle
+  positional-embedding failure.
 
 ### Fixed
 

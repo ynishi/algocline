@@ -34,6 +34,20 @@
 //! remember. The bare handle-level `forward` is deliberately *not*
 //! bound.
 //!
+//! # Sessions over trainable arches (GPT-2 / TinyLlama)
+//!
+//! The trainable arch models expose no KV cache — their `forward` is
+//! the training-loop full-sequence pass. Their sessions therefore run
+//! on a **stateless backend**: every `next_logits` re-forwards the full
+//! token history and slices the final position's row. That is O(n²)
+//! over the generation length, which is acceptable for the model sizes
+//! the train side targets (tiny/small presets, smoke-scale ctx) and
+//! buys the same Lua surface as the Llama session — a decode loop
+//! written against one handle kind runs unchanged against the others.
+//! The history is capped at the model's context window; exceeding it is
+//! a loud session-level error rather than a positional-embedding
+//! failure surfacing from candle.
+//!
 //! # Why the loop lives in Lua
 //!
 //! The session exposes one forward step (`next_logits`) and one
@@ -56,65 +70,188 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use algocline_nn::arch::adapter::{LlamaAdapter, LlamaCache};
+use algocline_nn::arch::adapter::{InferenceAdapter, LlamaAdapter, LlamaCache};
+use algocline_nn::arch::{Gpt2Model, TinyLlamaModel};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
-use candle_core::{DType, Tensor};
+use algocline_nn::train::DeviceView;
+use candle_core::{DType, Device, Tensor};
 use mlua::prelude::*;
 
-use super::nn_card::LlamaHandle;
+use super::nn_card::{Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle};
 
-/// One in-flight generation over a Llama adapter.
+/// The forward path a [`GenSession`] drives.
+///
+/// `Llama` forwards incrementally through a per-session KV cache. The
+/// trainable arches (`Gpt2` / `TinyLlama`) have no KV cache — their
+/// `forward` is the training-loop full-sequence pass — so their arm
+/// re-forwards the whole token history each step instead (see the
+/// module-level "Sessions over trainable arches" section for the cost
+/// trade-off).
+enum SessionBackend {
+    Llama {
+        /// Shared, read-only weights. Cloning the `Arc` is what lets
+        /// many sessions run against one loaded model.
+        adapter: Arc<LlamaAdapter>,
+        /// This session's private KV cache.
+        ///
+        /// The `Mutex` is here for the same reason as the one inside
+        /// [`LlamaAdapter`]: mlua's `send` feature requires the
+        /// `UserData` to be `Send`. The VM is single-threaded, so there
+        /// is no real contention on it.
+        cache: Mutex<LlamaCache>,
+    },
+    /// Stateless full-history re-forward over the shared trainable
+    /// model. Session isolation is trivial here — there is no
+    /// per-session state beyond the token history the session already
+    /// owns.
+    Gpt2(Arc<Mutex<Gpt2Model>>),
+    /// Same stateless discipline as `Gpt2`.
+    TinyLlama(Arc<Mutex<TinyLlamaModel>>),
+}
+
+/// One in-flight generation over a model handle.
 ///
 /// Holds the full token history (prompt included) plus the count of
-/// tokens already pushed through the KV cache, so a caller cannot get
-/// the `index_pos` bookkeeping wrong: `next_logits` derives it from the
-/// session's own state rather than taking it as an argument.
+/// tokens already forwarded, so a caller cannot get the `index_pos`
+/// bookkeeping wrong: `next_logits` derives it from the session's own
+/// state rather than taking it as an argument.
 pub(super) struct GenSession {
-    /// Shared, read-only weights. Cloning the `Arc` is what lets many
-    /// sessions run against one loaded model.
-    adapter: Arc<LlamaAdapter>,
-    /// This session's private KV cache.
-    ///
-    /// The `Mutex` is here for the same reason as the one inside
-    /// [`LlamaAdapter`]: mlua's `send` feature requires the `UserData`
-    /// to be `Send`. The VM is single-threaded, so there is no real
-    /// contention on it.
-    cache: Mutex<LlamaCache>,
+    backend: SessionBackend,
+    /// Device the input tensors must be built on. Captured at
+    /// construction — a model's device never changes after load.
+    device: Device,
+    /// Vocabulary bound every caller-supplied token id is checked
+    /// against.
+    vocab: usize,
+    /// Model context window. Enforced on the stateless arms, whose
+    /// full-history re-forward would otherwise surface a positional
+    /// embedding error from deep inside candle.
+    ctx: usize,
     /// Prompt tokens followed by every token the caller appended.
     tokens: Vec<u32>,
-    /// How many entries of `tokens` are already in the cache. Equals the
-    /// `index_pos` the next forward must start at.
+    /// How many entries of `tokens` are already forwarded (for the
+    /// Llama arm: already in the KV cache). Equals the `index_pos` the
+    /// next forward must start at.
     forwarded: usize,
 }
 
 impl GenSession {
-    /// Start a session over `prompt`.
+    /// Validate a caller-supplied prompt: non-empty, every id within
+    /// `vocab`.
     ///
     /// The prompt must be non-empty: a session with nothing to forward
     /// could not answer `next_logits`, and silently accepting one would
     /// only defer the failure to a confusing place.
-    fn new(adapter: Arc<LlamaAdapter>, prompt: &[i64]) -> LuaResult<Self> {
+    fn validate_prompt(prompt: &[i64], vocab: usize) -> LuaResult<Vec<u32>> {
         if prompt.is_empty() {
             return Err(LuaError::external(
                 "alc.nn generate_session: prompt_tokens is empty; \
                  provide at least one token id to forward",
             ));
         }
-        let vocab = adapter.vocab();
-        let tokens = prompt
+        prompt
             .iter()
             .enumerate()
             .map(|(i, id)| check_token(*id, vocab, &format!("prompt_tokens[{}]", i + 1)))
-            .collect::<LuaResult<Vec<u32>>>()?;
+            .collect()
+    }
+
+    /// Start a session over `prompt` against a Llama adapter.
+    fn new_llama(adapter: Arc<LlamaAdapter>, prompt: &[i64]) -> LuaResult<Self> {
+        let meta = adapter.meta();
+        let tokens = Self::validate_prompt(prompt, meta.vocab)?;
         let cache = adapter
             .new_cache()
             .map_err(|e| LuaError::external(format!("alc.nn generate_session: kv cache: {e}")))?;
         Ok(Self {
-            adapter,
-            cache: Mutex::new(cache),
+            backend: SessionBackend::Llama {
+                adapter,
+                cache: Mutex::new(cache),
+            },
+            device: meta.device,
+            vocab: meta.vocab,
+            ctx: meta.ctx,
             tokens,
             forwarded: 0,
         })
+    }
+
+    /// Start a session over `prompt` against a trainable GPT-2 model.
+    pub(super) fn new_gpt2(
+        model: Arc<Mutex<Gpt2Model>>,
+        vocab: usize,
+        ctx: usize,
+        prompt: &[i64],
+    ) -> LuaResult<Self> {
+        let tokens = Self::validate_prompt(prompt, vocab)?;
+        let device = model
+            .lock()
+            .map_err(|e| LuaError::external(format!("alc.nn generate_session: model lock: {e}")))?
+            .device()
+            .clone();
+        Ok(Self {
+            backend: SessionBackend::Gpt2(model),
+            device,
+            vocab,
+            ctx,
+            tokens,
+            forwarded: 0,
+        })
+    }
+
+    /// Start a session over `prompt` against a trainable TinyLlama
+    /// model.
+    pub(super) fn new_tinyllama(
+        model: Arc<Mutex<TinyLlamaModel>>,
+        vocab: usize,
+        ctx: usize,
+        prompt: &[i64],
+    ) -> LuaResult<Self> {
+        let tokens = Self::validate_prompt(prompt, vocab)?;
+        let device = model
+            .lock()
+            .map_err(|e| LuaError::external(format!("alc.nn generate_session: model lock: {e}")))?
+            .device()
+            .clone();
+        Ok(Self {
+            backend: SessionBackend::TinyLlama(model),
+            device,
+            vocab,
+            ctx,
+            tokens,
+            forwarded: 0,
+        })
+    }
+
+    /// Build the `[1, len]` input tensor for the full token history and
+    /// run one stateless forward, returning the final position's
+    /// `[1, vocab]` row.
+    ///
+    /// Shared by the `Gpt2` / `TinyLlama` arms of `next_logits`; the
+    /// per-arm closure only supplies the model's inherent `forward`.
+    fn full_history_row(
+        &self,
+        forward: impl FnOnce(&Tensor) -> candle_core::Result<Tensor>,
+    ) -> LuaResult<Tensor> {
+        let n = self.tokens.len();
+        if n > self.ctx {
+            return Err(LuaError::external(format!(
+                "alc.nn session:next_logits: session history ({n} tokens) exceeds \
+                 the model context window ({ctx}); trainable-arch sessions \
+                 re-forward the full history and cannot generate past ctx",
+                ctx = self.ctx
+            )));
+        }
+        let input = Tensor::from_slice(&self.tokens, (1, n), &self.device)
+            .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
+        // `[1, n, vocab]` full-sequence logits → keep only the final
+        // position's `[1, vocab]` row, matching the Llama adapter's
+        // LastToken output shape so the common tail below is shared.
+        let full = forward(&input)
+            .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
+        full.narrow(1, n - 1, 1)
+            .and_then(|t| t.squeeze(1))
+            .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))
     }
 
     /// Forward every token appended since the last call and return the
@@ -133,25 +270,43 @@ impl GenSession {
                  call session:append(token_id) first",
             ));
         }
-        let input = Tensor::from_slice(pending, (1, pending.len()), self.adapter.device())
-            .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
 
-        let logits = {
-            let mut cache = self.cache.lock().map_err(|e| {
-                LuaError::external(format!(
-                    "alc.nn session:next_logits: kv cache lock poisoned: {e}"
-                ))
-            })?;
-            self.adapter
-                .forward_with_cache(&input, self.forwarded, &mut cache)
-                .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?
+        let logits = match &self.backend {
+            SessionBackend::Llama { adapter, cache } => {
+                let input = Tensor::from_slice(pending, (1, pending.len()), &self.device)
+                    .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
+                let mut cache = cache.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: kv cache lock poisoned: {e}"
+                    ))
+                })?;
+                adapter
+                    .forward_with_cache(&input, self.forwarded, &mut cache)
+                    .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?
+            }
+            SessionBackend::Gpt2(model) => {
+                let guard = model.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: model lock poisoned: {e}"
+                    ))
+                })?;
+                self.full_history_row(|input| guard.forward(input))?
+            }
+            SessionBackend::TinyLlama(model) => {
+                let guard = model.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: model lock poisoned: {e}"
+                    ))
+                })?;
+                self.full_history_row(|input| guard.forward(input))?
+            }
         };
         // Advance only after a successful forward: a failed step leaves
         // the session where it was so the caller can react without the
         // position silently running ahead of the cache.
         self.forwarded = self.tokens.len();
 
-        // The adapter returns `[batch, vocab]` and this session always
+        // Every arm above lands on `[1, vocab]` and this session always
         // forwards batch 1, so drop the batch axis to reach the
         // `[vocab]` f32 row the sampler layer takes.
         let row = logits
@@ -169,10 +324,10 @@ impl GenSession {
 
     /// Commit `token` as the next token of this generation.
     ///
-    /// The token is only queued here; it reaches the KV cache on the
+    /// The token is only queued here; it reaches the forward pass on the
     /// following `next_logits` call.
     fn append(&mut self, token: i64) -> LuaResult<()> {
-        let id = check_token(token, self.adapter.vocab(), "token_id")?;
+        let id = check_token(token, self.vocab, "token_id")?;
         self.tokens.push(id);
         Ok(())
     }
@@ -324,7 +479,47 @@ where
     M: mlua::UserDataMethods<LlamaHandle>,
 {
     methods.add_method("generate_session", |_, this, prompt: Vec<i64>| {
-        GenSession::new(this.adapter(), &prompt)
+        GenSession::new_llama(this.adapter(), &prompt)
+    });
+}
+
+/// Register `handle:generate_session(prompt_tokens)` on the trainable
+/// GPT-2 handle's method table (stateless full-history backend).
+pub(super) fn add_gpt2_generate_session_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| {
+        GenSession::new_gpt2(this.model(), this.vocab(), this.ctx(), &prompt)
+    });
+}
+
+/// Register `handle:generate_session(prompt_tokens)` on the trainable
+/// TinyLlama handle's method table (stateless full-history backend).
+pub(super) fn add_tinyllama_generate_session_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| {
+        GenSession::new_tinyllama(this.model(), this.vocab(), this.ctx(), &prompt)
+    });
+}
+
+/// Register `handle:generate_session(prompt_tokens)` on the arch-neutral
+/// [`NnHandle`] union, fanning out per variant.
+///
+/// This is what closes the "train → save Card → `load_handle` →
+/// generate" loop from Lua: `alc.nn.card.load_handle` returns an
+/// `NnHandle`, so without this registration a reloaded model could not
+/// generate no matter which arch it wraps.
+pub(super) fn add_nn_handle_generate_session_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<NnHandle>,
+{
+    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| match this {
+        NnHandle::Llama(h) => GenSession::new_llama(h.adapter(), &prompt),
+        NnHandle::Gpt2(h) => GenSession::new_gpt2(h.model(), h.vocab(), h.ctx(), &prompt),
+        NnHandle::TinyLlama(h) => GenSession::new_tinyllama(h.model(), h.vocab(), h.ctx(), &prompt),
     });
 }
 
@@ -500,7 +695,7 @@ mod tests {
     }
 
     fn run(adapter: Arc<LlamaAdapter>, prompt: &[i64], steps: usize) -> Vec<(u32, Vec<f32>)> {
-        let mut s = GenSession::new(adapter, prompt).expect("session");
+        let mut s = GenSession::new_llama(adapter, prompt).expect("session");
         (0..steps).map(|_| step(&mut s)).collect()
     }
 
@@ -529,8 +724,8 @@ mod tests {
         let solo_a = run(Arc::clone(&adapter), &prompt_a, 4);
         let solo_b = run(Arc::clone(&adapter), &prompt_b, 4);
 
-        let mut a = GenSession::new(Arc::clone(&adapter), &prompt_a).expect("session a");
-        let mut b = GenSession::new(Arc::clone(&adapter), &prompt_b).expect("session b");
+        let mut a = GenSession::new_llama(Arc::clone(&adapter), &prompt_a).expect("session a");
+        let mut b = GenSession::new_llama(Arc::clone(&adapter), &prompt_b).expect("session b");
         let mut mixed_a = Vec::new();
         let mut mixed_b = Vec::new();
         for _ in 0..4 {
@@ -561,7 +756,7 @@ mod tests {
     fn logits_row_is_vocab_shaped_f32() {
         let adapter = tiny_adapter();
         let vocab = adapter.vocab();
-        let mut session = GenSession::new(adapter, &[1, 2, 3]).expect("session");
+        let mut session = GenSession::new_llama(adapter, &[1, 2, 3]).expect("session");
         let logits = session.next_logits().expect("next_logits");
         assert_eq!(logits.tensor().dims(), &[vocab]);
         assert_eq!(logits.tensor().dtype(), DType::F32);
@@ -572,7 +767,7 @@ mod tests {
     #[test]
     fn position_and_forwarded_track_appends() {
         let adapter = tiny_adapter();
-        let mut session = GenSession::new(adapter, &[1, 2, 3]).expect("session");
+        let mut session = GenSession::new_llama(adapter, &[1, 2, 3]).expect("session");
         assert_eq!(session.tokens.len(), 3);
         assert_eq!(session.forwarded, 0);
 

@@ -456,6 +456,154 @@ fn alc_nn_preset_gpt2_custom_builds_and_trains() {
     assert_eq!(step, 2);
 }
 
+/// Cross-module seam guard: the Card that `alc.nn.trainer.run_full_ft`
+/// writes (bridge/nn_trainer.rs) must resolve through
+/// `alc.nn.card.load_handle` (bridge/nn_card.rs) — bundle path,
+/// `bundle_ref = "nn/<card_id>"`, and `architecture` family-prefix
+/// dispatch all have to line up across the two modules. The per-module
+/// unit tests each assert their own half; this is the only place the
+/// whole chain runs from Lua. Motivated by the 2026-07-30 eval iter,
+/// where the raw-Checkpoint surface's `ckpt.card_id` (a checkpoint
+/// filename prefix, not a Card id) was mistaken for a loadable Card id.
+#[test]
+fn alc_nn_run_full_ft_card_load_handle_roundtrip() {
+    let (lua, _tmp) = production_vm();
+    lua.load(
+        r#"
+        local h = alc.nn.preset.gpt2("tiny", {
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+        })
+
+        local rows = {}
+        for r = 1, 8 do
+            local row = {}
+            for j = 1, 8 do row[j] = ((r + j) % 60) + 1 end
+            rows[r] = row
+        end
+        local ds = alc.nn.data.synthetic(rows, {
+            batch_size = 1,
+            ctx_len = 8,
+            shuffle = false,
+            pad_id = 0,
+        })
+
+        local card_id = alc.nn.trainer.run_full_ft(h, ds, {
+            lr = 1e-3,
+            batch = 1,
+            steps = 3,
+            warmup = 0,
+            schedule = "Constant",
+            name = "rt_smoke",
+        })
+        assert(type(card_id) == "string" and #card_id > 0,
+            "run_full_ft must return a non-empty card_id")
+
+        local reloaded = alc.nn.card.load_handle(card_id)
+        assert(reloaded ~= nil, "load_handle returned nil")
+        assert(reloaded:vocab() == h:vocab(),
+            "vocab mismatch: " .. reloaded:vocab() .. " vs " .. h:vocab())
+        assert(reloaded:ctx() == h:ctx(), "ctx mismatch")
+        assert(reloaded:layers() == h:layers(), "layers mismatch")
+        assert(reloaded:dim() == h:dim(), "dim mismatch")
+
+        -- The reloaded NnHandle must also generate: this is the last
+        -- leg of the Lua-only "train -> Card -> reload -> generate"
+        -- loop (stateless session backend on the trainable arch).
+        local session = reloaded:generate_session({ 1, 2, 3 })
+        local logits = session:next_logits()
+        assert(logits:vocab() == h:vocab(),
+            "reloaded handle logits must span the model vocab")
+        session:append(logits:argmax())
+        assert(session:position() == 4, "session must advance after append")
+    "#,
+    )
+    .exec()
+    .expect("run_full_ft -> card.load_handle round-trip");
+}
+
+/// The stateless session backend on a trainable GPT-2 handle: the
+/// decode loop written for Llama sessions runs unchanged, including
+/// the no-pending-tokens guard.
+#[test]
+fn alc_nn_gpt2_generate_session_stateless_loop() {
+    let (lua, _tmp) = production_vm();
+    lua.load(
+        r#"
+        local h = alc.nn.preset.gpt2("tiny", {
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+        })
+        local s = h:generate_session({ 1, 2, 3 })
+        local l1 = s:next_logits()
+        assert(l1:vocab() == h:vocab(), "logits row must span the model vocab")
+        s:append(l1:argmax())
+        assert(s:position() == 4, "position after one append")
+        local l2 = s:next_logits()
+        assert(l2:vocab() == h:vocab(), "second step logits row")
+        local ok, err = pcall(function() return s:next_logits() end)
+        assert(not ok, "next_logits without append must error")
+        assert(tostring(err):find("no pending tokens", 1, true),
+            "unexpected error: " .. tostring(err))
+    "#,
+    )
+    .exec()
+    .expect("gpt2 stateless session loop");
+}
+
+/// TinyLlama arm of the stateless session backend (the second
+/// trainable arch goes through its own `Module::forward`, so the
+/// GPT-2 test alone would leave this dispatch arm unexercised).
+#[test]
+fn alc_nn_tinyllama_generate_session_stateless_loop() {
+    let (lua, _tmp) = production_vm();
+    lua.load(
+        r#"
+        local h = alc.nn.preset.tinyllama("tiny", {
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+        })
+        local s = h:generate_session({ 1, 2 })
+        local l = s:next_logits()
+        assert(l:vocab() == h:vocab(), "logits row must span the model vocab")
+        s:append(l:argmax())
+        assert(s:position() == 3, "position after one append")
+    "#,
+    )
+    .exec()
+    .expect("tinyllama stateless session loop");
+}
+
+/// A stateless session cannot generate past the model's context
+/// window — the guard must fire as a session-level error naming ctx,
+/// not as a positional-embedding failure from inside candle.
+#[test]
+fn alc_nn_gpt2_session_history_over_ctx_errors() {
+    let (lua, _tmp) = production_vm();
+    lua.load(
+        r#"
+        local h = alc.nn.preset.gpt2("tiny", {
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+        })
+        assert(h:ctx() == 16, "tiny preset ctx expected to be 16")
+        local prompt = {}
+        for i = 1, 17 do prompt[i] = 1 end
+        local s = h:generate_session(prompt)
+        local ok, err = pcall(function() return s:next_logits() end)
+        assert(not ok, "over-ctx history must error")
+        assert(tostring(err):find("context window", 1, true),
+            "unexpected error: " .. tostring(err))
+    "#,
+    )
+    .exec()
+    .expect("gpt2 over-ctx guard");
+}
+
 /// MoE co-placement: `moe = {...}` composes with the non-dense axes
 /// (build succeeds), while the dense-MLP knobs (`act` / `mlp_ratio`)
 /// combined with `moe` are rejected Rust-side with the message

@@ -92,6 +92,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached under the app dir) is now reachable from Lua, closing the
   text → token ids → generation loop → text circle that
   `generate_session` needs.
+- `alc.nn.chat_prompt(preset, messages)` and, on the crate side,
+  `HfTokenizer::apply_chat_template(&[Message], add_generation_prompt)`:
+  a conversation (`{ { role = "user", content = "..." }, ... }`) is
+  rendered into the exact prompt string an instruction-tuned model was
+  tuned on. The wrapping is model-specific and shipped by the model
+  author as a Jinja2 program in `tokenizer_config.json`, so the
+  template is rendered rather than reimplemented — `minijinja` is the
+  new (minimal-feature) dependency behind it. The first-use tokenizer
+  fetch now picks `tokenizer_config.json` up alongside `tokenizer.json`
+  (cached as `<preset>-config.json`); a repo that ships none answers
+  404 and stays fully usable for encode / decode, with only
+  `apply_chat_template` refusing by name. `add_generation_prompt` is
+  fixed to `true` from Lua (the caller wants a prompt to continue);
+  the Rust API takes it as an argument. Roles are checked against
+  `system` / `user` / `assistant` / `tool`, and a missing `role` /
+  `content` names the offending index — a template branches on the
+  role string, so an unrecognised one silently drops the turn from the
+  prompt. Nothing degrades to a hand-built fallback: a prompt in the
+  wrong shape yields plausible-looking garbage instead of a visible
+  failure.
 - Layer 3 of the sampler plan: samplers and constraints are now Lua
   values. `alc.nn.sampler.greedy()` / `.temperature(t, seed)` /
   `.top_k_top_p(k, p, t, seed)` build the Rust Layer 1 samplers;

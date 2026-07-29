@@ -15,6 +15,7 @@
 //! logits:argmax()                        -> id
 //! alc.nn.tokenize(preset, text)          -> { id, ... }
 //! alc.nn.detokenize(preset, ids)         -> string
+//! alc.nn.chat_prompt(preset, messages)   -> string
 //! ```
 //!
 //! The samplers that consume a `LogitsHandle` live next door in
@@ -56,7 +57,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{LlamaAdapter, LlamaCache};
-use algocline_nn::tokenizer::HfTokenizer;
+use algocline_nn::tokenizer::{HfTokenizer, Message};
 use candle_core::{DType, Tensor};
 use mlua::prelude::*;
 
@@ -327,9 +328,19 @@ where
     });
 }
 
-/// Register `alc.nn.tokenize` / `alc.nn.detokenize`.
+/// Roles a message may carry.
 ///
-/// Both resolve the tokenizer through [`HfTokenizer::load_cached`]
+/// An allowlist rather than a pass-through: a chat template branches on
+/// the role string, and an unrecognised one (a typo'd `"assistent"`, a
+/// `"human"` borrowed from another API) usually falls through every
+/// branch and vanishes from the prompt. Silently dropping a turn is the
+/// worst failure this surface has, so the typo is refused here instead.
+const CHAT_ROLES: [&str; 4] = ["system", "user", "assistant", "tool"];
+
+/// Register `alc.nn.tokenize` / `alc.nn.detokenize` /
+/// `alc.nn.chat_prompt`.
+///
+/// All three resolve the tokenizer through [`HfTokenizer::load_cached`]
 /// against `<nn_dir>/tokenizers`, the same cache directory the
 /// `alc.nn.data.*` producers use, so a preset downloaded by either path
 /// is reused by the other.
@@ -344,7 +355,7 @@ pub(super) fn register_gen_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -
     )?;
     nn_table.set("tokenize", tokenize)?;
 
-    let detokenize_dir = nn_dir;
+    let detokenize_dir = nn_dir.clone();
     let detokenize = lua.create_function(
         move |_lua, (preset, ids): (String, Vec<u32>)| -> LuaResult<String> {
             let tok = load_tokenizer("alc.nn.detokenize", &preset, &detokenize_dir)?;
@@ -354,7 +365,71 @@ pub(super) fn register_gen_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -
     )?;
     nn_table.set("detokenize", detokenize)?;
 
+    let chat_dir = nn_dir;
+    let chat_prompt = lua.create_function(
+        move |_lua, (preset, messages): (String, LuaTable)| -> LuaResult<String> {
+            let messages = parse_messages("alc.nn.chat_prompt", &messages)?;
+            let tok = load_tokenizer("alc.nn.chat_prompt", &preset, &chat_dir)?;
+            // `add_generation_prompt` is fixed to true: what a caller
+            // wants from this entry point is a prompt to continue. The
+            // transcript-only form (false) is what a trainer wants, and
+            // it arrives with the rest of the training-side options
+            // rather than as a bare positional flag here.
+            tok.apply_chat_template(&messages, true)
+                .map_err(|e| LuaError::external(format!("alc.nn.chat_prompt: {e}")))
+        },
+    )?;
+    nn_table.set("chat_prompt", chat_prompt)?;
+
     Ok(())
+}
+
+/// Convert the Lua `{ { role = ..., content = ... }, ... }` array into
+/// [`Message`]s.
+///
+/// Every rejection names the offending index and what was expected: a
+/// conversation is assembled by a strategy loop, so "one of the turns is
+/// wrong" without a position is close to useless. Missing fields and
+/// wrong types are refused rather than defaulted — a turn with an empty
+/// role renders into a prompt the model was never tuned on, which shows
+/// up as a bad answer instead of an error.
+fn parse_messages(entry: &str, messages: &LuaTable) -> LuaResult<Vec<Message>> {
+    let mut out = Vec::with_capacity(messages.raw_len());
+    for (index, value) in messages.clone().sequence_values::<LuaValue>().enumerate() {
+        let position = index + 1;
+        let value = value?;
+        let turn = value.as_table().ok_or_else(|| {
+            LuaError::external(format!(
+                "{entry}: messages[{position}] must be a table with 'role' and 'content', got {}",
+                value.type_name()
+            ))
+        })?;
+        let role: String = field(entry, turn, position, "role")?;
+        let content: String = field(entry, turn, position, "content")?;
+        if !CHAT_ROLES.contains(&role.as_str()) {
+            return Err(LuaError::external(format!(
+                "{entry}: messages[{position}].role = '{role}' is not a chat role \
+                 (expected one of {})",
+                CHAT_ROLES.join(", ")
+            )));
+        }
+        out.push(Message { role, content });
+    }
+    Ok(out)
+}
+
+/// Read one required string field off a message table.
+fn field(entry: &str, turn: &LuaTable, position: usize, name: &str) -> LuaResult<String> {
+    match turn.get::<LuaValue>(name)? {
+        LuaValue::String(s) => Ok(s.to_str()?.to_string()),
+        LuaValue::Nil => Err(LuaError::external(format!(
+            "{entry}: messages[{position}] is missing '{name}'"
+        ))),
+        other => Err(LuaError::external(format!(
+            "{entry}: messages[{position}].{name} must be a string, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// Resolve a tokenizer preset against the session's nn directory.

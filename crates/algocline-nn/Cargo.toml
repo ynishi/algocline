@@ -38,6 +38,22 @@ serde_json = { workspace = true }
 # HuggingFace tokenizer for pre-trained tokenizer artifacts
 # (design §6.3 / §12 Q2 / §12 Q5).
 tokenizers = "0.19"
+# Jinja2 engine for the HuggingFace chat template
+# (`tokenizer.rs::apply_chat_template`). A chat template is shipped by the
+# model author as a Jinja2 program inside `tokenizer_config.json`, so
+# rendering one means running Jinja — hand-parsing the handful of
+# templates we know about would break on the next model. `minijinja` is
+# the de-facto Rust engine for this (candle, mistral.rs and text-
+# generation-inference all render HF chat templates with it).
+# `default-features = false` drops the pieces a chat template never
+# needs (debug tracing, `deserialization`, `multi_template`); `builtins`
+# covers the filters templates actually use (`trim`, `tojson`,
+# `default`, ...), `macros` the `{% macro %}` / `{% call %}` forms some
+# templates define, `loader` the owned-source registration
+# (`add_template_owned`) that lets a compiled template outlive the
+# string read off disk, and `serde` the `Message` -> template-value
+# conversion.
+minijinja = { version = "2", default-features = false, features = ["builtins", "macros", "loader", "serde"] }
 # Hub artifact fetch (`src/hub.rs`). `ureq` is a pure-sync client, which
 # keeps the bridge path Runtime-free — every async client (including
 # hf-hub 1.x, which wraps `reqwest`) would park a tokio runtime on a

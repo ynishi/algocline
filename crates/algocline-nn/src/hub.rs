@@ -45,8 +45,7 @@ const REVISION: &str = "main";
 /// own vocabulary rather than leaking this module's shape.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HubError {
-    /// Transport failure — DNS, TLS, connection, redirect, or a non-2xx
-    /// status (`ureq` surfaces those as errors by default).
+    /// Transport failure — DNS, TLS, connection, or redirect.
     #[error("GET {url}: {msg}")]
     Request {
         /// Fully-qualified URL that was requested.
@@ -54,8 +53,12 @@ pub(crate) enum HubError {
         /// Underlying client error, rendered.
         msg: String,
     },
-    /// Non-2xx status that reached us without being turned into a
-    /// transport error.
+    /// Non-2xx status.
+    ///
+    /// Carries the code rather than folding into [`Self::Request`] so a
+    /// caller can tell "this repo does not ship that file" (404) from
+    /// "the fetch failed" — [`download_optional`] is built on exactly
+    /// that distinction.
     #[error("GET {url}: unexpected status {status}")]
     Status {
         /// Fully-qualified URL that was requested.
@@ -81,6 +84,22 @@ pub(crate) enum HubError {
 pub(crate) fn download_to(repo: &str, filename: &str, dest: &Path) -> Result<(), HubError> {
     let endpoint = std::env::var("HF_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
     download_from(&endpoint, repo, filename, dest)
+}
+
+/// [`download_to`] for a file the repo may legitimately not ship.
+///
+/// Returns `Ok(true)` when the file landed at `dest` and `Ok(false)`
+/// when the Hub answered `404` — the artifact is genuinely absent
+/// upstream, which is a fact about the repo rather than a failure.
+/// Every other outcome (transport error, 401 on a gated repo, 5xx,
+/// local IO) still propagates: a network problem must not be mistaken
+/// for "the model has no such file".
+pub(crate) fn download_optional(repo: &str, filename: &str, dest: &Path) -> Result<bool, HubError> {
+    match download_to(repo, filename, dest) {
+        Ok(()) => Ok(true),
+        Err(HubError::Status { status: 404, .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// [`download_to`] with the Hub host supplied explicitly.
@@ -113,9 +132,18 @@ fn download_from(endpoint: &str, repo: &str, filename: &str, dest: &Path) -> Res
         }
     }
 
-    let response = request.call().map_err(|e| HubError::Request {
-        url: url.clone(),
-        msg: e.to_string(),
+    // `ureq` reports a non-2xx response as an error rather than handing
+    // back the response, so the status has to be recovered here — folding
+    // it into `Request` would erase the one bit `download_optional` needs.
+    let response = request.call().map_err(|e| match e {
+        ureq::Error::StatusCode(status) => HubError::Status {
+            url: url.clone(),
+            status,
+        },
+        other => HubError::Request {
+            url: url.clone(),
+            msg: other.to_string(),
+        },
     })?;
 
     let status = response.status().as_u16();

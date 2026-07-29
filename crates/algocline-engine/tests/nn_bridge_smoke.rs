@@ -77,10 +77,22 @@ const FIXTURE_TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":
  "post_processor":null,"decoder":null,
  "model":{"type":"WordLevel","vocab":{"[UNK]":0,"alpha":1,"beta":2,"gamma":3,"delta":4,"epsilon":5},"unk_token":"[UNK]"}}"#;
 
+/// `tokenizer_config.json` for the fixture preset, seeded beside the
+/// tokenizer under the name `HfTokenizer` reads (`<preset>-config.json`).
+/// The template is the shape a small chat model ships — one wrapped
+/// block per turn plus an `add_generation_prompt`-gated assistant
+/// opening — so `alc.nn.chat_prompt` resolves without a hub fetch.
+const FIXTURE_TOKENIZER_CONFIG: &str = r#"{
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}{{ eos_token }}\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+}"#;
+
 /// VM whose `nn_dir` already holds the fixture tokenizer, so
-/// `alc.nn.tokenize` / `alc.nn.detokenize` resolve offline. The
-/// `install_for_pkg_test` path cannot be used here: it owns its tempdir
-/// internally, leaving no place to seed the cache before registration.
+/// `alc.nn.tokenize` / `alc.nn.detokenize` / `alc.nn.chat_prompt`
+/// resolve offline. The `install_for_pkg_test` path cannot be used here:
+/// it owns its tempdir internally, leaving no place to seed the cache
+/// before registration.
 fn tokenizer_vm() -> (Lua, tempfile::TempDir) {
     let lua = Lua::new();
     let metrics = ExecutionMetrics::new();
@@ -90,6 +102,11 @@ fn tokenizer_vm() -> (Lua, tempfile::TempDir) {
     std::fs::create_dir_all(nn_dir.join("tokenizers")).expect("seed tokenizer dir");
     std::fs::write(nn_dir.join("tokenizers/gpt2.json"), FIXTURE_TOKENIZER)
         .expect("seed tokenizer fixture");
+    std::fs::write(
+        nn_dir.join("tokenizers/gpt2-config.json"),
+        FIXTURE_TOKENIZER_CONFIG,
+    )
+    .expect("seed tokenizer config fixture");
 
     let config = BridgeConfig {
         llm_tx: None,
@@ -813,6 +830,97 @@ fn alc_nn_tokenize_unknown_preset_errors() {
         .to_string();
     assert!(
         err.contains("alc.nn.tokenize") && err.contains("nonsense-preset-xyz"),
+        "unexpected error: {err}"
+    );
+}
+
+// ─── chat templates (Sampler plan Step 6) ────────────────────────────
+//
+// `alc.nn.chat_prompt(preset, messages)` renders a conversation through
+// the preset's own Jinja chat template. The fixture preset seeded by
+// `tokenizer_vm` ships one, so these stay offline.
+
+/// The rendered prompt is the preset's template applied verbatim: turn
+/// markers, the special tokens from `tokenizer_config.json`, and the
+/// assistant opening that makes it a prompt to continue
+/// (`add_generation_prompt` is fixed to true on this entry point).
+#[test]
+fn alc_nn_chat_prompt_renders_a_conversation() {
+    let (lua, _tmp) = tokenizer_vm();
+    let prompt: String = lua
+        .load(
+            r#"
+            return alc.nn.chat_prompt("gpt2", {
+                { role = "system", content = "be brief" },
+                { role = "user", content = "hi" },
+            })
+        "#,
+        )
+        .eval()
+        .expect("chat_prompt renders");
+    assert_eq!(
+        prompt,
+        "<s><|system|>\nbe brief</s>\n<|user|>\nhi</s>\n<|assistant|>\n"
+    );
+}
+
+/// A turn missing `content` is a caller bug that names its own position:
+/// defaulting it would render a turn the model never sees, which
+/// surfaces as a bad answer rather than an error.
+#[test]
+fn alc_nn_chat_prompt_malformed_message_errors() {
+    let (lua, _tmp) = tokenizer_vm();
+    let err = lua
+        .load(r#"alc.nn.chat_prompt("gpt2", { { role = "user" } })"#)
+        .exec()
+        .expect_err("a message without content must error")
+        .to_string();
+    assert!(
+        err.contains("messages[1] is missing 'content'"),
+        "unexpected error: {err}"
+    );
+
+    let err = lua
+        .load(r#"alc.nn.chat_prompt("gpt2", { "just a string" })"#)
+        .exec()
+        .expect_err("a non-table message must error")
+        .to_string();
+    assert!(
+        err.contains("messages[1] must be a table"),
+        "unexpected error: {err}"
+    );
+}
+
+/// An unknown role is refused instead of being passed to the template:
+/// templates branch on the role string, so an unrecognised one usually
+/// falls through every branch and drops the turn from the prompt.
+#[test]
+fn alc_nn_chat_prompt_unknown_role_errors() {
+    let (lua, _tmp) = tokenizer_vm();
+    let err = lua
+        .load(r#"alc.nn.chat_prompt("gpt2", { { role = "random", content = "hi" } })"#)
+        .exec()
+        .expect_err("an unknown role must error")
+        .to_string();
+    assert!(
+        err.contains("'random' is not a chat role") && err.contains("assistant"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Preset resolution is the tokenizer layer's, so an unknown preset
+/// fails the same way `alc.nn.tokenize` does rather than attempting a
+/// hub download.
+#[test]
+fn alc_nn_chat_prompt_unknown_preset_errors() {
+    let (lua, _tmp) = tokenizer_vm();
+    let err = lua
+        .load(r#"alc.nn.chat_prompt("nonsense-preset-xyz", { { role = "user", content = "hi" } })"#)
+        .exec()
+        .expect_err("unknown preset must error")
+        .to_string();
+    assert!(
+        err.contains("alc.nn.chat_prompt") && err.contains("nonsense-preset-xyz"),
         "unexpected error: {err}"
     );
 }

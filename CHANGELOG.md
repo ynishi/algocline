@@ -129,6 +129,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   There is deliberately no schedule primitive: the generation loop
   already lives in Lua, so mid-generation sampler swaps are plain
   Lua control flow (`local s = pos < 20 and greedy or temp`).
+- End-to-end smoke test for the chat generation path
+  (`crates/algocline-engine/tests/nn_bridge_smoke.rs`): `chat_prompt` ->
+  `tokenize` -> `generate_session` -> constrained sampler loop ->
+  `detokenize`, driven from Lua on the tiny CPU fixtures, so a break
+  *between* those hops is caught by a test instead of at first use.
 - `algocline-nn` inference adapters now have a typed contract:
   `arch::adapter::InferenceAdapter` (`meta()` + `forward(tokens,
   index_pos)`), `AdapterMeta` (family / variant / shape parameters /

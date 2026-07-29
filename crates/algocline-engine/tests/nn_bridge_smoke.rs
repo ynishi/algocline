@@ -1344,6 +1344,96 @@ fn alc_nn_json_schema_constraint_builds_and_rejects_bad_schemas() {
     );
 }
 
+// ─── end-to-end chat generation (Sampler plan Step 7) ────────────────
+
+/// The whole chat surface in one pass: `chat_prompt` renders the turns,
+/// `tokenize` turns them into ids, `generate_session` decodes with a
+/// constrained sampler driving the loop, and `detokenize` turns the
+/// drawn ids back into text. Every earlier test covers one hop; this one
+/// exists to catch a break *between* hops (a shape that only two
+/// adjacent layers agree on, an entry point that never got registered on
+/// the same table), which none of them can see.
+///
+/// Nothing is claimed about the text itself. The model is random-init,
+/// so its output carries no meaning — the assertion is that the pipeline
+/// runs to completion and yields a Lua string.
+///
+/// # Fixture pairing
+///
+/// The tokenizer fixture (a 6-entry WordLevel vocabulary) and the model
+/// fixture (`tiny`, a random-init Llama with a 64-token vocabulary) are
+/// unrelated, exactly as a real preset pair would not be. That is
+/// tolerable in both directions here:
+///
+/// - prompt ids land in `0..=5`, well inside the model's vocabulary, so
+///   the prompt needs no clamping to be a legal session input;
+/// - generated ids mostly fall outside the *tokenizer's* vocabulary, and
+///   `decode` drops ids it has no surface form for (documented on
+///   `HfTokenizer::vocab_strings`), so those contribute nothing to the
+///   decoded string rather than failing it.
+///
+/// Making the two fixtures agree would mean shipping a real tokenizer,
+/// which is a download; wiring is what this test is for.
+#[test]
+fn alc_nn_chat_roundtrip_returns_assistant_string() {
+    let (lua, _tmp) = tokenizer_vm();
+    let (text, steps): (String, usize) = lua
+        .load(
+            r#"
+            local preset = "gpt2"
+            local prompt = alc.nn.chat_prompt(preset, {
+                { role = "system", content = "You are terse." },
+                { role = "user", content = "Hi." },
+            })
+            local tokens = alc.nn.tokenize(preset, prompt)
+            assert(#tokens > 0, "the rendered prompt must tokenize to at least one id")
+
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            for i, id in ipairs(tokens) do
+                assert(id < h:vocab(),
+                    "prompt id at " .. i .. " (" .. id .. ") is outside the model vocabulary")
+            end
+
+            local session = h:generate_session(tokens)
+            local s = alc.nn.sampler.constrained(
+                alc.nn.sampler.greedy(),
+                -- Any in-vocabulary id serves as the stop token: greedy
+                -- over random weights gives no guarantee of drawing it,
+                -- so the step budget below is the load-bearing terminator
+                -- and the constraint is here to prove it composes.
+                alc.nn.constraint.stop_tokens({ 0 })
+            )
+
+            -- The tiny variant's context window is 16 positions and the
+            -- prompt already occupies part of it, so the budget is what
+            -- is left rather than a round number: overrunning it is a
+            -- rope/cache error, not a generation that trails off.
+            local budget = h:ctx() - #tokens
+            assert(budget > 0, "the prompt must leave room to generate")
+
+            local generated = {}
+            while not s:is_done() and #generated < budget do
+                local id = s:sample(session:next_logits())
+                session:append(id)
+                generated[#generated + 1] = id
+            end
+            assert(session:position() <= h:ctx(), "the loop ran past the context window")
+
+            return alc.nn.detokenize(preset, generated), #generated
+        "#,
+        )
+        .eval()
+        .expect("chat prompt -> tokenize -> generate -> detokenize");
+
+    // `text` being a String is the claim; its contents are the model's
+    // business and the model is random.
+    let _ = text;
+    assert!(
+        (1..=9).contains(&steps),
+        "the loop must draw at least one token and stop inside the budget, got {steps}"
+    );
+}
+
 /// `kv_heads` and `pretrained` are now part of the shared accessor
 /// surface every handle exposes, so the typed handles answer them too.
 ///

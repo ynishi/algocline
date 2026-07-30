@@ -79,6 +79,14 @@ tempfile = "3"
 # `alc` binary whose alc_run exposes alc.nn.
 nn = ["algocline-engine/nn"]
 
+# CUDA backend for the alc.nn bridge. Propagates through algocline-engine
+# to algocline-nn (which flips candle-core/cuda + candle-nn/cuda +
+# candle-transformers/cuda in lockstep, per the P3 pitfall documented in
+# workspace/tasks/alc-nn-gpu-smoke/runbook.md). Use `cargo install --path
+# . --features nn-cuda` on a CUDA-capable host to install an `alc` binary
+# whose alc.nn.preset.gpt2("...", { device = "cuda" }) actually resolves.
+nn-cuda = ["nn", "algocline-engine/nn-cuda"]
+
 [dev-dependencies]
 insta = { version = "1", features = ["json", "redactions"] }
 libc = { workspace = true }

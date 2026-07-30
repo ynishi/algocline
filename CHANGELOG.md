@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Top-level `nn-cuda` cargo feature that propagates through
+  `algocline-engine` down to `algocline-nn` (which flips
+  `candle-core/cuda` + `candle-nn/cuda` + `candle-transformers/cuda`
+  in lockstep, per the P3 pitfall in
+  `workspace/tasks/alc-nn-gpu-smoke/runbook.md`). Prior builds
+  required `cargo build --features nn-cuda -p algocline-nn -p
+  algocline-engine ...` and `cargo install --path .` still failed
+  because the top crate did not expose the feature; now
+  `cargo install --path . --features nn-cuda` installs an `alc`
+  binary whose `alc.nn.preset.gpt2("...", { device = "cuda" })`
+  resolves without extra flags. Additive — no changes to the `nn`
+  (CPU) feature.
+
 - `alc.nn`: `Gpt2Config::effective_kv_heads(&self)` as the SoT for
   the "custom.kv_heads.unwrap_or(heads)" projection used across
   build / reload / LoRA-wrap paths.

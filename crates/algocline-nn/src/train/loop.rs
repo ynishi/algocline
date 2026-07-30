@@ -19,6 +19,7 @@ use std::sync::{
     Arc,
 };
 
+use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
@@ -73,10 +74,18 @@ impl FtOptimizer {
         }
     }
 
-    fn backward_step(&mut self, loss: &Tensor) -> CandleResult<()> {
+    /// Apply a single optimizer step against a pre-computed
+    /// [`GradStore`]. This is the entry point the multi-micro-batch
+    /// path in [`run_ft_core`] uses to reuse the underlying
+    /// [`Optimizer::step`] once per `grad_accum` micro-batches, after
+    /// [`GradStore::extend`] has summed the per-micro grads. The
+    /// stock [`Optimizer::backward_step`] convenience is not delegated
+    /// because the loop always splits `backward()` and `step()` (even
+    /// for `grad_accum == 1`) so a single code path serves both cases.
+    fn step(&mut self, grads: &GradStore) -> CandleResult<()> {
         match self {
-            Self::Stock(o) => o.backward_step(loss),
-            Self::Mixed(o) => o.backward_step(loss),
+            Self::Stock(o) => o.step(grads),
+            Self::Mixed(o) => o.step(grads),
         }
     }
 }
@@ -95,11 +104,14 @@ pub struct FullFtConfig {
     pub batch_size: usize,
     /// Number of micro-batches summed per optimizer step.
     ///
-    /// Only `grad_accum == 1` is honoured by the MVP loop; higher
-    /// values are recorded on the config for downstream reporting but
-    /// currently trigger a clear error at loop start rather than
-    /// silently degrading. Multi-step accumulation is scheduled for a
-    /// follow-up once the internal `GradStore` API surface is finalised.
+    /// `grad_accum > 1` accumulates gradients across `grad_accum`
+    /// micro-batches before applying a single optimizer update, so the
+    /// effective batch size is `batch_size * grad_accum`. Each
+    /// micro-batch's loss is pre-scaled by `1 / grad_accum` before
+    /// `backward()` so the summed gradient equals the mean over the
+    /// full effective batch (canonical PyTorch form). `grad_accum = 0`
+    /// is refused as a config error; `grad_accum = 1` behaves exactly
+    /// like the single-micro path.
     pub grad_accum: usize,
     /// Total optimizer steps to run.
     pub steps: usize,
@@ -209,8 +221,16 @@ pub enum TrainError {
     /// Checkpoint I/O failure.
     #[error("checkpoint io: {0}")]
     Ckpt(String),
-    /// The caller requested `grad_accum > 1` but the MVP loop does
-    /// not implement it yet.
+    /// Deprecated: previously surfaced when the loop rejected
+    /// `grad_accum > 1`. The training loop now honours multi-step
+    /// accumulation natively, so this variant is unreachable from
+    /// [`run_ft_core`]; kept for one release cycle to avoid breaking
+    /// downstream `match` arms that still enumerate it.
+    #[deprecated(
+        since = "0.47.0",
+        note = "grad_accum > 1 is now supported natively; this variant is retained for one release cycle and is no longer constructed by the training loop"
+    )]
+    #[allow(dead_code)]
     #[error(
         "grad_accum > 1 is not implemented in the MVP loop; \
              please pass grad_accum = 1 or wait for the follow-up"
@@ -219,6 +239,11 @@ pub enum TrainError {
     /// Config asked for zero training steps.
     #[error("`steps` must be at least 1")]
     ZeroSteps,
+    /// Config asked for `grad_accum = 0`, which would divide by zero
+    /// when scaling per-micro losses. Multi-step accumulation is now
+    /// honoured for `grad_accum >= 1`.
+    #[error("`grad_accum` must be at least 1 (got 0)")]
+    ZeroGradAccum,
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
@@ -303,8 +328,8 @@ where
     if cfg.steps == 0 {
         return Err(TrainError::ZeroSteps);
     }
-    if cfg.grad_accum != 1 {
-        return Err(TrainError::GradAccumUnsupported);
+    if cfg.grad_accum == 0 {
+        return Err(TrainError::ZeroGradAccum);
     }
 
     let _lease = lease.acquire().ok_or(TrainError::LeaseHeld)?;
@@ -343,44 +368,88 @@ where
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
 
+    // Nested loop: outer = one optimizer step per iteration; inner =
+    // `cfg.grad_accum` micro-batches whose per-micro losses are scaled
+    // by `1 / grad_accum` and whose grads are summed through
+    // `GradStore::extend` before a single `opt.step`. For
+    // `grad_accum == 1` this collapses to the previous single-micro
+    // path (one backward + one step). `DatasetExhausted::seen` is
+    // reported as the number of *completed* optimizer steps: a mid-
+    // micro exhaustion inside a step counts that step as unfinished so
+    // the reported total matches "how many effective batches actually
+    // updated the parameters".
+    let grad_accum = cfg.grad_accum;
+    let scale = 1.0f64 / grad_accum as f64;
     for step in 0..cfg.steps {
         let lr = scheduler.lr_at(step);
         opt.set_learning_rate(lr);
 
-        let batch = dataset.next_batch()?.ok_or(TrainError::DatasetExhausted {
-            seen: step,
-            requested: cfg.steps,
-        })?;
+        let mut accum: Option<GradStore> = None;
+        let mut micro_loss_sum: f32 = 0.0;
+        for _micro in 0..grad_accum {
+            let batch = dataset.next_batch()?.ok_or(TrainError::DatasetExhausted {
+                seen: step,
+                requested: cfg.steps,
+            })?;
 
-        let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
-        let logits = model.forward(&inputs)?;
-        // Mixed precision: the loss (log_softmax + NLL reduction) is
-        // always scored in F32 — BF16's 8 mantissa bits are too coarse
-        // for a mean over thousands of log-probs. `to_dtype` is
-        // differentiable, so the backward pass crosses back into the
-        // model's dtype at this boundary. F32 logits pass through
-        // untouched.
-        let logits = if logits.dtype() == DType::F32 {
-            logits
-        } else {
-            logits.to_dtype(DType::F32)?
-        };
-        let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
+            let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
+            let logits = model.forward(&inputs)?;
+            // Mixed precision: the loss (log_softmax + NLL reduction)
+            // is always scored in F32 — BF16's 8 mantissa bits are too
+            // coarse for a mean over thousands of log-probs.
+            // `to_dtype` is differentiable, so the backward pass
+            // crosses back into the model's dtype at this boundary.
+            // F32 logits pass through untouched.
+            let logits = if logits.dtype() == DType::F32 {
+                logits
+            } else {
+                logits.to_dtype(DType::F32)?
+            };
+            let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
 
-        let loss_val: f32 = loss.to_scalar()?;
-        last_train_loss = loss_val;
-        if loss_val < running_min_loss {
-            running_min_loss = loss_val;
+            let loss_val: f32 = loss.to_scalar()?;
+            micro_loss_sum += loss_val;
+
+            // Pre-backward `1 / grad_accum` scaling — the canonical
+            // form. Scalar multiplication is linear w.r.t. the backward
+            // pass, so `sum_i grad(loss_i / N) == grad(mean_i loss_i)`
+            // and the reported grad equals the mean over the effective
+            // batch. For `grad_accum == 1` this reduces to `scale = 1`
+            // and the multiply is a no-op numerically.
+            let scaled = (&loss * scale)?;
+            let grads = scaled.backward()?;
+            match accum.as_mut() {
+                Some(store) => store.extend(grads)?,
+                None => accum = Some(grads),
+            }
+        }
+        // `accum` is always `Some` here because `grad_accum >= 1` is
+        // enforced above and the inner loop runs at least once — a
+        // mid-micro dataset exhaustion returns early via `?` above.
+        let grads = accum.expect("grad_accum >= 1 guarantees at least one backward");
+
+        let mean_loss = micro_loss_sum / grad_accum as f32;
+        last_train_loss = mean_loss;
+        if mean_loss < running_min_loss {
+            running_min_loss = mean_loss;
         }
 
         // Per-step observability. Emit through `tracing` so downstream
         // subscribers (RUST_LOG=algocline_nn=info) can collect the loss
-        // trajectory without changing the return shape. The training
-        // loop itself stays a closed function: this line is the only
-        // window a caller has into intermediate loss values.
-        tracing::info!(step = step, loss = loss_val, lr = lr, "train_step");
+        // trajectory without changing the return shape. `loss` is the
+        // mean per-micro loss (matches the equivalent single-micro
+        // `batch_size * grad_accum` run) and `grad_accum` is emitted as
+        // an additive field so post-hoc analysis can distinguish
+        // accumulated steps from raw single-micro ones.
+        tracing::info!(
+            step = step,
+            loss = mean_loss,
+            lr = lr,
+            grad_accum = grad_accum,
+            "train_step"
+        );
 
-        opt.backward_step(&loss)?;
+        opt.step(&grads)?;
 
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
             ckpt_store
@@ -735,20 +804,25 @@ mod tests {
     }
 
     #[test]
-    fn grad_accum_gt_one_errors_up_front() {
+    fn zero_grad_accum_errors_up_front() {
+        // `grad_accum = 0` would divide by zero when computing the
+        // pre-backward `1 / N` scale, so it is refused at loop entry
+        // rather than allowed to produce NaN grads. Multi-step
+        // accumulation (`grad_accum > 1`) is now honoured natively and
+        // has its own equivalence test in the integration suite.
         let (_, vm, model) = tiny_cfg_and_model();
         let mut ds = overfit_dataset();
         let loss = CrossEntropyLoss::new();
         let cfg = FullFtConfig {
-            grad_accum: 4,
+            grad_accum: 0,
             steps: 5,
             ..FullFtConfig::default()
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
         let err =
-            run_full_ft(&model, &vm, &mut ds, &cfg, &loss, tmp.path(), "g", lease).unwrap_err();
-        assert!(matches!(err, TrainError::GradAccumUnsupported));
+            run_full_ft(&model, &vm, &mut ds, &cfg, &loss, tmp.path(), "z", lease).unwrap_err();
+        assert!(matches!(err, TrainError::ZeroGradAccum));
     }
 
     #[test]

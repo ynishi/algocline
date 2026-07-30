@@ -62,8 +62,12 @@ fn synthetic_corpus(rows: usize) -> Vec<Vec<u32>> {
 }
 
 fn dataset_opts_for_seq(ctx_len: usize) -> DatasetOpts {
+    dataset_opts_for_seq_batched(ctx_len, 1)
+}
+
+fn dataset_opts_for_seq_batched(ctx_len: usize, batch_size: usize) -> DatasetOpts {
     DatasetOpts {
-        batch_size: 1,
+        batch_size,
         ctx_len,
         shuffle: false,
         pad_id: 0,
@@ -397,4 +401,221 @@ fn concurrency_lease_prevents_double_training() {
     // No terminal bundle should have been written because the run
     // never started.
     assert!(!tmp.path().join("second.safetensors").exists());
+}
+
+/// `grad_accum > 1` must be numerically equivalent to a single-micro run
+/// with `batch_size * grad_accum` samples. The corpus is deterministic
+/// (`synthetic_corpus` repeats a single 8-token row and `shuffle=false`
+/// in `DatasetOpts`), so both runs consume identical token content —
+/// the only difference is whether the loop batches once or accumulates
+/// over `N` micro-batches. `CrossEntropyLoss` uses mean reduction, so on
+/// identical rows the mean-of-per-micro losses equals the per-batch
+/// loss, and the pre-backward `1/N` scaling makes the summed gradient
+/// equal to the mean gradient. The remaining drift is BF16 rounding and
+/// scalar-multiply ordering — ~15-20% relative tolerance is generous
+/// enough to absorb both without hiding a real regression.
+#[test]
+fn grad_accum_matches_equivalent_batch() {
+    let steps = 40usize;
+
+    // Path A: single-micro path with batch_size = 4.
+    let min_loss_a = {
+        let (_cfg, vm, model) = tiny_model();
+        let corpus = synthetic_corpus(steps * 4 + 8);
+        let mut dataset = TokenizedDataset::new(corpus, dataset_opts_for_seq_batched(8, 4));
+        let loss = CrossEntropyLoss::new();
+        let ft_cfg = FullFtConfig {
+            lr: 8e-3,
+            batch_size: 4,
+            grad_accum: 1,
+            steps,
+            warmup: 2,
+            schedule: ScheduleKind::CosineWithWarmup,
+            weight_decay: 0.0,
+            ckpt_every: 0,
+            ckpt_keep: 1,
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut dataset,
+            &ft_cfg,
+            &loss,
+            tmp.path(),
+            "ga_ref",
+            lease,
+        )
+        .expect("single-micro training must complete");
+        *ckpt
+            .metrics
+            .get("min_train_loss")
+            .expect("min_train_loss must be recorded")
+    };
+
+    // Path B: grad_accum = 4 with batch_size = 1.
+    let min_loss_b = {
+        let (_cfg, vm, model) = tiny_model();
+        let corpus = synthetic_corpus(steps * 4 + 8);
+        let mut dataset = TokenizedDataset::new(corpus, dataset_opts_for_seq_batched(8, 1));
+        let loss = CrossEntropyLoss::new();
+        let ft_cfg = FullFtConfig {
+            lr: 8e-3,
+            batch_size: 1,
+            grad_accum: 4,
+            steps,
+            warmup: 2,
+            schedule: ScheduleKind::CosineWithWarmup,
+            weight_decay: 0.0,
+            ckpt_every: 0,
+            ckpt_keep: 1,
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut dataset,
+            &ft_cfg,
+            &loss,
+            tmp.path(),
+            "ga_accum",
+            lease,
+        )
+        .expect("grad_accum=4 training must complete");
+        *ckpt
+            .metrics
+            .get("min_train_loss")
+            .expect("min_train_loss must be recorded")
+    };
+
+    let rel = (min_loss_a - min_loss_b).abs() / min_loss_a.abs().max(1e-6);
+    assert!(
+        rel < 0.20,
+        "expected grad_accum=4 to match single-micro path within 20% \
+         relative tolerance; got min_loss_a={min_loss_a}, \
+         min_loss_b={min_loss_b}, rel={rel}"
+    );
+}
+
+/// End-to-end sanity check: `grad_accum = 4` on its own must reduce the
+/// training loss materially below the baseline forward-pass loss. This
+/// is the same shape as `synthetic_run_reduces_loss_and_saves_final_bundle`
+/// but drives the multi-micro path.
+#[test]
+fn grad_accum_gt_one_reduces_loss() {
+    let (_cfg, vm, model) = tiny_model();
+    let corpus = synthetic_corpus(800);
+    let baseline = baseline_loss(&model, &corpus[0]);
+    let mut dataset = TokenizedDataset::new(corpus, dataset_opts_for_seq_batched(8, 1));
+    let loss = CrossEntropyLoss::new();
+
+    let ft_cfg = FullFtConfig {
+        lr: 8e-3,
+        batch_size: 1,
+        grad_accum: 4,
+        steps: 60,
+        warmup: 2,
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+
+    let ckpt = run_full_ft(
+        &model,
+        &vm,
+        &mut dataset,
+        &ft_cfg,
+        &loss,
+        tmp.path(),
+        "ga_solo",
+        lease,
+    )
+    .expect("grad_accum training must complete");
+
+    let min_loss = *ckpt
+        .metrics
+        .get("min_train_loss")
+        .expect("min_train_loss must be recorded");
+    assert!(
+        min_loss < baseline * 0.75,
+        "expected grad_accum=4 training to drive loss under 0.75 * baseline; \
+         got min_train_loss={min_loss}, baseline={baseline}"
+    );
+    assert!(ckpt.train_loss.is_finite());
+}
+
+/// BF16 variant of the multi-micro sanity check. Combines
+/// `MixedAdamW`'s FP32-master update with `GradStore::extend`-based
+/// gradient accumulation to fence the drift path where BF16 grads are
+/// summed N times per optimizer step. Same shape and threshold as
+/// `bf16_synthetic_run_reduces_loss_through_mixed_adamw`.
+#[test]
+fn bf16_grad_accum_synthetic_run_reduces_loss_through_mixed_adamw() {
+    let device = Device::Cpu;
+    let vocab = 24usize;
+    let vm = VarMap::new();
+    let vb = VarBuilder::from_varmap(&vm, DType::BF16, &device);
+    let bias = vb
+        .get_with_hints(vocab, "bias", candle_nn::Init::Const(0.0))
+        .expect("register bf16 bias");
+    let model = UnigramModel {
+        bias,
+        vocab,
+        device: device.clone(),
+    };
+
+    let baseline = (vocab as f32).ln();
+
+    let mut dataset =
+        TokenizedDataset::new(synthetic_corpus(800), dataset_opts_for_seq_batched(8, 1));
+    let loss = CrossEntropyLoss::new();
+    let ft_cfg = FullFtConfig {
+        lr: 5e-2,
+        batch_size: 1,
+        grad_accum: 2,
+        steps: 150,
+        warmup: 5,
+        schedule: ScheduleKind::CosineWithWarmup,
+        weight_decay: 0.0,
+        ckpt_every: 0,
+        ckpt_keep: 1,
+    };
+    let tmp = TempDir::new().unwrap();
+    let lease = Arc::new(TrainingLease::new());
+
+    let ckpt = run_full_ft(
+        &model,
+        &vm,
+        &mut dataset,
+        &ft_cfg,
+        &loss,
+        tmp.path(),
+        "bf16_ga",
+        lease,
+    )
+    .expect("bf16 grad_accum training must complete");
+
+    let min_loss = *ckpt
+        .metrics
+        .get("min_train_loss")
+        .expect("min_train_loss must be recorded");
+    assert!(
+        min_loss < baseline * 0.8,
+        "expected bf16 grad_accum=2 training to drive loss under 0.8 * ln(vocab); \
+         got min_train_loss={min_loss}, baseline={baseline}"
+    );
+
+    // Parameters stayed BF16 across the accumulated updates.
+    for var in vm.all_vars() {
+        assert_eq!(
+            var.dtype(),
+            DType::BF16,
+            "var drifted off bf16 under grad_accum"
+        );
+    }
 }

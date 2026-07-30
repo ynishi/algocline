@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `alc.nn` trainer: `grad_accum > 1` is now honoured natively across
+  Full FT / LoRA / Distill. The loop scales each micro-batch loss by
+  `1 / grad_accum` before `backward()` and merges per-micro grads
+  through `GradStore::extend`, then applies a single `optimizer.step`
+  per `grad_accum` micro-batches — so the effective batch size is
+  `batch_size * grad_accum`. Previous behaviour surfaced a loud
+  `TrainError::GradAccumUnsupported` for any `grad_accum != 1`. The
+  default remains `grad_accum = 1` (single-micro path, bit-identical
+  to the pre-change loop for that case), so this is non-breaking for
+  existing callers. `grad_accum = 0` is now refused up front with a
+  new `TrainError::ZeroGradAccum`; the `GradAccumUnsupported` variant
+  is retained (with `#[deprecated(since = "0.47.0", ...)]`) for one
+  release cycle to avoid breaking downstream `match` arms.
+
 ### Added
 
 - Top-level `nn-cuda` cargo feature that propagates through

@@ -52,10 +52,14 @@
 //!    distill}`) accepts, reached through the shared
 //!    [`super::nn_opts::extract_run_train_cfg`]. A missing key keeps
 //!    the [`algocline_nn::train::FullFtConfig`] crate default and no
-//!    surface-specific validation is layered on top, so `grad_accum >
-//!    1` surfaces as a loud
-//!    [`algocline_nn::train::TrainError::GradAccumUnsupported`] from
-//!    the training loop rather than being refused here.
+//!    surface-specific validation is layered on top. `grad_accum > 1`
+//!    is honoured natively by [`algocline_nn::train::run_full_ft`] /
+//!    `run_lora_ft` / `run_distill`: `N` micro-batches are summed via
+//!    `GradStore::extend` (with a canonical `1 / N` pre-backward loss
+//!    scale) and a single optimizer step is applied per effective
+//!    batch of `batch * grad_accum` rows. Only `grad_accum = 0` is
+//!    refused up front with
+//!    [`algocline_nn::train::TrainError::ZeroGradAccum`].
 //! 5. [`TrainingLease`] — a fresh
 //!    `Arc::new(TrainingLease::new())` is constructed per-call. This
 //!    is a documented limitation: `run_lora_ft` does NOT share a

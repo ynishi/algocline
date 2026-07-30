@@ -1111,11 +1111,15 @@ table:
   derive `lora_card_id`. Defaults to `"run_lora_ft"` when absent
   or empty.
 
+`grad_accum` is accepted as a pass-through override on the shared
+train-config schema — passing `grad_accum = N` (N >= 1) makes the
+loop sum gradients over `N` micro-batches before each optimizer
+step, so the effective batch size is `batch * grad_accum`. `N = 0`
+is refused up front with `TrainError::ZeroGradAccum`.
+
 Not exposed (pinned to `FullFtConfig::default()` values):
-`grad_accum_steps = 1` (multi-step accumulation returns
-`GradAccumUnsupported` today), `ckpt_every = 0` (rotating
-checkpoint is out of scope for the Lua bridge — the Δ safetensors
-is always written once at end-of-run).
+`ckpt_every = 0` (rotating checkpoint is out of scope for the Lua
+bridge — the Δ safetensors is always written once at end-of-run).
 
 The Δ safetensors is written to
 `<nn_dir>/nn/lora-<lora_card_id>.safetensors` (the Rust surface

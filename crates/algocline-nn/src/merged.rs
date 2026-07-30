@@ -97,6 +97,9 @@ impl MergedProvenance {
     /// - `NnCandleBranch.bundle_ref` ← `self.bundle_ref`
     /// - `NnCandleBranch.lora` ← `None` (merged card no longer needs a wrap
     ///   block)
+    /// - `NnCandleBranch.custom` ← `None` (the merge path only accepts
+    ///   reference-architecture bases; a custom config is refused by
+    ///   `export_merged`)
     /// - `hyperparams` / `metrics` ← empty JSON objects (SoT remains on the
     ///   referenced LoRA card)
     pub fn to_card_meta(&self, name: String) -> NnCardMeta {
@@ -117,6 +120,7 @@ impl MergedProvenance {
                 device: None,
                 dtype: None,
                 lora: None,
+                custom: None,
             }),
         }
     }

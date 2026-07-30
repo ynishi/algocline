@@ -73,6 +73,7 @@ mod tests {
             TrainingPath::FullFt,
             &ckpt,
             &FullFtConfig::default(),
+            None,
         )
         .expect("test card")
     }

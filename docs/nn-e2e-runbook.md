@@ -195,7 +195,7 @@ consumes (KL soft targets are deferred).
 | 8 | `card_meta_shape` | `training_path="distillation"`, `hyperparams.loss_kind="ce"`, `bundle_ref="nn/<card_id>"` |
 | 9 | `loss_descended` | Final loss < 10.5 (baseline ln 50257 ≈ 10.825) |
 | 10 | `ckpt_file_exists` | Full student weights at `<nn_dir>/<card_id>.safetensors` (~13 MB) |
-| 11 | `custom_load_handle_contract` | `load_handle` on a `gpt2-custom` card is refused today (no `from_variant` config for custom shapes) — pinned so a behavior change surfaces here |
+| 11 | `custom_load_handle_roundtrip` | `load_handle` rebuilds the custom config from `metadata.nn.candle.custom` and reloads the trained weights standalone (shape accessors + one greedy token verified) |
 | 12 | `mask_boundary_guard` | `from_card` loudly refuses a row whose prompt exhausts `ctx_len` (FullyMaskedRow protection) |
 | 13 | `strict_validation_prefixes` | `run_distill` refuses missing `lr` / `loss_kind = "kl"` / `schedule = "linear"`, each with the `alc.nn.trainer.run_distill` prefix |
 
@@ -212,9 +212,11 @@ Distill-specific notes:
 - `run_distill` shares the strict `run_*` opts family: `batch` (not
   `batch_size`), `"CosineWithWarmup"` / `"Constant"` schedule
   vocabulary, `loss_kind` accepts only `"ce"`.
-- A `gpt2-custom` distill Card cannot be reloaded via `load_handle`
-  (Phase 11). If you need the train → Card → reload loop today, use
-  a named variant (tiny for toy vocab, medium for real gpt2 ids).
+- Custom cards record their shape under `metadata.nn.candle.custom`,
+  so `load_handle` reloads them standalone (Phase 11). Cards trained
+  by a build that predates this metadata are still refused with a
+  directional error; custom+MoE cards are refused until an MoE
+  reload path lands.
 
 ## Cleanup
 

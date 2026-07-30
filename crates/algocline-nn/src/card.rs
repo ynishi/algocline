@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
+use crate::arch::{Gpt2Config, Gpt2Custom, MoeConfig};
 use crate::train::{Checkpoint, FullFtConfig};
 
 /// Content of `[metadata.nn]`.
@@ -120,6 +121,114 @@ pub struct NnCandleBranch {
     /// foundation leaves this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lora: Option<NnLoraBranch>,
+
+    /// Custom-architecture branch — present only for cards trained
+    /// from a `Gpt2Config` that set `custom`. Absent (the common case)
+    /// means the bundle carries the GPT-2 reference architecture and
+    /// the load path can rebuild the config from the architecture
+    /// preset alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<NnCustomBranch>,
+}
+
+/// Content of `[metadata.nn.candle.custom]`.
+///
+/// A preset id such as `"gpt2-custom"` does not pin a shape, so
+/// custom-variant cards record their full shape here: the config
+/// scalars (`vocab` / `ctx` / `layers` / `heads` / `dim`) plus the
+/// [`Gpt2Custom`] spec and the optional MoE block. This is what lets
+/// `load_handle` rebuild the exact `Gpt2Config` the run was trained
+/// with — without it the safetensors bundle's Var set (which depends
+/// on `spec.act` / `spec.pos` / `spec.untied_head` / ...) could not be
+/// matched by any config the loader guesses.
+///
+/// The `dtype` / `device` the weights are read back at stay on the
+/// parent [`NnCandleBranch`]; they are load-time choices, not part of
+/// the trained shape.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NnCustomBranch {
+    /// Vocabulary size the `wte` / LM head were trained at.
+    pub vocab: usize,
+
+    /// Maximum context length (also the `wpe` size when
+    /// `spec.pos == PosKind::Learned`).
+    pub ctx: usize,
+
+    /// Number of transformer blocks.
+    pub layers: usize,
+
+    /// Number of attention heads.
+    pub heads: usize,
+
+    /// Model hidden size.
+    pub dim: usize,
+
+    /// Architecture customization spec (activation / norm kind +
+    /// placement / residual topology / MLP ratio / position / GQA /
+    /// sliding window / untied head).
+    #[serde(default)]
+    pub spec: Gpt2Custom,
+
+    /// Dense-MoE block, when the run combined `custom` with MoE.
+    /// Absent means the stock (possibly customized) dense MLP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<NnMoeBranch>,
+}
+
+impl NnCustomBranch {
+    /// Project a trained [`Gpt2Config`] onto the Card branch, or
+    /// `None` when the config is the GPT-2 reference architecture
+    /// (`custom: None`).
+    ///
+    /// `None` is what keeps a stock preset's metadata from growing a
+    /// shape block it does not need: `architecture` (e.g.
+    /// `"gpt2-medium"`) already pins the shape for those, and the load
+    /// path rebuilds them through [`Gpt2Config::from_variant`].
+    ///
+    /// `eps` is deliberately not recorded — it is not reachable from
+    /// the Lua `custom` opts table, so every custom config carries the
+    /// [`Gpt2Config::tiny`] default and the load path can restate it.
+    /// `dtype` / `device` are load-time choices and live on
+    /// [`NnCandleBranch`] instead.
+    pub fn from_gpt2_config(cfg: &Gpt2Config) -> Option<Self> {
+        let spec = cfg.custom.as_ref()?;
+        Some(Self {
+            vocab: cfg.vocab,
+            ctx: cfg.ctx,
+            layers: cfg.layers,
+            heads: cfg.heads,
+            dim: cfg.dim,
+            spec: spec.clone(),
+            moe: cfg.moe.as_ref().map(NnMoeBranch::from),
+        })
+    }
+}
+
+/// Content of `[metadata.nn.candle.custom.moe]` — the projection of
+/// [`crate::arch::MoeConfig`] onto the Card.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NnMoeBranch {
+    /// Number of experts per block.
+    pub n_experts: usize,
+
+    /// Number of experts a token's output is mixed from.
+    pub top_k: usize,
+
+    /// Load-balancing loss coefficient.
+    pub alpha: f64,
+}
+
+impl From<&MoeConfig> for NnMoeBranch {
+    /// Records every [`MoeConfig`] field: the three are the whole
+    /// config, so a Card that carries this branch describes the MoE
+    /// block completely.
+    fn from(cfg: &MoeConfig) -> Self {
+        Self {
+            n_experts: cfg.n_experts,
+            top_k: cfg.top_k,
+            alpha: cfg.alpha,
+        }
+    }
 }
 
 /// Content of `[metadata.nn.candle.lora]`.
@@ -494,6 +603,10 @@ impl NnModelCard {
     /// id as the checkpoint filename stem *before* the run finishes —
     /// the id must exist first so `<ckpt_dir>/<id>.safetensors` and
     /// the Card stay 1:1.
+    ///
+    /// `custom` records the architecture shape for runs whose config
+    /// set `Gpt2Config::custom`; pass `None` for reference-architecture
+    /// runs, whose shape is already implied by `architecture`.
     pub fn from_training(
         id: CardId,
         name: &str,
@@ -501,6 +614,7 @@ impl NnModelCard {
         path: TrainingPath,
         ckpt: &Checkpoint,
         cfg: &FullFtConfig,
+        custom: Option<NnCustomBranch>,
     ) -> Result<Self, String> {
         let training_path = path.as_str().to_string();
         let (lora, loss_kind) = match path {
@@ -527,6 +641,7 @@ impl NnModelCard {
             device: None,
             dtype: None,
             lora,
+            custom,
         };
 
         let meta = NnCardMeta {
@@ -590,6 +705,7 @@ mod tests {
                 device: Some("cuda:0".into()),
                 dtype: Some("bf16".into()),
                 lora: None,
+                custom: None,
             }),
         };
 
@@ -632,6 +748,7 @@ mod tests {
                         "/var/algocline/nn/ckpt/nn/lora-student-lora.safetensors".into(),
                     ),
                 }),
+                custom: None,
             }),
         };
 
@@ -712,6 +829,7 @@ mod tests {
                 device: None,
                 dtype: None,
                 lora: None,
+                custom: None,
             }),
         };
         let json = serde_json::to_value(&meta).expect("serialize");
@@ -720,6 +838,236 @@ mod tests {
             candle.get("lora").is_none(),
             "lora must be omitted (skip_serializing_if), got: {candle}"
         );
+        assert!(
+            candle.get("custom").is_none(),
+            "custom must be omitted (skip_serializing_if), got: {candle}"
+        );
+    }
+
+    fn sample_custom_branch() -> NnCustomBranch {
+        NnCustomBranch {
+            vocab: 64,
+            ctx: 16,
+            layers: 2,
+            heads: 4,
+            dim: 32,
+            spec: Gpt2Custom {
+                act: crate::arch::Activation::SwiGlu,
+                norm: crate::arch::NormKind::RmsNorm,
+                residual: crate::arch::ResidualKind::Parallel,
+                mlp_ratio: 3,
+                placement: crate::arch::NormPlacement::PreLn,
+                pos: crate::arch::PosKind::Rope,
+                kv_heads: Some(1),
+                window: Some(4),
+                untied_head: true,
+            },
+            moe: Some(NnMoeBranch {
+                n_experts: 4,
+                top_k: 2,
+                alpha: 0.01,
+            }),
+        }
+    }
+
+    /// A custom-variant card records its full shape so `load_handle`
+    /// can rebuild the identical `Gpt2Config`; the whole branch must
+    /// survive a JSON round-trip verbatim, non-default axes included.
+    #[test]
+    fn custom_branch_roundtrips_with_non_default_axes() {
+        let meta = NnCardMeta {
+            name: "gpt2-custom-run".into(),
+            backend: "candle".into(),
+            task: None,
+            architecture: "gpt2-custom".into(),
+            training_path: "full_ft".into(),
+            lineage: NnLineage::default(),
+            hyperparams: empty_object(),
+            metrics: empty_object(),
+            candle: Some(NnCandleBranch {
+                bundle_ref: "nn/gpt2-custom-run".into(),
+                device: None,
+                dtype: None,
+                lora: None,
+                custom: Some(sample_custom_branch()),
+            }),
+        };
+
+        let json = serde_json::to_value(&meta).expect("serialize");
+        let custom = json
+            .get("candle")
+            .and_then(|c| c.get("custom"))
+            .expect("custom sub-object present");
+        assert_eq!(custom.get("vocab"), Some(&serde_json::json!(64)));
+        assert_eq!(custom.get("ctx"), Some(&serde_json::json!(16)));
+        assert_eq!(custom.get("layers"), Some(&serde_json::json!(2)));
+        assert_eq!(custom.get("heads"), Some(&serde_json::json!(4)));
+        assert_eq!(custom.get("dim"), Some(&serde_json::json!(32)));
+        // Spec axes use the Lua-facing vocabulary.
+        let spec = custom.get("spec").expect("spec sub-object");
+        assert_eq!(spec.get("act"), Some(&serde_json::json!("swiglu")));
+        assert_eq!(spec.get("norm"), Some(&serde_json::json!("rmsnorm")));
+        assert_eq!(spec.get("residual"), Some(&serde_json::json!("parallel")));
+        assert_eq!(spec.get("placement"), Some(&serde_json::json!("preln")));
+        assert_eq!(spec.get("pos"), Some(&serde_json::json!("rope")));
+        assert_eq!(spec.get("mlp_ratio"), Some(&serde_json::json!(3)));
+        assert_eq!(spec.get("kv_heads"), Some(&serde_json::json!(1)));
+        assert_eq!(spec.get("window"), Some(&serde_json::json!(4)));
+        assert_eq!(spec.get("untied_head"), Some(&serde_json::json!(true)));
+        let moe = custom.get("moe").expect("moe sub-object");
+        assert_eq!(moe.get("n_experts"), Some(&serde_json::json!(4)));
+        assert_eq!(moe.get("top_k"), Some(&serde_json::json!(2)));
+
+        let back: NnCardMeta = serde_json::from_value(json.clone()).expect("deserialize");
+        let branch = back
+            .candle
+            .as_ref()
+            .and_then(|c| c.custom.as_ref())
+            .expect("custom branch present");
+        assert_eq!(branch.vocab, 64);
+        assert_eq!(branch.spec.act, crate::arch::Activation::SwiGlu);
+        assert_eq!(branch.spec.pos, crate::arch::PosKind::Rope);
+        assert_eq!(branch.spec.kv_heads, Some(1));
+        assert!(branch.spec.untied_head);
+        assert_eq!(branch.moe.as_ref().map(|m| m.top_k), Some(2));
+        assert_eq!(serde_json::to_value(&back).expect("re-serialize"), json);
+    }
+
+    /// A card written before the custom branch existed has no
+    /// `candle.custom` key; it must still deserialize, with the branch
+    /// absent (meaning "reference architecture").
+    #[test]
+    fn deserialize_backwards_compat_candle_without_custom() {
+        let legacy = serde_json::json!({
+            "name": "legacy-full-ft",
+            "backend": "candle",
+            "architecture": "gpt2-medium",
+            "training_path": "full_ft",
+            "candle": {
+                "bundle_ref": "nn/legacy-full-ft",
+                "dtype": "bf16",
+            }
+        });
+        let meta: NnCardMeta = serde_json::from_value(legacy).expect("legacy card deserialize");
+        let candle = meta.candle.as_ref().expect("candle branch present");
+        assert_eq!(candle.bundle_ref, "nn/legacy-full-ft");
+        assert_eq!(candle.dtype.as_deref(), Some("bf16"));
+        assert!(
+            candle.custom.is_none(),
+            "custom defaults to None for pre-custom cards"
+        );
+    }
+
+    /// A custom spec table that only names one axis must fill the rest
+    /// from the reference, so a hand-authored (or older) card is not
+    /// rejected for omitting axes.
+    #[test]
+    fn deserialize_custom_branch_with_partial_spec() {
+        let partial = serde_json::json!({
+            "name": "partial-custom",
+            "backend": "candle",
+            "architecture": "gpt2-custom",
+            "training_path": "full_ft",
+            "candle": {
+                "bundle_ref": "nn/partial-custom",
+                "custom": {
+                    "vocab": 64,
+                    "ctx": 16,
+                    "layers": 2,
+                    "heads": 2,
+                    "dim": 32,
+                    "spec": { "norm": "rmsnorm" }
+                }
+            }
+        });
+        let meta: NnCardMeta = serde_json::from_value(partial).expect("partial custom deserialize");
+        let branch = meta
+            .candle
+            .as_ref()
+            .and_then(|c| c.custom.as_ref())
+            .expect("custom branch present");
+        assert_eq!(branch.spec.norm, crate::arch::NormKind::RmsNorm);
+        assert_eq!(branch.spec.act, crate::arch::Activation::Gelu);
+        assert_eq!(branch.spec.pos, crate::arch::PosKind::Learned);
+        assert_eq!(branch.spec.kv_heads, None);
+        assert!(!branch.spec.untied_head);
+        assert!(branch.moe.is_none());
+    }
+
+    /// The `Gpt2Config` -> Card projection must copy the five shape
+    /// scalars and the spec verbatim, and fold `moe` through
+    /// `NnMoeBranch::from` — the load path rebuilds the config from
+    /// exactly these values, so a dropped field is a silently
+    /// different model on reload.
+    #[test]
+    fn custom_branch_from_gpt2_config_projects_shape_and_moe() {
+        let spec = Gpt2Custom {
+            act: crate::arch::Activation::Gelu,
+            norm: crate::arch::NormKind::RmsNorm,
+            pos: crate::arch::PosKind::Rope,
+            kv_heads: Some(2),
+            untied_head: true,
+            ..Gpt2Custom::default()
+        };
+        let cfg = Gpt2Config {
+            layers: 3,
+            heads: 4,
+            dim: 64,
+            ctx: 32,
+            vocab: 96,
+            custom: Some(spec.clone()),
+            moe: Some(MoeConfig {
+                n_experts: 4,
+                top_k: 2,
+                alpha: 0.01,
+            }),
+            ..Gpt2Config::tiny()
+        };
+        let branch = NnCustomBranch::from_gpt2_config(&cfg).expect("custom config projects");
+        assert_eq!(branch.layers, 3);
+        assert_eq!(branch.heads, 4);
+        assert_eq!(branch.dim, 64);
+        assert_eq!(branch.ctx, 32);
+        assert_eq!(branch.vocab, 96);
+        assert_eq!(
+            serde_json::to_value(&branch.spec).expect("spec json"),
+            serde_json::to_value(&spec).expect("spec json")
+        );
+        let moe = branch.moe.expect("moe branch");
+        assert_eq!(moe.n_experts, 4);
+        assert_eq!(moe.top_k, 2);
+        assert_eq!(moe.alpha, 0.01);
+    }
+
+    /// A reference-architecture config must project to `None` so stock
+    /// presets keep a lean `candle` branch (`architecture` alone pins
+    /// their shape).
+    #[test]
+    fn custom_branch_from_gpt2_config_is_none_for_reference_config() {
+        assert!(NnCustomBranch::from_gpt2_config(&Gpt2Config::tiny()).is_none());
+        assert!(NnCustomBranch::from_gpt2_config(&Gpt2Config::medium()).is_none());
+    }
+
+    #[test]
+    fn from_training_carries_custom_branch() {
+        let card = NnModelCard::from_training(
+            CardId::mint("custom-run"),
+            "custom-run",
+            "gpt2-custom".into(),
+            TrainingPath::FullFt,
+            &test_ckpt(),
+            &FullFtConfig::default(),
+            Some(sample_custom_branch()),
+        )
+        .expect("from_training");
+        let branch = card
+            .meta()
+            .candle
+            .as_ref()
+            .and_then(|c| c.custom.as_ref())
+            .expect("custom branch");
+        assert_eq!(branch.dim, 32);
+        assert_eq!(branch.spec.act, crate::arch::Activation::SwiGlu);
     }
 
     #[test]
@@ -830,6 +1178,7 @@ mod tests {
             TrainingPath::FullFt,
             &test_ckpt(),
             &FullFtConfig::default(),
+            None,
         )
         .expect("from_training");
 
@@ -859,6 +1208,7 @@ mod tests {
             },
             &test_ckpt(),
             &FullFtConfig::default(),
+            None,
         )
         .expect("from_training");
         assert_eq!(card.meta().training_path, "distillation");
@@ -885,6 +1235,7 @@ mod tests {
             TrainingPath::Lora(branch),
             &test_ckpt(),
             &FullFtConfig::default(),
+            None,
         )
         .expect("from_training");
         assert_eq!(card.meta().training_path, "lora");
@@ -914,6 +1265,7 @@ mod tests {
                 device: None,
                 dtype: None,
                 lora: None,
+                custom: None,
             }),
         };
         let err = NnModelCard::new(id, meta).expect_err("mismatch must be rejected");
@@ -960,6 +1312,7 @@ mod tests {
                 device: None,
                 dtype: None,
                 lora: None,
+                custom: None,
             }),
         };
         let card = NnModelCard::from_merge(id, "user-name".into(), meta).expect("from_merge");

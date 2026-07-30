@@ -741,9 +741,14 @@ reference (`algocline_nn::arch::Gpt2Custom`, nn arch Phase 3). The
 base shape is the `tiny` preset (2 layers / 2 heads / dim 32 / ctx 16
 / vocab 64); shape keys override it. Custom models are **random-init
 only** — `pretrained = false` is required (the default `true` is
-rejected with a directional error), and cards saved from a custom
-training run cannot be re-loaded through the pretrained loaders
-(same guard family as MoE).
+rejected with a directional error), and the HF-hub pretrained loader
+still refuses custom configs (hub bundles carry the reference
+layout). Cards saved from a custom **training** run record their
+full shape under `metadata.nn.candle.custom`, so
+`alc.nn.card.load_handle(card_id)` reloads them standalone; cards
+written before this metadata existed are refused with a directional
+error, and custom+MoE cards are refused until an MoE reload path
+lands.
 
 **opts (all optional except `pretrained = false`):**
 

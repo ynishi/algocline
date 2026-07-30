@@ -525,6 +525,114 @@ fn alc_nn_run_full_ft_card_load_handle_roundtrip() {
     .expect("run_full_ft -> card.load_handle round-trip");
 }
 
+/// Same cross-module seam as the round-trip above, on a `custom`
+/// architecture. This is the only place the whole save/load contract
+/// for a customized shape runs end to end:
+///
+/// - the trainer records `metadata.nn.candle.custom` off the live
+///   `Gpt2Config` (bridge/nn_trainer.rs), and
+/// - `load_handle` rebuilds that exact config from the Card
+///   (bridge/nn_card.rs) — `architecture = "gpt2-custom"` pins no
+///   shape, so without the branch the load has nothing to go on.
+///
+/// Every axis below is off the reference *and* changes the bundle's
+/// Var set or a weight shape (`swiglu` adds `mlp.c_gate`, `rmsnorm`
+/// drops the LayerNorm biases, `rope` drops `wpe`, `untied_head` adds
+/// `lm_head.weight`, `mlp_ratio = 3` resizes `mlp.c_fc`, `kv_heads =
+/// 1` resizes the KV projections), so a spec field lost in the Card
+/// round-trip surfaces as a load failure rather than a silently
+/// different model.
+#[test]
+fn alc_nn_run_full_ft_custom_card_load_handle_roundtrip() {
+    let (lua, _tmp) = production_vm();
+    lua.load(
+        r#"
+        local h = alc.nn.preset.gpt2("custom", {
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+            act = "swiglu",
+            norm = "rmsnorm",
+            pos = "rope",
+            mlp_ratio = 3,
+            kv_heads = 1,
+            untied_head = true,
+            vocab = 96,
+            ctx = 32,
+        })
+
+        local rows = {}
+        for r = 1, 8 do
+            local row = {}
+            for j = 1, 8 do row[j] = ((r + j) % 90) + 1 end
+            rows[r] = row
+        end
+        local ds = alc.nn.data.synthetic(rows, {
+            batch_size = 1,
+            ctx_len = 8,
+            shuffle = false,
+            pad_id = 0,
+        })
+
+        local card_id = alc.nn.trainer.run_full_ft(h, ds, {
+            lr = 1e-3,
+            batch = 1,
+            steps = 2,
+            warmup = 0,
+            schedule = "Constant",
+            name = "rt_custom_smoke",
+        })
+        assert(type(card_id) == "string" and #card_id > 0,
+            "run_full_ft must return a non-empty card_id")
+
+        -- Save side: the shape block must be on the Card, with the
+        -- same vocabulary the caller wrote above.
+        local card = alc.card.get(card_id)
+        assert(card ~= nil, "card.get returned nil")
+        local custom = card.metadata.nn.candle.custom
+        assert(custom ~= nil, "metadata.nn.candle.custom must be recorded")
+        assert(custom.vocab == 96, "custom.vocab: " .. tostring(custom.vocab))
+        assert(custom.ctx == 32, "custom.ctx: " .. tostring(custom.ctx))
+        assert(custom.layers == 2, "custom.layers: " .. tostring(custom.layers))
+        assert(custom.heads == 2, "custom.heads: " .. tostring(custom.heads))
+        assert(custom.dim == 32, "custom.dim: " .. tostring(custom.dim))
+        assert(custom.moe == nil, "no moe was requested")
+        assert(custom.spec.act == "swiglu", "spec.act: " .. tostring(custom.spec.act))
+        assert(custom.spec.norm == "rmsnorm", "spec.norm: " .. tostring(custom.spec.norm))
+        assert(custom.spec.pos == "rope", "spec.pos: " .. tostring(custom.spec.pos))
+        assert(custom.spec.mlp_ratio == 3,
+            "spec.mlp_ratio: " .. tostring(custom.spec.mlp_ratio))
+        assert(custom.spec.kv_heads == 1,
+            "spec.kv_heads: " .. tostring(custom.spec.kv_heads))
+        assert(custom.spec.untied_head == true,
+            "spec.untied_head: " .. tostring(custom.spec.untied_head))
+
+        -- Load side: the rebuilt config must match the bundle's Var
+        -- set (a mismatch errors inside from_safetensors_file) and
+        -- report the trained shape back.
+        local reloaded = alc.nn.card.load_handle(card_id)
+        assert(reloaded ~= nil, "load_handle returned nil")
+        assert(reloaded:vocab() == 96, "vocab mismatch: " .. reloaded:vocab())
+        assert(reloaded:ctx() == 32, "ctx mismatch: " .. reloaded:ctx())
+        assert(reloaded:layers() == 2, "layers mismatch: " .. reloaded:layers())
+        assert(reloaded:dim() == 32, "dim mismatch: " .. reloaded:dim())
+
+        -- ... and generate, closing the same "train -> Card -> reload
+        -- -> generate" loop the named-variant test walks.
+        local session = reloaded:generate_session({ 1, 2, 3 })
+        for _ = 1, 3 do
+            local logits = session:next_logits()
+            assert(logits:vocab() == 96,
+                "reloaded custom handle logits must span the custom vocab")
+            session:append(logits:argmax())
+        end
+        assert(session:position() == 6, "session must advance once per append")
+    "#,
+    )
+    .exec()
+    .expect("custom run_full_ft -> card.load_handle round-trip");
+}
+
 /// The stateless session backend on a trainable GPT-2 handle: the
 /// decode loop written for Llama sessions runs unchanged, including
 /// the no-pending-tokens guard.

@@ -40,7 +40,7 @@ use algocline_nn::arch::{
 };
 use algocline_nn::card::{
     bundle_ref_for, sanitize_stem, unique_stem, validate_training_path, CardId, NnCandleBranch,
-    NnCardMeta, NnLineage, NnLoraBranch, NnModelCard,
+    NnCardMeta, NnCustomBranch, NnLineage, NnLoraBranch, NnModelCard,
 };
 use algocline_nn::merged::{export_merged, MergeError, MergedProvenance};
 use algocline_nn::tokenizer::HfTokenizer;
@@ -893,6 +893,12 @@ fn build_nn_meta(card_id: &CardId, name: &str, user_meta: &Json) -> LuaResult<Nn
             .and_then(|v| v.as_str())
             .map(String::from),
         lora,
+        // The custom-architecture branch is derived from the trained
+        // config, not from caller-supplied metadata, so this save path
+        // (which projects a user `meta` table) leaves it absent. The
+        // trainer entry points record it through
+        // `NnModelCard::from_training`.
+        custom: None,
     };
 
     Ok(NnCardMeta {
@@ -1543,16 +1549,83 @@ fn preset_llama_neutral(
 // loaded through an mmap-backed VarBuilder that has no VarMap
 // counterpart (matches `Gpt2Model::from_pretrained` today).
 
-fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
+/// Rebuild the [`Gpt2Config`] a card's bundle was written under.
+///
+/// Two shapes of card reach here:
+///
+/// - **Named variant** (`"gpt2-medium"` / `"gpt2-tiny"` / ...) —
+///   [`Gpt2Config::from_variant`] is the single source of the shape,
+///   which is why those cards record no shape block.
+/// - **Custom variant** (`"gpt2-custom"`, written by
+///   `alc.nn.preset.gpt2("custom", ...)` plus a
+///   [`super::nn_trainer`] entry point) — the architecture string pins
+///   nothing, so the shape comes from `meta.candle.custom`
+///   ([`NnCustomBranch`], recorded by
+///   [`custom_branch_of_gpt2`]).
+///
+/// `device` / `dtype` are deliberately left at the base config's
+/// values: they are load-time choices that
+/// [`apply_candle_branch_device_dtype`] layers on top from
+/// `meta.candle`.
+///
+/// # Errors
+///
+/// - The `custom` branch carries an MoE block. The bundle's per-block
+///   expert Vars have no load path ([`Gpt2Model::from_safetensors_file`]
+///   refuses MoE configs), and rebuilding the config *without* `moe`
+///   would hand back a plain dense-MLP model under the card's name —
+///   a silent architecture swap. Refuse loudly instead.
+/// - The architecture is not a known variant and there is no `custom`
+///   branch to fall back on (an unknown variant, or a custom-variant
+///   card written before the shape block existed).
+fn gpt2_config_for_card(meta: &NnCardMeta) -> LuaResult<Gpt2Config> {
     // `Gpt2Config::from_variant` accepts both bare ("medium") and
     // "gpt2-medium" forms — pass the card's architecture string
     // directly.
-    let mut cfg = Gpt2Config::from_variant(&meta.architecture).ok_or_else(|| {
-        LuaError::external(format!(
-            "alc.nn.card.load: unknown gpt2 variant {:?} on card {:?}",
+    if let Some(cfg) = Gpt2Config::from_variant(&meta.architecture) {
+        return Ok(cfg);
+    }
+
+    let Some(branch) = meta.candle.as_ref().and_then(|c| c.custom.as_ref()) else {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.load: unknown gpt2 variant {:?} on card {:?}; if this is a \
+             custom-variant card it predates custom-shape metadata \
+             (metadata.nn.candle.custom is absent, so the trained shape cannot be \
+             recovered — retrain with a current build to make it reloadable)",
             meta.architecture, meta.name
-        ))
-    })?;
+        )));
+    };
+
+    if branch.moe.is_some() {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.load: card {:?} is a custom+MoE model; MoE safetensors reload \
+             is not supported yet (the bundle's per-block expert Vars have no load \
+             path), and loading it as a dense model would silently change the \
+             architecture — keep using the handle from the session that trained it",
+            meta.name
+        )));
+    }
+
+    Ok(Gpt2Config {
+        vocab: branch.vocab,
+        ctx: branch.ctx,
+        layers: branch.layers,
+        heads: branch.heads,
+        dim: branch.dim,
+        custom: Some(branch.spec.clone()),
+        // Refused above; restated so a future MoE load path has to
+        // revisit this arm rather than inheriting a stale `None`.
+        moe: None,
+        // `eps` is not reachable from the Lua `custom` opts table, so
+        // every custom config was built on the `tiny` base (see
+        // `build_custom_gpt2_config`). Spreading that base keeps the
+        // two sides sharing one epsilon instead of a literal here.
+        ..Gpt2Config::tiny()
+    })
+}
+
+fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
+    let mut cfg = gpt2_config_for_card(meta)?;
     apply_candle_branch_device_dtype("alc.nn.card.load", meta, &mut cfg.device, &mut cfg.dtype)?;
     guard_device_dtype_matrix("alc.nn.card.load", &cfg.device, cfg.dtype)?;
 
@@ -2612,6 +2685,53 @@ pub(super) fn guard_base_dtype_for_training(fn_name: &str, handle: &NnHandle) ->
         )));
     }
     Ok(())
+}
+
+/// Project the handle's architecture-customization spec onto a Card
+/// branch, for the trainer entry points that write a Card
+/// (`run_lora_ft` / `run_full_ft` / `run_distill` in
+/// [`super::nn_trainer`]).
+///
+/// Returns `None` — meaning "the Card needs no shape block" — for
+/// every handle whose config is the GPT-2 reference: the two
+/// non-GPT-2 arches (whose shape is pinned by their own variant
+/// presets) and a GPT-2 handle built from a named preset. Only a
+/// `preset.gpt2("custom", ...)` handle yields `Some`, because
+/// `architecture = "gpt2-custom"` does not pin a shape and the load
+/// path has nothing else to rebuild the config from.
+///
+/// # Lock discipline
+///
+/// The [`Gpt2Config`] is the only thing behind the model mutex that
+/// this reads, and [`NnCustomBranch::from_gpt2_config`] copies out of
+/// it, so the guard is released before returning. Callers invoke this
+/// *before* taking the training lock (alongside
+/// [`NnHandle::arch_family_variant`]) so the short read never nests
+/// inside the training critical section.
+///
+/// # Errors
+///
+/// A poisoned model mutex propagates as a loud [`LuaError::external`]
+/// under the caller's `fn_name` prefix — a previous panic while the
+/// model was locked means the shape on the Card cannot be trusted, so
+/// the run refuses rather than writing a Card with the branch absent
+/// (which the load path would read as "reference architecture").
+pub(super) fn custom_branch_of_gpt2(
+    fn_name: &str,
+    handle: &NnHandle,
+) -> LuaResult<Option<NnCustomBranch>> {
+    let Some(gpt2) = handle.as_gpt2() else {
+        return Ok(None);
+    };
+    let model_arc = gpt2.model();
+    let model = model_arc.lock().map_err(|e| {
+        LuaError::external(format!(
+            "{fn_name}: model lock while reading the custom architecture spec: {e}"
+        ))
+    })?;
+    let branch = NnCustomBranch::from_gpt2_config(model.config());
+    drop(model);
+    Ok(branch)
 }
 
 /// Test-only helper: swap the recorded `dtype` string on a
@@ -3719,6 +3839,79 @@ mod arch_ops_tests {
 }
 
 #[cfg(test)]
+mod custom_spec_vocabulary_tests {
+    //! Vocabulary parity pin for the `custom` spec axes (issue
+    //! 467e6630).
+    //!
+    //! Two independent definitions spell the same axis values:
+    //! [`build_custom_gpt2_config`]'s `match` arms decide what
+    //! `alc.nn.preset.gpt2("custom", ...)` accepts, and the `serde`
+    //! attributes on [`Gpt2Custom`] decide what a Card records. Both
+    //! matter to one caller: a Card is meant to read back the way it
+    //! was written, and [`gpt2_config_for_card`] deserializes the Card
+    //! straight into a spec to rebuild the config. If the two drift, a
+    //! Card either reports an axis under the wrong name or reloads as
+    //! a different model. This walks every accepted value of every
+    //! string axis in both directions (Lua -> spec -> JSON, and
+    //! JSON -> spec) and asserts they agree.
+    use super::*;
+    use mlua::Lua;
+
+    /// Every accepted value of every string-valued axis. A value added
+    /// to [`build_custom_gpt2_config`] without a line here is an
+    /// unpinned spelling.
+    const STRING_AXES: &[(&str, &[&str])] = &[
+        ("act", &["gelu", "relu", "silu", "swiglu", "geglu"]),
+        ("norm", &["layernorm", "rmsnorm"]),
+        ("residual", &["sequential", "parallel"]),
+        ("placement", &["preln", "postln"]),
+        ("pos", &["learned", "rope", "alibi", "nope"]),
+    ];
+
+    #[test]
+    fn lua_and_card_axis_spellings_agree() {
+        let lua = Lua::new();
+        for (axis, values) in STRING_AXES {
+            for value in *values {
+                // One axis per table: some values are mutually
+                // exclusive at build time (Post-LN excludes Parallel),
+                // and the parse step under test is per-axis anyway.
+                let opts = lua.create_table().expect("opts table");
+                opts.set(*axis, *value).expect("set axis");
+                let from_lua = build_custom_gpt2_config(Some(&opts))
+                    .unwrap_or_else(|e| panic!("Lua {axis} = {value:?} must parse: {e}"))
+                    .custom
+                    .expect("custom spec");
+
+                // Forward: the Card must name the axis the way the
+                // caller wrote it.
+                let json = serde_json::to_value(&from_lua).expect("serialize spec");
+                assert_eq!(
+                    json.get(*axis),
+                    Some(&serde_json::json!(*value)),
+                    "Card spelling for {axis} = {value:?} drifted from the Lua \
+                     vocabulary: {json}"
+                );
+
+                // Reverse: reading that spelling back must select the
+                // same variant the Lua string did.
+                let mut card_spec = serde_json::Map::new();
+                card_spec.insert((*axis).to_string(), serde_json::json!(*value));
+                let card_json = serde_json::Value::Object(card_spec);
+                let from_card: Gpt2Custom = serde_json::from_value(card_json)
+                    .unwrap_or_else(|e| panic!("Card {axis} = {value:?} must deserialize: {e}"));
+                assert_eq!(
+                    serde_json::to_value(&from_card).expect("re-serialize"),
+                    json,
+                    "{axis} = {value:?} deserializes to a different spec than the \
+                     Lua parse produces"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod nn_handle_helper_tests {
     //! Layer 5a S1 — `NnHandle::arch_family_variant` /
     //! `is_lora_wrapped` unit coverage.
@@ -3782,6 +3975,65 @@ mod nn_handle_helper_tests {
         // in build_tinyllama_handle), so pass-through is expected.
         assert_eq!(handle.arch_family_variant(), "tinyllama-tiny");
         assert!(!handle.is_lora_wrapped());
+    }
+
+    /// Save side of the custom-shape contract (issue 467e6630): a
+    /// `preset.gpt2("custom", ...)` handle projects its live
+    /// `Gpt2Config` onto the branch the trainers record. The values
+    /// have to be the ones the caller asked for — the load path
+    /// rebuilds the config from exactly these.
+    #[test]
+    fn custom_branch_of_gpt2_projects_the_custom_preset_shape() {
+        let dir = tempdir();
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+        opts.set("act", "swiglu").unwrap();
+        opts.set("norm", "rmsnorm").unwrap();
+        opts.set("pos", "rope").unwrap();
+        opts.set("kv_heads", 1).unwrap();
+        opts.set("untied_head", true).unwrap();
+        opts.set("vocab", 96).unwrap();
+        opts.set("ctx", 32).unwrap();
+        let gpt2 = build_gpt2_handle("custom", Some(&opts), dir.path()).expect("build custom gpt2");
+        let handle = NnHandle::Gpt2(gpt2);
+
+        let branch = custom_branch_of_gpt2("test", &handle)
+            .expect("projection must succeed")
+            .expect("custom handle must yield a branch");
+        assert_eq!(branch.vocab, 96);
+        assert_eq!(branch.ctx, 32);
+        assert_eq!(branch.layers, Gpt2Config::tiny().layers);
+        assert_eq!(branch.heads, Gpt2Config::tiny().heads);
+        assert_eq!(branch.dim, Gpt2Config::tiny().dim);
+        assert_eq!(branch.spec.act, Activation::SwiGlu);
+        assert_eq!(branch.spec.norm, NormKind::RmsNorm);
+        assert_eq!(branch.spec.pos, PosKind::Rope);
+        assert_eq!(branch.spec.kv_heads, Some(1));
+        assert!(branch.spec.untied_head);
+        assert!(branch.moe.is_none());
+    }
+
+    /// Named-variant and non-GPT-2 handles record no shape block:
+    /// their `architecture` string already pins the shape, so adding
+    /// one would only fatten the Card.
+    #[test]
+    fn custom_branch_of_gpt2_is_none_for_named_and_non_gpt2_handles() {
+        let dir = tempdir();
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+        opts.set("pretrained", false).unwrap();
+
+        let gpt2 = build_gpt2_handle("tiny", Some(&opts), dir.path()).expect("build gpt2");
+        assert!(custom_branch_of_gpt2("test", &NnHandle::Gpt2(gpt2))
+            .expect("projection must succeed")
+            .is_none());
+
+        let tll =
+            build_tinyllama_handle("tinyllama-tiny", Some(&opts), dir.path()).expect("build tll");
+        assert!(custom_branch_of_gpt2("test", &NnHandle::TinyLlama(tll))
+            .expect("projection must succeed")
+            .is_none());
     }
 
     #[test]
@@ -3850,6 +4102,7 @@ mod nn_model_card_persist_tests {
                 device: None,
                 dtype: None,
                 lora: None,
+                custom: None,
             }),
         }
     }
@@ -4482,6 +4735,169 @@ mod load_dispatch_tests {
             msg.contains("unknown training_path") || msg.contains("quantized_awq"),
             "message: {msg}"
         );
+    }
+
+    // ── gpt2-custom shape restore (issue 467e6630) ───────────
+
+    /// Seed an empty bundle at the path `load_handle_impl` resolves so
+    /// the pre-flight existence check passes. The two refusals below
+    /// fire while rebuilding the config, before any safetensors byte
+    /// is read, so the file's contents do not matter — but its absence
+    /// would mask the error under test.
+    fn touch_bundle(nn_dir: &std::path::Path, card_id: &str) {
+        std::fs::create_dir_all(nn_dir).expect("create nn dir");
+        std::fs::write(nn_dir.join(format!("{card_id}.safetensors")), b"")
+            .expect("seed placeholder bundle");
+    }
+
+    /// A `"gpt2-custom"` card with no shape block is unrecoverable:
+    /// the architecture string pins nothing and there is no
+    /// `candle.custom` to rebuild from. That is the state of cards
+    /// trained before the shape block existed, so the error has to say
+    /// so rather than reading as "you typed the variant wrong".
+    #[test]
+    fn load_handle_refuses_gpt2_custom_card_without_custom_branch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-custom-legacy",
+                "backend": "candle",
+                "architecture": "gpt2-custom",
+                "training_path": "full_ft",
+                "candle": { "bundle_ref": "nn/placeholder" }
+            }),
+        );
+        touch_bundle(&nn_dir, &card_id);
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("custom card without a shape block must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("gpt2-custom") && msg.contains("predates custom-shape metadata"),
+            "error must explain the missing shape block: {msg}"
+        );
+        assert!(
+            msg.contains("retrain"),
+            "error must name the recovery action: {msg}"
+        );
+    }
+
+    /// A custom+MoE card has no reload path: the bundle carries
+    /// per-block expert Vars that `from_safetensors_file` refuses.
+    /// Rebuilding the config with `moe: None` would load a dense-MLP
+    /// model under the card's name, so the loader must refuse instead
+    /// of silently swapping the architecture.
+    #[test]
+    fn load_handle_refuses_custom_moe_card() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "gpt2-custom-moe",
+                "backend": "candle",
+                "architecture": "gpt2-custom",
+                "training_path": "full_ft",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "custom": {
+                        "vocab": 64, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+                        "spec": { "norm": "rmsnorm" },
+                        "moe": { "n_experts": 4, "top_k": 2, "alpha": 0.01 }
+                    }
+                }
+            }),
+        );
+        touch_bundle(&nn_dir, &card_id);
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("custom+MoE card must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("custom+MoE") && msg.contains("not supported yet"),
+            "error must name the unsupported combination: {msg}"
+        );
+    }
+
+    /// The happy path of the same rebuild, at the level of the config
+    /// projection: every shape scalar comes off the branch, the spec
+    /// is restored verbatim, and `eps` matches the `tiny` base the
+    /// build side starts from (`build_custom_gpt2_config`). The
+    /// end-to-end version (train -> Card -> reload -> generate) lives
+    /// in `tests/nn_bridge_smoke.rs`, which can write a real bundle.
+    #[test]
+    fn gpt2_config_for_card_rebuilds_custom_shape() {
+        let meta: NnCardMeta = serde_json::from_value(json!({
+            "name": "gpt2-custom-run",
+            "backend": "candle",
+            "architecture": "gpt2-custom",
+            "training_path": "full_ft",
+            "candle": {
+                "bundle_ref": "nn/gpt2-custom-run",
+                "custom": {
+                    "vocab": 96, "ctx": 32, "layers": 3, "heads": 4, "dim": 64,
+                    "spec": {
+                        "act": "swiglu",
+                        "norm": "rmsnorm",
+                        "pos": "rope",
+                        "mlp_ratio": 3,
+                        "kv_heads": 1,
+                        "untied_head": true
+                    }
+                }
+            }
+        }))
+        .expect("meta deserialize");
+
+        let cfg = gpt2_config_for_card(&meta).expect("custom config rebuild");
+        assert_eq!(cfg.vocab, 96);
+        assert_eq!(cfg.ctx, 32);
+        assert_eq!(cfg.layers, 3);
+        assert_eq!(cfg.heads, 4);
+        assert_eq!(cfg.dim, 64);
+        assert_eq!(cfg.eps, Gpt2Config::tiny().eps);
+        assert!(cfg.moe.is_none());
+        let spec = cfg.custom.expect("custom spec restored");
+        assert_eq!(spec.act, Activation::SwiGlu);
+        assert_eq!(spec.norm, NormKind::RmsNorm);
+        assert_eq!(spec.pos, PosKind::Rope);
+        assert_eq!(spec.mlp_ratio, 3);
+        assert_eq!(spec.kv_heads, Some(1));
+        assert!(spec.untied_head);
+        // Axes the card left unset stay at the reference.
+        assert_eq!(spec.residual, ResidualKind::Sequential);
+        assert_eq!(spec.placement, NormPlacement::PreLn);
+        assert_eq!(spec.window, None);
+    }
+
+    /// A named variant must not consult the shape block at all — its
+    /// preset is the single source of the shape, and a stray `custom`
+    /// key on such a card must not silently reshape the model.
+    #[test]
+    fn gpt2_config_for_card_prefers_named_variant_over_custom_branch() {
+        let meta: NnCardMeta = serde_json::from_value(json!({
+            "name": "gpt2-tiny-run",
+            "backend": "candle",
+            "architecture": "gpt2-tiny",
+            "training_path": "full_ft",
+            "candle": {
+                "bundle_ref": "nn/gpt2-tiny-run",
+                "custom": {
+                    "vocab": 999, "ctx": 999, "layers": 9, "heads": 9, "dim": 99,
+                    "spec": { "act": "swiglu" }
+                }
+            }
+        }))
+        .expect("meta deserialize");
+
+        let cfg = gpt2_config_for_card(&meta).expect("named variant rebuild");
+        assert_eq!(cfg.vocab, Gpt2Config::tiny().vocab);
+        assert_eq!(cfg.layers, Gpt2Config::tiny().layers);
+        assert!(cfg.custom.is_none(), "named variant is the reference shape");
     }
 
     // ── load_wrap_impl directional errors + arch match ───────

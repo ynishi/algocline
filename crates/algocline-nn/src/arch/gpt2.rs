@@ -187,8 +187,11 @@ pub struct Gpt2Config {
     /// Architecture customization spec ([`Gpt2Custom`]: activation /
     /// norm kind + placement / residual topology / MLP ratio /
     /// position / GQA / sliding window / untied head). `None` (all
-    /// shipped presets) is the GPT-2 reference. Custom models are
-    /// random-init only. Combining `custom` with `moe` is allowed as
+    /// shipped presets) is the GPT-2 reference. Custom models cannot
+    /// warm-start from a HuggingFace bundle
+    /// ([`Gpt2Model::from_pretrained`] rejects them), but a bundle this
+    /// crate wrote for the same spec reloads through
+    /// [`Gpt2Model::from_safetensors_file`]. Combining `custom` with `moe` is allowed as
     /// long as the dense-MLP knobs (`act` / `mlp_ratio`) stay at the
     /// reference — those two do not apply to the experts and a
     /// non-default value would silently not take effect, so the build
@@ -785,20 +788,35 @@ impl Gpt2Model {
     }
 
     /// Load model weights from an on-disk safetensors bundle whose
-    /// key layout matches the HF GPT-2 convention (same layout that
+    /// key layout matches the Var names `cfg` declares — the HF GPT-2
+    /// convention for a reference config (same layout that
     /// [`Gpt2Model::from_pretrained`] downloads and that
-    /// [`super::lora::MergeableLora::export_merged`] emits).
+    /// [`super::lora::MergeableLora::export_merged`] emits), and the
+    /// spec-dependent superset for a `custom` one.
     ///
     /// This is the plain-load path used by (a) the merged-bundle
-    /// parity oracle in `tests/merged_export_parity_gpt2.rs` and
-    /// (b) future load-side integration that recognises
+    /// parity oracle in `tests/merged_export_parity_gpt2.rs`,
+    /// (b) load-side integration that recognises
     /// `training_path == "merged"` and dispatches here instead of
-    /// re-wrapping the model.
+    /// re-wrapping the model, and (c) reloading a Card-store bundle.
+    ///
+    /// `custom` configs are accepted here — unlike in
+    /// [`Gpt2Model::from_pretrained`]. Card-store bundles are written
+    /// by `VarMap::save`, so they carry exactly the Vars the config
+    /// declares (gated `mlp.c_gate`, an untied `lm_head.weight`, no
+    /// `wpe` for a non-learned position kind, no LayerNorm biases
+    /// under RMSNorm — all named by the same `get_with_hints` calls
+    /// [`Self::new`] makes). RoPE / ALiBi / causal-mask tables are
+    /// recomputed by [`Self::new`] and never live in the bundle.
+    /// The HF-hub path still refuses `custom` because a hub bundle
+    /// really does carry only the reference layout.
     ///
     /// # Errors
     ///
     /// `PretrainedError::Load` on safetensors parse failure or
-    /// weight-name mismatch against the model shape.
+    /// weight-name mismatch against the model shape, and for MoE
+    /// configs, whose `h.<i>.moe.*` layout no bundle currently
+    /// carries.
     pub fn from_safetensors_file(
         cfg: &Gpt2Config,
         path: &std::path::Path,
@@ -807,13 +825,6 @@ impl Gpt2Model {
             return Err(PretrainedError::Load(
                 "MoE configs are random-init only; no safetensors bundle carries the \
                  h.<i>.moe.* layout"
-                    .into(),
-            ));
-        }
-        if cfg.custom.is_some() {
-            return Err(PretrainedError::Load(
-                "custom configs are random-init only; safetensors bundles carry the \
-                 GPT-2 reference layout"
                     .into(),
             ));
         }
@@ -1715,6 +1726,56 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(msg.contains("export_merged"), "unexpected error: {msg}");
+    }
+
+    /// A bundle this crate wrote for a custom config must reload
+    /// through [`Gpt2Model::from_safetensors_file`] and reproduce the
+    /// same logits. `VarMap::save` writes exactly the Vars the spec
+    /// declares (gated `mlp.c_gate`, untied `lm_head.weight`, no `wpe`
+    /// under RoPE, no LayerNorm biases under RMSNorm) and `new`
+    /// requests those same names, so the round-trip is lossless; the
+    /// RoPE cache and causal mask are recomputed, not stored.
+    #[test]
+    fn custom_bundle_reloads_from_safetensors_with_identical_logits() {
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                act: Activation::SwiGlu,
+                norm: NormKind::RmsNorm,
+                pos: PosKind::Rope,
+                kv_heads: Some(1),
+                untied_head: true,
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let trained = Gpt2Model::new(&cfg, vs).expect("build custom model");
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5], (1, 5), &cfg.device).expect("ids");
+        let expected = trained.forward(&ids).expect("forward before save");
+
+        // The spec-dependent Vars must actually be in the bundle —
+        // otherwise the reload below would pass vacuously.
+        {
+            let data = vm.data().lock().expect("varmap lock");
+            assert!(data.keys().any(|n| n.contains(".c_gate.")), "gated MLP Var");
+            assert!(
+                data.keys().any(|n| n == "lm_head.weight"),
+                "untied head Var"
+            );
+            assert!(!data.keys().any(|n| n == "wpe.weight"), "no wpe under RoPE");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom.safetensors");
+        vm.save(&path).expect("varmap save");
+
+        let reloaded = Gpt2Model::from_safetensors_file(&cfg, &path).expect("reload custom bundle");
+        let actual = reloaded.forward(&ids).expect("forward after reload");
+        assert_eq!(actual.dims(), expected.dims());
+        let diff = crate::arch::max_abs_diff_f32(&expected, &actual).expect("diff");
+        assert!(diff < 1e-6, "logits diverged after reload: {diff}");
     }
 
     #[test]

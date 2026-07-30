@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `alc.nn`: custom-variant cards are now reloadable. Cards produced by
+  training a `alc.nn.preset.gpt2("custom", ...)` student record their
+  full shape (vocab / ctx / layers / heads / dim plus every
+  architecture axis) under `metadata.nn.candle.custom`, and
+  `alc.nn.card.load_handle(card_id)` rebuilds the config from the
+  Card and reloads the trained weights standalone — closing the
+  train → Card → reload → generate loop for custom shapes. Cards
+  written by earlier builds (no custom metadata) and custom+MoE cards
+  are refused with directional errors. (Breaking for direct Rust
+  callers of `NnModelCard::from_training` / struct-literal
+  constructors of `NnCandleBranch` only; the Card wire shape is
+  additive.)
+- E2E scripts driven via `alc_run` for the LoRA and distillation
+  training paths (`examples/nn_lora_shakespeare_e2e.lua`,
+  `examples/nn_distill_llm_teacher_e2e.lua`) plus matching sections
+  in `docs/nn-e2e-runbook.md`. The distillation script collects the
+  teacher signal from the host LLM through a single `alc.llm_batch`
+  pause (AnyModel routing — any model answering the pause becomes
+  the teacher).
+
 ### Changed — **BREAKING**: `alc.nn.trainer.{full_ft,lora,distill}` Checkpoint field `ckpt.card_id` renamed to `ckpt.ckpt_prefix`
 
 The raw-Checkpoint trainer surfaces returned a `card_id` field that

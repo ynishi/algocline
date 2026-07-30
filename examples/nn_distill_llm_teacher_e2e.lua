@@ -32,11 +32,11 @@
 --                                       random baseline
 --     10 ckpt_file_exists            — <nn_dir>/<card_id>.safetensors landed
 --
---   Designed refusals / guards (11-13)
---     11 custom_load_handle_contract — load_handle on a gpt2-custom card is
---                                       refused (custom variants have no
---                                       from_variant config; pins the current
---                                       behavior so a change is surfaced)
+--   Reload / guards (11-13)
+--     11 custom_load_handle_roundtrip — load_handle rebuilds the custom
+--                                       config from metadata.nn.candle.custom
+--                                       and reloads the trained weights
+--                                       standalone (shape + generate verified)
 --     12 mask_boundary_guard         — from_card refuses a row whose prompt
 --                                       exhausts ctx_len (FullyMaskedRow
 --                                       protection, loud)
@@ -357,29 +357,46 @@ run("ckpt_file_exists", function()
     return string.format("%d bytes at %s", size, path)
 end)
 
--- ── Phase 11: custom-variant load_handle contract (pinned) ──────────
+-- ── Phase 11: custom-variant Card reload round-trip ─────────────────
 --
--- gpt2-custom cards carry no from_variant config, so load_handle
--- refuses them today. Pinning the refusal makes any future change
--- (e.g. custom reload support) surface as a red here.
+-- Custom cards record their full shape under metadata.nn.candle
+-- .custom, so load_handle rebuilds the config from the Card and
+-- reloads the trained weights standalone (no base handle needed).
 
-run("custom_load_handle_contract", function()
+run("custom_load_handle_roundtrip", function()
     if not distill_card_id then
         error("no distill_card_id")
     end
-    local ok, err = pcall(function()
-        alc.nn.card.load_handle(distill_card_id)
-    end)
-    if ok then
+    local reloaded = alc.nn.card.load_handle(distill_card_id)
+    if not reloaded then
+        error("load_handle returned nil")
+    end
+    if reloaded:vocab() ~= 50257 or reloaded:ctx() ~= CTX_LEN then
         error(
-            "load_handle(gpt2-custom card) unexpectedly succeeded - contract changed, update this pin"
+            string.format(
+                "reloaded shape mismatch: vocab=%d ctx=%d (want 50257/%d)",
+                reloaded:vocab(),
+                reloaded:ctx(),
+                CTX_LEN
+            )
         )
     end
-    local msg = tostring(err)
-    if not msg:find("gpt2-custom", 1, true) then
-        error("refusal did not name gpt2-custom: " .. msg:sub(1, 200))
+    if reloaded:layers() ~= 2 or reloaded:dim() ~= 64 then
+        error(
+            string.format(
+                "reloaded shape mismatch: layers=%d dim=%d (want 2/64)",
+                reloaded:layers(),
+                reloaded:dim()
+            )
+        )
     end
-    return "refused as expected (custom variants have no reload config)"
+    local session = reloaded:generate_session({ 1, 2, 3 })
+    local logits = session:next_logits()
+    local tok = logits:argmax()
+    if type(tok) ~= "number" then
+        error("generate_session produced no token")
+    end
+    return string.format("reloaded standalone, shape ok, 1 greedy token = %d", tok)
 end)
 
 -- ── Phase 12: mask boundary guard (FullyMaskedRow protection) ───────

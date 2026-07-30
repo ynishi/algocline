@@ -74,6 +74,14 @@
 //!      pre-generated `lora_card_id`; a divergence surfaces as a
 //!      loud Lua error (mirrors the `save_impl` / `merge_lora_impl`
 //!      invariant guard).
+//!    - `candle.custom` — present iff the base handle is a
+//!      `preset.gpt2("custom", ...)` model, projected off its live
+//!      `Gpt2Config` by
+//!      [`super::nn_card::custom_branch_of_gpt2`]. `architecture =
+//!      "gpt2-custom"` pins no shape, so this branch is what lets
+//!      `alc.nn.card.load_handle` rebuild the trained config; named
+//!      variants leave it absent. All three entry points below record
+//!      it identically.
 //! 7. Δ safetensors path is fixed by the Rust surface convention:
 //!    [`run_lora_ft`] writes to
 //!    `<ckpt_dir>/nn/lora-<card_id>.safetensors`. This bridge passes
@@ -97,8 +105,8 @@ use crate::card::nn::persist;
 use crate::card::FileCardStore;
 
 use super::nn_card::{
-    guard_base_dtype_for_training, DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle,
-    TinyLlamaHandle,
+    custom_branch_of_gpt2, guard_base_dtype_for_training, DatasetHandle, Gpt2Handle, LlamaHandle,
+    NnHandle, TinyLlamaHandle,
 };
 use super::nn_opts::{
     extract_distill_loss_kind, extract_lora_cfg, extract_run_train_cfg, train_err_to_lua,
@@ -283,6 +291,10 @@ fn run_lora_ft_impl(
     //    lookup outside the training-loop critical section.
     let base_bundle_ref = bundle_ref_for(&handle.arch_family_variant());
     let architecture = handle.arch_family_variant();
+    // Same "before any lock" rule: reading the custom spec takes the
+    // model mutex briefly (see `custom_branch_of_gpt2`), so it happens
+    // here rather than nested inside the training critical section.
+    let custom = custom_branch_of_gpt2(RUN_LORA_FT_ERR_PREFIX, &handle)?;
 
     // 9. Fresh per-call TrainingLease. Design §0: single-lease-per
     //    -call is the L5b contract; sharing across Lua calls is out
@@ -392,6 +404,7 @@ fn run_lora_ft_impl(
         TrainingPath::Lora(lora_branch),
         &ckpt,
         &train_cfg,
+        custom,
     )
     .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_lora_ft: {e}")))?;
 
@@ -531,8 +544,12 @@ fn run_full_ft_impl(
     let card_id = CardId::mint(name_base);
 
     // 8. Derive architecture BEFORE any lock (immutable handle field
-    //    lookup outside the training-loop critical section).
+    //    lookup outside the training-loop critical section). The
+    //    custom-architecture branch rides along here for the same
+    //    reason (it takes the model mutex briefly — see
+    //    `custom_branch_of_gpt2`).
     let architecture = handle.arch_family_variant();
+    let custom = custom_branch_of_gpt2(RUN_FULL_FT_ERR_PREFIX, &handle)?;
 
     // 9. Fresh per-call TrainingLease (design §0, matches
     //    run_lora_ft_impl step 9).
@@ -623,6 +640,10 @@ fn run_full_ft_impl(
     //     `TrainingPath::FullFt` arm leaves that field `None`,
     //     matching `training_path="full_ft"` cards written by the
     //     sibling `alc.nn.trainer.full_ft` + `alc.nn.card.save` flow.
+    //     It DOES carry the custom branch when the base was a
+    //     `preset.gpt2("custom", ...)` handle: `architecture =
+    //     "gpt2-custom"` pins no shape, so `alc.nn.card.load_handle`
+    //     rebuilds the config from that branch.
     let card = NnModelCard::from_training(
         card_id,
         name_base,
@@ -630,6 +651,7 @@ fn run_full_ft_impl(
         TrainingPath::FullFt,
         &ckpt,
         &train_cfg,
+        custom,
     )
     .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))?;
 
@@ -772,8 +794,11 @@ fn run_distill_impl(
     let card_id = CardId::mint(name_base);
 
     // 8. Derive architecture BEFORE any lock (immutable handle field
-    //    lookup outside the training-loop critical section).
+    //    lookup outside the training-loop critical section), plus the
+    //    student's custom-architecture branch (brief model-mutex read,
+    //    same rationale as the siblings).
     let architecture = handle.arch_family_variant();
+    let custom = custom_branch_of_gpt2(RUN_DISTILL_ERR_PREFIX, &handle)?;
 
     // 9. Fresh per-call TrainingLease (design §0, matches the
     //    siblings).
@@ -871,6 +896,7 @@ fn run_distill_impl(
         },
         &ckpt,
         &spec.hyperparams,
+        custom,
     )
     .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: {e}")))?;
 

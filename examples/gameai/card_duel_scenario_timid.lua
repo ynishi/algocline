@@ -1,7 +1,7 @@
 --[[
   card_duel_scenario_timid — eval fence for the timid card duel NPC.
 
-  Sixteen cases over the `card_duel_npc` strategy:
+  Seventeen cases over the `card_duel_npc` strategy:
 
     * 10 style cases  -- does the gated decode reproduce the timid move
                          (the lowest distinct rank in hand) for a fixed
@@ -10,6 +10,9 @@
     *  5 legality cases -- does the answer carry the legality flag the
                          gate guarantees?
     *  1 determinism case -- do two independent decode sessions agree?
+    *  1 self-play compliance case -- over the states the model reaches
+                         by playing, does it still make the timid move
+                         at least 80% of the time?
 
   The Card trained on the timid style is pinned to its own alias, so the
   scenario has to be driven against that alias rather than the default
@@ -24,7 +27,9 @@
   There is no win rate case here: self-play inside the NPC package pits
   the Card against the random policy, and a style that always plays its
   lowest card is expected to lose that match. Measuring it would fence
-  the style's strength rather than the model's compliance with it.
+  the style's strength rather than the model's compliance with it. The
+  self-play case reads `style_match` from the same run instead, which is
+  the compliance number and is independent of how strong the style is.
 
   The states are the same literals as `card_duel_scenario.lua` and are
   written out rather than generated from `card_duel`, so the scenario is
@@ -34,8 +39,12 @@
   Grader note: evalframe bindings are suite-wide, so a scenario cannot
   select a different grader per case. Both `contains` and `regex` are
   therefore bound, and every case supplies an `expected` literal and a
-  `context.pattern` that accept exactly the same answers, which keeps
-  `pass_rate` readable as the compliance rate.
+  `context.pattern`. For the per-move cases the two accept exactly the
+  same answers, which keeps `pass_rate` readable as the compliance rate.
+  The self-play case splits the work instead: the `expected` list
+  carries the accepted `style_match=` bands and the pattern only asserts
+  that the field is present and well formed, since a Lua pattern cannot
+  express a numeric floor.
 ]]
 
 local ef = require("evalframe")
@@ -105,6 +114,17 @@ return {
             input = '{"mode":"determinism","state":' .. S1 .. "}",
             expected = "deterministic=true",
             context = { pattern = "deterministic=true" },
+        }),
+
+        -- Self-play compliance with the timid move, floor at 0.80.
+        ef.case("style_compliance_selfplay")({
+            input = '{"mode":"selfplay","games":20,"seed":7,"style":"timid"}',
+            expected = {
+                "style_match=0.8",
+                "style_match=0.9",
+                "style_match=1.0",
+            },
+            context = { pattern = "style_match=[01]%.%d%d" },
         }),
     },
 }

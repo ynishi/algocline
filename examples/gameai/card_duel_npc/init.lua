@@ -39,8 +39,11 @@
 --- - `decide` — `{ state }`; returns `action=<rank> legal=true raw_legal=<bool> gated=<bool>`
 --- - `determinism` — `{ state }`; decodes twice through independent
 ---   sessions and returns `deterministic=<bool> action=<rank>`
---- - `selfplay` — `{ games, seed }`; plays the NPC against
----   `card_duel.policy_random` and returns `winrate=<x.xx> illegal=<n>`
+--- - `selfplay` — `{ games, seed, style? }`; plays the NPC against
+---   `card_duel.policy_random` and returns
+---   `winrate=<x.xx> illegal=<n> style_match=<x.xx> style_hits=<n>/<n>`.
+---   `style` names the teacher policy every model move is compared
+---   against (default: `aggressive`)
 ---
 --- ## Caveats
 ---
@@ -54,6 +57,13 @@
 --- usual convention for symmetric two-player games. With five rounds
 --- and a nine-rank deck draws are common enough that scoring them as
 --- losses would depress the number for a reason unrelated to play.
+---
+--- The win rate is reported but it is not what self-play is for: it
+--- depends on the random opponent's deals as much as on the model.
+--- `style_match` is the direct measurement — the share of model moves
+--- that equal the teacher move for the same state, over states the
+--- model reaches by playing rather than over a fixed list. A model that
+--- learned its style scores near 1.00 whatever the win rate says.
 
 local duel = require("card_duel")
 
@@ -77,7 +87,8 @@ if T then
     run_entry = {
         input = T.shape({
             task = T.string:describe(
-                "JSON object with a mode field: decide / determinism / selfplay"
+                "JSON object with a mode field: decide / determinism / selfplay "
+                    .. "(selfplay also takes an optional style naming the teacher policy)"
             ),
             card_alias = T.string
                 :is_optional()
@@ -96,6 +107,10 @@ M.docs = {
 
 --- Default Card alias written by the training script.
 local DEFAULT_ALIAS = "card_duel_npc"
+
+--- Teacher style self-play compares the model against when the request
+--- names none. It matches the style behind the bare `DEFAULT_ALIAS`.
+local DEFAULT_STYLE = "aggressive"
 
 --- Loaded handles keyed by alias, per VM.
 ---
@@ -233,14 +248,48 @@ local function mode_determinism(handle, req)
     return string.format("deterministic=%s action=%d", tostring(same), first.rank)
 end
 
+--- Resolve the teacher policy self-play scores the model against.
+---
+--- The name is checked against `card_duel.STYLES` rather than against
+--- the presence of a `policy_<name>` field, so `random` — a policy that
+--- exists but is not a style — is rejected like any other typo, with
+--- the valid names spelled out.
+---@param raw any Requested style name, or nil for the default
+---@return fun(state: table): integer policy
+local function resolve_style_policy(raw)
+    local style = raw
+    if style == nil then
+        style = DEFAULT_STYLE
+    end
+    local known = false
+    for _, name in ipairs(duel.STYLES) do
+        if name == style then
+            known = true
+            break
+        end
+    end
+    if not known then
+        error(
+            string.format(
+                "card_duel_npc: unknown style %s (valid: %s)",
+                tostring(style),
+                table.concat(duel.STYLES, ", ")
+            )
+        )
+    end
+    return duel["policy_" .. style]
+end
+
 local function mode_selfplay(handle, req)
     local games = math.floor(tonumber(req.games) or 20)
     local seed = math.floor(tonumber(req.seed) or 1)
     if games <= 0 then
         error("card_duel_npc: task.games must be a positive integer")
     end
+    local policy = resolve_style_policy(req.style)
 
     local score, illegal = 0.0, 0
+    local moves, hits = 0, 0
     for i = 1, games do
         local g = duel.new_game(seed + i)
         local rng = alc.math.rng_create(seed * 1000 + i)
@@ -248,6 +297,10 @@ local function mode_selfplay(handle, req)
             local d = decide(handle, g.p1)
             if not d.raw_legal then
                 illegal = illegal + 1
+            end
+            moves = moves + 1
+            if d.rank == policy(g.p1) then
+                hits = hits + 1
             end
             g = duel.apply(g, d.rank, duel.policy_random(g.p2, rng))
         end
@@ -258,7 +311,20 @@ local function mode_selfplay(handle, req)
             score = score + 0.5
         end
     end
-    return string.format("winrate=%.2f illegal=%d", score / games, illegal)
+    if moves == 0 then
+        -- Unreachable while a fresh game runs five rounds. Kept loud so a
+        -- rules change that empties the loop cannot report style_match as
+        -- a division by zero or as a silent 0.00.
+        error("card_duel_npc: self-play made no move")
+    end
+    return string.format(
+        "winrate=%.2f illegal=%d style_match=%.2f style_hits=%d/%d",
+        score / games,
+        illegal,
+        hits / moves,
+        hits,
+        moves
+    )
 end
 
 -- ─── Strategy entry ─────────────────────────────────────────────────

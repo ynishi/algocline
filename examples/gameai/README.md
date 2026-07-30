@@ -20,7 +20,7 @@ examples/gameai/
   card_duel_interactive/init.lua     human vs NPC session, kept in alc.state
   card_duel_interactive/spec/        alc_pkg_test suite for the session
   train_card_duel_npc.lua            teacher corpus -> Full FT -> Card + alias
-  card_duel_scenario.lua             eval scenario (style / legality / determinism / win rate)
+  card_duel_scenario.lua             eval scenario (style / legality / determinism / self-play compliance)
   card_duel_scenario_timid.lua       eval scenario for the timid style
   card_duel_scenario_bold.lua        eval scenario for the bold style
   card_duel_tournament_scenario.lua  eval scenario for the round robin
@@ -128,8 +128,11 @@ alc_eval(scenario = "card_duel_scenario", strategy = "card_duel_npc")
 
 The scenario scores four things: style compliance over ten fixed
 states, the legality flag over five of them, agreement between two
-independent decode sessions, and a self-play win rate against the
-random policy with a lower fence at 0.50.
+independent decode sessions, and self-play compliance with a lower
+fence at 0.80 — the share of moves that match the teacher move over the
+states the model reaches by playing, rather than a win rate against the
+random policy, which moves with the opponent's deals as much as with
+what the model learned.
 
 ### Style zoo
 

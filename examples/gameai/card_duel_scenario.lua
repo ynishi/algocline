@@ -9,8 +9,16 @@
     *  5 legality cases -- does the answer carry the legality flag the
                          gate guarantees?
     *  1 determinism case -- do two independent decode sessions agree?
-    *  1 win rate case  -- does self-play against the random policy stay
-                         at or above 0.50?
+    *  1 self-play compliance case -- over the states the model reaches
+                         by playing, does it still make the teacher move
+                         at least 80% of the time?
+
+  The self-play case fences compliance rather than the win rate against
+  the random policy: a win rate moves with the opponent's deals and only
+  reads as "the model learned its style" indirectly, while `style_match`
+  compares every model move with the teacher move for the same state.
+  The ten fixed states above are hand-picked; self-play adds the states
+  the model actually walks into.
 
   The states are literals rather than generated from `card_duel`, so the
   scenario is self-contained: it can be installed on its own and still
@@ -19,10 +27,11 @@
   Grader note: evalframe bindings are suite-wide, so a scenario cannot
   select a different grader per case. Both `contains` and `regex` are
   therefore bound, and every case supplies an `expected` literal and a
-  `context.pattern` that accept exactly the same answers -- the win rate
-  case lists the five accepted `winrate=0.5..0.9` prefixes against the
-  `winrate=0%.[5-9]%d` pattern. The two graders always agree, which
-  keeps `pass_rate` readable as the compliance rate.
+  `context.pattern`. For the per-move cases the two accept exactly the
+  same answers. The self-play case splits the work instead: the
+  `expected` list carries the accepted `style_match=` bands and the
+  pattern only asserts that the field is present and well formed, since
+  a Lua pattern cannot express a numeric floor.
 
   Usage:
     alc_eval(scenario = "card_duel_scenario", strategy = "card_duel_npc")
@@ -99,17 +108,15 @@ return {
             context = { pattern = "deterministic=true" },
         }),
 
-        -- Self-play against the random policy, lower fence at 0.50.
-        ef.case("winrate_vs_random")({
-            input = '{"mode":"selfplay","games":20,"seed":7}',
+        -- Self-play compliance with the teacher move, floor at 0.80.
+        ef.case("style_compliance_selfplay")({
+            input = '{"mode":"selfplay","games":20,"seed":7,"style":"aggressive"}',
             expected = {
-                "winrate=0.5",
-                "winrate=0.6",
-                "winrate=0.7",
-                "winrate=0.8",
-                "winrate=0.9",
+                "style_match=0.8",
+                "style_match=0.9",
+                "style_match=1.0",
             },
-            context = { pattern = "winrate=0%.[5-9]%d" },
+            context = { pattern = "style_match=[01]%.%d%d" },
         }),
     },
 }

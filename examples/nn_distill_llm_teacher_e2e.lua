@@ -27,7 +27,10 @@
 --   Card / loss / ckpt contract (8-10)
 --     8  card_meta_shape             — training_path="distillation",
 --                                       hyperparams.loss_kind="ce",
---                                       bundle_ref="nn/<card_id>"
+--                                       bundle_ref="nn/<card_id>",
+--                                       candle.device / candle.dtype
+--                                       record the training-time target
+--                                       ("cpu"/"f32" on this run)
 --     9  loss_descended              — final loss below the ln(50257)=10.825
 --                                       random baseline
 --     10 ckpt_file_exists            — <nn_dir>/<card_id>.safetensors landed
@@ -294,7 +297,13 @@ run("card_meta_shape", function()
                 .. ")"
         )
     end
-    return "training_path=distillation loss_kind=ce bundle_ref ok"
+    if nn.candle.device ~= "cpu" then
+        error("candle.device = " .. tostring(nn.candle.device) .. " (want cpu)")
+    end
+    if nn.candle.dtype ~= "f32" then
+        error("candle.dtype = " .. tostring(nn.candle.dtype) .. " (want f32)")
+    end
+    return "training_path=distillation loss_kind=ce bundle_ref/device/dtype ok"
 end)
 
 -- ── Phase 9: loss curve inspection ──────────────────────────────────

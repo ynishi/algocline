@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `alc.nn`: trained Cards now round-trip the training-time device
+  and dtype. `NnModelCard::from_training` used to write
+  `candle.device = None` / `candle.dtype = None` regardless of the
+  handle's build target, so a GPU-trained Card silently reloaded on
+  CPU/f32 (the arch default from `Gpt2Config::tiny()`). The three
+  `run_*` trainers now project the strings off the handle and pass
+  them through; `load_handle`'s existing
+  `apply_candle_branch_device_dtype` path picks them up, so
+  `alc.card.get(id).metadata.nn.candle.device` / `dtype` are now
+  present and drive the reload target. (Breaking for direct Rust
+  callers of `NnModelCard::from_training` only: two new trailing
+  `Option<String>` params. The Card wire shape stays additive —
+  older Cards without the fields still deserialize.)
+
 - `alc.nn`: `Gpt2Handle:kv_heads()` reported the head count (2)
   instead of the configured KV-head count (1) for GQA custom
   models — the handle previously hard-mirrored `self.heads` into

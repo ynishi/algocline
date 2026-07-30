@@ -607,6 +607,15 @@ impl NnModelCard {
     /// `custom` records the architecture shape for runs whose config
     /// set `Gpt2Config::custom`; pass `None` for reference-architecture
     /// runs, whose shape is already implied by `architecture`.
+    ///
+    /// `device` / `dtype` record the training-time device and dtype
+    /// string ("cpu" / "cuda" / "metal", "f32" / "f16" / "bf16", …)
+    /// so `load_handle` restores the same target instead of silently
+    /// falling back to the arch default (which is CPU / f32 for
+    /// `Gpt2Config::tiny()`). Pass the same `None` pair the older
+    /// signature implied when the caller has no handle-level target
+    /// to record.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_training(
         id: CardId,
         name: &str,
@@ -615,6 +624,8 @@ impl NnModelCard {
         ckpt: &Checkpoint,
         cfg: &FullFtConfig,
         custom: Option<NnCustomBranch>,
+        device: Option<String>,
+        dtype: Option<String>,
     ) -> Result<Self, String> {
         let training_path = path.as_str().to_string();
         let (lora, loss_kind) = match path {
@@ -638,8 +649,8 @@ impl NnModelCard {
 
         let candle = NnCandleBranch {
             bundle_ref: id.bundle_ref(),
-            device: None,
-            dtype: None,
+            device,
+            dtype,
             lora,
             custom,
         };
@@ -1058,6 +1069,8 @@ mod tests {
             &test_ckpt(),
             &FullFtConfig::default(),
             Some(sample_custom_branch()),
+            None,
+            None,
         )
         .expect("from_training");
         let branch = card
@@ -1179,6 +1192,8 @@ mod tests {
             &test_ckpt(),
             &FullFtConfig::default(),
             None,
+            None,
+            None,
         )
         .expect("from_training");
 
@@ -1195,6 +1210,30 @@ mod tests {
             Some(&serde_json::json!(1.25))
         );
         assert!(meta.hyperparams.get("loss_kind").is_none());
+        assert!(
+            candle.device.is_none(),
+            "None device is preserved as absent"
+        );
+        assert!(candle.dtype.is_none(), "None dtype is preserved as absent");
+    }
+
+    #[test]
+    fn from_training_records_device_and_dtype_when_supplied() {
+        let card = NnModelCard::from_training(
+            CardId::mint("gpu-run"),
+            "gpu-run",
+            "gpt2-medium".into(),
+            TrainingPath::FullFt,
+            &test_ckpt(),
+            &FullFtConfig::default(),
+            None,
+            Some("cuda".into()),
+            Some("bf16".into()),
+        )
+        .expect("from_training");
+        let candle = card.meta().candle.as_ref().expect("candle branch");
+        assert_eq!(candle.device.as_deref(), Some("cuda"));
+        assert_eq!(candle.dtype.as_deref(), Some("bf16"));
     }
 
     #[test]
@@ -1208,6 +1247,8 @@ mod tests {
             },
             &test_ckpt(),
             &FullFtConfig::default(),
+            None,
+            None,
             None,
         )
         .expect("from_training");
@@ -1235,6 +1276,8 @@ mod tests {
             TrainingPath::Lora(branch),
             &test_ckpt(),
             &FullFtConfig::default(),
+            None,
+            None,
             None,
         )
         .expect("from_training");

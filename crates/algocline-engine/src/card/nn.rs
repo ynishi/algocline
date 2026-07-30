@@ -74,6 +74,8 @@ mod tests {
             &ckpt,
             &FullFtConfig::default(),
             None,
+            None,
+            None,
         )
         .expect("test card")
     }

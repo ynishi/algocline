@@ -2763,6 +2763,20 @@ pub(super) fn custom_branch_of_gpt2(
     Ok(branch)
 }
 
+/// Project the training-time device / dtype off a handle for
+/// [`NnModelCard::from_training`]. Both slots come back as
+/// `Some(&str)`-derived owned strings so the load path
+/// (`apply_candle_branch_device_dtype`) restores the exact target
+/// instead of silently falling back to the arch default (which is
+/// CPU / f32 for `Gpt2Config::tiny()`). All shipped handles record
+/// device / dtype as strings already (`Gpt2Handle::device` /
+/// `TinyLlamaHandle::device` / …), so the projection is exact — no
+/// stringification, no `Device::*` variant to translate here.
+pub(super) fn candle_branch_device_dtype_of(handle: &NnHandle) -> (Option<String>, Option<String>) {
+    let meta = handle.meta();
+    (Some(meta.device.to_string()), Some(meta.dtype.to_string()))
+}
+
 /// Test-only helper: swap the recorded `dtype` string on a
 /// [`Gpt2Handle`] without rebuilding the underlying model. Used by the
 /// L5b/L5c bridge tests to exercise the f16 handle-time guard

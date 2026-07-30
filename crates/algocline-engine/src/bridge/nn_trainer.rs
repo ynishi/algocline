@@ -105,8 +105,8 @@ use crate::card::nn::persist;
 use crate::card::FileCardStore;
 
 use super::nn_card::{
-    custom_branch_of_gpt2, guard_base_dtype_for_training, DatasetHandle, Gpt2Handle, LlamaHandle,
-    NnHandle, TinyLlamaHandle,
+    candle_branch_device_dtype_of, custom_branch_of_gpt2, guard_base_dtype_for_training,
+    DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle,
 };
 use super::nn_opts::{
     extract_distill_loss_kind, extract_lora_cfg, extract_run_train_cfg, train_err_to_lua,
@@ -291,6 +291,7 @@ fn run_lora_ft_impl(
     //    lookup outside the training-loop critical section.
     let base_bundle_ref = bundle_ref_for(&handle.arch_family_variant());
     let architecture = handle.arch_family_variant();
+    let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
     // Same "before any lock" rule: reading the custom spec takes the
     // model mutex briefly (see `custom_branch_of_gpt2`), so it happens
     // here rather than nested inside the training critical section.
@@ -405,6 +406,8 @@ fn run_lora_ft_impl(
         &ckpt,
         &train_cfg,
         custom,
+        device_str,
+        dtype_str,
     )
     .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_lora_ft: {e}")))?;
 
@@ -550,6 +553,7 @@ fn run_full_ft_impl(
     //    `custom_branch_of_gpt2`).
     let architecture = handle.arch_family_variant();
     let custom = custom_branch_of_gpt2(RUN_FULL_FT_ERR_PREFIX, &handle)?;
+    let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
 
     // 9. Fresh per-call TrainingLease (design §0, matches
     //    run_lora_ft_impl step 9).
@@ -652,6 +656,8 @@ fn run_full_ft_impl(
         &ckpt,
         &train_cfg,
         custom,
+        device_str,
+        dtype_str,
     )
     .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))?;
 
@@ -799,6 +805,7 @@ fn run_distill_impl(
     //    same rationale as the siblings).
     let architecture = handle.arch_family_variant();
     let custom = custom_branch_of_gpt2(RUN_DISTILL_ERR_PREFIX, &handle)?;
+    let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
 
     // 9. Fresh per-call TrainingLease (design §0, matches the
     //    siblings).
@@ -897,6 +904,8 @@ fn run_distill_impl(
         &ckpt,
         &spec.hyperparams,
         custom,
+        device_str,
+        dtype_str,
     )
     .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: {e}")))?;
 

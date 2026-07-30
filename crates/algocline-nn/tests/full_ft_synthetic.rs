@@ -404,23 +404,34 @@ fn concurrency_lease_prevents_double_training() {
 }
 
 /// `grad_accum > 1` must be numerically equivalent to a single-micro run
-/// with `batch_size * grad_accum` samples. The corpus is deterministic
-/// (`synthetic_corpus` repeats a single 8-token row and `shuffle=false`
-/// in `DatasetOpts`), so both runs consume identical token content —
-/// the only difference is whether the loop batches once or accumulates
-/// over `N` micro-batches. `CrossEntropyLoss` uses mean reduction, so on
-/// identical rows the mean-of-per-micro losses equals the per-batch
-/// loss, and the pre-backward `1/N` scaling makes the summed gradient
-/// equal to the mean gradient. The remaining drift is BF16 rounding and
-/// scalar-multiply ordering — ~15-20% relative tolerance is generous
-/// enough to absorb both without hiding a real regression.
+/// with `batch_size * grad_accum` samples. Both paths start from the
+/// **same random initial weights** — a fresh `VarMap` is created once,
+/// snapshotted to safetensors before either run touches it, and Path B
+/// reloads from that snapshot into a rebuilt model. Without this shared
+/// snapshot the paths would diverge from independent inits and the
+/// relative drift would swamp the equivalence signal.
+///
+/// The corpus is deterministic (`synthetic_corpus` repeats a single
+/// 8-token row and `shuffle=false` in `DatasetOpts`), so both runs
+/// consume identical token content. `CrossEntropyLoss` uses mean
+/// reduction, so on identical rows the mean-of-per-micro losses equals
+/// the per-batch loss, and the pre-backward `1/N` scaling makes the
+/// summed gradient equal to the mean gradient. The remaining drift is
+/// F32 rounding and scalar-multiply ordering — ~10% relative tolerance
+/// is tight enough to catch a real regression but forgiving of the
+/// last-bit noise that CPU stochastic ordering introduces.
 #[test]
 fn grad_accum_matches_equivalent_batch() {
     let steps = 40usize;
+    let init_tmp = TempDir::new().unwrap();
+    let init_snapshot = init_tmp.path().join("init.safetensors");
 
-    // Path A: single-micro path with batch_size = 4.
+    // Path A: single-micro path with batch_size = 4. Snapshot the
+    // initial weights before training so Path B can restart from the
+    // same point in weight space.
     let min_loss_a = {
         let (_cfg, vm, model) = tiny_model();
+        vm.save(&init_snapshot).expect("snapshot initial weights");
         let corpus = synthetic_corpus(steps * 4 + 8);
         let mut dataset = TokenizedDataset::new(corpus, dataset_opts_for_seq_batched(8, 4));
         let loss = CrossEntropyLoss::new();
@@ -454,9 +465,12 @@ fn grad_accum_matches_equivalent_batch() {
             .expect("min_train_loss must be recorded")
     };
 
-    // Path B: grad_accum = 4 with batch_size = 1.
+    // Path B: grad_accum = 4 with batch_size = 1. Reload the same
+    // initial weights so the equivalence claim tests the loop shape,
+    // not the two independent random inits.
     let min_loss_b = {
-        let (_cfg, vm, model) = tiny_model();
+        let (_cfg, mut vm, model) = tiny_model();
+        vm.load(&init_snapshot).expect("restore initial weights");
         let corpus = synthetic_corpus(steps * 4 + 8);
         let mut dataset = TokenizedDataset::new(corpus, dataset_opts_for_seq_batched(8, 1));
         let loss = CrossEntropyLoss::new();
@@ -492,10 +506,10 @@ fn grad_accum_matches_equivalent_batch() {
 
     let rel = (min_loss_a - min_loss_b).abs() / min_loss_a.abs().max(1e-6);
     assert!(
-        rel < 0.20,
-        "expected grad_accum=4 to match single-micro path within 20% \
-         relative tolerance; got min_loss_a={min_loss_a}, \
-         min_loss_b={min_loss_b}, rel={rel}"
+        rel < 0.10,
+        "expected grad_accum=4 to match single-micro path within 10% \
+         relative tolerance (both paths start from the same snapshot); \
+         got min_loss_a={min_loss_a}, min_loss_b={min_loss_b}, rel={rel}"
     );
 }
 

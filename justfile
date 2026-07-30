@@ -73,6 +73,7 @@ test-nn:
     cargo test -p algocline-engine --features nn --lib
     cargo test -p algocline-engine --features nn --test nn_bridge_smoke
     cargo test -p algocline-engine --features nn --test nn_distill_teacher_card_e2e
+    cargo test -p algocline-engine --features nn --test gameai_smoke_test
 
 # Clippy for the nn-feature layer. `just clippy` runs the default (nn off)
 # workspace clippy; this recipe closes the gap for the `--features nn` code

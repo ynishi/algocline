@@ -25,6 +25,21 @@ fn prelude_path() -> PathBuf {
         .join("prelude.lua")
 }
 
+/// Absolute path to the workspace-root `examples/gameai/` directory.
+///
+/// Resolved from `CARGO_MANIFEST_DIR` (which points at
+/// `crates/algocline-engine/`) rather than the process CWD, which
+/// differs between `cargo test` and IDE runners.
+fn gameai_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("engine crate parent (crates/)")
+        .parent()
+        .expect("workspace root")
+        .join("examples")
+        .join("gameai")
+}
+
 /// Execute one spec file and translate per-test results into a single
 /// Rust assertion. Per-spec setup errors (Err from `run_tests`) and per-test
 /// failures both panic with the spec name and the offending test list.
@@ -68,6 +83,17 @@ fn bridge_spec() {
     // always inject an absolute path resolved from CARGO_MANIFEST_DIR.
     std::env::set_var("PRELUDE_PATH", prelude_path());
     run_spec("bridge_test.lua");
+}
+
+#[test]
+fn card_duel_rules_spec() {
+    // card_duel_rules_test.lua reads `ALC_TEST_GAMEAI_DIR` to put
+    // `examples/gameai/?/init.lua` on `package.path`. The spec stubs
+    // `alc.math` itself, so no bridge is needed and this runs on the
+    // default feature set (the `nn` half is fenced by
+    // `tests/gameai_smoke_test.rs`).
+    std::env::set_var("ALC_TEST_GAMEAI_DIR", gameai_dir());
+    run_spec("card_duel_rules_test.lua");
 }
 
 #[test]

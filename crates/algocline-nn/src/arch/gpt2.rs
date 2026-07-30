@@ -285,6 +285,25 @@ impl Gpt2Config {
             _ => None,
         }
     }
+
+    /// Effective KV-head count for GQA-aware accessors and shape math.
+    ///
+    /// MHA — the reference and every named preset (`custom = None`) —
+    /// reports `heads`, so every query head has its own key/value head.
+    /// A custom spec that opts into GQA (`custom.kv_heads = Some(k)`)
+    /// reports the explicit `k`; `Some(1)` is MQA.
+    ///
+    /// This is the single source of truth for the KV-head count both
+    /// the [`Block`] builder and the Lua-facing `Gpt2Handle::meta`
+    /// accessor read from — the bridge previously mirrored `heads`
+    /// here, which silently misreported GQA models to Lua callers even
+    /// though the internal forward pass used the correct value.
+    pub fn effective_kv_heads(&self) -> usize {
+        self.custom
+            .as_ref()
+            .and_then(|c| c.kv_heads)
+            .unwrap_or(self.heads)
+    }
 }
 
 /// A single GPT-2 transformer block.
@@ -379,7 +398,7 @@ impl Block {
         let head_dim = cfg.dim / cfg.heads;
         let custom = cfg.custom.clone().unwrap_or_default();
         let norm_kind = custom.norm;
-        let kv_heads = custom.kv_heads.unwrap_or(cfg.heads);
+        let kv_heads = cfg.effective_kv_heads();
         let ln_1 = Norm::new(norm_kind, cfg.dim, cfg.eps, vs.pp("ln_1"))?;
         let resid_stdev = residual_init_stdev(cfg.layers);
         let attn_vs = vs.pp("attn");
@@ -1933,6 +1952,56 @@ mod tests {
         let d: Vec<Vec<f32>> = dist.to_vec2().unwrap();
         assert_eq!(d[2][0], 2.0);
         assert_eq!(d[2][2], 0.0);
+    }
+
+    #[test]
+    fn effective_kv_heads_mha_reports_full_head_count() {
+        // Reference / named preset: `custom = None` → MHA, kv == heads.
+        let cfg = tiny_cfg();
+        assert_eq!(cfg.effective_kv_heads(), cfg.heads);
+        assert_eq!(cfg.effective_kv_heads(), 2);
+    }
+
+    #[test]
+    fn effective_kv_heads_custom_default_still_reports_full_head_count() {
+        // `custom = Some(default)` leaves `kv_heads = None`, which is
+        // spec-equivalent to MHA — must still report `heads`.
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom::default()),
+            ..tiny_cfg()
+        };
+        assert_eq!(cfg.effective_kv_heads(), cfg.heads);
+    }
+
+    #[test]
+    fn effective_kv_heads_gqa_reports_explicit_value() {
+        // `custom.kv_heads = Some(1)` (MQA on a 2-head base) — the
+        // accessor must report 1, not silently mirror `heads`.
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                kv_heads: Some(1),
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        assert_eq!(cfg.effective_kv_heads(), 1);
+    }
+
+    #[test]
+    fn effective_kv_heads_ignores_unrelated_custom_axes() {
+        // Axes orthogonal to attention (`mlp_ratio`, `untied_head`)
+        // must not perturb the KV-head count — only `kv_heads`
+        // influences the result.
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                mlp_ratio: 3,
+                untied_head: true,
+                kv_heads: Some(2),
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        assert_eq!(cfg.effective_kv_heads(), 2);
     }
 
     #[test]

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn`: `Gpt2Config::effective_kv_heads(&self)` as the SoT for
+  the "custom.kv_heads.unwrap_or(heads)" projection used across
+  build / reload / LoRA-wrap paths.
+
+### Fixed
+
+- `alc.nn`: `Gpt2Handle:kv_heads()` reported the head count (2)
+  instead of the configured KV-head count (1) for GQA custom
+  models — the handle previously hard-mirrored `self.heads` into
+  its `meta()` projection. `Gpt2Handle` now carries a first-class
+  `kv_heads` field wired from the resolved config at every
+  construction site (preset build, `load_handle` reload,
+  `wrap_gpt2_lora_from_meta`, and the Lua-facing LoRA wrap), so a
+  Lua caller that trusts the accessor for KV-cache sizing or a GQA
+  branch no longer wires against a wrong value. Forward passes were
+  correct in every version (the model always used the config's
+  `kv_heads`); only the Lua accessor was wrong. TinyLlama was not
+  affected — `TinyLlamaHandle` has always carried `kv_heads` as a
+  first-class field.
+
 - `alc.nn`: custom-variant cards are now reloadable. Cards produced by
   training a `alc.nn.preset.gpt2("custom", ...)` student record their
   full shape (vocab / ctx / layers / heads / dim plus every

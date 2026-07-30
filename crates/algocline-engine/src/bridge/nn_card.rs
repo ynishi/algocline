@@ -561,6 +561,7 @@ fn wrap_gpt2_lora_from_meta(
     let variant = base.variant.clone();
     let layers = base.layers;
     let heads = base.heads;
+    let kv_heads = base.kv_heads;
     let dim = base.dim;
     let ctx_len = base.ctx;
     let vocab = base.vocab;
@@ -586,6 +587,7 @@ fn wrap_gpt2_lora_from_meta(
         variant,
         layers,
         heads,
+        kv_heads,
         dim,
         ctx: ctx_len,
         vocab,
@@ -718,6 +720,7 @@ pub(super) fn wrap_gpt2_lora_bridge(base: &Gpt2Handle, cfg: &LoraConfig) -> LuaR
     let variant = base.variant.clone();
     let layers = base.layers;
     let heads = base.heads;
+    let kv_heads = base.kv_heads;
     let dim = base.dim;
     let ctx_len = base.ctx;
     let vocab = base.vocab;
@@ -739,6 +742,7 @@ pub(super) fn wrap_gpt2_lora_bridge(base: &Gpt2Handle, cfg: &LoraConfig) -> LuaR
         variant,
         layers,
         heads,
+        kv_heads,
         dim,
         ctx: ctx_len,
         vocab,
@@ -1241,6 +1245,18 @@ pub(super) struct Gpt2Handle {
     variant: String,
     layers: usize,
     heads: usize,
+    /// KV head count for GQA-aware accessors.
+    ///
+    /// MHA — the reference and every named preset — stores
+    /// `kv_heads == heads`. A `custom = Some(spec)` build that opts
+    /// into GQA (`spec.kv_heads = Some(k)`) stores the explicit `k`.
+    /// This is populated at construction time from
+    /// [`Gpt2Config::effective_kv_heads`] and read back by
+    /// [`Self::meta`]; the two sides must stay in lockstep — mirroring
+    /// `heads` in the accessor here (instead of storing the config's
+    /// value) silently misreports GQA models to Lua callers even
+    /// though the forward pass uses the correct value.
+    kv_heads: usize,
     dim: usize,
     ctx: usize,
     vocab: usize,
@@ -1271,18 +1287,20 @@ impl mlua::UserData for Gpt2Handle {
 impl Gpt2Handle {
     /// Arch-neutral projection of this handle. See [`HandleMeta`].
     ///
-    /// `kv_heads` mirrors `heads`: GPT-2 is multi-head attention, so
-    /// every query head has its own key/value head. Reporting the
-    /// mirrored value (rather than omitting the accessor) keeps Lua
-    /// callers from having to branch on `handle:arch()` when they only
-    /// want the KV group count for a shape assertion.
+    /// `kv_heads` reports the value the handle was built with
+    /// ([`Gpt2Config::effective_kv_heads`]): MHA (the reference and
+    /// every named preset) reports `heads`; a `custom` build that opts
+    /// into GQA (`custom.kv_heads = Some(k)`) reports the explicit `k`.
+    /// The accessor previously mirrored `self.heads` unconditionally,
+    /// which silently misreported GQA custom models to Lua callers
+    /// even though the internal forward pass used the correct value.
     fn meta(&self) -> HandleMeta<'_> {
         HandleMeta {
             family: "gpt2",
             variant: &self.variant,
             layers: self.layers,
             heads: self.heads,
-            kv_heads: self.heads,
+            kv_heads: self.kv_heads,
             dim: self.dim,
             ctx: self.ctx,
             vocab: self.vocab,
@@ -1638,6 +1656,13 @@ fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult
         variant: meta.architecture.clone(),
         layers: cfg.layers,
         heads: cfg.heads,
+        // Recovers `custom.kv_heads` for GQA cards; MHA cards keep
+        // `kv_heads == heads`. Uses the same SoT the build path does
+        // so a train → save → reload round-trip preserves the GQA
+        // shape all the way through to the Lua accessor — the
+        // previous mirror-of-`heads` in `Gpt2Handle::meta` silently
+        // hid the reloaded value from Lua callers.
+        kv_heads: cfg.effective_kv_heads(),
         dim: cfg.dim,
         ctx: cfg.ctx,
         vocab: cfg.vocab,
@@ -2267,6 +2292,10 @@ pub(super) fn build_gpt2_handle(
         variant: variant.to_string(),
         layers: cfg.layers,
         heads: cfg.heads,
+        // SoT for both the internal `Block` builder and this Lua-facing
+        // handle field — see `Gpt2Config::effective_kv_heads` for the
+        // MHA / GQA resolution rule.
+        kv_heads: cfg.effective_kv_heads(),
         dim: cfg.dim,
         ctx: cfg.ctx,
         vocab: cfg.vocab,

@@ -633,6 +633,81 @@ fn alc_nn_run_full_ft_custom_card_load_handle_roundtrip() {
     .expect("custom run_full_ft -> card.load_handle round-trip");
 }
 
+/// Regression guard for the GPT-2 GQA `kv_heads` accessor.
+///
+/// `Gpt2Handle::meta` used to hard-mirror `self.heads` into the
+/// `kv_heads` slot of the shared accessor, so a `custom` build that
+/// opted into GQA (`kv_heads = 1` on a 2-head base) misreported
+/// `h:kv_heads() == 2` to Lua callers even though the internal
+/// `Block` builder used the correct `1`. The forward pass stayed
+/// numerically sound, but any Lua caller that trusted `:kv_heads()`
+/// for a KV-cache size estimate or a GQA branch selector silently
+/// wired the wrong value.
+///
+/// The reload path (`alc.nn.card.load_handle`) is a fresh consumer of
+/// the same handle field — the `custom_bundle_reloads_from_safetensors`
+/// unit test in the `nn` crate proves the config round-trips through
+/// the bundle, but the Lua-facing accessor is only exercisable
+/// through the engine bridge. Both build and reload must pin
+/// `:kv_heads() == 1` here.
+#[test]
+fn alc_nn_gpt2_custom_gqa_reports_configured_kv_heads_build_and_reload() {
+    let (lua, _tmp) = production_vm();
+    lua.load(
+        r#"
+        local h = alc.nn.preset.gpt2("custom", {
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+            kv_heads = 1,
+            vocab = 96,
+            ctx = 16,
+        })
+        assert(h:heads() == 2, "tiny base has 2 query heads")
+        assert(h:kv_heads() == 1,
+            "GQA build path must report the configured kv_heads (got " ..
+            tostring(h:kv_heads()) .. "), not mirror :heads()")
+
+        -- Round-trip the shape through train -> Card -> reload so the
+        -- reload path (`gpt2_from_safetensors`) is also pinned. Two
+        -- training steps are enough to close the save side; the
+        -- accessor assertion below covers the load side.
+        local rows = {}
+        for r = 1, 8 do
+            local row = {}
+            for j = 1, 8 do row[j] = ((r + j) % 90) + 1 end
+            rows[r] = row
+        end
+        local ds = alc.nn.data.synthetic(rows, {
+            batch_size = 1,
+            ctx_len = 8,
+            shuffle = false,
+            pad_id = 0,
+        })
+        local card_id = alc.nn.trainer.run_full_ft(h, ds, {
+            lr = 1e-3,
+            batch = 1,
+            steps = 2,
+            warmup = 0,
+            schedule = "Constant",
+            name = "kv_heads_regression",
+        })
+        assert(type(card_id) == "string" and #card_id > 0,
+            "run_full_ft must return a non-empty card_id")
+
+        local reloaded = alc.nn.card.load_handle(card_id)
+        assert(reloaded ~= nil, "load_handle returned nil")
+        assert(reloaded:heads() == 2,
+            "reloaded heads mismatch: " .. tostring(reloaded:heads()))
+        assert(reloaded:kv_heads() == 1,
+            "GQA reload path must report the configured kv_heads (got " ..
+            tostring(reloaded:kv_heads()) .. "), not mirror :heads()")
+    "#,
+    )
+    .exec()
+    .expect("gpt2 custom GQA kv_heads must survive build + reload");
+}
+
 /// The stateless session backend on a trainable GPT-2 handle: the
 /// decode loop written for Llama sessions runs unchanged, including
 /// the no-pending-tokens guard.

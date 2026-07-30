@@ -23,14 +23,16 @@ pushes — every remediation is a judgment for the caller.
 
 - **Do**: read the repo's `justfile` to confirm the target recipes exist;
   invoke each pre-push recipe (default: the sub-recipes of `just ci` =
-  `fmt-check` → `lua-fmt-check` → `clippy` → `test` → `check-invariants` →
-  `check-agent-index`, run individually so a failure of step N does not
-  hide steps N+1..); capture each recipe's exit code plus a stderr/stdout
-  tail (~30 lines); aggregate a step table and a single top-level
-  `VERDICT: PASS | BLOCKED`; when BLOCKED, surface a short `Fix hints`
-  section pointing the caller at the likely remediation (e.g. `cargo fmt
-  --all` for fmt-check drift, `stylua <path>` for lua-fmt-check drift) —
-  hints only, no execution.
+  `fmt-check` → `lua-fmt-check` → `clippy` → `clippy-nn` → `test` →
+  `test-nn` → `check-invariants` → `check-agent-index`, run individually
+  so a failure of step N does not hide steps N+1..); capture each
+  recipe's exit code plus a stderr/stdout tail (~30 lines); aggregate a
+  step table and a single top-level `VERDICT: PASS | BLOCKED`; when
+  BLOCKED, surface a short `Fix hints` section pointing the caller at
+  the likely remediation (e.g. `cargo fmt --all` for fmt-check drift,
+  `stylua <path>` for lua-fmt-check drift) — hints only, no execution.
+  The `ci:` recipe list is parsed at runtime; the enumeration here is
+  documentary only and stays in sync automatically.
 - **Don't**: run autofix commands (`cargo fmt --all`, `stylua <path>`,
   `cargo clippy --fix`); edit any source file; run `cargo install` /
   `cargo build` outside the recipe scope; commit, tag, or push; touch the
@@ -45,9 +47,10 @@ The caller (main thread) provides:
 
 - `mode`: one of
   - `full` (default) — run every sub-recipe of `just ci` individually
-  - `quick` — skip `test` and `check-invariants` (useful when the caller
-    just wants to know if fmt / clippy would block; still catches the
-    `cargo fmt --check` class of drift that motivated this agent)
+  - `quick` — skip `test`, `test-nn`, and `check-invariants` (useful
+    when the caller just wants to know if fmt / clippy would block;
+    still catches the `cargo fmt --check` class of drift that
+    motivated this agent)
   - `custom` — obey `recipes` below verbatim
 - optional `recipes`: an ordered list of recipe names (e.g.
   `["fmt-check", "lua-fmt-check", "clippy"]`), required when

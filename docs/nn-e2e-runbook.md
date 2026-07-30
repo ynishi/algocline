@@ -12,7 +12,11 @@ Lua author would touch: `alc.nn.preset.*`, `alc.nn.data.*`,
 `alc.card.get`, plus the trainable handles' `generate_session` /
 stateless backend.
 
-Script: `examples/nn_fullft_shakespeare_e2e.lua`.
+Scripts:
+
+- `examples/nn_fullft_shakespeare_e2e.lua` — Full FT path (15 phases)
+- `examples/nn_lora_shakespeare_e2e.lua` — LoRA path (15 phases, see
+  [LoRA path](#lora-path-nn_lora_shakespeare_e2elua) below)
 
 ## When to run it
 
@@ -119,12 +123,59 @@ Reference numbers from a CPU (M-series) run:
   contract regressed — check whether an opts-extraction refactor
   dropped the surface prefix argument.
 
+## LoRA path (`nn_lora_shakespeare_e2e.lua`)
+
+Same corpus, same invocation shape — point `code_file` at
+`examples/nn_lora_shakespeare_e2e.lua` instead. Exercises the LoRA
+one-call trainer, the Δ-only checkpoint contract, the
+`load_wrap` composition path, and the merge export:
+
+| # | Phase | Verifies |
+|---|---|---|
+| 1-3 | `corpus_fetch` / `tokenize_and_chunk` / `dataset_build` | Same as Full FT phases 1/2/4 |
+| 4 | `base_preset_build` | Fresh from-scratch base; dedicated to Phase 5 (run_lora_ft wraps the base model in place, so the handle is never reused) |
+| 5 | `lora_train_completed` | `alc.nn.trainer.run_lora_ft` trains the Δ **and** registers a Card in one call (rank=4, alpha=8, default target_modules) |
+| 6 | `lora_card_meta_shape` | `training_path="lora"`, `candle.lora` carries rank / alpha / `base_bundle_ref="nn/gpt2-tiny"` / the 6-entry gpt2 default target set, `bundle_ref="nn/<card_id>"` |
+| 7 | `lora_loss_descended` | Final loss < 4.05 (baseline ln 64 ≈ 4.158). LoRA has less capacity than Full FT here — the embedding and LM head stay frozen at random init, so the descent is smaller |
+| 8 | `delta_file_exists` | The Δ-only safetensors exists at `candle.lora.delta_path`; a LoRA card has **no** `<nn_dir>/<card_id>.safetensors` |
+| 9 | `load_handle_refusal` | `load_handle(lora_card_id)` is a designed refusal naming `training_path="lora"` and directing to `load_wrap` |
+| 10 | `load_wrap_roundtrip` | `alc.nn.card.load_wrap(card_id, fresh_base)` returns a wrapped NnHandle |
+| 11 | `wrapped_generates` | The wrapped handle exposes `generate_session` (stateless backend) |
+| 12 | `merge_export` | `alc.nn.card.merge_lora(wrapped, {name, lora_card})` registers a `training_path="merged"` Card with `lineage.parent = lora_card_id` |
+| 13 | `merged_load_generates` | The merged Card loads standalone via `load_handle` (no base needed) and generates |
+| 14 | `merged_parity_with_wrapped` | 12 greedy tokens byte-identical between the wrapped (base + Δ composed at forward time) and merged (Δ materialised) handles |
+| 15 | `strict_validation_prefixes` | `run_lora_ft` refuses (a) missing `rank` / (b) unknown target module / (c) `dropout = 1.5` / (d) an already-wrapped base, each with the `alc.nn.trainer.run_lora_ft` prefix |
+
+Reference numbers from a CPU (M-series) run:
+
+- Phase 7 final loss: ~3.97 (stable to 3 decimals across runs)
+- Total elapsed: ~5-7 s
+
+LoRA-specific failure notes:
+
+- **Phase 7 red** — the LoRA Δ did not descend. Check the
+  `run_lora_ft` dispatch in
+  `crates/algocline-engine/src/bridge/nn_trainer.rs` and the wrap
+  path in `crates/algocline-nn/src/arch/lora.rs`.
+- **Phase 14 red** — the merged export lost or distorted the Δ.
+  Compare with the Rust parity tests
+  (`crates/algocline-nn/tests/merged_export_parity_gpt2.rs`).
+- **opts gotcha** — the `run_*` trainer family wants `batch` and the
+  `"CosineWithWarmup"` / `"Constant"` schedule vocabulary; the
+  low-level `alc.nn.trainer.lora` wants `batch_size` and lower-case
+  `"cosine"` / `"constant"`. Copy-pasting opts across the two
+  families fails on `opts.batch` / `opts.schedule`.
+
 ## Cleanup
 
-The script writes only under `cache_dir` (default `target/nn-e2e`),
+Both scripts write only under `cache_dir` (default `target/nn-e2e`),
 which is inside `target/` and therefore always gitignored. Remove it
 manually if you want a fresh run:
 
 ```
 rm -rf target/nn-e2e
 ```
+
+The one-call trainers additionally register Cards (and write
+safetensors) under `~/.algocline/nn/` on every run; prune old
+`shakespeare-*` cards there if the accumulation bothers you.

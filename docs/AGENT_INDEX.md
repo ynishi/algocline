@@ -54,6 +54,9 @@ want one.
 
 - `tests/e2e.rs` — MCP tool E2E via `rmcp` client + child `alc` process. New
   MCP tools / params must add E2E cases here
+- [docs/nn-e2e-runbook.md](nn-e2e-runbook.md) — end-to-end runbook for
+  `alc.nn.*` (train + Card round-trip + sampler / hyperparam reflection +
+  loud-error prefix contract). Script: `examples/nn_fullft_shakespeare_e2e.lua`
 - `cargo insta review` (or `just snapshots`) — review snapshot diffs
 
 ## Release

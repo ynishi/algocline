@@ -17,6 +17,10 @@ Scripts:
 - `examples/nn_fullft_shakespeare_e2e.lua` — Full FT path (15 phases)
 - `examples/nn_lora_shakespeare_e2e.lua` — LoRA path (15 phases, see
   [LoRA path](#lora-path-nn_lora_shakespeare_e2elua) below)
+- `examples/nn_distill_llm_teacher_e2e.lua` — Distillation path with a
+  live LLM teacher (13 phases, see
+  [Distillation path](#distillation-path-nn_distill_llm_teacher_e2elua)
+  below)
 
 ## When to run it
 
@@ -166,9 +170,55 @@ LoRA-specific failure notes:
   `"cosine"` / `"constant"`. Copy-pasting opts across the two
   families fails on `opts.batch` / `opts.schedule`.
 
+## Distillation path (`nn_distill_llm_teacher_e2e.lua`)
+
+Same invocation shape, but the run **pauses once**: Phase 1 issues a
+single `alc.llm_batch` carrying 12 teacher prompts and `alc_run`
+returns `status: "needs_response"` with the query batch. Answer the
+queries — the sanctioned pattern is dispatching the `@alc-eval` agent
+with the desired teacher model (e.g. `model=haiku`) so the teacher is
+whichever LLM answers the pause, with no direct API billing — and the
+script resumes through Phase 13 with no further pauses. This
+exercises the AnyModel-routing shape end to end: the teacher signal
+is plain text, which is exactly what the hard-label CE distill loss
+consumes (KL soft targets are deferred).
+
+| # | Phase | Verifies |
+|---|---|---|
+| 1 | `teacher_collect` | One `alc.llm_batch` pause returns a non-empty response per prompt |
+| 2 | `teacher_card_created` | `alc.card.create` with Tier 1 `metadata.loss_mask = "response"` |
+| 3 | `samples_written` | `alc.card.write_samples` (write-once) lands 48 rows (12 pairs × 4 — `TeacherCardDataset` does not wrap, so rows ≥ steps × batch) |
+| 4 | `samples_roundtrip` | `alc.card.read_samples` returns the rows with `prompt` / `response` fields |
+| 5 | `dataset_built` | `alc.nn.data.from_card` builds the mask-carrying `TeacherCardDataset` with the real gpt2 tokenizer |
+| 6 | `student_built` | `alc.nn.preset.gpt2("custom", { vocab = 50257, … })` — the only small from-scratch config that holds real gpt2 token ids (tiny is vocab=64; medium is 355M) |
+| 7 | `distill_completed` | `alc.nn.trainer.run_distill` trains **and** registers a Card in one call |
+| 8 | `card_meta_shape` | `training_path="distillation"`, `hyperparams.loss_kind="ce"`, `bundle_ref="nn/<card_id>"` |
+| 9 | `loss_descended` | Final loss < 10.5 (baseline ln 50257 ≈ 10.825) |
+| 10 | `ckpt_file_exists` | Full student weights at `<nn_dir>/<card_id>.safetensors` (~13 MB) |
+| 11 | `custom_load_handle_contract` | `load_handle` on a `gpt2-custom` card is refused today (no `from_variant` config for custom shapes) — pinned so a behavior change surfaces here |
+| 12 | `mask_boundary_guard` | `from_card` loudly refuses a row whose prompt exhausts `ctx_len` (FullyMaskedRow protection) |
+| 13 | `strict_validation_prefixes` | `run_distill` refuses missing `lr` / `loss_kind = "kl"` / `schedule = "linear"`, each with the `alc.nn.trainer.run_distill` prefix |
+
+Reference numbers from CPU (M-series) runs with a Haiku teacher:
+
+- Phase 9 final loss: ~7.1-7.6 (teacher responses vary per run)
+- Post-resume elapsed: ~30-75 s (dominated by the 40 distill steps
+  over the vocab-50257 embedding)
+
+Distill-specific notes:
+
+- First run fetches `gpt2.json` from the HF hub into
+  `<nn_dir>/tokenizers/`; later runs are fully offline.
+- `run_distill` shares the strict `run_*` opts family: `batch` (not
+  `batch_size`), `"CosineWithWarmup"` / `"Constant"` schedule
+  vocabulary, `loss_kind` accepts only `"ce"`.
+- A `gpt2-custom` distill Card cannot be reloaded via `load_handle`
+  (Phase 11). If you need the train → Card → reload loop today, use
+  a named variant (tiny for toy vocab, medium for real gpt2 ids).
+
 ## Cleanup
 
-Both scripts write only under `cache_dir` (default `target/nn-e2e`),
+The Shakespeare scripts write only under `cache_dir` (default `target/nn-e2e`),
 which is inside `target/` and therefore always gitignored. Remove it
 manually if you want a fresh run:
 

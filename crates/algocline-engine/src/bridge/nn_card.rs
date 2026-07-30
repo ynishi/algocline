@@ -46,8 +46,7 @@ use algocline_nn::merged::{export_merged, MergeError, MergedProvenance};
 use algocline_nn::tokenizer::HfTokenizer;
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, Batch, CrossEntropyLoss, Dataset, DatasetOpts,
-    DistillLossKind, DistillSpec, FullFtConfig, JsonlDataset, ParquetDataset, ScheduleKind,
-    TeacherCardDataset, TokenizedDataset, TrainError, TrainingLease,
+    DistillSpec, JsonlDataset, ParquetDataset, TeacherCardDataset, TokenizedDataset, TrainingLease,
 };
 use candle_core::{DType, Device};
 use candle_nn::VarMap;
@@ -55,6 +54,7 @@ use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 use serde_json::Value as Json;
 
+use super::nn_opts::{extract_distill_loss_kind, extract_full_ft_opts, train_err_to_lua};
 use crate::card::nn::persist;
 use crate::card::{FileCardStore, SamplesQuery};
 
@@ -3079,10 +3079,12 @@ fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
 /// - a single per-VM [`TrainingLease`] (design's "one training session
 ///   per VM" invariant — [`run_full_ft`] / [`run_lora_ft`] /
 ///   [`run_distill`] all `acquire()` it internally),
-/// - the `FullFtConfig` opts-table extractor ([`extract_full_ft_opts`]),
-/// - a common [`ckpt_from_lease_result`] converter that turns
-///   [`TrainError`] into `mlua::Error` and the returned [`Checkpoint`]
-///   into a Lua table with primitive fields plus a metrics sub-table.
+/// - the `FullFtConfig` opts-table extractor ([`extract_full_ft_opts`],
+///   shared with the `run_*` surfaces via [`super::nn_opts`]),
+/// - the [`super::nn_opts::train_err_to_lua`] converter that turns
+///   `algocline_nn::train::TrainError` into `mlua::Error`, plus
+///   [`checkpoint_to_lua`] which turns the returned `Checkpoint` into a
+///   Lua table with primitive fields and a metrics sub-table.
 ///
 /// The `lora` binding additionally attaches a `lora = { rank, alpha,
 /// base_bundle_ref }` sub-table to the returned Checkpoint so callers
@@ -3166,7 +3168,7 @@ fn full_ft_impl(
     nn_dir: &std::path::Path,
     lease: Arc<TrainingLease>,
 ) -> LuaResult<LuaTable> {
-    let cfg = extract_full_ft_opts(opts)?;
+    let cfg = extract_full_ft_opts(TRAINER_ERR_PREFIX, opts)?;
     let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "full_ft")?;
 
     let gpt2 = handle.borrow::<Gpt2Handle>()?;
@@ -3209,7 +3211,7 @@ fn full_ft_impl(
     drop(ds_lock);
     drop(ds_guard);
 
-    let ckpt = result.map_err(train_err_to_lua)?;
+    let ckpt = result.map_err(|e| train_err_to_lua(TRAINER_ERR_PREFIX, e))?;
     checkpoint_to_lua(lua, &ckpt, &ckpt_prefix, None)
 }
 
@@ -3234,7 +3236,7 @@ fn lora_impl(
     nn_dir: &std::path::Path,
     lease: Arc<TrainingLease>,
 ) -> LuaResult<LuaTable> {
-    let train_cfg = extract_full_ft_opts(opts)?;
+    let train_cfg = extract_full_ft_opts(TRAINER_ERR_PREFIX, opts)?;
     let lora_cfg = extract_lora_cfg(opts)?;
     let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "lora")?;
 
@@ -3283,7 +3285,7 @@ fn lora_impl(
     drop(ds_lock);
     drop(ds_guard);
 
-    let ckpt = result.map_err(train_err_to_lua)?;
+    let ckpt = result.map_err(|e| train_err_to_lua(TRAINER_ERR_PREFIX, e))?;
 
     // Attach the LoRA branch descriptor. The Card foundation reads
     // this back through `meta.candle.lora` in `build_nn_meta`.
@@ -3312,9 +3314,10 @@ fn lora_impl(
 
 /// `alc.nn.trainer.distill(handle, dataset, opts?) -> Checkpoint`.
 ///
-/// Currently supports only `loss_kind = "ce"` (hard-label CE, the
-/// only variant [`DistillLossKind`] exposes). Unknown `loss_kind`
-/// values error out rather than silently fall back to CE.
+/// Currently supports only `loss_kind = "ce"` (hard-label CE, the only
+/// variant [`algocline_nn::train::DistillLossKind`] exposes). Unknown
+/// `loss_kind` values error out rather than silently fall back to CE
+/// ([`super::nn_opts::extract_distill_loss_kind`]).
 fn distill_impl(
     lua: &Lua,
     handle: &LuaAnyUserData,
@@ -3323,8 +3326,11 @@ fn distill_impl(
     nn_dir: &std::path::Path,
     lease: Arc<TrainingLease>,
 ) -> LuaResult<LuaTable> {
-    let hyperparams = extract_full_ft_opts(opts)?;
-    let loss_kind = extract_distill_loss_kind(opts)?;
+    let hyperparams = extract_full_ft_opts(TRAINER_ERR_PREFIX, opts)?;
+    // This surface spells its own prefix (`alc.nn.trainer.distill`,
+    // one level deeper than `TRAINER_ERR_PREFIX`) — keeping the
+    // literal preserves the pre-consolidation message byte for byte.
+    let loss_kind = extract_distill_loss_kind("alc.nn.trainer.distill", opts)?;
     let spec = DistillSpec {
         hyperparams,
         loss_kind,
@@ -3365,75 +3371,29 @@ fn distill_impl(
     drop(ds_lock);
     drop(ds_guard);
 
-    let ckpt = result.map_err(train_err_to_lua)?;
+    let ckpt = result.map_err(|e| train_err_to_lua(TRAINER_ERR_PREFIX, e))?;
     checkpoint_to_lua(lua, &ckpt, &ckpt_prefix, None)
 }
 
-/// Extract [`FullFtConfig`] from an opts table, applying the crate's
-/// defaults for any missing key. Rejects zero-sized values at the
-/// boundary (matches the training-loop's own early exit shape).
+/// Error prefix shared by the three `alc.nn.trainer.{full_ft, lora,
+/// distill}` entries registered here.
 ///
-/// Widened to `pub(super)` for L5b-S2 `nn_trainer.rs::run_lora_ft_impl`
-/// which reuses the same train-opts extractor (`lr` / `batch_size` /
-/// `steps` / `warmup` / `schedule` / etc.) and layers the `run_lora_ft`
-/// bind's stricter validation (steps > 0, batch > 0, lr > 0) on top.
-/// Do NOT reimplement the extractor there — keeping one SoT prevents
-/// field-set drift between the pre-existing `alc.nn.trainer.lora`
-/// / `full_ft` / `distill` entries and the new `run_lora_ft`.
-pub(super) fn extract_full_ft_opts(opts: Option<&LuaTable>) -> LuaResult<FullFtConfig> {
-    let mut cfg = FullFtConfig::default();
-    let Some(t) = opts else {
-        return Ok(cfg);
-    };
-    if let Some(v) = t.get::<Option<f64>>("lr")? {
-        cfg.lr = v;
-    }
-    if let Some(v) = t.get::<Option<usize>>("batch_size")? {
-        cfg.batch_size = v;
-    }
-    if let Some(v) = t.get::<Option<usize>>("grad_accum")? {
-        cfg.grad_accum = v;
-    }
-    if let Some(v) = t.get::<Option<usize>>("steps")? {
-        cfg.steps = v;
-    }
-    if let Some(v) = t.get::<Option<usize>>("warmup")? {
-        cfg.warmup = v;
-    }
-    if let Some(v) = t.get::<Option<String>>("schedule")? {
-        cfg.schedule = parse_schedule(&v)?;
-    }
-    if let Some(v) = t.get::<Option<f64>>("weight_decay")? {
-        cfg.weight_decay = v;
-    }
-    if let Some(v) = t.get::<Option<usize>>("ckpt_every")? {
-        cfg.ckpt_every = v;
-    }
-    if let Some(v) = t.get::<Option<usize>>("ckpt_keep")? {
-        cfg.ckpt_keep = v;
-    }
-    if cfg.batch_size == 0 {
-        return Err(LuaError::external(
-            "alc.nn.trainer: batch_size must be >= 1".to_string(),
-        ));
-    }
-    Ok(cfg)
-}
-
-fn parse_schedule(s: &str) -> LuaResult<ScheduleKind> {
-    match s {
-        "cosine" | "cosine_with_warmup" => Ok(ScheduleKind::CosineWithWarmup),
-        "constant" => Ok(ScheduleKind::Constant),
-        other => Err(LuaError::external(format!(
-            "alc.nn.trainer: unknown schedule '{other}' \
-             (expected 'cosine' or 'constant')"
-        ))),
-    }
-}
+/// Threaded into the shared [`super::nn_opts`] extractors /
+/// [`super::nn_opts::train_err_to_lua`] so those keep emitting this
+/// surface's prefix while holding a single implementation.
+const TRAINER_ERR_PREFIX: &str = "alc.nn.trainer";
 
 /// Extract [`LoraConfig`] from an opts table. `rank` and `alpha` are
 /// required — omitting them is almost certainly a user error and
 /// silently defaulting would hide a wrong training run.
+///
+/// This is the `alc.nn.trainer.lora` contract, which is *not* the one
+/// the `alc.nn.wrap_lora` / `alc.nn.trainer.run_lora_ft` surfaces use
+/// ([`super::nn_opts::extract_lora_cfg`]): here the architecture is
+/// not consulted, `dropout` is taken verbatim (no range check),
+/// `alpha` must additionally be finite, and `target_modules` is read
+/// with `pairs` so a map-shaped table is accepted. Those are
+/// Lua-visible differences, so the two extractors stay apart.
 fn extract_lora_cfg(opts: Option<&LuaTable>) -> LuaResult<LoraConfig> {
     let t = opts.ok_or_else(|| {
         LuaError::external(
@@ -3480,24 +3440,6 @@ fn extract_lora_cfg(opts: Option<&LuaTable>) -> LuaResult<LoraConfig> {
         target_modules,
         dropout,
     })
-}
-
-fn extract_distill_loss_kind(opts: Option<&LuaTable>) -> LuaResult<DistillLossKind> {
-    // Wrong-type input (`loss_kind = 42`) must surface as a Lua
-    // type-mismatch error rather than silently falling back to `"ce"`
-    // — silent fallback would hide a misconfigured caller.
-    let raw = match opts {
-        Some(t) => t
-            .get::<Option<String>>("loss_kind")?
-            .unwrap_or_else(|| "ce".to_string()),
-        None => "ce".to_string(),
-    };
-    match raw.as_str() {
-        "ce" => Ok(DistillLossKind::Ce),
-        other => Err(LuaError::external(format!(
-            "alc.nn.trainer.distill: unknown loss_kind '{other}' (expected 'ce')"
-        ))),
-    }
 }
 
 /// Decide where checkpoints get written for this training run.
@@ -3549,12 +3491,6 @@ fn resolve_ckpt_dest(
         None => unique_stem(stage),
     };
     Ok((ckpt_dir, ckpt_prefix))
-}
-
-/// Convert a [`TrainError`] into an `mlua::Error` with the training
-/// stage prefixed onto the message.
-fn train_err_to_lua(e: TrainError) -> LuaError {
-    LuaError::external(format!("alc.nn.trainer: {e}"))
 }
 
 /// Convert a [`algocline_nn::train::Checkpoint`] into a Lua table.
@@ -3995,68 +3931,11 @@ mod trainer_tests {
         t
     }
 
-    #[test]
-    fn full_ft_opts_defaults_when_empty() {
-        let lua = Lua::new();
-        let cfg = extract_full_ft_opts(None).expect("None -> defaults");
-        let default = FullFtConfig::default();
-        assert_eq!(cfg.lr, default.lr);
-        assert_eq!(cfg.batch_size, default.batch_size);
-        assert_eq!(cfg.steps, default.steps);
-
-        let empty = lua.create_table().unwrap();
-        let cfg2 = extract_full_ft_opts(Some(&empty)).expect("empty table -> defaults");
-        assert_eq!(cfg2.lr, default.lr);
-        assert_eq!(cfg2.batch_size, default.batch_size);
-    }
-
-    #[test]
-    fn full_ft_opts_partial_merges_with_defaults() {
-        let lua = Lua::new();
-        let opts = opts_from(
-            &lua,
-            &[
-                ("lr", LuaValue::Number(1e-3)),
-                ("steps", LuaValue::Integer(42)),
-            ],
-        );
-        let cfg = extract_full_ft_opts(Some(&opts)).expect("partial merge");
-        assert!((cfg.lr - 1e-3).abs() < 1e-12, "lr override");
-        assert_eq!(cfg.steps, 42, "steps override");
-        // Unset fields keep the crate default.
-        let d = FullFtConfig::default();
-        assert_eq!(cfg.batch_size, d.batch_size);
-        assert_eq!(cfg.warmup, d.warmup);
-    }
-
-    #[test]
-    fn full_ft_opts_reject_zero_batch_size() {
-        let lua = Lua::new();
-        let opts = opts_from(&lua, &[("batch_size", LuaValue::Integer(0))]);
-        let err = extract_full_ft_opts(Some(&opts)).expect_err("zero batch_size");
-        assert!(
-            err.to_string().contains("batch_size must be >= 1"),
-            "message: {err}"
-        );
-    }
-
-    #[test]
-    fn schedule_parser_accepts_known_and_rejects_unknown() {
-        assert!(matches!(
-            parse_schedule("cosine").unwrap(),
-            ScheduleKind::CosineWithWarmup
-        ));
-        assert!(matches!(
-            parse_schedule("cosine_with_warmup").unwrap(),
-            ScheduleKind::CosineWithWarmup
-        ));
-        assert!(matches!(
-            parse_schedule("constant").unwrap(),
-            ScheduleKind::Constant
-        ));
-        let err = parse_schedule("linear").expect_err("unknown");
-        assert!(err.to_string().contains("linear"), "message: {err}");
-    }
+    // The training-config extractor / schedule-parser and
+    // distillation-loss-selector unit tests live next to their
+    // implementation in `super::super::nn_opts` (moved there together
+    // with the functions). The `lora_cfg_*` tests below stay here
+    // because `extract_lora_cfg` is this surface's own contract.
 
     #[test]
     fn lora_cfg_requires_opts_table() {
@@ -4150,54 +4029,12 @@ mod trainer_tests {
     }
 
     #[test]
-    fn distill_loss_kind_rejects_wrong_type_input() {
-        let lua = Lua::new();
-        // `loss_kind = true` (boolean) must surface as a Lua
-        // type-mismatch error, not silently fall back to "ce".
-        // (Integers coerce to strings in mlua, so booleans are used to
-        // provoke the type check.)
-        let opts = opts_from(&lua, &[("loss_kind", LuaValue::Boolean(true))]);
-        let err = extract_distill_loss_kind(Some(&opts)).expect_err("wrong-type loss_kind");
-        let msg = err.to_string();
-        assert!(!msg.is_empty(), "type-mismatch error should have a message");
-    }
-
-    #[test]
     fn resolve_ckpt_dest_rejects_wrong_type_ckpt_dir() {
         let lua = Lua::new();
         let opts = opts_from(&lua, &[("ckpt_dir", LuaValue::Boolean(false))]);
         let tmp = std::env::temp_dir();
         let err = resolve_ckpt_dest(Some(&opts), &tmp, "full_ft").expect_err("wrong-type ckpt_dir");
         assert!(!err.to_string().is_empty());
-    }
-
-    #[test]
-    fn distill_loss_kind_defaults_to_ce_and_rejects_unknown() {
-        assert!(matches!(
-            extract_distill_loss_kind(None).unwrap(),
-            DistillLossKind::Ce
-        ));
-        let lua = Lua::new();
-        let opts = opts_from(
-            &lua,
-            &[(
-                "loss_kind",
-                LuaValue::String(lua.create_string("ce").unwrap()),
-            )],
-        );
-        assert!(matches!(
-            extract_distill_loss_kind(Some(&opts)).unwrap(),
-            DistillLossKind::Ce
-        ));
-        let bad = opts_from(
-            &lua,
-            &[(
-                "loss_kind",
-                LuaValue::String(lua.create_string("kl_soft").unwrap()),
-            )],
-        );
-        let err = extract_distill_loss_kind(Some(&bad)).expect_err("unknown loss");
-        assert!(err.to_string().contains("kl_soft"));
     }
 
     #[test]

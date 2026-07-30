@@ -24,23 +24,26 @@
 //!    via [`NnHandle::is_lora_wrapped`]), (c) inference-only
 //!    architectures (Llama).
 //! 2. `target_modules` validation routes through the underlying arch's
-//!    canonical target set ([`LoraConfig::default_targets`] for GPT-2,
-//!    [`TinyLlamaModel::default_lora_targets`] for TinyLlama). The
-//!    bridge does not hard-code an arch → target-set mapping locally;
-//!    both sources live in the `algocline-nn` crate and stay the SoT.
+//!    canonical target set
+//!    ([`algocline_nn::arch::LoraConfig::default_targets`] for GPT-2,
+//!    [`algocline_nn::arch::TinyLlamaModel::default_lora_targets`] for
+//!    TinyLlama), reached through
+//!    [`super::nn_opts::canonical_targets_for`]. The bridge does not
+//!    hard-code an arch → target-set mapping locally; both sources live
+//!    in the `algocline-nn` crate and stay the SoT.
 //! 3. `dropout` is validated in `[0.0, 1.0)` even though the current
 //!    LoRA forward path ignores it (schema stability for a future
-//!    dropout ship — see [`LoraConfig`] docs).
+//!    dropout ship — see [`algocline_nn::arch::LoraConfig`] docs).
 //! 4. File body is `#[cfg(feature = "nn")]` at the module level via
 //!    `bridge/mod.rs`; the default build never links this file.
 
-use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use mlua::prelude::*;
 
 use super::nn_card::{
     guard_base_dtype_for_training, wrap_gpt2_lora_bridge, wrap_tinyllama_lora_bridge, Gpt2Handle,
     LlamaHandle, NnHandle, TinyLlamaHandle,
 };
+use super::nn_opts::extract_lora_cfg;
 
 /// Register `alc.nn.wrap_lora` onto the pre-existing `alc.nn` table.
 ///
@@ -122,19 +125,15 @@ fn wrap_lora_impl(base: &LuaValue, opts: LuaTable) -> LuaResult<NnHandle> {
 
     let arch = handle.arch();
 
-    // 5. Extract + validate scalar opts.
-    let rank = extract_rank(&opts)?;
-    let alpha = extract_alpha(&opts)?;
-    let dropout = extract_dropout(&opts)?;
+    // 5. Extract + validate the LoRA opts schema: `rank` / `alpha` /
+    //    `dropout` plus `target_modules` (per-arch default when nil,
+    //    every explicit entry checked against the arch's canonical
+    //    set). Shared with `alc.nn.trainer.run_lora_ft` through
+    //    [`super::nn_opts`]; this surface's error prefix is passed in
+    //    so the loud-error contract is unchanged.
+    let cfg = extract_lora_cfg("alc.nn.wrap_lora", arch, &opts)?;
 
-    // 6. Resolve target_modules (per-arch default when nil) and
-    //    validate every entry against the arch's canonical set.
-    let target_modules = resolve_and_validate_targets(&opts, arch)?;
-
-    // 7. Build LoraConfig + dispatch per NnHandle variant.
-    let mut cfg = LoraConfig::with_targets(rank, alpha, target_modules);
-    cfg.dropout = dropout;
-
+    // 6. Dispatch per NnHandle variant.
     match handle {
         NnHandle::Gpt2(base_gpt2) => {
             let wrapped = wrap_gpt2_lora_bridge(&base_gpt2, &cfg)?;
@@ -150,98 +149,6 @@ fn wrap_lora_impl(base: &LuaValue, opts: LuaTable) -> LuaResult<NnHandle> {
             // rather than silently invoking a non-existent wrap path.
             unreachable!("Llama variant guarded above")
         }
-    }
-}
-
-fn extract_rank(opts: &LuaTable) -> LuaResult<usize> {
-    let raw: Option<i64> = opts.get("rank")?;
-    let n = raw.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.wrap_lora: opts.rank must be a positive integer")
-    })?;
-    Ok(n as usize)
-}
-
-fn extract_alpha(opts: &LuaTable) -> LuaResult<f32> {
-    let raw: Option<f64> = opts.get("alpha")?;
-    let v = raw.filter(|v| *v > 0.0).ok_or_else(|| {
-        LuaError::external("alc.nn.wrap_lora: opts.alpha must be a positive number")
-    })?;
-    Ok(v as f32)
-}
-
-fn extract_dropout(opts: &LuaTable) -> LuaResult<f32> {
-    // Absent → default 0.0 (design §1.1). Present → must be in
-    // `[0.0, 1.0)` (exclusive upper).
-    let raw: Option<f64> = opts.get("dropout")?;
-    let v = raw.unwrap_or(0.0);
-    if !(0.0..1.0).contains(&v) {
-        return Err(LuaError::external(
-            "alc.nn.wrap_lora: opts.dropout must be in [0.0, 1.0)",
-        ));
-    }
-    Ok(v as f32)
-}
-
-fn resolve_and_validate_targets(opts: &LuaTable, arch: &str) -> LuaResult<Vec<String>> {
-    // The wrap-capable arch dispatch is already guarded by
-    // `wrap_lora_impl` step 4; treat an unknown arch here as an
-    // internal invariant break so a future variant addition does not
-    // silently fall through to a Rust-side error.
-    let known = canonical_targets_for(arch).ok_or_else(|| {
-        LuaError::external(format!(
-            "alc.nn.wrap_lora: architecture {arch} is not LoRA-wrappable \
-             (only gpt2 / tinyllama families are supported)"
-        ))
-    })?;
-
-    let raw: LuaValue = opts.get("target_modules")?;
-    match raw {
-        LuaValue::Nil => Ok(known),
-        LuaValue::Table(tbl) => {
-            let entries: Vec<String> = tbl
-                .sequence_values::<String>()
-                .collect::<LuaResult<Vec<_>>>()?;
-            if entries.is_empty() {
-                return Err(LuaError::external(
-                    "alc.nn.wrap_lora: opts.target_modules must be non-empty \
-                     (or nil for the per-arch default)",
-                ));
-            }
-            for entry in &entries {
-                if !known.iter().any(|k| k == entry) {
-                    let known_list = known.join(", ");
-                    return Err(LuaError::external(format!(
-                        "alc.nn.wrap_lora: unknown target module {entry:?} for arch {arch} \
-                         (known: [{known_list}])"
-                    )));
-                }
-            }
-            Ok(entries)
-        }
-        other => Err(LuaError::external(format!(
-            "alc.nn.wrap_lora: opts.target_modules must be an array of strings \
-             (or nil for the per-arch default); got {}",
-            other.type_name()
-        ))),
-    }
-}
-
-/// Return the arch's canonical LoRA target-module set. Layer 5b
-/// discipline: read the set from the `algocline-nn` crate (SoT)
-/// rather than duplicate the list here — see design §1.3.
-///
-/// Adding a new LoRA-capable arch = new arm + widen the wrap-capable
-/// dispatch in [`wrap_lora_impl`] (step 4 arch refusal + step 7 match).
-/// A follow-up refactor could push this into `nn_card::ArchOps` as a
-/// new function-pointer slot (§Q4-A extension) so the arch table
-/// stays the single grep-able add site; kept inline for L5b-S1 to
-/// respect the "do not modify nn_card.rs beyond minimal widening"
-/// scope.
-fn canonical_targets_for(arch: &str) -> Option<Vec<String>> {
-    match arch {
-        "gpt2" => Some(LoraConfig::default_targets()),
-        "tinyllama" => Some(TinyLlamaModel::default_lora_targets()),
-        _ => None,
     }
 }
 

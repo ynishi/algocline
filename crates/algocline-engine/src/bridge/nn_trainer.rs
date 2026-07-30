@@ -46,11 +46,16 @@
 //!    value in the error. `steps == 0` is caught here so the caller
 //!    sees a Lua-shaped error rather than a candle back-trace via
 //!    [`algocline_nn::train::TrainError::ZeroSteps`].
-//! 4. `grad_accum_steps` / `ckpt_every` are NOT exposed and remain
-//!    pinned to their crate defaults (design §1.2 explicit
-//!    non-exposure — multi-step accumulation returns
-//!    `GradAccumUnsupported` today; rotating checkpoint is out of
-//!    scope for the Lua bridge).
+//! 4. `grad_accum` / `weight_decay` / `ckpt_every` / `ckpt_keep` are
+//!    accepted as pass-through overrides — the same field set the
+//!    `full_ft`-side surface (`alc.nn.trainer.{full_ft, lora,
+//!    distill}`) accepts, reached through the shared
+//!    [`super::nn_opts::extract_run_train_cfg`]. A missing key keeps
+//!    the [`algocline_nn::train::FullFtConfig`] crate default and no
+//!    surface-specific validation is layered on top, so `grad_accum >
+//!    1` surfaces as a loud
+//!    [`algocline_nn::train::TrainError::GradAccumUnsupported`] from
+//!    the training loop rather than being refused here.
 //! 5. [`TrainingLease`] — a fresh
 //!    `Arc::new(TrainingLease::new())` is constructed per-call. This
 //!    is a documented limitation: `run_lora_ft` does NOT share a
@@ -81,11 +86,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::card::{bundle_ref_for, CardId, NnLoraBranch, NnModelCard, TrainingPath};
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss, DistillLossKind, DistillSpec,
-    FullFtConfig, TrainError, TrainingLease,
+    TrainingLease,
 };
 use mlua::prelude::*;
 
@@ -93,9 +97,19 @@ use crate::card::nn::persist;
 use crate::card::FileCardStore;
 
 use super::nn_card::{
-    extract_full_ft_opts, guard_base_dtype_for_training, DatasetHandle, Gpt2Handle, LlamaHandle,
-    NnHandle, TinyLlamaHandle,
+    guard_base_dtype_for_training, DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle,
+    TinyLlamaHandle,
 };
+use super::nn_opts::{
+    extract_distill_loss_kind, extract_lora_cfg, extract_run_train_cfg, train_err_to_lua,
+};
+
+/// Error prefix for the `alc.nn.trainer.run_lora_ft` surface.
+const RUN_LORA_FT_ERR_PREFIX: &str = "alc.nn.trainer.run_lora_ft";
+/// Error prefix for the `alc.nn.trainer.run_full_ft` surface.
+const RUN_FULL_FT_ERR_PREFIX: &str = "alc.nn.trainer.run_full_ft";
+/// Error prefix for the `alc.nn.trainer.run_distill` surface.
+const RUN_DISTILL_ERR_PREFIX: &str = "alc.nn.trainer.run_distill";
 
 /// Register `alc.nn.trainer.{run_lora_ft, run_full_ft, run_distill}`
 /// onto the pre-existing `alc.nn.trainer` sub-table.
@@ -250,8 +264,8 @@ fn run_lora_ft_impl(
     //    misconfigured caller sees a Lua-shaped error rather than a
     //    candle back-trace).
     let arch = handle.arch();
-    let lora_cfg = extract_lora_cfg(&opts, arch)?;
-    let train_cfg = extract_train_cfg(&opts)?;
+    let lora_cfg = extract_lora_cfg(RUN_LORA_FT_ERR_PREFIX, arch, &opts)?;
+    let train_cfg = extract_run_train_cfg(RUN_LORA_FT_ERR_PREFIX, &opts)?;
 
     // 7. Pre-mint the Card id (mirrors save_impl / merge_lora_impl).
     //    Minted before training because the id doubles as the delta
@@ -311,7 +325,7 @@ fn run_lora_ft_impl(
             drop(ds_lock);
             drop(ds_handle);
 
-            result.map_err(train_err_to_lua)?
+            result.map_err(|e| train_err_to_lua(RUN_LORA_FT_ERR_PREFIX, e))?
         }
         NnHandle::TinyLlama(tll) => {
             let model_arc = tll.model();
@@ -337,7 +351,7 @@ fn run_lora_ft_impl(
             drop(ds_lock);
             drop(ds_handle);
 
-            result.map_err(train_err_to_lua)?
+            result.map_err(|e| train_err_to_lua(RUN_LORA_FT_ERR_PREFIX, e))?
         }
         NnHandle::Llama(_) => {
             // Guarded at step 4 above; kept as `unreachable!` so a
@@ -385,197 +399,6 @@ fn run_lora_ft_impl(
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_lora_ft: {e}")))
 }
 
-/// Extract a validated [`LoraConfig`] from `opts`. Mirrors the S1
-/// wrap-side validation (`nn_wrap.rs`) but under the trainer-side
-/// error prefix — sharing the extractor across surfaces would tie
-/// them to a single prefix, which defeats the loud-error contract.
-fn extract_lora_cfg(opts: &LuaTable, arch: &str) -> LuaResult<LoraConfig> {
-    let rank: Option<i64> = opts.get("rank")?;
-    let rank = rank.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_lora_ft: opts.rank must be a positive integer")
-    })? as usize;
-
-    let alpha: Option<f64> = opts.get("alpha")?;
-    let alpha = alpha.filter(|v| *v > 0.0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_lora_ft: opts.alpha must be a positive number")
-    })? as f32;
-
-    let dropout: Option<f64> = opts.get("dropout")?;
-    let dropout = dropout.unwrap_or(0.0);
-    if !(0.0..1.0).contains(&dropout) {
-        return Err(LuaError::external(
-            "alc.nn.trainer.run_lora_ft: opts.dropout must be in [0.0, 1.0)",
-        ));
-    }
-    let dropout = dropout as f32;
-
-    // Per-arch canonical target set (SoT lives in the algocline-nn
-    // crate; the bridge only routes, per L5b design §1.3). Same
-    // logic as `nn_wrap::canonical_targets_for` — duplicated 4-line
-    // match keeps this file self-contained.
-    let known = canonical_targets_for(arch).ok_or_else(|| {
-        LuaError::external(format!(
-            "alc.nn.trainer.run_lora_ft: architecture {arch} is not LoRA-wrappable \
-             (only gpt2 / tinyllama families are supported)"
-        ))
-    })?;
-
-    let raw: LuaValue = opts.get("target_modules")?;
-    let target_modules: Vec<String> = match raw {
-        LuaValue::Nil => known.clone(),
-        LuaValue::Table(tbl) => {
-            let entries: Vec<String> = tbl
-                .sequence_values::<String>()
-                .collect::<LuaResult<Vec<_>>>()?;
-            if entries.is_empty() {
-                return Err(LuaError::external(
-                    "alc.nn.trainer.run_lora_ft: opts.target_modules must be non-empty \
-                     (or nil for the per-arch default)",
-                ));
-            }
-            for entry in &entries {
-                if !known.iter().any(|k| k == entry) {
-                    let known_list = known.join(", ");
-                    return Err(LuaError::external(format!(
-                        "alc.nn.trainer.run_lora_ft: unknown target module {entry:?} \
-                         for arch {arch} (known: [{known_list}])"
-                    )));
-                }
-            }
-            entries
-        }
-        other => {
-            return Err(LuaError::external(format!(
-                "alc.nn.trainer.run_lora_ft: opts.target_modules must be an array of strings \
-                 (or nil for the per-arch default); got {}",
-                other.type_name()
-            )));
-        }
-    };
-
-    let mut cfg = LoraConfig::with_targets(rank, alpha, target_modules);
-    cfg.dropout = dropout;
-    Ok(cfg)
-}
-
-/// Extract a validated [`FullFtConfig`] from `opts`.
-///
-/// Design §1.2 pins the exposed field set to
-/// `lr / batch / steps / warmup / schedule`. Validation is
-/// pre-flight (`lr > 0`, `batch > 0`, `steps > 0`, `warmup >= 0`,
-/// `schedule` in `{CosineWithWarmup, Constant}`) so a misconfigured
-/// caller sees a Lua-shaped error before the training loop is
-/// entered. `grad_accum_steps` and `ckpt_every` are NOT exposed
-/// (they stay at [`FullFtConfig::default`] values: `grad_accum = 1`,
-/// `ckpt_every = 0`).
-///
-/// After validation the design §1.2 field names are canonicalised
-/// into the sibling extractor's naming convention
-/// (`batch` → `batch_size`, `"CosineWithWarmup"` →
-/// `"cosine_with_warmup"`, `"Constant"` → `"constant"`) and the
-/// shared [`extract_full_ft_opts`] does the final `FullFtConfig`
-/// assembly. That keeps a single SoT for the training-config
-/// schema — a future field addition to `FullFtConfig` gets picked
-/// up here automatically via the shared extractor.
-fn extract_train_cfg(opts: &LuaTable) -> LuaResult<FullFtConfig> {
-    let lr: Option<f64> = opts.get("lr")?;
-    let lr = lr.filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_lora_ft: opts.lr must be a positive number")
-    })?;
-
-    let batch: Option<i64> = opts.get("batch")?;
-    let batch = batch.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_lora_ft: opts.batch must be a positive integer")
-    })? as usize;
-
-    let steps: Option<i64> = opts.get("steps")?;
-    let steps = steps.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_lora_ft: opts.steps must be a positive integer")
-    })? as usize;
-
-    // Optional warmup — must be >= 0 (integer). i64 lets a negative
-    // value surface the design §2.2 loud error rather than silently
-    // clamp to 0.
-    let warmup = match opts.get::<Option<i64>>("warmup")? {
-        Some(v) if v < 0 => {
-            return Err(LuaError::external(
-                "alc.nn.trainer.run_lora_ft: opts.warmup must be >= 0",
-            ));
-        }
-        Some(v) => v as usize,
-        None => 0,
-    };
-
-    // Optional schedule — design §1.2 default "CosineWithWarmup".
-    // Anything outside the two-value enum is refused with the
-    // caller-supplied value in the error message so a typo is
-    // debuggable at the surface.
-    let schedule_canonical = match opts
-        .get::<Option<String>>("schedule")?
-        .as_deref()
-        .unwrap_or("CosineWithWarmup")
-    {
-        "CosineWithWarmup" => "cosine_with_warmup",
-        "Constant" => "constant",
-        other => {
-            return Err(LuaError::external(format!(
-                "alc.nn.trainer.run_lora_ft: opts.schedule must be one of \
-                 \"CosineWithWarmup\" / \"Constant\" (got {other:?})"
-            )));
-        }
-    };
-
-    // Canonicalise design §1.2 field names into the shared
-    // extractor's naming convention, then delegate. Mutating
-    // `opts` in place is safe: the caller-supplied table is a
-    // per-invocation value, no other closure retains it.
-    opts.set("lr", lr)?;
-    opts.set("batch_size", batch as i64)?;
-    opts.set("steps", steps as i64)?;
-    opts.set("warmup", warmup as i64)?;
-    opts.set("schedule", schedule_canonical.to_string())?;
-
-    extract_full_ft_opts(Some(opts))
-}
-
-/// Return the arch's canonical LoRA target-module set. Same source
-/// as [`super::nn_wrap`] — the Rust `algocline-nn` crate owns the
-/// SoT; the bridge only routes.
-fn canonical_targets_for(arch: &str) -> Option<Vec<String>> {
-    match arch {
-        "gpt2" => Some(LoraConfig::default_targets()),
-        "tinyllama" => Some(TinyLlamaModel::default_lora_targets()),
-        _ => None,
-    }
-}
-
-/// Translate a [`TrainError`] into a `run_lora_ft`-prefixed Lua
-/// error. Mirrors the shape spelled out in design §2.2.
-fn train_err_to_lua(e: TrainError) -> LuaError {
-    let msg = match e {
-        TrainError::ZeroSteps => "alc.nn.trainer.run_lora_ft: zero steps".to_string(),
-        TrainError::LeaseHeld => {
-            "alc.nn.trainer.run_lora_ft: training lease already active on this VM".to_string()
-        }
-        TrainError::DatasetExhausted { seen, requested } => format!(
-            "alc.nn.trainer.run_lora_ft: dataset exhausted after {seen} steps \
-             (requested {requested})"
-        ),
-        TrainError::Ckpt(inner) => {
-            format!("alc.nn.trainer.run_lora_ft: checkpoint: {inner}")
-        }
-        TrainError::Candle(inner) => {
-            format!("alc.nn.trainer.run_lora_ft: candle: {inner}")
-        }
-        // The `TrainError` enum is `#[non_exhaustive]`-adjacent (may
-        // gain variants); route unknown variants through Display so
-        // the caller still sees a loud error rather than a compile
-        // break.
-        other => format!("alc.nn.trainer.run_lora_ft: {other}"),
-    };
-    LuaError::external(msg)
-}
-
 // ─── Layer 5c S1 — `alc.nn.trainer.run_full_ft` ─────────────────────
 //
 // Sibling of [`run_lora_ft_impl`] above. Shares:
@@ -607,10 +430,11 @@ fn train_err_to_lua(e: TrainError) -> LuaError {
 //   wrapped handle would surprise the caller; refuse it up front
 //   with a directional error pointing at
 //   [`super::nn_wrap::register_nn_wrap`] (unwrap first).
-// - Error prefix — every [`LuaError::external`] emitted from this
-//   impl carries the prefix `alc.nn.trainer.run_full_ft:`. Do NOT
-//   share the extractor with [`extract_train_cfg`] above:
-//   design's loud-error contract pins one prefix per surface.
+// - Error prefix — every `LuaError::external` emitted from this impl
+//   carries the prefix `alc.nn.trainer.run_full_ft:`
+//   (`RUN_FULL_FT_ERR_PREFIX`), threaded into the shared
+//   `super::nn_opts` extractor / error converter so the loud-error
+//   contract (one prefix per surface) holds off one implementation.
 
 /// L5c S1 core. Mirrors [`run_lora_ft_impl`] structurally; see the
 /// section header above for the design divergence.
@@ -694,7 +518,7 @@ fn run_full_ft_impl(
 
     // 6. Extract + validate train opts (pre-flight so a misconfigured
     //    caller sees a Lua-shaped error rather than a candle back-trace).
-    let train_cfg = extract_train_cfg_ff(&opts)?;
+    let train_cfg = extract_run_train_cfg(RUN_FULL_FT_ERR_PREFIX, &opts)?;
 
     // 7. Pre-mint the Card id (mirrors run_lora_ft_impl step 7).
     //    Minted before training because the id doubles as the
@@ -751,7 +575,7 @@ fn run_full_ft_impl(
             drop(ds_lock);
             drop(ds_handle);
 
-            result.map_err(train_err_to_lua_ff)?
+            result.map_err(|e| train_err_to_lua(RUN_FULL_FT_ERR_PREFIX, e))?
         }
         NnHandle::TinyLlama(tll) => {
             let vm_arc = tll.varmap().ok_or_else(|| {
@@ -784,7 +608,7 @@ fn run_full_ft_impl(
             drop(ds_lock);
             drop(ds_handle);
 
-            result.map_err(train_err_to_lua_ff)?
+            result.map_err(|e| train_err_to_lua(RUN_FULL_FT_ERR_PREFIX, e))?
         }
         NnHandle::Llama(_) => {
             // Guarded at step 4 above; kept as `unreachable!` so a
@@ -821,94 +645,6 @@ fn run_full_ft_impl(
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))
 }
 
-/// Extract a validated [`FullFtConfig`] from `opts` for the
-/// `run_full_ft` surface.
-///
-/// Same field-set as [`extract_train_cfg`] (`lr` / `batch` /
-/// `steps` / `warmup` / `schedule`) with the same validation rules,
-/// but every error carries the `alc.nn.trainer.run_full_ft:` prefix
-/// per design's loud-error contract (one prefix per surface). The
-/// two extractors are intentionally duplicated 60-line-for-60-line
-/// so a future divergence of the training-config schema between
-/// LoRA and full-fine-tune surfaces stays local to one extractor.
-fn extract_train_cfg_ff(opts: &LuaTable) -> LuaResult<FullFtConfig> {
-    let lr: Option<f64> = opts.get("lr")?;
-    let lr = lr.filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_full_ft: opts.lr must be a positive number")
-    })?;
-
-    let batch: Option<i64> = opts.get("batch")?;
-    let batch = batch.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_full_ft: opts.batch must be a positive integer")
-    })? as usize;
-
-    let steps: Option<i64> = opts.get("steps")?;
-    let steps = steps.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_full_ft: opts.steps must be a positive integer")
-    })? as usize;
-
-    let warmup = match opts.get::<Option<i64>>("warmup")? {
-        Some(v) if v < 0 => {
-            return Err(LuaError::external(
-                "alc.nn.trainer.run_full_ft: opts.warmup must be >= 0",
-            ));
-        }
-        Some(v) => v as usize,
-        None => 0,
-    };
-
-    let schedule_canonical = match opts
-        .get::<Option<String>>("schedule")?
-        .as_deref()
-        .unwrap_or("CosineWithWarmup")
-    {
-        "CosineWithWarmup" => "cosine_with_warmup",
-        "Constant" => "constant",
-        other => {
-            return Err(LuaError::external(format!(
-                "alc.nn.trainer.run_full_ft: opts.schedule must be one of \
-                 \"CosineWithWarmup\" / \"Constant\" (got {other:?})"
-            )));
-        }
-    };
-
-    // Canonicalise design §1.2 field names into the shared
-    // extractor's naming convention, then delegate. Mutating
-    // `opts` in place is safe: the caller-supplied table is a
-    // per-invocation value.
-    opts.set("lr", lr)?;
-    opts.set("batch_size", batch as i64)?;
-    opts.set("steps", steps as i64)?;
-    opts.set("warmup", warmup as i64)?;
-    opts.set("schedule", schedule_canonical.to_string())?;
-
-    extract_full_ft_opts(Some(opts))
-}
-
-/// Translate a [`TrainError`] into a `run_full_ft`-prefixed Lua
-/// error. Mirrors [`train_err_to_lua`] structurally; diverges only
-/// on the surface prefix per design's loud-error contract.
-fn train_err_to_lua_ff(e: TrainError) -> LuaError {
-    let msg = match e {
-        TrainError::ZeroSteps => "alc.nn.trainer.run_full_ft: zero steps".to_string(),
-        TrainError::LeaseHeld => {
-            "alc.nn.trainer.run_full_ft: training lease already active on this VM".to_string()
-        }
-        TrainError::DatasetExhausted { seen, requested } => format!(
-            "alc.nn.trainer.run_full_ft: dataset exhausted after {seen} steps \
-             (requested {requested})"
-        ),
-        TrainError::Ckpt(inner) => {
-            format!("alc.nn.trainer.run_full_ft: checkpoint: {inner}")
-        }
-        TrainError::Candle(inner) => {
-            format!("alc.nn.trainer.run_full_ft: candle: {inner}")
-        }
-        other => format!("alc.nn.trainer.run_full_ft: {other}"),
-    };
-    LuaError::external(msg)
-}
-
 // ─── Layer 5c S2 — `alc.nn.trainer.run_distill` ─────────────────────
 //
 // Sibling of [`run_full_ft_impl`] above. Distillation IS a full
@@ -933,9 +669,10 @@ fn train_err_to_lua_ff(e: TrainError) -> LuaError {
 //   are refused rather than silently falling back to CE.
 // - `training_path = "distillation"` on the written Card (one of
 //   [`algocline_nn::card::SUPPORTED_TRAINING_PATHS`]).
-// - Error prefix `alc.nn.trainer.run_distill:` — one prefix per
-//   surface per design's loud-error contract; extractors are NOT
-//   shared with the siblings above.
+// - Error prefix `alc.nn.trainer.run_distill:`
+//   (`RUN_DISTILL_ERR_PREFIX`) — one prefix per surface per design's
+//   loud-error contract, carried into the shared `super::nn_opts`
+//   entries as an argument.
 
 /// L5c S2 core. Mirrors [`run_full_ft_impl`] structurally; see the
 /// section header above for the design divergence.
@@ -1019,8 +756,8 @@ fn run_distill_impl(
     // 6. Extract + validate train opts and the distillation-loss
     //    selector (pre-flight so a misconfigured caller sees a
     //    Lua-shaped error rather than a candle back-trace).
-    let train_cfg = extract_train_cfg_rd(&opts)?;
-    let loss_kind = extract_distill_loss_kind_rd(&opts)?;
+    let train_cfg = extract_run_train_cfg(RUN_DISTILL_ERR_PREFIX, &opts)?;
+    let loss_kind = extract_distill_loss_kind(RUN_DISTILL_ERR_PREFIX, Some(&opts))?;
     let spec = DistillSpec {
         hyperparams: train_cfg,
         loss_kind,
@@ -1076,7 +813,7 @@ fn run_distill_impl(
             drop(ds_lock);
             drop(ds_handle);
 
-            result.map_err(train_err_to_lua_rd)?
+            result.map_err(|e| train_err_to_lua(RUN_DISTILL_ERR_PREFIX, e))?
         }
         NnHandle::TinyLlama(tll) => {
             let vm_arc = tll.varmap().ok_or_else(|| {
@@ -1107,7 +844,7 @@ fn run_distill_impl(
             drop(ds_lock);
             drop(ds_handle);
 
-            result.map_err(train_err_to_lua_rd)?
+            result.map_err(|e| train_err_to_lua(RUN_DISTILL_ERR_PREFIX, e))?
         }
         NnHandle::Llama(_) => {
             // Guarded at step 4 above; kept as `unreachable!` so a
@@ -1145,112 +882,6 @@ fn run_distill_impl(
 
     persist(store, &card)
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_distill: {e}")))
-}
-
-/// Extract a validated [`FullFtConfig`] from `opts` for the
-/// `run_distill` surface.
-///
-/// Same field-set and validation rules as [`extract_train_cfg_ff`],
-/// but every error carries the `alc.nn.trainer.run_distill:` prefix
-/// per design's loud-error contract (one prefix per surface). The
-/// extractors are intentionally duplicated so a future divergence of
-/// the training-config schema between surfaces stays local to one
-/// extractor.
-fn extract_train_cfg_rd(opts: &LuaTable) -> LuaResult<FullFtConfig> {
-    let lr: Option<f64> = opts.get("lr")?;
-    let lr = lr.filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_distill: opts.lr must be a positive number")
-    })?;
-
-    let batch: Option<i64> = opts.get("batch")?;
-    let batch = batch.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_distill: opts.batch must be a positive integer")
-    })? as usize;
-
-    let steps: Option<i64> = opts.get("steps")?;
-    let steps = steps.filter(|v| *v > 0).ok_or_else(|| {
-        LuaError::external("alc.nn.trainer.run_distill: opts.steps must be a positive integer")
-    })? as usize;
-
-    let warmup = match opts.get::<Option<i64>>("warmup")? {
-        Some(v) if v < 0 => {
-            return Err(LuaError::external(
-                "alc.nn.trainer.run_distill: opts.warmup must be >= 0",
-            ));
-        }
-        Some(v) => v as usize,
-        None => 0,
-    };
-
-    let schedule_canonical = match opts
-        .get::<Option<String>>("schedule")?
-        .as_deref()
-        .unwrap_or("CosineWithWarmup")
-    {
-        "CosineWithWarmup" => "cosine_with_warmup",
-        "Constant" => "constant",
-        other => {
-            return Err(LuaError::external(format!(
-                "alc.nn.trainer.run_distill: opts.schedule must be one of \
-                 \"CosineWithWarmup\" / \"Constant\" (got {other:?})"
-            )));
-        }
-    };
-
-    // Canonicalise design §1.2 field names into the shared
-    // extractor's naming convention, then delegate. Mutating
-    // `opts` in place is safe: the caller-supplied table is a
-    // per-invocation value.
-    opts.set("lr", lr)?;
-    opts.set("batch_size", batch as i64)?;
-    opts.set("steps", steps as i64)?;
-    opts.set("warmup", warmup as i64)?;
-    opts.set("schedule", schedule_canonical.to_string())?;
-
-    extract_full_ft_opts(Some(opts))
-}
-
-/// Extract the distillation-loss selector from `opts.loss_kind`.
-///
-/// Mirrors the pre-existing `alc.nn.trainer.distill` extractor in
-/// [`super::nn_card`] but under the `run_distill` error prefix (one
-/// prefix per surface). Missing key defaults to `"ce"`; unknown
-/// values are refused rather than silently falling back — silent
-/// fallback would hide a misconfigured caller.
-fn extract_distill_loss_kind_rd(opts: &LuaTable) -> LuaResult<DistillLossKind> {
-    let raw = opts
-        .get::<Option<String>>("loss_kind")?
-        .unwrap_or_else(|| "ce".to_string());
-    match raw.as_str() {
-        "ce" => Ok(DistillLossKind::Ce),
-        other => Err(LuaError::external(format!(
-            "alc.nn.trainer.run_distill: unknown loss_kind '{other}' (expected 'ce')"
-        ))),
-    }
-}
-
-/// Translate a [`TrainError`] into a `run_distill`-prefixed Lua
-/// error. Mirrors [`train_err_to_lua_ff`] structurally; diverges only
-/// on the surface prefix per design's loud-error contract.
-fn train_err_to_lua_rd(e: TrainError) -> LuaError {
-    let msg = match e {
-        TrainError::ZeroSteps => "alc.nn.trainer.run_distill: zero steps".to_string(),
-        TrainError::LeaseHeld => {
-            "alc.nn.trainer.run_distill: training lease already active on this VM".to_string()
-        }
-        TrainError::DatasetExhausted { seen, requested } => format!(
-            "alc.nn.trainer.run_distill: dataset exhausted after {seen} steps \
-             (requested {requested})"
-        ),
-        TrainError::Ckpt(inner) => {
-            format!("alc.nn.trainer.run_distill: checkpoint: {inner}")
-        }
-        TrainError::Candle(inner) => {
-            format!("alc.nn.trainer.run_distill: candle: {inner}")
-        }
-        other => format!("alc.nn.trainer.run_distill: {other}"),
-    };
-    LuaError::external(msg)
 }
 
 #[cfg(test)]

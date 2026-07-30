@@ -12,11 +12,18 @@ building, and that it fits in a few hundred lines of Lua on top of
 
 ```
 examples/gameai/
-  card_duel/init.lua          rules, encoding, reference policies (pure Lua)
-  card_duel/spec/             alc_pkg_test suite for the rules
-  card_duel_npc/init.lua      NPC strategy: encode -> decode -> legal gate
-  train_card_duel_npc.lua     teacher corpus -> Full FT -> Card + alias
-  card_duel_scenario.lua      eval scenario (style / legality / determinism / win rate)
+  card_duel/init.lua                 rules, encoding, six reference styles (pure Lua)
+  card_duel/spec/                    alc_pkg_test suite for the rules
+  card_duel_npc/init.lua             NPC strategy: encode -> decode -> legal gate
+  card_duel_tournament/init.lua      round robin between styles, win rate matrix
+  card_duel_tournament/spec/         alc_pkg_test suite for the aggregation
+  card_duel_interactive/init.lua     human vs NPC session, kept in alc.state
+  card_duel_interactive/spec/        alc_pkg_test suite for the session
+  train_card_duel_npc.lua            teacher corpus -> Full FT -> Card + alias
+  card_duel_scenario.lua             eval scenario (style / legality / determinism / win rate)
+  card_duel_scenario_timid.lua       eval scenario for the timid style
+  card_duel_scenario_bold.lua        eval scenario for the bold style
+  card_duel_tournament_scenario.lua  eval scenario for the round robin
 ```
 
 ## The game
@@ -124,6 +131,145 @@ states, the legality flag over five of them, agreement between two
 independent decode sessions, and a self-play win rate against the
 random policy with a lower fence at 0.50.
 
+### Style zoo
+
+`card_duel.STYLES` lists six deterministic styles — `timid`, `bold`,
+`aggressive`, `defensive`, `late_bloomer` and `mimic` — and the training
+script learns any one of them:
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/train_card_duel_npc.lua",
+  ctx = { style = "timid", steps = 800, batch = 32 }
+)
+```
+
+`ctx.style = "all"` trains the whole zoo in turn and returns one entry
+per style:
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/train_card_duel_npc.lua",
+  ctx = { style = "all", steps = 800, batch = 32 }
+)
+```
+
+Each run pins its Card to `card_duel_npc_<style>`; the `aggressive` run
+additionally pins the bare `card_duel_npc` alias, so the original
+scenario and the Rust smoke harness keep resolving without a suffix.
+
+The NPC package reads the alias from `ctx.card_alias`, and the eval
+runner merges `strategy_opts` into that ctx, so one strategy serves
+every style without duplicating the scenario:
+
+```
+alc_scenario_install(source = "<repo>/examples/gameai/card_duel_scenario_timid.lua")
+alc_eval(
+  scenario = "card_duel_scenario_timid",
+  strategy = "card_duel_npc",
+  strategy_opts = { card_alias = "card_duel_npc_timid" }
+)
+```
+
+`card_duel_scenario_bold.lua` is the same fence for `card_duel_npc_bold`.
+
+### Tournament
+
+Once several styles are trained, `card_duel_tournament` plays them
+against each other — both seats are Cards, so nothing in the match is a
+hand-written policy:
+
+```
+alc_pkg_link(path = "<repo>/examples/gameai/card_duel_tournament")
+
+alc_run(code = [[
+  return require("card_duel_tournament").run({
+      styles = { "timid", "bold", "aggressive" },
+      games_per_pair = 10,
+      seed = 7,
+  })
+]])
+```
+
+The answer carries `matrix`, `summary` and a one-line `result`:
+
+```
+tournament styles=3 games=30 top=bold winrate=0.63
+```
+
+`matrix[a][b]` is the record of `a` against `b` — `wins`, `losses`,
+`draws` and `winrate = wins / games_per_pair`. Draws count for neither
+side, so `matrix[a][b].winrate + matrix[b][a].winrate` falls below 1.0
+by exactly the draw rate of that pair, and a pair of styles that mostly
+ties shows up as two low numbers rather than as a 50/50 split.
+`summary[style]` adds `total_winrate` over every game the style played,
+`avg_point_margin` (own points minus the opponent's, averaged) and
+`gated_rate`, the share of moves where the decode gate had to step away
+from the raw argmax. Average game length is not reported because the
+rules always run exactly five rounds.
+
+The tournament is a strategy package, so it can also be fenced:
+
+```
+alc_scenario_install(source = "<repo>/examples/gameai/card_duel_tournament_scenario.lua")
+alc_eval(
+  scenario = "card_duel_tournament_scenario",
+  strategy = "card_duel_tournament"
+)
+```
+
+That scenario binds a custom `winrate_at_least` grader, which reads the
+`winrate=` field of the result line and compares it with a numeric floor
+from `case.context.min`.
+
+### Interactive play
+
+`card_duel_interactive` keeps a game in `alc.state` between calls, so a
+human can take one seat and answer one move per `alc_run`:
+
+```
+alc_pkg_link(path = "<repo>/examples/gameai/card_duel_interactive")
+
+alc_run(code = [[
+  return require("card_duel_interactive").run({
+      action = "new", style = "aggressive", seed = 7,
+  })
+]])
+```
+
+```
+round 1 of 5: you 0 - 0 npc, hand 1,3,5,7,9, play one of 1,3,5,7,9
+```
+
+Then one call per round, five times, passing a rank from
+`legal_actions`:
+
+```
+alc_run(code = [[
+  return require("card_duel_interactive").run({ action = "play", rank = 9 })
+]])
+```
+
+```
+round 1: you played 9, the npc played 7, you score | round 2 of 5: you 1 - 0 npc, hand 1,3,5,7, play one of 1,3,5,7
+```
+
+`action = "show"` re-prints the board without moving, and `action =
+"end"` drops the session:
+
+```
+alc_run(code = [[
+  return require("card_duel_interactive").run({ action = "end" })
+]])
+```
+
+```
+session ended: game over: you 3 - 2 npc, you win
+```
+
+Pass `game_id` to keep several sessions apart, `user_seat = 2` to sit in
+the second seat, and `style` to choose which trained Card answers.
+
 ## CI
 
 Two fences run under `cargo test`:
@@ -145,10 +291,14 @@ cargo test -p algocline-engine
 cargo test -p algocline-engine --features nn --test gameai_smoke_test
 ```
 
-The package spec is separate and runs on demand:
+The package specs are separate and run on demand. None of them loads a
+model — the tournament and the session stub the NPC package out — so
+they pass on the default feature set:
 
 ```
 alc_pkg_test(pkg = "card_duel")
+alc_pkg_test(pkg = "card_duel_tournament")
+alc_pkg_test(pkg = "card_duel_interactive")
 ```
 
 ## Known limitations
@@ -156,7 +306,16 @@ alc_pkg_test(pkg = "card_duel")
 - Style compliance depends on the training budget. The defaults (800
   steps at batch 32) are sized for a laptop CPU, not for a compliance
   target.
-- The win rate is fenced with a regex threshold rather than a numeric
-  grader; a custom grader would express it directly.
-- Only the `p1` seat is driven by the model in self-play. A
-  model-vs-model match would need a second alias.
+- The tournament win rate is fenced with a custom numeric grader
+  (`winrate_at_least`). The per-move scenarios still use `contains` and
+  `regex`, which is enough for their exact-token answers but cannot
+  express a floor on a number.
+- Model-vs-model matches live in `card_duel_tournament`, which drives
+  both seats from Cards. The `selfplay` mode inside `card_duel_npc` is
+  still one-sided: the model takes the `p1` seat against the random
+  policy.
+- Decoding is greedy and therefore deterministic, so an NPC repeats
+  itself in identical positions. Noisy or temperature decoding is
+  deferred: the stdlib sampler has no legal-action mask, so sampling
+  would have to be filtered outside the sampler, and it would break the
+  determinism case the scenarios fence.

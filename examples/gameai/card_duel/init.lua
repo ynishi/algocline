@@ -35,11 +35,16 @@
 --- reproduce it by reading the encoded state rather than memorising a
 --- constant.
 ---
+--- The same rules carry a whole zoo of such styles (`M.STYLES`): the
+--- other five branch on the round, on the opponent history or on nothing
+--- at all, which lets one set of rules train and compare several NPCs.
+---
 --- ## Entry contract
 ---
 --- - `new_game` / `apply` / `is_over` / `winner` — game progression
 --- - `legal_actions` / `encode` / `vocab` / `to_ids` — NPC-facing view
---- - `policy_aggressive` / `policy_random` — reference policies
+--- - `policy_<style>` for every name in `STYLES` — deterministic styles
+--- - `policy_random` — the random opponent used by self-play
 --- - `run` — Strategy entry; returns the encoded opening state
 ---
 --- ## Caveats
@@ -402,6 +407,99 @@ function M.policy_aggressive(state)
     end
     return legal[1]
 end
+
+--- Timid style: always play the lowest legal rank.
+---@param state table Per-player state
+---@return integer action
+function M.policy_timid(state)
+    local legal = M.legal_actions(state)
+    if #legal == 0 then
+        error("card_duel.policy_timid: no legal action (empty hand)")
+    end
+    return legal[1]
+end
+
+--- Bold style: always play the highest legal rank.
+---@param state table Per-player state
+---@return integer action
+function M.policy_bold(state)
+    local legal = M.legal_actions(state)
+    if #legal == 0 then
+        error("card_duel.policy_bold: no legal action (empty hand)")
+    end
+    return legal[#legal]
+end
+
+--- Defensive style: the mirror image of the teacher.
+---
+--- Holds the high cards back while behind or level and spends them once
+--- ahead, so a model that learned `policy_aggressive` scores zero on
+--- this style rather than half its states by accident.
+---@param state table Per-player state
+---@return integer action
+function M.policy_defensive(state)
+    local legal = M.legal_actions(state)
+    if #legal == 0 then
+        error("card_duel.policy_defensive: no legal action (empty hand)")
+    end
+    if state.my_points <= state.opp_points then
+        return legal[1]
+    end
+    return legal[#legal]
+end
+
+--- Late bloomer style: coast through the opening, press at the end.
+---
+--- The branch is on the round rather than the score, so the style is
+--- only reproducible from the round field of the encoded state.
+---@param state table Per-player state
+---@return integer action
+function M.policy_late_bloomer(state)
+    local legal = M.legal_actions(state)
+    if #legal == 0 then
+        error("card_duel.policy_late_bloomer: no legal action (empty hand)")
+    end
+    if state.round <= 2 then
+        return legal[1]
+    end
+    return legal[#legal]
+end
+
+--- Mimic style: answer the opponent's last card with the nearest rank.
+---
+--- Ties in distance resolve to the lower rank so the style stays
+--- deterministic, and an empty history (round one) falls back to the
+--- middle of the legal actions rather than erroring: the state is legal,
+--- there is simply nothing to mirror yet.
+---@param state table Per-player state
+---@return integer action
+function M.policy_mimic(state)
+    local legal = M.legal_actions(state)
+    if #legal == 0 then
+        error("card_duel.policy_mimic: no legal action (empty hand)")
+    end
+    local history = state.opp_played or {}
+    local target = history[#history]
+    if target == nil then
+        return legal[math.ceil(#legal / 2)]
+    end
+    local best, best_gap = legal[1], math.abs(legal[1] - target)
+    for i = 2, #legal do
+        local gap = math.abs(legal[i] - target)
+        if gap < best_gap then
+            best, best_gap = legal[i], gap
+        end
+    end
+    return best
+end
+
+--- Canonical style names, in the order the trainer and the tournament
+--- iterate them.
+---
+--- Every entry `s` has a matching `M["policy_" .. s]`; callers that take
+--- a style name validate against this list instead of hard-coding their
+--- own copy.
+M.STYLES = { "timid", "bold", "aggressive", "defensive", "late_bloomer", "mimic" }
 
 --- Uniform choice over the legal actions, driven by a caller-owned RNG.
 ---

@@ -131,6 +131,50 @@ describe("card_duel.policy_aggressive", function()
     end)
 end)
 
+describe("card_duel.STYLES", function()
+    it("exports a policy for every canonical style", function()
+        expect(#duel.STYLES).to.equal(6)
+        for _, style in ipairs(duel.STYLES) do
+            expect(type(duel["policy_" .. style])).to.equal("function")
+        end
+    end)
+end)
+
+describe("card_duel style zoo", function()
+    it("plays the lowest card as timid", function()
+        local state = { round = 1, my_hand = { 2, 8, 5 }, my_points = 3, opp_points = 0 }
+        expect(duel.policy_timid(state)).to.equal(2)
+    end)
+
+    it("plays the highest card as bold", function()
+        local state = { round = 1, my_hand = { 2, 8, 5 }, my_points = 3, opp_points = 0 }
+        expect(duel.policy_bold(state)).to.equal(8)
+    end)
+
+    it("holds back while behind as defensive", function()
+        local state = { round = 2, my_hand = { 2, 8, 5 }, my_points = 0, opp_points = 1 }
+        expect(duel.policy_defensive(state)).to.equal(2)
+    end)
+
+    it("presses from round three as late bloomer", function()
+        local early = { round = 2, my_hand = { 2, 8, 5 }, my_points = 0, opp_points = 0 }
+        local late = { round = 3, my_hand = { 2, 8, 5 }, my_points = 0, opp_points = 0 }
+        expect(duel.policy_late_bloomer(early)).to.equal(2)
+        expect(duel.policy_late_bloomer(late)).to.equal(8)
+    end)
+
+    it("answers the last opponent card as mimic", function()
+        local state = {
+            round = 3,
+            my_hand = { 2, 8, 5 },
+            my_points = 1,
+            opp_points = 1,
+            opp_played = { 9, 6 },
+        }
+        expect(duel.policy_mimic(state)).to.equal(5)
+    end)
+end)
+
 describe("card_duel game loop", function()
     it("terminates and names a winner", function()
         local g = play_teacher_vs_random(31)

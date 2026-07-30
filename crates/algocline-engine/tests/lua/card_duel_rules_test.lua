@@ -187,6 +187,69 @@ describe("card_duel.winner", function()
     end)
 end)
 
+-- ─── winner outcomes ───
+--
+-- The four answers `winner` can give, each produced by actually playing
+-- a staged deal to the end rather than by asserting a point total the
+-- test assumed. `nil` is pinned as loudly as the three names: a caller
+-- that collapses the unfinished case into "draw" hides a loop that
+-- stopped one round early.
+
+--- Deal a game and swap in literal hands, so the scripted outcome is
+--- exact instead of seed-dependent.
+local function staged_game(hand1, hand2)
+    local g = duel.new_game(101)
+    g.p1.my_hand = hand1
+    g.p2.my_hand = hand2
+    return g
+end
+
+--- Play `rounds` rounds with one deterministic style per seat.
+local function play_rounds(g, p1_policy, p2_policy, rounds)
+    for _ = 1, rounds do
+        g = duel.apply(g, p1_policy(g.p1), p2_policy(g.p2))
+    end
+    return g
+end
+
+describe("card_duel.winner outcomes", function()
+    it("names p1 on a 3-2 finish", function()
+        local g = staged_game({ 9, 9, 9, 1, 1 }, { 2, 2, 2, 8, 8 })
+        g = play_rounds(g, duel.policy_bold, duel.policy_timid, duel.HAND_SIZE)
+        expect(duel.is_over(g)).to.equal(true)
+        expect(g.p1.my_points).to.equal(3)
+        expect(g.p2.my_points).to.equal(2)
+        expect(duel.winner(g)).to.equal("p1")
+    end)
+
+    it("names p2 on a 2-3 finish", function()
+        local g = staged_game({ 2, 2, 2, 8, 8 }, { 9, 9, 9, 1, 1 })
+        g = play_rounds(g, duel.policy_timid, duel.policy_bold, duel.HAND_SIZE)
+        expect(duel.is_over(g)).to.equal(true)
+        expect(g.p1.my_points).to.equal(2)
+        expect(g.p2.my_points).to.equal(3)
+        expect(duel.winner(g)).to.equal("p2")
+    end)
+
+    it("draws on level points with a tied round", function()
+        local g = staged_game({ 9, 9, 5, 1, 1 }, { 2, 2, 5, 8, 8 })
+        g = play_rounds(g, duel.policy_bold, duel.policy_timid, duel.HAND_SIZE)
+        expect(duel.is_over(g)).to.equal(true)
+        expect(g.p1.my_points).to.equal(2)
+        expect(g.p2.my_points).to.equal(2)
+        expect(duel.winner(g)).to.equal("draw")
+    end)
+
+    it("is nil one round short of the end, even with a point lead", function()
+        local g = staged_game({ 9, 9, 9, 1, 1 }, { 2, 2, 2, 8, 8 })
+        g = play_rounds(g, duel.policy_bold, duel.policy_timid, duel.HAND_SIZE - 1)
+        expect(duel.is_over(g)).to.equal(false)
+        expect(g.p1.my_points).to.equal(3)
+        expect(g.p2.my_points).to.equal(1)
+        expect(duel.winner(g)).to.equal(nil)
+    end)
+end)
+
 -- ─── encode ───
 
 describe("card_duel.encode", function()
@@ -291,6 +354,193 @@ describe("card_duel.policy_random", function()
             end
             expect(found).to.equal(true)
             g = duel.apply(g, duel.policy_aggressive(g.p1), a2)
+        end
+    end)
+end)
+
+-- ─── style zoo ───
+--
+-- Every style is a pure function of the per-player state, so the specs
+-- below feed literal states rather than replaying a deal: the branch
+-- each style reads (nothing, the score gap, the round, the opponent
+-- history) is exercised directly on both sides of its boundary.
+
+describe("card_duel.policy_timid", function()
+    it("plays the lowest legal rank", function()
+        local state = { round = 1, my_hand = { 3, 9, 6 }, my_points = 0, opp_points = 0 }
+        expect(duel.policy_timid(state)).to.equal(3)
+    end)
+
+    it("ignores the score gap", function()
+        local behind = { round = 4, my_hand = { 2, 8, 5 }, my_points = 0, opp_points = 3 }
+        local ahead = { round = 4, my_hand = { 2, 8, 5 }, my_points = 3, opp_points = 0 }
+        expect(duel.policy_timid(behind)).to.equal(2)
+        expect(duel.policy_timid(ahead)).to.equal(2)
+    end)
+end)
+
+describe("card_duel.policy_bold", function()
+    it("plays the highest legal rank", function()
+        local state = { round = 1, my_hand = { 3, 9, 6 }, my_points = 0, opp_points = 0 }
+        expect(duel.policy_bold(state)).to.equal(9)
+    end)
+
+    it("ignores the score gap", function()
+        local behind = { round = 4, my_hand = { 2, 8, 5 }, my_points = 0, opp_points = 3 }
+        local ahead = { round = 4, my_hand = { 2, 8, 5 }, my_points = 3, opp_points = 0 }
+        expect(duel.policy_bold(behind)).to.equal(8)
+        expect(duel.policy_bold(ahead)).to.equal(8)
+    end)
+end)
+
+describe("card_duel.policy_defensive", function()
+    it("plays the lowest legal rank when behind", function()
+        local state = { round = 2, my_hand = { 3, 9, 6 }, my_points = 0, opp_points = 2 }
+        expect(duel.policy_defensive(state)).to.equal(3)
+    end)
+
+    it("plays the lowest legal rank when level", function()
+        local state = { round = 2, my_hand = { 3, 9, 6 }, my_points = 1, opp_points = 1 }
+        expect(duel.policy_defensive(state)).to.equal(3)
+    end)
+
+    it("plays the highest legal rank when ahead", function()
+        local state = { round = 2, my_hand = { 3, 9, 6 }, my_points = 2, opp_points = 0 }
+        expect(duel.policy_defensive(state)).to.equal(9)
+    end)
+
+    it("mirrors the teacher on both sides of the gap", function()
+        local behind = { round = 2, my_hand = { 3, 9, 6 }, my_points = 0, opp_points = 2 }
+        local ahead = { round = 2, my_hand = { 3, 9, 6 }, my_points = 2, opp_points = 0 }
+        expect(duel.policy_defensive(behind) ~= duel.policy_aggressive(behind)).to.equal(true)
+        expect(duel.policy_defensive(ahead) ~= duel.policy_aggressive(ahead)).to.equal(true)
+    end)
+end)
+
+describe("card_duel.policy_late_bloomer", function()
+    it("plays the lowest legal rank in round one", function()
+        local state = { round = 1, my_hand = { 4, 8, 1 }, my_points = 0, opp_points = 0 }
+        expect(duel.policy_late_bloomer(state)).to.equal(1)
+    end)
+
+    it("still coasts in round two", function()
+        local state = { round = 2, my_hand = { 4, 8, 1 }, my_points = 0, opp_points = 1 }
+        expect(duel.policy_late_bloomer(state)).to.equal(1)
+    end)
+
+    it("switches to the highest legal rank in round three", function()
+        local state = { round = 3, my_hand = { 4, 8, 1 }, my_points = 0, opp_points = 1 }
+        expect(duel.policy_late_bloomer(state)).to.equal(8)
+    end)
+
+    it("presses in the last round", function()
+        local state = { round = 5, my_hand = { 4, 8 }, my_points = 2, opp_points = 2 }
+        expect(duel.policy_late_bloomer(state)).to.equal(8)
+    end)
+
+    it("ignores the score gap", function()
+        local ahead = { round = 1, my_hand = { 4, 8, 1 }, my_points = 3, opp_points = 0 }
+        expect(duel.policy_late_bloomer(ahead)).to.equal(1)
+    end)
+end)
+
+describe("card_duel.policy_mimic", function()
+    it("plays the middle legal rank when the history is empty", function()
+        local state =
+            { round = 1, my_hand = { 9, 5, 1 }, my_points = 0, opp_points = 0, opp_played = {} }
+        expect(duel.policy_mimic(state)).to.equal(5)
+    end)
+
+    it("rounds the middle down on an even count", function()
+        local state =
+            { round = 1, my_hand = { 2, 4, 6, 8 }, my_points = 0, opp_points = 0, opp_played = {} }
+        expect(duel.policy_mimic(state)).to.equal(4)
+    end)
+
+    it("answers the last opponent card with the nearest rank", function()
+        local state = {
+            round = 3,
+            my_hand = { 1, 4, 9 },
+            my_points = 1,
+            opp_points = 1,
+            opp_played = { 8, 5 },
+        }
+        expect(duel.policy_mimic(state)).to.equal(4)
+    end)
+
+    it("breaks a distance tie toward the lower rank", function()
+        local state =
+            { round = 3, my_hand = { 4, 6 }, my_points = 1, opp_points = 1, opp_played = { 2, 5 } }
+        expect(duel.policy_mimic(state)).to.equal(4)
+    end)
+
+    it("matches the opponent rank exactly when it is in hand", function()
+        local state =
+            { round = 2, my_hand = { 3, 7, 9 }, my_points = 0, opp_points = 0, opp_played = { 7 } }
+        expect(duel.policy_mimic(state)).to.equal(7)
+    end)
+
+    it("reads only the most recent opponent card", function()
+        local state = {
+            round = 3,
+            my_hand = { 2, 5, 8 },
+            my_points = 0,
+            opp_points = 2,
+            opp_played = { 9, 1 },
+        }
+        expect(duel.policy_mimic(state)).to.equal(2)
+    end)
+end)
+
+describe("card_duel.STYLES", function()
+    it("lists every deterministic style", function()
+        expect(#duel.STYLES).to.equal(6)
+    end)
+
+    it("names a policy function for each entry", function()
+        for _, style in ipairs(duel.STYLES) do
+            expect(type(duel["policy_" .. style])).to.equal("function")
+        end
+    end)
+
+    it("rejects an empty hand loudly for every style", function()
+        local empty = { round = 1, my_hand = {}, my_points = 0, opp_points = 0, opp_played = {} }
+        for _, style in ipairs(duel.STYLES) do
+            expect(function()
+                duel["policy_" .. style](empty)
+            end).to.fail()
+        end
+    end)
+
+    it("only ever returns a legal action over a whole playout", function()
+        for _, style in ipairs(duel.STYLES) do
+            local policy = duel["policy_" .. style]
+            local g = duel.new_game(73)
+            while not duel.is_over(g) do
+                local a1 = policy(g.p1)
+                local found = false
+                for _, rank in ipairs(duel.legal_actions(g.p1)) do
+                    if rank == a1 then
+                        found = true
+                    end
+                end
+                expect(found).to.equal(true)
+                g = duel.apply(g, a1, policy(g.p2))
+            end
+        end
+    end)
+
+    it("keeps every style deterministic", function()
+        local state = {
+            round = 3,
+            my_hand = { 2, 6, 9 },
+            my_points = 1,
+            opp_points = 2,
+            opp_played = { 4, 7 },
+        }
+        for _, style in ipairs(duel.STYLES) do
+            local policy = duel["policy_" .. style]
+            expect(policy(state)).to.equal(policy(state))
         end
     end)
 end)

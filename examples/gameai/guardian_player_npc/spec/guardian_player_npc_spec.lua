@@ -89,10 +89,15 @@ local HANDLE = {
 --- Alias of the most recent Card lookup.
 local last_alias = nil
 
+--- Persona the stub hands out with a Card, keyed by alias. A persona
+--- bake writes `persona.basis_style` onto its Card; the canonical
+--- teacher Cards carry none, which is the empty entry here.
+local PERSONA_BY_ALIAS = {}
+
 alc.card = {
     get_by_alias = function(alias)
         last_alias = alias
-        return { card_id = "stub-card-" .. alias }
+        return { card_id = "stub-card-" .. alias, persona = PERSONA_BY_ALIAS[alias] }
     end,
 }
 
@@ -358,6 +363,70 @@ describe("guardian_player_npc autoplay", function()
         -- The boss Card is decoded under the same basis the player views
         -- are built on, or the two seats read different distances.
         expect(last_boss_style).to.equal("guardian")
+    end)
+
+    it("reads the basis off a seated boss Card", function()
+        -- A persona bake records the basis its corpus was encoded
+        -- against on the Card, so a seated boss knows its own threshold
+        -- and the caller does not have to repeat it. The fight is the
+        -- same one as above — the stub boss answers with the teacher
+        -- either way — and what the basis moves is the `D` field of
+        -- every view the model is asked about.
+        PERSONA_BY_ALIAS["guardian_duel_npc_stalker"] = { basis_style = "turtle" }
+        local text = ask({
+            mode = "autoplay",
+            games = 1,
+            seed = 5,
+            boss_card_alias = "guardian_duel_npc_stalker",
+        })
+        expect(text).to.equal("winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0")
+        expect(last_boss_style).to.equal("turtle")
+        PERSONA_BY_ALIAS["guardian_duel_npc_stalker"] = nil
+    end)
+
+    it("lets boss_style override the basis on the Card", function()
+        -- The Card names a basis only when nobody else did: an explicit
+        -- `boss_style` is the caller measuring the fights against a
+        -- threshold of their own choosing.
+        PERSONA_BY_ALIAS["guardian_duel_npc_stalker"] = { basis_style = "turtle" }
+        ask({
+            mode = "autoplay",
+            games = 1,
+            seed = 5,
+            boss_card_alias = "guardian_duel_npc_stalker",
+            boss_style = "guardian",
+        })
+        expect(last_boss_style).to.equal("guardian")
+        PERSONA_BY_ALIAS["guardian_duel_npc_stalker"] = nil
+    end)
+
+    it("rejects a boss Card that records no basis when no boss_style is named", function()
+        -- The canonical teacher Cards carry no persona basis. Falling
+        -- back to the teacher default would measure every view against
+        -- a boss that is not seated, so the ask is loud instead.
+        expect(function()
+            ask({
+                mode = "autoplay",
+                games = 1,
+                seed = 5,
+                boss_card_alias = "guardian_duel_npc_plain",
+            })
+        end).to.fail()
+    end)
+
+    it("rejects a Card basis outside guardian_duel.STYLES", function()
+        -- A basis read off a Card is checked like one read off the
+        -- request: a threshold that does not exist cannot be encoded.
+        PERSONA_BY_ALIAS["guardian_duel_npc_bogus"] = { basis_style = "berserker" }
+        expect(function()
+            ask({
+                mode = "autoplay",
+                games = 1,
+                seed = 5,
+                boss_card_alias = "guardian_duel_npc_bogus",
+            })
+        end).to.fail()
+        PERSONA_BY_ALIAS["guardian_duel_npc_bogus"] = nil
     end)
 
     it("rejects a boss Card alias that is not a string", function()

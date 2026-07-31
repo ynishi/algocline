@@ -70,6 +70,12 @@
 --- impatient variant would be reading a number that means something
 --- else. `boss_card_alias` seats a boss Card instead of the teacher
 --- policy, decoded through `guardian_duel_npc` under the same basis.
+--- With a Card seated and no `boss_style`, the basis is read from the
+--- Card itself — `persona.basis_style`, the field the persona bake
+--- records — because defaulting to the teacher basis here would
+--- measure every view against a boss that is not seated. A seated
+--- Card that records no basis (the canonical teacher Cards do not) is
+--- a loud error asking for `boss_style` rather than a guess.
 ---
 --- Every mode also reads an optional `card_alias` from the task JSON;
 --- `ctx.card_alias` wins when both carry one. A task field outside the
@@ -130,7 +136,8 @@ if T then
             ),
             boss_style = T.string:is_optional():describe(
                 "Boss the autoplay fights are played against, and the distance basis "
-                    .. "every generated view is measured against (default: guardian)"
+                    .. "every generated view is measured against (default: guardian, "
+                    .. "or the basis recorded on a seated boss Card)"
             ),
         }),
         result = T.string:describe("Flat key=value summary of the requested mode"),
@@ -323,23 +330,56 @@ local function boss_payload(boss)
     }
 end
 
+--- Distance basis recorded on a seated boss Card.
+---
+--- A persona bake writes the basis its corpus was encoded against onto
+--- the Card (`persona.basis_style`), which is where
+--- `guardian_duel_interactive` reads it from too. A Card that carries
+--- none — the canonical teacher Cards do not — cannot name its own
+--- threshold, so the caller has to: guessing the teacher default here
+--- is exactly the footgun this lookup replaces, a `D` field measured
+--- against a boss that is not seated.
+---@param alias string Boss Card alias, already validated
+---@return string basis
+local function card_basis(alias)
+    if
+        type(alc) ~= "table"
+        or type(alc.card) ~= "table"
+        or type(alc.card.get_by_alias) ~= "function"
+    then
+        error("guardian_player_npc: alc.card.get_by_alias is unavailable")
+    end
+    local card = alc.card.get_by_alias(alias)
+    if type(card) ~= "table" then
+        error(string.format("guardian_player_npc: no Card bound to boss alias %q", alias))
+    end
+    local persona = card.persona
+    local basis = type(persona) == "table" and persona.basis_style or nil
+    if basis == nil then
+        error(
+            string.format(
+                "guardian_player_npc: boss Card %q carries no persona.basis_style; "
+                    .. "pass boss_style to name the distance basis its fights are measured against",
+                alias
+            )
+        )
+    end
+    return require_style(basis, "persona.basis_style of " .. alias)
+end
+
 --- Seat the opponent for one autoplay run.
 ---
---- With no `boss_card_alias` the boss is the teacher policy of
---- `boss_style`, which makes a run reproducible from its seed alone.
---- With one, the boss is another Card, decoded through
---- `guardian_duel_npc` under the same basis — the shape a demo uses to
---- put a baked player against a baked boss.
----@param req table Decoded task
+--- With no boss Card the boss is the teacher policy of `style`, which
+--- makes a run reproducible from its seed alone. With one, the boss is
+--- another Card, decoded through `guardian_duel_npc` under the same
+--- basis — the shape a demo uses to put a baked player against a baked
+--- boss.
+---@param alias string|nil Boss Card alias, already validated
 ---@param style string Boss style, the teacher default and the basis
 ---@return fun(state: table): string boss
-local function resolve_boss(req, style)
-    local alias = req.boss_card_alias
+local function resolve_boss(alias, style)
     if alias == nil then
         return duel["policy_" .. style]
-    end
-    if type(alias) ~= "string" or #alias == 0 then
-        error("guardian_player_npc: task.boss_card_alias must be a non-empty string")
     end
     require_json()
     local boss_npc = require("guardian_duel_npc")
@@ -381,10 +421,19 @@ local function mode_autoplay(handle, req, style)
     if games <= 0 then
         error("guardian_player_npc: task.games must be a positive integer")
     end
+    local alias = req.boss_card_alias
+    if alias ~= nil and (type(alias) ~= "string" or #alias == 0) then
+        error("guardian_player_npc: task.boss_card_alias must be a non-empty string")
+    end
     if req.boss_style ~= nil then
         style = require_style(req.boss_style, "task.boss_style")
     end
-    local boss = resolve_boss(req, style)
+    if style == nil then
+        -- Nobody named a basis. With a boss Card seated the Card names
+        -- it; with the teacher seated the teacher is its own basis.
+        style = alias ~= nil and card_basis(alias) or DEFAULT_BOSS_STYLE
+    end
+    local boss = resolve_boss(alias, style)
 
     local score, moves, raw_legal = 0.0, 0, 0
     local counts = {}
@@ -543,12 +592,13 @@ function M.run(ctx)
     end
     require_known_fields(req, req.mode, spec.fields)
 
-    -- The boss a Card was logged against is a property of the Card
-    -- rather than of the request, so it is read from the ctx and
-    -- validated once for every mode: it decides the distance basis the
-    -- views are built on, and an unknown one would measure against a
-    -- threshold that does not exist.
-    local style = DEFAULT_BOSS_STYLE
+    -- A ctx basis is validated once for every mode: it decides the
+    -- distance basis the views are built on, and an unknown one would
+    -- measure against a threshold that does not exist. It is left nil
+    -- rather than defaulted when the ctx names none, because the right
+    -- default depends on the boss seat — a seated boss Card names its
+    -- own basis — and only autoplay knows what is seated.
+    local style = nil
     if ctx.boss_style ~= nil then
         style = require_style(ctx.boss_style, "ctx.boss_style")
     end

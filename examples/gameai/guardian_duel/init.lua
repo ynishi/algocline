@@ -1300,7 +1300,7 @@ local function require_flag(fn, field, value)
     return value
 end
 
---- Validate the intent field of a player view.
+--- Validate the intent field of a player view against its mode.
 ---
 --- A view with no intent at all is a view from before the field
 --- existed, which is a different fault from a view that carries a
@@ -1308,7 +1308,25 @@ end
 --- the fix is to record a new one, the second is a corrupt entry. The
 --- two are reported apart so the caller is not sent to fix the wrong
 --- thing.
-local function require_intent(fn, value)
+---
+--- A third fault is an answer that is a boss move but not one this
+--- board could have shown. The twin slam spends the spikes the
+--- defensive move put up, so `legal_actions` only offers it while the
+--- boss is rolled up, and a view carries the mode — which makes that
+--- one condition answerable from the view alone. It is checked here
+--- because the live constructor already refuses the same pair against
+--- `legal_actions`, and without the check the bake path would take a
+--- `M0...t` line the play path would never produce into a corpus.
+---
+--- The rest of the legality is not checked and cannot be: which of the
+--- five unconditional moves comes next is a function of the boss cycle,
+--- and the cycle is the one field the player encoding deliberately
+--- leaves out. A view is therefore enough to reject the impossible
+--- pair, not enough to confirm the plausible one.
+---
+--- `mode` is the `view.mode` of the same view, and the caller passes it
+--- already validated.
+local function require_intent(fn, value, mode)
     if value == nil then
         error(
             string.format(
@@ -1329,6 +1347,19 @@ local function require_intent(fn, value)
                 table.concat(BOSS_ACTIONS, ", "),
                 NO_INTENT,
                 tostring(value)
+            )
+        )
+    end
+    if value == "t" and mode ~= 1 then
+        error(
+            string.format(
+                "guardian_duel.%s: view.intent is %q, which needs view.mode to be 1, got %s. "
+                    .. "The twin slam spends the spikes the defensive move puts up, so the "
+                    .. "board never offers it before the boss has rolled up: the two fields "
+                    .. "come from different turns",
+                fn,
+                "t",
+                tostring(mode)
             )
         )
     end
@@ -1353,7 +1384,10 @@ local function require_player_view(fn, view)
     require_flag(fn, "view.weakened", view.weakened)
     require_flag(fn, "view.exposed", view.exposed)
     require_flag(fn, "view.spikes", view.spikes)
-    require_intent(fn, view.intent)
+    -- The mode goes in last, after `require_int` has pinned it to 0 or
+    -- 1, so the intent is checked against a field that is known good
+    -- rather than against whatever the caller wrote there.
+    require_intent(fn, view.intent, view.mode)
     return view
 end
 

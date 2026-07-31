@@ -101,10 +101,51 @@ describe("guardian_duel.player_encode", function()
     end)
 
     it("spells every boss answer the reveal can carry", function()
+        -- Read from a rolled-up board, because that is the one position
+        -- all six moves are legal from: the slam is the conditional one
+        -- and it needs the mode the spikes went up with.
         for _, move in ipairs({ "c", "f", "v", "w", "d", "t" }) do
-            local encoded = duel.player_encode(player_view({ intent = move }))
+            local encoded = duel.player_encode(player_view({ mode = 1, intent = move }))
             expect(#encoded).to.equal(duel.PLAYER_ENCODED_LEN)
             expect(encoded:sub(-1)).to.equal(move)
+        end
+    end)
+
+    it("rejects a slam promised from a board that has not rolled up", function()
+        -- The one legality a view can answer for itself: the slam spends
+        -- the spikes the defensive move puts up, so the board only ever
+        -- shows it in mode 1. `M0...t` is a line the play path cannot
+        -- produce, and a bake path that let it through would train the
+        -- model on a question the rules never ask.
+        expect(function()
+            duel.player_encode(player_view({ intent = "t" }))
+        end).to.fail()
+    end)
+
+    it("names both fields when the slam and the mode disagree", function()
+        local ok, err = pcall(duel.player_encode, player_view({ intent = "t" }))
+        expect(ok).to.equal(false)
+        expect(err:match("view%.intent") ~= nil).to.equal(true)
+        expect(err:match("view%.mode") ~= nil).to.equal(true)
+    end)
+
+    it("takes the slam once the boss has rolled up", function()
+        -- The same answer on the board it belongs to still encodes, so
+        -- the check is on the pair rather than on the letter.
+        expect(duel.player_encode(player_view({ mode = 1, intent = "t" }))).to.equal(
+            "M1H9D3Y9T1S0t"
+        )
+    end)
+
+    it("leaves the five unconditional answers alone in either mode", function()
+        -- The cycle decides which of these comes next and the encoding
+        -- does not carry it, so the view has nothing to check them
+        -- against and must not invent a rejection.
+        for _, move in ipairs({ "c", "f", "v", "w", "d" }) do
+            for _, mode in ipairs({ 0, 1 }) do
+                local encoded = duel.player_encode(player_view({ mode = mode, intent = move }))
+                expect(encoded:sub(-1)).to.equal(move)
+            end
         end
     end)
 
@@ -579,6 +620,29 @@ describe("guardian_duel.rows_from_player_moves", function()
         expect(ok).to.equal(false)
         expect(err:match("move 2") ~= nil).to.equal(true)
         expect(err:match("view%.intent") ~= nil).to.equal(true)
+    end)
+
+    it("rejects a logged slam the board could not have shown", function()
+        -- The bake path reads the same rule as the play path: a view
+        -- that promises the slam from mode 0 is two turns spliced
+        -- together, and the entry it came from is named so the caller
+        -- can find it in the log rather than in the corpus.
+        local broken = {
+            log_entry(player_view(), "a"),
+            log_entry(player_view({ intent = "t" }), "b"),
+        }
+        local ok, err = pcall(duel.rows_from_player_moves, broken, { ctx_len = CTX_LEN })
+        expect(ok).to.equal(false)
+        expect(err:match("move 2") ~= nil).to.equal(true)
+        expect(err:match("view%.intent") ~= nil).to.equal(true)
+        expect(err:match("view%.mode") ~= nil).to.equal(true)
+    end)
+
+    it("keeps the rolled-up slam in the corpus", function()
+        -- The fixture above already carries one; this pins that the new
+        -- check did not take the legal half of the pair with it.
+        local rows = duel.rows_from_player_moves({ moves[2] }, { ctx_len = CTX_LEN })
+        expect(row_text(rows[1])).to.equal("M1H4D0Y6T5S4t>b\n")
     end)
 
     it("rejects a logged intent that is not a boss move", function()

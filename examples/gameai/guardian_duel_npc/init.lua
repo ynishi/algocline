@@ -1,64 +1,72 @@
---- card_duel_npc — SLM card duel NPC with a legal-action decode gate
+--- guardian_duel_npc — SLM boss NPC with a legal-action decode gate
 ---
 --- Wraps a tuned tiny SLM (a Card produced by
---- `examples/gameai/train_card_duel_npc.lua`) into an algocline
---- strategy that picks one card per round. The model never touches the
---- game state: `card_duel.legal_actions` enumerates the choices and the
---- gate walks the logit ranking until it hits one of them, so an
---- illegal move is structurally impossible while the raw argmax is
---- still reported as telemetry.
+--- `examples/gameai/train_guardian_npc.lua`) into an algocline strategy
+--- that answers one boss move per turn of a `guardian_duel` fight. The
+--- model never touches the fight: `guardian_duel.legal_actions`
+--- enumerates the moves the state allows and the gate walks the logit
+--- ranking until it hits one of them, so a twin slam without spikes is
+--- structurally impossible while the raw argmax is still reported as
+--- telemetry.
 ---
 --- ## Usage
 ---
 --- ```lua
---- local npc = require("card_duel_npc")
+--- local npc = require("guardian_duel_npc")
 --- return npc.run({
----     task = alc.json_encode({ mode = "decide", state = state }),
----     card_alias = "card_duel_npc",
+---     task = alc.json_encode({ mode = "decide", state = boss_state }),
+---     card_alias = "guardian_duel_npc_guardian",
+---     style = "guardian",
 --- })
 --- ```
 ---
 --- ## Algorithm
 ---
---- 1. Resolve the Card behind `card_alias` and load an `NnHandle`
----    (cached per VM, since a decode session is cheap but a model load
----    is not).
---- 2. Encode the state with `card_duel.encode` and append `">"`, the
----    separator the training lines use.
+--- 1. Resolve the Card behind the alias and load an `NnHandle` (cached
+---    per VM, since a decode session is cheap but a model load is not).
+--- 2. Encode the boss state with `guardian_duel.encode` against the
+---    style this NPC answers as, and append `">"`, the separator the
+---    training lines use.
 --- 3. Open a generation session over those token ids and read one
 ---    logits row.
---- 4. Record whether the raw argmax is a legal action (`raw_legal`),
----    then scan `logits:top(vocab)` in descending order and take the
----    first token that maps to a legal rank. That is greedy decoding
+--- 4. Record whether the raw argmax is a legal move (`raw_legal`), then
+---    scan `logits:top(vocab)` in descending order and take the first
+---    token that spells a legal move. That is greedy decoding
 ---    restricted to the legal subset.
 ---
 --- ## Entry contract
 ---
 --- `ctx.task` is a JSON object with a `mode` field:
 ---
---- - `decide` — `{ state }`; returns `action=<rank> legal=true raw_legal=<bool> gated=<bool>`
+--- - `decide` — `{ state }`; returns
+---   `action=<move> legal=true raw_legal=<bool> gated=<bool>`
 --- - `determinism` — `{ state }`; decodes twice through independent
----   sessions and returns `deterministic=<bool> action=<rank>`
+---   sessions and returns `deterministic=<bool> action=<move>`
 --- - `selfplay` — `{ games, seed, style?, policy_source? }`; plays the
----   NPC against `card_duel.policy_random` and returns
+---   NPC boss against `guardian_duel.policy_player_random` and returns
 ---   `winrate=<x.xx> illegal=<n> style_match=<x.xx> style_hits=<n>/<n>`.
 ---   `style` names the teacher policy every model move is compared
----   against (default: `aggressive`); `policy_source` overrides it with
----   a synthesised policy chunk, which is what a persona Card — a Card
----   with no entry in `card_duel.STYLES` — is scored against.
----   `policy_source` may also be passed on the strategy ctx, which is
----   where the eval runner merges `strategy_opts`.
+---   against (default: the style the NPC answers as); `policy_source`
+---   overrides it with a synthesised policy chunk, which is what a
+---   persona Card — a Card with no entry in `guardian_duel.STYLES` — is
+---   scored against. `policy_source` may also be passed on the strategy
+---   ctx, which is where the eval runner merges `strategy_opts`.
 ---
---- Every mode also reads an optional `card_alias` from the task JSON.
---- `ctx.card_alias` wins when both carry one, but the task field is the
---- only channel a caller that can pass nothing except the request has,
---- and ignoring it used to decode with the default Card while reporting
---- the answer as if the requested one had been loaded.
+--- `ctx.style` is the style the Card was trained as. It decides what
+--- the `D` field of every encoded state measures, because
+--- `guardian_duel.encode` writes the distance left to *that* style's
+--- mode shift; handing the model a distance its corpus was not labelled
+--- against would ask it about states it never saw. It is also the
+--- teacher self-play falls back to. A persona Card is trained under a
+--- declared basis style (`bake_guardian_persona.lua`), so it is
+--- answered for with that basis and scored against its own chunk.
 ---
---- A task field outside the set its mode reads is a loud error rather
---- than a silently dropped one: a misspelled `style` would otherwise
---- score the model against the default teacher and report the number as
---- though it had been asked for.
+--- Every mode also reads an optional `card_alias` from the task JSON;
+--- `ctx.card_alias` wins when both carry one. A task field outside the
+--- set its mode reads is a loud error rather than a silently dropped
+--- one: a misspelled `style` would otherwise score the model against
+--- the default teacher and report the number as though it had been
+--- asked for.
 ---
 --- ## Caveats
 ---
@@ -68,19 +76,21 @@
 --- entry fails loudly at Card load rather than degrading to a
 --- hand-written policy, which would silently score the wrong thing.
 ---
---- The self-play win rate counts a draw as half a win, matching the
---- usual convention for symmetric two-player games. With five rounds
---- and a nine-rank deck draws are common enough that scoring them as
---- losses would depress the number for a reason unrelated to play.
+--- A decoded state is handed to `guardian_duel` as it arrives. Nothing
+--- is defaulted, because every field of a boss state moves the answer —
+--- a missing `shifts` would silently move the distance basis, and a
+--- missing `mode` would silently offer the twin slam — so the rules
+--- module rejects the state naming the field instead.
 ---
---- The win rate is reported but it is not what self-play is for: it
---- depends on the random opponent's deals as much as on the model.
+--- The self-play win rate is reported from the boss seat, with a draw
+--- counted as half a win, but it is not what self-play is for: it
+--- depends on the random player's swings as much as on the model.
 --- `style_match` is the direct measurement — the share of model moves
 --- that equal the teacher move for the same state, over states the
 --- model reaches by playing rather than over a fixed list. A model that
 --- learned its style scores near 1.00 whatever the win rate says.
 
-local duel = require("card_duel")
+local duel = require("guardian_duel")
 
 local shapes_ok, S = pcall(require, "alc_shapes")
 local T = shapes_ok and S.T or nil
@@ -89,14 +99,14 @@ local M = {}
 
 ---@type AlcMeta
 M.meta = {
-    name = "card_duel_npc",
+    name = "guardian_duel_npc",
     version = "0.1.0",
-    description = "Card duel NPC driven by a tuned tiny SLM with a legal-action decode gate",
+    description = "Guardian duel boss NPC driven by a tuned tiny SLM with a legal-action decode gate",
     category = "game",
 }
 
 -- Runtime contract for `run`. Declared with the shapes DSL when it is
--- available and left empty otherwise, mirroring `card_duel`.
+-- available and left empty otherwise, mirroring `guardian_duel`.
 local run_entry = {}
 if T then
     run_entry = {
@@ -107,11 +117,15 @@ if T then
             ),
             card_alias = T.string:is_optional():describe(
                 "Card alias holding the tuned model, also readable from the task JSON "
-                    .. "(default: card_duel_npc)"
+                    .. "(default: guardian_duel_npc)"
+            ),
+            style = T.string:is_optional():describe(
+                "Boss style the Card was trained as: the distance basis every state is "
+                    .. "encoded against, and the default self-play teacher (default: guardian)"
             ),
             policy_source = T.string:is_optional():describe(
                 "Synthesised policy chunk self-play scores the model against, "
-                    .. "used for persona Cards that have no entry in card_duel.STYLES"
+                    .. "used for persona Cards that have no entry in guardian_duel.STYLES"
             ),
         }),
         result = T.string:describe("Flat key=value summary of the requested mode"),
@@ -125,18 +139,22 @@ M.docs = {
     schema_version = 1,
 }
 
---- Default Card alias written by the training script.
-local DEFAULT_ALIAS = "card_duel_npc"
+--- Default Card alias written by the training script for the teacher.
+local DEFAULT_ALIAS = "guardian_duel_npc"
 
---- Teacher style self-play compares the model against when the request
---- names none. It matches the style behind the bare `DEFAULT_ALIAS`.
-local DEFAULT_STYLE = "aggressive"
+--- Style the NPC answers as when the caller names none. It matches the
+--- style behind the bare `DEFAULT_ALIAS`.
+local DEFAULT_STYLE = "guardian"
+
+--- Stride between the self-play seed and the player RNG seed, so two
+--- fights of the same batch never share a stream.
+local RNG_STRIDE = 1000
 
 --- Loaded handles keyed by alias, per VM.
 ---
 --- A generation session is cheap; reloading the safetensors bundle for
 --- every decision is not, and a self-play run makes one decision per
---- round per game.
+--- turn per fight.
 local handle_cache = {}
 
 local VOCAB = duel.vocab()
@@ -145,9 +163,16 @@ local VOCAB = duel.vocab()
 
 local function require_nn()
     if type(alc) ~= "table" or type(alc.nn) ~= "table" or type(alc.nn.card) ~= "table" then
-        error("card_duel_npc: alc.nn.card is unavailable; build algocline with --features nn")
+        error("guardian_duel_npc: alc.nn.card is unavailable; build algocline with --features nn")
     end
     return alc.nn
+end
+
+local function require_math()
+    if type(alc) ~= "table" or type(alc.math) ~= "table" then
+        error("guardian_duel_npc: alc.math is required for self-play (alc.math.rng_create)")
+    end
+    return alc.math
 end
 
 --- Resolve the alias to a loaded model handle.
@@ -162,56 +187,88 @@ local function resolve_handle(alias)
     end
     local nn = require_nn()
     if type(alc.card) ~= "table" or type(alc.card.get_by_alias) ~= "function" then
-        error("card_duel_npc: alc.card.get_by_alias is unavailable")
+        error("guardian_duel_npc: alc.card.get_by_alias is unavailable")
     end
     local card = alc.card.get_by_alias(alias)
     if not card then
         error(
             string.format(
-                "card_duel_npc: no Card bound to alias %q; run examples/gameai/train_card_duel_npc.lua first",
+                "guardian_duel_npc: no Card bound to alias %q; run examples/gameai/train_guardian_npc.lua first",
                 alias
             )
         )
     end
     local card_id = card.card_id
     if type(card_id) ~= "string" or #card_id == 0 then
-        error(string.format("card_duel_npc: alias %q resolved to a Card without card_id", alias))
+        error(
+            string.format("guardian_duel_npc: alias %q resolved to a Card without card_id", alias)
+        )
     end
     local handle = nn.card.load_handle(card_id)
     handle_cache[alias] = handle
     return handle
 end
 
+-- ─── Styles ─────────────────────────────────────────────────────────
+
+--- Check a style name against `guardian_duel.STYLES`.
+---
+--- The name is checked against the canonical list rather than against
+--- the presence of a `policy_<name>` field, so a typo is rejected with
+--- the valid names spelled out instead of resolving to nothing.
+---@param raw any Requested style name
+---@param field string Name of the field it came from, for the message
+---@return string style
+local function require_style(raw, field)
+    if type(raw) ~= "string" then
+        error(string.format("guardian_duel_npc: %s must be a string, got %s", field, type(raw)))
+    end
+    for _, name in ipairs(duel.STYLES) do
+        if name == raw then
+            return raw
+        end
+    end
+    error(
+        string.format(
+            "guardian_duel_npc: unknown %s %q (valid: %s)",
+            field,
+            raw,
+            table.concat(duel.STYLES, ", ")
+        )
+    )
+end
+
 -- ─── Decode ─────────────────────────────────────────────────────────
 
---- Token ids that spell a legal action for this state.
+--- Token ids that spell a legal move for this state.
 local function legal_token_ids(state)
-    local ids, ranks = {}, {}
-    for _, rank in ipairs(duel.legal_actions(state)) do
-        local id = VOCAB.to_id[tostring(rank)]
+    local ids, moves = {}, {}
+    for _, action in ipairs(duel.legal_actions(state)) do
+        local id = VOCAB.to_id[action]
         if id == nil then
-            error(string.format("card_duel_npc: rank %s has no token id", tostring(rank)))
+            error(string.format("guardian_duel_npc: move %s has no token id", tostring(action)))
         end
-        ids[id] = rank
-        ranks[#ranks + 1] = rank
+        ids[id] = action
+        moves[#moves + 1] = action
     end
-    if #ranks == 0 then
-        error("card_duel_npc: state has no legal action")
+    if #moves == 0 then
+        error("guardian_duel_npc: state has no legal move")
     end
-    return ids, ranks
+    return ids, moves
 end
 
 --- One gated greedy decision.
 ---
---- Returns the chosen rank plus the two telemetry flags the eval
+--- Returns the chosen move plus the two telemetry flags the eval
 --- scenario fences on: whether the ungated argmax was already legal,
 --- and whether the gate had to move away from it.
 ---@param handle userdata NnHandle
----@param state table Per-player state
----@return table decision `{ rank, raw_legal, gated }`
-local function decide(handle, state)
+---@param state table Boss state
+---@param style string Distance basis the state is encoded against
+---@return table decision `{ action, raw_legal, gated }`
+local function decide(handle, state, style)
     local legal_ids = legal_token_ids(state)
-    local prompt = duel.encode(state) .. ">"
+    local prompt = duel.encode(state, style) .. ">"
     local session = handle:generate_session(duel.to_ids(prompt))
     local logits = session:next_logits()
 
@@ -220,145 +277,118 @@ local function decide(handle, state)
 
     local ranked = logits:top(logits:vocab())
     for _, entry in ipairs(ranked) do
-        local rank = legal_ids[entry.id]
-        if rank ~= nil then
-            return { rank = rank, raw_legal = raw_legal, gated = entry.id ~= raw }
+        local action = legal_ids[entry.id]
+        if action ~= nil then
+            return { action = action, raw_legal = raw_legal, gated = entry.id ~= raw }
         end
     end
     -- Unreachable: `top(vocab)` enumerates the whole vocabulary and the
     -- legal set is non-empty, so a legal id is always present. Kept as a
     -- loud failure rather than a silent fallback in case a future
     -- ranking change starts truncating.
-    error("card_duel_npc: no legal token found in the full logit ranking")
+    error("guardian_duel_npc: no legal token found in the full logit ranking")
 end
 
 -- ─── Modes ──────────────────────────────────────────────────────────
 
+--- The boss state a decode request carries.
+---
+--- Nothing is defaulted here on purpose: `guardian_duel` validates every
+--- field the encoding reads and names the one that is missing, whereas a
+--- default would answer a question the caller did not ask — a
+--- substituted `shifts` moves the distance the model reads, and a
+--- substituted `mode` changes which moves are legal.
 local function decode_state(req)
     local state = req.state
     if type(state) ~= "table" then
-        error("card_duel_npc: task.state must be an object")
+        error("guardian_duel_npc: task.state must be an object, got " .. type(state))
     end
-    if type(state.my_hand) ~= "table" then
-        error("card_duel_npc: task.state.my_hand must be an array")
-    end
-    state.my_points = tonumber(state.my_points) or 0
-    state.opp_points = tonumber(state.opp_points) or 0
-    state.round = tonumber(state.round) or 1
-    state.opp_played = state.opp_played or {}
     return state
 end
 
-local function mode_decide(handle, req)
-    local state = decode_state(req)
-    local d = decide(handle, state)
+local function mode_decide(handle, req, style)
+    local d = decide(handle, decode_state(req), style)
     return string.format(
-        "action=%d legal=true raw_legal=%s gated=%s",
-        d.rank,
+        "action=%s legal=true raw_legal=%s gated=%s",
+        d.action,
         tostring(d.raw_legal),
         tostring(d.gated)
     )
 end
 
-local function mode_determinism(handle, req)
+local function mode_determinism(handle, req, style)
     local state = decode_state(req)
-    local first = decide(handle, state)
-    local second = decide(handle, state)
-    local same = first.rank == second.rank
-    return string.format("deterministic=%s action=%d", tostring(same), first.rank)
-end
-
---- Resolve the teacher policy self-play scores the model against.
----
---- The name is checked against `card_duel.STYLES` rather than against
---- the presence of a `policy_<name>` field, so `random` — a policy that
---- exists but is not a style — is rejected like any other typo, with
---- the valid names spelled out.
----@param raw any Requested style name, or nil for the default
----@return fun(state: table): integer policy
-local function resolve_style_policy(raw)
-    local style = raw
-    if style == nil then
-        style = DEFAULT_STYLE
-    end
-    local known = false
-    for _, name in ipairs(duel.STYLES) do
-        if name == style then
-            known = true
-            break
-        end
-    end
-    if not known then
-        error(
-            string.format(
-                "card_duel_npc: unknown style %s (valid: %s)",
-                tostring(style),
-                table.concat(duel.STYLES, ", ")
-            )
-        )
-    end
-    return duel["policy_" .. style]
+    local first = decide(handle, state, style)
+    local second = decide(handle, state, style)
+    local same = first.action == second.action
+    return string.format("deterministic=%s action=%s", tostring(same), first.action)
 end
 
 --- Resolve the teacher for one self-play run.
 ---
 --- `policy_source` takes precedence over `style`: a persona Card is
 --- trained on an LLM-written policy that has no entry in
---- `card_duel.STYLES`, so the style whitelist would reject it by
+--- `guardian_duel.STYLES`, so the style whitelist would reject it by
 --- construction. The chunk is never loaded raw — `compile_policy` runs
 --- it in the restricted environment and makes it answer sampled states
---- legally and deterministically before a single move is scored
---- against it, which is the same gate the bake script applies.
+--- legally and deterministically before a single move is scored against
+--- it, which is the same gate the bake script applies.
 ---@param req table Decoded task
+---@param style string Style the NPC answers as, the teacher default
 ---@param seed integer Self-play seed, reused for the validation states
----@return fun(state: table): integer policy
-local function resolve_teacher(req, seed)
+---@return fun(state: table): string policy
+local function resolve_teacher(req, style, seed)
     local source = req.policy_source
     if source == nil then
-        return resolve_style_policy(req.style)
+        local name = style
+        if req.style ~= nil then
+            name = require_style(req.style, "task.style")
+        end
+        return duel["policy_" .. name]
     end
     if type(source) ~= "string" then
-        error("card_duel_npc: task.policy_source must be a string, got " .. type(source))
+        error("guardian_duel_npc: task.policy_source must be a string, got " .. type(source))
     end
     return duel.compile_policy(source, { seed = seed, chunk_name = "persona_policy" })
 end
 
-local function mode_selfplay(handle, req)
+local function mode_selfplay(handle, req, style)
     local games = math.floor(tonumber(req.games) or 20)
     local seed = math.floor(tonumber(req.seed) or 1)
     if games <= 0 then
-        error("card_duel_npc: task.games must be a positive integer")
+        error("guardian_duel_npc: task.games must be a positive integer")
     end
-    local policy = resolve_teacher(req, seed)
+    local policy = resolve_teacher(req, style, seed)
+    local math_ns = require_math()
 
     local score, illegal = 0.0, 0
     local moves, hits = 0, 0
     for i = 1, games do
         local g = duel.new_game(seed + i)
-        local rng = alc.math.rng_create(seed * 1000 + i)
+        local rng = math_ns.rng_create(seed * RNG_STRIDE + i)
         while not duel.is_over(g) do
-            local d = decide(handle, g.p1)
+            local d = decide(handle, g.boss, style)
             if not d.raw_legal then
                 illegal = illegal + 1
             end
             moves = moves + 1
-            if d.rank == policy(g.p1) then
+            if d.action == policy(g.boss) then
                 hits = hits + 1
             end
-            g = duel.apply(g, d.rank, duel.policy_random(g.p2, rng))
+            g = duel.apply(g, duel.policy_player_random(rng), d.action)
         end
         local w = duel.winner(g)
-        if w == "p1" then
+        if w == "boss" then
             score = score + 1.0
         elseif w == "draw" then
             score = score + 0.5
         end
     end
     if moves == 0 then
-        -- Unreachable while a fresh game runs five rounds. Kept loud so a
-        -- rules change that empties the loop cannot report style_match as
-        -- a division by zero or as a silent 0.00.
-        error("card_duel_npc: self-play made no move")
+        -- Unreachable while a fresh fight runs to the turn limit. Kept
+        -- loud so a rules change that empties the loop cannot report
+        -- style_match as a division by zero or as a silent 0.00.
+        error("guardian_duel_npc: self-play made no move")
     end
     return string.format(
         "winrate=%.2f illegal=%d style_match=%.2f style_hits=%d/%d",
@@ -426,7 +456,7 @@ local function require_known_fields(req, mode, fields)
     end
     error(
         string.format(
-            "card_duel_npc: task field(s) %s are not read in %s mode (known: %s)",
+            "guardian_duel_npc: task field(s) %s are not read in %s mode (known: %s)",
             table.concat(unknown, ", "),
             mode,
             table.concat(known, ", ")
@@ -450,29 +480,31 @@ local function resolve_alias(ctx, req)
         return DEFAULT_ALIAS
     end
     if type(alias) ~= "string" then
-        error("card_duel_npc: card_alias must be a string, got " .. type(alias))
+        error("guardian_duel_npc: card_alias must be a string, got " .. type(alias))
     end
     if #alias == 0 then
-        error("card_duel_npc: card_alias must not be empty")
+        error("guardian_duel_npc: card_alias must not be empty")
     end
     return alias
 end
 
----@param ctx table `{ task, card_alias?, policy_source? }`
+---@param ctx table `{ task, card_alias?, style?, policy_source? }`
 ---@return table result `{ result = <flat key=value summary> }`
 function M.run(ctx)
     ctx = ctx or {}
     local task = ctx.task
     if type(task) ~= "string" then
-        error("card_duel_npc: ctx.task must be a JSON string, got " .. type(task))
+        error("guardian_duel_npc: ctx.task must be a JSON string, got " .. type(task))
     end
     local req = alc.json_decode(task)
     if type(req) ~= "table" or type(req.mode) ~= "string" then
-        error("card_duel_npc: ctx.task must decode to an object with a mode field")
+        error("guardian_duel_npc: ctx.task must decode to an object with a mode field")
     end
     local mode = MODES[req.mode]
     if mode == nil then
-        error(string.format("card_duel_npc: unknown mode %q (expected %s)", req.mode, MODE_NAMES))
+        error(
+            string.format("guardian_duel_npc: unknown mode %q (expected %s)", req.mode, MODE_NAMES)
+        )
     end
     require_known_fields(req, req.mode, mode.fields)
 
@@ -485,9 +517,18 @@ function M.run(ctx)
         req.policy_source = ctx.policy_source
     end
 
+    -- The style the NPC answers as is a property of the Card rather than
+    -- of the request, so it is read from the ctx and validated once for
+    -- every mode: an unknown one would encode a distance against a
+    -- threshold that does not exist.
+    local style = DEFAULT_STYLE
+    if ctx.style ~= nil then
+        style = require_style(ctx.style, "ctx.style")
+    end
+
     local handle = resolve_handle(resolve_alias(ctx, req))
 
-    return { result = mode.run(handle, req) }
+    return { result = mode.run(handle, req, style) }
 end
 
 --- Drop cached handles. Exposed for the training script, which binds a

@@ -73,8 +73,14 @@ local HANDLE = {
     end,
 }
 
+--- Alias of the most recent Card lookup, which is the only place the
+--- alias resolution is observable: the stub hands out the same handle
+--- whatever it is asked for.
+local last_alias = nil
+
 alc.card = {
     get_by_alias = function(alias)
+        last_alias = alias
         return { card_id = "stub-card-" .. alias }
     end,
 }
@@ -110,6 +116,7 @@ local function ask(payload, extra)
         request[k] = v
     end
     npc.reset_cache()
+    last_alias = nil
     return npc.run(request).result
 end
 
@@ -256,6 +263,46 @@ describe("card_duel_npc selfplay policy_source", function()
     end)
 end)
 
+-- ─── alias resolution ───────────────────────────────────────────────
+
+describe("card_duel_npc card alias", function()
+    it("falls back to the default alias", function()
+        ask({ mode = "decide", state = STATE })
+        expect(last_alias).to.equal("card_duel_npc")
+    end)
+
+    it("reads the alias from the task JSON", function()
+        -- A caller whose only channel is the request JSON used to be
+        -- answered by the default Card without a word.
+        ask({ mode = "decide", state = STATE, card_alias = "card_duel_npc_timid" })
+        expect(last_alias).to.equal("card_duel_npc_timid")
+    end)
+
+    it("prefers the ctx alias over the task one", function()
+        ask({ mode = "decide", state = STATE, card_alias = "card_duel_npc_timid" }, {
+            card_alias = "card_duel_npc_bold",
+        })
+        expect(last_alias).to.equal("card_duel_npc_bold")
+    end)
+
+    it("keeps honouring the ctx alias on its own", function()
+        ask({ mode = "decide", state = STATE }, { card_alias = "card_duel_npc_bold" })
+        expect(last_alias).to.equal("card_duel_npc_bold")
+    end)
+
+    it("rejects an alias that is not a string", function()
+        expect(function()
+            ask({ mode = "decide", state = STATE, card_alias = 7 })
+        end).to.fail()
+    end)
+
+    it("rejects an empty alias", function()
+        expect(function()
+            ask({ mode = "decide", state = STATE, card_alias = "" })
+        end).to.fail()
+    end)
+end)
+
 -- ─── entry guards ───────────────────────────────────────────────────
 
 describe("card_duel_npc run", function()
@@ -269,5 +316,29 @@ describe("card_duel_npc run", function()
         expect(function()
             npc.run({ task = { mode = "decide" } })
         end).to.fail()
+    end)
+
+    it("rejects a misspelled task field", function()
+        -- A silently dropped `style` would score the model against the
+        -- default teacher and report the number as if it had been asked
+        -- for.
+        expect(function()
+            ask({ mode = "selfplay", games = 2, seed = 5, stlye = "bold" })
+        end).to.fail()
+    end)
+
+    it("rejects a field another mode reads", function()
+        expect(function()
+            ask({ mode = "decide", state = STATE, games = 2 })
+        end).to.fail()
+    end)
+
+    it("still accepts a ctx-wide policy_source in decide mode", function()
+        -- The eval runner merges `strategy_opts` into every case's ctx,
+        -- so a persona scenario carries the chunk on the decide cases
+        -- too; the field check must not turn that into an error.
+        expect(ask({ mode = "decide", state = STATE }, { policy_source = BOLD_SOURCE })).to.equal(
+            "action=9 legal=true raw_legal=true gated=false"
+        )
     end)
 end)

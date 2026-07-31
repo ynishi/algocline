@@ -26,6 +26,16 @@ examples/gameai/
   card_duel_scenario_timid.lua       eval scenario for the timid style
   card_duel_scenario_bold.lua        eval scenario for the bold style
   card_duel_tournament_scenario.lua  eval scenario for the round robin
+
+  guardian_duel/init.lua             boss rules: cycle, mode shift, three boss styles (pure Lua)
+  guardian_duel/spec/                alc_pkg_test suite for the boss rules
+  guardian_duel_npc/init.lua         boss NPC strategy: encode -> decode -> legal gate
+  guardian_duel_npc/spec/            alc_pkg_test suite for the boss NPC
+  guardian_duel_interactive/init.lua human vs boss session, kept in alc.state
+  guardian_duel_interactive/spec/    alc_pkg_test suite for the session
+  train_guardian_npc.lua             teacher corpus -> Full FT -> Card + alias
+  bake_guardian_persona.lua          NL prompt -> synthesised boss -> Card + alias
+  guardian_duel_scenario.lua         eval scenario (style / mode shift / legality / self-play)
 ```
 
 ## The game
@@ -389,6 +399,257 @@ log never contained, four of which left a free choice, two of the four
 agreed with the same rule — coverage is the number of games in the log,
 so a log meant to carry a style wants tens of games rather than three.
 
+## Guardian duel
+
+The second game in this directory is a boss fight, and it is here to ask
+a different question: can the same pipeline learn a boss *script* — a
+behaviour the player is meant to read and plan around — rather than a
+move preference?
+
+Its shape is borrowed from Slay the Spire's
+[The Guardian](https://slaythespire.wiki.gg/wiki/The_Guardian): the boss
+walks a fixed four-move cycle, a defensive sub-sequence interrupts that
+cycle once the boss has taken enough damage since its last interruption,
+and the damage it tolerates grows every time the interruption completes
+("Gains 30 Mode Shift, increased by 10 for each time Mode Shift
+triggered this combat"). Only that observable structure is borrowed.
+Every number below is this demo's own, sized for a nine-turn duel, and
+pinned by `guardian_duel/spec`.
+
+### The fight
+
+Nine turns, one player against one boss, both starting at 45 health.
+Each turn the player moves first and the boss answers:
+
+| player | effect |
+|---|---|
+| `a` | light attack |
+| `A` | heavy attack, and the boss's next answer hits harder |
+| `b` | block, which absorbs the answer of the same turn |
+| `p` | poke, which deals almost nothing and reveals the next answer |
+
+| boss | effect |
+|---|---|
+| `c` | charge, blocking the player's next attack |
+| `f` | fierce blow |
+| `v` | vent, weakening the player's next attack |
+| `w` | whirlwind |
+| `d` | defensive, putting up spikes that retaliate on every attack |
+| `t` | twin slam, which spends the spikes and ends the stagger |
+
+The fight ends when either side reaches zero or after nine turns, in
+which case the higher health bucket wins.
+
+`guardian_duel.policy_guardian` is the teacher: it walks `c f v w` in
+mode 0, drops everything and plays `d` the moment the damage taken since
+its last shift reaches its threshold, walks `d d t` while rolled up, and
+returns to the cycle with a threshold one bucket higher than before. Two
+variants ride the same machinery — `rusher` soaks five buckets before it
+bothers to roll up and cycles `f w f v`, `turtle` rolls up after two and
+cycles `c v c w` — so one rule set trains and compares three bosses.
+
+The twin slam is the only conditional move: it spends spikes, so it is
+legal in mode 1 alone. That single condition is what the decode gate has
+to hold back.
+
+### The encoding
+
+A boss state is one line over a 25-character alphabet:
+
+```
+C2M0H5D0L1T5>d
+ │ │ │ │ │ │ └─ boss move (only present in training lines)
+ │ │ │ │ │ └─── turn
+ │ │ │ │ └───── the player's last move, 0 until the first one
+ │ │ │ └─────── damage buckets left before the next mode shift
+ │ │ └───────── boss health bucket
+ │ └─────────── mode: 0 walking the cycle, 1 rolled up
+ └───────────── index into the cycle
+```
+
+Every state encodes to exactly 12 characters whatever the turn, so
+prompt plus action is 14 tokens and a training line 15, inside the
+16-token context of the `gpt2 tiny` preset. No context change was needed
+for this game.
+
+`D` is the distance left to the next mode shift rather than the damage
+already taken, and that is what makes twelve characters enough to answer
+from. The threshold rises with every shift, so the same accumulated
+damage means "roll up now" early in a fight and "keep swinging" after a
+stagger, and a model reading the damage would have to recover the shift
+count from the rest of the line before it could tell the two apart. The
+distance never asks it to: `D0` and "the shift is due" are the same
+statement for every style and every shift count, so the twelve
+characters are a sufficient statistic for the teacher. The number of
+completed shifts has no field of its own; it is folded into this one.
+
+The price is that the projection has to know whose threshold it is
+measuring, which is why `guardian_duel.encode` takes a style, why the
+NPC is told the style its Card was trained as, and why a persona Card
+records the basis it borrowed.
+
+### Run it
+
+```
+alc_pkg_link(path = "<repo>/examples/gameai/guardian_duel")
+alc_pkg_link(path = "<repo>/examples/gameai/guardian_duel_npc")
+alc_pkg_link(path = "<repo>/examples/gameai/guardian_duel_interactive")
+```
+
+Train the teacher. As with the card duel the script builds its own
+corpus, tunes the model, registers a Card and pins the alias:
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/train_guardian_npc.lua",
+  ctx = { style = "guardian", steps = 800, batch = 32 }
+)
+```
+
+`ctx.style = "all"` trains `guardian`, `rusher` and `turtle` in turn.
+Each run pins `guardian_duel_npc_<style>`; the `guardian` run also pins
+the bare `guardian_duel_npc` alias, which is the one the NPC falls back
+to.
+
+Ask the boss for one move:
+
+```
+alc_run(code = [[
+  local npc = require("guardian_duel_npc")
+  return npc.run({ task = alc.json_encode({
+      mode = "decide",
+      state = { cycle = 2, mode = 0, hp = 25, damage_since_shift = 15,
+                last_player = 1, turn = 5, shifts = 0 },
+  }) })
+]])
+```
+
+```
+action=d legal=true raw_legal=true gated=false
+```
+
+Nothing in a boss state is optional. A missing `shifts` would move the
+distance the model reads and a missing `mode` would offer it the twin
+slam, so the rules module names the field it did not get instead of
+filling one in.
+
+`bake_guardian_persona.lua` is the prompt path, and it works exactly
+like the card duel bake — synthesise a Lua policy, compile it in the
+restricted environment, make it answer sampled states legally and
+deterministically, then distil it — with one extra field:
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/bake_guardian_persona.lua",
+  ctx = {
+    prompt = "When it has taken enough damage since its last shift it drops everything and turtles; otherwise it walks its four-move cycle.",
+    name = "warden",
+    basis_style = "guardian",
+    steps = 800,
+    batch = 32,
+  }
+)
+```
+
+A persona has no mode-shift threshold in the rules, so it borrows one.
+`basis_style` names it, and the bake writes it onto the Card under
+`persona.basis_style` so every later decode reads the same basis the
+corpus was labelled against.
+
+Evaluate:
+
+```
+alc_scenario_install(source = "<repo>/examples/gameai/guardian_duel_scenario.lua")
+alc_eval(scenario = "guardian_duel_scenario", strategy = "guardian_duel_npc")
+```
+
+Seventeen cases: ten fixed states against the teacher move, five states
+where the answer has to stay out of the twin slam, agreement between two
+independent decode sessions, and self-play compliance with a floor at
+0.80. Three of the ten are the mode shift boundary — one point of damage
+short of the shift, exactly on it, and back on the cycle after a
+completed shift with the threshold one bucket higher.
+
+Every fixed state is a position from a traced playout rather than a
+hand-written one, and the scenario names the three fights it took them
+from. A state the teacher cannot reach — a boss rolled up before it has
+taken the damage that rolls it up, say — is off-distribution for a model
+trained on the teacher's own play, so a wrong answer there measures the
+fixture rather than the model. An earlier revision of this file learned
+that the expensive way.
+
+### Fighting it
+
+`guardian_duel_interactive` keeps a fight in `alc.state` between calls,
+so a human takes the player seat and answers one move per `alc_run`:
+
+```
+alc_run(code = [[
+  return require("guardian_duel_interactive").run({
+      action = "new", style = "guardian", seed = 7,
+  })
+]])
+```
+
+```
+turn 1 of 9: you 45 hp - boss 45 hp, 15 damage to its next shift, play one of a, A, b, p
+```
+
+```
+alc_run(code = [[
+  return require("guardian_duel_interactive").run({ action = "play", move = "A" })
+]])
+```
+
+```
+turn 1: you played A, the boss answered c | turn 2 of 9: you 45 hp - boss 36 hp, 6 damage to its next shift, play one of a, A, b, p
+```
+
+The remaining distance is on the board on purpose: a boss whose
+staggering is legible is the point of the game, and the number shown is
+the raw form of the `D` field the model reads. `action = "show"`
+re-prints the board without moving and `action = "end"` drops the
+session and hands back the transcript:
+
+```
+session ended: fight over: you 12 hp - boss 0 hp, you win
+```
+
+Pass `game_id` to keep several fights apart, `style` to choose which
+trained Card answers, and `basis_style` to override the basis a persona
+borrowed. The `move_log` returned by `end` has one entry per turn: the
+boss state the answer was decoded from, the answer, the player move and
+whether the player had already been shown it.
+
+### The poke, and what `intent` means here
+
+Slay the Spire shows the next enemy action every turn — the
+[Intent](https://slaythespire.wiki.gg/wiki/Intent) display. Here that
+readout is scaled down to something the player has to buy: `p` deals the
+least damage of the four moves — half a light attack, less than a
+quarter of a heavy one — in exchange for the answer of the next turn.
+
+```
+alc_run(code = [[
+  return require("guardian_duel_interactive").run({ action = "play", move = "p" })
+]])
+```
+
+```
+turn 2: you played p, the boss answered f | turn 3 of 9: you 33 hp - boss 36 hp, 6 damage to its next shift, play one of a, A, b, p | it will answer v
+```
+
+The reveal is a look-ahead of the *next decode*, not a second prediction
+that could disagree with it. The session decodes the answer for the
+position that follows the poke, stores it, and the next `play` replays
+that stored move instead of asking the model again — so the board cannot
+promise `v` and then swing something else. This is exact rather than
+lucky because the boss answers from the position at the head of the
+turn, which the player's own move never touches. A stored reveal that no
+longer belongs to the turn about to be played is a loud error instead of
+a fresh decode: it means the session was rewritten between calls, and
+the player paid a turn for a look at a position that no longer exists.
+
 ## CI
 
 Two fences run under `cargo test`:
@@ -410,14 +671,20 @@ cargo test -p algocline-engine
 cargo test -p algocline-engine --features nn --test gameai_smoke_test
 ```
 
+Both fences are card duel ones: the guardian duel packages have no entry
+in the Rust harness yet and are covered by their package specs alone.
+
 The package specs are separate and run on demand. None of them loads a
-model — the tournament and the session stub the NPC package out — so
-they pass on the default feature set:
+model — the tournament, the sessions and the boss NPC stub the model
+layer out — so they pass on the default feature set:
 
 ```
 alc_pkg_test(pkg = "card_duel")
 alc_pkg_test(pkg = "card_duel_tournament")
 alc_pkg_test(pkg = "card_duel_interactive")
+alc_pkg_test(pkg = "guardian_duel")
+alc_pkg_test(pkg = "guardian_duel_npc")
+alc_pkg_test(pkg = "guardian_duel_interactive")
 ```
 
 ## Known limitations
@@ -452,6 +719,15 @@ alc_pkg_test(pkg = "card_duel_interactive")
   straight back to the bake script is unaffected, but a strict JSON
   consumer that carries a log across a transport has to expect the
   object form on the first round of every game.
+- A guardian duel persona borrows the mode-shift threshold of a
+  canonical style, because the `D` field of the encoding is a distance
+  to *some* threshold and twelve characters have no room for another
+  one. A persona that staggers on a rule of its own is therefore a rules
+  change rather than a prompt.
+- `guardian_duel` duplicates the corpus, sampling and sandbox halves of
+  `card_duel` instead of sharing them. Two rule sets are not enough to
+  tell which parts are common; a third is the point at which to extract
+  them.
 - Decoding is greedy and therefore deterministic, so an NPC repeats
   itself in identical positions. Noisy or temperature decoding is
   deferred: the stdlib sampler has no legal-action mask, so sampling

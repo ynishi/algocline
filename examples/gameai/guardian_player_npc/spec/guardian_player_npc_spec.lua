@@ -279,6 +279,25 @@ end)
 
 -- ─── autoplay ───────────────────────────────────────────────────────
 
+--- The `player_seq` / `boss_seq` tail a one-game run ends with.
+---
+--- Replayed straight through `guardian_duel` rather than read back off
+--- the package, so the expectation and the implementation are two
+--- accounts of one fight instead of the same account twice. `move` is
+--- what the ranking makes the stub model answer on every position, and
+--- autoplay opens game `i` on `seed + i`, so a lone fight is `seed + 1`.
+local function tail(seed, move, policy)
+    local g = duel.new_game(seed + 1)
+    local player, boss = {}, {}
+    while not duel.is_over(g) do
+        local boss_action = policy(g.boss)
+        player[#player + 1] = move
+        boss[#boss + 1] = boss_action
+        g = duel.apply(g, move, boss_action)
+    end
+    return string.format(" player_seq=%s boss_seq=%s", table.concat(player), table.concat(boss))
+end
+
 describe("guardian_player_npc autoplay", function()
     it("plays the whole fight and reports how it went", function()
         -- Nine turns of block against the teacher: the boss takes
@@ -287,6 +306,7 @@ describe("guardian_player_npc autoplay", function()
         -- and loses on the comparison.
         expect(ask({ mode = "autoplay", games = 1, seed = 5, boss_style = "guardian" })).to.equal(
             "winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_guardian)
         )
     end)
 
@@ -295,13 +315,28 @@ describe("guardian_player_npc autoplay", function()
         -- batch is a repeat rather than a sample.
         expect(ask({ mode = "autoplay", seed = 5, boss_style = "guardian" })).to.equal(
             "winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_guardian)
         )
     end)
 
     it("repeats the same fight for a larger batch", function()
+        -- The sequences are left out above one game: every copy would
+        -- be the same string the first game already reported.
         expect(ask({ mode = "autoplay", games = 3, seed = 5, boss_style = "guardian" })).to.equal(
             "winrate=0.00 raw_legal=1.00 moves=27 a=0 A=0 b=27 p=0"
         )
+    end)
+
+    it("reports one move per seat per turn for a lone fight", function()
+        -- The pair is what a ghost replay is checked against, so its
+        -- length has to be the turn count the same line reports rather
+        -- than whatever the loop happened to append.
+        local text = ask({ mode = "autoplay", games = 1, seed = 5, boss_style = "guardian" })
+        local moves = tonumber(text:match("moves=(%d+)"))
+        local player, boss = text:match("player_seq=(%a+) boss_seq=(%a+)$")
+        expect(moves).to.equal(9)
+        expect(#player).to.equal(moves)
+        expect(#boss).to.equal(moves)
     end)
 
     it("seats the boss the ctx names", function()
@@ -309,6 +344,7 @@ describe("guardian_player_npc autoplay", function()
         -- so the same nine turns end level.
         expect(ask({ mode = "autoplay", games = 1, seed = 5 }, { boss_style = "turtle" })).to.equal(
             "winrate=0.50 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_turtle)
         )
     end)
 
@@ -319,7 +355,10 @@ describe("guardian_player_npc autoplay", function()
             seed = 5,
             boss_style = "turtle",
         }, { boss_style = "guardian" })
-        expect(overridden).to.equal("winrate=0.50 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0")
+        expect(overridden).to.equal(
+            "winrate=0.50 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_turtle)
+        )
     end)
 
     it("shows the model the answer its own poke bought", function()
@@ -332,7 +371,10 @@ describe("guardian_player_npc autoplay", function()
         local text = npc.run({
             task = alc.json_encode({ mode = "autoplay", games = 1, seed = 5 }),
         }).result
-        expect(text).to.equal("winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=0 p=9")
+        expect(text).to.equal(
+            "winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=0 p=9"
+                .. tail(5, "p", duel.policy_guardian)
+        )
         -- The last prompt is the ninth turn, bought by the eighth poke.
         -- Nothing the pokes did was enough to stagger the teacher, so it
         -- is still walking its four-move cycle and turn nine is back at
@@ -347,7 +389,11 @@ describe("guardian_player_npc autoplay", function()
         local text = npc.run({
             task = alc.json_encode({ mode = "autoplay", games = 1, boss_style = "guardian" }),
         }).result
-        expect(text).to.equal("winrate=0.00 raw_legal=0.00 moves=9 a=0 A=0 b=9 p=0")
+        -- No seed was asked for, so the fight is the default one.
+        expect(text).to.equal(
+            "winrate=0.00 raw_legal=0.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(1, "b", duel.policy_guardian)
+        )
     end)
 
     it("seats a boss Card when the task names one", function()
@@ -358,7 +404,10 @@ describe("guardian_player_npc autoplay", function()
             boss_card_alias = "guardian_duel_npc_stalker",
             boss_style = "guardian",
         })
-        expect(text).to.equal("winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0")
+        expect(text).to.equal(
+            "winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_guardian)
+        )
         expect(last_boss_alias).to.equal("guardian_duel_npc_stalker")
         -- The boss Card is decoded under the same basis the player views
         -- are built on, or the two seats read different distances.
@@ -379,7 +428,10 @@ describe("guardian_player_npc autoplay", function()
             seed = 5,
             boss_card_alias = "guardian_duel_npc_stalker",
         })
-        expect(text).to.equal("winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0")
+        expect(text).to.equal(
+            "winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_guardian)
+        )
         expect(last_boss_style).to.equal("turtle")
         PERSONA_BY_ALIAS["guardian_duel_npc_stalker"] = nil
     end)

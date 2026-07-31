@@ -51,7 +51,16 @@
 ---   `winrate=<x.xx> raw_legal=<x.xx> moves=<n> a=<n> A=<n> b=<n>
 ---   p=<n>`. The win rate is read from the player seat with a draw
 ---   counted as half a win, and the four counts are the model's own
----   move distribution.
+---   move distribution. A one-game run appends
+---   `player_seq=<moves> boss_seq=<moves>`, the two seats' answers turn
+---   by turn in the order they were played, so a caller replaying the
+---   fight can check its own transcript against the run that produced
+---   it without replaying the loop to find out what happened. A batch
+---   is a repeat of one fight, so the pair is left out above one game
+---   rather than printed as many identical copies of itself. The views
+---   the moves were chosen from are not reported either: the fight is a
+---   function of the seed and the two sequences, so `guardian_duel`
+---   rebuilds any of them from what is already here.
 ---
 --- Both seats decode greedily and `guardian_duel.new_game` opens the
 --- same board for every seed, so a fight is a function of the two
@@ -415,6 +424,13 @@ end
 --- are greedy and the opening is fixed, so a larger `games` repeats it.
 --- The loop still runs what it was asked for rather than collapsing the
 --- batch silently, because the caller may be timing decodes.
+---
+--- That is also why the turn-by-turn sequences are reported for a
+--- single game and only then. They are what a replay is checked
+--- against — a ghost that walks the same fight has to answer the same
+--- moves in the same order, and a rate cannot say whether it did — but
+--- above one game every copy is the same string, so a batch would pay
+--- for the summary N times to learn what the first game already said.
 local function mode_autoplay(handle, req, style)
     local games = math.floor(tonumber(req.games) or 1)
     local seed = math.floor(tonumber(req.seed) or 1)
@@ -436,6 +452,11 @@ local function mode_autoplay(handle, req, style)
     local boss = resolve_boss(alias, style)
 
     local score, moves, raw_legal = 0.0, 0, 0
+    -- Collected only for a lone fight, which is also the only run whose
+    -- sequences are reported: keeping them for a batch would build a
+    -- list per game that nothing ever reads.
+    local player_seq = games == 1 and {} or nil
+    local boss_seq = games == 1 and {} or nil
     local counts = {}
     for _, action in ipairs(MOVES) do
         counts[action] = 0
@@ -457,6 +478,10 @@ local function mode_autoplay(handle, req, style)
                 raw_legal = raw_legal + 1
             end
             counts[d.action] = counts[d.action] + 1
+            if player_seq then
+                player_seq[#player_seq + 1] = d.action
+                boss_seq[#boss_seq + 1] = boss_action
+            end
             g = duel.apply(g, d.action, boss_action)
         end
         local w = duel.winner(g)
@@ -472,7 +497,7 @@ local function mode_autoplay(handle, req, style)
         -- rates as a division by zero or as a silent 0.00.
         error("guardian_player_npc: autoplay made no move")
     end
-    return string.format(
+    local summary = string.format(
         "winrate=%.2f raw_legal=%.2f moves=%d a=%d A=%d b=%d p=%d",
         score / games,
         raw_legal / moves,
@@ -482,6 +507,15 @@ local function mode_autoplay(handle, req, style)
         counts.b,
         counts.p
     )
+    if player_seq then
+        summary = string.format(
+            "%s player_seq=%s boss_seq=%s",
+            summary,
+            table.concat(player_seq),
+            table.concat(boss_seq)
+        )
+    end
+    return summary
 end
 
 -- ─── Strategy entry ─────────────────────────────────────────────────

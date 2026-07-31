@@ -538,6 +538,115 @@ describe("guardian_duel_interactive move log", function()
     end)
 end)
 
+-- ─── Transcript: the player half ────────────────────────────────────
+
+describe("guardian_duel_interactive move log player view", function()
+    it("records the board the human chose from", function()
+        reset()
+        fight.run({ action = "new", style = "guardian", seed = 7 })
+        fight.run({ action = "play", move = "a" })
+        local log = fight.run({ action = "end" }).move_log
+        local view = log[1].player
+        -- The position before the turn was applied, which is the only
+        -- one the human ever looked at.
+        expect(view.turn).to.equal(1)
+        expect(view.mode).to.equal(0)
+        expect(view.boss_hp).to.equal(duel.BOSS_MAX_HP)
+        expect(view.hp).to.equal(duel.PLAYER_MAX_HP)
+        expect(view.shift_distance).to.equal(duel.threshold_damage("guardian", 0))
+        expect(view.weakened).to.equal(false)
+        expect(view.exposed).to.equal(false)
+        expect(view.spikes).to.equal(false)
+    end)
+
+    it("leaves the boss half of the entry alone", function()
+        reset()
+        fight.run({ action = "new", style = "guardian", seed = 7 })
+        fight.run({ action = "play", move = "a" })
+        local entry = fight.run({ action = "end" }).move_log[1]
+        expect(entry.boss.cycle).to.equal(0)
+        expect(entry.boss.mode).to.equal(0)
+        expect(entry.boss.hp).to.equal(duel.BOSS_MAX_HP)
+        expect(entry.boss.damage_since_shift).to.equal(0)
+        expect(entry.boss.last_player).to.equal(0)
+        expect(entry.boss.turn).to.equal(1)
+        expect(entry.boss.shifts).to.equal(0)
+        -- The block and spike counters are engine bookkeeping and stay
+        -- out of the boss half, exactly as before the player view was
+        -- added next to it.
+        expect(entry.boss.block).to.equal(nil)
+        expect(entry.boss.thorns).to.equal(nil)
+        expect(entry.boss_action).to.equal("c")
+        expect(entry.player_action).to.equal("a")
+        expect(entry.revealed).to.equal(false)
+    end)
+
+    it("measures the distance against the basis of the fight", function()
+        reset()
+        pin_persona("stalker", "turtle")
+        fight.run({ action = "new", style = "stalker", seed = 7 })
+        fight.run({ action = "play", move = "a" })
+        local log = fight.run({ action = "end" }).move_log
+        -- A persona fight is decoded under a borrowed basis, and the
+        -- transcript has to be logged under the same one or a Card baked
+        -- from it reads the `D` field as another boss's threshold.
+        expect(log[1].player.shift_distance).to.equal(duel.threshold_damage("turtle", 0))
+    end)
+
+    it("raises the exposure flag on the turn after a heavy attack", function()
+        reset()
+        fight.run({ action = "new", style = "guardian", seed = 7 })
+        fight.run({ action = "play", move = "A" })
+        fight.run({ action = "play", move = "b" })
+        local log = fight.run({ action = "end" }).move_log
+        expect(log[1].player.exposed).to.equal(false)
+        expect(log[2].player.exposed).to.equal(true)
+    end)
+
+    it("raises the spikes flag once the boss has rolled up", function()
+        reset()
+        fight.run({ action = "new", style = "guardian", seed = 7 })
+        for _ = 1, 4 do
+            fight.run({ action = "play", move = "A" })
+        end
+        fight.run({ action = "play", move = "b" })
+        local log = fight.run({ action = "end" }).move_log
+        expect(log[4].player.mode).to.equal(0)
+        expect(log[4].player.spikes).to.equal(false)
+        expect(log[5].player.mode).to.equal(1)
+        expect(log[5].player.spikes).to.equal(true)
+    end)
+
+    it("hands out a player view the caller cannot write back into", function()
+        reset()
+        fight.run({ action = "new", style = "guardian", seed = 7 })
+        fight.run({ action = "play", move = "a" })
+        local stored = store[KEY].move_log
+        local view = fight.run({ action = "end" }).move_log
+        view[1].player.hp = 1
+        expect(stored[1].player.hp).to.equal(duel.PLAYER_MAX_HP)
+    end)
+
+    it("hands the transcript to the play-log corpus builder unchanged", function()
+        reset()
+        local view = fight.run({ action = "new", style = "guardian", seed = 7 })
+        local script = { "a", "A", "b", "p", "a", "b", "A", "p", "b" }
+        for turn = 1, duel.TURN_LIMIT do
+            expect(view.status).to.equal("your_turn")
+            view = fight.run({ action = "play", move = script[turn] })
+        end
+        local log = fight.run({ action = "end" }).move_log
+        -- The bake script passes the log straight through, so a shape
+        -- the rules cannot read is a break between the two packages
+        -- rather than a caller mistake.
+        local rows, plays = duel.rows_from_player_moves(log, { ctx_len = duel.CTX_BUDGET })
+        expect(#rows).to.equal(duel.TURN_LIMIT)
+        expect(#plays).to.equal(duel.TURN_LIMIT)
+        expect(plays[1].action).to.equal("a")
+        expect(plays[2].action).to.equal("A")
+    end)
+end)
+
 -- ─── show / end ─────────────────────────────────────────────────────
 
 describe("guardian_duel_interactive show", function()

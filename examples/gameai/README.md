@@ -33,8 +33,11 @@ examples/gameai/
   guardian_duel_npc/spec/            alc_pkg_test suite for the boss NPC
   guardian_duel_interactive/init.lua human vs boss session, kept in alc.state
   guardian_duel_interactive/spec/    alc_pkg_test suite for the session
+  guardian_player_npc/init.lua       player NPC strategy: encode -> decode -> legal gate
+  guardian_player_npc/spec/          alc_pkg_test suite for the player NPC
   train_guardian_npc.lua             teacher corpus -> Full FT -> Card + alias
   bake_guardian_persona.lua          NL prompt -> synthesised boss -> Card + alias
+  bake_guardian_player_from_log.lua  player half of a move_log -> Card + alias
   guardian_duel_scenario.lua         eval scenario (style / mode shift / legality / self-play)
 ```
 
@@ -650,6 +653,66 @@ longer belongs to the turn about to be played is a loud error instead of
 a fresh decode: it means the session was rewritten between calls, and
 the player paid a turn for a look at a position that no longer exists.
 
+### Baking the player
+
+The `move_log` a finished fight hands back has two halves per turn. The
+boss half is the state its answer was decoded from; the player half is
+the *player view* — what the board showed the human before they chose,
+and the move they chose from it. `bake_guardian_player_from_log.lua`
+reads the second half and distils that habit into a Card:
+
+```
+alc_pkg_link(path = "<repo>/examples/gameai/guardian_player_npc")
+
+alc_run(
+  code_file = "<repo>/examples/gameai/bake_guardian_player_from_log.lua",
+  ctx = { moves = <move_log>, name = "ytk", steps = 800, batch = 32 }
+)
+```
+
+The two seats are not symmetric — a boss answers from a script it
+carries, a player answers from what the board shows — but the pipeline
+is neutral about which one it is holding. A role brings its own view,
+its own alphabet and its own Card; corpus building, Full FT, the alias
+and the decode gate underneath are the same code.
+
+The asymmetry lives in the encoding, and what it leaves out is the
+point. A player view carries only what the board shows: the boss mode,
+both health buckets, the distance to the next shift, the turn and the
+three status bits. The boss cycle index is not among them, and putting
+it there would end the poke — a player who reads the next answer for
+free has no reason to buy it.
+
+`guardian_player_npc` seats the baked Card and plays it:
+
+```
+alc_run(code = [[
+  return require("guardian_player_npc").run({
+      task = alc.json_encode({ mode = "autoplay", games = 1, boss_style = "guardian" }),
+      card_alias = "guardian_player_npc_ytk",
+  })
+]])
+```
+
+`boss_style` names both the boss the fights are played against and the
+distance basis every generated view is measured against — the `D` a
+model was logged under has to be the `D` it is autoplayed under.
+`boss_card_alias` seats a boss Card in place of the teacher policy, so a
+baked player can be put in front of a baked boss. `games` defaults to 1
+because both seats decode greedily from a fixed opening: ten games are
+ten copies of one fight rather than ten samples.
+
+A nine-move human game replayed with logging, baked at the defaults on
+2026-07-31 (`log_match=1.00`, `train_loss=0.151`), and the baked player
+replayed the original fight move for move — 9 of 9, the same 15-10 win,
+`raw_legal` 9 of 9.
+
+That is a fit, not a generalisation. Nine positions from one fight are
+what the model saw and what it gave back; nothing there says how it
+answers a position the log never contained. The scaling caveat is the
+card duel one — see "Baking from a play log" — coverage is the number
+of games in the log, so a log meant to carry a style wants tens of them.
+
 ## CI
 
 Two fences run under `cargo test`:
@@ -724,6 +787,13 @@ alc_pkg_test(pkg = "guardian_duel_interactive")
   to *some* threshold and twelve characters have no room for another
   one. A persona that staggers on a rule of its own is therefore a rules
   change rather than a prompt.
+- A poke buys the boss's next answer, but the player view has no field
+  for it. The transcript records only whether the answer had already
+  been revealed, not which one it was, so a Card baked from a log cannot
+  condition on a reveal the human paid for — every poked turn trains as
+  though the board had said nothing. Learning to play off a reveal needs
+  an `intent` field in the view and in the player encoding, which is
+  future work.
 - `guardian_duel` duplicates the corpus, sampling and sandbox halves of
   `card_duel` instead of sharing them. Two rule sets are not enough to
   tell which parts are common; a third is the point at which to extract

@@ -61,6 +61,9 @@
 --- - `build_corpus` — supervised training lines for any boss policy
 --- - `sample_states` / `compile_policy` — sandbox and validation for a
 ---   synthesised (LLM-written) boss policy chunk
+--- - `player_view` / `player_encode` / `player_vocab` /
+---   `player_to_ids` / `rows_from_player_moves` — the same fight from
+---   the player's chair, for baking a player NPC out of a play log
 --- - `hp_bucket` / `distance_bucket` / `shift_threshold` /
 ---   `threshold_damage` / `style_cycle` — the derived quantities the
 ---   NPC, the interactive session and the eval scenario read
@@ -99,6 +102,12 @@
 --- against. A synthesised persona is therefore trained under a declared
 --- style's distance basis; a persona that staggers on a rule of its own
 --- needs its own basis rather than a borrowed one.
+---
+--- The player-side projection is a second, independent encoding of the
+--- same fight, with its own layout, its own alphabet and its own corpus
+--- builder (see `player_encode`). It is not the boss encoding with the
+--- seats swapped: the two chairs see different things, and the boss
+--- script position in particular is hidden from the player by design.
 ---
 --- `build_corpus`, `sample_states` and `compile_policy` mirror the
 --- `card_duel` functions of the same name rather than sharing them: two
@@ -1053,6 +1062,443 @@ function M.build_corpus(policy, opts)
         end
     end
     return rows
+end
+
+-- ─── Player-side view ───────────────────────────────────────────────
+--
+-- Everything above answers the boss seat. What follows answers the
+-- other chair: the same fight as the player sees it, encoded so a tiny
+-- SLM can be baked from a log of the moves a human actually played
+-- (`examples/gameai/bake_guardian_player_from_log.lua`).
+--
+-- The two sides share no layout, no alphabet and no corpus builder. A
+-- boss state and a player view are different questions, and the two
+-- alphabets are different id spaces: a Card baked on one and decoded
+-- through the other would answer legally and mean nothing. The boss
+-- alphabet already refuses the player letters (see `CHARS`); the player
+-- alphabet returns the favour by carrying none of the boss moves.
+
+--- Fields of the player encoding, in layout order. Each is one letter
+--- and one digit:
+---
+--- - `M` boss mode — 0 while it walks its cycle, 1 while it is rolled
+---   up and the slam is coming
+--- - `H` boss health bucket
+--- - `D` bucket of the damage the boss still tolerates before its next
+---   mode shift, the same distance the boss encoding carries
+--- - `Y` your own health bucket
+--- - `T` turn
+--- - `S` status flags, folded into one digit (see `PLAYER_FLAGS`)
+local PLAYER_FIELDS = { "M", "H", "D", "Y", "T", "S" }
+
+--- Characters `player_encode` emits, checked on every call.
+local PLAYER_ENCODED_LEN = 2 * #PLAYER_FIELDS
+
+--- Tokens one player training line costs: the view, `>`, the move and
+--- the newline. The budget is checked once at load, like the boss row:
+--- a line that does not fit the preset cannot be trained on at all.
+local PLAYER_ROW_LEN = PLAYER_ENCODED_LEN + 3
+
+if PLAYER_ROW_LEN > CTX_BUDGET then
+    error(
+        string.format(
+            "guardian_duel: a player training line needs %d tokens but the tiny preset context is %d",
+            PLAYER_ROW_LEN,
+            CTX_BUDGET
+        )
+    )
+end
+
+-- Both health buckets are read with `hp_bucket`, which is written
+-- against the boss maximum, so the two maxima have to stay equal. They
+-- are (the end-of-fight comparison needs it), and saying so at load
+-- keeps a later tweak from producing a player bucket the encoder
+-- rejects halfway through a fight.
+if PLAYER_MAX_HP ~= BOSS_MAX_HP then
+    error("guardian_duel: the two health maxima must be equal for the shared bucket function")
+end
+
+--- Weight of every status flag inside the `S` digit.
+---
+--- The three are the modifiers that move the damage arithmetic without
+--- showing up in any other field: `weakened` shaves the player's next
+--- attack, `exposed` adds to the boss answer that follows a heavy
+--- attack, and `spikes` bites back on every attack while the boss is
+--- rolled up. Folding them into one digit is what buys the sixth field
+--- its place inside twelve characters.
+local PLAYER_FLAGS = { weakened = 1, exposed = 2, spikes = 4 }
+
+--- Char alphabet of the player side, indexed by model token id.
+---
+--- Index 1 holds token id 0 (the padding token), so `id = index - 1`.
+--- Twenty-three entries keep it inside the `gpt2 tiny` vocabulary of
+--- 64. The boss move letters are deliberately absent: a boss letter in
+--- a player training line is a bug rather than a move.
+local PLAYER_CHARS = {
+    "\0",
+    "\n",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "D",
+    "H",
+    "M",
+    "S",
+    "T",
+    "Y",
+    ">",
+    "a",
+    "A",
+    "b",
+    "p",
+}
+
+--- Vocabulary size of the `gpt2 tiny` preset both corpora target.
+local VOCAB_BUDGET = 64
+
+if #CHARS > VOCAB_BUDGET or #PLAYER_CHARS > VOCAB_BUDGET then
+    error(
+        string.format(
+            "guardian_duel: alphabets of %d and %d chars do not both fit the preset vocabulary of %d",
+            #CHARS,
+            #PLAYER_CHARS,
+            VOCAB_BUDGET
+        )
+    )
+end
+
+local PLAYER_TO_ID = {}
+local PLAYER_TO_CHAR = {}
+for index, ch in ipairs(PLAYER_CHARS) do
+    local id = index - 1
+    PLAYER_TO_ID[ch] = id
+    PLAYER_TO_CHAR[id] = ch
+end
+
+M.PLAYER_ENCODED_LEN = PLAYER_ENCODED_LEN
+
+--- Char-to-token-id map of the player alphabet.
+---
+--- A separate table from `vocab` rather than a superset of it: the two
+--- corpora are trained into separate Cards, and an id that meant `f` in
+--- one and `a` in the other would only be found by reading gibberish
+--- out of a model that looked healthy.
+---@return table vocab `{ size, pad_id, to_id, to_char }`
+function M.player_vocab()
+    local to_id, to_char = {}, {}
+    for ch, id in pairs(PLAYER_TO_ID) do
+        to_id[ch] = id
+    end
+    for id, ch in pairs(PLAYER_TO_CHAR) do
+        to_char[id] = ch
+    end
+    return {
+        size = #PLAYER_CHARS,
+        pad_id = PLAYER_TO_ID["\0"],
+        to_id = to_id,
+        to_char = to_char,
+    }
+end
+
+--- Map a string over the player alphabet to token ids.
+---
+--- Errors on an unknown character exactly as `to_ids` does, which is
+--- also what stops a boss line from being trained into a player Card:
+--- every boss move letter is outside this alphabet.
+---@param text string
+---@return integer[] ids
+function M.player_to_ids(text)
+    if type(text) ~= "string" then
+        error("guardian_duel.player_to_ids: text must be a string, got " .. type(text))
+    end
+    local ids = {}
+    for i = 1, #text do
+        local ch = text:sub(i, i)
+        local id = PLAYER_TO_ID[ch]
+        if id == nil then
+            error(
+                string.format(
+                    "guardian_duel.player_to_ids: char %q at %d is outside the player vocabulary",
+                    ch,
+                    i
+                )
+            )
+        end
+        ids[#ids + 1] = id
+    end
+    return ids
+end
+
+--- Read a boolean field of a player view, or fail naming it.
+---
+--- Only a boolean is accepted: `weakened = "no"` would read as true and
+--- flip a flag the log says was down.
+local function require_flag(fn, field, value)
+    if type(value) ~= "boolean" then
+        error(
+            string.format(
+                "guardian_duel.%s: %s must be a boolean, got %s",
+                fn,
+                field,
+                tostring(value)
+            )
+        )
+    end
+    return value
+end
+
+--- Validate every field the player encoding reads.
+---
+--- Like `require_boss_state`, the check runs before the encoder touches
+--- a field, so a view built by hand — a logged fight, a scenario case —
+--- fails on the field it got wrong rather than on the character it
+--- would have produced.
+local function require_player_view(fn, view)
+    if type(view) ~= "table" then
+        error(string.format("guardian_duel.%s: view must be a table, got %s", fn, type(view)))
+    end
+    require_int(fn, "view.mode", view.mode, 0, 1)
+    require_int(fn, "view.boss_hp", view.boss_hp, 0, BOSS_MAX_HP)
+    require_int(fn, "view.shift_distance", view.shift_distance, 0, MAX_DISTANCE)
+    require_int(fn, "view.hp", view.hp, 0, PLAYER_MAX_HP)
+    require_int(fn, "view.turn", view.turn, 1, TURN_LIMIT)
+    require_flag(fn, "view.weakened", view.weakened)
+    require_flag(fn, "view.exposed", view.exposed)
+    require_flag(fn, "view.spikes", view.spikes)
+    return view
+end
+
+--- Copy of a view, so a caller replaying a log cannot write into the
+--- table the corpus was built from.
+local function copy_player_view(view)
+    return {
+        turn = view.turn,
+        mode = view.mode,
+        boss_hp = view.boss_hp,
+        shift_distance = view.shift_distance,
+        hp = view.hp,
+        weakened = view.weakened,
+        exposed = view.exposed,
+        spikes = view.spikes,
+    }
+end
+
+--- What the player can see at the head of a turn.
+---
+--- One constructor for both callers — the interactive transcript and
+--- the player NPC's own playouts — because the two have to agree: a
+--- view built one way at log time and another way at play time would
+--- train a model on a question nobody asks it afterwards.
+---
+--- `style` is the distance basis the `D` field is measured against, the
+--- same argument `encode` takes and for the same reason. The board a
+--- human plays from shows that distance, so a logged view records the
+--- number that was on the screen.
+---
+--- `exposed` and `spikes` are not printed on the board as such, but
+--- both are knowable to the player who is looking at it: the exposure
+--- is the heavy attack they themselves played last turn, and the spikes
+--- go up with the mode shift the board reports.
+---@param g table Game
+---@param style string One of `STYLES`, the distance basis
+---@return table view `{ turn, mode, boss_hp, shift_distance, hp, weakened, exposed, spikes }`
+function M.player_view(g, style)
+    require_style("player_view", style)
+    if type(g) ~= "table" or type(g.boss) ~= "table" or type(g.player) ~= "table" then
+        error("guardian_duel.player_view: game must carry a boss and a player")
+    end
+    local boss = require_boss_state("player_view", g.boss)
+    require_int("player_view", "player.hp", g.player.hp, 0, PLAYER_MAX_HP)
+    local weak = g.player.weak
+    if weak ~= nil and type(weak) ~= "boolean" then
+        error("guardian_duel.player_view: player.weak must be a boolean, got " .. type(weak))
+    end
+    local thorns = boss.thorns or 0
+    require_int("player_view", "boss.thorns", thorns, 0, THORNS)
+    return {
+        turn = boss.turn,
+        mode = boss.mode,
+        boss_hp = boss.hp,
+        shift_distance = M.shift_distance(style, boss),
+        hp = g.player.hp,
+        weakened = weak == true,
+        exposed = boss.last_player == HEAVY_INDEX,
+        spikes = thorns > 0,
+    }
+end
+
+--- Encode a player view as one line over the player alphabet.
+---
+--- Layout: `M<boss mode>H<boss health>D<distance to the next mode
+--- shift>Y<your health>T<turn>S<status flags>`, every field one
+--- character.
+---
+--- ## The field that is not here
+---
+--- Six fields fit; seven were wanted. The one left out is the boss
+--- cycle index — the position it holds in its four-move script — and it
+--- is left out because the player never has it. The board a human plays
+--- from shows the mode, both healths, the distance, the turn and the
+--- weakened flag; it does not show which entry of the cycle comes next,
+--- and the poke exists precisely so that look can be bought for a turn.
+--- Encoding it would hand the model a field no human decision was ever
+--- a function of, and would also seat an NPC that reads the boss script
+--- through a wall.
+---
+--- What the six that are here buy, in the order a player uses them:
+---
+--- - blocking well needs to know what is coming. `M` and `D` are the
+---   two halves of that: `D0` says the cycle is about to be
+---   interrupted, `M1` says the slam is already on its way, and the
+---   `S` bit for the spikes says an attack costs health this turn
+--- - pressing an advantage needs `H`, and `S` says whether this turn's
+---   attack lands weakened
+--- - the endgame arithmetic needs `Y`, `H` and `T` together: the fight
+---   is decided on health buckets at the turn limit, so how many turns
+---   are left decides whether to race or to stall
+---@param view table Player view, as `player_view` builds one
+---@return string encoded Exactly `PLAYER_ENCODED_LEN` characters
+function M.player_encode(view)
+    require_player_view("player_encode", view)
+    local flags = 0
+    for field, weight in pairs(PLAYER_FLAGS) do
+        if view[field] then
+            flags = flags + weight
+        end
+    end
+    local text = table.concat({
+        "M",
+        tostring(view.mode),
+        "H",
+        tostring(M.hp_bucket(view.boss_hp)),
+        "D",
+        tostring(M.distance_bucket(view.shift_distance)),
+        "Y",
+        tostring(M.hp_bucket(view.hp)),
+        "T",
+        tostring(view.turn),
+        "S",
+        tostring(flags),
+    })
+    if #text ~= PLAYER_ENCODED_LEN then
+        error(
+            string.format(
+                "guardian_duel.player_encode: view encoded to %d chars but the layout is %d (%s)",
+                #text,
+                PLAYER_ENCODED_LEN,
+                text
+            )
+        )
+    end
+    return text
+end
+
+--- Encode one player training line and pad it to the context window.
+local function make_player_row(view, action, ctx_len, pad_id)
+    local ids = M.player_to_ids(M.player_encode(view) .. ">" .. action .. "\n")
+    if #ids > ctx_len then
+        error(
+            string.format(
+                "guardian_duel.rows_from_player_moves: encoded line needs %d tokens "
+                    .. "but the context is %d",
+                #ids,
+                ctx_len
+            )
+        )
+    end
+    for _ = #ids + 1, ctx_len do
+        ids[#ids + 1] = pad_id
+    end
+    return ids
+end
+
+--- Build the supervised corpus that teaches a play log to a model.
+---
+--- Where `build_corpus` labels sampled boss states with a policy
+--- function, this labels the player views of a log with the moves that
+--- were actually played — the `move_log` an interactive session hands
+--- back when it ends, passed in unchanged. There is no teacher function
+--- behind such a corpus, so nothing downstream can score the model on a
+--- position the log does not contain.
+---
+--- Every entry is validated and every failure names the entry: a log is
+--- data the caller collected elsewhere, and a view that is off by a
+--- field still encodes to characters inside the alphabet.
+---
+--- Returns the padded rows and the `{ view, action }` pairs behind
+--- them, so a caller that also replays the log against the trained
+--- model does not have to validate it a second time.
+---@param moves table[] Log entries `{ player = <view>, player_action = <move> }`
+---@param opts table `{ ctx_len, pad_id? }`
+---@return integer[][] rows Token id rows, each `ctx_len` long
+---@return table[] plays `{ { view = <player view>, action = <move> } }`
+function M.rows_from_player_moves(moves, opts)
+    if type(moves) ~= "table" then
+        error("guardian_duel.rows_from_player_moves: moves must be a table, got " .. type(moves))
+    end
+    if #moves == 0 then
+        error("guardian_duel.rows_from_player_moves: moves must hold at least one logged move")
+    end
+    if type(opts) ~= "table" then
+        error("guardian_duel.rows_from_player_moves: opts must be a table, got " .. type(opts))
+    end
+    local ctx_len = tonumber(opts.ctx_len)
+    if ctx_len == nil or ctx_len < 1 then
+        error("guardian_duel.rows_from_player_moves: opts.ctx_len must be a positive number")
+    end
+    ctx_len = math.floor(ctx_len)
+    local pad_id = opts.pad_id
+    if pad_id == nil then
+        pad_id = PLAYER_TO_ID["\0"]
+    end
+    if type(pad_id) ~= "number" then
+        error(
+            "guardian_duel.rows_from_player_moves: opts.pad_id must be a number, got "
+                .. type(pad_id)
+        )
+    end
+
+    local rows, plays = {}, {}
+    for i = 1, #moves do
+        local move = moves[i]
+        if type(move) ~= "table" then
+            error(
+                string.format(
+                    "guardian_duel.rows_from_player_moves: move %d must be a table, got %s",
+                    i,
+                    type(move)
+                )
+            )
+        end
+        -- The entry is a transcript row, so the view sits under `player`
+        -- next to the boss half of the same turn. An entry without one
+        -- is a log from a session that did not record the player's side
+        -- rather than a turn the player sat out.
+        local where = string.format("rows_from_player_moves: move %d", i)
+        local view = require_player_view(where, move.player)
+        local action = move.player_action
+        if PLAYER_INDEX[action] == nil then
+            error(
+                string.format(
+                    "guardian_duel.rows_from_player_moves: move %d played %s, "
+                        .. "which is not one of the moves %s",
+                    i,
+                    tostring(action),
+                    table.concat(PLAYER_ACTIONS, ", ")
+                )
+            )
+        end
+        rows[#rows + 1] = make_player_row(view, action, ctx_len, pad_id)
+        plays[#plays + 1] = { view = copy_player_view(view), action = action }
+    end
+    return rows, plays
 end
 
 -- ─── Synthesised policies ───────────────────────────────────────────

@@ -35,8 +35,8 @@
 ---    `draw`). An unfinished fight has no winner; reporting it as a draw
 ---    would hide a session that stopped early.
 --- 4. Every turn is appended to a `move_log` kept next to the fight: the
----    boss state the answer came from, the boss answer and the human
----    move. `end` returns that log.
+---    boss state the answer came from, the player view the human chose
+---    from, the boss answer and the human move. `end` returns that log.
 --- 5. `end` deletes the session. A finished fight is kept until then, so
 ---    the final board can still be shown.
 ---
@@ -107,11 +107,20 @@
 --- The session is stored under a caller-chosen `game_id` with no expiry.
 --- Sessions that are never ended stay in the state file.
 ---
---- `move_log` is a transcript rather than a training set: each entry
---- carries the boss state an answer came from and the answer itself,
---- which is the pair `guardian_duel.build_corpus` labels, but no bake
---- script reads it yet — `bake_card_duel_from_log.lua` is written
---- against the card duel encoding and does not apply here.
+--- `move_log` is a transcript of both seats. Each entry carries the boss
+--- state an answer came from and the answer itself — the pair
+--- `guardian_duel.build_corpus` labels — next to the player view the
+--- human chose from and the move they played, which is the pair
+--- `guardian_duel.rows_from_player_moves` bakes. The second half is
+--- what `examples/gameai/bake_guardian_player_from_log.lua` reads; the
+--- boss half has no bake script of its own, because a boss learned from
+--- a transcript would be a copy of the model that produced it.
+---
+--- The player view is the position as the board showed it, recorded
+--- before the turn was applied. It is measured against `basis_style`,
+--- which is also what the board's `shift_distance` is measured against,
+--- so a Card baked from the log answers under the basis it was logged
+--- under and no other.
 
 local duel = require("guardian_duel")
 
@@ -493,20 +502,42 @@ end
 
 -- ─── Play log ───────────────────────────────────────────────────────
 
+--- Copy of a player view, so a caller cannot write back into the
+--- transcript through the log it was handed.
+local function copy_player_view(view)
+    return {
+        turn = view.turn,
+        mode = view.mode,
+        boss_hp = view.boss_hp,
+        shift_distance = view.shift_distance,
+        hp = view.hp,
+        weakened = view.weakened,
+        exposed = view.exposed,
+        spikes = view.spikes,
+    }
+end
+
 --- Append the turn that was just played.
 ---
---- The boss state is the one the answer was decoded from, which is the
---- position the model was asked about; after `apply` it is a turn out of
---- date and belongs to a question nobody put to it.
-local function log_turn(session, boss_state, player_action, boss_action, revealed)
+--- The game is the one both seats were asked about, before `apply`: the
+--- boss state is the position the model answered from, and the player
+--- view is what the human was looking at when they chose their move.
+--- After `apply` both belong to a question nobody put to either side.
+---
+--- The two halves are kept apart because they are two different
+--- projections of the same turn, and each is baked through its own
+--- encoding: `guardian_duel.encode` reads the boss half,
+--- `guardian_duel.player_encode` reads the player half.
+local function log_turn(session, g, player_action, boss_action, revealed)
     local log = session.move_log
     if log == nil then
         log = {}
         session.move_log = log
     end
     log[#log + 1] = {
-        turn = boss_state.turn,
-        boss = boss_payload(boss_state),
+        turn = g.boss.turn,
+        boss = boss_payload(g.boss),
+        player = duel.player_view(g, session.basis_style),
         boss_action = boss_action,
         player_action = player_action,
         revealed = revealed,
@@ -518,12 +549,18 @@ end
 --- A fight that took no turn returns an empty array rather than nothing,
 --- so a caller can tell an unplayed session from a version of this
 --- package that did not keep a transcript yet.
+---
+--- An entry written by a session that predates the player view carries
+--- none, and is handed back without one rather than with an invented
+--- snapshot: `guardian_duel.rows_from_player_moves` then rejects that
+--- entry by name at bake time, which is where the gap belongs.
 local function copy_move_log(session)
     local out = {}
     for i, entry in ipairs(session.move_log or {}) do
         out[i] = {
             turn = entry.turn,
             boss = boss_payload(entry.boss),
+            player = entry.player and copy_player_view(entry.player) or nil,
             boss_action = entry.boss_action,
             player_action = entry.player_action,
             revealed = entry.revealed,
@@ -663,7 +700,7 @@ local function action_play(ctx, key)
     local revealed = current_intent(session)
     local boss_action = revealed or decode_boss(session)
 
-    log_turn(session, session.g.boss, player_action, boss_action, revealed ~= nil)
+    log_turn(session, session.g, player_action, boss_action, revealed ~= nil)
     session.g = duel.apply(session.g, player_action, boss_action)
 
     -- The rules mark the position a poke bought; reading the answer for

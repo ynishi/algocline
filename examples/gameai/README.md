@@ -741,7 +741,57 @@ answers a position the log never contained. The scaling caveat is the
 card duel one — see "Baking from a play log" — coverage is the number
 of games in the log, so a log meant to carry a style wants tens of them.
 
-## CI
+### Proving the bake generalises
+
+The claim "tens of games are enough for the habits to carry" is
+reproducible, not anecdotal. The repo ships a sample play log at the
+scale the caveat asks for, and a script that bakes it and scores the
+result on games the corpus never contained:
+
+```
+data/guardian_sample_playlog_train.json     36 games, 309 logged turns
+data/guardian_sample_playlog_holdout.json   18 games, 153 logged turns
+```
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/eval_guardian_player_generalization.lua",
+  ctx = {
+    train_file   = "<repo>/examples/gameai/data/guardian_sample_playlog_train.json",
+    holdout_file = "<repo>/examples/gameai/data/guardian_sample_playlog_holdout.json",
+  }
+)
+```
+
+The script bakes the training log with the exact parameters of
+`bake_guardian_player_from_log.lua`, decodes every held-out position
+through the fresh Card, and returns `pass` against explicit fences —
+style match on held-out rule positions ≥ 0.90, raw decode legality
+≥ 0.95, loss below the uniform baseline. Rates, not golden values:
+training shuffles, so reruns move the digits but not the verdict.
+
+The sample was played by a fixed conditional style ("sentinel", six
+rules documented in `gen_guardian_sample_playlog.lua`, which replays
+the deterministic collection and can regenerate or verify the data
+files at any time). That is what makes the measurement sharp: rules
+R1-R5 are functions of the player view alone, so every held-out
+position where one applies has a computable ground truth, and each
+position is classified seen/unseen by its 13-character encoding
+against the training set. Whose hands played the log is irrelevant to
+what is being proved — the proof needs a log with consistent habits
+in it, not a particular author.
+
+Measured on 2026-08-01 (two runs): rule positions 58/58 on held-out
+games both times, including every unseen one (19/19); `raw_legal`
+1.00, `gated_rate` 0.00. Overall held-out match sat at 0.61-0.73
+because the free slots — positions where the style genuinely leaves
+the move open — land at their noise floor, as they should: the view
+underdetermines them, so no amount of data closes that gap. The
+`log_match` analogue on the training set itself came in around 0.76,
+which is the memorisation of the small-log regime giving way to rule
+learning; a model that can no longer replay its corpus verbatim but
+answers every rule position it never saw is the shape of the claim
+this section set out to prove.
 
 Two fences run under `cargo test`:
 

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- gameai example: reproducible generalisation proof for the guardian
+  player bake. `examples/gameai/data/` ships a sample play log at the
+  tens-of-games scale (36 train / 18 held-out games, played by a fixed
+  conditional style), `eval_guardian_player_generalization.lua` bakes
+  it and scores the Card on held-out positions against explicit fences
+  (style match on rule positions ≥ 0.90, raw decode legality ≥ 0.95,
+  loss below baseline), and `gen_guardian_sample_playlog.lua` replays
+  the deterministic collection to regenerate or verify the data files.
+  Measured: rule positions 58/58 on held-out games including every
+  unseen one, across two runs. See README "Proving the bake
+  generalises".
+
 ### Changed
 
 - `alc.nn` trainer: `grad_accum > 1` is now honoured natively across

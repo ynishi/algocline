@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles, so the intended usage is to rebuild the chain per decision
   with the legal set recomputed and the seed derived explicitly (e.g.
   from a turn number).
+- gameai example: noisy decoding on the guardian player NPC, the first
+  consumer of `alc.nn.constraint.allow_list`.
+  `guardian_player_npc` gains a `decide_noisy` mode
+  (`{ view, seed, temperature? }`, returning
+  `action=<move> legal=true raw_legal=<bool> noisy=true temperature=<t>
+  seed=<n>`) that draws one move from
+  `sampler.constrained(sampler.temperature(t, seed), constraint.allow_list(move_ids))`
+  instead of scanning the ranking — legal by construction rather than
+  by a gate. Its `autoplay` mode takes the same optional `temperature`,
+  which turns a batch of fights from N copies of one greedy fight into
+  N samples; each decision draws under
+  `seed + game * (TURN_LIMIT + 1) + turn`, so a run is still a function
+  of its seed and a single turn can be replayed on its own. `seed` is
+  required on the noisy path (never defaulted) and the sampler chain is
+  rebuilt per decision, following the bridge's move semantics. The
+  greedy `decide` / `determinism` paths are untouched, so the existing
+  eval cases and the generalisation script keep fencing the same
+  behaviour. See README "Drawing instead of scanning".
 - gameai example: reproducible generalisation proof for the guardian
   player bake. `examples/gameai/data/` ships a sample play log at the
   tens-of-games scale (36 train / 18 held-out games, played by a fixed

@@ -13,9 +13,16 @@
 -- letter makes the raw argmax a token that is not a move at all, which
 -- is the case the gate exists for.
 --
+-- The sampler namespaces are stubbed in the same spirit. There is no
+-- RNG of the real kind, but the *contract* of the bridge is kept: a
+-- composition consumes both of its arguments and a spent handle is a
+-- loud error, so a chain reused across decisions fails here exactly as
+-- it would against `alc.nn.sampler.constrained`.
+--
 -- What is left under test is the request surface: the view the model is
 -- prompted with, the alias resolution, the boss the autoplay is seated
--- against, and the rejection of a field no mode reads.
+-- against, the seed every draw is derived from, and the rejection of a
+-- field no mode reads.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -101,10 +108,92 @@ alc.card = {
     end,
 }
 
+-- ─── Sampler stubs ──────────────────────────────────────────────────
+
+--- The four move ids, in the order the module masks with.
+local MOVE_IDS = {}
+for _, action in ipairs(duel.player_legal_actions()) do
+    MOVE_IDS[#MOVE_IDS + 1] = VOCAB.to_id[action]
+end
+
+--- Every chain built since the last reset, oldest first. Each entry is
+--- `{ temperature, seed, allow, draws }`.
+local CHAINS = {}
+
+--- The stand-in for a temperature draw.
+---
+--- Not a model of the real sampler — there is no row of logits behind
+--- it — but a function of the seed alone, which is the property the
+--- specs are about: a replay that derives the same seed draws the same
+--- move, and neighbouring seeds do not all land on one id.
+local function draw(seed, allow)
+    local mixed = (seed * 2654435761 + 1013904223) % 4294967296
+    return allow[math.floor(mixed / 65536) % #allow + 1]
+end
+
+--- A handle that can be moved out of, like the bridge's.
+local function spendable(kind)
+    return { kind = kind, spent = false }
+end
+
+local function spend(handle, kind)
+    if handle.spent then
+        error(
+            "spec: this "
+                .. kind
+                .. " was moved into a constrained sampler; build a fresh one instead"
+        )
+    end
+    handle.spent = true
+end
+
 alc.nn = {
     card = {
         load_handle = function()
             return HANDLE
+        end,
+    },
+    sampler = {
+        temperature = function(temperature, seed)
+            local handle = spendable("sampler")
+            handle.temperature = temperature
+            handle.seed = seed
+            return handle
+        end,
+        constrained = function(inner, constraint)
+            spend(inner, "sampler")
+            spend(constraint, "constraint")
+            local chain = {
+                temperature = inner.temperature,
+                seed = inner.seed,
+                allow = constraint.ids,
+                draws = 0,
+            }
+            CHAINS[#CHAINS + 1] = chain
+            return {
+                sample = function(self, logits)
+                    if logits ~= LOGITS then
+                        error("spec: a sampler must be handed the session's own logits row")
+                    end
+                    self.chain.draws = self.chain.draws + 1
+                    return draw(chain.seed, chain.allow)
+                end,
+                chain = chain,
+            }
+        end,
+    },
+    constraint = {
+        allow_list = function(ids)
+            if type(ids) ~= "table" or #ids == 0 then
+                error("spec: an empty allow list must be rejected at construction")
+            end
+            local handle = spendable("constraint")
+            local copy = {}
+            for i, id in ipairs(ids) do
+                copy[i] = id
+            end
+            handle.ids = copy
+            return handle
         end,
     },
 }
@@ -160,6 +249,7 @@ local function ask(payload, extra)
     rank_default()
     last_prompt, last_alias = nil, nil
     last_boss_alias, last_boss_style = nil, nil
+    CHAINS = {}
     return npc.run(request).result
 end
 
@@ -241,6 +331,149 @@ end)
 describe("guardian_player_npc determinism", function()
     it("agrees across two independent sessions", function()
         expect(ask({ mode = "determinism", view = VIEW })).to.equal("deterministic=true action=b")
+    end)
+end)
+
+-- ─── decide_noisy ───────────────────────────────────────────────────
+
+--- The move the stub draws for `seed`, as the summary spells it.
+local function drawn(seed)
+    return VOCAB.to_char[draw(seed, MOVE_IDS)]
+end
+
+describe("guardian_player_npc decide_noisy", function()
+    it("draws a legal move and reports the draw", function()
+        -- The whole line, not a match: the shape is what a caller
+        -- parses, and `noisy=true` is what tells a sweep the number in
+        -- front of it came from a draw rather than from the scan.
+        expect(ask({ mode = "decide_noisy", view = VIEW, seed = 7 })).to.equal(
+            string.format(
+                "action=%s legal=true raw_legal=true noisy=true temperature=1 seed=7",
+                drawn(7)
+            )
+        )
+    end)
+
+    it("masks every token that is not a player move", function()
+        -- Legality is a property of the mask, not of a check after the
+        -- draw, so the assertion is on the list the constraint was
+        -- built with.
+        ask({ mode = "decide_noisy", view = VIEW, seed = 7 })
+        expect(#CHAINS).to.equal(1)
+        expect(#CHAINS[1].allow).to.equal(#MOVE_IDS)
+        for i, id in ipairs(MOVE_IDS) do
+            expect(CHAINS[1].allow[i]).to.equal(id)
+        end
+    end)
+
+    it("draws the same move from the same seed", function()
+        local first = ask({ mode = "decide_noisy", view = VIEW, seed = 11 })
+        local second = ask({ mode = "decide_noisy", view = VIEW, seed = 11 })
+        expect(first).to.equal(second)
+    end)
+
+    it("does not answer every seed with one move", function()
+        -- The point of the mode. A sampler that collapsed onto a single
+        -- id would still be legal and still be useless.
+        local seen, distinct = {}, 0
+        for seed = 1, 12 do
+            local action =
+                ask({ mode = "decide_noisy", view = VIEW, seed = seed }):match("action=(%a)")
+            if not seen[action] then
+                seen[action] = true
+                distinct = distinct + 1
+            end
+        end
+        expect(distinct > 1).to.equal(true)
+    end)
+
+    it("carries the requested temperature into the sampler", function()
+        local text = ask({ mode = "decide_noisy", view = VIEW, seed = 7, temperature = 0.75 })
+        expect(CHAINS[1].temperature).to.equal(0.75)
+        expect(text:match("temperature=([%d%.]+)")).to.equal("0.75")
+    end)
+
+    it("defaults the temperature to 1.0", function()
+        ask({ mode = "decide_noisy", view = VIEW, seed = 7 })
+        expect(CHAINS[1].temperature).to.equal(1.0)
+    end)
+
+    it("passes the seed the caller derived", function()
+        ask({ mode = "decide_noisy", view = VIEW, seed = 42 })
+        expect(CHAINS[1].seed).to.equal(42)
+    end)
+
+    it("reports the raw argmax legality off the ungated row", function()
+        -- The draw is masked, so it cannot say whether the model was
+        -- still answering the question. The argmax still can.
+        npc.reset_cache()
+        rank({ "M", "b", "a", "p", "A" })
+        CHAINS = {}
+        local text = npc.run({
+            task = alc.json_encode({ mode = "decide_noisy", view = VIEW, seed = 7 }),
+        }).result
+        expect(text).to.equal(
+            string.format(
+                "action=%s legal=true raw_legal=false noisy=true temperature=1 seed=7",
+                drawn(7)
+            )
+        )
+    end)
+
+    it("requires a seed", function()
+        -- A default seed would make the draw depend on nothing the
+        -- caller can write down, which is the reproducibility the
+        -- sampler carries its own RNG for.
+        expect(function()
+            ask({ mode = "decide_noisy", view = VIEW })
+        end).to.fail()
+    end)
+
+    it("rejects a seed that is not a non-negative number", function()
+        expect(function()
+            ask({ mode = "decide_noisy", view = VIEW, seed = "7" })
+        end).to.fail()
+        expect(function()
+            ask({ mode = "decide_noisy", view = VIEW, seed = -1 })
+        end).to.fail()
+    end)
+
+    it("rejects a temperature that is not a finite positive number", function()
+        -- Zero is a caller who means greedy, and greedy has a mode.
+        expect(function()
+            ask({ mode = "decide_noisy", view = VIEW, seed = 7, temperature = 0 })
+        end).to.fail()
+        expect(function()
+            ask({ mode = "decide_noisy", view = VIEW, seed = 7, temperature = -0.5 })
+        end).to.fail()
+        expect(function()
+            ask({ mode = "decide_noisy", view = VIEW, seed = 7, temperature = "hot" })
+        end).to.fail()
+    end)
+
+    it("rejects a view that is not an object", function()
+        expect(function()
+            ask({ mode = "decide_noisy", view = "M0H9D3Y9T1S0-", seed = 7 })
+        end).to.fail()
+    end)
+
+    it("leaves the greedy decode alone", function()
+        -- The two paths share the prompt and the argmax, nothing else:
+        -- a greedy request must not reach the sampler at all, or the
+        -- determinism the scenarios fence would depend on a seed.
+        expect(ask({ mode = "decide", view = VIEW })).to.equal(
+            "action=b legal=true raw_legal=true gated=false"
+        )
+        expect(#CHAINS).to.equal(0)
+    end)
+
+    it("rejects the noisy fields on the greedy decode", function()
+        expect(function()
+            ask({ mode = "decide", view = VIEW, seed = 7 })
+        end).to.fail()
+        expect(function()
+            ask({ mode = "decide", view = VIEW, temperature = 0.8 })
+        end).to.fail()
     end)
 end)
 
@@ -499,6 +732,108 @@ describe("guardian_player_npc autoplay", function()
     it("rejects a non-positive game count", function()
         expect(function()
             ask({ mode = "autoplay", games = 0, boss_style = "guardian" })
+        end).to.fail()
+    end)
+end)
+
+-- ─── noisy autoplay ─────────────────────────────────────────────────
+
+describe("guardian_player_npc noisy autoplay", function()
+    it("draws every decision and says which kind of run it was", function()
+        local text = ask({
+            mode = "autoplay",
+            games = 1,
+            seed = 5,
+            boss_style = "guardian",
+            temperature = 0.8,
+        })
+        local moves = tonumber(text:match("moves=(%d+)"))
+        expect(text:match("noisy=true temperature=([%d%.]+)")).to.equal("0.8")
+        -- One chain per decision, and nothing decided outside one.
+        expect(#CHAINS).to.equal(moves)
+        local counted = 0
+        for _, action in ipairs(duel.player_legal_actions()) do
+            counted = counted + tonumber(text:match(" " .. action .. "=(%d+)"))
+        end
+        expect(counted).to.equal(moves)
+    end)
+
+    it("derives one distinct seed per decision from the run seed", function()
+        -- `seed + game * (TURN_LIMIT + 1) + turn`, which is what makes a
+        -- single turn of a single game replayable without walking the
+        -- fights in front of it.
+        local text = ask({
+            mode = "autoplay",
+            games = 1,
+            seed = 5,
+            boss_style = "guardian",
+            temperature = 0.8,
+        })
+        local moves = tonumber(text:match("moves=(%d+)"))
+        for turn = 1, moves do
+            expect(CHAINS[turn].seed).to.equal(5 + 1 * (duel.TURN_LIMIT + 1) + turn)
+            expect(CHAINS[turn].temperature).to.equal(0.8)
+        end
+    end)
+
+    it("gives the games of a batch seeds of their own", function()
+        -- Greedy, a batch is one fight counted N times. Noisy, it is a
+        -- sample, and it is only a sample if the games differ.
+        local text = ask({
+            mode = "autoplay",
+            games = 3,
+            seed = 5,
+            boss_style = "guardian",
+            temperature = 1.2,
+        })
+        expect(tonumber(text:match("moves=(%d+)"))).to.equal(#CHAINS)
+        local seen = {}
+        for _, chain in ipairs(CHAINS) do
+            expect(seen[chain.seed]).to.equal(nil)
+            seen[chain.seed] = true
+        end
+    end)
+
+    it("leaves the greedy autoplay alone", function()
+        expect(ask({ mode = "autoplay", games = 1, seed = 5, boss_style = "guardian" })).to.equal(
+            "winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0"
+                .. tail(5, "b", duel.policy_guardian)
+        )
+        expect(#CHAINS).to.equal(0)
+    end)
+
+    it("rejects a negative seed once the draws are derived from it", function()
+        -- Greedy, a negative seed is just another board. Noisy, it is
+        -- the base of every sampler seed of the run.
+        expect(function()
+            ask({
+                mode = "autoplay",
+                games = 1,
+                seed = -3,
+                boss_style = "guardian",
+                temperature = 0.8,
+            })
+        end).to.fail()
+    end)
+
+    it("rejects a seed that is not a number once the draws are derived from it", function()
+        -- Greedy, a malformed seed falls back to the default board.
+        -- Noisy, that fallback would seed every draw of the run from a
+        -- number the caller never asked for, so it is loud instead.
+        expect(function()
+            ask({
+                mode = "autoplay",
+                games = 1,
+                seed = "abc",
+                boss_style = "guardian",
+                temperature = 0.8,
+            })
+        end).to.fail()
+    end)
+
+    it("rejects a temperature that is not a finite positive number", function()
+        expect(function()
+            ask({ mode = "autoplay", games = 1, boss_style = "guardian", temperature = 0 })
         end).to.fail()
     end)
 end)

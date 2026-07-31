@@ -741,6 +741,70 @@ answers a position the log never contained. The scaling caveat is the
 card duel one — see "Baking from a play log" — coverage is the number
 of games in the log, so a log meant to carry a style wants tens of them.
 
+### Drawing instead of scanning
+
+`decide_noisy` answers the same position by drawing from the model
+rather than by scanning its ranking, and it stays legal by construction:
+a temperature sampler is wrapped in `alc.nn.constraint.allow_list` over
+the four move ids, so every other logit is `-inf` before the draw
+happens. An illegal move is not rejected and redrawn, it is not
+representable.
+
+```
+alc_run(code = [[
+  return require("guardian_player_npc").run({
+      task = alc.json_encode({
+          mode = "decide_noisy", view = <player view>, temperature = 0.8, seed = 4,
+      }),
+      card_alias = "guardian_player_npc_ytk",
+  })
+]])
+```
+
+```
+action=A legal=true raw_legal=true noisy=true temperature=0.8 seed=4
+```
+
+`seed` is required rather than defaulted, and the chain is rebuilt for
+every decision. Both follow from the bridge: composing a sampler with a
+constraint *consumes* both handles, because a sampler owns its RNG and
+two handles onto one RNG would interleave draws from generations that
+each believe they are reproducible from their seed. So the caller
+derives the seed — from a turn number, from a run seed plus an index —
+and a replay that derives it the same way draws the same move.
+`raw_legal` is still the argmax, and still says whether the model was
+answering the question at all.
+
+`autoplay` takes the same `temperature`, and that is what turns a batch
+into a sample: with it present `games` fights are `games` fights rather
+than one counted N times, and the summary carries `noisy=true
+temperature=<t>` so a sweep is three calls that each say what they were.
+Every decision draws under `seed + game * (TURN_LIMIT + 1) + turn`, a
+stride one wider than the longest fight, so no two decisions of a run
+share a draw and a single turn of a single game can be rebuilt without
+replaying the fights in front of it.
+
+```
+alc_run(code = [[
+  return require("guardian_player_npc").run({
+      task = alc.json_encode({
+          mode = "autoplay", games = 20, seed = 5,
+          boss_style = "guardian", temperature = 0.8,
+      }),
+      card_alias = "guardian_player_npc_ytk",
+  })
+]])
+```
+
+```
+winrate=0.42 raw_legal=1.00 moves=176 a=61 A=48 b=44 p=23 noisy=true temperature=0.8
+```
+
+(Shape of the answer, not a measured run.) `decide` and `determinism`
+are untouched by any of this: they never reach the sampler, so the
+determinism the scenarios fence is still a property of the greedy
+path.
+
 ### Proving the bake generalises
 
 The claim "tens of games are enough for the habits to carry" is
@@ -826,6 +890,7 @@ alc_pkg_test(pkg = "card_duel_interactive")
 alc_pkg_test(pkg = "guardian_duel")
 alc_pkg_test(pkg = "guardian_duel_npc")
 alc_pkg_test(pkg = "guardian_duel_interactive")
+alc_pkg_test(pkg = "guardian_player_npc")
 ```
 
 ## Known limitations
@@ -878,8 +943,11 @@ alc_pkg_test(pkg = "guardian_duel_interactive")
   `card_duel` instead of sharing them. Two rule sets are not enough to
   tell which parts are common; a third is the point at which to extract
   them.
-- Decoding is greedy and therefore deterministic, so an NPC repeats
-  itself in identical positions. Noisy or temperature decoding is
-  deferred: the stdlib sampler has no legal-action mask, so sampling
-  would have to be filtered outside the sampler, and it would break the
-  determinism case the scenarios fence.
+- Noisy decoding exists on the player NPC alone
+  (`guardian_player_npc`'s `decide_noisy`, and `temperature` on its
+  autoplay). The card duel NPC, the boss NPC and the tournament still
+  decode greedily and therefore repeat themselves in identical
+  positions. Wiring the same allow-list draw into them is a port of a
+  dozen lines rather than a design question, but their eval scenarios
+  fence determinism, so it is a mode next to the greedy one there too —
+  not a replacement for it.

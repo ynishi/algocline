@@ -375,6 +375,160 @@ describe("card_duel_interactive seat two", function()
     end)
 end)
 
+-- ─── Play log ───────────────────────────────────────────────────────
+
+describe("card_duel_interactive move log", function()
+    it("records the position the human answered", function()
+        reset()
+        new_with_hands(
+            { action = "new", style = "timid", seed = 21 },
+            { 1, 1, 1, 1, 1 },
+            { 9, 9, 9, 9, 9 }
+        )
+        game.run({ action = "play", rank = 1 })
+        local log = game.run({ action = "end" }).move_log
+        expect(#log).to.equal(1)
+        expect(log[1].round).to.equal(1)
+        -- The hand still holds five cards and the history is empty: the
+        -- entry is the position before the round was applied, which is
+        -- the only one the human was ever asked about.
+        expect(#log[1].my_hand).to.equal(duel.HAND_SIZE)
+        expect(log[1].my_points).to.equal(0)
+        expect(log[1].opp_points).to.equal(0)
+        expect(#log[1].opp_played).to.equal(0)
+        expect(log[1].action).to.equal(1)
+    end)
+
+    it("appends one entry per move, in order", function()
+        reset()
+        local view = game.run({ action = "new", style = "timid", seed = 21 })
+        for _ = 1, duel.HAND_SIZE do
+            view = game.run({ action = "play", rank = view.legal_actions[1] })
+        end
+        local log = game.run({ action = "end" }).move_log
+        expect(#log).to.equal(duel.HAND_SIZE)
+        for round, move in ipairs(log) do
+            expect(move.round).to.equal(round)
+            expect(#move.my_hand).to.equal(duel.HAND_SIZE - round + 1)
+            expect(#move.opp_played).to.equal(round - 1)
+        end
+    end)
+
+    it("carries the running score of the logged position", function()
+        reset()
+        new_with_hands(
+            { action = "new", style = "timid", seed = 21 },
+            { 9, 9, 9, 9, 9 },
+            { 1, 1, 1, 1, 1 }
+        )
+        game.run({ action = "play", rank = 9 })
+        game.run({ action = "play", rank = 9 })
+        local log = game.run({ action = "end" }).move_log
+        expect(log[1].my_points).to.equal(0)
+        expect(log[2].my_points).to.equal(1)
+        expect(log[2].opp_played[1]).to.equal(1)
+    end)
+
+    it("logs the human seat when the human sits second", function()
+        reset()
+        new_with_hands(
+            { action = "new", style = "timid", seed = 21, user_seat = 2 },
+            { 1, 1, 1, 1, 1 },
+            { 9, 9, 9, 9, 9 }
+        )
+        game.run({ action = "play", rank = 9 })
+        local log = game.run({ action = "end" }).move_log
+        -- Seat two holds the nines here, so a log built from seat one
+        -- would carry a hand the human never held.
+        expect(log[1].my_hand[1]).to.equal(9)
+        expect(log[1].action).to.equal(9)
+    end)
+
+    it("keeps a snapshot rather than a reference into the position", function()
+        reset()
+        new_with_hands(
+            { action = "new", style = "timid", seed = 21 },
+            { 1, 1, 1, 1, 1 },
+            { 9, 9, 9, 9, 9 }
+        )
+        game.run({ action = "play", rank = 1 })
+        -- Rewrite the live hand between the two moves, which is what
+        -- `new_with_hands` does at the start of every seat test.
+        local session = store[KEY]
+        session.g.p1.my_hand = { 2, 2, 2, 2 }
+        store[KEY] = session
+        game.run({ action = "play", rank = 2 })
+        local log = game.run({ action = "end" }).move_log
+        expect(log[1].my_hand[1]).to.equal(1)
+        expect(#log[1].my_hand).to.equal(duel.HAND_SIZE)
+        expect(log[2].my_hand[1]).to.equal(2)
+    end)
+
+    it("hands out a copy the caller cannot write back into", function()
+        reset()
+        new_with_hands(
+            { action = "new", style = "timid", seed = 21 },
+            { 1, 1, 1, 1, 1 },
+            { 9, 9, 9, 9, 9 }
+        )
+        game.run({ action = "play", rank = 1 })
+        local stored = store[KEY].move_log
+        local view = game.run({ action = "end" })
+        view.move_log[1].my_hand[1] = 7
+        view.move_log[1].opp_played[1] = 7
+        expect(stored[1].my_hand[1]).to.equal(1)
+        expect(#stored[1].opp_played).to.equal(0)
+    end)
+
+    it("returns an empty log for a session that took no move", function()
+        reset()
+        game.run({ action = "new", style = "timid", seed = 21 })
+        local log = game.run({ action = "end" }).move_log
+        expect(type(log)).to.equal("table")
+        expect(#log).to.equal(0)
+    end)
+
+    it("is only handed out by end", function()
+        reset()
+        local opened = game.run({ action = "new", style = "timid", seed = 21 })
+        expect(opened.move_log).to.equal(nil)
+        expect(game.run({ action = "play", rank = opened.legal_actions[1] }).move_log).to.equal(nil)
+        expect(game.run({ action = "show" }).move_log).to.equal(nil)
+        -- A log is a whole session, so an unfinished one would hand the
+        -- bake path rows the next move is about to relabel.
+        expect(#game.run({ action = "end" }).move_log).to.equal(1)
+    end)
+
+    it("leaves the rest of the end view untouched", function()
+        reset()
+        local view = game.run({ action = "new", style = "timid", seed = 21 })
+        for _ = 1, duel.HAND_SIZE do
+            view = game.run({ action = "play", rank = view.legal_actions[1] })
+        end
+        local ended = game.run({ action = "end" })
+        expect(ended.ended).to.equal(true)
+        expect(ended.status).to.equal("finished")
+        expect(ended.winner).to.equal(view.winner)
+        expect(ended.result).to.equal(ended.text)
+        expect(store[KEY]).to.equal(nil)
+    end)
+
+    it("produces a log the bake path accepts as is", function()
+        reset()
+        local view = game.run({ action = "new", style = "timid", seed = 21 })
+        for _ = 1, duel.HAND_SIZE do
+            view = game.run({ action = "play", rank = view.legal_actions[1] })
+        end
+        local log = game.run({ action = "end" }).move_log
+        -- `examples/gameai/bake_card_duel_from_log.lua` feeds the log
+        -- straight to this call, so the two shapes have to agree.
+        local rows, plays = duel.rows_from_moves(log, { ctx_len = 16 })
+        expect(#rows).to.equal(duel.HAND_SIZE)
+        expect(#plays).to.equal(duel.HAND_SIZE)
+        expect(plays[1].action).to.equal(log[1].action)
+    end)
+end)
+
 -- ─── show / end ─────────────────────────────────────────────────────
 
 describe("card_duel_interactive show", function()

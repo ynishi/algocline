@@ -21,6 +21,7 @@ examples/gameai/
   card_duel_interactive/spec/        alc_pkg_test suite for the session
   train_card_duel_npc.lua            teacher corpus -> Full FT -> Card + alias
   bake_card_duel_persona.lua         NL prompt -> synthesised teacher -> Card + alias
+  bake_card_duel_from_log.lua        interactive move_log -> Card + alias (play-log bake)
   card_duel_scenario.lua             eval scenario (style / legality / determinism / self-play compliance)
   card_duel_scenario_timid.lua       eval scenario for the timid style
   card_duel_scenario_bold.lua        eval scenario for the bold style
@@ -347,6 +348,47 @@ The board view gains `style_kind` (`canonical` / `persona`) and the
 tournament answer gains `style_kinds` per style, because a persona row
 cannot be read next to a compliance figure the way a canonical row can.
 
+### Baking from a play log
+
+The third bake input is a game someone actually played. The `end`
+action returns the session's `move_log` — the position the human was
+looking at before each move (round, hand, both scores, opponent
+history) and the rank they chose — and `bake_card_duel_from_log.lua`
+trains on exactly those rows:
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/bake_card_duel_from_log.lua",
+  ctx = { moves = <move_log>, name = "mine", steps = 800, batch = 32 }
+)
+```
+
+`ctx` takes `moves` and `name` (a `^[a-z0-9_]+$` slug, pinned as the
+alias `card_duel_npc_<name>`) plus `steps`, `batch`, `lr` and `seed`.
+The logs of several sessions can be concatenated into one `moves`
+array; nothing in a row is session-scoped. No `alc.llm` call happens
+anywhere on this path, so unlike the persona bake the run never pauses.
+
+There is no teacher function here, so there is nothing to score the
+model against beyond the log itself. `log_match` is the replay of the
+logged positions — the states the model was trained on — and is
+therefore a training fit rather than a generalisation rate.
+`replicate_factor` is the other half of the same caveat: it states how
+many times the log had to be repeated to answer `steps * batch`
+samples, and replication buys steps, not coverage.
+
+Three games played strictly lowest-card, baked at the defaults on
+2026-07-31:
+
+```
+moves=15 log_match=1.00 train_loss=0.187 replicate_factor=1707
+```
+
+The fifteen logged positions come back exactly. Probing positions the
+log never contained, four of which left a free choice, two of the four
+agreed with the same rule — coverage is the number of games in the log,
+so a log meant to carry a style wants tens of games rather than three.
+
 ## CI
 
 Two fences run under `cargo test`:
@@ -404,6 +446,12 @@ alc_pkg_test(pkg = "card_duel_interactive")
   instead of writing a policy that labels them, is not wired here. It
   belongs with the play-log input path, where the labels come from
   recorded games rather than from a function.
+- An empty `opp_played` in a `move_log` entry is an empty Lua table,
+  which JSON renders as `{}` rather than `[]`.
+  `card_duel.rows_from_moves` reads either shape, so a log handed
+  straight back to the bake script is unaffected, but a strict JSON
+  consumer that carries a log across a transport has to expect the
+  object form on the first round of every game.
 - Decoding is greedy and therefore deterministic, so an NPC repeats
   itself in identical positions. Noisy or temperature decoding is
   deferred: the stdlib sampler has no legal-action mask, so sampling

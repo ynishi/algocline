@@ -46,6 +46,7 @@
 --- - `policy_<style>` for every name in `STYLES` — deterministic styles
 --- - `policy_random` — the random opponent used by self-play
 --- - `build_corpus` — supervised training lines for any policy
+--- - `rows_from_moves` — supervised training lines for a play log
 --- - `sample_states` / `compile_policy` — sandbox and validation for a
 ---   synthesised (LLM-written) policy chunk
 --- - `run` — Strategy entry; returns the encoded opening state
@@ -607,6 +608,152 @@ function M.build_corpus(policy, opts)
         end
     end
     return rows
+end
+
+--- Read one integer field of a logged move, or fail naming it.
+---
+--- A log entry is data the caller collected elsewhere, so every field
+--- is checked before it reaches the encoder: a rank of `10` or a round
+--- of `0` still encodes to characters inside the alphabet and would
+--- teach the model a state the rules can never produce.
+local function move_int(index, field, value, min, max)
+    if type(value) ~= "number" or value ~= math.floor(value) or value < min or value > max then
+        error(
+            string.format(
+                "card_duel.rows_from_moves: move %d field %s must be an integer in %d..%d, got %s",
+                index,
+                field,
+                min,
+                max,
+                tostring(value)
+            )
+        )
+    end
+    return value
+end
+
+--- Read a rank-list field of a logged move.
+---
+--- The field has to be present even when it is empty: an entry that
+--- simply lacks `opp_played` is a truncated log rather than a first
+--- round, and treating the two alike would bake a state the human never
+--- saw.
+local function move_ranks(index, field, value, min_len)
+    if type(value) ~= "table" then
+        error(
+            string.format(
+                "card_duel.rows_from_moves: move %d field %s must be an array, got %s",
+                index,
+                field,
+                type(value)
+            )
+        )
+    end
+    local out = {}
+    for i = 1, #value do
+        out[i] = move_int(index, string.format("%s[%d]", field, i), value[i], MIN_RANK, MAX_RANK)
+    end
+    if #out < min_len then
+        error(
+            string.format(
+                "card_duel.rows_from_moves: move %d field %s needs at least %d rank(s), got %d",
+                index,
+                field,
+                min_len,
+                #out
+            )
+        )
+    end
+    return out
+end
+
+--- Build the supervised corpus that teaches a play log to a model.
+---
+--- Where `build_corpus` labels sampled states with a policy function,
+--- this labels the states of a log with the ranks that were actually
+--- played — the `move_log` an interactive session hands back when it
+--- ends. There is no teacher function behind such a corpus, so nothing
+--- downstream can score the model on states the log does not contain.
+---
+--- Every entry is validated, and an action outside the legal ranks of
+--- its own hand is a loud error rather than a dropped row: silently
+--- skipping it would train on a log the caller believes was used whole
+--- and shift every count reported afterwards.
+---
+--- Returns the padded rows and the `{ state, action }` pairs behind
+--- them, so a caller that also replays the log against the trained model
+--- does not have to validate it a second time.
+---@param moves table[] `{ round, my_hand, my_points, opp_points, opp_played, action }`
+---@param opts table `{ ctx_len, pad_id? }`
+---@return integer[][] rows Token id rows, each `ctx_len` long
+---@return table[] plays `{ { state = <per-player state>, action = <rank> } }`
+function M.rows_from_moves(moves, opts)
+    if type(moves) ~= "table" then
+        error("card_duel.rows_from_moves: moves must be a table, got " .. type(moves))
+    end
+    if #moves == 0 then
+        error("card_duel.rows_from_moves: moves must hold at least one logged move")
+    end
+    if type(opts) ~= "table" then
+        error("card_duel.rows_from_moves: opts must be a table, got " .. type(opts))
+    end
+    local ctx_len = tonumber(opts.ctx_len)
+    if ctx_len == nil or ctx_len < 1 then
+        error("card_duel.rows_from_moves: opts.ctx_len must be a positive number")
+    end
+    ctx_len = math.floor(ctx_len)
+    local pad_id = opts.pad_id
+    if pad_id == nil then
+        pad_id = TO_ID["\0"]
+    end
+    if type(pad_id) ~= "number" then
+        error("card_duel.rows_from_moves: opts.pad_id must be a number, got " .. type(pad_id))
+    end
+
+    local rows, plays = {}, {}
+    for i = 1, #moves do
+        local move = moves[i]
+        if type(move) ~= "table" then
+            error(
+                string.format(
+                    "card_duel.rows_from_moves: move %d must be a table, got %s",
+                    i,
+                    type(move)
+                )
+            )
+        end
+        local state = make_state(
+            move_int(i, "round", move.round, 1, HAND_SIZE),
+            sorted_copy(move_ranks(i, "my_hand", move.my_hand, 1)),
+            move_int(i, "my_points", move.my_points, 0, HAND_SIZE),
+            move_int(i, "opp_points", move.opp_points, 0, HAND_SIZE),
+            move_ranks(i, "opp_played", move.opp_played, 0)
+        )
+        local action = move_int(i, "action", move.action, MIN_RANK, MAX_RANK)
+        local legal = M.legal_actions(state)
+        local playable = false
+        for _, rank in ipairs(legal) do
+            if rank == action then
+                playable = true
+                break
+            end
+        end
+        if not playable then
+            error(
+                string.format(
+                    "card_duel.rows_from_moves: move %d played %s on state %s, "
+                        .. "which is not one of the legal ranks %s",
+                    i,
+                    tostring(action),
+                    M.encode(state),
+                    table.concat(legal, ", ")
+                )
+            )
+        end
+        rows[#rows + 1] = make_row(state, action, ctx_len, pad_id)
+        plays[#plays + 1] = { state = state, action = action }
+    end
+    return rows, plays
 end
 
 -- ─── Synthesised policies ───────────────────────────────────────────

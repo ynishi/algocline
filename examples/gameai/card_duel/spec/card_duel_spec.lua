@@ -283,6 +283,175 @@ describe("card_duel.build_corpus", function()
     end)
 end)
 
+describe("card_duel.rows_from_moves", function()
+    --- One entry of the `move_log` an interactive session hands back.
+    local function logged_move()
+        return {
+            round = 2,
+            my_hand = { 1, 4, 9, 9 },
+            my_points = 1,
+            opp_points = 0,
+            opp_played = { 3 },
+            action = 4,
+        }
+    end
+
+    it("emits one padded row per logged move", function()
+        local rows = duel.rows_from_moves({ logged_move(), logged_move() }, { ctx_len = CTX_LEN })
+        expect(#rows).to.equal(2)
+        local pad_id = duel.vocab().pad_id
+        for _, row in ipairs(rows) do
+            expect(#row).to.equal(CTX_LEN)
+            expect(row[#row]).to.equal(pad_id)
+        end
+    end)
+
+    it("writes the logged state, separator and action", function()
+        local rows = duel.rows_from_moves({ logged_move() }, { ctx_len = CTX_LEN })
+        expect(row_text(rows[1])).to.equal("R2H1499P10O3>4\n")
+    end)
+
+    it("returns the validated state and action behind every row", function()
+        -- The bake script replays the log against the trained model, so
+        -- it gets the pairs back rather than validating them twice.
+        local _, plays = duel.rows_from_moves({ logged_move() }, { ctx_len = CTX_LEN })
+        expect(#plays).to.equal(1)
+        expect(plays[1].action).to.equal(4)
+        expect(duel.encode(plays[1].state)).to.equal("R2H1499P10O3")
+    end)
+
+    it("sorts the logged hand like the encoder", function()
+        local shuffled = logged_move()
+        shuffled.my_hand = { 9, 4, 9, 1 }
+        local a = duel.rows_from_moves({ shuffled }, { ctx_len = CTX_LEN })
+        local b = duel.rows_from_moves({ logged_move() }, { ctx_len = CTX_LEN })
+        expect(row_text(a[1])).to.equal(row_text(b[1]))
+    end)
+
+    it("honours a pad id override", function()
+        local rows = duel.rows_from_moves({ logged_move() }, { ctx_len = CTX_LEN, pad_id = 2 })
+        expect(rows[1][#rows[1]]).to.equal(2)
+    end)
+
+    it("rejects an action that is not in the logged hand", function()
+        -- Dropping the entry instead would train on a log the caller
+        -- believes was used whole.
+        local move = logged_move()
+        move.action = 7
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("names the entry that failed", function()
+        local bad = logged_move()
+        bad.action = 7
+        local ok, err = pcall(duel.rows_from_moves, { logged_move(), bad }, { ctx_len = CTX_LEN })
+        expect(ok).to.equal(false)
+        expect(err:match("move 2") ~= nil).to.equal(true)
+    end)
+
+    it("rejects a move that is missing a field", function()
+        local move = logged_move()
+        move.my_points = nil
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects a move without an opponent history", function()
+        -- An entry with no `opp_played` is a truncated log, not a first
+        -- round: a first round carries an empty array.
+        local move = logged_move()
+        move.opp_played = nil
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("accepts an empty opponent history", function()
+        local move = logged_move()
+        move.round = 1
+        move.my_points = 0
+        move.opp_played = {}
+        local rows = duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        expect(row_text(rows[1])).to.equal("R1H1499P00O>4\n")
+    end)
+
+    it("rejects a hand that is not an array", function()
+        local move = logged_move()
+        move.my_hand = "1499"
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects an empty hand", function()
+        local move = logged_move()
+        move.my_hand = {}
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects a rank outside the deck", function()
+        -- Rank 10 encodes to two chars that are both in the alphabet, so
+        -- the row would look well formed and mean nothing.
+        local move = logged_move()
+        move.my_hand = { 1, 4, 10 }
+        move.action = 10
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects a round outside the game", function()
+        local move = logged_move()
+        move.round = 0
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects a rank that is not an integer", function()
+        local move = logged_move()
+        move.action = 4.5
+        expect(function()
+            duel.rows_from_moves({ move }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects an entry that is not a table", function()
+        expect(function()
+            duel.rows_from_moves({ logged_move(), "R2H1499P10O3>4" }, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects an empty log", function()
+        expect(function()
+            duel.rows_from_moves({}, { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects a log that is not a table", function()
+        expect(function()
+            duel.rows_from_moves("R2H1499P10O3>4", { ctx_len = CTX_LEN })
+        end).to.fail()
+    end)
+
+    it("rejects a missing context window", function()
+        expect(function()
+            duel.rows_from_moves({ logged_move() }, {})
+        end).to.fail()
+    end)
+
+    it("refuses a context window the line does not fit in", function()
+        expect(function()
+            duel.rows_from_moves({ logged_move() }, { ctx_len = 4 })
+        end).to.fail()
+    end)
+end)
+
 describe("card_duel.sample_states", function()
     it("collects both seats of every round", function()
         expect(#duel.sample_states({ games = 4, seed = 3 })).to.equal(4 * duel.ROWS_PER_GAME)

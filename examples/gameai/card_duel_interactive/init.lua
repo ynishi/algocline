@@ -33,7 +33,12 @@
 ---    is translated to the human's point of view (`you` / `npc` /
 ---    `draw`). An unfinished game has no winner; reporting it as a draw
 ---    would hide a session that stopped early.
---- 4. `end` deletes the session. A finished game is kept until then, so
+--- 4. Every human move is appended to a `move_log` kept next to the
+---    game: the position the human was looking at (round, hand, both
+---    scores, opponent history) and the rank they chose. `end` returns
+---    that log, which is the training input of
+---    `examples/gameai/bake_card_duel_from_log.lua`.
+--- 5. `end` deletes the session. A finished game is kept until then, so
 ---    the final board can still be shown.
 ---
 --- ## Entry contract
@@ -48,9 +53,20 @@
 --- Every action returns the same board view — `round`, `your_hand`,
 --- `your_points`, `npc_points`, `npc_played`, `legal_actions`, `status`
 --- and a one-line `text` — plus `style_kind` (`canonical` / `persona`),
---- `last_round` after a move, `winner` once the game is over and
---- `ended` after `end`. `result` mirrors `text`, which is the field an
---- algocline caller reads by convention.
+--- `last_round` after a move, `winner` once the game is over, and
+--- `ended` plus `move_log` after `end`. `result` mirrors `text`, which
+--- is the field an algocline caller reads by convention.
+---
+--- ## Play log
+---
+--- The log is only handed out by `end`, because a log is a whole
+--- session: rows baked from a session that is still running would be
+--- relabelled by the moves that come after them. Each entry is
+--- `{ round, my_hand, my_points, opp_points, opp_played, action }`,
+--- which is exactly the per-player state `card_duel.encode` reads plus
+--- the rank that was played, so `card_duel.rows_from_moves` turns the
+--- log into training rows without a translation step. Only human moves
+--- are logged; the NPC seat is already a model.
 ---
 --- ## Styles
 ---
@@ -234,7 +250,7 @@ local function seats(session)
     return session.g.p1, session.g.p2
 end
 
--- ─── Board view ─────────────────────────────────────────────────────
+-- ─── Shared helpers ─────────────────────────────────────────────────
 
 local function copy_list(list)
     local out = {}
@@ -243,6 +259,53 @@ local function copy_list(list)
     end
     return out
 end
+
+-- ─── Play log ───────────────────────────────────────────────────────
+
+--- Append the position the human just answered, plus their answer.
+---
+--- The two lists are copied on the way in. `my_hand` and `opp_played`
+--- are the live tables of the current position, and a caller that
+--- rewrites a hand between moves — which the session allows, since the
+--- board it hands back is a view — would otherwise rewrite a move that
+--- was already made.
+local function log_move(session, user, rank)
+    local log = session.move_log
+    if log == nil then
+        log = {}
+        session.move_log = log
+    end
+    log[#log + 1] = {
+        round = user.round,
+        my_hand = copy_list(user.my_hand),
+        my_points = user.my_points,
+        opp_points = user.opp_points,
+        opp_played = copy_list(user.opp_played),
+        action = rank,
+    }
+end
+
+--- The log as the caller receives it: a copy, entries included.
+---
+--- A session that never took a move returns an empty array rather than
+--- nothing, so a caller can tell an unplayed session from a version of
+--- this package that did not keep a log yet.
+local function copy_move_log(session)
+    local out = {}
+    for i, move in ipairs(session.move_log or {}) do
+        out[i] = {
+            round = move.round,
+            my_hand = copy_list(move.my_hand),
+            my_points = move.my_points,
+            opp_points = move.opp_points,
+            opp_played = copy_list(move.opp_played),
+            action = move.action,
+        }
+    end
+    return out
+end
+
+-- ─── Board view ─────────────────────────────────────────────────────
 
 local function join(list)
     if #list == 0 then
@@ -430,6 +493,12 @@ local function action_play(ctx, key)
     local your_rank = check_rank(user, ctx.rank)
     local their_rank = npc_rank(session, opponent)
 
+    -- Logged before the round is applied, from the seat state the human
+    -- was answering: after `apply` the hand is one card shorter and the
+    -- opponent history one card longer, which is a position nobody was
+    -- ever asked about.
+    log_move(session, user, your_rank)
+
     -- `apply` takes the seat-one move first, so the pair is swapped
     -- when the human sits in seat two.
     if session.user_seat == 2 then
@@ -471,6 +540,7 @@ end
 local function action_end(_ctx, key)
     local session = load_session(key)
     local view = board_view(session)
+    view.move_log = copy_move_log(session)
     state_ns().delete(key)
     view.ended = true
     view.text = "session ended: " .. view.text

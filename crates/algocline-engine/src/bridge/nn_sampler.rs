@@ -12,6 +12,7 @@
 //! alc.nn.sampler.constrained(sampler, constraint)          -> Sampler
 //!
 //! alc.nn.constraint.stop_tokens({ id, ... })               -> Constraint
+//! alc.nn.constraint.allow_list({ id, ... })                -> Constraint
 //! alc.nn.constraint.regex(pattern, vocab)                  -> Constraint
 //! alc.nn.constraint.json_schema(schema, vocab)             -> Constraint
 //!
@@ -52,6 +53,26 @@
 //! and any later use of those handles is a loud error rather than a
 //! surprise alias. Build a second sampler instead of sharing one.
 //!
+//! Rebuilding is therefore the intended shape for a per-decision legal
+//! mask, not a workaround for it:
+//!
+//! ```lua
+//! for turn, legal_ids in ipairs(decisions) do
+//!     -- one fresh chain per decision; the seed is derived explicitly
+//!     -- so the turn stays reproducible on its own
+//!     local s = alc.nn.sampler.constrained(
+//!         alc.nn.sampler.temperature(0.8, base_seed + turn),
+//!         alc.nn.constraint.allow_list(legal_ids)
+//!     )
+//!     local id = s:sample(session:next_logits())
+//!     session:append(id)
+//! end
+//! ```
+//!
+//! There is deliberately no API to hand a live constraint a new id list:
+//! a mutable legal set would make a draw depend on call order instead of
+//! on the seed and the prefix.
+//!
 //! # Custom samplers see masked logits
 //!
 //! A Lua callback wrapped by `alc.nn.sampler.constrained` receives the
@@ -64,8 +85,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use algocline_nn::sampling::{
-    ConstrainedSampler, Constraint, GreedySampler, JsonSchemaConstraint, RegexConstraint, Sampler,
-    StopTokensConstraint, TemperatureSampler, TopKTopPSampler,
+    AllowListConstraint, ConstrainedSampler, Constraint, GreedySampler, JsonSchemaConstraint,
+    RegexConstraint, Sampler, StopTokensConstraint, TemperatureSampler, TopKTopPSampler,
 };
 use candle_core::{Result as CandleResult, Tensor};
 use mlua::prelude::*;
@@ -358,6 +379,17 @@ pub(super) fn register_sampler_ns(
         Ok(ConstraintHandle::new(StopTokensConstraint::new(ids)))
     })?;
     constraint_ns.set("stop_tokens", stop_tokens)?;
+
+    // No vocabulary argument: an allow list names token ids directly,
+    // so it needs no surface strings to reason about — which is also why
+    // it works with a tokenizer this bridge has never seen.
+    let allow_list = lua.create_function(|_, ids: Vec<u32>| {
+        const ENTRY: &str = "alc.nn.constraint.allow_list";
+        let constraint = AllowListConstraint::new(ids)
+            .map_err(|e| LuaError::external(format!("{ENTRY}: {e}")))?;
+        Ok(ConstraintHandle::new(constraint))
+    })?;
+    constraint_ns.set("allow_list", allow_list)?;
 
     let regex_dir = nn_dir.clone();
     let regex = lua.create_function(move |_, (pattern, vocab): (String, LuaValue)| {

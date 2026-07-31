@@ -1644,6 +1644,64 @@ fn alc_nn_constrained_sampler_is_reusable_after_reset() {
     );
 }
 
+/// The allow-list constraint is the one-line legality guarantee: a noisy
+/// temperature sampler under `constraint.allow_list` draws only listed
+/// ids, and the chain is rebuilt per decision (the composition consumes
+/// both handles, so that is the intended shape rather than a
+/// workaround). An empty list is refused at construction, where the
+/// caller's legality computation is, instead of at the draw.
+#[test]
+fn alc_nn_allow_list_constraint_confines_the_generated_tokens() {
+    let lua = nn_vm();
+    let (drawn, err): (Vec<u32>, String) = eval_with_handle(
+        &lua,
+        r#"
+        -- An "illegal" argmax: whatever greedy would draw first is left
+        -- out of the legal set, so a mask that stopped binding shows up
+        -- as an out-of-set token rather than as a coincidence.
+        local probe = h:generate_session({ 1, 2, 3 })
+        local greedy_pick = alc.nn.sampler.greedy():sample(probe:next_logits())
+        local legal, seen = {}, {}
+        for id = 0, 63, 7 do
+            if id ~= greedy_pick then
+                legal[#legal + 1] = id
+                seen[id] = true
+            end
+        end
+
+        local session = h:generate_session({ 1, 2, 3 })
+        local out = {}
+        for turn = 1, 6 do
+            -- One fresh chain per decision, seed derived from the turn.
+            local s = alc.nn.sampler.constrained(
+                alc.nn.sampler.temperature(1.2, 1000 + turn),
+                alc.nn.constraint.allow_list(legal)
+            )
+            assert(not s:is_done(), "an allow list never terminates on its own")
+            local id = s:sample(session:next_logits())
+            assert(seen[id], "turn " .. turn .. " drew illegal token " .. tostring(id))
+            assert(not s:is_done(), "an allow list must stay non-terminal after a draw")
+            session:append(id)
+            out[turn] = id
+        end
+
+        local ok, err = pcall(alc.nn.constraint.allow_list, {})
+        assert(not ok, "an empty allow list must be rejected at construction")
+        return out, tostring(err)
+    "#,
+        "allow-list constrained generation",
+    );
+    assert_eq!(drawn.len(), 6);
+    assert!(
+        drawn.iter().all(|id| *id % 7 == 0 && *id < 64),
+        "illegal token in the stream: {drawn:?}"
+    );
+    assert!(
+        err.contains("allow_list") && err.contains("empty"),
+        "unexpected error: {err}"
+    );
+}
+
 /// The JSON-schema constraint is reachable from Lua and rejects a schema
 /// it cannot translate at construction — before a single token is
 /// generated, which is the whole point of compiling the pattern up

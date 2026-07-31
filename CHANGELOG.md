@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.constraint.allow_list({ id, ... })` — allow-list (legal-mask)
+  logits constraint, backed by the new
+  `algocline_nn::sampling::AllowListConstraint`. Every logit outside the
+  listed token ids is masked to `-inf` at every position, so
+  `sampler.constrained(sampler.temperature(t, seed), constraint.allow_list(ids))`
+  is a one-line legality-guaranteed noisy decode. The mask is
+  prefix-agnostic and never terminal — stopping stays with
+  `stop_tokens` / the generation loop. An empty id list is refused at
+  construction rather than at the draw. Composition still consumes both
+  handles, so the intended usage is to rebuild the chain per decision
+  with the legal set recomputed and the seed derived explicitly (e.g.
+  from a turn number).
 - gameai example: reproducible generalisation proof for the guardian
   player bake. `examples/gameai/data/` ships a sample play log at the
   tens-of-games scale (36 train / 18 held-out games, played by a fixed

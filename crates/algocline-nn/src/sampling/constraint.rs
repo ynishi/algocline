@@ -31,7 +31,9 @@
 //!
 //! [`StopTokensConstraint`] is the termination-only case: it masks
 //! nothing and only answers [`Constraint::is_terminal`].
-//! [`RegexConstraint`] is the first structural one — it drives an
+//! [`AllowListConstraint`] is the masking-only case: a fixed legal set,
+//! the same at every position. [`RegexConstraint`] is the first
+//! structural one — it drives an
 //! anchored DFA over the tokenizer's surface strings so every sampled
 //! token keeps the output on a path towards a full pattern match. JSON
 //! schema and GBNF grammars are future additions behind the same trait.
@@ -233,6 +235,86 @@ impl Constraint for StopTokensConstraint {
             Some(last) => self.stop_tokens.contains(last),
             None => false,
         }
+    }
+}
+
+/// Restrict every position to a fixed set of legal token ids.
+///
+/// The mirror image of [`StopTokensConstraint`]: that one only
+/// terminates and never masks, this one only masks and never terminates.
+/// [`Constraint::mask`] returns the same [`TokenMask::Allow`] regardless
+/// of the prefix, so an inner sampler may draw as noisily as it likes
+/// and still return a legal token — the "legal mask" a game or tool
+/// caller wants when the legal set is known *before* decoding and does
+/// not depend on what was decoded so far.
+///
+/// Termination is deliberately left elsewhere: a fixed legal set says
+/// nothing about when a sequence is complete, so `is_terminal` is always
+/// `false` and the generation loop (or a stacked
+/// [`StopTokensConstraint`]) owns stopping.
+///
+/// # Empty lists are rejected
+///
+/// An empty legal set permits nothing, which [`apply_mask`] refuses at
+/// sample time. That is one token too late to be useful: the mistake is
+/// in the caller's legality computation, not in the draw. `new` returns
+/// `Err` instead, the same way [`RegexConstraint::new`] rejects a
+/// pattern it cannot compile.
+///
+/// # Intended usage: rebuild per decision
+///
+/// [`ConstrainedSampler`] owns both its inner sampler and its
+/// constraint, and the Lua-facing `alc.nn.sampler.constrained` consumes
+/// both handles. The intended pattern is therefore to rebuild the whole
+/// chain for each decision, with the legal set recomputed from the
+/// current position and the seed derived explicitly (from a turn number,
+/// say) so the decision stays reproducible:
+///
+/// ```text
+/// sampler.constrained(sampler.temperature(t, seed_i),
+///                     constraint.allow_list(legal_ids_i))
+/// ```
+///
+/// There is intentionally no API to swap the id list on a live
+/// constraint: a mutable legal set would make the mask depend on call
+/// order rather than on the prefix, which is exactly the purity the
+/// [`Constraint`] contract relies on for reproducibility.
+#[derive(Debug, Clone)]
+pub struct AllowListConstraint {
+    allowed: Vec<u32>,
+}
+
+impl AllowListConstraint {
+    /// Build a constraint permitting exactly `allowed`.
+    ///
+    /// Returns `Err` when `allowed` is empty (see the type doc).
+    /// Duplicate ids are harmless, and ids outside the vocab are caught
+    /// when the mask is applied — the constraint has no way to know the
+    /// vocab size, and inventing one here would be a second source of
+    /// truth for it.
+    pub fn new(allowed: Vec<u32>) -> CandleResult<Self> {
+        if allowed.is_empty() {
+            return Err(candle_core::Error::Msg(
+                "AllowListConstraint: the allow list is empty, so no token could ever be sampled"
+                    .into(),
+            ));
+        }
+        Ok(Self { allowed })
+    }
+
+    /// The configured legal token ids.
+    pub fn allowed(&self) -> &[u32] {
+        &self.allowed
+    }
+}
+
+impl Constraint for AllowListConstraint {
+    fn mask(&self, _prefix: &[u32]) -> TokenMask {
+        TokenMask::Allow(self.allowed.clone())
+    }
+
+    fn is_terminal(&self, _prefix: &[u32]) -> bool {
+        false
     }
 }
 
@@ -489,7 +571,7 @@ fn apply_mask(logits: &Tensor, mask: &TokenMask) -> CandleResult<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sampling::{GreedySampler, TopKTopPSampler};
+    use crate::sampling::{GreedySampler, TemperatureSampler, TopKTopPSampler};
     use candle_core::Device;
 
     fn cpu_logits(vals: &[f32]) -> Tensor {
@@ -895,6 +977,110 @@ mod tests {
             "positions 4-7 must be digits: {seq_a:?}"
         );
         assert!(a.is_done(), "the completed pattern must be terminal");
+    }
+
+    // ─── AllowListConstraint ──────────────────────────────────────────
+
+    /// The legal set is the whole answer: the same `Allow` mask comes
+    /// back at every position, and the constraint never claims a prefix
+    /// is terminal (stopping belongs to the loop / stop tokens).
+    #[test]
+    fn allow_list_masks_identically_at_every_position() {
+        let c = AllowListConstraint::new(vec![0, 3]).expect("non-empty allow list");
+        assert_eq!(c.allowed(), &[0, 3]);
+        for prefix in [vec![], vec![3], vec![0, 3, 3], vec![99]] {
+            assert_eq!(
+                c.mask(&prefix),
+                TokenMask::Allow(vec![0, 3]),
+                "prefix {prefix:?} must not change the legal set"
+            );
+            assert!(
+                !c.is_terminal(&prefix),
+                "prefix {prefix:?} must not be terminal"
+            );
+        }
+    }
+
+    /// Sampling through the constraint returns only listed ids, even
+    /// when the argmax is illegal — the guarantee the "legal mask" is
+    /// there for. Greedy makes the choice unambiguous: token 1 wins the
+    /// unmasked row, token 3 is the best of the legal ones.
+    #[test]
+    fn allow_list_confines_the_sampled_tokens() {
+        let allowed = vec![0, 3];
+        let mut s = ConstrainedSampler::new(
+            GreedySampler,
+            AllowListConstraint::new(allowed.clone()).expect("non-empty allow list"),
+        );
+        for step in 0..4 {
+            let token = s.sample(&fixture()).expect("sample");
+            assert_eq!(token, 3, "step {step} drew an illegal token");
+        }
+        assert!(
+            s.prefix().iter().all(|t| allowed.contains(t)),
+            "illegal token leaked into the prefix: {:?}",
+            s.prefix()
+        );
+    }
+
+    /// The noisy-but-legal composition from the issue: a temperature
+    /// sampler under an allow list stays reproducible by seed and still
+    /// never leaves the legal set. The allow list excludes the argmax
+    /// (a mask that stopped binding would show up as token 1) and its
+    /// two members carry equal logits, so the draw is a genuine coin
+    /// flip rather than a disguised argmax.
+    #[test]
+    fn allow_list_under_temperature_stays_legal_and_reproducible() {
+        let logits = cpu_logits(&[1.0, 9.0, 3.0, 2.0, 1.0, 0.5, 0.5, 2.5]);
+        let allowed = vec![5, 6];
+        let build = || {
+            ConstrainedSampler::new(
+                TemperatureSampler::new(1.5, 24601),
+                AllowListConstraint::new(allowed.clone()).expect("non-empty allow list"),
+            )
+        };
+        let mut a = build();
+        let mut b = build();
+
+        let seq_a: Vec<u32> = (0..8).map(|_| a.sample(&logits).expect("sample")).collect();
+        let seq_b: Vec<u32> = (0..8).map(|_| b.sample(&logits).expect("sample")).collect();
+        assert_eq!(seq_a, seq_b, "allow-listed sampler diverged on shared seed");
+        assert!(
+            seq_a.iter().all(|t| allowed.contains(t)),
+            "illegal token in the stream: {seq_a:?}"
+        );
+        assert!(
+            seq_a.contains(&5) && seq_a.contains(&6),
+            "the draw is degenerate, so the test proves nothing about noise: {seq_a:?}"
+        );
+    }
+
+    /// An empty legal set is a caller bug in the *legality* computation,
+    /// so it is refused where that computation is wired up rather than
+    /// one token later inside `apply_mask`.
+    #[test]
+    fn allow_list_rejects_an_empty_list_at_construction() {
+        let err = match AllowListConstraint::new(Vec::new()) {
+            Ok(_) => panic!("an empty allow list must be rejected at construction"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// An id past the end of the vocab is still caught, just later: the
+    /// constraint cannot know the vocab size, so `apply_mask` is the one
+    /// place that can tell.
+    #[test]
+    fn allow_list_out_of_range_id_errors_at_sample_time() {
+        let mut s = ConstrainedSampler::new(
+            GreedySampler,
+            AllowListConstraint::new(vec![5]).expect("non-empty allow list"),
+        );
+        assert!(
+            s.sample(&fixture()).is_err(),
+            "an id outside the vocab must error"
+        );
+        assert!(s.prefix().is_empty(), "failed step must not grow prefix");
     }
 
     /// `StopTokensConstraint` never masks — it only terminates. Asserted

@@ -12,8 +12,9 @@
 //!   [`TopKTopPSampler`]). Every consumer starts here.
 //! - **Layer 2 ([`constraint`] / [`json_schema`])** — filters that mask
 //!   logits before a Layer 1 sampler picks, wired in through
-//!   [`ConstrainedSampler`], itself a `Sampler`. Three [`Constraint`]s
+//!   [`ConstrainedSampler`], itself a `Sampler`. Four [`Constraint`]s
 //!   have landed: [`StopTokensConstraint`] (termination only),
+//!   [`AllowListConstraint`] (a fixed legal set, masking only),
 //!   [`RegexConstraint`] (anchored full-match over a tokenizer's surface
 //!   strings) and [`JsonSchemaConstraint`] (a JSON schema compiled to a
 //!   regex and enforced through the previous one). GBNF grammars are a
@@ -54,7 +55,8 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 
 pub use constraint::{
-    ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint, TokenMask,
+    AllowListConstraint, ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint,
+    TokenMask,
 };
 pub use json_schema::JsonSchemaConstraint;
 

@@ -98,49 +98,14 @@ end
 
 -- ─── Corpus ─────────────────────────────────────────────────────────
 --
--- One training line is `<encoded state>><teacher action>\n`, padded to
--- the model context window. Both seats contribute a line every round:
--- player one actually plays the teacher move, player two plays a random
--- move but its state is still labelled with the teacher action, which
--- widens the state coverage without changing the target function.
+-- The corpus itself is built by `card_duel.build_corpus`, which is
+-- shared with `bake_card_duel_persona.lua`: the rows only depend on the
+-- policy handed to it, so a synthesised persona and a canonical style
+-- train on lines of exactly the same shape.
 --
 -- A synthetic dataset walks its rows once, so the playout count is
--- raised until the corpus covers `steps * batch` rows; `ctx.games` acts
--- as a floor rather than the exact count.
-
-local ROWS_PER_GAME = 2 * duel.HAND_SIZE
-
-local function make_row(state, action, ctx_len)
-    local ids = duel.to_ids(duel.encode(state) .. ">" .. tostring(action) .. "\n")
-    if #ids > ctx_len then
-        error(
-            string.format(
-                "train_card_duel_npc: encoded line needs %d tokens but the model context is %d",
-                #ids,
-                ctx_len
-            )
-        )
-    end
-    for _ = #ids + 1, ctx_len do
-        ids[#ids + 1] = VOCAB.pad_id
-    end
-    return ids
-end
-
-local function build_corpus(ctx_len, playouts, policy)
-    local rows = {}
-    for i = 1, playouts do
-        local g = duel.new_game(SEED + i)
-        local rng = alc.math.rng_create(SEED * 7919 + i)
-        while not duel.is_over(g) do
-            local a1 = policy(g.p1)
-            rows[#rows + 1] = make_row(g.p1, a1, ctx_len)
-            rows[#rows + 1] = make_row(g.p2, policy(g.p2), ctx_len)
-            g = duel.apply(g, a1, duel.policy_random(g.p2, rng))
-        end
-    end
-    return rows
-end
+-- raised here until the corpus covers `steps * batch` rows; `ctx.games`
+-- acts as a floor rather than the exact count.
 
 -- ─── Quick check through the NPC package ────────────────────────────
 --
@@ -185,8 +150,13 @@ local function train_style(style, alias)
         )
     end
 
-    local playouts = math.max(GAMES, math.ceil(STEPS * BATCH / ROWS_PER_GAME))
-    local rows = build_corpus(ctx_len, playouts, policy)
+    local playouts = math.max(GAMES, math.ceil(STEPS * BATCH / duel.ROWS_PER_GAME))
+    local rows = duel.build_corpus(policy, {
+        ctx_len = ctx_len,
+        games = playouts,
+        seed = SEED,
+        pad_id = VOCAB.pad_id,
+    })
     log(
         string.format(
             "[%s] corpus: %d rows x %d tokens from %d playouts",

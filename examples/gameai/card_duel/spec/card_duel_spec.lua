@@ -189,6 +189,227 @@ describe("card_duel game loop", function()
     end)
 end)
 
+-- ─── Corpus ─────────────────────────────────────────────────────────
+
+local CTX_LEN = 16
+
+--- Decode a padded token row back to the training line it carries.
+local function row_text(row)
+    local v = duel.vocab()
+    local chars = {}
+    for _, id in ipairs(row) do
+        if id == v.pad_id then
+            break
+        end
+        chars[#chars + 1] = v.to_char[id]
+    end
+    return table.concat(chars)
+end
+
+describe("card_duel.build_corpus", function()
+    it("emits one row per seat per round", function()
+        local rows = duel.build_corpus(duel.policy_aggressive, {
+            ctx_len = CTX_LEN,
+            games = 3,
+            seed = 11,
+        })
+        expect(#rows).to.equal(3 * duel.ROWS_PER_GAME)
+    end)
+
+    it("writes state, separator and action on every line", function()
+        local rows = duel.build_corpus(duel.policy_timid, {
+            ctx_len = CTX_LEN,
+            games = 2,
+            seed = 13,
+        })
+        for _, row in ipairs(rows) do
+            local text = row_text(row)
+            expect(text:match("^R%d+H%d*P%d%dO%d*>%d\n$") ~= nil).to.equal(true)
+        end
+    end)
+
+    it("pads every row to the context window", function()
+        local rows = duel.build_corpus(duel.policy_bold, {
+            ctx_len = CTX_LEN,
+            games = 2,
+            seed = 17,
+        })
+        local pad_id = duel.vocab().pad_id
+        for _, row in ipairs(rows) do
+            expect(#row).to.equal(CTX_LEN)
+            expect(row[#row]).to.equal(pad_id)
+        end
+    end)
+
+    it("honours a pad id override", function()
+        local rows = duel.build_corpus(duel.policy_bold, {
+            ctx_len = CTX_LEN,
+            games = 1,
+            seed = 19,
+            pad_id = 2,
+        })
+        expect(rows[1][#rows[1]]).to.equal(2)
+    end)
+
+    it("is reproducible from the seed", function()
+        local opts = { ctx_len = CTX_LEN, games = 2, seed = 5 }
+        local a = duel.build_corpus(duel.policy_aggressive, opts)
+        local b = duel.build_corpus(duel.policy_aggressive, opts)
+        expect(row_text(a[1])).to.equal(row_text(b[1]))
+        expect(row_text(a[#a])).to.equal(row_text(b[#b]))
+    end)
+
+    it("refuses a context window the line does not fit in", function()
+        -- Truncating instead would teach the model a state it can never
+        -- be asked about at decode time.
+        expect(function()
+            duel.build_corpus(duel.policy_timid, { ctx_len = 4, games = 1, seed = 23 })
+        end).to.fail()
+    end)
+
+    it("rejects a policy that is not a function", function()
+        expect(function()
+            duel.build_corpus("timid", { ctx_len = CTX_LEN, games = 1, seed = 23 })
+        end).to.fail()
+    end)
+
+    it("rejects a missing context window or game count", function()
+        expect(function()
+            duel.build_corpus(duel.policy_timid, { games = 1 })
+        end).to.fail()
+        expect(function()
+            duel.build_corpus(duel.policy_timid, { ctx_len = CTX_LEN, games = 0 })
+        end).to.fail()
+    end)
+end)
+
+describe("card_duel.sample_states", function()
+    it("collects both seats of every round", function()
+        expect(#duel.sample_states({ games = 4, seed = 3 })).to.equal(4 * duel.ROWS_PER_GAME)
+    end)
+
+    it("is reproducible from the seed", function()
+        local a = duel.sample_states({ games = 2, seed = 29 })
+        local b = duel.sample_states({ games = 2, seed = 29 })
+        for i, state in ipairs(a) do
+            expect(duel.encode(state)).to.equal(duel.encode(b[i]))
+        end
+    end)
+
+    it("rejects a non-positive game count", function()
+        expect(function()
+            duel.sample_states({ games = 0 })
+        end).to.fail()
+    end)
+end)
+
+-- ─── Synthesised policies ───────────────────────────────────────────
+
+describe("card_duel.compile_policy", function()
+    local states = { { round = 1, my_hand = { 1, 3, 5, 7, 9 }, my_points = 0, opp_points = 0 } }
+
+    it("accepts a chunk that answers legally and deterministically", function()
+        local policy = duel.compile_policy("return function(state) return state.my_hand[1] end", {
+            games = 2,
+            seed = 31,
+        })
+        expect(policy(states[1])).to.equal(1)
+    end)
+
+    it("rejects a chunk that does not compile", function()
+        expect(function()
+            duel.compile_policy("return function(state", { states = states })
+        end).to.fail()
+    end)
+
+    it("rejects a chunk that does not return a function", function()
+        expect(function()
+            duel.compile_policy("return 7", { states = states })
+        end).to.fail()
+    end)
+
+    it("rejects an answer outside the legal actions", function()
+        expect(function()
+            duel.compile_policy("return function(state) return 42 end", { states = states })
+        end).to.fail()
+    end)
+
+    it("rejects an answer that is not an integer rank", function()
+        expect(function()
+            duel.compile_policy("return function(state) return nil end", { states = states })
+        end).to.fail()
+    end)
+
+    it("rejects a policy that answers the same state twice differently", function()
+        local flip = [[
+local n = 0
+return function(state)
+    n = n + 1
+    if n % 2 == 0 then
+        return state.my_hand[1]
+    end
+    return state.my_hand[#state.my_hand]
+end
+]]
+        expect(function()
+            duel.compile_policy(flip, { states = states })
+        end).to.fail()
+    end)
+
+    it("rejects a chunk reaching for a global outside the sandbox", function()
+        -- `os` / `io` / `load` / `setmetatable` are all absent, so the
+        -- call raises instead of touching the host.
+        expect(function()
+            duel.compile_policy("return function(state) return os.time() end", { states = states })
+        end).to.fail()
+        expect(function()
+            duel.compile_policy("return function(state) return load('return 1')() end", {
+                states = states,
+            })
+        end).to.fail()
+    end)
+
+    it("rejects a source that is not a string", function()
+        expect(function()
+            duel.compile_policy(nil, { states = states })
+        end).to.fail()
+    end)
+
+    it("rejects an empty validation batch", function()
+        expect(function()
+            duel.compile_policy("return function(state) return state.my_hand[1] end", {
+                states = {},
+            })
+        end).to.fail()
+    end)
+
+    it("keeps a mutating chunk away from the live state", function()
+        local mutating = [[
+return function(state)
+    table.remove(state.my_hand)
+    return state.my_hand[1]
+end
+]]
+        local state = { round = 1, my_hand = { 1, 3, 5, 7, 9 }, my_points = 0, opp_points = 0 }
+        local policy = duel.compile_policy(mutating, { states = { state } })
+        expect(#state.my_hand).to.equal(5)
+        expect(policy(state)).to.equal(1)
+        expect(#state.my_hand).to.equal(5)
+    end)
+
+    it("labels a corpus like any other policy", function()
+        local policy = duel.compile_policy(
+            "return function(state) return state.my_hand[#state.my_hand] end",
+            { games = 2, seed = 37 }
+        )
+        local rows = duel.build_corpus(policy, { ctx_len = CTX_LEN, games = 2, seed = 37 })
+        expect(#rows).to.equal(2 * duel.ROWS_PER_GAME)
+        for _, row in ipairs(rows) do
+            expect(row_text(row):match("^R%d+H%d*P%d%dO%d*>%d\n$") ~= nil).to.equal(true)
+        end
+    end)
+end)
+
 describe("card_duel.vocab", function()
     it("fits the tiny preset vocabulary", function()
         expect(duel.vocab().size <= 64).to.equal(true)

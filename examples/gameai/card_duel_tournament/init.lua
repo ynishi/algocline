@@ -21,9 +21,10 @@
 ---
 --- ## Algorithm
 ---
---- 1. Validate the requested styles against `card_duel.STYLES`, so a
----    typo fails here rather than as a missing Card alias halfway
----    through the run.
+--- 1. Validate the requested styles against `card_duel.STYLES`, or —
+---    for a persona style, which has no entry there — against the Card
+---    pinned to `alias_prefix .. style`, so a typo fails here rather
+---    than as a missing Card alias halfway through the run.
 --- 2. For every unordered pair `(i < j)` play `games_per_pair` games.
 ---    The game seed is derived as
 ---    `seed + pair_index * 1000 + game_index`, which makes the whole
@@ -47,12 +48,26 @@
 ---   with many draws leaves both directions below `0.5`
 --- - `summary[style]` — `{ total_winrate, gated_rate, avg_point_margin }`
 ---   over every game the style played
+--- - `style_kinds[style]` — `canonical` for a style `card_duel` ships a
+---   policy for, `persona` for one that exists only as a Card
 --- - `styles` / `games_per_pair` / `seed` — the effective settings
 --- - `result` — one line an eval grader can read
 ---
 --- The same fields may arrive JSON-encoded in `ctx.task`: the evalframe
 --- provider passes a case input that way, and decoding it here lets one
 --- entry point serve both `alc_run` and `alc_eval`.
+---
+--- ## Persona styles
+---
+--- A persona style is baked from a prompt by
+--- `examples/gameai/bake_card_duel_persona.lua` and has no teacher
+--- policy: `card_duel.STYLES` does not list it and `policy_<style>`
+--- does not exist. Nothing in this package needs one — every number it
+--- reports (the matrix, `gated_rate`, `avg_point_margin`) is folded
+--- from decodes through the Card alias — so a persona style enters the
+--- round robin on the same terms as a canonical one. `style_kinds`
+--- says which is which, because a persona row cannot be compared with
+--- a compliance figure the way a canonical row can.
 ---
 --- ## Caveats
 ---
@@ -96,7 +111,8 @@ if T then
                 "JSON object carrying the same fields (used by the evalframe provider)"
             ),
             styles = T.array_of(T.string):is_optional():describe(
-                "Styles to enter, a subset of card_duel.STYLES (default: four styles)"
+                "Styles to enter: card_duel.STYLES names or persona styles pinned "
+                    .. "to <alias_prefix><style> (default: four styles)"
             ),
             games_per_pair = T.number
                 :is_optional()
@@ -194,14 +210,45 @@ local function effective_ctx(ctx)
     return out
 end
 
---- Validate the requested styles against the canonical list.
+--- Report whether a Card is pinned to `alias`.
 ---
---- A name outside `card_duel.STYLES` has no trained alias, and a
---- duplicate would enter a style against itself, so both fail here with
---- the valid names spelled out.
+--- A persona style has no entry in `card_duel.STYLES` — the bake script
+--- leaves only a Card behind — so the alias is the one piece of
+--- evidence that the style exists at all. A host that cannot answer is
+--- reported through `reason` rather than as "no such alias": the two
+--- cases need different fixes, and folding the first into the second
+--- would tell the caller to check a spelling that is already right.
+---@param alias string
+---@return boolean found
+---@return string|nil reason Why the lookup could not be made
+local function alias_card_exists(alias)
+    if
+        type(alc) ~= "table"
+        or type(alc.card) ~= "table"
+        or type(alc.card.get_by_alias) ~= "function"
+    then
+        return false, "alc.card.get_by_alias is unavailable"
+    end
+    local ok, card = pcall(alc.card.get_by_alias, alias)
+    if not ok then
+        return false, tostring(card)
+    end
+    return card ~= nil, nil
+end
+
+--- Validate the requested styles and classify each one.
+---
+--- A name in `card_duel.STYLES` is canonical and is accepted exactly as
+--- before. A name outside it is only accepted when a Card is pinned to
+--- its alias — that is a persona style, baked from a prompt — and is
+--- otherwise a typo that fails here, with both the canonical names and
+--- the alias that was looked for spelled out. A duplicate would enter a
+--- style against itself and fails either way.
 ---@param raw any
+---@param alias_prefix string Prefix the persona alias is built from
 ---@return string[] styles
-local function resolve_styles(raw)
+---@return table<string, string> kinds `canonical` / `persona` per style
+local function resolve_styles(raw, alias_prefix)
     if raw == nil then
         raw = DEFAULT_STYLES
     end
@@ -212,27 +259,45 @@ local function resolve_styles(raw)
     for _, name in ipairs(duel.STYLES) do
         known[name] = true
     end
-    local seen, out = {}, {}
+    local seen, out, kinds = {}, {}, {}
     for _, name in ipairs(raw) do
-        if type(name) ~= "string" or not known[name] then
+        if type(name) ~= "string" then
             error(
                 string.format(
-                    "card_duel_tournament: unknown style %s (valid: %s)",
-                    tostring(name),
-                    table.concat(duel.STYLES, ", ")
+                    "card_duel_tournament: style names must be strings, got %s",
+                    type(name)
                 )
             )
+        end
+        local kind = "canonical"
+        if not known[name] then
+            local alias = alias_prefix .. name
+            local found, reason = alias_card_exists(alias)
+            if not found then
+                error(
+                    string.format(
+                        "card_duel_tournament: unknown style %s (canonical: %s; "
+                            .. "persona alias %s: %s)",
+                        name,
+                        table.concat(duel.STYLES, ", "),
+                        alias,
+                        reason or "no Card is pinned to it"
+                    )
+                )
+            end
+            kind = "persona"
         end
         if seen[name] then
             error(string.format("card_duel_tournament: style %q is listed twice", name))
         end
         seen[name] = true
         out[#out + 1] = name
+        kinds[name] = kind
     end
     if #out < 2 then
         error(string.format("card_duel_tournament: at least two styles are required, got %d", #out))
     end
-    return out
+    return out, kinds
 end
 
 --- Validate the games played per pair.
@@ -462,18 +527,21 @@ end
 -- ─── Strategy entry ─────────────────────────────────────────────────
 
 ---@param ctx table `{ styles?, games_per_pair?, seed?, alias_prefix?, task? }`
----@return table result `{ matrix, summary, styles, games_per_pair, seed, result }`
+---@return table result `{ matrix, summary, styles, style_kinds, games_per_pair, seed, result }`
 function M.run(ctx)
     require_json()
     local req = effective_ctx(ctx or {})
 
-    local styles = resolve_styles(req.styles)
-    local games_per_pair = resolve_games_per_pair(req.games_per_pair)
-    local seed = math.floor(optional_number("seed", req.seed, DEFAULT_SEED))
+    -- The prefix is resolved first because a persona style is
+    -- recognised by the Card pinned to `alias_prefix .. style`, so the
+    -- style check needs the effective prefix rather than the default.
     local alias_prefix = req.alias_prefix or DEFAULT_ALIAS_PREFIX
     if type(alias_prefix) ~= "string" then
         error("card_duel_tournament: alias_prefix must be a string, got " .. type(alias_prefix))
     end
+    local styles, style_kinds = resolve_styles(req.styles, alias_prefix)
+    local games_per_pair = resolve_games_per_pair(req.games_per_pair)
+    local seed = math.floor(optional_number("seed", req.seed, DEFAULT_SEED))
 
     local npc = require("card_duel_npc")
 
@@ -495,6 +563,7 @@ function M.run(ctx)
         matrix = folded.matrix,
         summary = folded.summary,
         styles = styles,
+        style_kinds = style_kinds,
         games_per_pair = games_per_pair,
         seed = seed,
         result = folded.result,

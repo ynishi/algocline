@@ -5,12 +5,37 @@
 -- registered `card_duel` and this package. The `lust` globals are
 -- pre-loaded by the runner.
 --
--- The suite never loads a model: `card_duel_npc` is replaced through
--- `package.preload` by a stub that answers from the rules alone, so the
--- aggregation and the match loop are covered on the default feature set
--- while the decode path stays the NPC package's own concern.
+-- The suite never loads a model and never reads a real Card:
+-- `card_duel_npc` is replaced through `package.preload` by a stub that
+-- answers from the rules alone and `alc.card` hands out the aliases the
+-- test registers, so the aggregation, the match loop and the style
+-- resolution are covered on the default feature set while the decode
+-- path stays the NPC package's own concern.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
+
+-- ─── Card stub ──────────────────────────────────────────────────────
+--
+-- A persona style exists only as a pinned Card, so the alias table is
+-- what makes one enterable. It starts empty: a name outside
+-- `card_duel.STYLES` is a typo unless a test registers it.
+
+local persona_cards = {}
+
+--- Alias lookups made so far, so the canonical path can be shown to
+--- stay off the Card layer.
+local alias_lookups = 0
+
+alc.card = {
+    get_by_alias = function(alias)
+        alias_lookups = alias_lookups + 1
+        local card_id = persona_cards[alias]
+        if card_id == nil then
+            return nil
+        end
+        return { card_id = card_id }
+    end,
+}
 
 -- ─── NPC stub ───────────────────────────────────────────────────────
 --
@@ -208,6 +233,124 @@ describe("card_duel_tournament.run validation", function()
         })
         npc.run = original
         expect(ok).to.equal(false)
+    end)
+end)
+
+-- ─── Persona styles ─────────────────────────────────────────────────
+
+describe("card_duel_tournament persona styles", function()
+    local function with_persona(alias, body)
+        persona_cards[alias] = "stub-card-" .. alias
+        local ok, err = pcall(body)
+        persona_cards[alias] = nil
+        if not ok then
+            error(err, 0)
+        end
+    end
+
+    it("enters a style that exists only as a pinned Card", function()
+        with_persona("card_duel_npc_pop", function()
+            local out = tournament.run({
+                styles = { "bold", "pop" },
+                games_per_pair = 2,
+                seed = 5,
+            })
+            expect(out.style_kinds.pop).to.equal("persona")
+            expect(out.style_kinds.bold).to.equal("canonical")
+            local cell = out.matrix.bold.pop
+            expect(cell.wins + cell.losses + cell.draws).to.equal(2)
+        end)
+    end)
+
+    it("reports the same summary fields for a persona row", function()
+        with_persona("card_duel_npc_pop", function()
+            local out = tournament.run({
+                styles = { "bold", "pop" },
+                games_per_pair = 2,
+                seed = 5,
+            })
+            -- Every number here is folded from decodes through the Card
+            -- alias, so a row with no teacher policy is still complete.
+            local row = out.summary.pop
+            expect(type(row.total_winrate)).to.equal("number")
+            expect(type(row.avg_point_margin)).to.equal("number")
+            expect(row.gated_rate).to.equal(1.0)
+        end)
+    end)
+
+    it("builds the persona alias from the requested prefix", function()
+        with_persona("persona_pop", function()
+            local out = tournament.run({
+                styles = { "timid", "pop" },
+                games_per_pair = 1,
+                seed = 5,
+                alias_prefix = "persona_",
+            })
+            expect(out.style_kinds.pop).to.equal("persona")
+        end)
+    end)
+
+    it("refuses a style with neither a policy nor a Card", function()
+        -- `gambler` is outside `card_duel.STYLES` and has no alias
+        -- registered here. `mimic` would not do: it reads as a persona
+        -- name but is a shipped style, so it is accepted by the first
+        -- check and never reaches the alias lookup.
+        local ok, err = pcall(tournament.run, {
+            styles = { "timid", "gambler" },
+            games_per_pair = 1,
+            seed = 5,
+        })
+        expect(ok).to.equal(false)
+        -- Both places that were searched are named, or a caller cannot
+        -- tell a misspelt style from an unbaked persona.
+        expect(err:match("canonical:") ~= nil).to.equal(true)
+        expect(err:match("card_duel_npc_gambler") ~= nil).to.equal(true)
+    end)
+
+    it("refuses a persona style when the Card layer cannot answer", function()
+        local card_ns = alc.card
+        alc.card = nil
+        local ok, err = pcall(tournament.run, {
+            styles = { "timid", "pop" },
+            games_per_pair = 1,
+            seed = 5,
+        })
+        alc.card = card_ns
+        expect(ok).to.equal(false)
+        expect(err:match("get_by_alias is unavailable") ~= nil).to.equal(true)
+    end)
+
+    it("still refuses the same persona style twice", function()
+        with_persona("card_duel_npc_pop", function()
+            local ok = pcall(tournament.run, {
+                styles = { "pop", "pop" },
+                games_per_pair = 1,
+                seed = 5,
+            })
+            expect(ok).to.equal(false)
+        end)
+    end)
+end)
+
+-- ─── Canonical styles (regression) ──────────────────────────────────
+
+describe("card_duel_tournament canonical styles", function()
+    it("marks every shipped style as canonical", function()
+        local out = tournament.run({
+            styles = { "timid", "bold" },
+            games_per_pair = 1,
+            seed = 5,
+        })
+        expect(out.style_kinds.timid).to.equal("canonical")
+        expect(out.style_kinds.bold).to.equal("canonical")
+    end)
+
+    it("never asks the Card layer about a shipped style", function()
+        local before = alias_lookups
+        tournament.run({ styles = { "timid", "bold" }, games_per_pair = 1, seed = 5 })
+        -- A persona Card must not be able to shadow a shipped style, so
+        -- the alias lookup stays behind the STYLES check.
+        expect(alias_lookups).to.equal(before)
     end)
 end)
 

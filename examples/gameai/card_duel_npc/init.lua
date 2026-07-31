@@ -39,11 +39,15 @@
 --- - `decide` — `{ state }`; returns `action=<rank> legal=true raw_legal=<bool> gated=<bool>`
 --- - `determinism` — `{ state }`; decodes twice through independent
 ---   sessions and returns `deterministic=<bool> action=<rank>`
---- - `selfplay` — `{ games, seed, style? }`; plays the NPC against
----   `card_duel.policy_random` and returns
+--- - `selfplay` — `{ games, seed, style?, policy_source? }`; plays the
+---   NPC against `card_duel.policy_random` and returns
 ---   `winrate=<x.xx> illegal=<n> style_match=<x.xx> style_hits=<n>/<n>`.
 ---   `style` names the teacher policy every model move is compared
----   against (default: `aggressive`)
+---   against (default: `aggressive`); `policy_source` overrides it with
+---   a synthesised policy chunk, which is what a persona Card — a Card
+---   with no entry in `card_duel.STYLES` — is scored against.
+---   `policy_source` may also be passed on the strategy ctx, which is
+---   where the eval runner merges `strategy_opts`.
 ---
 --- ## Caveats
 ---
@@ -93,6 +97,10 @@ if T then
             card_alias = T.string
                 :is_optional()
                 :describe("Card alias holding the tuned model (default: card_duel_npc)"),
+            policy_source = T.string:is_optional():describe(
+                "Synthesised policy chunk self-play scores the model against, "
+                    .. "used for persona Cards that have no entry in card_duel.STYLES"
+            ),
         }),
         result = T.string:describe("Flat key=value summary of the requested mode"),
     }
@@ -280,13 +288,36 @@ local function resolve_style_policy(raw)
     return duel["policy_" .. style]
 end
 
+--- Resolve the teacher for one self-play run.
+---
+--- `policy_source` takes precedence over `style`: a persona Card is
+--- trained on an LLM-written policy that has no entry in
+--- `card_duel.STYLES`, so the style whitelist would reject it by
+--- construction. The chunk is never loaded raw — `compile_policy` runs
+--- it in the restricted environment and makes it answer sampled states
+--- legally and deterministically before a single move is scored
+--- against it, which is the same gate the bake script applies.
+---@param req table Decoded task
+---@param seed integer Self-play seed, reused for the validation states
+---@return fun(state: table): integer policy
+local function resolve_teacher(req, seed)
+    local source = req.policy_source
+    if source == nil then
+        return resolve_style_policy(req.style)
+    end
+    if type(source) ~= "string" then
+        error("card_duel_npc: task.policy_source must be a string, got " .. type(source))
+    end
+    return duel.compile_policy(source, { seed = seed, chunk_name = "persona_policy" })
+end
+
 local function mode_selfplay(handle, req)
     local games = math.floor(tonumber(req.games) or 20)
     local seed = math.floor(tonumber(req.seed) or 1)
     if games <= 0 then
         error("card_duel_npc: task.games must be a positive integer")
     end
-    local policy = resolve_style_policy(req.style)
+    local policy = resolve_teacher(req, seed)
 
     local score, illegal = 0.0, 0
     local moves, hits = 0, 0
@@ -340,6 +371,13 @@ function M.run(ctx)
     local req = alc.json_decode(task)
     if type(req) ~= "table" or type(req.mode) ~= "string" then
         error("card_duel_npc: ctx.task must decode to an object with a mode field")
+    end
+
+    -- A synthesised teacher can arrive on the ctx instead of inside the
+    -- task JSON, because that is where the eval runner merges
+    -- `strategy_opts`. The task form wins when both carry one.
+    if req.policy_source == nil and ctx.policy_source ~= nil then
+        req.policy_source = ctx.policy_source
     end
 
     local handle = resolve_handle(ctx.card_alias or DEFAULT_ALIAS)

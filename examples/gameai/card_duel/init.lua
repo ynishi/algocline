@@ -45,6 +45,9 @@
 --- - `legal_actions` / `encode` / `vocab` / `to_ids` — NPC-facing view
 --- - `policy_<style>` for every name in `STYLES` — deterministic styles
 --- - `policy_random` — the random opponent used by self-play
+--- - `build_corpus` — supervised training lines for any policy
+--- - `sample_states` / `compile_policy` — sandbox and validation for a
+---   synthesised (LLM-written) policy chunk
 --- - `run` — Strategy entry; returns the encoded opening state
 ---
 --- ## Caveats
@@ -107,9 +110,18 @@ local MIN_RANK, MAX_RANK = 1, 9
 --- Cards per hand, which is also the number of rounds.
 local HAND_SIZE = 5
 
+--- Training lines one playout contributes: both seats speak once per
+--- round, and a game runs `HAND_SIZE` rounds.
+local ROWS_PER_GAME = 2 * HAND_SIZE
+
+--- Stride between the deal seed and the opponent RNG seed of a playout,
+--- so two playouts of the same batch never share an RNG stream.
+local RNG_STRIDE = 7919
+
 M.HAND_SIZE = HAND_SIZE
 M.MIN_RANK = MIN_RANK
 M.MAX_RANK = MAX_RANK
+M.ROWS_PER_GAME = ROWS_PER_GAME
 
 --- Char alphabet, indexed by model token id.
 ---
@@ -515,6 +527,268 @@ function M.policy_random(state, rng)
     end
     local math_ns = require_rng()
     return legal[math_ns.rng_int(rng, 1, #legal)]
+end
+
+-- ─── Corpus ─────────────────────────────────────────────────────────
+
+--- Encode one training line and pad it to the model context window.
+---
+--- The line is `<encoded state>><action>\n`. A line that does not fit
+--- is a loud error rather than a truncation: a truncated line teaches
+--- the model a state it can never be asked about at decode time.
+local function make_row(state, action, ctx_len, pad_id)
+    local ids = M.to_ids(M.encode(state) .. ">" .. tostring(action) .. "\n")
+    if #ids > ctx_len then
+        error(
+            string.format(
+                "card_duel.build_corpus: encoded line needs %d tokens but the context is %d",
+                #ids,
+                ctx_len
+            )
+        )
+    end
+    for _ = #ids + 1, ctx_len do
+        ids[#ids + 1] = pad_id
+    end
+    return ids
+end
+
+--- Build the supervised corpus that teaches `policy` to a model.
+---
+--- Both seats contribute a line every round: player one actually plays
+--- the `policy` move, player two plays a random move but its state is
+--- still labelled with the `policy` action, which widens the state
+--- coverage without changing the target function. One playout is
+--- therefore `ROWS_PER_GAME` rows.
+---
+--- `alc.nn.data.synthetic` walks its rows once, so a trainer asking for
+--- `steps * batch` rows needs `games >= steps * batch / ROWS_PER_GAME`;
+--- computing that floor is left to the caller, which is the only side
+--- that knows the training budget.
+---@param policy fun(state: table): integer Labelling policy
+---@param opts table `{ ctx_len, games, seed?, pad_id? }`
+---@return integer[][] rows Token id rows, each `ctx_len` long
+function M.build_corpus(policy, opts)
+    if type(policy) ~= "function" then
+        error("card_duel.build_corpus: policy must be a function, got " .. type(policy))
+    end
+    if type(opts) ~= "table" then
+        error("card_duel.build_corpus: opts must be a table, got " .. type(opts))
+    end
+    local ctx_len = tonumber(opts.ctx_len)
+    if ctx_len == nil or ctx_len < 1 then
+        error("card_duel.build_corpus: opts.ctx_len must be a positive number")
+    end
+    ctx_len = math.floor(ctx_len)
+    local games = tonumber(opts.games)
+    if games == nil or games < 1 then
+        error("card_duel.build_corpus: opts.games must be a positive number")
+    end
+    games = math.floor(games)
+    local seed = math.floor(tonumber(opts.seed) or 1)
+    local pad_id = opts.pad_id
+    if pad_id == nil then
+        pad_id = TO_ID["\0"]
+    end
+    if type(pad_id) ~= "number" then
+        error("card_duel.build_corpus: opts.pad_id must be a number, got " .. type(pad_id))
+    end
+
+    local math_ns = require_rng()
+    local rows = {}
+    for i = 1, games do
+        local g = M.new_game(seed + i)
+        local rng = math_ns.rng_create(seed * RNG_STRIDE + i)
+        while not M.is_over(g) do
+            local a1 = policy(g.p1)
+            rows[#rows + 1] = make_row(g.p1, a1, ctx_len, pad_id)
+            rows[#rows + 1] = make_row(g.p2, policy(g.p2), ctx_len, pad_id)
+            g = M.apply(g, a1, M.policy_random(g.p2, rng))
+        end
+    end
+    return rows
+end
+
+-- ─── Synthesised policies ───────────────────────────────────────────
+--
+-- A persona NPC starts as a Lua chunk written by an LLM
+-- (`examples/gameai/bake_card_duel_persona.lua`). Such a chunk is
+-- never loaded raw: it is compiled into a restricted environment and
+-- then has to answer a batch of sampled states legally and
+-- deterministically before it is allowed to label a single training
+-- line.
+
+--- Collect per-player states from random self-play.
+---
+--- The states are the ones a policy is actually asked about during a
+--- game rather than a hand-picked list, and the walk is fully
+--- determined by `seed`, so a validation verdict is reproducible.
+---@param opts table|nil `{ games?, seed? }`
+---@return table[] states `games * ROWS_PER_GAME` per-player states
+function M.sample_states(opts)
+    opts = opts or {}
+    local games = math.floor(tonumber(opts.games) or 20)
+    if games < 1 then
+        error("card_duel.sample_states: opts.games must be a positive number")
+    end
+    local seed = math.floor(tonumber(opts.seed) or 1)
+    local math_ns = require_rng()
+    local states = {}
+    for i = 1, games do
+        local g = M.new_game(seed + i)
+        local rng = math_ns.rng_create(seed * RNG_STRIDE + i)
+        while not M.is_over(g) do
+            states[#states + 1] = g.p1
+            states[#states + 1] = g.p2
+            g = M.apply(g, M.policy_random(g.p1, rng), M.policy_random(g.p2, rng))
+        end
+    end
+    return states
+end
+
+--- Environment a synthesised chunk is compiled into.
+---
+--- Only the pure parts of the standard library are reachable, and
+--- `math` / `table` are shallow copies so a chunk cannot reach the host
+--- tables through them. There is no `load`, no `setmetatable`, no
+--- `os` / `io` / `require`, so a chunk can compute but cannot observe
+--- or change anything outside its own argument. `math.random` is
+--- present but useless: the determinism check below rejects any policy
+--- that answers the same state twice with two different ranks.
+local function sandbox_env()
+    local math_copy, table_copy = {}, {}
+    for k, v in pairs(math) do
+        math_copy[k] = v
+    end
+    for k, v in pairs(table) do
+        table_copy[k] = v
+    end
+    return {
+        math = math_copy,
+        table = table_copy,
+        ipairs = ipairs,
+        pairs = pairs,
+    }
+end
+
+--- Copy of a per-player state, so a chunk cannot mutate the live game.
+local function copy_state(state)
+    return make_state(
+        state.round,
+        copy_list(state.my_hand),
+        state.my_points,
+        state.opp_points,
+        copy_list(state.opp_played or {})
+    )
+end
+
+--- Whether `action` is one of the ranks `state` may still play.
+local function is_legal_action(state, action)
+    if type(action) ~= "number" or action ~= math.floor(action) then
+        return false
+    end
+    for _, rank in ipairs(M.legal_actions(state)) do
+        if rank == action then
+            return true
+        end
+    end
+    return false
+end
+
+--- Compile and validate a synthesised policy chunk.
+---
+--- `source` is expected to be `return function(state) ... end`. It is
+--- loaded in text mode only (never bytecode) into `sandbox_env`, and
+--- the returned function is then asked about every state in
+--- `opts.states` (sampled from random self-play when the caller passes
+--- none). A candidate is accepted only when, for every state, the call
+--- succeeds, the answer is a legal rank, and a second call with the
+--- same state returns the same rank.
+---
+--- Every rejection is a loud error naming the state and the reason, so
+--- a caller driving an LLM can feed the message straight back into the
+--- next synthesis attempt.
+---
+--- The accepted policy is wrapped so it receives a copy of the state: a
+--- chunk that sorts or empties `my_hand` would otherwise corrupt the
+--- game it is labelling, which is a silent data fault rather than a
+--- visible one.
+---@param source string Lua chunk returning a policy function
+---@param opts table|nil `{ states?, games?, seed?, chunk_name? }`
+---@return fun(state: table): integer policy
+function M.compile_policy(source, opts)
+    if type(source) ~= "string" then
+        error("card_duel.compile_policy: source must be a string, got " .. type(source))
+    end
+    opts = opts or {}
+    local chunk_name = opts.chunk_name or "synthesised_policy"
+    local chunk, load_err = load(source, "=" .. chunk_name, "t", sandbox_env())
+    if chunk == nil then
+        error("card_duel.compile_policy: source does not compile: " .. tostring(load_err))
+    end
+    local ran, policy = pcall(chunk)
+    if not ran then
+        error(
+            "card_duel.compile_policy: chunk raised while returning the policy: "
+                .. tostring(policy)
+        )
+    end
+    if type(policy) ~= "function" then
+        error("card_duel.compile_policy: chunk must return a function, got " .. type(policy))
+    end
+
+    local states = opts.states
+    if states == nil then
+        states = M.sample_states({ games = opts.games, seed = opts.seed })
+    end
+    if type(states) ~= "table" or #states == 0 then
+        error("card_duel.compile_policy: opts.states must hold at least one state")
+    end
+
+    local guarded = function(state)
+        return policy(copy_state(state))
+    end
+
+    for i, state in ipairs(states) do
+        local ok, action = pcall(guarded, state)
+        if not ok then
+            error(
+                string.format(
+                    "card_duel.compile_policy: policy raised on state %d (%s): %s",
+                    i,
+                    M.encode(state),
+                    tostring(action)
+                )
+            )
+        end
+        if not is_legal_action(state, action) then
+            error(
+                string.format(
+                    "card_duel.compile_policy: policy answered %s on state %d (%s), "
+                        .. "which is not one of the legal ranks %s",
+                    tostring(action),
+                    i,
+                    M.encode(state),
+                    table.concat(M.legal_actions(state), ", ")
+                )
+            )
+        end
+        local ok_again, again = pcall(guarded, state)
+        if not ok_again or again ~= action then
+            error(
+                string.format(
+                    "card_duel.compile_policy: policy is not deterministic on state %d (%s): "
+                        .. "%s then %s",
+                    i,
+                    M.encode(state),
+                    tostring(action),
+                    tostring(again)
+                )
+            )
+        end
+    end
+
+    return guarded
 end
 
 -- ─── Strategy entry ─────────────────────────────────────────────────

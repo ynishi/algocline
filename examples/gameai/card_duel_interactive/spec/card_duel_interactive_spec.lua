@@ -5,11 +5,14 @@
 -- registered `card_duel` and this package. The `lust` globals are
 -- pre-loaded by the runner.
 --
--- No model and no state file are touched: `card_duel_npc` is replaced
--- through `package.preload` by a stub that answers from the rules, and
+-- No model, no Card and no state file are touched: `card_duel_npc` is
+-- replaced through `package.preload` by a stub that answers from the
+-- rules, `alc.card` hands out the aliases the test registers and
 -- `alc.state` is swapped for an in-memory table the assertions can read
 -- back. What is left under test is the session lifecycle, the move
--- validation and the seat bookkeeping.
+-- validation, the seat bookkeeping and the style resolution — a
+-- canonical style comes from `card_duel`, a persona style only from a
+-- pinned Card.
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
@@ -36,14 +39,40 @@ alc.state = {
     end,
 }
 
+--- Cards a persona bake would have pinned, keyed by alias.
+---
+--- Empty by default, so a style outside `card_duel.STYLES` is a typo
+--- unless a test says otherwise.
+local persona_cards = {}
+
+--- Alias lookups made so far, so the canonical path can be shown to
+--- stay off the Card layer.
+local alias_lookups = 0
+
+alc.card = {
+    get_by_alias = function(alias)
+        alias_lookups = alias_lookups + 1
+        local card_id = persona_cards[alias]
+        if card_id == nil then
+            return nil
+        end
+        return { card_id = card_id }
+    end,
+}
+
 --- Last state the NPC was asked about, so the seat wiring is checkable.
 local last_npc_state = nil
+
+--- Last alias the NPC was asked to decode with, which is the only thing
+--- that makes a persona game differ from a canonical one.
+local last_npc_alias = nil
 
 package.preload["card_duel_npc"] = function()
     return {
         run = function(ctx)
             local req = alc.json_decode(ctx.task)
             last_npc_state = req.state
+            last_npc_alias = ctx.card_alias
             -- Timid: always the lowest legal rank.
             local rank = duel.legal_actions(req.state)[1]
             return {
@@ -61,7 +90,11 @@ local function reset()
     for key in pairs(store) do
         store[key] = nil
     end
+    for alias in pairs(persona_cards) do
+        persona_cards[alias] = nil
+    end
     last_npc_state = nil
+    last_npc_alias = nil
 end
 
 --- Deal a game and pin both hands, so the seat assertions do not depend
@@ -133,6 +166,102 @@ describe("card_duel_interactive new", function()
         reset()
         expect(function()
             game.run({ action = "resign" })
+        end).to.fail()
+    end)
+end)
+
+-- ─── Persona styles ─────────────────────────────────────────────────
+
+describe("card_duel_interactive persona styles", function()
+    it("accepts a style that exists only as a pinned Card", function()
+        reset()
+        persona_cards["card_duel_npc_gambler"] = "stub-card-gambler"
+        local view = game.run({ action = "new", style = "gambler", seed = 7 })
+        expect(view.style).to.equal("gambler")
+        expect(view.style_kind).to.equal("persona")
+        expect(view.status).to.equal("your_turn")
+    end)
+
+    it("decodes the npc seat through the persona alias", function()
+        reset()
+        persona_cards["card_duel_npc_gambler"] = "stub-card-gambler"
+        new_with_hands(
+            { action = "new", style = "gambler", seed = 21 },
+            { 9, 9, 9, 9, 9 },
+            { 1, 1, 1, 1, 1 }
+        )
+        local view = game.run({ action = "play", rank = 9 })
+        -- Play is a decode through the alias and nothing else, so a
+        -- persona game reaches a scored round like a canonical one.
+        expect(last_npc_alias).to.equal("card_duel_npc_gambler")
+        expect(view.last_round.you).to.equal(9)
+        expect(view.last_round.npc).to.equal(1)
+        expect(view.your_points).to.equal(1)
+    end)
+
+    it("keeps the persona kind across the session actions", function()
+        reset()
+        persona_cards["card_duel_npc_gambler"] = "stub-card-gambler"
+        game.run({ action = "new", style = "gambler", seed = 7 })
+        expect(game.run({ action = "show" }).style_kind).to.equal("persona")
+        expect(game.run({ action = "end" }).style_kind).to.equal("persona")
+    end)
+
+    it("refuses a style with neither a policy nor a Card", function()
+        reset()
+        local ok, err = pcall(game.run, { action = "new", style = "gambler", seed = 7 })
+        expect(ok).to.equal(false)
+        -- The message has to name both places that were searched, or a
+        -- caller cannot tell a misspelt style from an unbaked persona.
+        expect(err:match("canonical:") ~= nil).to.equal(true)
+        expect(err:match("card_duel_npc_gambler") ~= nil).to.equal(true)
+    end)
+
+    it("refuses a persona style when the Card layer cannot answer", function()
+        reset()
+        local card_ns = alc.card
+        alc.card = nil
+        local ok, err = pcall(game.run, { action = "new", style = "gambler", seed = 7 })
+        alc.card = card_ns
+        -- Falling back to the default style here would seat an NPC the
+        -- caller never asked for, so the missing surface is reported.
+        expect(ok).to.equal(false)
+        expect(err:match("get_by_alias is unavailable") ~= nil).to.equal(true)
+    end)
+end)
+
+-- ─── Canonical styles (regression) ──────────────────────────────────
+
+describe("card_duel_interactive canonical styles", function()
+    it("reports a shipped style as canonical", function()
+        reset()
+        local view = game.run({ action = "new", style = "bold", seed = 7 })
+        expect(view.style).to.equal("bold")
+        expect(view.style_kind).to.equal("canonical")
+    end)
+
+    it("defaults to the aggressive style", function()
+        reset()
+        local view = game.run({ action = "new", seed = 7 })
+        expect(view.style).to.equal("aggressive")
+        expect(view.style_kind).to.equal("canonical")
+    end)
+
+    it("never asks the Card layer about a shipped style", function()
+        reset()
+        local before = alias_lookups
+        for _, style in ipairs(duel.STYLES) do
+            game.run({ action = "new", style = style, seed = 7 })
+        end
+        -- A persona Card must not be able to shadow a shipped style, so
+        -- the alias lookup stays behind the policy check.
+        expect(alias_lookups).to.equal(before)
+    end)
+
+    it("still refuses a style that is not a string", function()
+        reset()
+        expect(function()
+            game.run({ action = "new", style = 7, seed = 7 })
         end).to.fail()
     end)
 end)

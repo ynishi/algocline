@@ -20,6 +20,7 @@ examples/gameai/
   card_duel_interactive/init.lua     human vs NPC session, kept in alc.state
   card_duel_interactive/spec/        alc_pkg_test suite for the session
   train_card_duel_npc.lua            teacher corpus -> Full FT -> Card + alias
+  bake_card_duel_persona.lua         NL prompt -> synthesised teacher -> Card + alias
   card_duel_scenario.lua             eval scenario (style / legality / determinism / self-play compliance)
   card_duel_scenario_timid.lua       eval scenario for the timid style
   card_duel_scenario_bold.lua        eval scenario for the bold style
@@ -273,6 +274,79 @@ session ended: game over: you 3 - 2 npc, you win
 Pass `game_id` to keep several sessions apart, `user_seat = 2` to sit in
 the second seat, and `style` to choose which trained Card answers.
 
+## Persona bake
+
+`train_card_duel_npc.lua` learns one of the six styles that ship with
+`card_duel`. `bake_card_duel_persona.lua` takes a *description* of a
+style instead — one line of plain language — and synthesises the
+teacher.
+
+The script asks the host LLM for the matching Lua policy and never
+loads the answer raw. `card_duel.compile_policy` compiles it in a
+restricted environment (`math`, `table`, `ipairs`, `pairs`; no `load`,
+no `os`, no `io`), hands it a copy of the state so it cannot touch the
+live game, and requires two hundred sampled states to come back as a
+legal rank and as the *same* rank on a second pass. A rejected
+candidate is re-synthesised with the rejection message attached, up to
+three times, after which the run fails loudly. Everything after that is
+the path above unchanged: the accepted policy labels the corpus, Full
+FT tunes the model, the Card is pinned to `card_duel_npc_<name>`, and
+the prompt is appended to the Card under a `persona` key so the
+sentence that produced the weights travels with them.
+
+```
+alc_run(
+  code_file = "<repo>/examples/gameai/bake_card_duel_persona.lua",
+  ctx = {
+    prompt = "When behind on points it panics and dumps its highest card immediately; when ahead it coasts with its lowest card.",
+    name = "panic",
+    steps = 800,
+    batch = 32,
+  }
+)
+```
+
+`ctx` also takes `games`, `lr`, `seed` and `check_games` (the number of
+self-play games behind the compliance report, default 20). Unlike the
+training script this run **pauses once**: the `alc.llm` call carrying
+the synthesis prompt comes back as `needs_response`, so it needs a host
+that answers it through `alc_continue` before the training phase is
+reached.
+
+The answer carries `card_id`, `alias`, `train_loss`, `retries` and
+`style_match` — the share of self-play moves that agree with the
+synthesised teacher, on the same footing as the self-play compliance of
+the scenarios. It is reported rather than asserted, because what counts
+as an acceptable rate depends on the training budget.
+
+Two personas baked at the defaults on 2026-07-31:
+
+```
+panic    style_match=1.00 style_hits=100/100 retries=0
+hoarder  style_match=0.99 style_hits=99/100  retries=0
+```
+
+### Playing a baked persona
+
+`card_duel_interactive` and `card_duel_tournament` take a persona name
+wherever they take a canonical one. Resolution reads the
+`policy_<style>` field first and only then falls back to the
+`card_duel_npc_<style>` alias, so a baked Card can never shadow a
+shipped style, and a name that is neither fails loudly instead of
+seating the default NPC:
+
+```
+alc_run(code = [[
+  return require("card_duel_interactive").run({
+      action = "new", style = "panic", seed = 7,
+  })
+]])
+```
+
+The board view gains `style_kind` (`canonical` / `persona`) and the
+tournament answer gains `style_kinds` per style, because a persona row
+cannot be read next to a compliance figure the way a canonical row can.
+
 ## CI
 
 Two fences run under `cargo test`:
@@ -317,6 +391,19 @@ alc_pkg_test(pkg = "card_duel_interactive")
   both seats from Cards. The `selfplay` mode inside `card_duel_npc` is
   still one-sided: the model takes the `p1` seat against the random
   policy.
+- A persona is only as good as the policy the host LLM synthesised for
+  it. The prompt is read once, at synthesis time; a description read
+  loosely still yields a teacher that is legal and deterministic, and
+  the rest of the pipeline has no way to notice it is not the style
+  that was asked for.
+- `style_match` on a baked persona is agreement with that synthesised
+  teacher, not fidelity to the prompt. It fences the distillation step
+  — did the model learn its teacher — and says nothing about the
+  synthesis step.
+- Direct label distillation, where the LLM labels the moves itself
+  instead of writing a policy that labels them, is not wired here. It
+  belongs with the play-log input path, where the labels come from
+  recorded games rather than from a function.
 - Decoding is greedy and therefore deterministic, so an NPC repeats
   itself in identical positions. Noisy or temperature decoding is
   deferred: the stdlib sampler has no legal-action mask, so sampling

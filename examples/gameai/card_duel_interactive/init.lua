@@ -19,7 +19,7 @@
 --- ## Algorithm
 ---
 --- 1. `new` deals a game with `card_duel.new_game` and stores
----    `{ g, style, user_seat }` under
+---    `{ g, style, style_kind, user_seat }` under
 ---    `"gameai_interactive:" .. game_id`. `alc.state` is file backed, so
 ---    the session survives between `alc_run` calls; several sessions can
 ---    coexist under different `game_id` values.
@@ -47,9 +47,22 @@
 ---
 --- Every action returns the same board view — `round`, `your_hand`,
 --- `your_points`, `npc_points`, `npc_played`, `legal_actions`, `status`
---- and a one-line `text` — plus `last_round` after a move, `winner`
---- once the game is over and `ended` after `end`. `result` mirrors
---- `text`, which is the field an algocline caller reads by convention.
+--- and a one-line `text` — plus `style_kind` (`canonical` / `persona`),
+--- `last_round` after a move, `winner` once the game is over and
+--- `ended` after `end`. `result` mirrors `text`, which is the field an
+--- algocline caller reads by convention.
+---
+--- ## Styles
+---
+--- A *canonical* style is one `card_duel` ships a `policy_<style>` for.
+--- A *persona* style is baked from a prompt by
+--- `examples/gameai/bake_card_duel_persona.lua`: it leaves a Card
+--- pinned to `card_duel_npc_<style>` behind and no teacher policy at
+--- all, so the name is accepted once that alias resolves. Play needs
+--- nothing else — every move of the NPC seat is a decode through the
+--- alias — so a persona style plays exactly like a canonical one. A
+--- name that is neither fails loudly rather than falling back to the
+--- default style, which would seat an NPC the caller never asked for.
 ---
 --- ## Caveats
 ---
@@ -84,9 +97,10 @@ if T then
         input = T.shape({
             action = T.string:describe("One of: new / play / show / end"),
             rank = T.number:is_optional():describe("Rank to play, required by the play action"),
-            style = T.string
-                :is_optional()
-                :describe("NPC style for a new game (default: aggressive)"),
+            style = T.string:is_optional():describe(
+                "NPC style for a new game: a card_duel style or a persona style "
+                    .. "pinned to card_duel_npc_<style> (default: aggressive)"
+            ),
             seed = T.number:is_optional():describe("Deal seed for a new game"),
             user_seat = T.number
                 :is_optional()
@@ -128,6 +142,32 @@ local function require_json()
     if type(alc) ~= "table" or type(alc.json_encode) ~= "function" then
         error("card_duel_interactive: alc.json_encode is required")
     end
+end
+
+--- Report whether a Card is pinned to `alias`.
+---
+--- A persona style has no `policy_<style>` in `card_duel` — the bake
+--- script leaves only a Card behind — so the alias is the one piece of
+--- evidence that the style exists at all. A host that cannot answer is
+--- reported through `reason` rather than as "no such alias": the two
+--- cases need different fixes, and folding the first into the second
+--- would tell the caller to check a spelling that is already right.
+---@param alias string
+---@return boolean found
+---@return string|nil reason Why the lookup could not be made
+local function alias_card_exists(alias)
+    if
+        type(alc) ~= "table"
+        or type(alc.card) ~= "table"
+        or type(alc.card.get_by_alias) ~= "function"
+    then
+        return false, "alc.card.get_by_alias is unavailable"
+    end
+    local ok, card = pcall(alc.card.get_by_alias, alias)
+    if not ok then
+        return false, tostring(card)
+    end
+    return card ~= nil, nil
 end
 
 -- ─── Request parsing ────────────────────────────────────────────────
@@ -268,6 +308,10 @@ local function board_view(session)
     local view = {
         round = session.g.round,
         style = session.style,
+        -- A session written before persona styles existed carries no
+        -- kind, and it can only hold a canonical one: the fallback did
+        -- not exist when it was dealt.
+        style_kind = session.style_kind or "canonical",
         user_seat = session.user_seat,
         your_hand = copy_list(user.my_hand),
         your_points = user.my_points,
@@ -285,18 +329,37 @@ end
 
 -- ─── Actions ────────────────────────────────────────────────────────
 
+--- Resolve the NPC style of a new game and say which kind it is.
+---
+--- A canonical style is decided by the `policy_<style>` field, exactly
+--- as before. Only a name that has none reaches the alias lookup, so a
+--- persona Card can never shadow a shipped style, and the extra lookup
+--- costs nothing on the canonical path.
+---@param raw any Requested style name, or nil for the default
+---@return string style
+---@return string kind `"canonical"` or `"persona"`
 local function resolve_style(raw)
     local style = raw or DEFAULT_STYLE
-    if type(style) ~= "string" or type(duel["policy_" .. style]) ~= "function" then
+    if type(style) == "string" then
+        if type(duel["policy_" .. style]) == "function" then
+            return style, "canonical"
+        end
+        local alias = ALIAS_PREFIX .. style
+        local found, reason = alias_card_exists(alias)
+        if found then
+            return style, "persona"
+        end
         error(
             string.format(
-                "card_duel_interactive: unknown style %s (valid: %s)",
+                "card_duel_interactive: unknown style %s (canonical: %s; persona alias %s: %s)",
                 tostring(raw),
-                table.concat(duel.STYLES, ", ")
+                table.concat(duel.STYLES, ", "),
+                alias,
+                reason or "no Card is pinned to it"
             )
         )
     end
-    return style
+    error(string.format("card_duel_interactive: style must be a string, got %s", type(style)))
 end
 
 local function resolve_seat(raw)
@@ -308,9 +371,11 @@ local function resolve_seat(raw)
 end
 
 local function action_new(ctx, key)
+    local style, kind = resolve_style(ctx.style)
     local session = {
         g = duel.new_game(math.floor(optional_number("seed", ctx.seed, DEFAULT_SEED))),
-        style = resolve_style(ctx.style),
+        style = style,
+        style_kind = kind,
         user_seat = resolve_seat(ctx.user_seat),
     }
     save_session(key, session)

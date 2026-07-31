@@ -108,6 +108,10 @@
 --- builder (see `player_encode`). It is not the boss encoding with the
 --- seats swapped: the two chairs see different things, and the boss
 --- script position in particular is hidden from the player by design.
+--- The one thing the player can buy is the boss answer of a single
+--- turn, and that is the `intent` field: a poke pays for it, every
+--- other turn encodes the placeholder, and no field ever carries a
+--- value the board did not show.
 ---
 --- `build_corpus`, `sample_states` and `compile_policy` mirror the
 --- `card_duel` functions of the same name rather than sharing them: two
@@ -271,6 +275,13 @@ for index, ch in ipairs(PLAYER_ACTIONS) do
     PLAYER_INDEX[ch] = index
 end
 local HEAVY_INDEX = PLAYER_INDEX["A"]
+
+--- The boss moves as a set, for the one player-side field that carries
+--- a boss letter (see `player_view`).
+local BOSS_MOVE = {}
+for _, ch in ipairs(BOSS_ACTIONS) do
+    BOSS_MOVE[ch] = true
+end
 
 M.TURN_LIMIT = TURN_LIMIT
 M.BOSS_MAX_HP = BOSS_MAX_HP
@@ -1091,8 +1102,27 @@ end
 --- - `S` status flags, folded into one digit (see `PLAYER_FLAGS`)
 local PLAYER_FIELDS = { "M", "H", "D", "Y", "T", "S" }
 
+--- The intent field of a player view that has not been shown one.
+---
+--- A poke buys the boss answer of the following turn, so the field is
+--- either that answer or the statement that nothing was bought. The
+--- placeholder is a character of its own rather than a boss move,
+--- because "the board said nothing" is what the model has to read on
+--- eight turns out of nine and it is not one of the six answers.
+local NO_INTENT = "-"
+
+M.NO_INTENT = NO_INTENT
+
 --- Characters `player_encode` emits, checked on every call.
-local PLAYER_ENCODED_LEN = 2 * #PLAYER_FIELDS
+---
+--- Twelve for the six lettered fields plus one for the intent, which is
+--- the only field with no letter of its own. It has none because there
+--- is no room for one: a training line is the view, `>`, the move and
+--- the newline, so `12 + 1 + 3` is exactly the `CTX_BUDGET` of 16 the
+--- tiny preset offers and a seventh letter would put the line outside
+--- the window it has to be trained in. Every field is fixed width, so
+--- the position carries what the letter would have said.
+local PLAYER_ENCODED_LEN = 2 * #PLAYER_FIELDS + 1
 
 --- Tokens one player training line costs: the view, `>`, the move and
 --- the newline. The budget is checked once at load, like the boss row:
@@ -1131,9 +1161,18 @@ local PLAYER_FLAGS = { weakened = 1, exposed = 2, spikes = 4 }
 --- Char alphabet of the player side, indexed by model token id.
 ---
 --- Index 1 holds token id 0 (the padding token), so `id = index - 1`.
---- Twenty-three entries keep it inside the `gpt2 tiny` vocabulary of
---- 64. The boss move letters are deliberately absent: a boss letter in
---- a player training line is a bug rather than a move.
+--- Thirty entries keep it inside the `gpt2 tiny` vocabulary of 64.
+---
+--- The six boss moves are in it for one reason only: the intent field
+--- spells the answer a poke bought, and spelling it as anything else
+--- would ask the model to learn a second name for a move it already
+--- has one for. They are still not player moves — the decode gate takes
+--- the first *player* letter in the ranking (see `guardian_player_npc`)
+--- — and the two alphabets stay separate id spaces in both directions,
+--- because the boss field letters `C` and `L` are absent here and `Y`,
+--- `S` and the placeholder are absent there. A line from either corpus
+--- fed to the other tokeniser is still a loud error rather than
+--- gibberish that tokenises.
 local PLAYER_CHARS = {
     "\0",
     "\n",
@@ -1158,6 +1197,13 @@ local PLAYER_CHARS = {
     "A",
     "b",
     "p",
+    "c",
+    "f",
+    "v",
+    "w",
+    "d",
+    "t",
+    NO_INTENT,
 }
 
 --- Vocabulary size of the `gpt2 tiny` preset both corpora target.
@@ -1254,6 +1300,41 @@ local function require_flag(fn, field, value)
     return value
 end
 
+--- Validate the intent field of a player view.
+---
+--- A view with no intent at all is a view from before the field
+--- existed, which is a different fault from a view that carries a
+--- nonsense one: the first is a log recorded by an older session and
+--- the fix is to record a new one, the second is a corrupt entry. The
+--- two are reported apart so the caller is not sent to fix the wrong
+--- thing.
+local function require_intent(fn, value)
+    if value == nil then
+        error(
+            string.format(
+                "guardian_duel.%s: view.intent is missing. The player view carries the boss "
+                    .. "answer a poke revealed (%s when none was), and a view without the field "
+                    .. "predates it: the log has to be recorded again rather than filled in, "
+                    .. "because nothing here knows what the board showed",
+                fn,
+                NO_INTENT
+            )
+        )
+    end
+    if type(value) ~= "string" or (value ~= NO_INTENT and not BOSS_MOVE[value]) then
+        error(
+            string.format(
+                "guardian_duel.%s: view.intent must be one of %s or %q, got %s",
+                fn,
+                table.concat(BOSS_ACTIONS, ", "),
+                NO_INTENT,
+                tostring(value)
+            )
+        )
+    end
+    return value
+end
+
 --- Validate every field the player encoding reads.
 ---
 --- Like `require_boss_state`, the check runs before the encoder touches
@@ -1272,6 +1353,7 @@ local function require_player_view(fn, view)
     require_flag(fn, "view.weakened", view.weakened)
     require_flag(fn, "view.exposed", view.exposed)
     require_flag(fn, "view.spikes", view.spikes)
+    require_intent(fn, view.intent)
     return view
 end
 
@@ -1287,6 +1369,7 @@ local function copy_player_view(view)
         weakened = view.weakened,
         exposed = view.exposed,
         spikes = view.spikes,
+        intent = view.intent,
     }
 end
 
@@ -1306,10 +1389,70 @@ end
 --- both are knowable to the player who is looking at it: the exposure
 --- is the heavy attack they themselves played last turn, and the spikes
 --- go up with the mode shift the board reports.
+---
+--- The intent field is the one thing the rules cannot work out on their
+--- own. Whether a look was bought is theirs — `revealed` is set by the
+--- poke — but *what* it showed belongs to whoever seats the boss: a
+--- model, a Card or a teacher policy. So the caller passes the answer
+--- and the rules check it against the fight, in both directions: a
+--- revealed turn built without one would train the model as though the
+--- board had said nothing, and an answer on an unrevealed turn would
+--- encode a look nobody paid for. Both are the same fault — a view that
+--- does not match the board — and both are loud.
+local function view_intent(boss, revealed, intent)
+    if intent == nil or intent == NO_INTENT then
+        if revealed then
+            error(
+                "guardian_duel.player_view: the previous turn was a poke, so the board showed "
+                    .. "the boss answer of this one; pass it to player_view rather than "
+                    .. "recording a view that says nothing was shown"
+            )
+        end
+        return NO_INTENT
+    end
+    if not revealed then
+        error(
+            string.format(
+                "guardian_duel.player_view: intent %s was passed for a turn no poke bought a "
+                    .. "look at, and the board cannot show an answer the player did not pay for",
+                tostring(intent)
+            )
+        )
+    end
+    if not BOSS_MOVE[intent] then
+        error(
+            string.format(
+                "guardian_duel.player_view: intent must be one of %s, got %s",
+                table.concat(BOSS_ACTIONS, ", "),
+                tostring(intent)
+            )
+        )
+    end
+    -- The reveal is the answer to *this* turn, so it is the move the
+    -- boss is about to be allowed to play. An intent outside that set
+    -- comes from a position other than the one being viewed, which is
+    -- worth catching here rather than one call later inside `apply`.
+    local legal = M.legal_actions(boss)
+    for _, ch in ipairs(legal) do
+        if ch == intent then
+            return intent
+        end
+    end
+    error(
+        string.format(
+            "guardian_duel.player_view: intent %s is not one of the legal moves %s on state (%s)",
+            intent,
+            table.concat(legal, ", "),
+            state_summary(boss)
+        )
+    )
+end
+
 ---@param g table Game
 ---@param style string One of `STYLES`, the distance basis
----@return table view `{ turn, mode, boss_hp, shift_distance, hp, weakened, exposed, spikes }`
-function M.player_view(g, style)
+---@param intent string|nil Boss answer a poke revealed for this turn
+---@return table view `{ turn, mode, boss_hp, shift_distance, hp, weakened, exposed, spikes, intent }`
+function M.player_view(g, style, intent)
     require_style("player_view", style)
     if type(g) ~= "table" or type(g.boss) ~= "table" or type(g.player) ~= "table" then
         error("guardian_duel.player_view: game must carry a boss and a player")
@@ -1319,6 +1462,10 @@ function M.player_view(g, style)
     local weak = g.player.weak
     if weak ~= nil and type(weak) ~= "boolean" then
         error("guardian_duel.player_view: player.weak must be a boolean, got " .. type(weak))
+    end
+    local revealed = g.revealed
+    if revealed ~= nil and type(revealed) ~= "boolean" then
+        error("guardian_duel.player_view: game.revealed must be a boolean, got " .. type(revealed))
     end
     local thorns = boss.thorns or 0
     require_int("player_view", "boss.thorns", thorns, 0, THORNS)
@@ -1331,14 +1478,20 @@ function M.player_view(g, style)
         weakened = weak == true,
         exposed = boss.last_player == HEAVY_INDEX,
         spikes = thorns > 0,
+        intent = view_intent(boss, revealed == true, intent),
     }
 end
 
 --- Encode a player view as one line over the player alphabet.
 ---
 --- Layout: `M<boss mode>H<boss health>D<distance to the next mode
---- shift>Y<your health>T<turn>S<status flags>`, every field one
---- character.
+--- shift>Y<your health>T<turn>S<status flags><boss answer a poke
+--- revealed>`, every field one character.
+---
+--- The last one is the intent, and it is the only field written without
+--- a letter of its own: thirteen characters plus the separator, the
+--- move and the newline is exactly the sixteen the tiny preset has, so
+--- there was room for the field but not for its label.
 ---
 --- ## The field that is not here
 ---
@@ -1363,6 +1516,12 @@ end
 --- - the endgame arithmetic needs `Y`, `H` and `T` together: the fight
 ---   is decided on health buckets at the turn limit, so how many turns
 ---   are left decides whether to race or to stall
+--- - the intent is the turn the guessing stops: a poke on the turn
+---   before hands the player the answer, and blocking a `t` that is
+---   spelled out is a different decision from blocking one that is
+---   inferred from `M1`. Without the field every poked turn would train
+---   as though the board had said nothing, which is the one place the
+---   encoding would be lying about what the player could see
 ---@param view table Player view, as `player_view` builds one
 ---@return string encoded Exactly `PLAYER_ENCODED_LEN` characters
 function M.player_encode(view)
@@ -1386,6 +1545,7 @@ function M.player_encode(view)
         tostring(view.turn),
         "S",
         tostring(flags),
+        view.intent,
     })
     if #text ~= PLAYER_ENCODED_LEN then
         error(

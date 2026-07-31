@@ -32,10 +32,11 @@
 --- The player has all four moves on every turn of every fight, so the
 --- gate never removes an option the rules would have allowed. It is
 --- still here, and `raw_legal` is still reported, because the model can
---- answer with a digit, a field letter or the padding token — a token
---- that is not a move at all — and a run whose `raw_legal` rate sags is
---- a model that has stopped answering the question rather than one
---- playing badly.
+--- answer with a digit, a field letter, a boss letter (the intent field
+--- of the view puts the six of them in the alphabet) or the padding
+--- token — a token that is not a player move at all — and a run whose
+--- `raw_legal` rate sags is a model that has stopped answering the
+--- question rather than one playing badly.
 ---
 --- ## Entry contract
 ---
@@ -275,7 +276,9 @@ end
 --- Nothing is defaulted: `guardian_duel` validates every field the
 --- encoding reads and names the one that is missing, whereas a default
 --- would answer a question the caller did not ask — a substituted
---- `shift_distance` moves the field the model reads hardest.
+--- `shift_distance` moves the field the model reads hardest, and a
+--- substituted `intent` would tell the model the board showed nothing
+--- on a turn the player had bought a look at.
 local function decode_view(req)
     local view = req.view
     if type(view) ~= "table" then
@@ -391,13 +394,21 @@ local function mode_autoplay(handle, req, style)
     for i = 1, games do
         local g = duel.new_game(seed + i)
         while not duel.is_over(g) do
-            local d = decide(handle, duel.player_view(g, style))
+            -- The boss answers from the position at the head of the
+            -- turn, which the player's own move never touches, so
+            -- asking it first changes nothing about the fight and is
+            -- what makes the reveal available: on a turn the model
+            -- poked for, this is the move the board would have shown
+            -- it, and the view has to carry it or the model is
+            -- autoplayed on a question it was never trained on.
+            local boss_action = boss(g.boss)
+            local d = decide(handle, duel.player_view(g, style, g.revealed and boss_action or nil))
             moves = moves + 1
             if d.raw_legal then
                 raw_legal = raw_legal + 1
             end
             counts[d.action] = counts[d.action] + 1
-            g = duel.apply(g, d.action, boss(g.boss))
+            g = duel.apply(g, d.action, boss_action)
         end
         local w = duel.winner(g)
         if w == "player" then

@@ -44,9 +44,11 @@
 -- ctx:
 --   moves  -- required; array of logged turns, each carrying a `player`
 --             view (`{ turn, mode, boss_hp, shift_distance, hp,
---             weakened, exposed, spikes }`) and a `player_action`. This
---             is the `move_log` array of a finished interactive
---             session, unchanged
+--             weakened, exposed, spikes, intent }`) and a
+--             `player_action`. This is the `move_log` array of a
+--             finished interactive session, unchanged. A log recorded
+--             before the view carried `intent` is rejected rather than
+--             read: see the format check below
 --   name   -- required; slug matching ^[a-z0-9_]+$. The Card is pinned
 --             to the alias `guardian_player_npc_<name>`
 --   steps  -- Full FT steps (default 800)
@@ -119,6 +121,37 @@ if type(NAME) ~= "string" or not NAME:match("^[a-z0-9_]+$") then
 end
 if STEPS <= 0 or BATCH <= 0 then
     error("bake_guardian_player_from_log: ctx.steps and ctx.batch must be positive integers")
+end
+
+-- ─── Log format ─────────────────────────────────────────────────────
+--
+-- The player view carries an `intent` field: the boss answer a poke
+-- revealed for that turn, or the placeholder on a turn nobody bought
+-- one. A log recorded before the field existed carries views without
+-- it, and the gap cannot be closed here — nothing outside the session
+-- that played the fight knows what the board showed, and filling it
+-- with the placeholder would teach the model that the reveals the human
+-- paid for said nothing.
+--
+-- So an old log is refused by name, at the front of the script, rather
+-- than a few lines later inside the corpus builder: the fix is to
+-- collect the log again, and the sooner that is said the fewer minutes
+-- of training are spent on a corpus that was never going to be right.
+for i, move in ipairs(MOVES) do
+    local view = type(move) == "table" and move.player or nil
+    if type(view) == "table" and view.intent == nil then
+        error(
+            string.format(
+                "bake_guardian_player_from_log: logged turn %d carries a player view with no "
+                    .. "intent field, so this log predates the field. The view now records the "
+                    .. "boss answer a poke revealed (%q when none was), and the missing value "
+                    .. "cannot be invented: play the fight again with the current "
+                    .. "guardian_duel_interactive and bake the move_log that session returns.",
+                i,
+                duel.NO_INTENT
+            )
+        )
+    end
 end
 
 local ALIAS = "guardian_player_npc_" .. NAME

@@ -121,6 +121,13 @@
 --- which is also what the board's `shift_distance` is measured against,
 --- so a Card baked from the log answers under the basis it was logged
 --- under and no other.
+---
+--- A revealed answer is part of that position: the view of a turn a
+--- poke bought carries the move in its `intent` field, and the view of
+--- every other turn carries `guardian_duel.NO_INTENT`. The transcript
+--- therefore records not only that the player had been shown something
+--- but what it was, which is what a baked player needs in order to
+--- learn the move the reveal was bought for.
 
 local duel = require("guardian_duel")
 
@@ -514,6 +521,7 @@ local function copy_player_view(view)
         weakened = view.weakened,
         exposed = view.exposed,
         spikes = view.spikes,
+        intent = view.intent,
     }
 end
 
@@ -528,6 +536,13 @@ end
 --- projections of the same turn, and each is baked through its own
 --- encoding: `guardian_duel.encode` reads the boss half,
 --- `guardian_duel.player_encode` reads the player half.
+---
+--- `revealed` is the answer the poke of the previous turn bought, or
+--- nil on a turn nobody paid for one. It goes into the player view as
+--- the intent field, which is what makes "I blocked because I had been
+--- shown the slam" a thing a Card baked from this log can learn: the
+--- entry-level flag next to it says the same thing about the turn, but
+--- a flag is not a field of the encoding and the model never sees it.
 local function log_turn(session, g, player_action, boss_action, revealed)
     local log = session.move_log
     if log == nil then
@@ -537,10 +552,10 @@ local function log_turn(session, g, player_action, boss_action, revealed)
     log[#log + 1] = {
         turn = g.boss.turn,
         boss = boss_payload(g.boss),
-        player = duel.player_view(g, session.basis_style),
+        player = duel.player_view(g, session.basis_style, revealed),
         boss_action = boss_action,
         player_action = player_action,
-        revealed = revealed,
+        revealed = revealed ~= nil,
     }
 end
 
@@ -700,7 +715,7 @@ local function action_play(ctx, key)
     local revealed = current_intent(session)
     local boss_action = revealed or decode_boss(session)
 
-    log_turn(session, session.g, player_action, boss_action, revealed ~= nil)
+    log_turn(session, session.g, player_action, boss_action, revealed)
     session.g = duel.apply(session.g, player_action, boss_action)
 
     -- The rules mark the position a poke bought; reading the answer for

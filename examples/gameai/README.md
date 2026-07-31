@@ -621,8 +621,9 @@ session ended: fight over: you 12 hp - boss 0 hp, you win
 Pass `game_id` to keep several fights apart, `style` to choose which
 trained Card answers, and `basis_style` to override the basis a persona
 borrowed. The `move_log` returned by `end` has one entry per turn: the
-boss state the answer was decoded from, the answer, the player move and
-whether the player had already been shown it.
+boss state the answer was decoded from, the answer, the player move,
+whether the player had already been shown it and — inside the player
+view of that turn — which move they were shown.
 
 ### The poke, and what `intent` means here
 
@@ -678,10 +679,33 @@ and the decode gate underneath are the same code.
 
 The asymmetry lives in the encoding, and what it leaves out is the
 point. A player view carries only what the board shows: the boss mode,
-both health buckets, the distance to the next shift, the turn and the
-three status bits. The boss cycle index is not among them, and putting
-it there would end the poke — a player who reads the next answer for
-free has no reason to buy it.
+both health buckets, the distance to the next shift, the turn, the
+three status bits and the answer a poke revealed. The boss cycle index
+is not among them, and putting it there would end the poke — a player
+who reads the next answer for free has no reason to buy it.
+
+The reveal is the one boss-side value a player view is allowed to
+carry, because it is the one the board really showed. It is the last
+character of the line, `-` on a turn nobody bought a look at and the
+boss move itself on a turn somebody did:
+
+```
+M0H9D3Y9T1S0->a     turn 1, nothing revealed, light attack
+M1H4D0Y6T5S4t>b     turn 5, the slam was poked for, block
+```
+
+Without it every poked turn would train as though the board had said
+nothing, and "I blocked because I had been shown the slam" would reach
+the model as "I blocked". The field has no letter of its own because
+the budget has no room for one: thirteen characters, the separator, the
+move and the newline are exactly the sixteen tokens of the `gpt2 tiny`
+context, so the player line now fills the window rather than padding
+it. A `move_log` recorded before the field existed is rejected by
+`bake_guardian_player_from_log.lua` by entry number instead of being
+padded with the placeholder — nothing outside the session that played
+the fight knows what the board showed, and a guess there teaches the
+model that reveals say nothing. Old logs are re-collected, not
+repaired.
 
 `guardian_player_npc` seats the baked Card and plays it:
 
@@ -705,7 +729,11 @@ ten copies of one fight rather than ten samples.
 A nine-move human game replayed with logging, baked at the defaults on
 2026-07-31 (`log_match=1.00`, `train_loss=0.151`), and the baked player
 replayed the original fight move for move — 9 of 9, the same 15-10 win,
-`raw_legal` 9 of 9.
+`raw_legal` 9 of 9. That run predates the `intent` field, so its log is
+one of the ones the bake script now refuses: the numbers stand for the
+twelve-character layout they were measured on, and reproducing them
+means playing the fight again rather than re-baking the old
+transcript.
 
 That is a fit, not a generalisation. Nine positions from one fight are
 what the model saw and what it gave back; nothing there says how it
@@ -787,13 +815,15 @@ alc_pkg_test(pkg = "guardian_duel_interactive")
   to *some* threshold and twelve characters have no room for another
   one. A persona that staggers on a rule of its own is therefore a rules
   change rather than a prompt.
-- A poke buys the boss's next answer, but the player view has no field
-  for it. The transcript records only whether the answer had already
-  been revealed, not which one it was, so a Card baked from a log cannot
-  condition on a reveal the human paid for — every poked turn trains as
-  though the board had said nothing. Learning to play off a reveal needs
-  an `intent` field in the view and in the player encoding, which is
-  future work.
+- The player line now fills the tiny preset context exactly (thirteen
+  characters plus the separator, the move and the newline). There is no
+  room left for another field, so the next thing worth showing the
+  player — a second turn of look-ahead, the boss's shift count — is a
+  context-window change rather than a layout one.
+- A play log recorded before the `intent` field cannot be baked. The
+  bake script rejects it by entry number and says so; the fix is to
+  play the fight again with the current session, because what the board
+  showed on a poked turn is not recoverable from the log.
 - `guardian_duel` duplicates the corpus, sampling and sandbox halves of
   `card_duel` instead of sharing them. Two rule sets are not enough to
   tell which parts are common; a third is the point at which to extract

@@ -136,6 +136,7 @@ local function player_view(fields)
         weakened = false,
         exposed = false,
         spikes = false,
+        intent = duel.NO_INTENT,
     }
     for key, value in pairs(fields or {}) do
         view[key] = value
@@ -203,7 +204,7 @@ describe("guardian_player_npc decide", function()
 
     it("rejects a view that is not an object", function()
         expect(function()
-            ask({ mode = "decide", view = "M0H9D3Y9T1S0" })
+            ask({ mode = "decide", view = "M0H9D3Y9T1S0-" })
         end).to.fail()
     end)
 
@@ -214,6 +215,21 @@ describe("guardian_player_npc decide", function()
         expect(function()
             ask({ mode = "decide", view = view })
         end).to.fail()
+    end)
+
+    it("rejects a view that carries no intent", function()
+        -- A substituted placeholder would tell the model the board
+        -- showed nothing on a turn the player had bought a look at.
+        local view = player_view()
+        view.intent = nil
+        expect(function()
+            ask({ mode = "decide", view = view })
+        end).to.fail()
+    end)
+
+    it("prompts with the answer a poke revealed", function()
+        ask({ mode = "decide", view = player_view({ mode = 1, intent = "t" }) })
+        expect(prompt_text()).to.equal("M1H9D3Y9T1S0t>")
     end)
 end)
 
@@ -299,6 +315,25 @@ describe("guardian_player_npc autoplay", function()
             boss_style = "turtle",
         }, { boss_style = "guardian" })
         expect(overridden).to.equal("winrate=0.50 raw_legal=1.00 moves=9 a=0 A=0 b=9 p=0")
+    end)
+
+    it("shows the model the answer its own poke bought", function()
+        -- A model that pokes every turn buys a look at every turn but
+        -- the first, so the view it is asked about has to carry the
+        -- boss answer: autoplaying it on the placeholder would be
+        -- asking a question the log it was baked from never contained.
+        npc.reset_cache()
+        rank({ "p", "b", "a", "A" })
+        local text = npc.run({
+            task = alc.json_encode({ mode = "autoplay", games = 1, seed = 5 }),
+        }).result
+        expect(text).to.equal("winrate=0.00 raw_legal=1.00 moves=9 a=0 A=0 b=0 p=9")
+        -- The last prompt is the ninth turn, bought by the eighth poke.
+        -- Nothing the pokes did was enough to stagger the teacher, so it
+        -- is still walking its four-move cycle and turn nine is back at
+        -- the head of it: the charge.
+        local intent = prompt_text():sub(duel.PLAYER_ENCODED_LEN, duel.PLAYER_ENCODED_LEN)
+        expect(intent).to.equal("c")
     end)
 
     it("counts a gated answer against the raw legality rate", function()

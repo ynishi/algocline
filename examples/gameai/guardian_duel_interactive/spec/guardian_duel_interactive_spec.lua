@@ -557,6 +557,25 @@ describe("guardian_duel_interactive move log player view", function()
         expect(view.weakened).to.equal(false)
         expect(view.exposed).to.equal(false)
         expect(view.spikes).to.equal(false)
+        -- Nothing was bought on turn one, so the field says the board
+        -- showed no answer rather than carrying one.
+        expect(view.intent).to.equal(duel.NO_INTENT)
+    end)
+
+    it("records the answer a poke bought as the intent of the view", function()
+        reset()
+        fight.run({ action = "new", style = "guardian", seed = 7 })
+        local revealed = fight.run({ action = "play", move = "p" }).intent
+        fight.run({ action = "play", move = "b" })
+        local log = fight.run({ action = "end" }).move_log
+        -- The turn the poke paid for is the one whose view carries the
+        -- move, and it is the same move the boss then played: the
+        -- transcript records what the board showed, not a second
+        -- prediction of it.
+        expect(log[1].player.intent).to.equal(duel.NO_INTENT)
+        expect(log[2].player.intent).to.equal(revealed)
+        expect(log[2].boss_action).to.equal(revealed)
+        expect(log[2].revealed).to.equal(true)
     end)
 
     it("leaves the boss half of the entry alone", function()
@@ -644,6 +663,11 @@ describe("guardian_duel_interactive move log player view", function()
         expect(#plays).to.equal(duel.TURN_LIMIT)
         expect(plays[1].action).to.equal("a")
         expect(plays[2].action).to.equal("A")
+        -- The script pokes on turns four and eight, so the two turns
+        -- after them are the ones whose rows carry a revealed answer.
+        expect(plays[4].view.intent).to.equal(duel.NO_INTENT)
+        expect(plays[5].view.intent ~= duel.NO_INTENT).to.equal(true)
+        expect(plays[9].view.intent ~= duel.NO_INTENT).to.equal(true)
     end)
 end)
 

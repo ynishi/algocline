@@ -28,6 +28,7 @@ local function player_view(fields)
         weakened = false,
         exposed = false,
         spikes = false,
+        intent = duel.NO_INTENT,
     }
     for key, value in pairs(fields or {}) do
         view[key] = value
@@ -36,6 +37,10 @@ local function player_view(fields)
 end
 
 --- A transcript entry as the interactive session writes one.
+---
+--- The entry-level `revealed` flag follows the intent of the view, the
+--- way the session writes the two: the flag describes the turn and the
+--- field is what the model reads.
 local function log_entry(view, action)
     return {
         turn = view.turn,
@@ -43,7 +48,7 @@ local function log_entry(view, action)
         player = view,
         boss_action = "c",
         player_action = action,
-        revealed = false,
+        revealed = view.intent ~= duel.NO_INTENT,
     }
 end
 
@@ -63,25 +68,69 @@ end
 -- ─── Encoding ───────────────────────────────────────────────────────
 
 describe("guardian_duel.player_encode", function()
-    it("writes the six fields in layout order", function()
+    it("writes the six fields and the intent in layout order", function()
         -- An untouched board: the boss at full health three buckets from
         -- its first stagger, the player at full health on turn one with
-        -- nothing on either of them.
-        expect(duel.player_encode(player_view())).to.equal("M0H9D3Y9T1S0")
+        -- nothing on either of them and no reveal bought.
+        expect(duel.player_encode(player_view())).to.equal("M0H9D3Y9T1S0-")
     end)
 
-    it("is exactly twelve chars", function()
+    it("is exactly thirteen chars", function()
         local encoded = duel.player_encode(player_view())
         expect(#encoded).to.equal(duel.PLAYER_ENCODED_LEN)
-        expect(#encoded).to.equal(12)
+        expect(#encoded).to.equal(13)
     end)
 
     it("keeps view plus move inside the tiny preset context", function()
-        -- Twelve chars, the separator, the move and the newline: the
-        -- fifteen tokens the tiny preset has room for.
+        -- Thirteen chars, the separator, the move and the newline: the
+        -- sixteen tokens the tiny preset has room for, exactly. This is
+        -- why the intent has no letter of its own — a seventh label
+        -- would put the line outside the window.
         local line = duel.player_encode(player_view()) .. ">a\n"
-        expect(#duel.player_to_ids(line)).to.equal(15)
-        expect(#duel.player_to_ids(line) <= duel.CTX_BUDGET).to.equal(true)
+        expect(#duel.player_to_ids(line)).to.equal(16)
+        expect(#duel.player_to_ids(line)).to.equal(duel.CTX_BUDGET)
+    end)
+
+    it("writes the boss answer a poke revealed", function()
+        -- The whole point of the field: the same board, once with the
+        -- slam spelled out and once with it left to inference.
+        expect(duel.player_encode(player_view({ mode = 1, intent = "t" }))).to.equal(
+            "M1H9D3Y9T1S0t"
+        )
+        expect(duel.player_encode(player_view({ mode = 1 }))).to.equal("M1H9D3Y9T1S0-")
+    end)
+
+    it("spells every boss answer the reveal can carry", function()
+        for _, move in ipairs({ "c", "f", "v", "w", "d", "t" }) do
+            local encoded = duel.player_encode(player_view({ intent = move }))
+            expect(#encoded).to.equal(duel.PLAYER_ENCODED_LEN)
+            expect(encoded:sub(-1)).to.equal(move)
+        end
+    end)
+
+    it("rejects an intent that is not a boss move", function()
+        -- A player letter here would be the human's own move recorded as
+        -- the answer they were shown.
+        expect(function()
+            duel.player_encode(player_view({ intent = "a" }))
+        end).to.fail()
+        expect(function()
+            duel.player_encode(player_view({ intent = "cf" }))
+        end).to.fail()
+        expect(function()
+            duel.player_encode(player_view({ intent = 1 }))
+        end).to.fail()
+    end)
+
+    it("names the missing field when the view predates the intent", function()
+        -- A view without the field is a log recorded by an older
+        -- session, and the fix is to record a new one rather than to
+        -- guess what the board showed, so the message says so.
+        local view = player_view()
+        view.intent = nil
+        local ok, err = pcall(duel.player_encode, view)
+        expect(ok).to.equal(false)
+        expect(err:match("view%.intent") ~= nil).to.equal(true)
     end)
 
     it("keeps bucket zero for an exhausted side", function()
@@ -99,11 +148,11 @@ describe("guardian_duel.player_encode", function()
     end)
 
     it("folds the three status flags into one digit", function()
-        expect(duel.player_encode(player_view({ weakened = true }))).to.equal("M0H9D3Y9T1S1")
-        expect(duel.player_encode(player_view({ exposed = true }))).to.equal("M0H9D3Y9T1S2")
-        expect(duel.player_encode(player_view({ spikes = true }))).to.equal("M0H9D3Y9T1S4")
+        expect(duel.player_encode(player_view({ weakened = true }))).to.equal("M0H9D3Y9T1S1-")
+        expect(duel.player_encode(player_view({ exposed = true }))).to.equal("M0H9D3Y9T1S2-")
+        expect(duel.player_encode(player_view({ spikes = true }))).to.equal("M0H9D3Y9T1S4-")
         local all = player_view({ weakened = true, exposed = true, spikes = true })
-        expect(duel.player_encode(all)).to.equal("M0H9D3Y9T1S7")
+        expect(duel.player_encode(all)).to.equal("M0H9D3Y9T1S7-")
     end)
 
     it("keeps every flag combination inside one char", function()
@@ -126,11 +175,14 @@ describe("guardian_duel.player_encode", function()
     end)
 
     it("writes the last turn of the fight", function()
-        expect(duel.player_encode(player_view({ turn = duel.TURN_LIMIT }))).to.equal("M0H9D3Y9T9S0")
+        expect(duel.player_encode(player_view({ turn = duel.TURN_LIMIT }))).to.equal(
+            "M0H9D3Y9T9S0-"
+        )
     end)
 
     it("rejects a turn outside the fight", function()
-        -- Turn ten would need two chars and blow the twelve-char layout.
+        -- Turn ten would need two chars and blow the thirteen-char
+        -- layout.
         expect(function()
             duel.player_encode(player_view({ turn = duel.TURN_LIMIT + 1 }))
         end).to.fail()
@@ -181,7 +233,7 @@ describe("guardian_duel.player_encode", function()
 
     it("rejects a view that is not a table", function()
         expect(function()
-            duel.player_encode("M0H9D3Y9T1S0")
+            duel.player_encode("M0H9D3Y9T1S0-")
         end).to.fail()
     end)
 
@@ -198,8 +250,8 @@ describe("guardian_duel.player_encode", function()
         expect(moved.boss.cycle).to.equal(1)
         expect(g.boss.cycle).to.equal(0)
         -- Only the turn separates them, so the cycle really is absent.
-        expect(duel.player_encode(head)).to.equal("M0H9D3Y9T1S0")
-        expect(duel.player_encode(later)).to.equal("M0H9D3Y9T2S0")
+        expect(duel.player_encode(head)).to.equal("M0H9D3Y9T1S0-")
+        expect(duel.player_encode(later)).to.equal("M0H9D3Y9T2S0-")
     end)
 end)
 
@@ -216,6 +268,64 @@ describe("guardian_duel.player_view", function()
         expect(view.weakened).to.equal(false)
         expect(view.exposed).to.equal(false)
         expect(view.spikes).to.equal(false)
+        -- Nothing has been bought on the opening turn, so the field says
+        -- the board showed no answer rather than carrying one.
+        expect(view.intent).to.equal(duel.NO_INTENT)
+    end)
+
+    it("carries the answer the poke of the previous turn bought", function()
+        local g = duel.apply(duel.new_game(3), "p", "c")
+        expect(g.revealed).to.equal(true)
+        local answer = duel.policy_guardian(g.boss)
+        expect(duel.player_view(g, "guardian", answer).intent).to.equal(answer)
+    end)
+
+    it("refuses a revealed turn built without the answer", function()
+        -- The board showed the human a move here. A view that says
+        -- nothing was shown would train the model on a question the
+        -- player never faced.
+        local g = duel.apply(duel.new_game(3), "p", "c")
+        local ok, err = pcall(duel.player_view, g, "guardian")
+        expect(ok).to.equal(false)
+        expect(err:match("poke") ~= nil).to.equal(true)
+        expect(function()
+            duel.player_view(g, "guardian", duel.NO_INTENT)
+        end).to.fail()
+    end)
+
+    it("refuses an answer on a turn no poke bought a look at", function()
+        -- The other direction of the same rule: the encoding may not
+        -- carry a value the board did not show.
+        expect(function()
+            duel.player_view(duel.new_game(3), "guardian", "c")
+        end).to.fail()
+        local g = duel.apply(duel.new_game(3), "a", "c")
+        expect(g.revealed).to.equal(false)
+        expect(function()
+            duel.player_view(g, "guardian", "f")
+        end).to.fail()
+    end)
+
+    it("refuses an answer the boss could not play from here", function()
+        -- The reveal is the answer to this very turn, so it has to be
+        -- one of the moves the position allows: the slam needs the boss
+        -- rolled up, and one promised from a cycle turn came from a
+        -- position other than the one being viewed.
+        local g = duel.apply(duel.new_game(3), "p", "c")
+        expect(g.boss.mode).to.equal(0)
+        expect(function()
+            duel.player_view(g, "guardian", "t")
+        end).to.fail()
+    end)
+
+    it("refuses an intent that is not a boss move at all", function()
+        local g = duel.apply(duel.new_game(3), "p", "c")
+        expect(function()
+            duel.player_view(g, "guardian", "a")
+        end).to.fail()
+        expect(function()
+            duel.player_view(g, "guardian", 3)
+        end).to.fail()
     end)
 
     it("measures the distance against the style it is given", function()
@@ -292,7 +402,7 @@ end)
 describe("guardian_duel.player_vocab", function()
     it("fits the tiny preset vocabulary", function()
         local v = duel.player_vocab()
-        expect(v.size).to.equal(23)
+        expect(v.size).to.equal(30)
         expect(v.size <= 64).to.equal(true)
         expect(v.pad_id).to.equal(0)
     end)
@@ -311,25 +421,41 @@ describe("guardian_duel.player_vocab", function()
         end
     end)
 
-    it("carries none of the boss moves", function()
-        -- A boss letter inside a player line is a bug rather than a
-        -- move, so the alphabet cannot spell one.
+    it("carries the boss moves the intent field spells", function()
+        -- They are in the alphabet for the intent field alone. Spelling
+        -- a revealed answer as anything other than the move's own letter
+        -- would give the model a second name for a move it already has
+        -- one for.
         local v = duel.player_vocab()
         for _, move in ipairs({ "c", "f", "v", "w", "d", "t" }) do
-            expect(v.to_id[move]).to.equal(nil)
+            expect(type(v.to_id[move])).to.equal("number")
         end
+        expect(type(v.to_id[duel.NO_INTENT])).to.equal("number")
     end)
 
     it("stays separate from the boss alphabet in both directions", function()
+        -- The two are still different id spaces: the boss alphabet has
+        -- no player move and no player field letter, and the player one
+        -- has neither of the boss field letters, so a line from either
+        -- corpus fails loudly against the other tokeniser.
         local boss = duel.vocab()
         for _, move in ipairs(duel.player_legal_actions()) do
             expect(boss.to_id[move]).to.equal(nil)
         end
+        expect(boss.to_id["Y"]).to.equal(nil)
+        expect(boss.to_id["S"]).to.equal(nil)
+        expect(boss.to_id[duel.NO_INTENT]).to.equal(nil)
+        local player = duel.player_vocab()
+        expect(player.to_id["C"]).to.equal(nil)
+        expect(player.to_id["L"]).to.equal(nil)
         expect(function()
             duel.to_ids("a")
         end).to.fail()
         expect(function()
-            duel.player_to_ids("f")
+            duel.player_to_ids("C0M0H9D3L0T1>c\n")
+        end).to.fail()
+        expect(function()
+            duel.to_ids("M0H9D3Y9T1S0->b\n")
         end).to.fail()
     end)
 
@@ -357,9 +483,10 @@ end)
 
 describe("guardian_duel.rows_from_player_moves", function()
     -- Three positions a fight really reaches: the opening, a rolled-up
-    -- boss with its spikes up and a stagger that is due on the turn
-    -- after a heavy attack. A fixture that could not occur would be
-    -- copied into the next spec, so the numbers here hang together.
+    -- boss whose slam the player poked for on the turn before, and a
+    -- stagger that is due on the turn after a heavy attack. A fixture
+    -- that could not occur would be copied into the next spec, so the
+    -- numbers here hang together.
     local moves = {
         log_entry(player_view(), "a"),
         log_entry(
@@ -370,6 +497,7 @@ describe("guardian_duel.rows_from_player_moves", function()
                 boss_hp = 16,
                 shift_distance = 0,
                 hp = 30,
+                intent = "t",
             }),
             "b"
         ),
@@ -391,20 +519,31 @@ describe("guardian_duel.rows_from_player_moves", function()
         expect(#plays).to.equal(3)
     end)
 
-    it("pads every row to the context window", function()
+    it("fills the context window, and pads a wider one", function()
+        local v = duel.player_vocab()
         local rows = duel.rows_from_player_moves(moves, { ctx_len = CTX_LEN })
-        local pad = duel.player_vocab().pad_id
         for _, row in ipairs(rows) do
+            -- With the intent field the line is exactly the window, so
+            -- there is nothing left to pad and the row ends on the
+            -- newline that closes it.
             expect(#row).to.equal(CTX_LEN)
-            expect(row[#row]).to.equal(pad)
+            expect(row[#row]).to.equal(v.to_id["\n"])
+        end
+        local wider = duel.rows_from_player_moves(moves, { ctx_len = CTX_LEN + 2 })
+        for _, row in ipairs(wider) do
+            expect(#row).to.equal(CTX_LEN + 2)
+            expect(row[#row]).to.equal(v.pad_id)
         end
     end)
 
     it("writes the view, the separator and the move that was played", function()
         local rows = duel.rows_from_player_moves(moves, { ctx_len = CTX_LEN })
-        expect(row_text(rows[1])).to.equal("M0H9D3Y9T1S0>a\n")
-        expect(row_text(rows[2])).to.equal("M1H4D0Y6T5S4>b\n")
-        expect(row_text(rows[3])).to.equal("M0H6D0Y7T4S2>A\n")
+        expect(row_text(rows[1])).to.equal("M0H9D3Y9T1S0->a\n")
+        -- The second entry is the reveal doing its work: the slam was
+        -- bought on the turn before and the block is the answer to
+        -- having seen it.
+        expect(row_text(rows[2])).to.equal("M1H4D0Y6T5S4t>b\n")
+        expect(row_text(rows[3])).to.equal("M0H6D0Y7T4S2->A\n")
     end)
 
     it("returns the pairs behind the rows", function()
@@ -412,6 +551,10 @@ describe("guardian_duel.rows_from_player_moves", function()
         expect(plays[2].action).to.equal("b")
         expect(plays[2].view.turn).to.equal(5)
         expect(plays[2].view.spikes).to.equal(true)
+        -- The copy carries the reveal too, so a caller replaying the log
+        -- through a Card asks the same question the row trained.
+        expect(plays[2].view.intent).to.equal("t")
+        expect(plays[1].view.intent).to.equal(duel.NO_INTENT)
     end)
 
     it("hands out views the caller cannot write back into", function()
@@ -421,8 +564,29 @@ describe("guardian_duel.rows_from_player_moves", function()
     end)
 
     it("takes the pad id from the player alphabet", function()
-        local rows = duel.rows_from_player_moves(moves, { ctx_len = CTX_LEN, pad_id = 7 })
+        local rows = duel.rows_from_player_moves(moves, { ctx_len = CTX_LEN + 1, pad_id = 7 })
         expect(rows[1][#rows[1]]).to.equal(7)
+    end)
+
+    it("rejects a log recorded before the view carried an intent", function()
+        -- The gap cannot be filled in: nothing here knows whether the
+        -- board showed an answer on that turn, and the placeholder would
+        -- teach the model that a reveal the human paid for said nothing.
+        local view = player_view()
+        view.intent = nil
+        local broken = { log_entry(player_view(), "a"), log_entry(view, "b") }
+        local ok, err = pcall(duel.rows_from_player_moves, broken, { ctx_len = CTX_LEN })
+        expect(ok).to.equal(false)
+        expect(err:match("move 2") ~= nil).to.equal(true)
+        expect(err:match("view%.intent") ~= nil).to.equal(true)
+    end)
+
+    it("rejects a logged intent that is not a boss move", function()
+        expect(function()
+            duel.rows_from_player_moves({ log_entry(player_view({ intent = "a" }), "b") }, {
+                ctx_len = CTX_LEN,
+            })
+        end).to.fail()
     end)
 
     it("rejects an entry that carries no player view", function()
@@ -499,11 +663,15 @@ describe("guardian_duel.rows_from_player_moves", function()
         local script = { "a", "A", "b", "p", "a", "b", "A", "p", "b" }
         for i = 1, duel.TURN_LIMIT do
             local move = script[i]
+            -- The teacher answers from the position at the head of the
+            -- turn, so on the turn after a poke its answer is exactly
+            -- what the board showed the player.
+            local answer = duel.policy_guardian(g.boss)
             log[#log + 1] = {
-                player = duel.player_view(g, "guardian"),
+                player = duel.player_view(g, "guardian", g.revealed and answer or nil),
                 player_action = move,
             }
-            g = duel.apply(g, move, duel.policy_guardian(g.boss))
+            g = duel.apply(g, move, answer)
         end
         local rows, plays = duel.rows_from_player_moves(log, { ctx_len = CTX_LEN })
         expect(#rows).to.equal(duel.TURN_LIMIT)
@@ -511,5 +679,11 @@ describe("guardian_duel.rows_from_player_moves", function()
         for _, row in ipairs(rows) do
             expect(#row).to.equal(CTX_LEN)
         end
+        -- The script pokes on turns four and eight, so the two turns
+        -- after them are the ones that carry an answer.
+        expect(plays[1].view.intent).to.equal(duel.NO_INTENT)
+        expect(plays[4].view.intent).to.equal(duel.NO_INTENT)
+        expect(plays[5].view.intent ~= duel.NO_INTENT).to.equal(true)
+        expect(plays[9].view.intent ~= duel.NO_INTENT).to.equal(true)
     end)
 end)

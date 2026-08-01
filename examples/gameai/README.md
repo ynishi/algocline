@@ -923,6 +923,34 @@ for a human to judge — how much of the character survives the win-rate
 climb is deliberately not a machine's call. `ckpt_every = 0` (the
 default) restores the plain training run untouched.
 
+### Harvesting staged bosses in a single run
+
+`enable_stages = true` swaps the single-threshold gate for a *staged*
+judgment that carves the strength axis into named bands (default
+`weak [0.10, 0.30]` / `mid [0.55, 0.85]` / `strong [0.851, 0.98]` on
+`level.ci_lower`). Every checkpoint whose `ci_lower` lands in a band
+is immediately baked into a durable Card via
+`alc.nn.card.save_from_ckpt`, pinned to
+`<stage_alias_prefix>_<label>` (`guardian_duel_npc_weak` /
+`_mid` / `_strong` by default), and recorded in a JSON manifest at
+`collection_path`. First-writer-wins per label: the earliest fire to
+enter a band harvests it, because the earlier fire keeps more of the
+teacher-distance and sampler-entropy that the mid- to strong-band
+policy loses on its way to the win-rate ceiling. A checkpoint above
+the topmost band `hi` stops the run (a break); everything below the
+lowest band `lo` keeps training. `enable_stages` and `enable_gate`
+compose: the gate can still break early on the strength axis while
+staged is still filling weaker labels. `stage_bands` in `ctx`
+overrides the defaults if the measured-in-the-wild bands live
+elsewhere.
+
+`alc.nn.card.save_from_ckpt(path, name, meta)` is the additive
+sibling of `alc.nn.card.save`: instead of taking an in-memory vars
+table it copies a raw safetensors file (a `run_full_ft` checkpoint,
+in this pipeline) into the Card store's canonical layout and mints
+a Card. It lets the harvest hook promote a mid-run checkpoint to a
+persistent artefact without paying the round-trip through vars.
+
 ## Known limitations
 
 - Style compliance depends on the training budget. The defaults (800

@@ -95,7 +95,15 @@ alc.math.rng_int = function(rng, min, max)
 end
 
 alc.card = alc.card or {}
-alc.card.alias_set = function() end
+
+--- alias_set invocations recorded in fire order. Each entry is
+--- `{alias, card_id, opts}`; specs assert on both the alias name (built
+--- from `<prefix>_<label>`) and the count so a double-bake would show
+--- up as an over-count rather than silently as a duplicate row.
+local ALIAS_SET_CALLS = {}
+alc.card.alias_set = function(alias, card_id, opts)
+    ALIAS_SET_CALLS[#ALIAS_SET_CALLS + 1] = { alias = alias, card_id = card_id, opts = opts }
+end
 alc.card.get = function()
     -- Below `math.log(model_vocab)`, so the script's "gradients flowed"
     -- assertion passes and `ok` reports on the wiring instead.
@@ -148,6 +156,19 @@ local LOADED = {}
 --- When set, `load_ckpt` raises this message instead of returning.
 local LOAD_CKPT_ERROR = nil
 
+--- save_from_ckpt invocations recorded in fire order. Each entry is
+--- `{ckpt_path, name, meta}` so a spec can check that the copy source
+--- is the very ckpt path the hook was handed (rather than a cached
+--- previous path) and that the meta carries `training_path = "full_ft"`.
+local SAVE_FROM_CKPT_CALLS = {}
+--- Card IDs the save_from_ckpt stub hands back, one per call.
+local NEXT_CARD_ID = 0
+
+local function next_card_id()
+    NEXT_CARD_ID = NEXT_CARD_ID + 1
+    return string.format("card-harvest-%04d", NEXT_CARD_ID)
+end
+
 alc.nn.card = {
     load_ckpt = function(path, opts)
         if LOAD_CKPT_ERROR ~= nil then
@@ -156,6 +177,16 @@ alc.nn.card = {
         local handle = { _ckpt_path = path, _arch = opts and opts.arch }
         LOADED[#LOADED + 1] = handle
         return handle
+    end,
+    save_from_ckpt = function(path, name, meta)
+        local card_id = next_card_id()
+        SAVE_FROM_CKPT_CALLS[#SAVE_FROM_CKPT_CALLS + 1] = {
+            ckpt_path = path,
+            name = name,
+            meta = meta,
+            card_id = card_id,
+        }
+        return card_id
     end,
 }
 
@@ -225,6 +256,62 @@ package.preload["gameai_metrics"] = function()
     return {}
 end
 
+--- Records handed to the harvest collection helper, in append order.
+--- Each entry mirrors the tuple the train script feeds `:append`.
+local COLL_APPEND_CALLS = {}
+--- Number of `:save()` calls the collection saw during the drive.
+local COLL_SAVE_CALLS = 0
+--- Opts the script handed to `hc.new` on the last drive (nil when the
+--- staged path was off).
+local COLL_NEW_OPTS = nil
+
+--- Stub collection helper. Mirrors the real one's contract without
+--- touching the filesystem: `:append` respects first-writer-wins per
+--- label, `:save` is a counter, and the two invocation logs above let
+--- a spec assert on both the tuple shape and the call ordering. The
+--- real helper is spec'd separately under
+--- `gameai_metrics/spec/harvest_collection_spec.lua`.
+package.preload["gameai_metrics.harvest_collection"] = function()
+    return {
+        new = function(opts)
+            COLL_NEW_OPTS = opts
+            local coll = {
+                _entries = {},
+                _by_label = {},
+            }
+            function coll:append(dec, info, records, extra)
+                COLL_APPEND_CALLS[#COLL_APPEND_CALLS + 1] = {
+                    dec = dec,
+                    info = info,
+                    records = records,
+                    extra = extra,
+                }
+                local label = dec and dec.meta and dec.meta.label
+                if type(label) ~= "string" or label == "" then
+                    return false
+                end
+                if self._by_label[label] then
+                    return false
+                end
+                self._by_label[label] = true
+                self._entries[#self._entries + 1] = { label = label, extra = extra }
+                return true
+            end
+            function coll:save()
+                COLL_SAVE_CALLS = COLL_SAVE_CALLS + 1
+            end
+            function coll:entries()
+                local out = {}
+                for index, entry in ipairs(self._entries) do
+                    out[index] = entry
+                end
+                return out
+            end
+            return coll
+        end,
+    }
+end
+
 -- ─── Driver ─────────────────────────────────────────────────────────
 
 --- Values the stub `level` metric reports, overridden per case.
@@ -240,6 +327,12 @@ local function configure()
     TRAIN_OPTS = nil
     LOAD_CKPT_ERROR = nil
     LEVEL_ERROR = nil
+    ALIAS_SET_CALLS = {}
+    SAVE_FROM_CKPT_CALLS = {}
+    NEXT_CARD_ID = 0
+    COLL_APPEND_CALLS = {}
+    COLL_SAVE_CALLS = 0
+    COLL_NEW_OPTS = nil
     LEVEL_VALUES = {
         win_rate = 0.40,
         ci_lower = 0.28,
@@ -307,6 +400,21 @@ end
 
 local function contains(haystack, needle)
     return tostring(haystack):find(needle, 1, true) ~= nil
+end
+
+--- Filter `ALIAS_SET_CALLS` down to the ones matching `alias`. Kept
+--- separate from a raw length check because `train_style` also pins
+--- the training aliases (`guardian_duel_npc_<style>` and the bare
+--- `guardian_duel_npc`) on every run, which have nothing to do with
+--- the staged harvest path and would otherwise dominate the count.
+local function alias_set_calls_for(alias)
+    local out = {}
+    for _, call in ipairs(ALIAS_SET_CALLS) do
+        if call.alias == alias then
+            out[#out + 1] = call
+        end
+    end
+    return out
 end
 
 -- ─── Cases ──────────────────────────────────────────────────────────
@@ -490,6 +598,227 @@ describe("train_guardian_npc measurement failure", function()
         expect(contains(out.observations, '"view_id":"ckpt_load"')).to.equal(true)
         -- No handle reached a metric, so none of them ran.
         expect(#EVAL_CALLS).to.equal(0)
+    end)
+end)
+
+describe("train_guardian_npc staged harvest", function()
+    it("does not touch the harvest path when enable_stages is off", function()
+        configure()
+        -- ci_lower sits inside the default weak band; the staged path
+        -- would harvest here if it were live. With the switch off it
+        -- must not fire the bake, the alias, or the collection.
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({})
+
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        -- The training aliases still get pinned per style (that path
+        -- is pre-existing); only the harvest-specific aliases stay
+        -- absent when the staged switch is off.
+        expect(#alias_set_calls_for("guardian_duel_npc_weak")).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_mid")).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_strong")).to.equal(0)
+        expect(#COLL_APPEND_CALLS).to.equal(0)
+        expect(COLL_SAVE_CALLS).to.equal(0)
+        expect(COLL_NEW_OPTS).to.equal(nil)
+        expect(out.stages_enabled).to.equal(false)
+        expect(#out.stages_harvested).to.equal(0)
+        expect(out.collection_path).to.equal(nil)
+        -- Existing hook path stays byte-invariant.
+        for _, action in ipairs(HOOK_ACTIONS) do
+            expect(action).to.equal("continue")
+        end
+        expect(out.ckpt_fires).to.equal(PLANNED_FIRES)
+    end)
+
+    it("bakes a Card, pins the alias and records one entry on harvest", function()
+        configure()
+        -- Sits in the default weak band [0.10, 0.30].
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({ enable_stages = true })
+
+        expect(type(COLL_NEW_OPTS)).to.equal("table")
+        expect(COLL_NEW_OPTS.path).to.equal("workspace/gameai-harvest/collection.json")
+        expect(#COLL_NEW_OPTS.bands).to.equal(3)
+        expect(COLL_NEW_OPTS.meta.style).to.equal("guardian")
+
+        -- Only the first fire in the band pays the bake; the other two
+        -- hit first-writer-wins and skip the Card copy entirely.
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(1)
+        expect(SAVE_FROM_CKPT_CALLS[1].ckpt_path).to.equal("ckpt-1.safetensors")
+        expect(SAVE_FROM_CKPT_CALLS[1].name).to.equal("guardian_duel_npc_weak")
+        expect(SAVE_FROM_CKPT_CALLS[1].meta.architecture).to.equal("gpt2-tiny")
+        expect(SAVE_FROM_CKPT_CALLS[1].meta.training_path).to.equal("full_ft")
+
+        local weak_aliases = alias_set_calls_for("guardian_duel_npc_weak")
+        expect(#weak_aliases).to.equal(1)
+        expect(weak_aliases[1].card_id).to.equal(SAVE_FROM_CKPT_CALLS[1].card_id)
+        expect(contains(weak_aliases[1].opts.note, "label=weak")).to.equal(true)
+
+        expect(#COLL_APPEND_CALLS).to.equal(1)
+        expect(COLL_APPEND_CALLS[1].extra.card_id).to.equal(SAVE_FROM_CKPT_CALLS[1].card_id)
+        expect(COLL_APPEND_CALLS[1].extra.alias).to.equal("guardian_duel_npc_weak")
+        -- Write-through: save() rides along with the append that
+        -- actually stored an entry.
+        expect(COLL_SAVE_CALLS).to.equal(1)
+
+        expect(out.stages_enabled).to.equal(true)
+        expect(#out.stages_harvested).to.equal(1)
+        expect(out.stages_harvested[1]).to.equal("weak")
+        expect(out.collection_path).to.equal(
+            "workspace/gameai-harvest/collection.json"
+        )
+        for _, action in ipairs(HOOK_ACTIONS) do
+            expect(action).to.equal("continue")
+        end
+    end)
+
+    it("stops the run when the staged judgment breaks above the top band", function()
+        configure()
+        -- Above default strong.hi = 0.98: the staged judgment answers
+        -- "break", and no Card is baked (harvest and break are
+        -- exclusive per fire).
+        LEVEL_VALUES.ci_lower = 0.99
+        local out = drive({ enable_stages = true })
+
+        expect(HOOK_ACTIONS[1]).to.equal("break")
+        expect(#HOOK_ACTIONS).to.equal(1)
+        expect(out.ckpt_fires).to.equal(1)
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_strong")).to.equal(0)
+        expect(#COLL_APPEND_CALLS).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+        -- The Card is still minted by the trainer stub on a
+        -- hook-requested stop.
+        expect(out.card_id).to.equal("card-stub-0001")
+    end)
+
+    it("harvests then continues when only the staged path fires under a coexisting gate", function()
+        configure()
+        -- Below the gate target, inside the weak band. Staged harvests
+        -- weak, gate continues, hook keeps going.
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({
+            enable_stages = true,
+            enable_gate = true,
+            target_win_rate_lo = 0.55,
+        })
+
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(1)
+        expect(SAVE_FROM_CKPT_CALLS[1].name).to.equal("guardian_duel_npc_weak")
+        expect(out.stages_harvested[1]).to.equal("weak")
+        expect(out.gate_enabled).to.equal(true)
+        for _, action in ipairs(HOOK_ACTIONS) do
+            expect(action).to.equal("continue")
+        end
+        expect(out.ckpt_fires).to.equal(PLANNED_FIRES)
+    end)
+
+    it("breaks on the gate when the staged path is only harvesting under coexistence", function()
+        configure()
+        -- Sits in the default mid band [0.55, 0.85] and above the
+        -- gate target: staged harvests mid, gate breaks. Harvest
+        -- side-effects still land on the fire the break happens on,
+        -- so the manifest keeps the mid entry.
+        LEVEL_VALUES.ci_lower = 0.75
+        local out = drive({
+            enable_stages = true,
+            enable_gate = true,
+            target_win_rate_lo = 0.55,
+        })
+
+        expect(HOOK_ACTIONS[1]).to.equal("break")
+        expect(#HOOK_ACTIONS).to.equal(1)
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(1)
+        expect(SAVE_FROM_CKPT_CALLS[1].name).to.equal("guardian_duel_npc_mid")
+        expect(out.stages_harvested[1]).to.equal("mid")
+    end)
+
+    it("prefers the staged break when the staged and gate breaks fire together", function()
+        configure()
+        -- Above default strong.hi and above the gate target: staged
+        -- says break, gate says break. Either way the hook stops the
+        -- run; the assertion is that no harvest side-effect leaks in
+        -- (a staged break is exclusive with harvest for the same fire).
+        LEVEL_VALUES.ci_lower = 0.99
+        local out = drive({
+            enable_stages = true,
+            enable_gate = true,
+            target_win_rate_lo = 0.55,
+        })
+
+        expect(HOOK_ACTIONS[1]).to.equal("break")
+        expect(#HOOK_ACTIONS).to.equal(1)
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_strong")).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+    end)
+
+    it("skips the harvest when the strength view records an error", function()
+        configure()
+        LEVEL_ERROR = "level exploded on purpose"
+        local out = drive({ enable_stages = true })
+
+        -- Staged reads the error record as a miss and continues; the
+        -- run keeps going without paying any bake or alias.
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_weak")).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_mid")).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_strong")).to.equal(0)
+        expect(#COLL_APPEND_CALLS).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+        for _, action in ipairs(HOOK_ACTIONS) do
+            expect(action).to.equal("continue")
+        end
+        expect(out.ckpt_fires).to.equal(PLANNED_FIRES)
+    end)
+
+    it("skips the harvest when the checkpoint fails to load", function()
+        configure()
+        LOAD_CKPT_ERROR = "load_ckpt: no such file"
+        local out = drive({ enable_stages = true })
+
+        -- No handle reached the staged judgment; nothing to harvest.
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_weak")).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_mid")).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_strong")).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+        for _, action in ipairs(HOOK_ACTIONS) do
+            expect(action).to.equal("continue")
+        end
+    end)
+
+    it("refuses ckpt_keep < 2 when stages are enabled", function()
+        configure()
+        local ok, err = pcall(drive, { enable_stages = true, ckpt_keep = 1 })
+        expect(ok).to.equal(false)
+        expect(contains(err, "ckpt_keep")).to.equal(true)
+        expect(contains(err, "enable_stages")).to.equal(true)
+    end)
+
+    it("threads a custom alias prefix through both the bake and the alias", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({
+            enable_stages = true,
+            stage_alias_prefix = "custom_boss",
+        })
+
+        expect(SAVE_FROM_CKPT_CALLS[1].name).to.equal("custom_boss_weak")
+        expect(#alias_set_calls_for("custom_boss_weak")).to.equal(1)
+        expect(out.stages_harvested[1]).to.equal("weak")
+    end)
+
+    it("respects a caller-supplied collection path in the manifest options", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({
+            enable_stages = true,
+            collection_path = "/tmp/spec-collection.json",
+        })
+
+        expect(COLL_NEW_OPTS.path).to.equal("/tmp/spec-collection.json")
+        expect(out.collection_path).to.equal("/tmp/spec-collection.json")
     end)
 end)
 

@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.card.save_from_ckpt(path, name, meta) -> card_id` — additive
+  sibling of `alc.nn.card.save`. Copies a raw safetensors file (a
+  mid-run `alc.nn.trainer.run_full_ft` checkpoint, in practice) into
+  the Card store's canonical layout and mints a Card without paying
+  the vars round-trip. Same meta schema, same on-disk layout, so
+  downstream `alc.nn.card.load` / `load_handle` consume the result
+  unchanged. Named-variant only (`gpt2-tiny` etc.); `gpt2-custom`
+  needs `build_nn_meta` to populate the custom branch and is deferred.
+  4 Rust unit tests + 2 Lua bridge round-trip tests.
+
+- `examples/gameai/anymetric` — `judgment.band{view_id, field, lo, hi,
+  label?}` and `judgment.staged{view_id, field, bands}`. Four arms
+  (missing / errored / non-numeric → `continue`, inside a band →
+  `harvest` with `Decision.meta = {label, step, values}`, above
+  topmost `hi` → `break`, below the lowest `lo` → `continue`). Bands
+  are strictly disjoint (`bands[i].hi < bands[i+1].lo`); a shared
+  boundary is rejected because the hit label would be
+  non-deterministic. `Decision` gains an optional `meta` field that
+  the adapter merges into the harvest marker; built-in `harvest` /
+  `reason` fields always win over conflicting meta keys. Stateless —
+  first-writer-wins is caller-side. Existing `threshold` /
+  `never_break` remain byte-invariant (no `meta`). 32 new spec tests.
+
+- `examples/gameai/gameai_metrics/harvest_collection.lua` — Lua-side
+  utility that consumes anymetric harvest markers and writes a JSON
+  manifest (`schema_version = 1`) of `(label, step, ckpt_path,
+  card_id, alias, level_win_rate, level_ci_lower, sd_teacher,
+  trickiness_norm)` tuples. Configurable policy
+  (`first_writer_wins` default / `last_writer_wins`), partial
+  collections allowed (a run that only hits some bands still saves).
+  23 spec tests covering the write-through / merge / policy /
+  round-trip surface.
+
+- `examples/gameai/train_guardian_npc.lua` — `enable_stages = true`
+  arms the staged-harvest path: every checkpoint whose `level.ci_lower`
+  lands in a band is baked immediately via `save_from_ckpt`, pinned
+  to `<stage_alias_prefix>_<label>` (`guardian_duel_npc_weak/mid/
+  strong` by default), and appended to the collection manifest.
+  First-writer-wins per label. `enable_stages` composes with
+  `enable_gate`: staged-side `break` (top-band overshoot) wins over
+  a same-fire gate break; harvest side-effects still run when the
+  gate breaks on the same fire (so the mid-band Card lands even when
+  the gate stops the run on the same checkpoint). `ckpt_keep >= 2` is
+  asserted up front. `enable_stages = false` (the default) is
+  byte-invariant with the prior behaviour. 11 new spec tests.
+
 - `alc.nn.trainer.run_full_ft` now accepts the optional `opts.on_ckpt`
   checkpoint hook, mirrored from the `alc.nn.trainer.full_ft` sibling
   through the shared extractor. The Card-writing surface (the one every

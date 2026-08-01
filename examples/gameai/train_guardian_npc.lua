@@ -40,7 +40,11 @@
 --                  byte-for-byte the pre-observation one.
 --   ckpt_keep   -- rotating checkpoints kept on disk (default 6). The
 --                  hook loads the file it is handed, so this only has
---                  to outlive one fire.
+--                  to outlive one fire. When `enable_stages` is true
+--                  the floor is raised to 2, because the staged path
+--                  loads the ckpt and then copies it into a Card
+--                  through `alc.nn.card.save_from_ckpt`, and the copy
+--                  needs the file to survive past the load.
 --   teacher_alias        -- reference Card the style distance is
 --                  measured against (default "guardian_duel_npc", the
 --                  bare teacher alias). It has to name a Card baked
@@ -63,6 +67,32 @@
 --                  (default 0.55). A floor rather than a band: at the
 --                  measured interval widths a band would fire on
 --                  noise.
+--
+-- ctx (staged harvest, all optional):
+--   enable_stages        -- when true the run also runs a staged
+--                  judgment over `stage_bands`, bakes a Card via
+--                  `alc.nn.card.save_from_ckpt` for the first fire
+--                  that lands in each band, pins the per-band alias
+--                  and appends one entry per band to a collection
+--                  manifest (default false). May be combined with
+--                  `enable_gate`: the two judgments are independent
+--                  and are merged in the hook. Refused for
+--                  `style = "all"` because one manifest cannot cover
+--                  several styles at once.
+--   stage_bands  -- array of `{lo, hi, label}` bands the staged
+--                  judgment reads off `level.ci_lower`. The default
+--                  is the three-band schedule the design settled on
+--                  (`{lo=0.10, hi=0.30, weak}, {lo=0.55, hi=0.85, mid},
+--                  {lo=0.85, hi=0.98, strong}`); `strong.hi = 0.98`
+--                  is deliberately under 1.0 so an above-top break is
+--                  physically reachable and terminates the run.
+--   stage_alias_prefix   -- prefix the per-band alias is built from
+--                  (default "guardian_duel_npc"); the alias name is
+--                  `<prefix>_<label>` (e.g. "guardian_duel_npc_mid").
+--   collection_path      -- output path for the harvest manifest
+--                  (default "workspace/gameai-harvest/collection.json").
+--                  Rewritten in full after every harvest for crash
+--                  tolerance.
 --
 -- The three views are read independently and never folded into one
 -- number: win rate answers game-optimality, style distance answers how
@@ -133,6 +163,33 @@ local GATE_GAMES = math.floor(tonumber(ctx_field("gate_games")) or 50)
 local TARGET_WIN_RATE_LO = tonumber(ctx_field("target_win_rate_lo")) or 0.55
 local ENABLE_GATE = ctx_field("enable_gate") and true or false
 
+--- Staged harvest configuration. `ENABLE_STAGES` is the switch every
+--- other setting on this block depends on; when it is false the whole
+--- harvest path is inert and the run is byte-for-byte the pre-harvest
+--- one (same trainer opts, same hook body, same return shape modulo the
+--- additive `stages_*` fields).
+---
+--- The default bands come straight from the observation table in the
+--- design doc: `weak` sits under the noise floor the first fires
+--- produce, `mid` covers the middle of the arc, and `strong.hi = 0.98`
+--- leaves a physical gap between the top band and 1.0 so a break at
+--- the top is reachable rather than nominal.
+local ENABLE_STAGES = ctx_field("enable_stages") and true or false
+-- Bands are held to `anymetric.judgment.staged`'s disjointness rule
+-- (`bands[i].hi < bands[i+1].lo`), so the design's headline cut point
+-- of 0.85 lands on the mid band and the strong band opens one epsilon
+-- above it. That leaves the arc's intent intact (mid covers up to 0.85,
+-- strong covers 0.85+) while satisfying the domain contract.
+local STAGE_BANDS = ctx_field("stage_bands")
+    or {
+        { lo = 0.10, hi = 0.30, label = "weak" },
+        { lo = 0.55, hi = 0.85, label = "mid" },
+        { lo = 0.851, hi = 0.98, label = "strong" },
+    }
+local STAGE_ALIAS_PREFIX = ctx_field("stage_alias_prefix") or "guardian_duel_npc"
+local COLLECTION_PATH = ctx_field("collection_path")
+    or "workspace/gameai-harvest/collection.json"
+
 --- Player policies the win rate is measured against.
 ---
 --- Not a ctx field: on the boss seat the opponent sits in the player
@@ -169,6 +226,44 @@ if CKPT_EVERY > 0 then
     -- below reach them by name. Deferred behind the switch so a run
     -- with observation disabled touches no metric surface at all.
     require("gameai_metrics")
+end
+
+-- Staged harvest preconditions. All of them are enforced up front so a
+-- broken ctx fails before any training budget is spent, rather than
+-- surfacing sixty steps into the run.
+if ENABLE_STAGES then
+    if CKPT_EVERY <= 0 then
+        error(
+            "train_guardian_npc: ctx.enable_stages requires ctx.ckpt_every > 0 (the harvest "
+                .. "path fires from the checkpoint hook)"
+        )
+    end
+    -- The staged path loads the ckpt in the hook and then copies it
+    -- into a Card via `save_from_ckpt`, so the trainer must retain at
+    -- least the file being read plus the one written just before it.
+    -- A rotating buffer of one would delete the ckpt out from under
+    -- the copy on the next fire.
+    if CKPT_KEEP < 2 then
+        error(
+            "train_guardian_npc: ctx.enable_stages requires ctx.ckpt_keep >= 2 (safety net for "
+                .. "load_ckpt + save_from_ckpt on the same file)"
+        )
+    end
+    if STYLE == "all" then
+        error(
+            "train_guardian_npc: ctx.enable_stages is single-style only; one manifest cannot "
+                .. "cover several styles at once"
+        )
+    end
+    if type(STAGE_ALIAS_PREFIX) ~= "string" or #STAGE_ALIAS_PREFIX == 0 then
+        error("train_guardian_npc: ctx.stage_alias_prefix must be a non-empty string")
+    end
+    if type(COLLECTION_PATH) ~= "string" or #COLLECTION_PATH == 0 then
+        error("train_guardian_npc: ctx.collection_path must be a non-empty string")
+    end
+    if type(STAGE_BANDS) ~= "table" or #STAGE_BANDS == 0 then
+        error("train_guardian_npc: ctx.stage_bands must be a non-empty array of bands")
+    end
 end
 
 local VOCAB = duel.vocab()
@@ -415,16 +510,20 @@ end
 -- strength gate cannot start reacting to a personality metric that
 -- happens to be observed alongside it.
 
---- Bind the views, the judgment and the log a single run is observed
+--- Bind the views, the judgments and the log a single run is observed
 --- through.
 ---
 --- The prompt set is the branch states `check_states` already collected:
 --- boss states reached by playing, which is the element type both
 --- distribution metrics read on the boss seat. Writing positions out by
 --- hand instead would measure the Card on lines a fight never produces.
+---
+--- Returns the gate judgment and the staged judgment as separate values
+--- so the hook can react to each one independently. Either or both may
+--- be `nil` when the corresponding switch is off.
 ---@param style string Distance basis every view shares
 ---@param checks table[] `check_states(style)` output
----@return table views, function judgment, table run_log
+---@return table views, function|nil gate_judgment, function|nil stage_judgment, table run_log
 local function observation_wiring(style, checks)
     local prompt_set = {}
     for _, check in ipairs(checks) do
@@ -466,32 +565,78 @@ local function observation_wiring(style, checks)
     -- Only the strength axis carries a criterion that can be written
     -- down, so it is the only one wired to a gate. The other two are
     -- recorded for a reader and never consulted here.
-    local judgment
+    local gate_judgment
     if ENABLE_GATE then
-        judgment = am.judgment.threshold({
+        gate_judgment = am.judgment.threshold({
             view_id = "level",
             field = "ci_lower",
             op = ">=",
             value = TARGET_WIN_RATE_LO,
         })
-    else
-        judgment = am.judgment.never_break()
     end
 
-    return views, judgment, am.run_log.new()
+    -- Staged harvest reads the same strength view: the bands are lower
+    -- bounds on the same ci_lower the gate consults. The judgment is
+    -- stateless (`anymetric` does not remember which labels have been
+    -- harvested); enforcing "one bake per label" is `make_observer`'s
+    -- job, in tandem with the collection helper's first-writer policy.
+    local stage_judgment
+    if ENABLE_STAGES then
+        stage_judgment = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = STAGE_BANDS,
+        })
+    end
+
+    return views, gate_judgment, stage_judgment, am.run_log.new()
 end
 
 --- Build the checkpoint observer one style's run fires.
 ---
---- The returned table carries the hook itself, the fire count and the
---- log the records land in, so the caller can report all three without
---- reaching into a closure.
+--- The returned table carries the hook itself, the fire count, the log
+--- the records land in, and — when `ENABLE_STAGES` is on — the harvest
+--- collection helper and the list of band labels that were baked into
+--- Cards during this run. Keeping every piece the caller might report
+--- on the observer means the return of `train_style` can be assembled
+--- without reaching into a closure.
 ---@param style string
 ---@param checks table[] `check_states(style)` output
----@return table observer `{ hook, fires, run_log }`
+---@return table observer `{ hook, fires, run_log, collection?, stages_harvested }`
 local function make_observer(style, checks)
-    local views, judgment, run_log = observation_wiring(style, checks)
-    local observer = { fires = 0, run_log = run_log }
+    local views, gate_judgment, stage_judgment, run_log = observation_wiring(style, checks)
+
+    -- Built once per run so the fallback (no gate, no stages) keeps its
+    -- pre-observation cost profile: one judgment, one closure allocation.
+    local fallback_judgment = am.judgment.never_break()
+
+    local collection
+    if ENABLE_STAGES then
+        -- Deferred behind the switch so the run stays byte-identical
+        -- to the pre-stages one when the harvest path is off: the
+        -- module is not required, the helper is not built, no
+        -- collection file is touched.
+        local hc = require("gameai_metrics.harvest_collection")
+        collection = hc.new({
+            path = COLLECTION_PATH,
+            meta = {
+                style = style,
+                steps = STEPS,
+                ckpt_every = CKPT_EVERY,
+                gate_games = GATE_GAMES,
+                seed = SEED,
+                alias_prefix = STAGE_ALIAS_PREFIX,
+            },
+            bands = STAGE_BANDS,
+        })
+    end
+
+    local observer = {
+        fires = 0,
+        run_log = run_log,
+        collection = collection,
+        stages_harvested = {},
+    }
 
     observer.hook = function(info)
         observer.fires = observer.fires + 1
@@ -522,7 +667,87 @@ local function make_observer(style, checks)
             log(string.format("[%s] observation %s", style, alc.json_encode(record)))
         end
 
-        return am.to_hook_action(judgment(records), run_log)
+        -- The two judgments run independently on the same records: the
+        -- staged one reads `level.ci_lower` for band membership, the
+        -- gate one reads the same field for the target floor. Either
+        -- may be absent when its switch is off.
+        local stage_dec = stage_judgment and stage_judgment(records) or nil
+        local gate_dec = gate_judgment and gate_judgment(records) or nil
+
+        -- Harvest side-effects: bake the ckpt into a Card, pin the
+        -- per-band alias, and record the entry in the manifest. Order
+        -- matters — the manifest carries the card_id and alias only
+        -- after both have been minted. First-writer-wins is enforced
+        -- twice: once via the local `stages_harvested` set (so the
+        -- second fire in the same band never pays the Card copy), and
+        -- once inside the collection helper (which drops the append
+        -- with `stored = false` if the local set was somehow bypassed).
+        if collection and stage_dec and stage_dec.action == "harvest" then
+            local label = stage_dec.meta and stage_dec.meta.label
+            if type(label) == "string" and label ~= "" then
+                local already = false
+                for _, seen in ipairs(observer.stages_harvested) do
+                    if seen == label then
+                        already = true
+                        break
+                    end
+                end
+                if not already then
+                    local alias = string.format("%s_%s", STAGE_ALIAS_PREFIX, label)
+                    local card_id = alc.nn.card.save_from_ckpt(info.ckpt_path, alias, {
+                        architecture = CKPT_ARCH,
+                        training_path = "full_ft",
+                    })
+                    alc.card.alias_set(alias, card_id, {
+                        pkg = "guardian_duel_npc",
+                        note = "boss harvest label=" .. label,
+                    })
+                    local stored = collection:append(
+                        stage_dec,
+                        info,
+                        records,
+                        { card_id = card_id, alias = alias }
+                    )
+                    if stored then
+                        observer.stages_harvested[#observer.stages_harvested + 1] = label
+                        -- Write-through so a mid-run crash still
+                        -- leaves the entries collected so far on disk.
+                        collection:save()
+                        log(
+                            string.format(
+                                "[%s] harvested %s -> card %s (alias %q)",
+                                style,
+                                label,
+                                card_id,
+                                alias
+                            )
+                        )
+                    end
+                end
+            end
+        end
+
+        -- Break precedence: the staged "above top" break wins over
+        -- the gate break when they fire on the same record. That
+        -- matches the design's semantics — reaching `strong` means
+        -- the arc is complete, and by construction the gate's target
+        -- has been passed long before.
+        if stage_dec and stage_dec.action == "break" then
+            return "break"
+        end
+        if gate_dec and gate_dec.action == "break" then
+            return "break"
+        end
+
+        -- Fall through to the adapter with whichever decision remains.
+        -- When both switches are off the run is byte-for-byte the
+        -- pre-observation one: `never_break` continues, `to_hook_action`
+        -- projects that to "continue".
+        local dec = stage_dec or gate_dec
+        if dec == nil then
+            dec = fallback_judgment(records)
+        end
+        return am.to_hook_action(dec, run_log)
     end
 
     return observer
@@ -764,6 +989,16 @@ local function train_style(style, alias)
         gate_games = GATE_GAMES,
         teacher_alias = TEACHER_ALIAS,
         observations = observations,
+        -- Staged harvest trail. `stages_enabled` is reported even when
+        -- the harvest path is off so a downstream reader can tell an
+        -- inert run from one that ran the path but harvested nothing;
+        -- `stages_harvested` is the ordered list of band labels the
+        -- run actually baked into Cards, and `collection_path` is the
+        -- manifest path the entries were written to (nil when
+        -- `enable_stages = false`).
+        stages_enabled = ENABLE_STAGES,
+        stages_harvested = observer.stages_harvested,
+        collection_path = ENABLE_STAGES and COLLECTION_PATH or nil,
     }
 end
 

@@ -951,6 +951,32 @@ in this pipeline) into the Card store's canonical layout and mints
 a Card. It lets the harvest hook promote a mid-run checkpoint to a
 persistent artefact without paying the round-trip through vars.
 
+### Auditing a harvested collection
+
+`gameai_metrics.audit_matrix` reads back a manifest that
+`harvest_collection` wrote, restores each Card from its recorded
+`card_id`, and produces two tables side by side: a per-Card
+baseline (`level.win_rate` + Wilson CI vs the random player policy,
+`trickiness` on the boss seat, `style_distance` vs the teacher) at
+higher game counts than the harvest hook could afford, and a
+pair-wise `style_distance` matrix between the Cards themselves.
+The pair-wise matrix answers the question the harvest hook cannot:
+"how different is each stage from the others, not just from the
+teacher?" — the human-judgment input for whether a strong Card is
+a distinct policy or the mid Card carried further along the same
+teacher-collapse trajectory. `examples/gameai/audit_boss_collection.lua`
+is a thin `alc_run` driver: point it at a harvest manifest with
+`ctx.collection_path` and a `ctx.output` path, and it writes the
+audit as JSON plus a summary line per Card and per Card-pair.
+
+The auto-mkdir helper that both the harvest manifest writer and
+the audit writer use lives in `gameai_metrics._fs` — the manifest
+writer used to require the parent directory to exist before the
+first `on_ckpt` fire, which meant a missing `workspace/…` prefix
+crashed the trainer mid-run; `_fs.ensure_parent_dir` runs `mkdir
+-p` under a POSIX single-quote escape so any path the caller can
+name is safe to hand to `:save()`.
+
 ## Known limitations
 
 - Style compliance depends on the training budget. The defaults (800

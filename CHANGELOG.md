@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/gameai/gameai_metrics/audit_matrix.lua` — post-hoc auditor
+  for a boss harvest manifest. `am.new{collection_path | aliases,
+  n_games, prompt_set_size, seed, style, teacher_alias}` builds an
+  auditor; `audit:run()` restores each Card from its recorded
+  `card_id`, re-measures the per-Card baseline (`level` with a Wilson
+  CI at higher game counts than the harvest hook could afford,
+  `trickiness` on the boss seat, `style_distance` vs the teacher),
+  and fills a symmetric pair-wise `style_distance` matrix between the
+  Cards themselves — the numeric input to the question a
+  teacher-only distance cannot answer, whether a strong Card is a
+  distinct policy or the mid Card carried further along the same
+  teacher-collapse arc. `audit:save(path)` writes the report as JSON
+  through the shared auto-mkdir helper. 26 spec tests.
+
+- `examples/gameai/audit_boss_collection.lua` — thin `alc_run` driver
+  around `audit_matrix`. Takes `ctx.collection_path` +
+  `ctx.output` (required) and the standard opt fields as passthroughs;
+  logs a one-line header, one line per Card, and one line per
+  Card-pair after `:save()`. 17 spec tests drive the required-field
+  loud errors, the default fallbacks, the runner wiring, and the
+  summary emission.
+
+- `examples/gameai/gameai_metrics/_fs.lua` — shared filesystem helper
+  with `shell_squote` (POSIX single-quote wrap that neutralises `$` /
+  `` ` `` / `!` / `"` / whitespace — Lua's `string.format("%q", …)`
+  produces Lua source escapes, not shell escapes) and
+  `ensure_parent_dir(path)`, an `os.execute("mkdir -p …")` wrapper
+  with a loud return-code check so a mid-run manifest write no longer
+  crashes the trainer when the caller has not created the target
+  directory first (the accident class the prior iter's boss-harvest
+  smoke hit). `harvest_collection:save()` now calls it before
+  `io.open`; the auditor `save` calls it too. 15 helper spec tests +
+  2 new manifest-writer tests covering fresh-directory creation.
+
 - `alc.nn.card.save_from_ckpt(path, name, meta) -> card_id` — additive
   sibling of `alc.nn.card.save`. Copies a raw safetensors file (a
   mid-run `alc.nn.trainer.run_full_ft` checkpoint, in practice) into

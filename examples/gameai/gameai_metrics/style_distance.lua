@@ -3,7 +3,7 @@
 ---
 --- ## Contract
 ---
---- `style_distance(card_a, card_b, prompt_set) -> number`
+--- `style_distance(card_a, card_b, prompt_set, opts?) -> number`
 ---
 --- - `card_a`, `card_b` — either a Lua string (Card alias resolved via
 ---   `alc.card.get_by_alias` → `alc.nn.card.load_handle`) or a live
@@ -26,32 +26,73 @@
 ---   `info.ckpt_path` is a rotating file, so the load has to happen
 ---   inside the hook body (see `alc.nn.card.load_ckpt` docs).
 ---
---- - `prompt_set` — a non-empty Lua array of guardian player-view tables
----   (`{ turn, mode, boss_hp, shift_distance, hp, weakened, exposed,
----   spikes, intent }`, as emitted by `guardian_duel.player_view`).
----   Callers building one from the bundled sample play log extract the
----   `.player` field of each entry:
+--- - `prompt_set` — a non-empty Lua array of positions. **The element
+---   type follows the seat**:
 ---
----   ```lua
----   local raw = alc.json_decode(alc.fs_read(
----       "examples/gameai/data/guardian_sample_playlog_train.json"))
----   local prompt_set = {}
----   for _, entry in ipairs(raw) do
----       prompt_set[#prompt_set + 1] = entry.player
----   end
----   ```
+---   - `seat = "player"` (default) — guardian player-view tables
+---     (`{ turn, mode, boss_hp, shift_distance, hp, weakened, exposed,
+---     spikes, intent }`, as emitted by `guardian_duel.player_view`).
+---     Callers building one from the bundled sample play log extract the
+---     `.player` field of each entry:
+---
+---     ```lua
+---     local raw = alc.json_decode(alc.fs_read(
+---         "examples/gameai/data/guardian_sample_playlog_train.json"))
+---     local prompt_set = {}
+---     for _, entry in ipairs(raw) do
+---         prompt_set[#prompt_set + 1] = entry.player
+---     end
+---     ```
+---
+---   - `seat = "boss"` — boss states (`{ cycle, mode, hp,
+---     damage_since_shift, last_player, turn, shifts }`, i.e.
+---     `guardian_duel.new_game(seed).boss` or the `.state` of a
+---     `check_states` entry).
+---
+---   Mixing the two is a loud error: a player view handed to the boss
+---   seat is named as such (`boss_seat.require_state`) rather than
+---   failing later on a missing `cycle` field.
+---
+--- - `opts` — optional table, every field additive (omitting `opts`
+---   reproduces the pre-seat behaviour byte for byte):
+---   - `seat` — `"player"` (default) or `"boss"`, the seat both Cards are
+---     read from. Both Cards are always read from the *same* seat: a
+---     divergence between two seats is not a distance.
+---   - `style` — one of `guardian_duel.STYLES`, required when
+---     `seat = "boss"`. See the same-basis contract below.
+---
+--- ## Same-basis contract (boss seat)
+---
+--- There is exactly one `style`, shared by both Cards, because the
+--- distance is only defined on a shared basis: `guardian_duel.encode`
+--- measures its `D` field against the style's mode-shift threshold, so
+--- two Cards decoded under different bases would be answering different
+--- questions and their divergence would measure the basis, not the
+--- policy. The same warning the trainer carries applies here — "a model
+--- trained under one basis and decoded under another reads a distance its
+--- labels never followed" (`train_guardian_npc.lua:41-43`).
+---
+--- This file cannot detect the violation that matters: nothing in a
+--- handle says which basis it was baked under, so a caller pairing a
+--- `guardian` bake with a `rusher` teacher gets a number that looks
+--- healthy and means nothing. Keeping the two Cards on one basis is the
+--- caller's job (the Level Sweep smoke config pins teacher and student to
+--- the same style for exactly this reason).
 ---
 --- ## Output
 ---
---- The scalar mean of `alc.nn.metric.js(p_a, p_b)` over every view in
+--- The scalar mean of `alc.nn.metric.js(p_a, p_b)` over every position in
 --- `prompt_set`, where `p_a` / `p_b` are the softmax-over-legal-moves
 --- probability rows read from each Card's next-token logits at the
 --- position (temperature 1.0, so the softmax base matches the sampler's
---- default draw).
+--- default draw). The mask is the four player moves on the player seat
+--- and the state's legal boss moves (five or six) on the boss seat; both
+--- Cards read the same state, so their rows always align element by
+--- element.
 ---
 --- Zero when the two Cards agree on every position, close to `log(2)`
 --- when they never overlap. The mean is preferred over a sum so a
---- 100-view sweep is comparable to a 32-view one.
+--- 100-position sweep is comparable to a 32-position one.
 ---
 --- ## Validation
 ---
@@ -61,6 +102,7 @@
 --- undermine the whole design.
 
 local duel = require("guardian_duel")
+local boss_seat = require("gameai_metrics.boss_seat")
 
 local M
 
@@ -94,7 +136,7 @@ end
 --- run (the stubs the spec injects) is honoured.
 local function require_js()
     if not (alc and alc.nn and alc.nn.metric and type(alc.nn.metric.js) == "function") then
-        error("style_distance: alc.nn.metric.js is unavailable; ST2 bridge missing")
+        error("style_distance: alc.nn.metric.js is unavailable; nn metric bridge missing")
     end
     return alc.nn.metric.js
 end
@@ -232,7 +274,7 @@ local function probs_for_view(handle, view)
     return probs
 end
 
---- Validate a prompt_set is a non-empty array of view tables.
+--- Validate a prompt_set is a non-empty array of positions.
 local function require_prompt_set(prompt_set)
     if type(prompt_set) ~= "table" then
         error(
@@ -248,7 +290,17 @@ local function require_prompt_set(prompt_set)
 end
 
 --- Compute mean JS divergence between two Cards over a prompt set.
-M = function(card_a, card_b, prompt_set)
+M = function(card_a, card_b, prompt_set, opts)
+    if opts ~= nil and type(opts) ~= "table" then
+        error("style_distance: opts must be a table, got " .. type(opts))
+    end
+    opts = opts or {}
+    local seat = boss_seat.require_seat(opts.seat, "style_distance")
+    local style
+    if seat == "boss" then
+        style = boss_seat.require_style(opts.style, "style_distance")
+    end
+
     local n = require_prompt_set(prompt_set)
     local js = require_js()
     local handle_a = resolve_handle(card_a, "card_a")
@@ -256,18 +308,25 @@ M = function(card_a, card_b, prompt_set)
 
     local total = 0.0
     for i = 1, n do
-        local view = prompt_set[i]
-        if type(view) ~= "table" then
-            error(
-                string.format(
-                    "style_distance: prompt_set[%d] must be a player view table, got %s",
-                    i,
-                    type(view)
+        local position = prompt_set[i]
+        local p, q
+        if seat == "boss" then
+            boss_seat.require_state(position, string.format("style_distance: prompt_set[%d]", i))
+            p = boss_seat.probs(handle_a, position, style)
+            q = boss_seat.probs(handle_b, position, style)
+        else
+            if type(position) ~= "table" then
+                error(
+                    string.format(
+                        "style_distance: prompt_set[%d] must be a player view table, got %s",
+                        i,
+                        type(position)
+                    )
                 )
-            )
+            end
+            p = probs_for_view(handle_a, position)
+            q = probs_for_view(handle_b, position)
         end
-        local p = probs_for_view(handle_a, view)
-        local q = probs_for_view(handle_b, view)
         total = total + js(p, q)
     end
     return total / n

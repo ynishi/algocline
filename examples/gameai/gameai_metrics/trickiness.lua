@@ -3,29 +3,54 @@
 ---
 --- ## Contract
 ---
---- `trickiness(card, prompt_set, temperature?) -> number`
+--- `trickiness(card, prompt_set, temperature?, opts?) -> number|table`
 ---
 --- - `card` — string alias, or a live handle (table or userdata) with a
 ---   `generate_session(ids)` method, same shape as `style_distance`
 ---   (see `style_distance.lua`, including the `on_ckpt` +
 ---   `alc.nn.card.load_ckpt` usage).
 ---
---- - `prompt_set` — non-empty array of guardian player-view tables.
+--- - `prompt_set` — non-empty array of positions; the element type
+---   follows the seat exactly as in `style_distance.lua` (player views on
+---   the player seat, boss states on the boss seat, mixing them a loud
+---   error).
 ---
 --- - `temperature` — optional positive finite number, default `1.0`. The
 ---   distribution the entropy is measured over is the temperature-scaled
----   softmax of the Card's next-token logits, masked to the four legal
----   player moves. The scaling matches what
+---   softmax of the Card's next-token logits, masked to the legal moves
+---   of the seat. The scaling matches what
 ---   `alc.nn.sampler.temperature(t, seed)` would draw from, so a
 ---   `trickiness` reading at `t = 1.5` predicts the entropy of the
 ---   noisy autoplay at the same temperature.
 ---
+--- - `opts` — optional table, every field additive (omitting `opts`
+---   reproduces the pre-seat behaviour byte for byte):
+---   - `seat` — `"player"` (default) or `"boss"`.
+---   - `style` — one of `guardian_duel.STYLES`, required when
+---     `seat = "boss"` (the boss prompt is measured against the style's
+---     mode-shift threshold).
+---
 --- ## Output
 ---
---- Mean of `alc.nn.metric.entropy(p)` (natural log, base e) across every
---- view in `prompt_set`. Zero when the Card is fully committed to one
---- move at every position (equivalent to greedy), approaches `log(4)`
---- when the four legal moves are uniformly distributed.
+--- - `seat = "player"` — the scalar mean of `alc.nn.metric.entropy(p)`
+---   (natural log, base e) across every view in `prompt_set`. Zero when
+---   the Card is fully committed to one move at every position
+---   (equivalent to greedy), approaches `log(4)` when the four legal
+---   moves are uniformly distributed. The player mask is four moves at
+---   every position, so the raw entropies are already comparable across
+---   positions.
+---
+--- - `seat = "boss"` — a table `{ value, raw_mean }`, where `value` is
+---   the mean **normalised** entropy `H / log(#legal)` and `raw_mean` is
+---   the mean raw `H`. The normalisation exists because the boss legal
+---   set is state-dependent: the twin slam `t` is only legal in mode 1
+---   (`guardian_duel/init.lua:644-651`), so a state offers five or six
+---   moves and the raw ceiling moves with it (`log 5` vs `log 6`).
+---   Averaging raw entropies across a mixed prompt set would read a
+---   change in the mode distribution as a change in the policy.
+---   `value` is in `[0, 1]` at every position, so a mixed set averages
+---   into a comparable number; `raw_mean` is kept alongside so the nats
+---   are not lost.
 ---
 --- ## Why measure it from the logits, not by sampling
 ---
@@ -36,6 +61,7 @@
 --- deterministic per (card, view, temperature) triple.
 
 local duel = require("guardian_duel")
+local boss_seat = require("gameai_metrics.boss_seat")
 
 local M
 
@@ -58,7 +84,7 @@ end
 
 local function require_entropy()
     if not (alc and alc.nn and alc.nn.metric and type(alc.nn.metric.entropy) == "function") then
-        error("trickiness: alc.nn.metric.entropy is unavailable; ST2 bridge missing")
+        error("trickiness: alc.nn.metric.entropy is unavailable; nn metric bridge missing")
     end
     return alc.nn.metric.entropy
 end
@@ -197,12 +223,8 @@ local function require_prompt_set(prompt_set)
     return n
 end
 
-M = function(card, prompt_set, temperature)
-    local n = require_prompt_set(prompt_set)
-    local t = decode_temperature(temperature)
-    local entropy = require_entropy()
-    local handle = resolve_handle(card)
-
+--- Mean raw entropy over player views (the pre-seat path).
+local function player_mean(handle, prompt_set, n, t, entropy)
     local total = 0.0
     for i = 1, n do
         local view = prompt_set[i]
@@ -219,6 +241,57 @@ M = function(card, prompt_set, temperature)
         total = total + entropy(p)
     end
     return total / n
+end
+
+--- Mean normalised and raw entropy over boss states.
+---
+--- Each position is divided by its own `log(#legal)` before averaging,
+--- so a prompt set that mixes mode-0 (five moves) and mode-1 (six moves)
+--- states averages comparable quantities.
+local function boss_mean(handle, prompt_set, n, t, entropy, style)
+    local normalised, raw = 0.0, 0.0
+    for i = 1, n do
+        local state = prompt_set[i]
+        boss_seat.require_state(state, string.format("trickiness: prompt_set[%d]", i))
+        local p, legal = boss_seat.probs(handle, state, style, t)
+        local ceiling = math.log(#legal.ids)
+        if ceiling <= 0 then
+            error(
+                string.format(
+                    "trickiness: prompt_set[%d] offers %d legal boss move(s); "
+                        .. "a normalised entropy needs at least two",
+                    i,
+                    #legal.ids
+                )
+            )
+        end
+        local h = entropy(p)
+        raw = raw + h
+        normalised = normalised + h / ceiling
+    end
+    return { value = normalised / n, raw_mean = raw / n }
+end
+
+M = function(card, prompt_set, temperature, opts)
+    if opts ~= nil and type(opts) ~= "table" then
+        error("trickiness: opts must be a table, got " .. type(opts))
+    end
+    opts = opts or {}
+    local seat = boss_seat.require_seat(opts.seat, "trickiness")
+    local style
+    if seat == "boss" then
+        style = boss_seat.require_style(opts.style, "trickiness")
+    end
+
+    local n = require_prompt_set(prompt_set)
+    local t = decode_temperature(temperature)
+    local entropy = require_entropy()
+    local handle = resolve_handle(card)
+
+    if seat == "boss" then
+        return boss_mean(handle, prompt_set, n, t, entropy, style)
+    end
+    return player_mean(handle, prompt_set, n, t, entropy)
 end
 
 return M

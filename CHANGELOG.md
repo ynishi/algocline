@@ -34,6 +34,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `from_safetensors_file` expects and fail loudly; GPT-2 (named and
   custom) round-trips.
 
+- `examples/gameai/anymetric` — new Lua pkg defining a generic
+  observation domain (no gameai vocabulary) for the Level Sweep
+  learning iter. A *view* (`am.view(view_id, metric_name, config)`)
+  binds a metric registered in `alc.nn.metric.registry` to a fixed
+  config under a first-class `view_id`, so the same metric can be
+  observed under several configs in one run. `am.observe(views,
+  {card, step})` evaluates every view per checkpoint behind a per-view
+  `pcall`: a failing metric becomes an `ErrorRecord {step, view_id,
+  error}` in the run log instead of propagating as `TrainError::Hook`
+  (which would skip the terminal checkpoint save). Judgment is a
+  separate layer — `am.judgment.threshold{view_id, field, op, value}` /
+  `never_break()` return a `Decision {action, reason}` with `action ∈
+  break | continue | harvest`, and `am.to_hook_action` projects it
+  onto the 2-value trainer hook ABI (harvest → continue + a harvest
+  marker record, reserved for the staged-boss iteration). 51 spec
+  tests including structural isolation proofs (a judgment never reads
+  records outside its declared `view_id`/`field`).
+
+- `examples/gameai/gameai_metrics` — boss-seat measurement arm. New
+  shared `boss_seat.lua` (encode + legal-gated distribution over the
+  boss action set; deliberate exception to the per-file duplication
+  convention, since `guardian_duel_npc.decide` is module-local and the
+  NPC pkg's public API should not widen for measurement's sake). All
+  three metrics accept additive `seat` / `style` opts (default
+  `"player"`, prior behaviour unchanged): `level` gains an opponent
+  pool (`opponents` list, per-opponent Wilson CI + pooled aggregate +
+  `win_rate_min`), `style_distance` documents and enforces its
+  same-basis contract (boss prompt sets are boss states; element-type
+  mismatch is a loud error), `trickiness` returns normalised entropy
+  (`H / log |legal|`) on the boss seat where the legal set is
+  state-dependent. `wilson_ci` now clamps the interval to contain the
+  point estimate (float residue at p̂ = 1 could violate
+  `ci_lower <= win_rate <= ci_upper`). 83 spec tests total.
+
+- `examples/gameai/train_guardian_npc.lua` — per-checkpoint
+  observation wiring (additive; `ckpt_every = 0`, the default,
+  restores the previous run untouched). New ctx fields `ckpt_every` /
+  `ckpt_keep` / `gate_games` / `teacher_alias` / `enable_gate` /
+  `target_win_rate_lo`. Each checkpoint is measured on three
+  independent axes (level / style_distance vs the teacher /
+  trickiness) via `anymetric`; only the strength axis may stop the run
+  (`ci_lower >= target_win_rate_lo` achievement gate — a point
+  estimate inside a 0.20 band is narrower than the Wilson CI at
+  feasible game counts, so band-inclusion gating would fire on noise).
+  Personality axes are logged for human judgment only. Records are
+  emitted per fire (human line + JSON) and returned in an
+  `observations` field for transcription. 15 spec tests drive the
+  whole script against a stubbed host.
+
 - `crates/algocline-engine/tests/gameai_ckpt_metric_e2e.rs` — end-to-end
   smoke wiring the three pieces above together in one training run:
   `alc.nn.trainer.run_full_ft` fires `on_ckpt` at every `ckpt_every`
@@ -203,8 +252,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Top-level `nn-cuda` cargo feature that propagates through
   `algocline-engine` down to `algocline-nn` (which flips
   `candle-core/cuda` + `candle-nn/cuda` + `candle-transformers/cuda`
-  in lockstep, per the P3 pitfall in
-  `workspace/tasks/alc-nn-gpu-smoke/runbook.md`). Prior builds
+  in lockstep — candle-nn 0.11 gates its LayerNorm CUDA path behind
+  the crate's own `cuda` feature, so enabling only `candle-core/cuda`
+  fails at runtime). Prior builds
   required `cargo build --features nn-cuda -p algocline-nn -p
   algocline-engine ...` and `cargo install --path .` still failed
   because the top crate did not expose the feature; now

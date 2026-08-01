@@ -893,6 +893,36 @@ alc_pkg_test(pkg = "guardian_duel_interactive")
 alc_pkg_test(pkg = "guardian_player_npc")
 ```
 
+## Observing a bake — anymetric + gameai_metrics
+
+Two packages turn a training run into an observable object:
+
+- **`anymetric/`** — a generic observation domain with no gameai
+  vocabulary. A *view* binds a registered metric name to a fixed config
+  under a caller-chosen `view_id`; `observe(views, {card, step})`
+  evaluates every view per checkpoint behind a per-view `pcall` (a
+  broken metric yields an `ErrorRecord` instead of killing the run and
+  its terminal checkpoint) and returns uniform records; *judgment*
+  (`threshold` / `never_break`) consumes records and returns a
+  `Decision {action, reason}` which a thin adapter projects onto the
+  trainer hook ABI. Measurement and judgment stay separate layers:
+  a metric never gates, a judgment never measures.
+- **`gameai_metrics/`** — the game-specific instances (`level` =
+  win rate + Wilson CI against an opponent pool, `style_distance` =
+  adherence to a same-basis teacher, `trickiness` = sampler entropy,
+  normalised on the boss seat where the legal set is state-dependent).
+  All three accept `seat = "boss"` to measure a boss-side bake through
+  the shared `boss_seat.lua` encode path.
+
+`train_guardian_npc.lua` wires them together: pass `ckpt_every > 0`
+(plus `gate_games` / `teacher_alias` / `enable_gate` /
+`target_win_rate_lo`) and every checkpoint is measured on all three
+axes independently. Only the strength axis may stop the run
+(`ci_lower >= target_win_rate_lo`); the personality axes are logged
+for a human to judge — how much of the character survives the win-rate
+climb is deliberately not a machine's call. `ckpt_every = 0` (the
+default) restores the plain training run untouched.
+
 ## Known limitations
 
 - Style compliance depends on the training budget. The defaults (800

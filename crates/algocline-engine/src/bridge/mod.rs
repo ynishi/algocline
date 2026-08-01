@@ -27,6 +27,8 @@ mod nn_card;
 #[cfg(feature = "nn")]
 mod nn_gen;
 #[cfg(feature = "nn")]
+mod nn_metric;
+#[cfg(feature = "nn")]
 mod nn_opts;
 #[cfg(feature = "nn")]
 mod nn_sampler;
@@ -140,6 +142,15 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
     register_math(lua, alc_table)?;
     #[cfg(feature = "nn")]
     register_nn(lua, alc_table, config.nn_dir.clone())?;
+    // `alc.nn.metric.*` — pure primitives + per-VM Lua registry. Placed
+    // right after `register_nn` (which creates the `alc.nn` sub-table)
+    // and before `register_nn_card` so the metric surface is available
+    // to any nn caller regardless of card/trainer wiring order.
+    #[cfg(feature = "nn")]
+    {
+        let nn_table: LuaTable = alc_table.get("nn")?;
+        nn_metric::register_nn_metric(lua, &nn_table)?;
+    }
     #[cfg(feature = "nn")]
     nn_card::register_nn_card(
         lua,

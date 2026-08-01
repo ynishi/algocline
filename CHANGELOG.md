@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.metric.*` Lua bridge — `alc.nn.metric.{kl, js, tvd, entropy}`
+  wrap the `algocline_nn::metric` primitives added in the previous
+  commit (Lua array table in, Rust `Vec<f32>` cross the FFI, typed
+  `MetricError` surfaces as `LuaError::external` with the `metric:`
+  prefix preserved). `kl` may return `math.huge` when
+  `q[i] == 0 && p[i] > 0` per the KL definition (do **not** treat as
+  error). `js` / `tvd` / `entropy` never emit non-finite values on
+  validated inputs.
+- `alc.nn.metric.registry.{register, get, evaluate, list}` —
+  per-VM Lua-side name → fn registry for the metric infrastructure.
+  Fresh empty on every VM boot; `gameai_metrics` and any other pkg
+  self-register on `require`. `register` / `evaluate` refuse loudly
+  (`error(..)` at `level = 2`) on bad name / missing fn / unknown
+  metric; `get` returns `nil` on miss (query surface); `list` returns
+  a sorted array of registered names. Kept in Lua (no Rust
+  `RegistryKey`) so name → fn dispatch has zero cross-FFI lifetime.
 - `algocline_nn::metric` — new Rust module exposing four distribution /
   entropy primitives (`kl` / `js` / `tvd` / `entropy`) that back the
   metric infrastructure for the GameAI SLM Level Sweep learning iter

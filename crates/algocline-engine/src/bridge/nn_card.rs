@@ -9,6 +9,7 @@
 //! alc.nn.card.save(vars, name, meta)         -> card_id
 //! alc.nn.card.load(card_id)                  -> vars_table
 //! alc.nn.card.load_gpt2(card_id, base)       -> Gpt2Handle (LoRA cards)
+//! alc.nn.card.load_ckpt(path, spec)          -> NnHandle (Cardless)
 //! alc.nn.card.register(card_id, model_name)
 //! ```
 //!
@@ -122,6 +123,19 @@ pub(super) fn register_nn_card(
         load_handle_impl(load_handle_store.as_ref(), &card_id, &load_handle_nn_dir)
     })?;
     card_ns.set("load_handle", load_handle)?;
+
+    // Cardless sibling of `load_handle`: rebuild a handle from a raw
+    // safetensors path plus a caller-supplied arch spec. The entry an
+    // `alc.nn.trainer.*` `on_ckpt` hook uses to evaluate a mid-run
+    // checkpoint, which has no Card to read the architecture from.
+    // Captures nothing — no card store, no `nn_dir` — because the
+    // caller names the file outright.
+    let load_ckpt = lua.create_function(
+        move |_lua, (path, spec): (String, LuaTable)| -> LuaResult<NnHandle> {
+            load_ckpt_impl(&path, &spec)
+        },
+    )?;
+    card_ns.set("load_ckpt", load_ckpt)?;
 
     let load_gpt2_store = Arc::clone(&card_store);
     let load_gpt2 = lua.create_function(
@@ -363,6 +377,227 @@ fn load_handle_impl(
         )));
     }
     build(&meta, &path)
+}
+
+/// Error prefix for the `alc.nn.card.load_ckpt` surface.
+const LOAD_CKPT_ERR_PREFIX: &str = "alc.nn.card.load_ckpt";
+
+/// Spec keys that describe a custom GPT-2 shape. Presence of any one
+/// of them switches [`load_ckpt_impl`] into synthesising a
+/// [`NnCustomBranch`]; the list mirrors what
+/// [`build_custom_gpt2_config`] reads, so a key added there without a
+/// line here would be silently ignored by the load path.
+const LOAD_CKPT_CUSTOM_KEYS: &[&str] = &[
+    "layers",
+    "heads",
+    "dim",
+    "ctx",
+    "vocab",
+    "act",
+    "norm",
+    "residual",
+    "placement",
+    "pos",
+    "mlp_ratio",
+    "kv_heads",
+    "window",
+    "untied_head",
+    "moe",
+];
+
+/// Cardless self-contained loader — `alc.nn.card.load_ckpt(path, spec)`.
+///
+/// Rebuilds a handle straight from a raw safetensors file, with the
+/// architecture supplied by the caller instead of read off a Card.
+/// This is what lets an `on_ckpt` hook turn the `info.ckpt_path` it
+/// receives mid-run into a handle the metric surfaces can consume:
+/// mid-run checkpoints have no Card, so [`load_handle_impl`] cannot
+/// reach them.
+///
+/// ```text
+/// local handle = alc.nn.card.load_ckpt(info.ckpt_path, {
+///     arch = "gpt2-tiny",   -- required; same vocabulary as load_handle
+///     device = "cpu",       -- optional, default "cpu"
+///     dtype = "f32",        -- optional, default "f32"
+/// })
+/// ```
+///
+/// A custom-shape run (`arch = "gpt2-custom"`) additionally passes the
+/// shape keys it built the preset with (`vocab` / `ctx` / `layers` /
+/// `heads` / `dim` / `act` / `norm` / `residual` / `placement` / `pos`
+/// / `mlp_ratio` / `kv_heads` / `window` / `untied_head` / `moe`) —
+/// the architecture string pins nothing for that variant, so the shape
+/// has to come from the caller the same way it does on the build side.
+///
+/// # Checkpoint paths are volatile
+///
+/// `info.ckpt_path` names a rotating file: the trainer keeps only the
+/// last `ckpt_keep` checkpoints and unlinks the rest. Loading it
+/// **inside the hook body** is the only safe use — storing the path and
+/// loading it after the run has moved on races the rotation, and the
+/// failure mode is a missing file (or, worse, a different step's
+/// weights at the same name). Callers who need a durable artifact
+/// should let the run finish and load the Card it persists.
+///
+/// # Cost
+///
+/// The hook fires while the trainer holds the model mutex and the
+/// dataset lock, so a `load_ckpt` from inside it constructs a *second*
+/// full model while training is paused. That is free at `gpt2-tiny`
+/// scale, but a large architecture combined with a small `ckpt_every`
+/// pays for a whole model build per checkpoint out of the run's
+/// wall-clock.
+///
+/// # Locking
+///
+/// This path never touches an existing handle's `Mutex` or `VarMap` —
+/// it only builds a new model from the file. That is what makes it
+/// callable from inside the hook at all: any route that re-read the
+/// training handle's config (e.g. [`custom_branch_of_gpt2`]) would
+/// deadlock against the mutex the trainer is already holding.
+///
+/// # Errors
+///
+/// Two prefixes surface here, by design:
+///
+/// - This function's own validation — missing / mistyped `spec.arch`,
+///   a `path` that is not on disk, an architecture with no bridge
+///   dispatch, and inference-only architectures (`llama`) whose
+///   `build_from_safetensors` slot is `None` — carries
+///   `alc.nn.card.load_ckpt:`.
+/// - Everything raised while reading the bundle (unknown variant,
+///   custom+MoE refusal, device / dtype parsing, shape mismatch)
+///   keeps the `alc.nn.card.load:` prefix its shared implementation
+///   already spells. Re-prefixing those would mean threading a context
+///   argument through the `ArchOps` function-pointer signature, which
+///   this iteration does not change.
+fn load_ckpt_impl(path: &str, spec: &LuaTable) -> LuaResult<NnHandle> {
+    let arch: String = spec
+        .get::<Option<String>>("arch")
+        .map_err(|_| {
+            LuaError::external(format!(
+                "{LOAD_CKPT_ERR_PREFIX}: spec.arch must be a string"
+            ))
+        })?
+        .ok_or_else(|| {
+            LuaError::external(format!(
+                "{LOAD_CKPT_ERR_PREFIX}: spec.arch is required (e.g. 'gpt2-tiny'); \
+                 it uses the same architecture vocabulary as alc.nn.card.load_handle"
+            ))
+        })?;
+
+    // `device` / `dtype` default to the CPU / f32 pair every shipped
+    // preset builds with, so a hook that only knows its arch stays a
+    // one-liner. Their *values* are validated downstream by the shared
+    // card-load path (see the error-prefix note above).
+    let device = spec
+        .get::<Option<String>>("device")
+        .map_err(|_| {
+            LuaError::external(format!(
+                "{LOAD_CKPT_ERR_PREFIX}: spec.device must be a string"
+            ))
+        })?
+        .unwrap_or_else(|| "cpu".to_string());
+    let dtype = spec
+        .get::<Option<String>>("dtype")
+        .map_err(|_| {
+            LuaError::external(format!(
+                "{LOAD_CKPT_ERR_PREFIX}: spec.dtype must be a string"
+            ))
+        })?
+        .unwrap_or_else(|| "f32".to_string());
+
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        return Err(LuaError::external(format!(
+            "{LOAD_CKPT_ERR_PREFIX}: no safetensors file at {path:?} \
+             (mid-run checkpoints rotate — load info.ckpt_path inside the \
+             on_ckpt hook body, not after the run)"
+        )));
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            LuaError::external(format!(
+                "{LOAD_CKPT_ERR_PREFIX}: path {path:?} has no file stem to name the handle after"
+            ))
+        })?;
+
+    // Synthesise the `NnCardMeta` the shared load core reads. Every
+    // field is spelled out: the struct derives no `Default`, and an
+    // implicit one would let a future field land here unnoticed.
+    //
+    // The candle branch is always present — leaving it `None` would
+    // drop `device` / `dtype` back to the architecture default and
+    // silently ignore what the caller asked for. `bundle_ref` is not
+    // meaningful for a Cardless load (there is no `nn/<card_id>`
+    // bundle), so it carries the `"ckpt/<stem>"` marker; the
+    // `bundle_ref == "nn/<card_id>"` invariant belongs to the Card
+    // surfaces and `assert_bundle_ref_matches` is deliberately not
+    // called here.
+    let meta = NnCardMeta {
+        name: stem.clone(),
+        backend: "candle".to_string(),
+        task: None,
+        architecture: arch.clone(),
+        // Raw checkpoints are written by the full-fine-tune loop; the
+        // LoRA path records a delta instead and reloads through
+        // `load_wrap`.
+        training_path: "full_ft".to_string(),
+        lineage: NnLineage::default(),
+        hyperparams: Json::Object(serde_json::Map::new()),
+        metrics: Json::Object(serde_json::Map::new()),
+        candle: Some(NnCandleBranch {
+            bundle_ref: format!("ckpt/{stem}"),
+            device: Some(device),
+            dtype: Some(dtype),
+            lora: None,
+            custom: custom_branch_from_spec(spec)?,
+        }),
+    };
+
+    let ops = resolve_arch_ops(&arch).ok_or_else(|| {
+        LuaError::external(format!(
+            "{LOAD_CKPT_ERR_PREFIX}: spec.arch {arch:?} has no bridge dispatch \
+             (expected one of {})",
+            registered_arch_names().join(" / ")
+        ))
+    })?;
+    let build = ops.build_from_safetensors.ok_or_else(|| {
+        LuaError::external(format!(
+            "{LOAD_CKPT_ERR_PREFIX}: spec.arch {arch:?} does not support loading a \
+             self-contained safetensors checkpoint (adapter-style architectures are \
+             inference-only and never produce one)"
+        ))
+    })?;
+    build(&meta, path)
+}
+
+/// Project the custom-shape keys of a `load_ckpt` spec onto a
+/// [`NnCustomBranch`], or `None` when the spec names none of them.
+///
+/// `None` is the common case (`arch = "gpt2-tiny"` and friends): a
+/// named variant rebuilds its shape from the architecture string alone,
+/// and [`gpt2_config_for_card`] ignores the branch for those anyway.
+/// Synthesising one unconditionally would therefore be dead weight for
+/// every named arch and misleading metadata on the handle.
+fn custom_branch_from_spec(spec: &LuaTable) -> LuaResult<Option<NnCustomBranch>> {
+    let mut names_a_shape = false;
+    for key in LOAD_CKPT_CUSTOM_KEYS {
+        if spec.contains_key(*key)? {
+            names_a_shape = true;
+            break;
+        }
+    }
+    if !names_a_shape {
+        return Ok(None);
+    }
+    // Same parser the build side uses, so a spec that repeats the
+    // `alc.nn.preset.gpt2("custom", ...)` opts verbatim reconstructs
+    // the exact config that run was trained with.
+    let cfg = build_custom_gpt2_config(LOAD_CKPT_ERR_PREFIX, Some(spec))?;
+    Ok(NnCustomBranch::from_gpt2_config(&cfg))
 }
 
 /// Reconstruct a LoRA-wrapped [`Gpt2Handle`] from a Card + a fresh
@@ -2231,7 +2466,7 @@ pub(super) fn build_gpt2_handle(
     nn_dir: &std::path::Path,
 ) -> LuaResult<Gpt2Handle> {
     let mut cfg = if variant == "custom" || variant == "gpt2-custom" {
-        build_custom_gpt2_config(opts)?
+        build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, opts)?
     } else {
         if let Some(t) = opts {
             reject_custom_only_keys(variant, t)?;
@@ -2355,17 +2590,23 @@ fn reject_custom_only_keys(variant: &str, t: &LuaTable) -> LuaResult<()> {
 /// the wrong Lua type is a hard, actionable error — a silently
 /// ignored `mlp_ratio = "3"` would build the reference MLP while the
 /// caller believes they are running a ratio-3 experiment.
-fn custom_opt<T: mlua::FromLua>(t: &LuaTable, key: &str, expected: &str) -> LuaResult<Option<T>> {
-    t.get::<Option<T>>(key).map_err(|_| {
-        LuaError::external(format!(
-            "alc.nn.preset.gpt2('custom'): option '{key}' must be {expected}"
-        ))
-    })
+/// Error prefix for the custom-shape parser when it serves the
+/// `alc.nn.preset.gpt2("custom", ...)` build side.
+const GPT2_CUSTOM_PRESET_ERR_PREFIX: &str = "alc.nn.preset.gpt2('custom')";
+
+fn custom_opt<T: mlua::FromLua>(
+    ctx: &str,
+    t: &LuaTable,
+    key: &str,
+    expected: &str,
+) -> LuaResult<Option<T>> {
+    t.get::<Option<T>>(key)
+        .map_err(|_| LuaError::external(format!("{ctx}: option '{key}' must be {expected}")))
 }
 
-fn custom_bad_value(key: &str, got: &str, expected: &str) -> LuaError {
+fn custom_bad_value(ctx: &str, key: &str, got: &str, expected: &str) -> LuaError {
     LuaError::external(format!(
-        "alc.nn.preset.gpt2('custom'): unknown {key} '{got}' (expected {expected})"
+        "{ctx}: unknown {key} '{got}' (expected {expected})"
     ))
 }
 
@@ -2377,7 +2618,12 @@ fn custom_bad_value(key: &str, got: &str, expected: &str) -> LuaError {
 /// (PostLN×Parallel, GQA divisibility, RoPE even head_dim, MoE
 /// dense-knob combination) live Rust-side in `Gpt2Custom::validate` /
 /// `Gpt2Model::new`; their messages propagate to Lua verbatim.
-fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
+///
+/// `ctx` is the caller-facing tag every option error is prefixed with,
+/// so the same parser can serve `alc.nn.preset.gpt2('custom')` (build
+/// side) and `alc.nn.card.load_ckpt` (raw-checkpoint load side) without
+/// pointing a load-time typo at the preset entry.
+fn build_custom_gpt2_config(ctx: &str, opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
     let mut cfg = Gpt2Config::tiny();
     let mut spec = Gpt2Custom::default();
     let Some(t) = opts else {
@@ -2385,23 +2631,23 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
         return Ok(cfg);
     };
 
-    if let Some(v) = custom_opt::<usize>(t, "layers", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "layers", "an integer")? {
         cfg.layers = v;
     }
-    if let Some(v) = custom_opt::<usize>(t, "heads", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "heads", "an integer")? {
         cfg.heads = v;
     }
-    if let Some(v) = custom_opt::<usize>(t, "dim", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "dim", "an integer")? {
         cfg.dim = v;
     }
-    if let Some(v) = custom_opt::<usize>(t, "ctx", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "ctx", "an integer")? {
         cfg.ctx = v;
     }
-    if let Some(v) = custom_opt::<usize>(t, "vocab", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "vocab", "an integer")? {
         cfg.vocab = v;
     }
 
-    if let Some(s) = custom_opt::<String>(t, "act", "a string")? {
+    if let Some(s) = custom_opt::<String>(ctx, t, "act", "a string")? {
         spec.act = match s.as_str() {
             "gelu" => Activation::Gelu,
             "relu" => Activation::Relu,
@@ -2410,6 +2656,7 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
             "geglu" => Activation::GeGlu,
             other => {
                 return Err(custom_bad_value(
+                    ctx,
                     "act",
                     other,
                     "'gelu' / 'relu' / 'silu' / 'swiglu' / 'geglu'",
@@ -2417,19 +2664,27 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
             }
         };
     }
-    if let Some(s) = custom_opt::<String>(t, "norm", "a string")? {
+    if let Some(s) = custom_opt::<String>(ctx, t, "norm", "a string")? {
         spec.norm = match s.as_str() {
             "layernorm" => NormKind::LayerNorm,
             "rmsnorm" => NormKind::RmsNorm,
-            other => return Err(custom_bad_value("norm", other, "'layernorm' / 'rmsnorm'")),
+            other => {
+                return Err(custom_bad_value(
+                    ctx,
+                    "norm",
+                    other,
+                    "'layernorm' / 'rmsnorm'",
+                ))
+            }
         };
     }
-    if let Some(s) = custom_opt::<String>(t, "residual", "a string")? {
+    if let Some(s) = custom_opt::<String>(ctx, t, "residual", "a string")? {
         spec.residual = match s.as_str() {
             "sequential" => ResidualKind::Sequential,
             "parallel" => ResidualKind::Parallel,
             other => {
                 return Err(custom_bad_value(
+                    ctx,
                     "residual",
                     other,
                     "'sequential' / 'parallel'",
@@ -2437,14 +2692,21 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
             }
         };
     }
-    if let Some(s) = custom_opt::<String>(t, "placement", "a string")? {
+    if let Some(s) = custom_opt::<String>(ctx, t, "placement", "a string")? {
         spec.placement = match s.as_str() {
             "preln" => NormPlacement::PreLn,
             "postln" => NormPlacement::PostLn,
-            other => return Err(custom_bad_value("placement", other, "'preln' / 'postln'")),
+            other => {
+                return Err(custom_bad_value(
+                    ctx,
+                    "placement",
+                    other,
+                    "'preln' / 'postln'",
+                ))
+            }
         };
     }
-    if let Some(s) = custom_opt::<String>(t, "pos", "a string")? {
+    if let Some(s) = custom_opt::<String>(ctx, t, "pos", "a string")? {
         spec.pos = match s.as_str() {
             "learned" => PosKind::Learned,
             "rope" => PosKind::Rope,
@@ -2452,6 +2714,7 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
             "nope" => PosKind::NoPos,
             other => {
                 return Err(custom_bad_value(
+                    ctx,
                     "pos",
                     other,
                     "'learned' / 'rope' / 'alibi' / 'nope'",
@@ -2459,20 +2722,20 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
             }
         };
     }
-    if let Some(v) = custom_opt::<usize>(t, "mlp_ratio", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "mlp_ratio", "an integer")? {
         spec.mlp_ratio = v;
     }
-    if let Some(v) = custom_opt::<usize>(t, "kv_heads", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "kv_heads", "an integer")? {
         spec.kv_heads = Some(v);
     }
-    if let Some(v) = custom_opt::<usize>(t, "window", "an integer")? {
+    if let Some(v) = custom_opt::<usize>(ctx, t, "window", "an integer")? {
         spec.window = Some(v);
     }
-    if let Some(b) = custom_opt::<bool>(t, "untied_head", "a boolean")? {
+    if let Some(b) = custom_opt::<bool>(ctx, t, "untied_head", "a boolean")? {
         spec.untied_head = b;
     }
 
-    cfg.moe = parse_custom_moe(t)?;
+    cfg.moe = parse_custom_moe(ctx, t)?;
     cfg.custom = Some(spec);
     Ok(cfg)
 }
@@ -2481,18 +2744,18 @@ fn build_custom_gpt2_config(opts: Option<&LuaTable>) -> LuaResult<Gpt2Config> {
 /// table. Defaults mirror [`MoeConfig::new`] (Mixtral top-2 routing,
 /// Switch α = 0.01); `MoeConfig::validate` runs at build time in
 /// `Gpt2Model::new`.
-fn parse_custom_moe(t: &LuaTable) -> LuaResult<Option<MoeConfig>> {
-    let Some(m) = custom_opt::<LuaTable>(t, "moe", "a table")? else {
+fn parse_custom_moe(ctx: &str, t: &LuaTable) -> LuaResult<Option<MoeConfig>> {
+    let Some(m) = custom_opt::<LuaTable>(ctx, t, "moe", "a table")? else {
         return Ok(None);
     };
-    let n_experts = custom_opt::<usize>(&m, "n_experts", "an integer")?.ok_or_else(|| {
-        LuaError::external("alc.nn.preset.gpt2('custom'): moe.n_experts is required (integer ≥ 1)")
+    let n_experts = custom_opt::<usize>(ctx, &m, "n_experts", "an integer")?.ok_or_else(|| {
+        LuaError::external(format!("{ctx}: moe.n_experts is required (integer ≥ 1)"))
     })?;
     let mut moe = MoeConfig::new(n_experts);
-    if let Some(k) = custom_opt::<usize>(&m, "top_k", "an integer")? {
+    if let Some(k) = custom_opt::<usize>(ctx, &m, "top_k", "an integer")? {
         moe.top_k = k;
     }
-    if let Some(a) = custom_opt::<f64>(&m, "alpha", "a number")? {
+    if let Some(a) = custom_opt::<f64>(ctx, &m, "alpha", "a number")? {
         moe.alpha = a;
     }
     Ok(Some(moe))
@@ -3929,7 +4192,7 @@ mod custom_spec_vocabulary_tests {
                 // and the parse step under test is per-axis anyway.
                 let opts = lua.create_table().expect("opts table");
                 opts.set(*axis, *value).expect("set axis");
-                let from_lua = build_custom_gpt2_config(Some(&opts))
+                let from_lua = build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, Some(&opts))
                     .unwrap_or_else(|e| panic!("Lua {axis} = {value:?} must parse: {e}"))
                     .custom
                     .expect("custom spec");
@@ -5096,6 +5359,526 @@ mod load_dispatch_tests {
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("delta_path"), "message: {msg}");
+    }
+}
+
+/// ST-B integration tests — `alc.nn.card.load_ckpt`.
+///
+/// The Cardless loader is what an `on_ckpt` hook uses to turn the raw
+/// `info.ckpt_path` it receives mid-run into a handle, so the axes
+/// here are:
+///
+/// - **hook round-trip**: a checkpoint written mid-run loads *from
+///   inside the hook body* (the trainer holds the model mutex and the
+///   dataset lock there — a load path that touched either would
+///   deadlock) and the resulting handle generates.
+/// - **restore equivalence**: with `steps % ckpt_every == 0` the last
+///   mid-run checkpoint holds the weights the run finalises with, so
+///   loading it must agree logit-for-logit with loading the Card the
+///   Card-writing trainer persists. The premise is pinned in the test
+///   body: a run whose step count is not a multiple of `ckpt_every`
+///   keeps training after the last hook and would diverge for a
+///   legitimate reason.
+/// - **arch coverage**: GPT-2 (named + custom shape) and TinyLlama,
+///   confirming the spec's `arch` vocabulary matches `load_handle`'s.
+/// - **refusals**: missing file, missing / unknown `spec.arch`,
+///   inference-only architectures, and custom-shape typos.
+#[cfg(test)]
+mod load_ckpt_tests {
+    use super::*;
+    use candle_core::Tensor;
+    use mlua::Lua;
+    use serde_json::json;
+
+    fn opts_table(lua: &Lua, v: serde_json::Value) -> LuaTable {
+        match lua.to_value(&v).expect("json to Lua value") {
+            LuaValue::Table(t) => t,
+            _ => unreachable!("json object must serialise to a Lua table"),
+        }
+    }
+
+    /// Training row that fits `gpt2-tiny` (ctx = 16). Mirrors the
+    /// sibling scaffolding in [`super::super::nn_trainer`]'s tests.
+    fn overfit_row() -> Vec<u32> {
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    }
+
+    fn make_dataset_handle(lua: &Lua, n: usize) -> LuaAnyUserData {
+        let rows: Vec<Vec<u32>> = std::iter::repeat_with(overfit_row).take(n).collect();
+        let ds = TokenizedDataset::new(
+            rows,
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 16,
+                shuffle: false,
+                pad_id: 0,
+                text_field: "text".into(),
+            },
+        );
+        lua.create_userdata(DatasetHandle::for_test(
+            Box::new(ds),
+            "test-synthetic".into(),
+            1,
+            16,
+        ))
+        .expect("dataset userdata")
+    }
+
+    /// Full-fine-tune `gpt2-tiny` with mid-run checkpointing, running
+    /// `on_hook` for every checkpoint the trainer writes.
+    ///
+    /// Returns the `info.ckpt_path` values the hook observed, in fire
+    /// order. `ckpt_keep` is generous so every path handed to the hook
+    /// is still on disk once the run returns.
+    fn train_with_ckpts(
+        lua: &Lua,
+        nn_dir: &std::path::Path,
+        prefix: &str,
+        steps: usize,
+        ckpt_every: usize,
+        mut on_hook: impl FnMut(&Lua, &str) + Send + 'static,
+    ) -> Vec<String> {
+        let base_opts = opts_table(lua, json!({ "pretrained": false }));
+        let base = build_gpt2_handle("tiny", Some(&base_opts), nn_dir).expect("gpt2 tiny base");
+        let base_ud = lua.create_userdata(base).expect("handle userdata");
+        let ds_ud = make_dataset_handle(lua, 20);
+
+        let opts = opts_table(
+            lua,
+            json!({
+                "lr": 5e-3,
+                "batch_size": 1,
+                "steps": steps,
+                "warmup": 0,
+                "schedule": "constant",
+                "ckpt_every": ckpt_every,
+                "ckpt_keep": 8,
+                "ckpt_prefix": prefix,
+            }),
+        );
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let on_ckpt = lua
+            .create_function_mut(move |lua, info: LuaTable| -> LuaResult<()> {
+                let path: String = info.get("ckpt_path")?;
+                on_hook(lua, &path);
+                sink.lock().expect("hook sink").push(path);
+                Ok(())
+            })
+            .expect("create on_ckpt");
+        opts.set("on_ckpt", on_ckpt).expect("set on_ckpt");
+
+        full_ft_impl(
+            lua,
+            &base_ud,
+            &ds_ud,
+            Some(&opts),
+            nn_dir,
+            Arc::new(TrainingLease::new()),
+        )
+        .expect("full_ft with on_ckpt");
+
+        let observed = seen.lock().expect("hook sink").clone();
+        observed
+    }
+
+    /// Next-token logits over `prompt`, read straight off the model so
+    /// the comparison does not depend on the generation session's
+    /// bookkeeping.
+    fn logits_of(handle: &NnHandle, prompt: &[u32]) -> Vec<f32> {
+        let gpt2 = handle.as_gpt2().expect("gpt2 handle");
+        let model = gpt2.model();
+        let guard = model.lock().expect("model lock");
+        let input =
+            Tensor::from_slice(prompt, (1, prompt.len()), &Device::Cpu).expect("input tensor");
+        guard
+            .forward(&input)
+            .expect("forward")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("logits row")
+    }
+
+    /// Write a Card pointing at `nn/<card_id>` so `load_handle` accepts
+    /// it, and return the id (the caller drops the matching bundle at
+    /// `<nn_dir>/<card_id>.safetensors`).
+    fn write_full_ft_card(store: &FileCardStore, architecture: &str) -> String {
+        let card_id = unique_stem("ckptcard");
+        let payload = json!({
+            "pkg": { "name": "alc_nn" },
+            "card_id": card_id,
+            "metadata": {
+                "kind": "nn_model",
+                "nn": {
+                    "name": "ckpt-equivalence",
+                    "backend": "candle",
+                    "architecture": architecture,
+                    "training_path": "full_ft",
+                    "candle": {
+                        "bundle_ref": bundle_ref_for(&card_id),
+                        "device": "cpu",
+                        "dtype": "f32"
+                    }
+                }
+            }
+        });
+        let (card_id, _path) = store.create(payload).expect("create card");
+        card_id
+    }
+
+    /// A file that exists but is never read — the refusals below fire
+    /// before a single safetensors byte is touched, and the path check
+    /// would otherwise mask the error under test.
+    fn touch(path: &std::path::Path) {
+        std::fs::write(path, b"").expect("seed placeholder file");
+    }
+
+    // ── hook round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn load_ckpt_loads_a_mid_run_checkpoint_from_inside_the_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+
+        // Loading from inside the hook body is the production shape:
+        // the trainer is holding the model mutex + dataset lock while
+        // this runs, so a successful load here is the deadlock-freedom
+        // assertion (a hang, not a failed assert, is the failure mode
+        // this guards against).
+        let loaded_in_hook: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&loaded_in_hook);
+        let observed = train_with_ckpts(&lua, &nn_dir, "hookload", 4, 2, move |lua, path| {
+            let spec = opts_table(lua, json!({ "arch": "gpt2-tiny" }));
+            let handle = load_ckpt_impl(path, &spec).expect("load_ckpt inside on_ckpt");
+            assert_eq!(handle.arch(), "gpt2");
+            *counter.lock().expect("counter") += 1;
+        });
+
+        assert_eq!(
+            observed.len(),
+            2,
+            "steps=4 / ckpt_every=2 must fire the hook twice: {observed:?}"
+        );
+        assert_eq!(
+            *loaded_in_hook.lock().expect("counter"),
+            2,
+            "every hook firing must have completed a load_ckpt"
+        );
+
+        // The handle the hook could have kept still generates after the
+        // run returns (`ckpt_keep` kept the file).
+        let last = observed.last().expect("at least one checkpoint");
+        let spec = opts_table(&lua, json!({ "arch": "gpt2-tiny" }));
+        let handle = load_ckpt_impl(last, &spec).expect("load_ckpt after the run");
+        let vocab = handle.as_gpt2().expect("gpt2 handle").vocab;
+        lua.globals()
+            .set("h", lua.create_userdata(handle).expect("handle userdata"))
+            .expect("set global");
+        let argmax: u32 = lua
+            .load(
+                r#"
+                local s = h:generate_session({ 1, 2, 3 })
+                return s:next_logits():argmax()
+                "#,
+            )
+            .eval()
+            .expect("generate_session over a load_ckpt handle");
+        assert!(
+            (argmax as usize) < vocab,
+            "argmax {argmax} must be a token id under vocab {vocab}"
+        );
+    }
+
+    // ── restore equivalence ──────────────────────────────────────
+
+    #[test]
+    fn load_ckpt_of_the_final_checkpoint_matches_the_card_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+
+        // Premise (design F13): `steps % ckpt_every == 0`. Only then is
+        // the last mid-run checkpoint the same weight set the run
+        // finalises with — with a remainder the trainer keeps stepping
+        // after the last hook and the two loads diverge legitimately.
+        let steps = 4;
+        let ckpt_every = 2;
+        assert_eq!(steps % ckpt_every, 0, "test premise");
+        let observed = train_with_ckpts(&lua, &nn_dir, "equiv", steps, ckpt_every, |_, _| {});
+        let last = observed.last().expect("at least one checkpoint");
+
+        // Card side: `save_final` writes `<prefix>.safetensors`, which
+        // is exactly what a Card-writing trainer persists as the
+        // Card's bundle.
+        let final_bundle = nn_dir.join("ckpt").join("equiv.safetensors");
+        assert!(final_bundle.exists(), "final save at {final_bundle:?}");
+        let card_id = write_full_ft_card(&store, "gpt2-tiny");
+        std::fs::create_dir_all(&nn_dir).expect("nn dir");
+        std::fs::copy(&final_bundle, nn_dir.join(format!("{card_id}.safetensors")))
+            .expect("place the card bundle");
+
+        let via_card = load_handle_impl(&store, &card_id, &nn_dir).expect("load_handle");
+        let spec = opts_table(&lua, json!({ "arch": "gpt2-tiny" }));
+        let via_ckpt = load_ckpt_impl(last, &spec).expect("load_ckpt");
+
+        let prompt = [1u32, 2, 3];
+        let from_ckpt = logits_of(&via_ckpt, &prompt);
+        let from_card = logits_of(&via_card, &prompt);
+        assert_eq!(
+            from_ckpt.len(),
+            from_card.len(),
+            "both loads must produce a vocab-shaped row"
+        );
+        // Same weights through the same forward: the rows agree to
+        // f32 round-off. A tolerance rather than bitwise equality
+        // keeps the assertion honest about float summation order
+        // without weakening it — a wrong config would be off by
+        // orders of magnitude, not 1e-6.
+        let worst = from_ckpt
+            .iter()
+            .zip(&from_card)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= 1e-6,
+            "load_ckpt and load_handle disagree by {worst} on the same weights"
+        );
+    }
+
+    // ── arch coverage ────────────────────────────────────────────
+
+    #[test]
+    fn load_ckpt_restores_a_tinyllama_bundle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+        let base = build_tinyllama_handle(
+            "tinyllama-tiny",
+            Some(&opts_table(&lua, json!({ "pretrained": false }))),
+            &nn_dir,
+        )
+        .expect("tinyllama-tiny base");
+
+        // Written in the HF Llama key layout, which is what
+        // `TinyLlamaModel::from_safetensors_file` reads (see the
+        // raw-VarMap test below for the layout that does not load).
+        let path = tmp.path().join("tinyllama-bundle.safetensors");
+        {
+            let model = base.model();
+            let guard = model.lock().expect("model lock");
+            export_merged(
+                &*guard,
+                &MergedProvenance {
+                    lora_card: "cards/none".into(),
+                    arch: "tinyllama-tiny".into(),
+                    bundle_ref: "nn/tinyllama-bundle".into(),
+                },
+                &path,
+            )
+            .expect("write tinyllama bundle");
+        }
+
+        let spec = opts_table(&lua, json!({ "arch": "tinyllama-tiny" }));
+        let handle =
+            load_ckpt_impl(path.to_str().expect("utf-8 path"), &spec).expect("load_ckpt tinyllama");
+        assert_eq!(handle.arch(), "tinyllama");
+        assert!(handle.as_tinyllama().is_some());
+    }
+
+    /// KNOWN LIMITATION (pre-existing, not introduced by `load_ckpt`).
+    ///
+    /// A from-scratch TinyLlama handle registers its Vars at the model
+    /// root (`TinyLlamaModel::new` hands the same `VarBuilder` to both
+    /// halves of the split), so a raw `VarMap` dump — which is exactly
+    /// what the trainer's `CheckpointStore` writes — has no `model.`
+    /// prefix. `TinyLlamaModel::from_safetensors_file` reads the HF
+    /// layout (`model.*` plus a top-level `lm_head.weight`), so the two
+    /// do not meet. The same asymmetry blocks the TinyLlama
+    /// `run_full_ft` -> Card -> `load_handle` round-trip; GPT-2 is
+    /// unaffected (one flat namespace on both sides).
+    ///
+    /// This test pins the current failure so the gap is visible and a
+    /// future fix has a place to flip. Until then, `load_ckpt` on a
+    /// TinyLlama mid-run checkpoint fails loudly rather than silently
+    /// returning a randomly-initialised model.
+    #[test]
+    fn load_ckpt_of_a_raw_tinyllama_varmap_dump_is_refused_today() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+        let base = build_tinyllama_handle(
+            "tinyllama-tiny",
+            Some(&opts_table(&lua, json!({ "pretrained": false }))),
+            &nn_dir,
+        )
+        .expect("tinyllama-tiny base");
+        let path = tmp.path().join("tinyllama-varmap.safetensors");
+        base.varmap()
+            .expect("from-scratch handle carries a VarMap")
+            .save(&path)
+            .expect("write raw varmap dump");
+
+        let spec = opts_table(&lua, json!({ "arch": "tinyllama-tiny" }));
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &spec) {
+            Ok(_) => panic!(
+                "a raw VarMap dump does not carry the HF key layout; \
+                 loading it must not silently succeed"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("cannot find tensor model."),
+            "the failure must name the missing HF-prefixed tensor: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_ckpt_rebuilds_a_custom_gpt2_shape_from_the_spec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+        let shape = json!({
+            "vocab": 48,
+            "ctx": 16,
+            "layers": 2,
+            "heads": 2,
+            "dim": 32,
+            "act": "silu",
+            "norm": "rmsnorm",
+            "pos": "rope",
+            "untied_head": true,
+        });
+
+        let mut build_opts = shape.clone();
+        build_opts["pretrained"] = json!(false);
+        let base = build_gpt2_handle("custom", Some(&opts_table(&lua, build_opts)), &nn_dir)
+            .expect("custom gpt2 base");
+        let path = tmp.path().join("custom-run.safetensors");
+        base.varmap()
+            .expect("from-scratch handle carries a VarMap")
+            .save(&path)
+            .expect("write checkpoint");
+
+        // `"gpt2-custom"` pins no shape, so the spec repeats the same
+        // keys the preset was built with — the load side has no other
+        // source for them (a Card would carry them in
+        // `candle.custom`).
+        let mut spec = shape;
+        spec["arch"] = json!("gpt2-custom");
+        let handle = load_ckpt_impl(path.to_str().expect("utf-8 path"), &opts_table(&lua, spec))
+            .expect("load_ckpt custom");
+        let gpt2 = handle.as_gpt2().expect("gpt2 handle");
+        assert_eq!(gpt2.vocab, 48);
+        assert_eq!(gpt2.ctx, 16);
+        assert_eq!(gpt2.layers, 2);
+        assert_eq!(gpt2.dim, 32);
+    }
+
+    // ── refusals ─────────────────────────────────────────────────
+
+    #[test]
+    fn load_ckpt_refuses_a_path_that_is_not_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let spec = opts_table(&lua, json!({ "arch": "gpt2-tiny" }));
+        let missing = tmp.path().join("rotated-away.safetensors");
+        let msg = match load_ckpt_impl(missing.to_str().expect("utf-8 path"), &spec) {
+            Ok(_) => panic!("a missing checkpoint must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:") && msg.contains("no safetensors file"),
+            "message: {msg}"
+        );
+        assert!(
+            msg.contains("on_ckpt"),
+            "the message must name the rotation trap: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_ckpt_requires_spec_arch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let path = tmp.path().join("run.safetensors");
+        touch(&path);
+        let spec = opts_table(&lua, json!({ "device": "cpu" }));
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &spec) {
+            Ok(_) => panic!("a spec without arch must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:") && msg.contains("spec.arch is required"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_ckpt_refuses_an_unregistered_arch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let path = tmp.path().join("run.safetensors");
+        touch(&path);
+        let spec = opts_table(&lua, json!({ "arch": "qwen2-1.5b" }));
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &spec) {
+            Ok(_) => panic!("an unregistered arch must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:") && msg.contains("no bridge dispatch"),
+            "message: {msg}"
+        );
+        assert!(
+            msg.contains("gpt2"),
+            "the message must list the registered families: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_ckpt_refuses_an_inference_only_arch() {
+        // `llama` resolves to an ArchOps entry, but its
+        // `build_from_safetensors` slot is `None` — adapter-style
+        // architectures never write a self-contained checkpoint. The
+        // refusal has to say that rather than read as "unknown arch".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let path = tmp.path().join("run.safetensors");
+        touch(&path);
+        let spec = opts_table(&lua, json!({ "arch": "llama-tiny" }));
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &spec) {
+            Ok(_) => panic!("an inference-only arch must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:")
+                && msg.contains("does not support loading a self-contained safetensors checkpoint"),
+            "message: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_ckpt_custom_spec_typos_carry_the_load_ckpt_prefix() {
+        // The custom-shape parser is shared with
+        // `alc.nn.preset.gpt2("custom", ...)`; a load-time typo must
+        // point at the load entry, not at the preset call the caller
+        // is not making here.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let path = tmp.path().join("run.safetensors");
+        touch(&path);
+        let spec = opts_table(&lua, json!({ "arch": "gpt2-custom", "norm": "rmsnrm" }));
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &spec) {
+            Ok(_) => panic!("an unknown norm must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:") && msg.contains("unknown norm 'rmsnrm'"),
+            "message: {msg}"
+        );
     }
 }
 

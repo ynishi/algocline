@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `run_full_ft` (previously the pairing was a silent no-op: the
   hook could never fire and the run reported clean).
 
+- `alc.nn.card.load_ckpt(path, spec) -> NnHandle` — Cardless loader that
+  rebuilds a handle straight from a raw safetensors file, with the
+  architecture supplied by the caller (`spec.arch`, same vocabulary as
+  `load_handle`; optional `device` / `dtype` defaulting to cpu / f32,
+  plus the custom-shape keys for `arch = "gpt2-custom"`). This is the
+  bridge an `on_ckpt` hook uses to turn the mid-run `info.ckpt_path`
+  (which has no Card yet) into a handle the metric surfaces can
+  consume. The load path never touches an existing handle's mutex, so
+  it is safe to call from inside the hook while the trainer holds the
+  model lock. Checkpoint paths rotate (`ckpt_keep`) — load inside the
+  hook body only. Known limitation (pre-existing, pinned by a test):
+  TinyLlama raw checkpoints use a different tensor layout than
+  `from_safetensors_file` expects and fail loudly; GPT-2 (named and
+  custom) round-trips.
+
 - `examples/gameai/gameai_metrics` — new Lua pkg composing the metric
   primitives + Registry into three GameAI-specific metrics for the
   Level Sweep learning iter. `style_distance(card_a, card_b,

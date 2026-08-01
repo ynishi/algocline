@@ -1,0 +1,204 @@
+--- trickiness — mean Shannon entropy of one Card's temperature-scaled
+--- action distribution over a shared prompt set.
+---
+--- ## Contract
+---
+--- `trickiness(card, prompt_set, temperature?) -> number`
+---
+--- - `card` — string alias or handle table, same shape as
+---   `style_distance` (see `style_distance.lua`).
+---
+--- - `prompt_set` — non-empty array of guardian player-view tables.
+---
+--- - `temperature` — optional positive finite number, default `1.0`. The
+---   distribution the entropy is measured over is the temperature-scaled
+---   softmax of the Card's next-token logits, masked to the four legal
+---   player moves. The scaling matches what
+---   `alc.nn.sampler.temperature(t, seed)` would draw from, so a
+---   `trickiness` reading at `t = 1.5` predicts the entropy of the
+---   noisy autoplay at the same temperature.
+---
+--- ## Output
+---
+--- Mean of `alc.nn.metric.entropy(p)` (natural log, base e) across every
+--- view in `prompt_set`. Zero when the Card is fully committed to one
+--- move at every position (equivalent to greedy), approaches `log(4)`
+--- when the four legal moves are uniformly distributed.
+---
+--- ## Why measure it from the logits, not by sampling
+---
+--- Sampling `N` draws per position and estimating the empirical
+--- distribution would need `N` in the hundreds to stabilise the entropy
+--- of a peaky distribution — the sampler is what the entropy is *of*, so
+--- reading it from the softmax that feeds the sampler is cheaper and
+--- deterministic per (card, view, temperature) triple.
+
+local duel = require("guardian_duel")
+
+local M
+
+local VOCAB = duel.player_vocab()
+local LEGAL_ACTIONS = duel.player_legal_actions()
+local LEGAL_IDS = {}
+for _, action in ipairs(LEGAL_ACTIONS) do
+    local id = VOCAB.to_id[action]
+    if id == nil then
+        error("trickiness: legal action " .. tostring(action) .. " is outside player_vocab")
+    end
+    LEGAL_IDS[#LEGAL_IDS + 1] = id
+end
+
+local function require_nn_card()
+    if type(alc) ~= "table" or type(alc.nn) ~= "table" or type(alc.nn.card) ~= "table" then
+        error("trickiness: alc.nn.card is unavailable; build algocline with --features nn")
+    end
+end
+
+local function require_entropy()
+    if not (alc and alc.nn and alc.nn.metric and type(alc.nn.metric.entropy) == "function") then
+        error("trickiness: alc.nn.metric.entropy is unavailable; ST2 bridge missing")
+    end
+    return alc.nn.metric.entropy
+end
+
+--- Match `style_distance.resolve_handle`; kept local so a spec that stubs
+--- one metric does not have to reach into the other's module state.
+local function resolve_handle(card)
+    if type(card) == "table" then
+        if type(card.generate_session) ~= "function" then
+            error(
+                "trickiness: card table has no generate_session method; "
+                    .. "expected a handle returned by alc.nn.card.load_handle"
+            )
+        end
+        return card
+    end
+    if type(card) == "string" then
+        if #card == 0 then
+            error("trickiness: card must be a non-empty string alias")
+        end
+        require_nn_card()
+        if type(alc.card) ~= "table" or type(alc.card.get_by_alias) ~= "function" then
+            error("trickiness: alc.card.get_by_alias is unavailable")
+        end
+        local entry = alc.card.get_by_alias(card)
+        if not entry then
+            error(string.format("trickiness: alias %q is not bound to any Card", card))
+        end
+        local card_id = entry.card_id
+        if type(card_id) ~= "string" or #card_id == 0 then
+            error(string.format("trickiness: alias %q resolved to a Card without card_id", card))
+        end
+        return alc.nn.card.load_handle(card_id)
+    end
+    error("trickiness: card must be a string alias or a handle table, got " .. type(card))
+end
+
+--- Check `temperature` is finite and strictly positive. Zero is rejected
+--- rather than folded into greedy: the sampler would divide by it, and
+--- a caller who means greedy already gets it by omitting the argument
+--- and reading `trickiness ≈ 0` from a peaked softmax.
+local function decode_temperature(raw)
+    if raw == nil then
+        return 1.0
+    end
+    if type(raw) ~= "number" or raw ~= raw or raw == math.huge or raw <= 0 then
+        error("trickiness: temperature must be a finite positive number, got " .. tostring(raw))
+    end
+    return raw
+end
+
+--- Temperature-scaled softmax over the four legal moves. Numerically
+--- stable via max-subtraction before `exp`.
+local function probs_for_view(handle, view, temperature)
+    local prompt = duel.player_encode(view) .. ">"
+    local session = handle:generate_session(duel.player_to_ids(prompt))
+    local logits = session:next_logits()
+    local ranked = logits:top(logits:vocab())
+
+    local raw = {}
+    for i = 1, #LEGAL_IDS do
+        raw[i] = nil
+    end
+    local seen = 0
+    for _, entry in ipairs(ranked) do
+        for i, legal_id in ipairs(LEGAL_IDS) do
+            if entry.id == legal_id and raw[i] == nil then
+                raw[i] = entry.value
+                seen = seen + 1
+                break
+            end
+        end
+        if seen == #LEGAL_IDS then
+            break
+        end
+    end
+    if seen ~= #LEGAL_IDS then
+        error("trickiness: player move id missing from logits ranking")
+    end
+
+    local scaled = {}
+    for i, l in ipairs(raw) do
+        scaled[i] = l / temperature
+    end
+    local max_l = scaled[1]
+    for i = 2, #scaled do
+        if scaled[i] > max_l then
+            max_l = scaled[i]
+        end
+    end
+    local probs = {}
+    local sum = 0.0
+    for i, l in ipairs(scaled) do
+        local w = math.exp(l - max_l)
+        probs[i] = w
+        sum = sum + w
+    end
+    if sum <= 0 then
+        error("trickiness: softmax over legal moves normalised to zero")
+    end
+    for i, w in ipairs(probs) do
+        probs[i] = w / sum
+    end
+    return probs
+end
+
+local function require_prompt_set(prompt_set)
+    if type(prompt_set) ~= "table" then
+        error(
+            "trickiness: prompt_set must be a table (array of player views), got "
+                .. type(prompt_set)
+        )
+    end
+    local n = #prompt_set
+    if n == 0 then
+        error("trickiness: prompt_set is empty; nothing to average over")
+    end
+    return n
+end
+
+M = function(card, prompt_set, temperature)
+    local n = require_prompt_set(prompt_set)
+    local t = decode_temperature(temperature)
+    local entropy = require_entropy()
+    local handle = resolve_handle(card)
+
+    local total = 0.0
+    for i = 1, n do
+        local view = prompt_set[i]
+        if type(view) ~= "table" then
+            error(
+                string.format(
+                    "trickiness: prompt_set[%d] must be a player view table, got %s",
+                    i,
+                    type(view)
+                )
+            )
+        end
+        local p = probs_for_view(handle, view, t)
+        total = total + entropy(p)
+    end
+    return total / n
+end
+
+return M

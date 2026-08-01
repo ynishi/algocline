@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/gameai/gameai_metrics` — new Lua pkg composing the metric
+  primitives + Registry into three GameAI-specific metrics for the
+  Level Sweep learning iter. `style_distance(card_a, card_b,
+  prompt_set)` returns mean JS divergence over prompt-set greedy action
+  distributions (composes `alc.nn.metric.js`). `trickiness(card,
+  prompt_set, temperature)` returns mean Shannon entropy of
+  temperature-scaled softmax over legal moves (composes
+  `alc.nn.metric.entropy`). `level(card, opponent, n_games, seed)`
+  returns `{ win_rate, ci_lower, ci_upper }` (Wilson 95% CI) over N
+  autoplay games against `"greedy"` / `"random"` boss (boss-Card seat
+  via `guardian_duel_npc` deferred to the Level Sweep iter). The pkg
+  self-registers into `alc.nn.metric.registry` on `require` so the
+  trainer `on_ckpt` hook can dispatch by name (`registry.evaluate("level",
+  { card = info.ckpt_path, opponent = "greedy", n_games = 32 })`).
+  `prompt_set` is caller-supplied as a Lua array of `player_view`
+  tables — raw playlog load (`data/guardian_sample_playlog_*.json`)
+  stays at the caller layer to keep the metric compose free of file
+  paths. 20 spec tests (6 style / 6 trickiness / 8 level) cover
+  primitive composition, arg validation, and return shape; stylua
+  clean.
+
 - `alc.nn.trainer.full_ft` gains an optional `on_ckpt` callback in
   `opts` — invoked at every `ckpt_every` boundary right after the
   weights checkpoint is saved. Signature is

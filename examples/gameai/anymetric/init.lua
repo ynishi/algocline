@@ -10,15 +10,23 @@
 ---   `ErrorRecord` behind instead of killing the training run.
 ---
 --- - **judgment**: a `Judgment` is `fn(records) -> Decision` where
----   `Decision = { action = "break"|"continue"|"harvest", reason = <string> }`.
----   Judgments read the records of the views they were told to read and
----   nothing else, so a strength gate never accidentally couples itself
----   to a personality metric that happens to be observed alongside it.
+---   `Decision = { action = "break"|"continue"|"harvest", reason = <string>,
+---   meta = <table|nil> }`. Judgments read the records of the views they
+---   were told to read and nothing else, so a strength gate never
+---   accidentally couples itself to a personality metric that happens to
+---   be observed alongside it. `meta` is an optional caller-defined table
+---   that band / staged judgments use to carry the hit `label` plus the
+---   observing step and raw values; simpler judgments (threshold,
+---   never_break) leave it absent so downstream callers see the exact
+---   same shape they always did.
 ---
 --- Only `to_hook_action` knows about the trainer hook ABI (the bridge
 --- accepts `"break"` / `"continue"` / `nil` and nothing else), so the
 --- domain is free to carry a third action (`harvest`) that the ABI has
---- no room for.
+--- no room for. When a harvest decision carries `meta`, the marker
+--- record appended to the run log carries the same table so a
+--- collection helper can extract the label without a second judgment
+--- call.
 ---
 --- Nothing in this module is game-specific: metric names, ctx keys and
 --- the fields a judgment reads are all supplied by the caller.
@@ -388,8 +396,8 @@ local function comparator_list()
     return table.concat(ops, " ")
 end
 
-local function decision(action, reason)
-    return { action = action, reason = reason }
+local function decision(action, reason, meta)
+    return { action = action, reason = reason, meta = meta }
 end
 
 M.judgment = {}
@@ -480,6 +488,254 @@ function M.judgment.threshold(opts)
     end
 end
 
+--- Find the record for `view_id` in `records` and, if the field is a
+--- usable number, return `(record, value, nil)`. Otherwise return
+--- `(nil, nil, continue_decision)` where the continue decision names the
+--- reason (no record / errored / missing field / non-numeric field), so
+--- the caller can return it verbatim. Meta is left absent on the miss
+--- path — a measurement gap is not a labelled outcome.
+local function read_numeric_field(records, view_id, field)
+    if type(records) ~= "table" then
+        error("anymetric.judgment: records must be an array, got " .. type(records), 3)
+    end
+    local target
+    for _, record in ipairs(records) do
+        if type(record) == "table" and rawget(record, "view_id") == view_id then
+            target = record
+        end
+    end
+    if target == nil then
+        return nil,
+            nil,
+            decision("continue", string.format("view '%s' produced no record", view_id))
+    end
+    if target.error ~= nil then
+        return nil,
+            nil,
+            decision(
+                "continue",
+                string.format("view '%s' errored: %s", view_id, tostring(target.error))
+            )
+    end
+    local values = target.values
+    local actual = type(values) == "table" and values[field] or nil
+    if type(actual) ~= "number" then
+        return nil,
+            nil,
+            decision(
+                "continue",
+                string.format("view '%s' has no numeric field '%s'", view_id, field)
+            )
+    end
+    return target, actual, nil
+end
+
+local function normalise_band(band, where)
+    if type(band) ~= "table" then
+        error(where .. ": band must be a table, got " .. type(band), 3)
+    end
+    local lo, hi, label = band.lo, band.hi, band.label
+    if type(lo) ~= "number" then
+        error(where .. ": band.lo must be a number, got " .. type(lo), 3)
+    end
+    if type(hi) ~= "number" then
+        error(where .. ": band.hi must be a number, got " .. type(hi), 3)
+    end
+    if lo > hi then
+        error(string.format("%s: band.lo (%.4f) must be <= band.hi (%.4f)", where, lo, hi), 3)
+    end
+    if label ~= nil and type(label) ~= "string" then
+        error(where .. ": band.label must be a string or nil, got " .. type(label), 3)
+    end
+    return { lo = lo, hi = hi, label = label }
+end
+
+--- Build a harvest decision for a hit band, carrying the label plus the
+--- observing step and raw values in `meta`.
+local function harvest_hit(view_id, field, record, actual, band)
+    local reason
+    if band.label ~= nil then
+        reason = string.format(
+            "%s.%s = %.4f in [%.4f, %.4f] (%s)",
+            view_id,
+            field,
+            actual,
+            band.lo,
+            band.hi,
+            band.label
+        )
+    else
+        reason =
+            string.format("%s.%s = %.4f in [%.4f, %.4f]", view_id, field, actual, band.lo, band.hi)
+    end
+    return decision("harvest", reason, {
+        label = band.label,
+        step = record.step,
+        values = record.values,
+    })
+end
+
+--- A judgment that harvests once one numeric field of one view falls
+--- inside a single closed interval `[lo, hi]`, continues while the
+--- value is below `lo`, and breaks once it rises above `hi`.
+---
+--- Both ends are inclusive so the boundary picks the band above rather
+--- than falling into a silent gap. `label` is optional; when set it is
+--- copied into the harvest decision's `meta.label` (and its `reason`),
+--- so a collection helper can address the hit without a second judgment
+--- call.
+---
+--- Like `threshold`, the judgment reads the records of `view_id` only.
+--- A missing record, an ErrorRecord, or a non-numeric field all resolve
+--- to `continue` and name the reason.
+---
+---@param opts table `{ view_id, field, lo, hi, label? }`
+---@return function judgment `fn(records) -> Decision`
+function M.judgment.band(opts)
+    if type(opts) ~= "table" then
+        error("anymetric.judgment.band: opts must be a table, got " .. type(opts), 2)
+    end
+    local view_id, field = opts.view_id, opts.field
+    if type(view_id) ~= "string" or view_id == "" then
+        error("anymetric.judgment.band: view_id must be a non-empty string", 2)
+    end
+    if type(field) ~= "string" or field == "" then
+        error("anymetric.judgment.band: field must be a non-empty string", 2)
+    end
+    local band = normalise_band(
+        { lo = opts.lo, hi = opts.hi, label = opts.label },
+        "anymetric.judgment.band"
+    )
+
+    return function(records)
+        local record, actual, miss = read_numeric_field(records, view_id, field)
+        if miss ~= nil then
+            return miss
+        end
+        if actual < band.lo then
+            local suffix = band.label and (" (" .. band.label .. ")") or ""
+            return decision(
+                "continue",
+                string.format(
+                    "%s.%s = %.4f below lo=%.4f%s",
+                    view_id,
+                    field,
+                    actual,
+                    band.lo,
+                    suffix
+                )
+            )
+        end
+        if actual > band.hi then
+            local suffix = band.label and (" (" .. band.label .. ")") or ""
+            return decision(
+                "break",
+                string.format(
+                    "%s.%s = %.4f above hi=%.4f%s",
+                    view_id,
+                    field,
+                    actual,
+                    band.hi,
+                    suffix
+                )
+            )
+        end
+        return harvest_hit(view_id, field, record, actual, band)
+    end
+end
+
+--- A staged judgment: several disjoint bands in ascending `lo` order,
+--- each with an optional `label`. When the observed field falls into
+--- one of the bands the judgment harvests and copies that band's label
+--- into `meta.label`; below the lowest band it continues; above the
+--- highest band's `hi` it breaks. Between two bands (no band contains
+--- the value) it also continues.
+---
+--- The judgment is stateless — it holds no history of which labels
+--- have been harvested. Enforcing "one bake per label" is the caller's
+--- job (the collection helper handles first-writer-wins). The one
+--- structural rule enforced here is that bands are disjoint
+--- (`bands[i].hi < bands[i+1].lo`); overlapping bands would make the
+--- hit label non-deterministic, which is a caller wiring bug and is
+--- raised loudly.
+---
+--- A one-band staged judgment is allowed and is equivalent to a single
+--- `band(...)`; an empty bands list is a wiring bug and raises.
+---
+---@param opts table `{ view_id, field, bands = { { lo, hi, label? }, ... } }`
+---@return function judgment `fn(records) -> Decision`
+function M.judgment.staged(opts)
+    if type(opts) ~= "table" then
+        error("anymetric.judgment.staged: opts must be a table, got " .. type(opts), 2)
+    end
+    local view_id, field = opts.view_id, opts.field
+    if type(view_id) ~= "string" or view_id == "" then
+        error("anymetric.judgment.staged: view_id must be a non-empty string", 2)
+    end
+    if type(field) ~= "string" or field == "" then
+        error("anymetric.judgment.staged: field must be a non-empty string", 2)
+    end
+    if type(opts.bands) ~= "table" then
+        error("anymetric.judgment.staged: bands must be an array, got " .. type(opts.bands), 2)
+    end
+    if #opts.bands == 0 then
+        error("anymetric.judgment.staged: bands must not be empty", 2)
+    end
+
+    local bands = {}
+    for index, raw in ipairs(opts.bands) do
+        bands[index] = normalise_band(raw, "anymetric.judgment.staged: bands[" .. index .. "]")
+    end
+    for index = 2, #bands do
+        local prev, curr = bands[index - 1], bands[index]
+        if not (prev.hi < curr.lo) then
+            error(
+                string.format(
+                    "anymetric.judgment.staged: bands must be in ascending order and disjoint "
+                        .. "(bands[%d].hi=%.4f must be < bands[%d].lo=%.4f)",
+                    index - 1,
+                    prev.hi,
+                    index,
+                    curr.lo
+                ),
+                2
+            )
+        end
+    end
+
+    local top = bands[#bands]
+
+    return function(records)
+        local record, actual, miss = read_numeric_field(records, view_id, field)
+        if miss ~= nil then
+            return miss
+        end
+        if actual > top.hi then
+            local suffix = top.label and (" (" .. top.label .. ")") or ""
+            return decision(
+                "break",
+                string.format(
+                    "%s.%s = %.4f above top hi=%.4f%s",
+                    view_id,
+                    field,
+                    actual,
+                    top.hi,
+                    suffix
+                )
+            )
+        end
+        for _, band in ipairs(bands) do
+            if actual >= band.lo and actual <= band.hi then
+                return harvest_hit(view_id, field, record, actual, band)
+            end
+        end
+        return decision(
+            "continue",
+            string.format("%s.%s = %.4f between bands (no hit)", view_id, field, actual)
+        )
+    end
+end
+
 --- A judgment that never stops the run. Used when the run is observed
 --- for its record trail only (gate disabled).
 ---@return function judgment `fn(records) -> Decision`
@@ -502,7 +758,14 @@ end
 --- from. Keeping the projection in one function is what lets the domain
 --- grow actions the ABI cannot express.
 ---
----@param dec table Decision `{ action, reason }`
+--- When the harvest decision carries a `meta` table, that table is
+--- copied onto the marker record so a collection helper can extract the
+--- band label / step / values without a second judgment call. A harvest
+--- decision without `meta` (e.g. a caller who built one by hand)
+--- appends the same `{ harvest, reason }` shape the previous iteration
+--- used, so downstream code that never read `meta` stays byte-identical.
+---
+---@param dec table Decision `{ action, reason, meta? }`
 ---@param run_log table|nil run log, required for `harvest`
 ---@return string action `"break"` or `"continue"`
 function M.to_hook_action(dec, run_log)
@@ -520,7 +783,22 @@ function M.to_hook_action(dec, run_log)
                 2
             )
         end
-        run_log:append({ { harvest = true, reason = dec.reason } })
+        local marker = { harvest = true, reason = dec.reason }
+        if dec.meta ~= nil then
+            if type(dec.meta) ~= "table" then
+                error(
+                    "anymetric.to_hook_action: decision.meta must be a table or nil, got "
+                        .. type(dec.meta),
+                    2
+                )
+            end
+            for key, value in pairs(dec.meta) do
+                if marker[key] == nil then
+                    marker[key] = value
+                end
+            end
+        end
+        run_log:append({ marker })
         return "continue"
     end
     error(

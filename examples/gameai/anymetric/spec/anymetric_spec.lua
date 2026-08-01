@@ -497,6 +497,449 @@ describe("anymetric.judgment.threshold", function()
     end)
 end)
 
+describe("anymetric.judgment.threshold Decision.meta absence", function()
+    -- The threshold judgment must not carry `meta` on either arm,
+    -- because downstream callers (the trainer hook adapter, log lines,
+    -- collection helpers) read the same {action, reason} shape they
+    -- always did. `meta` is opt-in for band / staged only.
+    it("leaves Decision.meta absent on break", function()
+        reset()
+        local d = am.judgment.threshold({
+            view_id = "level",
+            field = "ci_lower",
+            op = ">=",
+            value = 0.55,
+        })({ { step = 60, view_id = "level", values = { ci_lower = 0.61 } } })
+        expect(d.action).to.equal("break")
+        expect(d.meta).to.equal(nil)
+    end)
+
+    it("leaves Decision.meta absent on continue", function()
+        reset()
+        local d = am.judgment.threshold({
+            view_id = "level",
+            field = "ci_lower",
+            op = ">=",
+            value = 0.55,
+        })({ { step = 60, view_id = "level", values = { ci_lower = 0.41 } } })
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+    end)
+end)
+
+describe("anymetric.judgment.band", function()
+    local function level_records(ci_lower)
+        return {
+            {
+                step = 180,
+                view_id = "level",
+                metric = "level",
+                values = { ci_lower = ci_lower, win_rate = 0.9 },
+            },
+        }
+    end
+
+    it("harvests when the field falls inside [lo, hi] (label carried on meta)", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+        })
+        local d = judge(level_records(0.70))
+        expect(d.action).to.equal("harvest")
+        expect(d.reason:find("mid") ~= nil).to.equal(true)
+        expect(type(d.meta)).to.equal("table")
+        expect(d.meta.label).to.equal("mid")
+        expect(d.meta.step).to.equal(180)
+        expect(d.meta.values.ci_lower).to.equal(0.70)
+        expect(d.meta.values.win_rate).to.equal(0.9)
+    end)
+
+    it("harvests on both endpoints (both inclusive)", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+        })
+        expect(judge(level_records(0.55)).action).to.equal("harvest")
+        expect(judge(level_records(0.85)).action).to.equal("harvest")
+    end)
+
+    it("continues (no meta) when the field is below lo", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+        })
+        local d = judge(level_records(0.40))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("below") ~= nil).to.equal(true)
+    end)
+
+    it("breaks (no meta) when the field is above hi", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+        })
+        local d = judge(level_records(0.99))
+        expect(d.action).to.equal("break")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("above") ~= nil).to.equal(true)
+    end)
+
+    it("continues (no meta) when the target view produced no record", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+        })
+        local d = judge({ { step = 60, view_id = "trickiness", values = { value = 0.9 } } })
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("no record") ~= nil).to.equal(true)
+    end)
+
+    it("continues (no meta) on an ErrorRecord", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.10,
+            hi = 0.30,
+        })
+        local d = judge({ { step = 60, view_id = "level", error = "boom" } })
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("errored") ~= nil).to.equal(true)
+    end)
+
+    it("continues when the field is absent or non-numeric", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.10,
+            hi = 0.30,
+        })
+        expect(judge({ { step = 1, view_id = "level", values = { win_rate = 0.9 } } }).action).to.equal(
+            "continue"
+        )
+        expect(judge({ { step = 1, view_id = "level", values = { ci_lower = "hi" } } }).action).to.equal(
+            "continue"
+        )
+    end)
+
+    it("omits meta.label when label is not supplied", function()
+        reset()
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+        })
+        local d = judge(level_records(0.70))
+        expect(d.action).to.equal("harvest")
+        expect(type(d.meta)).to.equal("table")
+        expect(d.meta.label).to.equal(nil)
+        expect(d.meta.step).to.equal(180)
+    end)
+
+    it("rejects lo > hi at construction time", function()
+        reset()
+        local ok, err = pcall(am.judgment.band, {
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.85,
+            hi = 0.55,
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("lo") ~= nil and err:find("hi") ~= nil).to.equal(true)
+    end)
+
+    it("rejects malformed opts at construction time", function()
+        reset()
+        expect(pcall(am.judgment.band, "nope")).to.equal(false)
+        expect(pcall(am.judgment.band, { field = "ci_lower", lo = 0.1, hi = 0.2 })).to.equal(false)
+        expect(pcall(am.judgment.band, { view_id = "level", lo = 0.1, hi = 0.2 })).to.equal(false)
+        expect(pcall(am.judgment.band, { view_id = "level", field = "x", hi = 0.2 })).to.equal(
+            false
+        )
+        expect(pcall(am.judgment.band, { view_id = "level", field = "x", lo = 0.1 })).to.equal(
+            false
+        )
+        expect(pcall(am.judgment.band, {
+            view_id = "level",
+            field = "x",
+            lo = 0.1,
+            hi = 0.2,
+            label = 7,
+        })).to.equal(false)
+    end)
+
+    it("reads only the view it was bound to, even when foreign records are hostile", function()
+        reset()
+        local records = {
+            booby_record("sd_teacher"),
+            { step = 180, view_id = "level", metric = "level", values = { ci_lower = 0.70 } },
+            booby_record("trickiness"),
+        }
+        local judge = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+        })
+        local d = judge(records)
+        expect(d.action).to.equal("harvest")
+        expect(d.meta.label).to.equal("mid")
+        expect(d.reason:find("sd_teacher") == nil).to.equal(true)
+        expect(d.reason:find("trickiness") == nil).to.equal(true)
+    end)
+end)
+
+describe("anymetric.judgment.staged", function()
+    local function level_records(ci_lower)
+        return {
+            {
+                step = 240,
+                view_id = "level",
+                metric = "level",
+                values = { ci_lower = ci_lower, win_rate = 0.9 },
+            },
+        }
+    end
+
+    local function default_bands()
+        return {
+            { lo = 0.10, hi = 0.30, label = "weak" },
+            { lo = 0.55, hi = 0.85, label = "mid" },
+            { lo = 0.85 + 1e-9, hi = 0.98, label = "strong" },
+        }
+    end
+
+    it("harvests the matching band and copies its label into meta", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        local weak = judge(level_records(0.20))
+        expect(weak.action).to.equal("harvest")
+        expect(weak.meta.label).to.equal("weak")
+        expect(weak.meta.step).to.equal(240)
+        local mid = judge(level_records(0.70))
+        expect(mid.action).to.equal("harvest")
+        expect(mid.meta.label).to.equal("mid")
+        local strong = judge(level_records(0.90))
+        expect(strong.action).to.equal("harvest")
+        expect(strong.meta.label).to.equal("strong")
+    end)
+
+    it("continues below the lowest band's lo", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        local d = judge(level_records(0.05))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+    end)
+
+    it("continues between two bands (in the gap)", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        local d = judge(level_records(0.45))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+    end)
+
+    it("breaks once the value rises above the topmost band's hi", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        local d = judge(level_records(0.999))
+        expect(d.action).to.equal("break")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("above") ~= nil).to.equal(true)
+    end)
+
+    it("continues (no meta) on missing record / ErrorRecord / non-numeric field", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        expect(judge({ { step = 1, view_id = "other", values = { value = 0.9 } } }).action).to.equal(
+            "continue"
+        )
+        expect(judge({ { step = 1, view_id = "level", error = "boom" } }).action).to.equal(
+            "continue"
+        )
+        expect(judge({ { step = 1, view_id = "level", values = { ci_lower = "hi" } } }).action).to.equal(
+            "continue"
+        )
+    end)
+
+    it("rejects overlapping / non-disjoint bands loudly", function()
+        reset()
+        local ok, err = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                { lo = 0.10, hi = 0.50, label = "a" },
+                { lo = 0.40, hi = 0.80, label = "b" },
+            },
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("disjoint") ~= nil).to.equal(true)
+    end)
+
+    it(
+        "rejects touching bands (equal boundary) loudly — label would be non-deterministic",
+        function()
+            reset()
+            local ok = pcall(am.judgment.staged, {
+                view_id = "level",
+                field = "ci_lower",
+                bands = {
+                    { lo = 0.10, hi = 0.50, label = "a" },
+                    { lo = 0.50, hi = 0.80, label = "b" },
+                },
+            })
+            expect(ok).to.equal(false)
+        end
+    )
+
+    it("rejects descending bands loudly", function()
+        reset()
+        local ok = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                { lo = 0.60, hi = 0.90, label = "hi" },
+                { lo = 0.10, hi = 0.30, label = "lo" },
+            },
+        })
+        expect(ok).to.equal(false)
+    end)
+
+    it("rejects an empty bands list loudly", function()
+        reset()
+        local ok, err = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = {},
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("empty") ~= nil).to.equal(true)
+    end)
+
+    it("rejects a band with lo > hi", function()
+        reset()
+        local ok = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = { { lo = 0.85, hi = 0.55, label = "bad" } },
+        })
+        expect(ok).to.equal(false)
+    end)
+
+    it("rejects malformed opts / missing bands / non-table band", function()
+        reset()
+        expect(pcall(am.judgment.staged, "nope")).to.equal(false)
+        expect(pcall(am.judgment.staged, { field = "x", bands = { { lo = 0, hi = 1 } } })).to.equal(
+            false
+        )
+        expect(pcall(am.judgment.staged, { view_id = "v", bands = { { lo = 0, hi = 1 } } })).to.equal(
+            false
+        )
+        expect(pcall(am.judgment.staged, { view_id = "v", field = "x" })).to.equal(false)
+        expect(pcall(am.judgment.staged, { view_id = "v", field = "x", bands = { "not a band" } })).to.equal(
+            false
+        )
+    end)
+
+    it("a one-band staged judgment is equivalent to a plain band judgment", function()
+        reset()
+        local staged = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = { { lo = 0.55, hi = 0.85, label = "mid" } },
+        })
+        local band = am.judgment.band({
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+        })
+        for _, v in ipairs({ 0.10, 0.55, 0.70, 0.85, 0.99 }) do
+            local s = staged(level_records(v))
+            local b = band(level_records(v))
+            expect(s.action).to.equal(b.action)
+            expect(s.meta and s.meta.label or nil).to.equal(b.meta and b.meta.label or nil)
+        end
+    end)
+
+    it("is stateless: two harvest calls on the same band both return harvest", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        expect(judge(level_records(0.70)).action).to.equal("harvest")
+        expect(judge(level_records(0.72)).action).to.equal("harvest")
+    end)
+
+    it("reads only the view it was bound to, even when foreign records are hostile", function()
+        reset()
+        local records = {
+            booby_record("sd_teacher"),
+            { step = 240, view_id = "level", metric = "level", values = { ci_lower = 0.90 } },
+            booby_record("trickiness"),
+        }
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = default_bands(),
+        })
+        local d = judge(records)
+        expect(d.action).to.equal("harvest")
+        expect(d.meta.label).to.equal("strong")
+        expect(d.reason:find("sd_teacher") == nil).to.equal(true)
+        expect(d.reason:find("trickiness") == nil).to.equal(true)
+    end)
+end)
+
 describe("anymetric.judgment.never_break", function()
     it("continues even on records a threshold would break on", function()
         reset()
@@ -558,6 +1001,79 @@ describe("anymetric.to_hook_action", function()
         expect(err:find("halt") ~= nil).to.equal(true)
         expect(pcall(am.to_hook_action, "break")).to.equal(false)
         expect(pcall(am.to_hook_action, {})).to.equal(false)
+    end)
+
+    it("merges Decision.meta into the harvest marker record", function()
+        reset()
+        local log = am.run_log.new()
+        local meta = { label = "mid", step = 180, values = { ci_lower = 0.70 } }
+        local action = am.to_hook_action(
+            { action = "harvest", reason = "band [0.55, 0.85] hit (mid)", meta = meta },
+            log
+        )
+        expect(action).to.equal("continue")
+        local all = log:all()
+        expect(#all).to.equal(1)
+        expect(all[1].harvest).to.equal(true)
+        expect(all[1].reason).to.equal("band [0.55, 0.85] hit (mid)")
+        expect(all[1].label).to.equal("mid")
+        expect(all[1].step).to.equal(180)
+        expect(all[1].values.ci_lower).to.equal(0.70)
+    end)
+
+    it("meta is copy-only: mutating the marker does not leak into the source table", function()
+        reset()
+        local log = am.run_log.new()
+        local meta = { label = "mid", step = 180 }
+        am.to_hook_action({ action = "harvest", reason = "x", meta = meta }, log)
+        -- The marker got its own label copy — reading it back must not
+        -- reflect a later change to `meta`.
+        meta.label = "mutated"
+        expect(log:all()[1].label).to.equal("mid")
+    end)
+
+    it("harvest without meta keeps the previous {harvest, reason} shape byte-for-byte", function()
+        reset()
+        local log = am.run_log.new()
+        am.to_hook_action({ action = "harvest", reason = "no meta here" }, log)
+        local marker = log:all()[1]
+        expect(marker.harvest).to.equal(true)
+        expect(marker.reason).to.equal("no meta here")
+        expect(marker.label).to.equal(nil)
+        expect(marker.step).to.equal(nil)
+        expect(marker.values).to.equal(nil)
+        -- Count keys: exactly {harvest, reason}, nothing else.
+        local count = 0
+        for _ in pairs(marker) do
+            count = count + 1
+        end
+        expect(count).to.equal(2)
+    end)
+
+    it("refuses to fold in a non-table meta", function()
+        reset()
+        local log = am.run_log.new()
+        local ok, err = pcall(am.to_hook_action, {
+            action = "harvest",
+            reason = "x",
+            meta = "not a table",
+        }, log)
+        expect(ok).to.equal(false)
+        expect(err:find("meta") ~= nil).to.equal(true)
+    end)
+
+    it("built-in fields (harvest, reason) always win over meta keys of the same name", function()
+        reset()
+        local log = am.run_log.new()
+        am.to_hook_action({
+            action = "harvest",
+            reason = "authoritative",
+            meta = { reason = "meta wins?", harvest = false, label = "mid" },
+        }, log)
+        local marker = log:all()[1]
+        expect(marker.harvest).to.equal(true)
+        expect(marker.reason).to.equal("authoritative")
+        expect(marker.label).to.equal("mid")
     end)
 end)
 

@@ -459,6 +459,38 @@ mod tests {
         assert_eq!(result, serde_json::json!(42));
     }
 
+    /// Regression for issue bda23871: a package symlinked into the lib path
+    /// **after** the Executor (and its shared-VM resolver) was constructed
+    /// must still be requirable through `eval_simple`. The old
+    /// `SymlinkAwareSandbox` default snapshotted symlink targets at
+    /// construction time, so `alc_pkg_link` after MCP server startup broke
+    /// `alc_eval` / `alc_advice` / `alc_pkg_list` meta loads with
+    /// `path traversal blocked` until a server restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_vm_resolves_symlink_created_after_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_root = tmp.path().join("packages");
+        fs::create_dir_all(&pkg_root).unwrap();
+
+        // Executor constructed while the packages dir is still empty —
+        // its shared VM resolver exists before the symlink does.
+        let executor = Executor::new(vec![pkg_root.clone()]).await.unwrap();
+
+        // Simulate `alc_pkg_link scope=global`: source outside the packages
+        // dir, symlinked in afterwards.
+        let external = tmp.path().join("worktree").join("late_pkg");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("init.lua"), "return { value = 42 }").unwrap();
+        std::os::unix::fs::symlink(&external, pkg_root.join("late_pkg")).unwrap();
+
+        let result = executor
+            .eval_simple("return require('late_pkg').value".to_string())
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!(42));
+    }
+
     /// `eval_simple_with_paths` with a project-local package.
     ///
     /// Creates a temp dir with `test_pkg/init.lua` returning `{value = 99}`,

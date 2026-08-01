@@ -88,6 +88,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Packages linked with `alc_pkg_link --scope=global` **after** MCP server
+  startup no longer fail with `path traversal blocked` in `alc_eval` /
+  `alc_advice` / `alc_pkg_list` metadata loads. The engine's default
+  sandbox (upstream `mlua_pkg::SymlinkAwareSandbox`) snapshots symlink
+  targets once at construction time, and the shared `eval_simple` VM —
+  used by the library-package guard in front of `alc_eval` / `alc_advice`
+  and by `alc_pkg_list` — lives for the whole server process, so its
+  snapshot went stale and rejected any symlink created after startup
+  (a restart "fixed" it). The factory now installs an engine-local
+  `RescanSymlinkSandbox` that re-resolves the symlink set under the
+  packages dir on every read: same boundary semantics (readable iff
+  under the root or under a currently-present symlink's target), no
+  restart needed, and removed links are revoked immediately.
+  `ALC_PKG_STRICT=1` strict behaviour is unchanged. `alc_run` and
+  per-session VMs were never affected (they build a fresh resolver per
+  call).
+
 - `alc.nn`: trained Cards now round-trip the training-time device
   and dtype. `NnModelCard::from_training` used to write
   `candle.device = None` / `candle.dtype = None` regardless of the

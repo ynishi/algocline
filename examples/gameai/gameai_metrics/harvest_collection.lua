@@ -81,6 +81,8 @@
 --- two (weak + mid, strong never fired) and still be useful for a
 --- Human observation note.
 
+local fs = require("gameai_metrics._fs")
+
 local M = {}
 
 ---@type AlcMeta
@@ -364,6 +366,11 @@ function Collection:save()
     if not ok then
         error("harvest_collection:save: failed to encode manifest: " .. tostring(encoded), 2)
     end
+    -- Idempotent parent-dir mkdir: removes the previous iteration's
+    -- Run 1 accident class (missing workspace/gameai-harvest/ crashed
+    -- the trainer hook mid-run). See gameai_metrics._fs for the shell
+    -- escape rationale.
+    fs.ensure_parent_dir(self._path)
     local f, err = io.open(self._path, "w")
     if f == nil then
         error(

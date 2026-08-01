@@ -646,13 +646,83 @@ describe("gameai_metrics.harvest_collection:save", function()
     end)
 
     it("raises loudly when the output path is not writable", function()
+        -- The path is an existing directory: `ensure_parent_dir` sees
+        -- the parent already exists (mkdir -p is a no-op) and then
+        -- io.open(path, "w") fails because you cannot open a directory
+        -- for writing. Keeps the io.open error path exercised even
+        -- after the auto-mkdir was inserted at the top of :save().
         local coll = hc.new({
-            path = "/no/such/directory/definitely/absent.json",
+            path = "/tmp",
             bands = { { lo = 0.55, hi = 0.85, label = "mid" } },
         })
         local ok, err = pcall(coll.save, coll)
         expect(ok).to.equal(false)
         expect(err:find("cannot open") ~= nil).to.equal(true)
+    end)
+
+    it("auto-creates a missing parent directory before writing", function()
+        -- Build a path whose parent directory does not yet exist so
+        -- the ensure_parent_dir call at the top of :save() has to
+        -- actually run mkdir -p. os.tmpname() reserves a fresh file
+        -- path under a writable tmp root; we append a nested subdir
+        -- so the parent is guaranteed absent when :save() starts.
+        local base = os.tmpname()
+        os.remove(base) -- reclaim the reserved file, we only wanted a unique prefix
+        local dir = base .. "-parent"
+        local path = dir .. "/nested/harvest.json"
+        local coll = hc.new({
+            path = path,
+            meta = { style = "guardian" },
+            bands = { { lo = 0.55, hi = 0.85, label = "mid" } },
+        })
+        coll:append(
+            harvest_decision("mid", 180, {}),
+            { step = 180, ckpt_path = "/nn/ckpt-000180.safetensors" },
+            { level_record(180, 0.93, 0.825) }
+        )
+        coll:save()
+        local f = io.open(path, "r")
+        expect(f ~= nil).to.equal(true)
+        local body = f:read("a")
+        f:close()
+        os.remove(path)
+        os.remove(dir .. "/nested")
+        os.remove(dir)
+        local parsed = json_decode(body)
+        expect(parsed.schema_version).to.equal(1)
+        expect(#parsed.entries).to.equal(1)
+        expect(parsed.entries[1].label).to.equal("mid")
+    end)
+
+    it("is a no-op when the parent directory already exists", function()
+        -- Second save() into the same parent directory must succeed
+        -- without complaint (mkdir -p is idempotent). Byte-equality of
+        -- the two writes anchors the "existing parent is safe" contract.
+        local base = os.tmpname()
+        os.remove(base)
+        local dir = base .. "-existing"
+        assert(os.execute("mkdir -p '" .. dir .. "'"))
+        local path = dir .. "/harvest.json"
+        local coll = hc.new({
+            path = path,
+            bands = { { lo = 0.55, hi = 0.85, label = "mid" } },
+        })
+        coll:append(
+            harvest_decision("mid", 180, {}),
+            { step = 180, ckpt_path = "/x.st" },
+            { level_record(180, 0.7, 0.6) }
+        )
+        coll:save()
+        local f1 = io.open(path, "r")
+        local body1 = f1:read("a")
+        f1:close()
+        coll:save()
+        local f2 = io.open(path, "r")
+        local body2 = f2:read("a")
+        f2:close()
+        os.remove(path)
+        os.remove(dir)
+        expect(body1).to.equal(body2)
     end)
 end)
 

@@ -352,3 +352,149 @@ fn load_missing_bundle_errors() {
     let msg = err.to_string();
     assert!(!msg.is_empty(), "orphan-bundle load must surface an error");
 }
+
+/// ST-D bridge smoke: run `alc.nn.trainer.full_ft` for a single fire
+/// with a hook that captures `info.ckpt_path`, feed the captured path
+/// into `alc.nn.card.save_from_ckpt`, and confirm the returned card_id
+/// is round-trippable through `alc.nn.card.load_handle` — the
+/// production shape a boss-harvest hook uses to promote a mid-run
+/// checkpoint into a first-class Card in the same fire the checkpoint
+/// was written.
+///
+/// The invariants under test:
+///
+/// 1. The Lua-facing entry is actually present on `alc.nn.card` (the
+///    registration path in `register_nn_card` runs end-to-end).
+/// 2. A ckpt path handed to `save_from_ckpt` inside an `on_ckpt` hook
+///    body — while the trainer holds the model mutex — completes
+///    without deadlock, mirroring the pattern `load_ckpt` already
+///    supports (see `gameai_ckpt_metric_e2e.rs`).
+/// 3. The Card the promotion writes is indistinguishable from a Card
+///    written by any other on-ramp: `load_handle` rebuilds a live
+///    handle whose architecture matches the meta the caller supplied,
+///    and the handle's `forward` runs over a prompt.
+#[test]
+fn save_from_ckpt_roundtrips_a_full_ft_checkpoint_via_load_handle() {
+    let (lua, _tmp) = nn_card_vm();
+
+    // The `tiny` named variant is the smallest fully-baked shape that
+    // `load_handle` can rebuild from Card meta alone — the `custom`
+    // variant needs `metadata.nn.candle.custom` to survive round-trip,
+    // and `save_from_ckpt` intentionally reuses `save`'s `build_nn_meta`
+    // path (which omits the custom branch) since a promoted mid-run
+    // checkpoint is always a named-variant snapshot (a `custom` shape
+    // originates from a trainer entry that records `custom` through
+    // `NnModelCard::from_training`, not through the `save` on-ramp).
+    let card_id: String = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.gpt2("tiny", {
+                pretrained = false,
+                device = "cpu",
+            })
+            local ctx_len = h:ctx()
+            local rows = {}
+            for i = 1, 4 do
+                local row = {}
+                for j = 1, ctx_len do
+                    row[j] = ((i * 7 + j * 3) % 30) + 1
+                end
+                rows[i] = row
+            end
+            local ds = alc.nn.data.synthetic(rows, {
+                batch_size = 1,
+                ctx_len = ctx_len,
+                shuffle = false,
+                pad_id = 0,
+            })
+
+            local captured_id = nil
+            alc.nn.trainer.full_ft(h, ds, {
+                lr = 3e-4,
+                batch_size = 1,
+                steps = 2,
+                warmup = 0,
+                schedule = "constant",
+                weight_decay = 0.0,
+                ckpt_every = 2,
+                ckpt_keep = 3,
+                ckpt_prefix = "save_from_ckpt_smoke",
+                on_ckpt = function(info)
+                    assert(type(info.ckpt_path) == "string",
+                        "info.ckpt_path must be a string")
+                    -- Promote the mid-run checkpoint into a first-class
+                    -- Card from inside the hook. Runs while the trainer
+                    -- holds the model mutex, so a hang here (not a
+                    -- failed assertion) would be the deadlock-freedom
+                    -- regression.
+                    captured_id = alc.nn.card.save_from_ckpt(
+                        info.ckpt_path,
+                        "boss-mid-smoke",
+                        {
+                            training_path = "full_ft",
+                            architecture  = "gpt2-tiny",
+                        }
+                    )
+                    assert(type(captured_id) == "string" and #captured_id > 0,
+                        "save_from_ckpt must return a non-empty card_id")
+                    return "continue"
+                end,
+            })
+
+            assert(captured_id ~= nil,
+                "on_ckpt hook must have fired at least once")
+
+            -- Round-trip: the promoted Card must be loadable back into a
+            -- live handle whose architecture matches the meta above.
+            local loaded = alc.nn.card.load_handle(captured_id)
+            assert(type(loaded) == "userdata",
+                "load_handle must return an NnHandle userdata")
+            assert(loaded:arch() == "gpt2",
+                "loaded handle arch must be gpt2, got " .. tostring(loaded:arch()))
+            -- The `tiny` variant baked-in vocab is 64 (see
+            -- `Gpt2Config::tiny`) — asserting on it confirms the reload
+            -- path rebuilt the same shape rather than silently defaulting
+            -- to some other variant.
+            assert(loaded:vocab() == 64,
+                "loaded handle must report tiny vocab (64), got " .. tostring(loaded:vocab()))
+
+            return captured_id
+        "#,
+        )
+        .eval()
+        .expect("save_from_ckpt round-trip must succeed");
+
+    assert!(!card_id.is_empty(), "captured card_id must be non-empty");
+}
+
+/// ST-D negative path: `save_from_ckpt` refuses a non-existent source
+/// safetensors file loudly, with a message that names the entry so a
+/// caller reading the trace sees which bridge surfaced the error.
+#[test]
+fn save_from_ckpt_errors_when_source_is_missing_from_lua() {
+    let (lua, _tmp) = nn_card_vm();
+    let err = lua
+        .load(
+            r#"
+            return alc.nn.card.save_from_ckpt(
+                "/definitely/does/not/exist.safetensors",
+                "boss-missing",
+                {
+                    training_path = "full_ft",
+                    architecture  = "gpt2-medium",
+                }
+            )
+            "#,
+        )
+        .exec()
+        .expect_err("missing source must fail loudly across the Lua boundary");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("save_from_ckpt"),
+        "error must name the save_from_ckpt entry, got: {msg}"
+    );
+    assert!(
+        msg.contains("source safetensors not found"),
+        "error must name the missing-source case, got: {msg}"
+    );
+}

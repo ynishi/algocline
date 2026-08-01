@@ -3,13 +3,15 @@
 //! Sits on top of the existing `alc.nn` primitives (safetensors save/load
 //! + model registry) already registered by `super::register_nn`.
 //!
-//! Provides four Lua-facing entries under the `alc.nn.card` sub-table:
+//! Provides the following Lua-facing entries under the `alc.nn.card`
+//! sub-table:
 //!
 //! ```text
-//! alc.nn.card.save(vars, name, meta)         -> card_id
-//! alc.nn.card.load(card_id)                  -> vars_table
-//! alc.nn.card.load_gpt2(card_id, base)       -> Gpt2Handle (LoRA cards)
-//! alc.nn.card.load_ckpt(path, spec)          -> NnHandle (Cardless)
+//! alc.nn.card.save(vars, name, meta)               -> card_id
+//! alc.nn.card.save_from_ckpt(path, name, meta)     -> card_id
+//! alc.nn.card.load(card_id)                        -> vars_table
+//! alc.nn.card.load_gpt2(card_id, base)             -> Gpt2Handle (LoRA cards)
+//! alc.nn.card.load_ckpt(path, spec)                -> NnHandle (Cardless)
 //! alc.nn.card.register(card_id, model_name)
 //! ```
 //!
@@ -94,6 +96,30 @@ pub(super) fn register_nn_card(
         },
     )?;
     card_ns.set("save", save)?;
+
+    // Cardless sibling of `save`: promote an existing safetensors file
+    // (typically a mid-run checkpoint written by `alc.nn.trainer.*`) into
+    // a first-class Card without re-serialising in-memory Vars. Captures
+    // both the card store and `nn_dir` so the bytes land in the same
+    // `<nn_dir>/<card_id>.safetensors` layout that `load_handle` reads
+    // from, giving downstream loaders no way to distinguish a Card that
+    // came in through `save` from one that came in through
+    // `save_from_ckpt`.
+    let save_from_ckpt_store = Arc::clone(&card_store);
+    let save_from_ckpt_nn_dir = nn_dir.clone();
+    let save_from_ckpt = lua.create_function(
+        move |lua, (ckpt_path, name, meta): (String, String, LuaTable)| -> LuaResult<String> {
+            save_from_ckpt_impl(
+                lua,
+                save_from_ckpt_store.as_ref(),
+                &save_from_ckpt_nn_dir,
+                &ckpt_path,
+                &name,
+                meta,
+            )
+        },
+    )?;
+    card_ns.set("save_from_ckpt", save_from_ckpt)?;
 
     // Legacy raw-vars loader (returns a Lua table of tensor Vars).
     // Layer 4b S4 renames the entry from `load` to `load_vars` so
@@ -234,6 +260,91 @@ fn save_impl(
     // `crate::card::nn::persist` — propagate errors loudly
     // (invariant #2).
     persist(store, &card).map_err(|e| LuaError::external(format!("alc.nn.card.save: {e}")))
+}
+
+/// Promote an existing safetensors file into a first-class Card by
+/// copying the bytes into the Card store's canonical location and
+/// recording the accompanying `NnModelCard` — the on-disk twin of
+/// [`save_impl`] for callers that already hold the bundle on disk
+/// (typically a mid-run checkpoint written by `alc.nn.trainer.*` via
+/// its `on_ckpt` hook, where re-serialising the trainer's live Vars
+/// would fight the trainer for the model mutex).
+///
+/// Contract:
+///
+/// - `ckpt_path` must point at an existing safetensors file. A missing
+///   source surfaces as a loud Lua error (invariant #2) rather than a
+///   zero-byte copy landing in the store.
+/// - `meta` follows the same schema `save` accepts (required
+///   `training_path` / `architecture`, plus optional pass-through).
+///   Architecture-family / bundle-ref coherence is enforced by
+///   [`NnModelCard::new`] just as in [`save_impl`] — an unregistered
+///   arch is rejected before any Card TOML lands.
+/// - The bundle is copied to `<nn_dir>/<card_id>.safetensors` (the
+///   same layout `alc.nn.save` produces via [`algocline_nn::FsStore`]),
+///   so `alc.nn.card.load_handle` / `.load` cannot distinguish a Card
+///   written this way from one written through `save`.
+/// - Byte-preserving copy: the semantic contract is that the caller
+///   already produced a valid safetensors file matching `meta`; this
+///   function does not re-validate the tensor payload against `meta`.
+///   A weight/architecture mismatch surfaces at load time via the
+///   arch-specific `build_from_safetensors` route, mirroring how
+///   [`load_ckpt_impl`] handles Cardless loads.
+fn save_from_ckpt_impl(
+    lua: &Lua,
+    store: &FileCardStore,
+    nn_dir: &std::path::Path,
+    ckpt_path: &str,
+    name: &str,
+    meta: LuaTable,
+) -> LuaResult<String> {
+    let meta_json: Json = lua.from_value(LuaValue::Table(meta))?;
+
+    // Refuse a missing source loudly. `std::fs::copy` would produce its
+    // own error, but catching it here means the message names the
+    // Lua-facing entry (invariant #2) and the store never sees a
+    // half-built card_id whose bundle failed to land.
+    let src = std::path::Path::new(ckpt_path);
+    if !src.exists() {
+        return Err(LuaError::external(format!(
+            "alc.nn.card.save_from_ckpt: source safetensors not found: {ckpt_path}"
+        )));
+    }
+
+    // Pre-mint the id so bundle_ref = "nn/<card_id>" is known before we
+    // build the Card. Mirrors [`save_impl`] invariant #1 exactly — the
+    // aggregate constructor derives its expected bundle_ref from this
+    // id at construction time.
+    let card_id = CardId::mint(name);
+
+    // Copy first, then persist: if the copy fails we abort before
+    // recording a Card that would dangle without a bundle. `nn_dir`
+    // may not exist yet on a fresh install (the `save` path relies on
+    // `FsStore::save_path` to `create_dir_all` for it), so mirror that
+    // guarantee here.
+    let dst = nn_dir.join(format!("{}.safetensors", card_id.as_str()));
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            LuaError::external(format!(
+                "alc.nn.card.save_from_ckpt: create {parent:?}: {e}"
+            ))
+        })?;
+    }
+    std::fs::copy(src, &dst).map_err(|e| {
+        LuaError::external(format!(
+            "alc.nn.card.save_from_ckpt: copy {src:?} -> {dst:?}: {e}"
+        ))
+    })?;
+
+    // Reuse the exact aggregate + persistence path `save_impl` uses so
+    // architecture / training_path / bundle_ref invariants apply
+    // identically across the two on-ramps.
+    let nn_meta = build_nn_meta(&card_id, name, &meta_json)?;
+    let card = NnModelCard::new(card_id, nn_meta)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.save_from_ckpt: {e}")))?;
+
+    persist(store, &card)
+        .map_err(|e| LuaError::external(format!("alc.nn.card.save_from_ckpt: {e}")))
 }
 
 /// Load the safetensors bundle referenced by a Card and return the
@@ -4469,6 +4580,190 @@ mod nn_model_card_persist_tests {
         assert!(
             err.contains("does not match card_id"),
             "expected coherence error, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod save_from_ckpt_tests {
+    //! ST-D — `alc.nn.card.save_from_ckpt` covers the Cardless-to-Card
+    //! promotion path. These tests exercise the Rust core directly (no
+    //! Lua VM required) so the invariants that matter — bytes land under
+    //! the canonical layout, missing sources are refused, and the
+    //! aggregate rejects unknown architecture families before writing —
+    //! stay pinned regardless of how the Lua wrapper evolves.
+    use super::*;
+    use mlua::Lua;
+
+    /// Write a placeholder file at `path`. `save_from_ckpt` treats the
+    /// source as opaque bytes (per the docstring: no re-validation
+    /// against `meta`), so a short sentinel string is sufficient — the
+    /// tests assert on both the copy landing and the byte content.
+    fn write_placeholder_bundle(path: &std::path::Path) {
+        std::fs::write(path, b"placeholder-safetensors-bytes").expect("seed placeholder bundle");
+    }
+
+    /// A meta table matching the minimum schema `build_nn_meta`
+    /// requires (`training_path` + `architecture`). Additional fields
+    /// are exercised by `build_nn_meta_*` tests in `trainer_tests`.
+    fn meta_table(lua: &Lua, architecture: &str) -> LuaTable {
+        let meta = lua.create_table().expect("meta table");
+        meta.set("training_path", "full_ft").expect("training_path");
+        meta.set("architecture", architecture)
+            .expect("architecture");
+        meta
+    }
+
+    #[test]
+    fn save_from_ckpt_records_card_and_copies_bundle_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        // The production shape places the mid-run checkpoint under
+        // `<nn_dir>/ckpt/`, but `save_from_ckpt` treats the source path
+        // as opaque input — a sibling temp file is enough to prove the
+        // contract.
+        let src = tmp.path().join("src.safetensors");
+        write_placeholder_bundle(&src);
+
+        let lua = Lua::new();
+        let meta = meta_table(&lua, "gpt2-medium");
+
+        let card_id = save_from_ckpt_impl(
+            &lua,
+            &store,
+            &nn_dir,
+            src.to_str().expect("utf8 source path"),
+            "boss-mid",
+            meta,
+        )
+        .expect("save_from_ckpt must succeed on a well-formed input");
+
+        assert!(
+            !card_id.is_empty(),
+            "save_from_ckpt must return a non-empty card_id"
+        );
+
+        // Card TOML lands in the store — envelope shape is asserted by
+        // `nn_model_card_persist_tests`, so here we just confirm the
+        // record exists under the returned id.
+        assert!(
+            store.get(&card_id).expect("store get").is_some(),
+            "card '{card_id}' must be recorded in the store"
+        );
+
+        // The safetensors bundle lands at the canonical layout
+        // `load_handle_impl` reads from — the whole point of the
+        // Cardless promotion.
+        let bundle = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(
+            bundle.exists(),
+            "safetensors bundle must be copied to {bundle:?}"
+        );
+
+        // Byte-preserving: the copy is straight `fs::copy`, not a
+        // re-serialisation, so downstream loaders see exactly what the
+        // trainer wrote.
+        let copied = std::fs::read(&bundle).expect("read copied bundle");
+        assert_eq!(
+            copied, b"placeholder-safetensors-bytes",
+            "bundle bytes must survive the copy verbatim"
+        );
+    }
+
+    #[test]
+    fn save_from_ckpt_errors_when_source_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        let lua = Lua::new();
+        let meta = meta_table(&lua, "gpt2-medium");
+
+        let err = save_from_ckpt_impl(
+            &lua,
+            &store,
+            &nn_dir,
+            "/definitely/does/not/exist.safetensors",
+            "boss-mid",
+            meta,
+        )
+        .expect_err("missing source safetensors must surface loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source safetensors not found"),
+            "error must name the missing-source case, got: {msg}"
+        );
+
+        // A refused source must NOT plant a Card TOML — otherwise a
+        // retry would fail with a duplicate-id error and mask the real
+        // cause. The store is empty because we abort before persist.
+        let created = std::fs::read_dir(tmp.path().join("cards"))
+            .map(|iter| iter.count())
+            .unwrap_or(0);
+        assert_eq!(
+            created, 0,
+            "store must not receive any Card writes when the source is missing"
+        );
+    }
+
+    #[test]
+    fn save_from_ckpt_rejects_unknown_architecture_family() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        let src = tmp.path().join("src.safetensors");
+        write_placeholder_bundle(&src);
+
+        let lua = Lua::new();
+        let meta = meta_table(&lua, "nonexistent-arch");
+
+        let err = save_from_ckpt_impl(
+            &lua,
+            &store,
+            &nn_dir,
+            src.to_str().expect("utf8 source path"),
+            "boss-mid",
+            meta,
+        )
+        .expect_err("unknown architecture family must surface loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown architecture family"),
+            "error must name the architecture-family mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn save_from_ckpt_errors_when_training_path_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+
+        let src = tmp.path().join("src.safetensors");
+        write_placeholder_bundle(&src);
+
+        let lua = Lua::new();
+        let meta = lua.create_table().expect("meta table");
+        meta.set("architecture", "gpt2-medium")
+            .expect("architecture");
+        // deliberately omit training_path
+
+        let err = save_from_ckpt_impl(
+            &lua,
+            &store,
+            &nn_dir,
+            src.to_str().expect("utf8 source path"),
+            "boss-mid",
+            meta,
+        )
+        .expect_err("missing meta.training_path must fail loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("training_path"),
+            "error must name the missing meta field, got: {msg}"
         );
     }
 }

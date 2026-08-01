@@ -32,6 +32,44 @@
 --   check_games -- self-play fights behind the compliance line
 --                  (default 20)
 --
+-- ctx (mid-run observation, all optional):
+--   ckpt_every  -- steps between mid-run checkpoints, and therefore
+--                  between observation fires (default 60). Zero
+--                  disables the whole observation path: no checkpoint
+--                  hook is handed to the trainer and the run is
+--                  byte-for-byte the pre-observation one.
+--   ckpt_keep   -- rotating checkpoints kept on disk (default 6). The
+--                  hook loads the file it is handed, so this only has
+--                  to outlive one fire.
+--   teacher_alias        -- reference Card the style distance is
+--                  measured against (default "guardian_duel_npc", the
+--                  bare teacher alias). It has to name a Card baked
+--                  under the same `style` as this run: the distance is
+--                  only defined on a shared basis, and pairing two
+--                  bases reads the basis rather than the policy. That
+--                  makes the default sound for `style = "guardian"`
+--                  and wrong for the other styles and for
+--                  `style = "all"`, which have to name their own
+--                  teacher. An alias bound to no Card is not fatal:
+--                  the view records the failure and the run carries
+--                  on with the other two axes.
+--   gate_games  -- autoplay fights per opponent behind the win rate
+--                  and its Wilson interval (default 50)
+--   enable_gate -- when true the run stops at the first checkpoint
+--                  whose pooled `ci_lower` reaches
+--                  `target_win_rate_lo` (default false: every fire is
+--                  recorded and none of them stops the run)
+--   target_win_rate_lo   -- lower bound the gate waits for
+--                  (default 0.55). A floor rather than a band: at the
+--                  measured interval widths a band would fire on
+--                  noise.
+--
+-- The three views are read independently and never folded into one
+-- number: win rate answers game-optimality, style distance answers how
+-- far the Card has moved from its teacher, trickiness answers how
+-- committed its policy is. Only the first of them is allowed to stop a
+-- run, because only its target is a criterion rather than a taste.
+--
 -- Aliases: the style-specific alias is always pinned, and the
 -- `guardian` style additionally pins the bare `guardian_duel_npc` alias
 -- to the same Card, which is the one the NPC package falls back to.
@@ -44,10 +82,14 @@
 --
 -- Returns a flat table of scalars for a single style so a Rust smoke
 -- harness can assert on it directly. With `style = "all"` the return is
--- `{ ok, styles = { [style] = <flat table> }, trained }` instead.
+-- `{ ok, styles = { [style] = <flat table> }, trained }` instead. The
+-- observation trail rides along as `ckpt_fires` plus `observations`, a
+-- JSON array of the records every fire produced, so a written-up
+-- observation note can be transcribed from the return value alone.
 
 local duel = require("guardian_duel")
 local npc = require("guardian_duel_npc")
+local am = require("anymetric")
 
 -- `ctx` is a global injected by alc_run. When the caller passes no ctx
 -- the global is a non-table userdata that cannot be indexed, so every
@@ -74,6 +116,60 @@ local CHECK_GAMES = math.floor(tonumber(ctx_field("check_games")) or 20)
 
 --- Alias the NPC package falls back to, kept for the teacher style.
 local BARE_ALIAS = "guardian_duel_npc"
+
+-- ─── Mid-run observation ────────────────────────────────────────────
+--
+-- Every `CKPT_EVERY` steps the trainer writes a checkpoint and hands it
+-- to the hook below, which reads the half-trained model through three
+-- independent metric views and writes one record per view into an
+-- append-only log. The measurement layer stops there; whether any of
+-- those numbers should end the run is a separate decision, taken by a
+-- judgment bound once per run (see `observation_wiring`).
+
+local CKPT_EVERY = math.floor(tonumber(ctx_field("ckpt_every")) or 60)
+local CKPT_KEEP = math.floor(tonumber(ctx_field("ckpt_keep")) or 6)
+local TEACHER_ALIAS = ctx_field("teacher_alias") or BARE_ALIAS
+local GATE_GAMES = math.floor(tonumber(ctx_field("gate_games")) or 50)
+local TARGET_WIN_RATE_LO = tonumber(ctx_field("target_win_rate_lo")) or 0.55
+local ENABLE_GATE = ctx_field("enable_gate") and true or false
+
+--- Player policies the win rate is measured against.
+---
+--- Not a ctx field: on the boss seat the opponent sits in the player
+--- chair, and `"random"` is the only player policy the repo carries
+--- (the player side is a Card, not a scripted style). A configurable
+--- pool would promise matchups that do not exist yet.
+local OPPONENTS = { "random" }
+
+--- Architecture the mid-run checkpoint is rebuilt under.
+---
+--- A raw checkpoint file carries weights and no shape, so the loader is
+--- told which preset produced them. It has to keep naming the same
+--- preset `train_style` builds its handle from.
+local CKPT_ARCH = "gpt2-tiny"
+
+if CKPT_EVERY < 0 then
+    error("train_guardian_npc: ctx.ckpt_every must be zero or a positive integer")
+end
+if CKPT_EVERY > 0 then
+    if CKPT_KEEP <= 0 then
+        error("train_guardian_npc: ctx.ckpt_keep must be a positive integer")
+    end
+    if GATE_GAMES <= 0 then
+        error("train_guardian_npc: ctx.gate_games must be a positive integer")
+    end
+    if TARGET_WIN_RATE_LO < 0 or TARGET_WIN_RATE_LO > 1 then
+        error("train_guardian_npc: ctx.target_win_rate_lo must sit in [0, 1]")
+    end
+    if type(TEACHER_ALIAS) ~= "string" or #TEACHER_ALIAS == 0 then
+        error("train_guardian_npc: ctx.teacher_alias must be a non-empty Card alias")
+    end
+    -- Requiring the pkg self-registers style_distance / trickiness /
+    -- level into `alc.nn.metric.registry`, which is where the views
+    -- below reach them by name. Deferred behind the switch so a run
+    -- with observation disabled touches no metric surface at all.
+    require("gameai_metrics")
+end
 
 local VOCAB = duel.vocab()
 
@@ -307,6 +403,146 @@ else
     check_states(STYLE)
 end
 
+-- ─── Observation wiring ─────────────────────────────────────────────
+--
+-- Three views, read independently, of the same checkpoint. They answer
+-- different questions and are never folded into one score: a win rate
+-- that rose while the distance to the teacher collapsed is a different
+-- run from one where both moved, and a single number cannot say which
+-- happened.
+--
+-- The judgment is bound once per run and reads one view only, so the
+-- strength gate cannot start reacting to a personality metric that
+-- happens to be observed alongside it.
+
+--- Bind the views, the judgment and the log a single run is observed
+--- through.
+---
+--- The prompt set is the branch states `check_states` already collected:
+--- boss states reached by playing, which is the element type both
+--- distribution metrics read on the boss seat. Writing positions out by
+--- hand instead would measure the Card on lines a fight never produces.
+---@param style string Distance basis every view shares
+---@param checks table[] `check_states(style)` output
+---@return table views, function judgment, table run_log
+local function observation_wiring(style, checks)
+    local prompt_set = {}
+    for _, check in ipairs(checks) do
+        prompt_set[#prompt_set + 1] = check.state
+    end
+
+    local views = {
+        -- Strength: win rate and its Wilson interval from the seat the
+        -- Card plays. The seed is fixed for the whole run, so every
+        -- fire replays the same openings and the difference between
+        -- two fires is the model's rather than the draw's.
+        am.view("level", "level", {
+            seat = "boss",
+            style = style,
+            opponents = OPPONENTS,
+            n_games = GATE_GAMES,
+            seed = SEED,
+            required = { "seat", "style", "opponents", "n_games" },
+        }),
+        -- Personality: how far the Card has moved from its teacher.
+        -- Both Cards are read under the one style basis this run names.
+        am.view("sd_teacher", "style_distance", {
+            seat = "boss",
+            style = style,
+            card_b = TEACHER_ALIAS,
+            prompt_set = prompt_set,
+            required = { "seat", "style", "card_b", "prompt_set" },
+        }),
+        -- Personality: how committed the policy is, normalised by the
+        -- legal-move count of each state.
+        am.view("trickiness", "trickiness", {
+            seat = "boss",
+            style = style,
+            prompt_set = prompt_set,
+            required = { "seat", "style", "prompt_set" },
+        }),
+    }
+
+    -- Only the strength axis carries a criterion that can be written
+    -- down, so it is the only one wired to a gate. The other two are
+    -- recorded for a reader and never consulted here.
+    local judgment
+    if ENABLE_GATE then
+        judgment = am.judgment.threshold({
+            view_id = "level",
+            field = "ci_lower",
+            op = ">=",
+            value = TARGET_WIN_RATE_LO,
+        })
+    else
+        judgment = am.judgment.never_break()
+    end
+
+    return views, judgment, am.run_log.new()
+end
+
+--- Build the checkpoint observer one style's run fires.
+---
+--- The returned table carries the hook itself, the fire count and the
+--- log the records land in, so the caller can report all three without
+--- reaching into a closure.
+---@param style string
+---@param checks table[] `check_states(style)` output
+---@return table observer `{ hook, fires, run_log }`
+local function make_observer(style, checks)
+    local views, judgment, run_log = observation_wiring(style, checks)
+    local observer = { fires = 0, run_log = run_log }
+
+    observer.hook = function(info)
+        observer.fires = observer.fires + 1
+
+        -- The checkpoint path names a rotating file, so the load
+        -- happens inside the hook rather than being carried over from
+        -- a previous fire.
+        --
+        -- A failed load is recorded like a failed metric instead of
+        -- being raised: an error escaping this hook reaches the trainer
+        -- as a hook error, which skips the final save and throws the
+        -- terminal checkpoint away. A measurement that could not be
+        -- taken must not cost the training result.
+        local ok, loaded = pcall(alc.nn.card.load_ckpt, info.ckpt_path, { arch = CKPT_ARCH })
+        local records
+        if ok then
+            records = am.observe(views, { card = loaded, step = info.step })
+        else
+            records = { { step = info.step, view_id = "ckpt_load", error = tostring(loaded) } }
+        end
+        run_log:append(records)
+
+        -- Two sinks, on purpose: one human-readable line per fire, and
+        -- one JSON object per record for the observation note to be
+        -- transcribed from.
+        log(string.format("[%s] %s", style, am.log_line(records)))
+        for _, record in ipairs(records) do
+            log(string.format("[%s] observation %s", style, alc.json_encode(record)))
+        end
+
+        return am.to_hook_action(judgment(records), run_log)
+    end
+
+    return observer
+end
+
+--- Render a run log as a JSON array for the return value.
+---
+--- An empty log is spelled out rather than encoded, because an encoder
+--- handed `{}` has no way to tell an empty array from an empty object
+--- and the consumer of this field reads an array.
+---@param run_log table
+---@return string json
+local function encode_observations(run_log)
+    local records = run_log:all()
+    if #records == 0 then
+        return "[]"
+    end
+    return alc.json_encode(records)
+end
+
 -- ─── Train one style ────────────────────────────────────────────────
 
 --- Run the whole pipeline for a single style and return the flat result
@@ -361,14 +597,38 @@ local function train_style(style, alias)
     })
 
     log(string.format("[%s] full_ft: %d steps, lr=%g, batch=%d", style, STEPS, LR, BATCH))
-    local card_id = alc.nn.trainer.run_full_ft(handle, dataset, {
+    local observer = make_observer(style, checks)
+    local train_opts = {
         lr = LR,
         batch = BATCH,
         steps = STEPS,
         warmup = 0,
         schedule = "Constant",
         name = NAME,
-    })
+    }
+    -- The checkpoint keys are added together or not at all. A hook
+    -- without a positive `ckpt_every` is refused by the bridge (it
+    -- could never fire), and `ckpt_every = 0` is the documented way to
+    -- ask for the pre-observation run: no checkpoints, no hook, no
+    -- metric evaluated.
+    if CKPT_EVERY > 0 then
+        train_opts.ckpt_every = CKPT_EVERY
+        train_opts.ckpt_keep = CKPT_KEEP
+        train_opts.on_ckpt = observer.hook
+        log(
+            string.format(
+                "[%s] observing every %d steps: gate=%s (level.ci_lower >= %.2f over %d games vs %s), teacher=%s",
+                style,
+                CKPT_EVERY,
+                tostring(ENABLE_GATE),
+                TARGET_WIN_RATE_LO,
+                GATE_GAMES,
+                table.concat(OPPONENTS, "+"),
+                TEACHER_ALIAS
+            )
+        )
+    end
+    local card_id = alc.nn.trainer.run_full_ft(handle, dataset, train_opts)
     if type(card_id) ~= "string" or #card_id == 0 then
         error("train_guardian_npc: run_full_ft returned no card_id")
     end
@@ -462,6 +722,14 @@ local function train_style(style, alias)
         error("train_guardian_npc: self-play answer carried no style_match: " .. selfplay)
     end
 
+    -- The whole trail in one line, after the run rather than during it,
+    -- so an observation note can be lifted out of a single log entry
+    -- (or out of the identical `observations` field of the return).
+    local observations = encode_observations(observer.run_log)
+    if observer.fires > 0 then
+        log(string.format("[%s] observations (%d fires) %s", style, observer.fires, observations))
+    end
+
     return {
         ok = decide_legal and train_loss < baseline_loss,
         card_id = card_id,
@@ -486,6 +754,16 @@ local function train_style(style, alias)
         style_match = style_match,
         selfplay = selfplay,
         decisions = table.concat(reports, " | "),
+        -- Observation trail. `ckpt_fires` is asserted before anything
+        -- read out of `observations`: a hook that never fired would
+        -- leave an empty array that looks like a clean measurement.
+        ckpt_every = CKPT_EVERY,
+        ckpt_fires = observer.fires,
+        gate_enabled = ENABLE_GATE,
+        gate_target_lo = TARGET_WIN_RATE_LO,
+        gate_games = GATE_GAMES,
+        teacher_alias = TEACHER_ALIAS,
+        observations = observations,
     }
 end
 

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.trainer.run_full_ft` now accepts the optional `opts.on_ckpt`
+  checkpoint hook, mirrored from the `alc.nn.trainer.full_ft` sibling
+  through the shared extractor. The Card-writing surface (the one every
+  gameai bake script drives) can now run per-checkpoint evaluation and
+  early-break the training loop. `run_lora_ft` / `run_distill` keep
+  passing no hook. Additionally, supplying `on_ckpt` without a positive
+  `ckpt_every` is now refused with a loud error on **both** `full_ft`
+  and `run_full_ft` (previously the pairing was a silent no-op: the
+  hook could never fire and the run reported clean).
+
 - `examples/gameai/gameai_metrics` — new Lua pkg composing the metric
   primitives + Registry into three GameAI-specific metrics for the
   Level Sweep learning iter. `style_distance(card_a, card_b,

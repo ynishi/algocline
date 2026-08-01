@@ -113,7 +113,8 @@ use super::nn_card::{
     DatasetHandle, Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle,
 };
 use super::nn_opts::{
-    extract_distill_loss_kind, extract_lora_cfg, extract_run_train_cfg, train_err_to_lua,
+    extract_distill_loss_kind, extract_lora_cfg, extract_on_ckpt_hook, extract_run_train_cfg,
+    train_err_to_lua,
 };
 
 /// Error prefix for the `alc.nn.trainer.run_lora_ft` surface.
@@ -159,8 +160,8 @@ pub(super) fn register_nn_trainer(
     let store_ff = Arc::clone(&card_store);
     let dir_ff = nn_dir.clone();
     let run_full_ft = lua.create_function(
-        move |_lua, (base, dataset, opts): (LuaValue, LuaValue, LuaTable)| -> LuaResult<String> {
-            run_full_ft_impl(&store_ff, &dir_ff, &base, &dataset, opts)
+        move |lua, (base, dataset, opts): (LuaValue, LuaValue, LuaTable)| -> LuaResult<String> {
+            run_full_ft_impl(&store_ff, &dir_ff, lua, &base, &dataset, opts)
         },
     )?;
     trainer.set("run_full_ft", run_full_ft)?;
@@ -455,12 +456,24 @@ fn run_lora_ft_impl(
 //   (`RUN_FULL_FT_ERR_PREFIX`), threaded into the shared
 //   `super::nn_opts` extractor / error converter so the loud-error
 //   contract (one prefix per surface) holds off one implementation.
+// - `opts.on_ckpt` — the checkpoint hook, mirrored from the Layer 5b
+//   sibling `alc.nn.trainer.full_ft` (`super::nn_card`) through the
+//   shared [`super::nn_opts::extract_on_ckpt_hook`]. Full-fine-tune is
+//   the only surface carrying it: `run_lora_ft` / `run_distill` keep
+//   passing `None` (Layer 5b design decision, revisited only if a
+//   caller needs it). Requires `ckpt_every > 0`, otherwise the hook
+//   could never fire and the extractor refuses the pair.
 
 /// L5c S1 core. Mirrors [`run_lora_ft_impl`] structurally; see the
 /// section header above for the design divergence.
+///
+/// Takes `lua` (unlike the LoRA / distillation siblings) because the
+/// optional `on_ckpt` hook holds the Lua callback through a `WeakLua`
+/// — see [`extract_on_ckpt_hook`].
 fn run_full_ft_impl(
     store: &FileCardStore,
     nn_dir: &std::path::Path,
+    lua: &Lua,
     base: &LuaValue,
     dataset: &LuaValue,
     opts: LuaTable,
@@ -540,6 +553,13 @@ fn run_full_ft_impl(
     //    caller sees a Lua-shaped error rather than a candle back-trace).
     let train_cfg = extract_run_train_cfg(RUN_FULL_FT_ERR_PREFIX, &opts)?;
 
+    // 6.5. Extract the optional `on_ckpt` hook alongside the config
+    //      (shared helper with the Layer 5b sibling
+    //      `alc.nn.trainer.full_ft`). The extractor also refuses an
+    //      `on_ckpt` paired with `ckpt_every = 0` / absent, which would
+    //      register a hook that can never fire.
+    let hook = extract_on_ckpt_hook(RUN_FULL_FT_ERR_PREFIX, lua, Some(&opts))?;
+
     // 7. Pre-mint the Card id (mirrors run_lora_ft_impl step 7).
     //    Minted before training because the id doubles as the
     //    checkpoint filename stem (`<nn_dir>/<id>.safetensors`).
@@ -595,11 +615,11 @@ fn run_full_ft_impl(
                 nn_dir,
                 card_id.as_str(),
                 Arc::clone(&lease),
-                // `alc.nn.trainer.run_full_ft` does not expose the
-                // `on_ckpt` hook yet — the Layer 5b sibling
-                // `alc.nn.trainer.full_ft` (nn_card.rs) is the current
-                // hook surface.
-                None,
+                // Optional `on_ckpt` hook (step 6.5). `None` when the
+                // caller omitted the key, which keeps the pre-hook
+                // behaviour bit-identical. `CkptHook` is not `Clone`,
+                // but the match arms are exclusive so the move is fine.
+                hook,
             );
             drop(model);
             drop(ds_lock);
@@ -633,9 +653,8 @@ fn run_full_ft_impl(
                 nn_dir,
                 card_id.as_str(),
                 Arc::clone(&lease),
-                // Same as above: `run_full_ft` bridge does not expose
-                // on_ckpt yet.
-                None,
+                // Same as above: optional `on_ckpt` hook from step 6.5.
+                hook,
             );
             drop(model);
             drop(ds_lock);
@@ -957,6 +976,7 @@ mod run_ft_bridge_tests {
     use candle_nn::VarMap;
     use mlua::Lua;
     use serde_json::json;
+    use std::sync::Mutex;
 
     /// Training row that fits inside both `gpt2-tiny` (ctx=16,
     /// vocab=64) and `tinyllama-tiny` (ctx=16, vocab=32). Values
@@ -1378,6 +1398,7 @@ mod run_ft_bridge_tests {
         let card_id = run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::UserData(ds_ud),
             opts,
@@ -1429,6 +1450,7 @@ mod run_ft_bridge_tests {
         let card_id = run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::UserData(ds_ud),
             opts,
@@ -1461,6 +1483,7 @@ mod run_ft_bridge_tests {
         let msg = expect_err(run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::UserData(ds_ud),
             opts,
@@ -1505,6 +1528,7 @@ mod run_ft_bridge_tests {
         let msg = expect_err(run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(wrapped_ud),
             &LuaValue::UserData(ds_ud2),
             ff_opts,
@@ -1532,6 +1556,7 @@ mod run_ft_bridge_tests {
         let msg = expect_err(run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::UserData(ds_ud),
             opts,
@@ -1539,6 +1564,218 @@ mod run_ft_bridge_tests {
         assert!(
             msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("pretrained=true"),
             "expected pretrained refusal, got: {msg}"
+        );
+    }
+
+    // ─── L5c S1 — `on_ckpt` hook mirror ───────────────────────────
+    //
+    // The hook first shipped on the Layer 5b sibling
+    // `alc.nn.trainer.full_ft` (nn_card.rs) and is mirrored here so the
+    // Card-writing surface can drive per-checkpoint evaluation. Axes:
+    // - fire path: hook runs at each `ckpt_every` boundary and the
+    //   `info.ckpt_path` it receives points at a real file.
+    // - early break: `"break"` stops the run and the Card is still
+    //   persisted (the trainer finalizes through `save_final`).
+    // - error path: a Lua-side `error(...)` surfaces as a loud Lua
+    //   error rather than a silent PASS.
+    // - no-op guard: `on_ckpt` without a positive `ckpt_every` is
+    //   refused up front (the hook could never fire).
+    // The `hook = None` regression (a run without `on_ckpt` behaves as
+    // before) is carried by the happy-path tests above.
+
+    #[test]
+    fn run_full_ft_fires_on_ckpt_hook_at_each_boundary() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(4);
+        o["ckpt_every"] = json!(2);
+        // Keep every rotating checkpoint so the paths handed to the
+        // hook are still on disk when the assertions run.
+        o["ckpt_keep"] = json!(5);
+        let opts = opts_table(&lua, o);
+
+        let fires: Arc<Mutex<Vec<(i64, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&fires);
+        let on_ckpt = lua
+            .create_function(move |_, info: LuaTable| -> LuaResult<()> {
+                let step: i64 = info.get("step")?;
+                let path: String = info.get("ckpt_path")?;
+                // Returning nil maps to `CkptControl::Continue`.
+                sink.lock().expect("hook sink").push((step, path));
+                Ok(())
+            })
+            .expect("create on_ckpt");
+        opts.set("on_ckpt", on_ckpt).unwrap();
+
+        let card_id = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft with on_ckpt");
+
+        let fired = fires.lock().expect("hook sink");
+        let steps: Vec<i64> = fired.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            steps,
+            vec![2, 4],
+            "hook must fire once per ckpt_every boundary (steps=4, ckpt_every=2)"
+        );
+        for (step, path) in fired.iter() {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "info.ckpt_path for step {step} must point at a written file: {path}"
+            );
+        }
+
+        // The Card is still written after a full (non-break) run.
+        assert!(
+            store.get(&card_id).unwrap().is_some(),
+            "run_full_ft must persist the Card even with a hook attached"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_on_ckpt_break_stops_early_and_persists_card() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(6);
+        o["ckpt_every"] = json!(2);
+        o["ckpt_keep"] = json!(5);
+        let opts = opts_table(&lua, o);
+
+        let fires: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&fires);
+        let on_ckpt = lua
+            .create_function(move |lua, _info: LuaTable| -> LuaResult<LuaValue> {
+                let n = {
+                    let mut g = counter.lock().expect("hook counter");
+                    *g += 1;
+                    *g
+                };
+                if n >= 2 {
+                    Ok(LuaValue::String(lua.create_string("break")?))
+                } else {
+                    Ok(LuaValue::Nil)
+                }
+            })
+            .expect("create on_ckpt");
+        opts.set("on_ckpt", on_ckpt).unwrap();
+
+        let card_id = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft with early-breaking on_ckpt");
+
+        assert_eq!(
+            *fires.lock().expect("hook counter"),
+            2,
+            "hook must fire twice (steps 2 and 4) and then break"
+        );
+
+        // Terminal safetensors + Card are written on the early-break
+        // path too (the trainer finalizes through `save_final`).
+        let ckpt_path = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(
+            ckpt_path.exists(),
+            "early break must still write {ckpt_path:?}"
+        );
+        let card = store
+            .get(&card_id)
+            .unwrap()
+            .expect("Card must be persisted");
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        assert_eq!(
+            nn.get("training_path").unwrap().as_str().unwrap(),
+            "full_ft"
+        );
+        // The recorded step is the break boundary (4), not the
+        // requested `steps` (6) — proof the run stopped early.
+        assert_eq!(
+            nn.get("metrics")
+                .and_then(|m| m.get("step"))
+                .and_then(|s| s.as_u64())
+                .unwrap(),
+            4,
+            "Card must record the break step, not the requested step count"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_on_ckpt_error_propagates_as_lua_error() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(4);
+        o["ckpt_every"] = json!(2);
+        let opts = opts_table(&lua, o);
+
+        // Lua-side `error(...)` (the shape a real callback raises)
+        // rather than a Rust-constructed LuaError.
+        let on_ckpt: LuaFunction = lua
+            .load(r#"return function(_info) error("hook exploded") end"#)
+            .eval()
+            .expect("load on_ckpt");
+        opts.set("on_ckpt", on_ckpt).unwrap();
+
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_full_ft:")
+                && msg.contains("on_ckpt callback failed")
+                && msg.contains("hook exploded"),
+            "hook error must surface loudly with the surface prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_full_ft_refuses_on_ckpt_without_ckpt_every() {
+        // Silent-no-op guard: `ckpt_every` defaults to 0 (mid-run
+        // checkpoints disabled), so a hook supplied without it would
+        // never fire. Refused before training starts.
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 5);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let on_ckpt = lua
+            .create_function(|_, _info: LuaTable| -> LuaResult<()> { Ok(()) })
+            .expect("create on_ckpt");
+        opts.set("on_ckpt", on_ckpt).unwrap();
+
+        let msg = expect_err(run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        ));
+        assert!(
+            msg.contains("alc.nn.trainer.run_full_ft:") && msg.contains("opts.ckpt_every > 0"),
+            "expected on_ckpt/ckpt_every pairing refusal, got: {msg}"
         );
     }
 
@@ -1757,6 +1994,7 @@ mod run_ft_bridge_tests {
         let msg = expect_err(run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::UserData(ds_ud),
             opts,
@@ -1852,6 +2090,7 @@ mod run_ft_bridge_tests {
         let msg = expect_err(run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::Nil,
             opts,
@@ -1887,6 +2126,7 @@ mod run_ft_bridge_tests {
         let msg = expect_err(run_full_ft_impl(
             &store,
             &nn_dir,
+            &lua,
             &LuaValue::UserData(base_ud),
             &LuaValue::Nil,
             opts,

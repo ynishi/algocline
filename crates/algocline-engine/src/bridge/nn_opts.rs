@@ -108,6 +108,15 @@ pub(super) fn extract_full_ft_opts(
 /// still writes the terminal `<prefix>.safetensors` before returning,
 /// so the caller has last-good weights on disk (see
 /// [`algocline_nn::train::TrainError::Hook`] docs).
+///
+/// # `ckpt_every` cross-check
+///
+/// The training loop only fires the hook when `ckpt_every > 0`
+/// ([`algocline_nn::train::FullFtConfig::ckpt_every`] defaults to `0`,
+/// i.e. mid-run checkpoints disabled), so an `on_ckpt` supplied without
+/// a positive `ckpt_every` is a silent no-op: the caller would see a
+/// clean run and never a single fire. That pairing is refused here,
+/// loudly, for every surface that extracts the hook.
 pub(super) fn extract_on_ckpt_hook(
     prefix: &str,
     lua: &Lua,
@@ -119,6 +128,17 @@ pub(super) fn extract_on_ckpt_hook(
     let Some(callback): Option<LuaFunction> = t.get("on_ckpt")? else {
         return Ok(None);
     };
+
+    // Cross-check against the sibling `ckpt_every` key read by
+    // `apply_optional_overrides` — a hook that can never fire is a
+    // configuration error, not a no-op default.
+    let ckpt_every: usize = t.get::<Option<usize>>("ckpt_every")?.unwrap_or(0);
+    if ckpt_every == 0 {
+        return Err(LuaError::external(format!(
+            "{prefix}: opts.on_ckpt requires opts.ckpt_every > 0 \
+             (the hook would never fire)"
+        )));
+    }
 
     let weak = lua.weak();
     let prefix_owned = prefix.to_string();
@@ -939,6 +959,66 @@ mod tests {
             hook.is_none(),
             "opts table without on_ckpt must yield hook=None"
         );
+    }
+
+    #[test]
+    fn extract_on_ckpt_hook_refuses_hook_without_positive_ckpt_every() {
+        // `ckpt_every` defaults to 0 (mid-run checkpoints disabled), so
+        // an `on_ckpt` without it registers a hook that can never fire.
+        // Both the absent and the explicit-zero spellings must be loud.
+        let lua = Lua::new();
+        let callback = lua
+            .create_function(|_, _: LuaValue| Ok(()))
+            .expect("create on_ckpt stub");
+
+        // `CkptHook` is a boxed closure (no `Debug`), so `expect_err`
+        // is unavailable — unwrap the error arm by hand.
+        fn expect_refusal(result: LuaResult<Option<CkptHook>>, what: &str) -> LuaError {
+            match result {
+                Ok(_) => panic!("{what}"),
+                Err(e) => e,
+            }
+        }
+
+        let no_ckpt_every = opts_from(&lua, &[("on_ckpt", LuaValue::Function(callback.clone()))]);
+        let err = expect_refusal(
+            extract_on_ckpt_hook("alc.nn.trainer.run_full_ft", &lua, Some(&no_ckpt_every)),
+            "on_ckpt without ckpt_every must be refused",
+        );
+        assert!(
+            err.to_string().contains("alc.nn.trainer.run_full_ft:")
+                && err.to_string().contains("opts.ckpt_every > 0"),
+            "message must name the surface + the missing key: {err}"
+        );
+
+        let zero_ckpt_every = opts_from(
+            &lua,
+            &[
+                ("on_ckpt", LuaValue::Function(callback.clone())),
+                ("ckpt_every", LuaValue::Integer(0)),
+            ],
+        );
+        let err = expect_refusal(
+            extract_on_ckpt_hook("alc.nn.trainer.full_ft", &lua, Some(&zero_ckpt_every)),
+            "on_ckpt with ckpt_every = 0 must be refused",
+        );
+        assert!(
+            err.to_string().contains("alc.nn.trainer.full_ft:")
+                && err.to_string().contains("opts.ckpt_every > 0"),
+            "message: {err}"
+        );
+
+        // Positive `ckpt_every` keeps the hook.
+        let ok = opts_from(
+            &lua,
+            &[
+                ("on_ckpt", LuaValue::Function(callback)),
+                ("ckpt_every", LuaValue::Integer(2)),
+            ],
+        );
+        let hook = extract_on_ckpt_hook("alc.nn.trainer.run_full_ft", &lua, Some(&ok))
+            .expect("ckpt_every = 2 must yield a hook");
+        assert!(hook.is_some(), "positive ckpt_every must yield Some(hook)");
     }
 
     #[test]

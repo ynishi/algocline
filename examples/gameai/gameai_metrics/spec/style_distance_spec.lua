@@ -91,6 +91,19 @@ local function make_handle(alias, logits_by_view)
     return handle
 end
 
+--- Hide a stub handle behind a metatable so `generate_session` is only
+--- reachable through `__index`, the way a userdata handle answers its
+--- methods. `rawget(proxy, "generate_session")` is nil, so a guard that
+--- read the field straight off the table would refuse this shape.
+---
+--- Userdata itself cannot be built inside a spec VM; the userdata leg of
+--- the guard is exercised by the engine-level e2e
+--- (`crates/algocline-engine/tests/gameai_ckpt_metric_e2e.rs`), which
+--- feeds a real `alc.nn.card.load_ckpt` handle into the same metric.
+local function via_metatable(handle)
+    return setmetatable({}, { __index = handle })
+end
+
 --- Stub `alc.card.get_by_alias` → `alc.nn.card.load_handle` chain.
 local ALIAS_TO_HANDLE = {}
 alc.card = {
@@ -232,5 +245,23 @@ describe("gameai_metrics.style_distance", function()
         local d = style_distance("A", "B", { view() })
         expect(d).to.equal(0.0) -- both uniform → stub js returns 0
         expect(#JS_CALLS).to.equal(1)
+    end)
+
+    it("accepts a handle whose generate_session comes from a metatable", function()
+        reset()
+        local ha = via_metatable(make_handle("A"))
+        local hb = via_metatable(make_handle("B"))
+        expect(rawget(ha, "generate_session")).to.equal(nil)
+        local d = style_distance(ha, hb, { view(), view({ turn = 2 }) })
+        expect(d).to.equal(0.0)
+        expect(#JS_CALLS).to.equal(2)
+    end)
+
+    it("still refuses a table without a generate_session method", function()
+        reset()
+        local hb = make_handle("B")
+        local ok, err = pcall(style_distance, { alias = "A" }, hb, { view() })
+        expect(ok).to.equal(false)
+        expect(err:find("generate_session") ~= nil).to.equal(true)
     end)
 end)

@@ -5,8 +5,10 @@
 ---
 --- `level(card, opponent, n_games?, seed?) -> { win_rate, ci_lower, ci_upper }`
 ---
---- - `card` — string alias or handle table, same shape as
----   `style_distance` (see `style_distance.lua`). Plays the player seat.
+--- - `card` — string alias, or a live handle (table or userdata) with a
+---   `generate_session(ids)` method, same shape as `style_distance`
+---   (see `style_distance.lua`, including the `on_ckpt` +
+---   `alc.nn.card.load_ckpt` usage). Plays the player seat.
 ---
 --- - `opponent` — describes the boss seat:
 ---   - `"greedy"` (default alias) — the teacher policy
@@ -87,14 +89,27 @@ local function require_math_rng()
     end
 end
 
+--- Match `style_distance.has_generate_session`; see that file for why
+--- the method rather than the Lua type is what the guard reads, and why
+--- the read is wrapped in `pcall`.
+local function has_generate_session(card)
+    local ok, method = pcall(function()
+        return card.generate_session
+    end)
+    return ok and type(method) == "function"
+end
+
 local function resolve_card_handle(card, which)
-    if type(card) == "table" then
-        if type(card.generate_session) ~= "function" then
+    local kind = type(card)
+    if kind == "table" or kind == "userdata" then
+        if not has_generate_session(card) then
             error(
                 string.format(
-                    "level: %s is a table but has no generate_session method; "
-                        .. "expected a handle returned by alc.nn.card.load_handle",
-                    which
+                    "level: %s is a %s but has no generate_session method; "
+                        .. "expected a handle returned by alc.nn.card.load_handle "
+                        .. "or alc.nn.card.load_ckpt",
+                    which,
+                    kind
                 )
             )
         end
@@ -122,7 +137,7 @@ local function resolve_card_handle(card, which)
     end
     error(
         string.format(
-            "level: %s must be a string alias or a handle table, got %s",
+            "level: %s must be a string alias or a handle (table or userdata), got %s",
             which,
             type(card)
         )
@@ -166,11 +181,14 @@ local function boss_from(opponent, seed)
             return duel.policy_boss_random(boss, rng)
         end
     end
-    if type(opponent) == "table" then
-        if type(opponent.generate_session) ~= "function" then
+    if type(opponent) == "table" or type(opponent) == "userdata" then
+        if not has_generate_session(opponent) then
             error(
-                "level: opponent table has no generate_session method; "
-                    .. "expected a boss handle or a policy fn"
+                string.format(
+                    "level: opponent is a %s but has no generate_session method; "
+                        .. "expected a boss handle or a policy fn",
+                    type(opponent)
+                )
             )
         end
         -- Treat as a boss Card handle. Decoding a boss NPC goes through

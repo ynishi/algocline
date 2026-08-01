@@ -6,12 +6,25 @@
 --- `style_distance(card_a, card_b, prompt_set) -> number`
 ---
 --- - `card_a`, `card_b` — either a Lua string (Card alias resolved via
----   `alc.card.get_by_alias` → `alc.nn.card.load_handle`) or a handle
----   table with a `generate_session(ids)` method (the shape returned by
----   `alc.nn.card.load_handle`). The trainer `on_ckpt` hook currently
----   hands in a filesystem ckpt path string, which the caller must
----   resolve to an alias before calling — direct ckpt-path→handle load
----   is out of scope for this iter (see Follow-up in the ST4 report).
+---   `alc.card.get_by_alias` → `alc.nn.card.load_handle`) or a live
+---   handle (table or userdata) carrying a `generate_session(ids)`
+---   method. `alc.nn.card.load_handle` returns userdata; a spec stub is
+---   a plain table; both are accepted because what the metric needs is
+---   the method, not a particular Lua type.
+---
+---   Inside a trainer `on_ckpt` hook the mid-run checkpoint has no Card
+---   to alias, so the path the hook receives is loaded directly:
+---
+---   ```lua
+---   on_ckpt = function(info)
+---       local h = alc.nn.card.load_ckpt(info.ckpt_path, { arch = "gpt2-tiny" })
+---       local d = style_distance(h, "guardian_player_npc_teacher", prompt_set)
+---       return d < 0.2 and "break" or "continue"
+---   end
+---   ```
+---
+---   `info.ckpt_path` is a rotating file, so the load has to happen
+---   inside the hook body (see `alc.nn.card.load_ckpt` docs).
 ---
 --- - `prompt_set` — a non-empty Lua array of guardian player-view tables
 ---   (`{ turn, mode, boss_hp, shift_distance, hp, weakened, exposed,
@@ -86,15 +99,38 @@ local function require_js()
     return alc.nn.metric.js
 end
 
---- Resolve `card` (alias string or handle table) to a live handle.
+--- True when `card` answers `generate_session` with a callable.
+---
+--- The handles this metric consumes come in two Lua types: a plain
+--- table (what a spec stubs) and the `NnHandle` userdata
+--- `alc.nn.card.load_handle` / `load_ckpt` return. Both answer
+--- `card.generate_session` with a function, so the method — not the
+--- type — is what the guard tests.
+---
+--- Indexing an *unrelated* userdata raises rather than returning nil
+--- (mlua refuses unknown fields), so the read is guarded and a raise is
+--- read as "no such method": the caller then gets the directional error
+--- below instead of mlua's internal wording.
+local function has_generate_session(card)
+    local ok, method = pcall(function()
+        return card.generate_session
+    end)
+    return ok and type(method) == "function"
+end
+
+--- Resolve `card` (alias string, or handle table / userdata) to a live
+--- handle.
 local function resolve_handle(card, which)
-    if type(card) == "table" then
-        if type(card.generate_session) ~= "function" then
+    local kind = type(card)
+    if kind == "table" or kind == "userdata" then
+        if not has_generate_session(card) then
             error(
                 string.format(
-                    "style_distance: %s is a table but has no generate_session method; "
-                        .. "expected a handle returned by alc.nn.card.load_handle",
-                    which
+                    "style_distance: %s is a %s but has no generate_session method; "
+                        .. "expected a handle returned by alc.nn.card.load_handle "
+                        .. "or alc.nn.card.load_ckpt",
+                    which,
+                    kind
                 )
             )
         end
@@ -128,7 +164,7 @@ local function resolve_handle(card, which)
     end
     error(
         string.format(
-            "style_distance: %s must be a string alias or a handle table, got %s",
+            "style_distance: %s must be a string alias or a handle (table or userdata), got %s",
             which,
             type(card)
         )

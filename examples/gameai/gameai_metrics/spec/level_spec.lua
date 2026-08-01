@@ -74,6 +74,12 @@ local function make_handle(preferred_move)
     }
 end
 
+--- See style_distance_spec.lua for why the metatable proxy stands in for
+--- the userdata handle shape here.
+local function via_metatable(handle)
+    return setmetatable({}, { __index = handle })
+end
+
 local ALIAS_TO_HANDLE = {}
 alc.card = {
     get_by_alias = function(alias)
@@ -194,5 +200,29 @@ describe("gameai_metrics.level", function()
         local result = level(h, "random", 3, 5)
         expect(result.n_games).to.equal(3)
         expect(type(result.win_rate)).to.equal("number")
+    end)
+
+    it("resolves a string alias through alc.card.get_by_alias", function()
+        reset()
+        ALIAS_TO_HANDLE["b"] = make_handle("b")
+        local result = level("b", "greedy", 4, 1)
+        expect(result.n_games).to.equal(4)
+        expect(type(result.win_rate)).to.equal("number")
+    end)
+
+    it("accepts a handle whose generate_session comes from a metatable", function()
+        reset()
+        local h = via_metatable(make_handle("b"))
+        expect(rawget(h, "generate_session")).to.equal(nil)
+        local result = level(h, "greedy", 4, 1)
+        expect(result.n_games).to.equal(4)
+        expect(type(result.win_rate)).to.equal("number")
+    end)
+
+    it("still refuses a card table without a generate_session method", function()
+        reset()
+        local ok, err = pcall(level, { alias = "b" }, "greedy", 4, 1)
+        expect(ok).to.equal(false)
+        expect(err:find("generate_session") ~= nil).to.equal(true)
     end)
 end)

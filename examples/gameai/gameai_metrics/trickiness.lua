@@ -5,8 +5,10 @@
 ---
 --- `trickiness(card, prompt_set, temperature?) -> number`
 ---
---- - `card` — string alias or handle table, same shape as
----   `style_distance` (see `style_distance.lua`).
+--- - `card` — string alias, or a live handle (table or userdata) with a
+---   `generate_session(ids)` method, same shape as `style_distance`
+---   (see `style_distance.lua`, including the `on_ckpt` +
+---   `alc.nn.card.load_ckpt` usage).
 ---
 --- - `prompt_set` — non-empty array of guardian player-view tables.
 ---
@@ -61,14 +63,29 @@ local function require_entropy()
     return alc.nn.metric.entropy
 end
 
+--- Match `style_distance.has_generate_session`; see that file for why
+--- the method rather than the Lua type is what the guard reads, and why
+--- the read is wrapped in `pcall`.
+local function has_generate_session(card)
+    local ok, method = pcall(function()
+        return card.generate_session
+    end)
+    return ok and type(method) == "function"
+end
+
 --- Match `style_distance.resolve_handle`; kept local so a spec that stubs
 --- one metric does not have to reach into the other's module state.
 local function resolve_handle(card)
-    if type(card) == "table" then
-        if type(card.generate_session) ~= "function" then
+    local kind = type(card)
+    if kind == "table" or kind == "userdata" then
+        if not has_generate_session(card) then
             error(
-                "trickiness: card table has no generate_session method; "
-                    .. "expected a handle returned by alc.nn.card.load_handle"
+                string.format(
+                    "trickiness: card is a %s but has no generate_session method; "
+                        .. "expected a handle returned by alc.nn.card.load_handle "
+                        .. "or alc.nn.card.load_ckpt",
+                    kind
+                )
             )
         end
         return card
@@ -91,7 +108,10 @@ local function resolve_handle(card)
         end
         return alc.nn.card.load_handle(card_id)
     end
-    error("trickiness: card must be a string alias or a handle table, got " .. type(card))
+    error(
+        "trickiness: card must be a string alias or a handle (table or userdata), got "
+            .. type(card)
+    )
 end
 
 --- Check `temperature` is finite and strictly positive. Zero is rejected

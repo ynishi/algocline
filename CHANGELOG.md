@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `from_safetensors_file` expects and fail loudly; GPT-2 (named and
   custom) round-trips.
 
+- `crates/algocline-engine/tests/gameai_ckpt_metric_e2e.rs` — end-to-end
+  smoke wiring the three pieces above together in one training run:
+  `alc.nn.trainer.run_full_ft` fires `on_ckpt` at every `ckpt_every`
+  boundary, the hook turns `info.ckpt_path` into a handle with
+  `alc.nn.card.load_ckpt`, and
+  `alc.nn.metric.registry.evaluate("trickiness", …)` reads a number off
+  that handle — all while the trainer holds the model mutex and the
+  dataset lock. The hook fire count is asserted first (a silent no-op
+  hook would make the rest vacuous) and the metric is bounded by its
+  definition (`[0, ln 4]`) rather than by a training-budget threshold.
+  Added to `just test-nn`.
+
 - `examples/gameai/gameai_metrics` — new Lua pkg composing the metric
   primitives + Registry into three GameAI-specific metrics for the
   Level Sweep learning iter. `style_distance(card_a, card_b,
@@ -156,6 +168,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generalises".
 
 ### Changed
+
+- `examples/gameai/gameai_metrics`: the three metrics now accept a live
+  handle as **userdata** as well as a table. `style_distance` /
+  `trickiness` / `level` previously gated their `card` argument on
+  `type(card) == "table"`, which rejected the `NnHandle` userdata
+  `alc.nn.card.load_handle` and `alc.nn.card.load_ckpt` return — so a
+  trainer `on_ckpt` hook could load a checkpoint but not measure it. The
+  guards now test what they actually need (a callable
+  `generate_session`), and the `level` boss-seat guard follows suit so a
+  userdata opponent reaches the directional "not wired in this iter"
+  error instead of a type complaint. Error messages name the observed
+  Lua type and point at both loaders. 8 further spec tests (28 total)
+  pin the table path, the alias path and the "no `generate_session`"
+  refusal; the userdata path is covered by the new end-to-end test
+  below.
 
 - `alc.nn` trainer: `grad_accum > 1` is now honoured natively across
   Full FT / LoRA / Distill. The loop scales each micro-batch loss by

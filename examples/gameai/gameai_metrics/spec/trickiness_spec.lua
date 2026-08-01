@@ -71,6 +71,12 @@ local function make_handle(alias)
     return handle
 end
 
+--- See style_distance_spec.lua for why the metatable proxy stands in for
+--- the userdata handle shape here.
+local function via_metatable(handle)
+    return setmetatable({}, { __index = handle })
+end
+
 local ALIAS_TO_HANDLE = {}
 alc.card = {
     get_by_alias = function(alias)
@@ -187,5 +193,30 @@ describe("gameai_metrics.trickiness", function()
         local ok, err = pcall(trickiness, h, {})
         expect(ok).to.equal(false)
         expect(err:find("empty") ~= nil).to.equal(true)
+    end)
+
+    it("resolves a string alias through alc.card.get_by_alias", function()
+        reset()
+        local h = make_handle("A")
+        ALIAS_TO_HANDLE["A"] = h
+        local t = trickiness("A", { view() })
+        expect(math.abs(t - math.log(4)) < 1e-6).to.equal(true)
+        expect(#ENTROPY_CALLS).to.equal(1)
+    end)
+
+    it("accepts a handle whose generate_session comes from a metatable", function()
+        reset()
+        local h = via_metatable(make_handle("A"))
+        expect(rawget(h, "generate_session")).to.equal(nil)
+        local t = trickiness(h, { view() })
+        expect(math.abs(t - math.log(4)) < 1e-6).to.equal(true)
+        expect(#ENTROPY_CALLS).to.equal(1)
+    end)
+
+    it("still refuses a table without a generate_session method", function()
+        reset()
+        local ok, err = pcall(trickiness, { alias = "A" }, { view() })
+        expect(ok).to.equal(false)
+        expect(err:find("generate_session") ~= nil).to.equal(true)
     end)
 end)

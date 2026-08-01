@@ -145,6 +145,7 @@ fn synthetic_run_reduces_loss_and_saves_final_bundle() {
         tmp.path(),
         "synthetic",
         lease,
+        None,
     )
     .expect("training must complete");
 
@@ -256,6 +257,7 @@ fn bf16_synthetic_run_reduces_loss_through_mixed_adamw() {
         tmp.path(),
         "bf16_synthetic",
         lease,
+        None,
     )
     .expect("bf16 training must complete");
 
@@ -311,6 +313,7 @@ fn f16_params_refused_before_training_starts() {
         tmp.path(),
         "f16_refused",
         lease,
+        None,
     ) {
         Ok(_) => panic!("expected f16 refusal"),
         Err(e) => e,
@@ -348,6 +351,7 @@ fn dataset_exhaustion_surfaces_error() {
         tmp.path(),
         "short",
         lease,
+        None,
     ) {
         Ok(_) => panic!("expected DatasetExhausted"),
         Err(e) => e,
@@ -392,6 +396,7 @@ fn concurrency_lease_prevents_double_training() {
         tmp.path(),
         "second",
         lease.clone(),
+        None,
     ) {
         Ok(_) => panic!("expected LeaseHeld"),
         Err(e) => e,
@@ -457,6 +462,7 @@ fn grad_accum_matches_equivalent_batch() {
             tmp.path(),
             "ga_ref",
             lease,
+            None,
         )
         .expect("single-micro training must complete");
         *ckpt
@@ -496,6 +502,7 @@ fn grad_accum_matches_equivalent_batch() {
             tmp.path(),
             "ga_accum",
             lease,
+            None,
         )
         .expect("grad_accum=4 training must complete");
         *ckpt
@@ -548,6 +555,7 @@ fn grad_accum_gt_one_reduces_loss() {
         tmp.path(),
         "ga_solo",
         lease,
+        None,
     )
     .expect("grad_accum training must complete");
 
@@ -611,6 +619,7 @@ fn bf16_grad_accum_synthetic_run_reduces_loss_through_mixed_adamw() {
         tmp.path(),
         "bf16_ga",
         lease,
+        None,
     )
     .expect("bf16 grad_accum training must complete");
 

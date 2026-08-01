@@ -456,6 +456,145 @@ fn alc_nn_preset_gpt2_custom_builds_and_trains() {
     assert_eq!(step, 2);
 }
 
+/// `alc.nn.trainer.full_ft`'s `on_ckpt` hook fires at each
+/// `ckpt_every` boundary and can early-break the run by returning
+/// `"break"`. The returned Checkpoint carries the `early_break = 1.0`
+/// metric so downstream consumers can distinguish an early stop from
+/// a full-run save.
+///
+/// End-to-end coverage of the Lua-side wiring added for the metric
+/// infra iter (`fc070f15`): parse `on_ckpt` opts →
+/// `extract_on_ckpt_hook` → `CkptHook` adapter → trainer fire path.
+#[test]
+fn alc_nn_trainer_full_ft_on_ckpt_break_stops_early() {
+    let (lua, _tmp) = production_vm();
+    let (step, early_break, fires) = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.gpt2("custom", {
+                pretrained = false,
+                device = "cpu",
+                vocab = 32,
+            })
+            -- Enough rows for `steps=8` at batch_size=1 so the loop
+            -- can reach the second `ckpt_every=2` boundary before
+            -- exhausting the dataset (TokenizedDataset does not
+            -- cycle when `shuffle=false`).
+            local rows = {
+                { 1, 5, 12, 20, 30, 3, 8, 15 },
+                { 2, 8, 15, 22, 30, 4, 9, 16 },
+                { 3, 7, 14, 21, 28, 5, 10, 17 },
+                { 4, 6, 13, 19, 27, 6, 11, 18 },
+                { 5, 9, 16, 23, 29, 7, 12, 19 },
+                { 6, 10, 11, 24, 26, 8, 13, 20 },
+                { 7, 11, 17, 25, 31, 9, 14, 21 },
+                { 8, 12, 18, 20, 25, 10, 15, 22 },
+            }
+            local ds = alc.nn.data.synthetic(rows, {
+                batch_size = 1,
+                ctx_len = 8,
+                shuffle = false,
+                pad_id = 0,
+            })
+
+            local fires = 0
+            local ckpt = alc.nn.trainer.full_ft(h, ds, {
+                lr = 3e-4,
+                batch_size = 1,
+                steps = 8,
+                warmup = 0,
+                schedule = "constant",
+                weight_decay = 0.0,
+                ckpt_every = 2,
+                ckpt_keep = 3,
+                ckpt_prefix = "smoke_on_ckpt_break",
+                on_ckpt = function(info)
+                    -- Sanity: every documented field is present and
+                    -- has a plausible type.
+                    assert(type(info.step) == "number", "info.step must be number")
+                    assert(type(info.ckpt_path) == "string", "info.ckpt_path must be string")
+                    assert(type(info.train_loss) == "number", "info.train_loss must be number")
+                    assert(type(info.lr) == "number", "info.lr must be number")
+                    assert(type(info.grad_norm) == "number", "info.grad_norm must be number")
+                    assert(type(info.elapsed_ms) == "number", "info.elapsed_ms must be number")
+                    assert(type(info.min_train_loss) == "number",
+                        "info.min_train_loss must be number")
+                    fires = fires + 1
+                    if fires >= 2 then
+                        return "break"
+                    end
+                    return "continue"
+                end,
+            })
+
+            return ckpt.step, ckpt.metrics.early_break or 0, fires
+        "#,
+        )
+        .eval::<(i64, f64, i64)>()
+        .expect("full_ft with on_ckpt early break");
+
+    // ckpt_every = 2, break on 2nd fire → step 4.
+    assert_eq!(step, 4, "trainer must stop at the break-triggering step");
+    assert!(
+        (early_break - 1.0).abs() < 1e-9,
+        "metrics.early_break must be 1.0 on early-break exit, got {early_break}"
+    );
+    assert_eq!(fires, 2, "hook must have fired exactly twice before break");
+}
+
+/// A Lua-side error inside `on_ckpt` surfaces as a Lua error with the
+/// `alc.nn.trainer` prefix (via `TrainError::Hook` → `train_err_to_lua`),
+/// not as a silent PASS or a Rust panic.
+#[test]
+fn alc_nn_trainer_full_ft_on_ckpt_error_propagates() {
+    let (lua, _tmp) = production_vm();
+    let err = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.gpt2("custom", {
+                pretrained = false,
+                device = "cpu",
+                vocab = 32,
+            })
+            local rows = {
+                { 1, 5, 12, 20, 30, 3, 8, 15 },
+                { 2, 8, 15, 22, 30, 4, 9, 16 },
+            }
+            local ds = alc.nn.data.synthetic(rows, {
+                batch_size = 1,
+                ctx_len = 8,
+                shuffle = false,
+                pad_id = 0,
+            })
+            alc.nn.trainer.full_ft(h, ds, {
+                lr = 3e-4,
+                batch_size = 1,
+                steps = 4,
+                warmup = 0,
+                schedule = "constant",
+                weight_decay = 0.0,
+                ckpt_every = 2,
+                ckpt_keep = 1,
+                ckpt_prefix = "smoke_on_ckpt_err",
+                on_ckpt = function(_info)
+                    return "sideways"
+                end,
+            })
+        "#,
+        )
+        .exec()
+        .expect_err("invalid on_ckpt return must surface as Lua error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("alc.nn.trainer") && msg.contains("on_ckpt"),
+        "error must carry the trainer prefix and mention on_ckpt: {msg}"
+    );
+    assert!(
+        msg.contains("sideways"),
+        "error must name the offending return value: {msg}"
+    );
+}
+
 /// Cross-module seam guard: the Card that `alc.nn.trainer.run_full_ft`
 /// writes (bridge/nn_trainer.rs) must resolve through
 /// `alc.nn.card.load_handle` (bridge/nn_card.rs) — bundle path,

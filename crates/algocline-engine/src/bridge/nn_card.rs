@@ -54,7 +54,9 @@ use mlua::prelude::*;
 use mlua::LuaSerdeExt;
 use serde_json::Value as Json;
 
-use super::nn_opts::{extract_distill_loss_kind, extract_full_ft_opts, train_err_to_lua};
+use super::nn_opts::{
+    extract_distill_loss_kind, extract_full_ft_opts, extract_on_ckpt_hook, train_err_to_lua,
+};
 use crate::card::nn::persist;
 use crate::card::{FileCardStore, SamplesQuery};
 
@@ -3332,6 +3334,11 @@ fn full_ft_impl(
     lease: Arc<TrainingLease>,
 ) -> LuaResult<LuaTable> {
     let cfg = extract_full_ft_opts(TRAINER_ERR_PREFIX, opts)?;
+    // Extract the optional `on_ckpt` hook alongside the config. The
+    // hook is a separate independent arg to `run_full_ft` (see
+    // `CkptHook` docs: the callback can't sit inside `FullFtConfig`
+    // without breaking its derive cascade).
+    let hook = extract_on_ckpt_hook(TRAINER_ERR_PREFIX, lua, opts)?;
     let (ckpt_dir, ckpt_prefix) = resolve_ckpt_dest(opts, nn_dir, "full_ft")?;
 
     let gpt2 = handle.borrow::<Gpt2Handle>()?;
@@ -3369,6 +3376,7 @@ fn full_ft_impl(
         &ckpt_dir,
         &ckpt_prefix,
         lease,
+        hook,
     );
     drop(model);
     drop(ds_lock);

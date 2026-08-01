@@ -440,6 +440,7 @@ fn run_lora_ft_updates_lora_weights() {
         tmp.path(),
         "weight-update",
         lease,
+        None,
     )
     .expect("run_full_ft on lora_vm must succeed");
 

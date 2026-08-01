@@ -595,6 +595,11 @@ fn run_full_ft_impl(
                 nn_dir,
                 card_id.as_str(),
                 Arc::clone(&lease),
+                // `alc.nn.trainer.run_full_ft` does not expose the
+                // `on_ckpt` hook yet — the Layer 5b sibling
+                // `alc.nn.trainer.full_ft` (nn_card.rs) is the current
+                // hook surface.
+                None,
             );
             drop(model);
             drop(ds_lock);
@@ -628,6 +633,9 @@ fn run_full_ft_impl(
                 nn_dir,
                 card_id.as_str(),
                 Arc::clone(&lease),
+                // Same as above: `run_full_ft` bridge does not expose
+                // on_ckpt yet.
+                None,
             );
             drop(model);
             drop(ds_lock);

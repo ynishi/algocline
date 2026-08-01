@@ -175,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &ckpt_dir,
         ckpt_prefix,
         lease,
+        None,
     )?;
     let elapsed = train_t0.elapsed();
 

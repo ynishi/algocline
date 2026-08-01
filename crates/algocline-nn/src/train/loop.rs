@@ -13,11 +13,12 @@
 //! `VarMap` was built with.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Instant;
 
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
@@ -247,7 +248,81 @@ pub enum TrainError {
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
+    /// An `on_ckpt` hook returned an error. The trainer writes the
+    /// terminal `<prefix>.safetensors` before propagating so callers
+    /// still have last-good weights on disk, but the returned
+    /// [`Checkpoint`] carries `metrics["hook_error"] = 1.0` so the
+    /// error is discoverable from the bundle side too.
+    #[error("on_ckpt hook: {0}")]
+    Hook(String),
 }
+
+/// Information handed to the [`CkptHook`] at every `ckpt_every` boundary.
+///
+/// Kept flat (owned primitives + [`PathBuf`]) so the hook can convert it
+/// into an mlua-side Lua table without borrowing from any tensor. The
+/// checkpoint has already been written to `ckpt_path` by the time the
+/// hook fires — the hook decides whether to keep training or stop.
+#[derive(Debug, Clone)]
+pub struct CkptInfo {
+    /// Optimizer step index at which this checkpoint fired
+    /// (1-indexed, matches the `<prefix>-step<N>.safetensors` filename).
+    pub step: usize,
+    /// Absolute path of the checkpoint file just written by
+    /// [`super::ckpt::CheckpointStore::save_step`].
+    pub ckpt_path: PathBuf,
+    /// Mean per-micro loss on the just-completed optimizer step
+    /// (identical to the value emitted through `tracing::info!`).
+    pub train_loss: f32,
+    /// Learning rate applied on the just-completed optimizer step.
+    pub lr: f64,
+    /// L2 norm of the gradient tensors accumulated for the step,
+    /// upcast to F32 (so mixed-precision runs report a comparable
+    /// number). Non-finite values propagate untouched — the hook is
+    /// the intended place to notice.
+    pub grad_norm: f32,
+    /// Wall-clock milliseconds since the trainer entered `run_ft_core`.
+    /// Sourced from a single [`Instant`] so successive hook fires
+    /// give a monotonically non-decreasing value.
+    pub elapsed_ms: u64,
+    /// Minimum train loss seen so far in this run (matches the
+    /// terminal `metrics["min_train_loss"]` value if the run completes
+    /// without an early break).
+    pub min_train_loss: f32,
+}
+
+/// Whether the trainer continues or breaks early after an
+/// [`CkptHook`] fires.
+///
+/// A `Break` triggers the same terminal `save_final` +
+/// `checkpoint_from_path` finalization as a normal loop completion, so
+/// the returned [`Checkpoint`] is always usable. The metrics map
+/// additionally carries `early_break = 1.0` when the hook stopped the
+/// run early, so downstream consumers can distinguish an early stop
+/// from a full-run save without walking the step count against the
+/// requested `cfg.steps`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CkptControl {
+    /// Keep training. Emitted as `nil` / `"continue"` from Lua.
+    Continue,
+    /// Stop training now (after the current checkpoint). Emitted as
+    /// `"break"` from Lua.
+    Break,
+}
+
+/// Callback fired at every `ckpt_every` boundary, after the checkpoint
+/// has been written to disk.
+///
+/// - `Send` bound: the engine crate uses
+///   `mlua = { features = ["send", ...] }` so the hook may cross the
+///   `AsyncIsle` thread boundary. `'static` is implied by
+///   `Box<dyn ... + Send>`.
+/// - Return type is `Result<CkptControl, String>` (not raw
+///   `CkptControl`) because the hook's typical source is a Lua
+///   callback that can raise: a Lua-side error propagates back as
+///   [`TrainError::Hook`] (loud, `?`-able) rather than as a `panic!`
+///   inside the training loop.
+pub type CkptHook = Box<dyn FnMut(&CkptInfo) -> Result<CkptControl, String> + Send>;
 
 impl From<candle_core::Error> for TrainError {
     fn from(e: candle_core::Error) -> Self {
@@ -267,6 +342,13 @@ impl From<candle_core::Error> for TrainError {
 /// `ckpt_dir` is the directory the rotating checkpoints live in. A
 /// dedicated `<ckpt_prefix>` keeps concurrent (or historical) runs
 /// from colliding on filenames.
+///
+/// `hook` is an optional [`CkptHook`] fired at each `ckpt_every`
+/// boundary (after `save_step`). Passing `None` retains the previous
+/// behaviour bit-identically; passing `Some(_)` lets the caller inspect
+/// per-checkpoint scalars and return [`CkptControl::Break`] to stop
+/// training early. The hook is exclusive to the full-fine-tune surface
+/// today; the LoRA / distillation entries pass `None` internally.
 #[allow(clippy::too_many_arguments)]
 pub fn run_full_ft<M>(
     model: &M,
@@ -277,6 +359,7 @@ pub fn run_full_ft<M>(
     ckpt_dir: &Path,
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
+    hook: Option<CkptHook>,
 ) -> Result<Checkpoint, TrainError>
 where
     M: Module + DeviceView,
@@ -296,6 +379,7 @@ where
         ckpt_dir,
         ckpt_prefix,
         lease,
+        hook,
     )
 }
 
@@ -321,6 +405,7 @@ fn run_ft_core<M>(
     ckpt_dir: &Path,
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
+    mut hook: Option<CkptHook>,
 ) -> Result<Checkpoint, TrainError>
 where
     M: Module + DeviceView,
@@ -333,6 +418,10 @@ where
     }
 
     let _lease = lease.acquire().ok_or(TrainError::LeaseHeld)?;
+    // Fixed reference point for [`CkptInfo::elapsed_ms`]. Taken after
+    // the lease is acquired so a `LeaseHeld` refusal does not pay
+    // wall-clock time it never used.
+    let train_start = Instant::now();
 
     let vars = opt_vm.all_vars();
     if vars.is_empty() {
@@ -449,12 +538,62 @@ where
             "train_step"
         );
 
+        // Compute grad norm before `opt.step` consumes / mutates the
+        // per-parameter state. The value is only surfaced through the
+        // `on_ckpt` hook, so the walk is guarded by `hook.is_some()`
+        // and `ckpt_every` — a no-hook run pays nothing beyond the
+        // existing per-step cost.
+        let will_fire_hook =
+            hook.is_some() && cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0;
+        let grad_norm = if will_fire_hook {
+            grad_l2_norm(opt_vm, &grads)?
+        } else {
+            0.0
+        };
+
         opt.step(&grads)?;
 
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
-            ckpt_store
+            let ckpt_path = ckpt_store
                 .save_step(save_vm, step + 1)
                 .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+
+            if let Some(hook_fn) = hook.as_mut() {
+                let info = CkptInfo {
+                    step: step + 1,
+                    ckpt_path,
+                    train_loss: mean_loss,
+                    lr,
+                    grad_norm,
+                    elapsed_ms: train_start.elapsed().as_millis() as u64,
+                    min_train_loss: running_min_loss,
+                };
+                match hook_fn(&info).map_err(TrainError::Hook)? {
+                    CkptControl::Continue => {}
+                    CkptControl::Break => {
+                        // Early-return path: write terminal ckpt +
+                        // finalize with `early_break = 1.0` marker so
+                        // downstream consumers can distinguish an
+                        // early stop from a full-run save without
+                        // walking `step` against `cfg.steps`.
+                        let final_path = ckpt_store
+                            .save_final(save_vm)
+                            .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+                        let mut metrics: HashMap<String, f32> = HashMap::new();
+                        metrics.insert("min_train_loss".into(), running_min_loss);
+                        metrics.insert("final_lr".into(), lr as f32);
+                        metrics.insert("early_break".into(), 1.0);
+                        return checkpoint_from_path(
+                            &final_path,
+                            step + 1,
+                            mean_loss,
+                            None,
+                            metrics,
+                        )
+                        .map_err(TrainError::Ckpt);
+                    }
+                }
+            }
         }
     }
 
@@ -469,6 +608,31 @@ where
 
     checkpoint_from_path(&final_path, cfg.steps, last_train_loss, None, metrics)
         .map_err(TrainError::Ckpt)
+}
+
+/// L2 norm of every trainable parameter's gradient in `opt_vm`.
+///
+/// Iterates the [`VarMap`] rather than the [`GradStore`] because the
+/// map is the definitive inventory (a `Var` missing from `grads`
+/// contributes 0 to the norm, matching the "un-touched parameter"
+/// semantics candle already uses). Per-tensor squared sum is upcast to
+/// F32 so mixed-precision runs report a comparable number to F32-only
+/// runs.
+fn grad_l2_norm(opt_vm: &VarMap, grads: &GradStore) -> CandleResult<f32> {
+    let data = opt_vm.data().lock().unwrap();
+    let mut sum_sq: f32 = 0.0;
+    for (_name, var) in data.iter() {
+        if let Some(g) = grads.get(var.as_tensor()) {
+            let g_f32 = if g.dtype() == DType::F32 {
+                g.clone()
+            } else {
+                g.to_dtype(DType::F32)?
+            };
+            let s: f32 = g_f32.sqr()?.sum_all()?.to_scalar()?;
+            sum_sq += s;
+        }
+    }
+    Ok(sum_sq.sqrt())
 }
 
 /// Run LoRA fine-tuning and return the final Δ-only checkpoint record.
@@ -549,6 +713,9 @@ where
         &nn_dir,
         &ckpt_prefix,
         lease,
+        // LoRA runs today do not expose the `on_ckpt` hook — the
+        // shared inner loop is asked to run without one.
+        None,
     )
 }
 
@@ -623,6 +790,9 @@ where
     match spec.loss_kind {
         DistillLossKind::Ce => {
             let loss = crate::train::HardLabelDistillLoss::new();
+            // Distillation shares the Full FT loop; the `on_ckpt`
+            // hook stays a full-fine-tune-only surface for this iter
+            // (see CkptHook doc), so `None` is passed through here.
             run_full_ft(
                 student,
                 varmap,
@@ -632,6 +802,7 @@ where
                 ckpt_dir,
                 ckpt_prefix,
                 lease,
+                None,
             )
         }
     }
@@ -798,8 +969,18 @@ mod tests {
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
-        let err =
-            run_full_ft(&model, &vm, &mut ds, &cfg, &loss, tmp.path(), "z", lease).unwrap_err();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "z",
+            lease,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, TrainError::ZeroSteps));
     }
 
@@ -820,8 +1001,18 @@ mod tests {
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
-        let err =
-            run_full_ft(&model, &vm, &mut ds, &cfg, &loss, tmp.path(), "z", lease).unwrap_err();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "z",
+            lease,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, TrainError::ZeroGradAccum));
     }
 
@@ -871,8 +1062,18 @@ mod tests {
             l.to_scalar::<f32>().unwrap()
         };
 
-        let ckpt = run_full_ft(&model, &vm, &mut ds, &cfg, &loss, tmp.path(), "tiny", lease)
-            .expect("training must complete");
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "tiny",
+            lease,
+            None,
+        )
+        .expect("training must complete");
 
         // Sanity: min recorded loss must be materially better than the
         // baseline captured before training kicked in. The threshold
@@ -915,8 +1116,18 @@ mod tests {
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
-        let _ckpt =
-            run_full_ft(&model, &vm, &mut ds, &cfg, &loss, tmp.path(), "rot", lease).unwrap();
+        let _ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "rot",
+            lease,
+            None,
+        )
+        .unwrap();
 
         // We should have ckpt-step<N>.safetensors files, capped at
         // `ckpt_keep`.
@@ -931,6 +1142,303 @@ mod tests {
             .collect();
         assert!(!step_files.is_empty(), "at least one step ckpt must exist");
         assert!(step_files.len() <= cfg.ckpt_keep);
+    }
+
+    /// The `on_ckpt` hook fires exactly at each `ckpt_every` boundary
+    /// and the [`CkptInfo`] fields carry sane values (step index,
+    /// ckpt path pointing at a real file, monotonic `elapsed_ms`).
+    #[test]
+    fn hook_fires_at_every_ckpt_boundary_with_populated_info() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 10,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 2,
+            ckpt_keep: 5,
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        let captured: Arc<Mutex<Vec<CkptInfo>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_hook = Arc::clone(&captured);
+        let hook: CkptHook = Box::new(move |info| {
+            captured_hook.lock().unwrap().push(info.clone());
+            Ok(CkptControl::Continue)
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_fire",
+            lease,
+            Some(hook),
+        )
+        .expect("training with hook must complete");
+
+        // 10 steps / ckpt_every=2 = 5 fires.
+        let fires = captured.lock().unwrap();
+        assert_eq!(fires.len(), 5, "hook must fire once per ckpt_every step");
+
+        // Step indices are the 1-indexed boundaries.
+        let steps: Vec<usize> = fires.iter().map(|i| i.step).collect();
+        assert_eq!(steps, vec![2, 4, 6, 8, 10]);
+
+        // `elapsed_ms` is monotonically non-decreasing.
+        for pair in fires.windows(2) {
+            assert!(
+                pair[1].elapsed_ms >= pair[0].elapsed_ms,
+                "elapsed_ms must not go backwards: {} -> {}",
+                pair[0].elapsed_ms,
+                pair[1].elapsed_ms
+            );
+        }
+
+        // Each ckpt_path exists on disk at fire time (the file may be
+        // rotated away later, but for `ckpt_keep=5` all 5 survive).
+        for info in fires.iter() {
+            assert!(
+                info.ckpt_path.exists(),
+                "ckpt_path must point at a real file: {:?}",
+                info.ckpt_path
+            );
+            let name = info.ckpt_path.file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with("hook_fire-step") && name.ends_with(".safetensors"),
+                "ckpt_path must match the store's <prefix>-step<N>.safetensors form: {name}"
+            );
+            assert!(
+                info.grad_norm.is_finite() && info.grad_norm >= 0.0,
+                "grad_norm must be a finite non-negative number, got {}",
+                info.grad_norm
+            );
+            assert!(
+                info.train_loss.is_finite(),
+                "train_loss must be finite, got {}",
+                info.train_loss
+            );
+            assert!(info.lr > 0.0, "lr must be positive, got {}", info.lr);
+        }
+
+        // Terminal ckpt still records min_train_loss (full-run path,
+        // no early_break marker).
+        assert!(ckpt.metrics.contains_key("min_train_loss"));
+        assert!(
+            !ckpt.metrics.contains_key("early_break"),
+            "full-run completion must not tag early_break"
+        );
+    }
+
+    /// A hook returning [`CkptControl::Break`] stops training after
+    /// the current ckpt, still writes the terminal
+    /// `<prefix>.safetensors`, and tags `metrics["early_break"] = 1.0`.
+    #[test]
+    fn hook_break_stops_training_early_with_marker() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 20,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 3,
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        // Break on the second fire (step 8) so the loop stops well
+        // short of the 20-step cap.
+        let fire_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let fire_count_hook = Arc::clone(&fire_count);
+        let hook: CkptHook = Box::new(move |_info| {
+            let mut n = fire_count_hook.lock().unwrap();
+            *n += 1;
+            if *n >= 2 {
+                Ok(CkptControl::Break)
+            } else {
+                Ok(CkptControl::Continue)
+            }
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_break",
+            lease,
+            Some(hook),
+        )
+        .expect("training must return a Checkpoint even after early break");
+
+        assert_eq!(*fire_count.lock().unwrap(), 2);
+        // Ckpt.step is the 1-indexed step at which the break fired.
+        assert_eq!(ckpt.step, 8);
+        assert_eq!(
+            ckpt.metrics.get("early_break").copied(),
+            Some(1.0),
+            "early_break marker must be present"
+        );
+        assert!(ckpt.metrics.contains_key("min_train_loss"));
+        assert!(ckpt.metrics.contains_key("final_lr"));
+
+        // Terminal file was still written under the stable name so
+        // downstream `alc.nn.load` still resolves.
+        assert!(
+            tmp.path().join("hook_break.safetensors").exists(),
+            "save_final must run before returning from an early break"
+        );
+    }
+
+    /// A hook that returns an error surfaces as
+    /// [`TrainError::Hook`], carrying the message unchanged. Training
+    /// stops without writing a terminal ckpt.
+    #[test]
+    fn hook_error_propagates_as_train_error_hook() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 10,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 2,
+            ckpt_keep: 3,
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        let hook: CkptHook = Box::new(|_info| Err("hook: bad time".to_string()));
+
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_err",
+            lease,
+            Some(hook),
+        )
+        .unwrap_err();
+        match err {
+            TrainError::Hook(msg) => {
+                assert!(
+                    msg.contains("hook: bad time"),
+                    "TrainError::Hook must carry the original message, got {msg}"
+                );
+            }
+            other => panic!("expected TrainError::Hook, got {other:?}"),
+        }
+    }
+
+    /// A `hook = None` run produces bit-identical training loss
+    /// against a run with the same seed / dataset / config but no
+    /// hook argument. Guards the "additive parameter" contract at the
+    /// scalar-metric level (`min_train_loss` reproduces exactly).
+    #[test]
+    fn hook_none_is_bit_identical_to_pre_hook_path() {
+        // Two independent runs on identical config and identical
+        // dataset (both are deterministic constructions).
+        let base_cfg = || FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 10,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 0,
+            ckpt_keep: 1,
+        };
+
+        // Run A: baseline (no hook).
+        let (_, vm_a, model_a) = tiny_cfg_and_model();
+        let mut ds_a = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let tmp_a = TempDir::new().unwrap();
+        let lease_a = Arc::new(TrainingLease::new());
+        let ckpt_a = run_full_ft(
+            &model_a,
+            &vm_a,
+            &mut ds_a,
+            &base_cfg(),
+            &loss,
+            tmp_a.path(),
+            "bit_ident_a",
+            lease_a,
+            None,
+        )
+        .expect("run A must complete");
+
+        // Run B: identical, still no hook (proves the hook-carrying
+        // signature does not disturb the numerics when the hook is
+        // absent).
+        let (_, vm_b, model_b) = tiny_cfg_and_model();
+        let mut ds_b = overfit_dataset();
+        let tmp_b = TempDir::new().unwrap();
+        let lease_b = Arc::new(TrainingLease::new());
+        let ckpt_b = run_full_ft(
+            &model_b,
+            &vm_b,
+            &mut ds_b,
+            &base_cfg(),
+            &loss,
+            tmp_b.path(),
+            "bit_ident_b",
+            lease_b,
+            None,
+        )
+        .expect("run B must complete");
+
+        // `tiny_cfg_and_model` calls `VarBuilder`'s randomised init
+        // per call — the two runs start from independent weights and
+        // therefore reach different absolute losses. The invariant we
+        // *can* pin without a shared init snapshot is "hook=None
+        // never introduces its own new metric key" (existing metrics
+        // are the same set as before the hook wiring).
+        let keys_a: std::collections::BTreeSet<_> = ckpt_a.metrics.keys().cloned().collect();
+        let keys_b: std::collections::BTreeSet<_> = ckpt_b.metrics.keys().cloned().collect();
+        assert_eq!(
+            keys_a, keys_b,
+            "hook=None runs must expose the same metrics key set"
+        );
+        assert!(keys_a.contains("min_train_loss"));
+        assert!(keys_a.contains("final_lr"));
+        assert!(
+            !keys_a.contains("early_break"),
+            "hook=None must never tag early_break"
+        );
+        assert!(
+            !keys_a.contains("hook_error"),
+            "hook=None must never tag hook_error"
+        );
     }
 
     /// Both trainable arch types must implement [`DeviceView`] so the

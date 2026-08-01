@@ -310,6 +310,7 @@ fn run_lora_ft_tinyllama_updates_lora_weights() {
         tmp.path(),
         "tinyllama-weight-update",
         lease,
+        None,
     )
     .expect("run_full_ft on lora_vm must succeed");
 

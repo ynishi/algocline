@@ -32,7 +32,9 @@
 //! serves four trainer entrypoints off a single `fn_name` argument.
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
-use algocline_nn::train::{DistillLossKind, FullFtConfig, ScheduleKind, TrainError};
+use algocline_nn::train::{
+    CkptControl, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, ScheduleKind, TrainError,
+};
 use mlua::prelude::*;
 
 /// Extract a [`FullFtConfig`] from an opts table, applying the crate's
@@ -77,6 +79,108 @@ pub(super) fn extract_full_ft_opts(
         )));
     }
     Ok(cfg)
+}
+
+/// Extract an optional `on_ckpt` Lua callback from an opts table and
+/// wrap it as a Rust-side [`CkptHook`].
+///
+/// Kept separate from [`extract_full_ft_opts`] because the hook is not
+/// part of [`FullFtConfig`]'s owned data (a `Box<dyn FnMut>` breaks the
+/// `#[derive(Debug, Clone)]` cascade and pushes the borrow story into
+/// every downstream consumer). The full-fine-tune bridge extracts the
+/// hook alongside the config and passes both to `run_full_ft` as
+/// independent arguments.
+///
+/// The returned closure holds the Lua callback via a [`WeakLua`] +
+/// [`LuaFunction`] pair, mirroring the sampler bridge
+/// ([`crate::bridge::nn_sampler::LuaSamplerBridge`]) — mlua 0.11's
+/// `send` feature makes both `Send`, so the resulting hook satisfies
+/// the `Send` bound on [`CkptHook`]. A dropped Lua VM surfaces as a
+/// `TrainError::Hook` rather than a `panic!`.
+///
+/// Lua return-value contract (loud on anything else):
+/// - `nil` or `"continue"` → [`CkptControl::Continue`]
+/// - `"break"` → [`CkptControl::Break`]
+/// - any other value → `TrainError::Hook` naming the offending value
+///
+/// A Lua-side `error(...)` inside the callback also surfaces as
+/// `TrainError::Hook` with the raised message. Either way the trainer
+/// still writes the terminal `<prefix>.safetensors` before returning,
+/// so the caller has last-good weights on disk (see
+/// [`algocline_nn::train::TrainError::Hook`] docs).
+pub(super) fn extract_on_ckpt_hook(
+    prefix: &str,
+    lua: &Lua,
+    opts: Option<&LuaTable>,
+) -> LuaResult<Option<CkptHook>> {
+    let Some(t) = opts else {
+        return Ok(None);
+    };
+    let Some(callback): Option<LuaFunction> = t.get("on_ckpt")? else {
+        return Ok(None);
+    };
+
+    let weak = lua.weak();
+    let prefix_owned = prefix.to_string();
+    let hook: CkptHook = Box::new(move |info: &CkptInfo| -> Result<CkptControl, String> {
+        let lua = weak
+            .try_upgrade()
+            .ok_or_else(|| format!("{prefix_owned}: Lua state owning on_ckpt is gone"))?;
+        let table = ckpt_info_to_lua(&lua, info)
+            .map_err(|e| format!("{prefix_owned}: cannot build info table: {e}"))?;
+        let returned: LuaValue = callback
+            .call(table)
+            .map_err(|e| format!("{prefix_owned}: on_ckpt callback failed: {e}"))?;
+        parse_ckpt_control(&prefix_owned, &returned)
+    });
+    Ok(Some(hook))
+}
+
+/// Build a Lua table mirroring the [`CkptInfo`] fields so the callback
+/// can index into it by name (`info.step`, `info.ckpt_path`, …).
+fn ckpt_info_to_lua(lua: &Lua, info: &CkptInfo) -> LuaResult<LuaTable> {
+    let t = lua.create_table()?;
+    t.set("step", info.step)?;
+    // `ckpt_path` is UTF-8 in practice (`CheckpointStore` builds it
+    // from ASCII prefix + numeric step + `.safetensors`), but the file
+    // system can technically return non-UTF-8 bytes on Linux — fall
+    // back to a lossy display so the callback still sees a string.
+    let path_string = info
+        .ckpt_path
+        .to_str()
+        .map(String::from)
+        .unwrap_or_else(|| info.ckpt_path.to_string_lossy().into_owned());
+    t.set("ckpt_path", path_string)?;
+    t.set("train_loss", info.train_loss)?;
+    t.set("lr", info.lr)?;
+    t.set("grad_norm", info.grad_norm)?;
+    t.set("elapsed_ms", info.elapsed_ms)?;
+    t.set("min_train_loss", info.min_train_loss)?;
+    Ok(t)
+}
+
+/// Map a Lua-side `on_ckpt` return value to a [`CkptControl`].
+///
+/// Kept out of [`extract_on_ckpt_hook`] so the parser is testable
+/// without spinning up a full trainer run.
+fn parse_ckpt_control(prefix: &str, value: &LuaValue) -> Result<CkptControl, String> {
+    match value {
+        LuaValue::Nil => Ok(CkptControl::Continue),
+        LuaValue::String(s) => match s.to_str().as_deref() {
+            Ok("continue") => Ok(CkptControl::Continue),
+            Ok("break") => Ok(CkptControl::Break),
+            Ok(other) => Err(format!(
+                "{prefix}: on_ckpt must return 'continue' | 'break' | nil, got {other:?}"
+            )),
+            Err(e) => Err(format!(
+                "{prefix}: on_ckpt returned a non-UTF-8 string: {e}"
+            )),
+        },
+        other => Err(format!(
+            "{prefix}: on_ckpt must return string or nil, got {}",
+            other.type_name()
+        )),
+    }
 }
 
 /// Extract a validated [`FullFtConfig`] from `opts` for the
@@ -354,6 +458,7 @@ pub(super) fn train_err_to_lua(prefix: &str, e: TrainError) -> LuaError {
         ),
         TrainError::Ckpt(inner) => format!("{prefix}: checkpoint: {inner}"),
         TrainError::Candle(inner) => format!("{prefix}: candle: {inner}"),
+        TrainError::Hook(inner) => format!("{prefix}: {inner}"),
         other => format!("{prefix}: {other}"),
     };
     LuaError::external(msg)
@@ -777,6 +882,62 @@ mod tests {
                 "alc.nn.trainer.run_distill: unknown loss_kind 'kl_soft' (expected 'ce')"
             ),
             "message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_ckpt_control_accepts_nil_and_continue_and_break() {
+        let lua = Lua::new();
+        assert!(matches!(
+            parse_ckpt_control("prefix", &LuaValue::Nil).unwrap(),
+            CkptControl::Continue
+        ));
+        let s_cont = LuaValue::String(lua.create_string("continue").unwrap());
+        assert!(matches!(
+            parse_ckpt_control("prefix", &s_cont).unwrap(),
+            CkptControl::Continue
+        ));
+        let s_break = LuaValue::String(lua.create_string("break").unwrap());
+        assert!(matches!(
+            parse_ckpt_control("prefix", &s_break).unwrap(),
+            CkptControl::Break
+        ));
+    }
+
+    #[test]
+    fn parse_ckpt_control_rejects_other_strings_and_wrong_types() {
+        let lua = Lua::new();
+        let bad_str = LuaValue::String(lua.create_string("halt").unwrap());
+        let err = parse_ckpt_control("alc.nn.trainer", &bad_str).unwrap_err();
+        assert!(
+            err.contains("alc.nn.trainer") && err.contains("on_ckpt") && err.contains("halt"),
+            "message must name prefix + surface + offending value: {err}"
+        );
+
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Boolean(true)).unwrap_err();
+        assert!(
+            err.contains("must return string or nil") && err.contains("boolean"),
+            "wrong-type message must state the expected shape + observed type: {err}"
+        );
+
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Integer(1)).unwrap_err();
+        assert!(
+            err.contains("must return string or nil") && err.contains("integer"),
+            "wrong-type message must state the observed type: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_on_ckpt_hook_returns_none_when_key_absent() {
+        let lua = Lua::new();
+        let hook = extract_on_ckpt_hook("alc.nn.trainer", &lua, None).unwrap();
+        assert!(hook.is_none(), "opts=None must yield hook=None");
+
+        let empty = lua.create_table().unwrap();
+        let hook = extract_on_ckpt_hook("alc.nn.trainer", &lua, Some(&empty)).unwrap();
+        assert!(
+            hook.is_none(),
+            "opts table without on_ckpt must yield hook=None"
         );
     }
 

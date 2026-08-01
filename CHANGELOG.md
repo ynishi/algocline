@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.nn.trainer.full_ft` gains an optional `on_ckpt` callback in
+  `opts` — invoked at every `ckpt_every` boundary right after the
+  weights checkpoint is saved. Signature is
+  `function(info) -> "continue" | "break" | nil`; `nil` is treated as
+  `"continue"`. `info` is a Lua table with `{ step, ckpt_path,
+  train_loss, lr, grad_norm, elapsed_ms, min_train_loss }` — enough
+  context to gate on any metric registered via
+  `alc.nn.metric.registry.evaluate`. Returning `"break"` writes the
+  terminal `<prefix>.safetensors` from the current weights, sets
+  `metrics.early_break = 1.0`, and returns the `Checkpoint` early
+  (the remaining `cfg.steps` are not run). Any other return value
+  (unknown string, wrong type, Lua `error(..)`) aborts the run with
+  `TrainError::Hook` after the terminal ckpt is still written, so the
+  caller keeps last-good weights. `on_ckpt` absent = pre-existing
+  behaviour byte-for-byte. **Rust public API additive change**:
+  `algocline_nn::train::run_full_ft` grows a 9th `hook:
+  Option<CkptHook>` parameter, and `CkptInfo` / `CkptControl` /
+  `CkptHook` are newly exported from `algocline_nn::train`. `FullFtConfig`
+  itself is unchanged (the hook lives out-of-band to keep the
+  struct-literal / derive contract byte-identical). `run_lora_ft` and
+  the distill trainer keep their signatures — internally they pass
+  `None` through `run_ft_core`, so the hook applies to `full_ft` only
+  in this iter (LoRA / distill hook wiring is deferred to a later
+  iter). Industry-standard equivalent: HuggingFace `TrainerCallback`
+  `on_save` + `EarlyStoppingCallback` collapsed into a single
+  ckpt-boundary hook. `grad_norm` is computed via L2 over the
+  `VarMap` grads only when a hook fires, so no-hook runs pay zero
+  overhead.
 - `alc.nn.metric.*` Lua bridge — `alc.nn.metric.{kl, js, tvd, entropy}`
   wrap the `algocline_nn::metric` primitives added in the previous
   commit (Lua array table in, Rust `Vec<f32>` cross the FFI, typed

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `algocline_nn::metric` — new Rust module exposing four distribution /
+  entropy primitives (`kl` / `js` / `tvd` / `entropy`) that back the
+  metric infrastructure for the GameAI SLM Level Sweep learning iter
+  (issue fc070f15). Operates on `&[f32]` slices interpreted as
+  probability distributions with loud validation (empty / non-finite /
+  negative / not-normalized / length-mismatch → typed `MetricError`).
+  `kl` follows the `0·log 0 := 0` convention and returns
+  `f32::INFINITY` when `q[i] == 0 && p[i] > 0` per the KL definition;
+  `js` and `tvd` are symmetric and bounded (`[0, ln 2]` / `[0, 1]`);
+  `entropy` is bounded on `[0, ln(len)]`. Domain-agnostic Rust core —
+  the Lua bridge (`alc.nn.metric.*`) and the `MetricRegistry` follow in
+  a subsequent commit; domain composition (gameai style-distance /
+  trickiness / level) lives in a separate Lua pkg.
+
 - `alc.nn.constraint.allow_list({ id, ... })` — allow-list (legal-mask)
   logits constraint, backed by the new
   `algocline_nn::sampling::AllowListConstraint`. Every logit outside the

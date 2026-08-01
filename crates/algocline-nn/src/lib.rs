@@ -31,6 +31,7 @@ pub mod arch;
 pub mod card;
 mod hub;
 pub mod merged;
+pub mod metric;
 pub mod sampling;
 pub mod tokenizer;
 pub mod train;

@@ -81,10 +81,11 @@ nn = ["algocline-engine/nn"]
 
 # CUDA backend for the alc.nn bridge. Propagates through algocline-engine
 # to algocline-nn (which flips candle-core/cuda + candle-nn/cuda +
-# candle-transformers/cuda in lockstep, per the P3 pitfall documented in
-# workspace/tasks/alc-nn-gpu-smoke/runbook.md). Use `cargo install --path
-# . --features nn-cuda` on a CUDA-capable host to install an `alc` binary
-# whose alc.nn.preset.gpt2("...", { device = "cuda" }) actually resolves.
+# candle-transformers/cuda in lockstep; candle-nn gates its LayerNorm CUDA
+# path behind the crate's own `cuda` feature, so the features must move
+# together). Use `cargo install --path . --features nn-cuda` on a
+# CUDA-capable host to install an `alc` binary whose
+# alc.nn.preset.gpt2("...", { device = "cuda" }) actually resolves.
 nn-cuda = ["nn", "algocline-engine/nn-cuda"]
 
 [dev-dependencies]

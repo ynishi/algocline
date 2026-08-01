@@ -38,8 +38,7 @@
 --                                     on cuda + 3-step run_full_ft
 --   10 gpu_medium_card_meta         — medium Card records cuda / bf16
 --
--- Pod-side invocation (documented in workspace/tasks/alc-nn-gpu-smoke/
--- runbook.md):
+-- Pod-side invocation:
 --
 --   1. cargo install --path . --features nn,nn-cuda
 --   2. alc info | grep nn   -- confirm nn feature is live

@@ -8,7 +8,7 @@
 //! the `alc` table of a real engine VM, the four primitives round-trip
 //! through Lua, `MetricError` variants surface as `LuaError::external`,
 //! and the Pure-Lua `registry` supports the `register` / `evaluate`
-//! contract the trainer `on_ckpt` hook (ST3) depends on.
+//! contract the trainer `on_ckpt` hook depends on.
 //!
 //! Uses `install_for_pkg_test` — the same registration path the pkg-test
 //! sandbox uses — so a passing test also means the metric surface is
@@ -110,7 +110,7 @@ fn bridge_error_negative_refused() {
 /// Registry round-trip: `register(name, fn)` followed by
 /// `evaluate(name, ctx)` must call the stored closure with the supplied
 /// context and return its result. Exercises the exact call shape the
-/// trainer `on_ckpt` hook (ST3) will use.
+/// trainer `on_ckpt` hook will use.
 #[test]
 fn registry_round_trip() {
     let lua = nn_vm();

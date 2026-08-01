@@ -21,7 +21,7 @@
 //! fresh VM starts with an empty registry, and `gameai_metrics` (or any
 //! other pkg) `register`s into it after `require`.
 //!
-//! The trainer `on_ckpt` hook (ST3) reaches the registry via
+//! The trainer `on_ckpt` hook reaches the registry via
 //! `alc.nn.metric.registry.evaluate(name, ctx)` — a single Lua entry point
 //! that centralises the "look up + call" pair so callers never handle a
 //! missing metric silently.

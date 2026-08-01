@@ -13,7 +13,7 @@ journal as a read-only context and **returns a single-turn improvement
 proposal to the main thread** based on the recent adviser / coder activity
 against the target.
 
-It is explicitly kicked when the main thread wants a "post-smoke retrospective"
+It is explicitly kicked when the main thread wants a "post-smoke review"
 or "an observation of recent activity". Carving out the "observe ->
 improvement" role into an independent Agent isolates the Reviewer/Refiner axis
 (MAgICoRe ablation, +0.6-1.2% advantage, arXiv:2409.12147).

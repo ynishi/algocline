@@ -240,7 +240,7 @@ impl AppService {
         // - `-installed_at` (desc) breaks ties with newest install first.
         // Sort prose says "active=true 先頭"; using `-active`
         // (DESC) is the only way to satisfy that with the bool ordering
-        // contract — see context-st2.md Pitfall #3.
+        // contract (a plain `active` ASC would put `false` first).
         let sort_str = opts.sort.as_deref().unwrap_or("-active,-installed_at");
         let sort_keys = parse_sort(sort_str).map_err(ServiceError::InvalidInput)?;
         let fields = resolve_fields(
@@ -627,7 +627,7 @@ return meta"#,
         // ── List-tool pipeline: filter → sort → truncate → project ──────
         // Applied to the per-entry `packages` array only. Top-level
         // shape (`search_paths`, `project_root`, `lockfile_path`) is
-        // never projected — see context-st2.md.
+        // never projected.
         if let Some(ref filter_map) = opts.filter {
             if !filter_map.is_empty() {
                 all_packages.retain(|v| matches_filter(v, filter_map));

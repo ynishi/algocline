@@ -155,9 +155,8 @@ exit 0. A single BLOCKED step ⇒ top-level BLOCKED.
   defined` in preflight — that is an intentional forcing function to
   update this doc alongside the rename.
 - **Not a publish gate**. This agent is a pre-push safety net for the
-  ordinary edit → commit → push cycle. Release gates
-  (`@publish-checker` / `@release-checker` / `@dist-rust-orch`) are
-  separate and run on top of a green pre-push.
+  ordinary edit → commit → push cycle. Release gates are separate and
+  run on top of a green pre-push.
 - **`test` recipe boundary**. `test` invokes the full workspace test
   suite (unit + integration + e2e) and can take several minutes plus
   network egress (e2e tests spawn the `alc` binary). Use `mode: quick`

@@ -93,6 +93,15 @@
 --- surfacing as an obscure `io.open` `No such file or directory` (the
 --- same failure mode `harvest_collection` prevented at ST-0).
 
+-- Force gameai_metrics.init to run so its self_register populates
+-- alc.nn.metric.registry with `level` / `style_distance` / `trickiness`.
+-- Requiring the submodule (this file) directly does not execute the
+-- package's init.lua, so without this line the runner would raise
+-- "no metric registered as 'style_distance'" on the first pair-wise
+-- call. gameai_metrics.init does not require this submodule back, so
+-- there is no cycle.
+require("gameai_metrics")
+
 local am = require("anymetric")
 local duel = require("guardian_duel")
 local boss_seat = require("gameai_metrics.boss_seat")

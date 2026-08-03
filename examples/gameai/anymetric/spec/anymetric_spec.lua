@@ -940,6 +940,310 @@ describe("anymetric.judgment.staged", function()
     end)
 end)
 
+describe("anymetric.judgment.staged band require", function()
+    -- A band may make its harvest conditional on a second view of the
+    -- same fire. The cases below fix the whole contract: the floor is
+    -- inclusive, a reading under it continues, and a requirement that
+    -- could not be read at all continues too — a measurement gap is not
+    -- a pass.
+
+    --- One fire's records. `trickiness` is the second view; pass nil to
+    --- leave it out, "error" to make it an ErrorRecord, or a string to
+    --- put a non-numeric value where the number should be.
+    local function fire(ci_lower, trickiness)
+        local records = {
+            {
+                step = 120,
+                view_id = "level",
+                metric = "level",
+                values = { ci_lower = ci_lower, win_rate = 0.93 },
+            },
+        }
+        if trickiness == nil then
+            return records
+        end
+        if trickiness == "error" then
+            records[#records + 1] =
+                { step = 120, view_id = "trickiness", metric = "trickiness", error = "boom" }
+            return records
+        end
+        records[#records + 1] = {
+            step = 120,
+            view_id = "trickiness",
+            metric = "trickiness",
+            values = { value = trickiness, raw_mean = 1.2 },
+        }
+        return records
+    end
+
+    --- The design's three-band schedule: only the middle band carries a
+    --- requirement, so the same judgment covers the mixed case.
+    local function mixed_bands()
+        return {
+            { lo = 0.03, hi = 0.20, label = "weak_v2" },
+            {
+                lo = 0.60,
+                hi = 0.85,
+                label = "mid_v2",
+                require = { view_id = "trickiness", field = "value", min = 0.57 },
+            },
+            { lo = 0.851, hi = 0.98, label = "strong_v2" },
+        }
+    end
+
+    local function mixed_judge()
+        return am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = mixed_bands(),
+        })
+    end
+
+    it("harvests when the required view clears the floor", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, 0.795))
+        expect(d.action).to.equal("harvest")
+        expect(d.meta.label).to.equal("mid_v2")
+        expect(d.meta.step).to.equal(120)
+        expect(d.meta.values.ci_lower).to.equal(0.70)
+    end)
+
+    it("carries the satisfied requirement in meta.require", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, 0.795))
+        expect(type(d.meta.require)).to.equal("table")
+        expect(d.meta.require.view_id).to.equal("trickiness")
+        expect(d.meta.require.field).to.equal("value")
+        expect(d.meta.require.value).to.equal(0.795)
+        -- The reason names the second condition too, so a run log line
+        -- shows why this band was allowed through.
+        expect(d.reason:find("trickiness") ~= nil).to.equal(true)
+        expect(d.reason:find("0.5700") ~= nil).to.equal(true)
+    end)
+
+    it("treats the floor as inclusive (value == min harvests)", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, 0.57))
+        expect(d.action).to.equal("harvest")
+        expect(d.meta.require.value).to.equal(0.57)
+    end)
+
+    it("continues when the required view is below the floor, naming both numbers", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, 0.354))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("band hit %(mid_v2%)") ~= nil).to.equal(true)
+        expect(d.reason:find("below required min=0.5700") ~= nil).to.equal(true)
+        expect(d.reason:find("0.3540") ~= nil).to.equal(true)
+    end)
+
+    it("continues when the required view produced no record at all", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, nil))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("could not be read") ~= nil).to.equal(true)
+        expect(d.reason:find("no record") ~= nil).to.equal(true)
+    end)
+
+    it("continues when the required view errored", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, "error"))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("could not be read") ~= nil).to.equal(true)
+        expect(d.reason:find("errored") ~= nil).to.equal(true)
+    end)
+
+    it("continues when the required field is present but not a number", function()
+        reset()
+        local d = mixed_judge()(fire(0.70, "very tricky"))
+        expect(d.action).to.equal("continue")
+        expect(d.meta).to.equal(nil)
+        expect(d.reason:find("could not be read") ~= nil).to.equal(true)
+        expect(d.reason:find("no numeric field") ~= nil).to.equal(true)
+    end)
+
+    it("continues when the required field name is absent from the values table", function()
+        reset()
+        local judge = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                {
+                    lo = 0.60,
+                    hi = 0.85,
+                    label = "mid_v2",
+                    require = { view_id = "trickiness", field = "raw_value", min = 0.57 },
+                },
+            },
+        })
+        local d = judge(fire(0.70, 0.795))
+        expect(d.action).to.equal("continue")
+        expect(d.reason:find("raw_value") ~= nil).to.equal(true)
+    end)
+
+    it("leaves bands without a require untouched in the same judgment", function()
+        reset()
+        -- The weak band has no requirement, so it harvests even on a
+        -- fire where the second view is missing entirely.
+        local weak = mixed_judge()(fire(0.10, nil))
+        expect(weak.action).to.equal("harvest")
+        expect(weak.meta.label).to.equal("weak_v2")
+        expect(weak.meta.require).to.equal(nil)
+        -- ... and on a fire whose second view would have failed the
+        -- mid band's floor.
+        local weak_again = mixed_judge()(fire(0.10, 0.01))
+        expect(weak_again.action).to.equal("harvest")
+        expect(weak_again.meta.require).to.equal(nil)
+    end)
+
+    it("still breaks above the top band regardless of the requirement", function()
+        reset()
+        local d = mixed_judge()(fire(0.999, 0.01))
+        expect(d.action).to.equal("break")
+        expect(d.meta).to.equal(nil)
+    end)
+
+    it("reads only the primary view and the one the band named", function()
+        reset()
+        -- sd_teacher raises on any field read: the judgment completing
+        -- proves the opt-in requirement widened the read by exactly one
+        -- named view and no further.
+        local records = fire(0.70, 0.795)
+        table.insert(records, 1, booby_record("sd_teacher"))
+        local d = mixed_judge()(records)
+        expect(d.action).to.equal("harvest")
+        expect(d.meta.require.value).to.equal(0.795)
+        expect(d.reason:find("sd_teacher") == nil).to.equal(true)
+    end)
+
+    it("rejects a non-table require at construction time", function()
+        reset()
+        local ok, err = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = { { lo = 0.6, hi = 0.85, label = "mid_v2", require = "trickiness" } },
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("require") ~= nil).to.equal(true)
+        expect(pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = { { lo = 0.6, hi = 0.85, require = 7 } },
+        })).to.equal(false)
+    end)
+
+    it("rejects a require without a non-empty string view_id", function()
+        reset()
+        local ok, err = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = { { lo = 0.6, hi = 0.85, require = { field = "value", min = 0.57 } } },
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("view_id") ~= nil).to.equal(true)
+        expect(pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                { lo = 0.6, hi = 0.85, require = { view_id = "", field = "value", min = 0.5 } },
+            },
+        })).to.equal(false)
+        expect(pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                { lo = 0.6, hi = 0.85, require = { view_id = 7, field = "value", min = 0.5 } },
+            },
+        })).to.equal(false)
+    end)
+
+    it("rejects a require without a non-empty string field", function()
+        reset()
+        local ok, err = pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = { { lo = 0.6, hi = 0.85, require = { view_id = "trickiness", min = 0.57 } } },
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("field") ~= nil).to.equal(true)
+        expect(pcall(am.judgment.staged, {
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                {
+                    lo = 0.6,
+                    hi = 0.85,
+                    require = { view_id = "trickiness", field = "", min = 0.5 },
+                },
+            },
+        })).to.equal(false)
+    end)
+
+    it("rejects a non-finite or non-numeric require min", function()
+        reset()
+        local function with_min(min)
+            return pcall(am.judgment.staged, {
+                view_id = "level",
+                field = "ci_lower",
+                bands = {
+                    {
+                        lo = 0.6,
+                        hi = 0.85,
+                        require = { view_id = "trickiness", field = "value", min = min },
+                    },
+                },
+            })
+        end
+        local ok, err = with_min("0.57")
+        expect(ok).to.equal(false)
+        expect(err:find("min") ~= nil).to.equal(true)
+        expect(with_min(nil)).to.equal(false)
+        expect(with_min(math.huge)).to.equal(false)
+        expect(with_min(-math.huge)).to.equal(false)
+        expect(with_min(0 / 0)).to.equal(false)
+    end)
+
+    it("refuses a require on the single-view band() judgment", function()
+        reset()
+        local ok, err = pcall(am.judgment.band, {
+            view_id = "level",
+            field = "ci_lower",
+            lo = 0.60,
+            hi = 0.85,
+            label = "mid_v2",
+            require = { view_id = "trickiness", field = "value", min = 0.57 },
+        })
+        expect(ok).to.equal(false)
+        -- Loud rather than ignored, and the message points at the path
+        -- that can honour it.
+        expect(err:find("require") ~= nil).to.equal(true)
+        expect(err:find("staged") ~= nil).to.equal(true)
+    end)
+
+    it("leaves a require-free staged judgment byte-identical in behaviour", function()
+        reset()
+        local plain = am.judgment.staged({
+            view_id = "level",
+            field = "ci_lower",
+            bands = {
+                { lo = 0.03, hi = 0.20, label = "weak_v2" },
+                { lo = 0.60, hi = 0.85, label = "mid_v2" },
+                { lo = 0.851, hi = 0.98, label = "strong_v2" },
+            },
+        })
+        -- The second view is present and would have failed any floor;
+        -- with no require declared it is not read and cannot matter.
+        local d = plain(fire(0.70, 0.01))
+        expect(d.action).to.equal("harvest")
+        expect(d.meta.label).to.equal("mid_v2")
+        expect(d.meta.require).to.equal(nil)
+        expect(d.reason:find("required") == nil).to.equal(true)
+    end)
+end)
+
 describe("anymetric.judgment.never_break", function()
     it("continues even on records a threshold would break on", function()
         reset()

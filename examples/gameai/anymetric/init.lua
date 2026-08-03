@@ -14,7 +14,13 @@
 ---   meta = <table|nil> }`. Judgments read the records of the views they
 ---   were told to read and nothing else, so a strength gate never
 ---   accidentally couples itself to a personality metric that happens to
----   be observed alongside it. `meta` is an optional caller-defined table
+---   be observed alongside it. The one exception is opt-in and written
+---   down band by band: a `staged` band may carry an explicit
+---   `require = { view_id, field, min }`, and then that band — only that
+---   band, only that named view, only that named field — is allowed to
+---   read a second view before it harvests. A coupling the caller spelled
+---   out is not the accidental one this rule exists to prevent; a view no
+---   band named still goes unread. `meta` is an optional caller-defined table
 ---   that band / staged judgments use to carry the hit `label` plus the
 ---   observing step and raw values; simpler judgments (threshold,
 ---   never_break) leave it absent so downstream callers see the exact
@@ -530,7 +536,45 @@ local function read_numeric_field(records, view_id, field)
     return target, actual, nil
 end
 
-local function normalise_band(band, where)
+--- Validate a band's optional `require` clause. Returns
+--- `(require_table|nil, error_message|nil)` rather than raising, so the
+--- caller keeps one error level for every band problem.
+---
+--- `allow_require` is false on the single-view paths. Refusing the
+--- clause there is deliberate: a judgment that reads one view cannot
+--- honour a second-view condition, and silently dropping it would read
+--- as "the requirement is in force" to anyone looking at the caller.
+local function check_require(raw, allow_require)
+    if raw == nil then
+        return nil, nil
+    end
+    if not allow_require then
+        return nil,
+            "band.require is not supported here; this judgment reads a single view, so a "
+                .. "second-view condition would be silently ignored — use judgment.staged with a "
+                .. "require band instead"
+    end
+    if type(raw) ~= "table" then
+        return nil, "band.require must be a table { view_id, field, min }, got " .. type(raw)
+    end
+    local view_id, field, min = raw.view_id, raw.field, raw.min
+    if type(view_id) ~= "string" or view_id == "" then
+        return nil, "band.require.view_id must be a non-empty string"
+    end
+    if type(field) ~= "string" or field == "" then
+        return nil,
+            "band.require.field must be a non-empty string (require view '" .. view_id .. "')"
+    end
+    -- Infinities and NaN are refused alongside non-numbers: a NaN floor
+    -- compares false against every measurement, which reads as "the band
+    -- never qualifies" instead of as the wiring bug it is.
+    if type(min) ~= "number" or min ~= min or min == math.huge or min == -math.huge then
+        return nil, "band.require.min must be a finite number, got " .. tostring(min)
+    end
+    return { view_id = view_id, field = field, min = min }, nil
+end
+
+local function normalise_band(band, where, allow_require)
     if type(band) ~= "table" then
         error(where .. ": band must be a table, got " .. type(band), 3)
     end
@@ -547,12 +591,38 @@ local function normalise_band(band, where)
     if label ~= nil and type(label) ~= "string" then
         error(where .. ": band.label must be a string or nil, got " .. type(label), 3)
     end
-    return { lo = lo, hi = hi, label = label }
+    local required, require_error = check_require(band.require, allow_require)
+    if require_error ~= nil then
+        error(where .. ": " .. require_error, 3)
+    end
+    return { lo = lo, hi = hi, label = label, require = required }
+end
+
+--- Name a band hit for a `reason` string, before it is known whether the
+--- hit actually harvests.
+local function band_hit_prefix(view_id, field, actual, band)
+    if band.label ~= nil then
+        return string.format("band hit (%s) at %s.%s = %.4f", band.label, view_id, field, actual)
+    end
+    return string.format(
+        "band hit [%.4f, %.4f] at %s.%s = %.4f",
+        band.lo,
+        band.hi,
+        view_id,
+        field,
+        actual
+    )
 end
 
 --- Build a harvest decision for a hit band, carrying the label plus the
 --- observing step and raw values in `meta`.
-local function harvest_hit(view_id, field, record, actual, band)
+---
+--- `require_hit` is the `{view_id, field, value, min}` of a satisfied
+--- `require` clause, or nil for a band that carried none. When present
+--- it is copied into `meta.require` as `{view_id, field, value}`, so the
+--- provenance of the second condition survives into the marker record
+--- and from there into a harvest manifest.
+local function harvest_hit(view_id, field, record, actual, band, require_hit)
     local reason
     if band.label ~= nil then
         reason = string.format(
@@ -568,11 +638,27 @@ local function harvest_hit(view_id, field, record, actual, band)
         reason =
             string.format("%s.%s = %.4f in [%.4f, %.4f]", view_id, field, actual, band.lo, band.hi)
     end
-    return decision("harvest", reason, {
+    local meta = {
         label = band.label,
         step = record.step,
         values = record.values,
-    })
+    }
+    if require_hit ~= nil then
+        reason = string.format(
+            "%s; required %s.%s = %.4f >= min=%.4f",
+            reason,
+            require_hit.view_id,
+            require_hit.field,
+            require_hit.value,
+            require_hit.min
+        )
+        meta.require = {
+            view_id = require_hit.view_id,
+            field = require_hit.field,
+            value = require_hit.value,
+        }
+    end
+    return decision("harvest", reason, meta)
 end
 
 --- A judgment that harvests once one numeric field of one view falls
@@ -589,6 +675,11 @@ end
 --- A missing record, an ErrorRecord, or a non-numeric field all resolve
 --- to `continue` and name the reason.
 ---
+--- A `require` clause (the second-view condition `staged` bands accept)
+--- is refused here rather than ignored: this judgment reads one view, so
+--- honouring it is impossible and dropping it silently would leave a
+--- caller believing a condition is in force that nothing checks.
+---
 ---@param opts table `{ view_id, field, lo, hi, label? }`
 ---@return function judgment `fn(records) -> Decision`
 function M.judgment.band(opts)
@@ -603,8 +694,9 @@ function M.judgment.band(opts)
         error("anymetric.judgment.band: field must be a non-empty string", 2)
     end
     local band = normalise_band(
-        { lo = opts.lo, hi = opts.hi, label = opts.label },
-        "anymetric.judgment.band"
+        { lo = opts.lo, hi = opts.hi, label = opts.label, require = opts.require },
+        "anymetric.judgment.band",
+        false
     )
 
     return function(records)
@@ -662,7 +754,25 @@ end
 --- A one-band staged judgment is allowed and is equivalent to a single
 --- `band(...)`; an empty bands list is a wiring bug and raises.
 ---
----@param opts table `{ view_id, field, bands = { { lo, hi, label? }, ... } }`
+--- ## Per-band `require` (opt-in second view)
+---
+--- A band may carry `require = { view_id, field, min }`. It is the one
+--- documented exception to "a judgment reads the view it was bound to
+--- and nothing else": when that band is hit, and only then, the judgment
+--- also reads `require.view_id`'s record and harvests only if its
+--- numeric `field` is `>= min`. Below the floor it continues and names
+--- both numbers. A second view that produced no record, produced an
+--- ErrorRecord, or holds no numeric field of that name also continues —
+--- a measurement gap is not evidence that the requirement was met, and
+--- treating it as a pass is how a floor quietly stops being a floor.
+---
+--- The clause is per band: bands without it behave exactly as before,
+--- and a view no band named is never read. On a satisfied requirement
+--- the harvest carries `meta.require = { view_id, field, value }` so the
+--- second condition is visible in the marker record rather than only in
+--- the caller's configuration.
+---
+---@param opts table `{ view_id, field, bands = { { lo, hi, label?, require? }, ... } }`
 ---@return function judgment `fn(records) -> Decision`
 function M.judgment.staged(opts)
     if type(opts) ~= "table" then
@@ -684,7 +794,8 @@ function M.judgment.staged(opts)
 
     local bands = {}
     for index, raw in ipairs(opts.bands) do
-        bands[index] = normalise_band(raw, "anymetric.judgment.staged: bands[" .. index .. "]")
+        bands[index] =
+            normalise_band(raw, "anymetric.judgment.staged: bands[" .. index .. "]", true)
     end
     for index = 2, #bands do
         local prev, curr = bands[index - 1], bands[index]
@@ -726,7 +837,45 @@ function M.judgment.staged(opts)
         end
         for _, band in ipairs(bands) do
             if actual >= band.lo and actual <= band.hi then
-                return harvest_hit(view_id, field, record, actual, band)
+                local required = band.require
+                if required == nil then
+                    return harvest_hit(view_id, field, record, actual, band)
+                end
+                -- The band named a second view, so this hit — and no
+                -- other band's — reads it.
+                local _, secondary, secondary_miss =
+                    read_numeric_field(records, required.view_id, required.field)
+                if secondary_miss ~= nil then
+                    return decision(
+                        "continue",
+                        string.format(
+                            "%s but the required %s.%s could not be read: %s",
+                            band_hit_prefix(view_id, field, actual, band),
+                            required.view_id,
+                            required.field,
+                            secondary_miss.reason
+                        )
+                    )
+                end
+                if secondary < required.min then
+                    return decision(
+                        "continue",
+                        string.format(
+                            "%s but %s.%s = %.4f below required min=%.4f",
+                            band_hit_prefix(view_id, field, actual, band),
+                            required.view_id,
+                            required.field,
+                            secondary,
+                            required.min
+                        )
+                    )
+                end
+                return harvest_hit(view_id, field, record, actual, band, {
+                    view_id = required.view_id,
+                    field = required.field,
+                    value = secondary,
+                    min = required.min,
+                })
             end
         end
         return decision(

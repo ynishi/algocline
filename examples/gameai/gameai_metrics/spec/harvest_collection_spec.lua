@@ -329,6 +329,72 @@ describe("gameai_metrics.harvest_collection.new", function()
         expect(err:find("bands%[2%]") ~= nil).to.equal(true)
     end)
 
+    it("keeps a band's require clause in the recorded bands", function()
+        local coll = hc.new({
+            path = "/tmp/x.json",
+            bands = {
+                { lo = 0.03, hi = 0.20, label = "weak_v2" },
+                {
+                    lo = 0.60,
+                    hi = 0.85,
+                    label = "mid_v2",
+                    require = { view_id = "trickiness", field = "value", min = 0.57 },
+                },
+            },
+        })
+        local bands = coll:_manifest().bands
+        expect(bands[1].require).to.equal(nil)
+        expect(type(bands[2].require)).to.equal("table")
+        expect(bands[2].require.view_id).to.equal("trickiness")
+        expect(bands[2].require.field).to.equal("value")
+        expect(bands[2].require.min).to.equal(0.57)
+    end)
+
+    it("records only the three require fields, not whatever else the caller attached", function()
+        local coll = hc.new({
+            path = "/tmp/x.json",
+            bands = {
+                {
+                    lo = 0.60,
+                    hi = 0.85,
+                    label = "mid_v2",
+                    require = {
+                        view_id = "trickiness",
+                        field = "value",
+                        min = 0.57,
+                        note = "not part of the contract",
+                    },
+                },
+            },
+        })
+        local required = coll:_manifest().bands[1].require
+        expect(required.note).to.equal(nil)
+        expect(required.min).to.equal(0.57)
+    end)
+
+    it("refuses a non-table require", function()
+        local ok, err = pcall(hc.new, {
+            path = "/tmp/x.json",
+            bands = { { lo = 0.60, hi = 0.85, label = "mid_v2", require = "trickiness" } },
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("require") ~= nil).to.equal(true)
+    end)
+
+    it("leaves the recorded band shape unchanged when no band requires anything", function()
+        local coll = hc.new({
+            path = "/tmp/x.json",
+            bands = { { lo = 0.55, hi = 0.85, label = "mid" } },
+        })
+        local band = coll:_manifest().bands[1]
+        local keys = 0
+        for _ in pairs(band) do
+            keys = keys + 1
+        end
+        expect(keys).to.equal(3)
+        expect(band.require).to.equal(nil)
+    end)
+
     it("copies meta so a later caller mutation does not bleed into the manifest", function()
         local meta = { style = "guardian", steps = 300 }
         local coll = hc.new({
@@ -614,6 +680,66 @@ describe("gameai_metrics.harvest_collection:save", function()
         expect(entry.level_ci_lower).to.equal(0.825)
         expect(entry.sd_teacher).to.equal(0.089)
         expect(entry.trickiness_norm).to.equal(0.417)
+    end)
+
+    it("round-trips a band require clause through the written JSON", function()
+        -- The selection rule a harvest ran under has to survive into the
+        -- file: a manifest that records `mid_v2` as a bare interval
+        -- cannot tell a reader that the entry also had to clear a floor
+        -- on a second view.
+        local path = tmp_path()
+        local coll = hc.new({
+            path = path,
+            meta = { style = "guardian" },
+            bands = {
+                { lo = 0.03, hi = 0.20, label = "weak_v2" },
+                {
+                    lo = 0.60,
+                    hi = 0.85,
+                    label = "mid_v2",
+                    require = { view_id = "trickiness", field = "value", min = 0.57 },
+                },
+            },
+        })
+        coll:append(
+            harvest_decision("mid_v2", 180, {}),
+            { step = 180, ckpt_path = "/nn/ckpt-000180.safetensors" },
+            {
+                level_record(180, 0.93, 0.825),
+                trickiness_record(180, 0.795),
+            }
+        )
+        coll:save()
+        local f = io.open(path, "r")
+        local body = f:read("a")
+        f:close()
+        os.remove(path)
+        local parsed = json_decode(body)
+        expect(#parsed.bands).to.equal(2)
+        expect(parsed.bands[1].require).to.equal(nil)
+        expect(parsed.bands[2].require.view_id).to.equal("trickiness")
+        expect(parsed.bands[2].require.field).to.equal("value")
+        expect(parsed.bands[2].require.min).to.equal(0.57)
+        expect(parsed.entries[1].label).to.equal("mid_v2")
+        expect(parsed.entries[1].trickiness_norm).to.equal(0.795)
+    end)
+
+    it("writes the same band shape as before when no band requires anything", function()
+        local path = tmp_path()
+        local coll = hc.new({
+            path = path,
+            bands = { { lo = 0.55, hi = 0.85, label = "mid" } },
+        })
+        coll:save()
+        local f = io.open(path, "r")
+        local body = f:read("a")
+        f:close()
+        os.remove(path)
+        local band = json_decode(body).bands[1]
+        expect(band.lo).to.equal(0.55)
+        expect(band.hi).to.equal(0.85)
+        expect(band.label).to.equal("mid")
+        expect(band.require).to.equal(nil)
     end)
 
     it("can be called repeatedly and reflects the current entries every time", function()

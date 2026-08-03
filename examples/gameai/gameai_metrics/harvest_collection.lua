@@ -96,11 +96,20 @@ M.meta = {
 local SCHEMA_VERSION = 1
 local POLICIES = { first_writer_wins = true, last_writer_wins = true }
 
---- Copy an array of band tables, keeping only the three fields the
---- manifest records. The staged judgment already validated shape /
---- disjointness before it was handed to the caller, so this helper only
---- refuses obvious wiring mistakes (non-array / non-table entry /
---- non-number lo|hi / non-string label).
+--- Copy an array of band tables, keeping the fields the manifest
+--- records. The staged judgment already validated shape / disjointness
+--- before it was handed to the caller, so this helper only refuses
+--- obvious wiring mistakes (non-array / non-table entry / non-number
+--- lo|hi / non-string label / non-table require).
+---
+--- A band's optional `require = {view_id, field, min}` is copied across
+--- field by field. Without it the manifest would record a band as a bare
+--- `{lo, hi, label}` interval and the second condition that actually
+--- decided the harvest would be missing from the provenance — a reader
+--- of the manifest could not tell a plain band hit from one that also
+--- had to clear a floor on another view. The three fields are named
+--- rather than shallow-copied so a caller's stray key cannot ride into
+--- the manifest as if it were part of the contract.
 local function normalise_bands(bands)
     if type(bands) ~= "table" then
         error(
@@ -143,7 +152,23 @@ local function normalise_bands(bands)
                 3
             )
         end
+        if band.require ~= nil and type(band.require) ~= "table" then
+            error(
+                "harvest_collection.new: bands["
+                    .. index
+                    .. "].require must be a table or nil, got "
+                    .. type(band.require),
+                3
+            )
+        end
         out[index] = { lo = band.lo, hi = band.hi, label = band.label }
+        if band.require ~= nil then
+            out[index].require = {
+                view_id = band.require.view_id,
+                field = band.require.field,
+                min = band.require.min,
+            }
+        end
     end
     return out
 end
@@ -416,9 +441,11 @@ end
 --- - `meta`   — table of caller-supplied run metadata (optional).
 ---   Every key is copied verbatim into the top level of the manifest,
 ---   e.g. `{run_id, style, steps, ckpt_every, gate_games, seed}`.
---- - `bands`  — array of `{lo, hi, label?}` band tables (required).
----   Recorded into the manifest as-is; the staged judgment is the one
----   that enforces disjointness at read time.
+--- - `bands`  — array of `{lo, hi, label?, require?}` band tables
+---   (required). Recorded into the manifest as-is, `require` included,
+---   so the selection rule a harvest actually ran under stays readable
+---   off the manifest alone; the staged judgment is the one that
+---   enforces disjointness and validates `require` at read time.
 --- - `policy` — string, `"first_writer_wins"` (default) or
 ---   `"last_writer_wins"`. `first_writer_wins` matches the
 ---   "pick the earliest fire that lands in the band" observation

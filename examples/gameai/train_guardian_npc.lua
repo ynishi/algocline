@@ -79,13 +79,28 @@
 --                  and are merged in the hook. Refused for
 --                  `style = "all"` because one manifest cannot cover
 --                  several styles at once.
---   stage_bands  -- array of `{lo, hi, label}` bands the staged
---                  judgment reads off `level.ci_lower`. The default
---                  is the three-band schedule the design settled on
---                  (`{lo=0.10, hi=0.30, weak}, {lo=0.55, hi=0.85, mid},
+--   stage_bands  -- array of `{lo, hi, label, require?}` bands the
+--                  staged judgment reads off `level.ci_lower`. The
+--                  default is the three-band schedule the design settled
+--                  on (`{lo=0.10, hi=0.30, weak}, {lo=0.55, hi=0.85, mid},
 --                  {lo=0.85, hi=0.98, strong}`); `strong.hi = 0.98`
 --                  is deliberately under 1.0 so an above-top break is
 --                  physically reachable and terminates the run.
+--                  A band may add `require = {view_id, field, min}` to
+--                  make its harvest conditional on a second view of the
+--                  same fire (e.g. `{view_id = "trickiness", field =
+--                  "value", min = 0.57}`). The `view_id` has to name one
+--                  of the three views this run observes and is checked
+--                  against them before any training budget is spent.
+--   pin_bare_alias       -- when false, the `guardian` style stops
+--                  pinning the bare `guardian_duel_npc` alias to the
+--                  Card this run produced (default true, which is the
+--                  historical behaviour). A harvest run re-points that
+--                  alias at a fresh model, and the bare alias is what
+--                  the style-distance view, the audit default and the
+--                  NPC package fallback all read: a run whose purpose is
+--                  to harvest mid-run checkpoints wants the previous
+--                  teacher left where it is.
 --   stage_alias_prefix   -- prefix the per-band alias is built from
 --                  (default "guardian_duel_npc"); the alias name is
 --                  `<prefix>_<label>` (e.g. "guardian_duel_npc_mid").
@@ -100,9 +115,19 @@
 -- committed its policy is. Only the first of them is allowed to stop a
 -- run, because only its target is a criterion rather than a taste.
 --
+-- A personality axis may still enter a harvest decision, but only as an
+-- explicit per-band `require` and only once the pair (metric, measuring
+-- conditions) has been measured against something that matters: what is
+-- promoted to a criterion is never the metric on its own. The threshold
+-- then has to be derived from readings taken under the conditions the
+-- gate itself reads, because the same metric measured over a different
+-- prompt set is a different quantity and a floor carried across from one
+-- to the other is a floor on nothing.
+--
 -- Aliases: the style-specific alias is always pinned, and the
 -- `guardian` style additionally pins the bare `guardian_duel_npc` alias
--- to the same Card, which is the one the NPC package falls back to.
+-- to the same Card, which is the one the NPC package falls back to
+-- (`ctx.pin_bare_alias = false` leaves the bare alias untouched).
 --
 -- The style is not only the teacher: `guardian_duel.encode` measures its
 -- `D` field against the style's mode-shift threshold, so the corpus, the
@@ -147,6 +172,18 @@ local CHECK_GAMES = math.floor(tonumber(ctx_field("check_games")) or 20)
 --- Alias the NPC package falls back to, kept for the teacher style.
 local BARE_ALIAS = "guardian_duel_npc"
 
+--- Whether the `guardian` style re-points the bare alias at this run's
+--- Card. Defaults to true so an unconfigured run is byte-for-byte the
+--- historical one; `false` is for runs whose product is a mid-run
+--- harvest rather than a new teacher.
+local PIN_BARE_ALIAS = true
+do
+    local raw = ctx_field("pin_bare_alias")
+    if raw ~= nil then
+        PIN_BARE_ALIAS = raw and true or false
+    end
+end
+
 -- ─── Mid-run observation ────────────────────────────────────────────
 --
 -- Every `CKPT_EVERY` steps the trainer writes a checkpoint and hands it
@@ -187,8 +224,7 @@ local STAGE_BANDS = ctx_field("stage_bands")
         { lo = 0.851, hi = 0.98, label = "strong" },
     }
 local STAGE_ALIAS_PREFIX = ctx_field("stage_alias_prefix") or "guardian_duel_npc"
-local COLLECTION_PATH = ctx_field("collection_path")
-    or "workspace/gameai-harvest/collection.json"
+local COLLECTION_PATH = ctx_field("collection_path") or "workspace/gameai-harvest/collection.json"
 
 --- Player policies the win rate is measured against.
 ---
@@ -264,6 +300,12 @@ if ENABLE_STAGES then
     if type(STAGE_BANDS) ~= "table" or #STAGE_BANDS == 0 then
         error("train_guardian_npc: ctx.stage_bands must be a non-empty array of bands")
     end
+    -- The band interiors are not re-validated here: `anymetric` owns the
+    -- shape rules (lo <= hi, disjointness, and the `require` clause's
+    -- own field types) and repeating them would give the same wiring
+    -- mistake two different error messages. What this script does own is
+    -- whether a `require` can be satisfied by *this* run's views, which
+    -- `assert_stage_band_views` checks once the views are defined.
 end
 
 local VOCAB = duel.vocab()
@@ -510,27 +552,30 @@ end
 -- strength gate cannot start reacting to a personality metric that
 -- happens to be observed alongside it.
 
---- Bind the views, the judgments and the log a single run is observed
---- through.
----
---- The prompt set is the branch states `check_states` already collected:
---- boss states reached by playing, which is the element type both
---- distribution metrics read on the boss seat. Writing positions out by
---- hand instead would measure the Card on lines a fight never produces.
----
---- Returns the gate judgment and the staged judgment as separate values
---- so the hook can react to each one independently. Either or both may
---- be `nil` when the corresponding switch is off.
----@param style string Distance basis every view shares
+--- The prompt set both distribution metrics read: the branch states
+--- `check_states` already collected, i.e. boss states reached by
+--- playing. Writing positions out by hand instead would measure the
+--- Card on lines a fight never produces.
 ---@param checks table[] `check_states(style)` output
----@return table views, function|nil gate_judgment, function|nil stage_judgment, table run_log
-local function observation_wiring(style, checks)
+---@return table prompt_set
+local function prompt_set_of(checks)
     local prompt_set = {}
     for _, check in ipairs(checks) do
         prompt_set[#prompt_set + 1] = check.state
     end
+    return prompt_set
+end
 
-    local views = {
+--- The views one run is observed through — the single place their ids
+--- are decided. Anything that needs to know which views exist (the
+--- observer, and the stage-band check below) derives that from this
+--- list rather than repeating the names, so a view renamed here cannot
+--- leave a stale copy behind somewhere else.
+---@param style string Distance basis every view shares
+---@param prompt_set table `prompt_set_of(checks)` output
+---@return table views
+local function build_views(style, prompt_set)
+    return {
         -- Strength: win rate and its Wilson interval from the seat the
         -- Card plays. The seed is fixed for the whole run, so every
         -- fire replays the same openings and the difference between
@@ -561,10 +606,27 @@ local function observation_wiring(style, checks)
             required = { "seat", "style", "prompt_set" },
         }),
     }
+end
 
-    -- Only the strength axis carries a criterion that can be written
-    -- down, so it is the only one wired to a gate. The other two are
-    -- recorded for a reader and never consulted here.
+--- Bind the views, the judgments and the log a single run is observed
+--- through.
+---
+--- Returns the gate judgment and the staged judgment as separate values
+--- so the hook can react to each one independently. Either or both may
+--- be `nil` when the corresponding switch is off.
+---@param style string Distance basis every view shares
+---@param checks table[] `check_states(style)` output
+---@return table views, function|nil gate_judgment, function|nil stage_judgment, table run_log
+local function observation_wiring(style, checks)
+    local views = build_views(style, prompt_set_of(checks))
+
+    -- The strength axis is the only one wired to a *gate*: its target is
+    -- a criterion that can be written down, whereas "far enough from the
+    -- teacher" is a taste. A personality axis can still enter a harvest
+    -- decision through a band's `require` clause, but only as a floor
+    -- the caller derived from measurements taken the way this run
+    -- measures — the pair (metric, measuring conditions), never the
+    -- metric alone.
     local gate_judgment
     if ENABLE_GATE then
         gate_judgment = am.judgment.threshold({
@@ -590,6 +652,129 @@ local function observation_wiring(style, checks)
     end
 
     return views, gate_judgment, stage_judgment, am.run_log.new()
+end
+
+--- Refuse a stage band whose `require` names a view this run never
+--- observes.
+---
+--- The judgment cannot catch this: a requirement pointed at a view id
+--- that produces no record is, by the contract, a measurement gap, and a
+--- measurement gap continues. A typo in the view name would therefore
+--- read as "the band was never good enough" for the whole run and cost
+--- the entire training budget before anyone noticed. The observed ids
+--- come from `build_views`, so this check follows a view rename instead
+--- of carrying its own copy of the names.
+---@param style string
+---@param checks table[] `check_states(style)` output
+local function assert_stage_band_views(style, checks)
+    local observed, names = {}, {}
+    for _, view in ipairs(build_views(style, prompt_set_of(checks))) do
+        observed[view.view_id] = true
+        names[#names + 1] = view.view_id
+    end
+    for index, band in ipairs(STAGE_BANDS) do
+        local required = type(band) == "table" and band.require or nil
+        if required ~= nil then
+            local label = (type(band) == "table" and type(band.label) == "string") and band.label
+                or ("#" .. index)
+            if type(required) ~= "table" then
+                error(
+                    string.format(
+                        "train_guardian_npc: stage band %s has a require of type %s; expected a "
+                            .. "table {view_id, field, min}",
+                        label,
+                        type(required)
+                    )
+                )
+            end
+            if type(required.view_id) ~= "string" or required.view_id == "" then
+                error(
+                    string.format(
+                        "train_guardian_npc: stage band %s has a require without a view_id string",
+                        label
+                    )
+                )
+            end
+            if not observed[required.view_id] then
+                error(
+                    string.format(
+                        "train_guardian_npc: stage band %s requires view %q which this run does "
+                            .. "not observe (observed: %s)",
+                        label,
+                        required.view_id,
+                        table.concat(names, ", ")
+                    )
+                )
+            end
+        end
+    end
+end
+
+-- Settled before a single training step is paid for, next to the
+-- coverage check above: both answer "is this configuration observable at
+-- all", and both are functions of the ctx and the rules alone.
+if ENABLE_STAGES then
+    assert_stage_band_views(STYLE, check_states(STYLE))
+end
+
+--- The `(view_id, field)` pairs the stage bands make a harvest
+--- conditional on, deduplicated and in band order.
+---@return table targets `{ {view_id, field, min, label}, ... }`
+local function stage_require_targets()
+    local targets, seen = {}, {}
+    for index, band in ipairs(STAGE_BANDS) do
+        local required = type(band) == "table" and band.require or nil
+        if type(required) == "table" and type(required.view_id) == "string" then
+            local field = type(required.field) == "string" and required.field or "value"
+            local key = required.view_id .. "." .. field
+            if not seen[key] then
+                seen[key] = true
+                targets[#targets + 1] = {
+                    view_id = required.view_id,
+                    field = field,
+                    label = (type(band.label) == "string") and band.label or ("#" .. index),
+                }
+            end
+        end
+    end
+    return targets
+end
+
+--- Name every require clause that had nothing to read all run.
+---
+--- A band whose requirement is never measurable continues on every fire,
+--- and continuing is also what a band does while the run is simply not
+--- good enough yet. The two are indistinguishable from the outside, so
+--- the difference is reported rather than left for a reader to infer
+--- from an empty manifest: the view was there and said no, or the view
+--- was never read at all.
+---@param run_log table
+---@return table gaps array of message strings (empty when all were read)
+local function require_coverage_gaps(run_log)
+    local records = run_log:all()
+    local gaps = {}
+    for _, target in ipairs(stage_require_targets()) do
+        local readings = 0
+        for _, record in ipairs(records) do
+            if rawget(record, "view_id") == target.view_id then
+                local values = record.values
+                if type(values) == "table" and type(values[target.field]) == "number" then
+                    readings = readings + 1
+                end
+            end
+        end
+        if readings == 0 then
+            gaps[#gaps + 1] = string.format(
+                "stage band %s requires %s.%s, but no fire produced a numeric reading of it; "
+                    .. "every hit of that band continued on a measurement gap rather than on the "
+                    .. "requirement itself",
+                target.label,
+                target.view_id,
+                target.field
+            )
+        end
+    end
+    return gaps
 end
 
 --- Build the checkpoint observer one style's run fires.
@@ -865,13 +1050,27 @@ local function train_style(style, alias)
     log(string.format("[%s] card %s pinned to alias %q", style, card_id, alias))
 
     -- The NPC package defaults to the bare alias, so the teacher style
-    -- keeps it pointing at its own Card.
+    -- keeps it pointing at its own Card — unless the caller asked for
+    -- the opposite. The style-distance view of *this* run reads the bare
+    -- alias as its teacher, and so do the audit defaults of later runs:
+    -- a run that exists to harvest mid-run checkpoints would otherwise
+    -- move the reference every measurement afterwards is taken against.
     if style == "guardian" and alias ~= BARE_ALIAS then
-        alc.card.alias_set(BARE_ALIAS, card_id, {
-            pkg = "guardian_duel_npc",
-            note = "guardian duel teacher-style boss NPC",
-        })
-        log(string.format("[%s] bare alias %q pinned to the same card", style, BARE_ALIAS))
+        if PIN_BARE_ALIAS then
+            alc.card.alias_set(BARE_ALIAS, card_id, {
+                pkg = "guardian_duel_npc",
+                note = "guardian duel teacher-style boss NPC",
+            })
+            log(string.format("[%s] bare alias %q pinned to the same card", style, BARE_ALIAS))
+        else
+            log(
+                string.format(
+                    "[%s] bare alias %q left untouched (ctx.pin_bare_alias = false)",
+                    style,
+                    BARE_ALIAS
+                )
+            )
+        end
     end
 
     -- Uniform-random baseline over the model vocabulary. A final loss
@@ -955,6 +1154,19 @@ local function train_style(style, alias)
         log(string.format("[%s] observations (%d fires) %s", style, observer.fires, observations))
     end
 
+    -- A require clause that was never measurable is reported at the end
+    -- of the run rather than raised: the training result is already in
+    -- hand and throwing it away would cost more than the missing
+    -- measurement did. It is loud enough that "the bands never fired"
+    -- cannot be read as "the model never qualified" by mistake.
+    local require_gaps = {}
+    if ENABLE_STAGES and observer.fires > 0 then
+        require_gaps = require_coverage_gaps(observer.run_log)
+        for _, gap in ipairs(require_gaps) do
+            log(string.format("[%s] REQUIRE GAP: %s", style, gap))
+        end
+    end
+
     return {
         ok = decide_legal and train_loss < baseline_loss,
         card_id = card_id,
@@ -996,9 +1208,14 @@ local function train_style(style, alias)
         -- run actually baked into Cards, and `collection_path` is the
         -- manifest path the entries were written to (nil when
         -- `enable_stages = false`).
+        -- `stages_require_gaps` is the same list the log carried: every
+        -- band `require` that had nothing to read all run. Empty is the
+        -- healthy answer; nil means the staged path was off.
         stages_enabled = ENABLE_STAGES,
         stages_harvested = observer.stages_harvested,
+        stages_require_gaps = ENABLE_STAGES and require_gaps or nil,
         collection_path = ENABLE_STAGES and COLLECTION_PATH or nil,
+        pin_bare_alias = PIN_BARE_ALIAS,
     }
 end
 

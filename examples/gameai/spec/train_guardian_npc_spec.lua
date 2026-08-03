@@ -664,9 +664,7 @@ describe("train_guardian_npc staged harvest", function()
         expect(out.stages_enabled).to.equal(true)
         expect(#out.stages_harvested).to.equal(1)
         expect(out.stages_harvested[1]).to.equal("weak")
-        expect(out.collection_path).to.equal(
-            "workspace/gameai-harvest/collection.json"
-        )
+        expect(out.collection_path).to.equal("workspace/gameai-harvest/collection.json")
         for _, action in ipairs(HOOK_ACTIONS) do
             expect(action).to.equal("continue")
         end
@@ -819,6 +817,156 @@ describe("train_guardian_npc staged harvest", function()
 
         expect(COLL_NEW_OPTS.path).to.equal("/tmp/spec-collection.json")
         expect(out.collection_path).to.equal("/tmp/spec-collection.json")
+    end)
+end)
+
+describe("train_guardian_npc stage band require", function()
+    --- A one-band schedule whose only band is conditional on the
+    --- trickiness view. `min` is moved per case; the stub trickiness
+    --- metric reports 0.62.
+    local function require_bands(min, view_id)
+        return {
+            {
+                lo = 0.10,
+                hi = 0.30,
+                label = "mid_v2",
+                require = { view_id = view_id or "trickiness", field = "value", min = min },
+            },
+        }
+    end
+
+    it("refuses a require pointed at a view this run does not observe", function()
+        configure()
+        local ok, err = pcall(drive, {
+            enable_stages = true,
+            stage_bands = require_bands(0.57, "counter_resistance"),
+        })
+        expect(ok).to.equal(false)
+        expect(contains(err, "counter_resistance")).to.equal(true)
+        expect(contains(err, "mid_v2")).to.equal(true)
+        -- The message lists what the run does observe, so the fix is
+        -- readable off the error itself.
+        expect(contains(err, "trickiness")).to.equal(true)
+        -- Refused before any training budget is spent.
+        expect(TRAIN_OPTS).to.equal(nil)
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+    end)
+
+    it("accepts a require naming one of the three observed views", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({ enable_stages = true, stage_bands = require_bands(0.57) })
+
+        -- trickiness reports 0.62, which clears the 0.57 floor.
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(1)
+        expect(SAVE_FROM_CKPT_CALLS[1].name).to.equal("guardian_duel_npc_mid_v2")
+        expect(out.stages_harvested[1]).to.equal("mid_v2")
+        -- The requirement rides into the manifest options as well.
+        expect(COLL_NEW_OPTS.bands[1].require.view_id).to.equal("trickiness")
+        expect(COLL_NEW_OPTS.bands[1].require.min).to.equal(0.57)
+        -- The harvest tuple carries the satisfied requirement.
+        expect(COLL_APPEND_CALLS[1].dec.meta.require.value).to.equal(0.62)
+        expect(#out.stages_require_gaps).to.equal(0)
+    end)
+
+    it("harvests nothing while the required view sits below the floor", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({ enable_stages = true, stage_bands = require_bands(0.90) })
+
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_mid_v2")).to.equal(0)
+        expect(#COLL_APPEND_CALLS).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+        expect(out.ckpt_fires).to.equal(PLANNED_FIRES)
+        for _, action in ipairs(HOOK_ACTIONS) do
+            expect(action).to.equal("continue")
+        end
+        -- The view was read on every fire, so this is a refusal rather
+        -- than a measurement gap.
+        expect(#out.stages_require_gaps).to.equal(0)
+    end)
+
+    it("reports a require whose view never produced a numeric reading", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        METRICS.trickiness = function()
+            error("trickiness exploded on purpose", 0)
+        end
+        local out = drive({ enable_stages = true, stage_bands = require_bands(0.57) })
+
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+        -- Without this the run is indistinguishable from one where the
+        -- model simply never qualified.
+        expect(#out.stages_require_gaps).to.equal(1)
+        expect(contains(out.stages_require_gaps[1], "trickiness.value")).to.equal(true)
+        expect(contains(out.stages_require_gaps[1], "mid_v2")).to.equal(true)
+        local logged = false
+        for _, line in ipairs(LOG_LINES) do
+            if contains(line, "REQUIRE GAP") then
+                logged = true
+            end
+        end
+        expect(logged).to.equal(true)
+    end)
+
+    it("reports no gap and no field when the staged path is off", function()
+        configure()
+        local out = drive({})
+        expect(out.stages_require_gaps).to.equal(nil)
+    end)
+
+    it("leaves the default band schedule free of any requirement", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({ enable_stages = true })
+
+        expect(COLL_NEW_OPTS.bands[1].require).to.equal(nil)
+        expect(COLL_NEW_OPTS.bands[2].require).to.equal(nil)
+        expect(COLL_NEW_OPTS.bands[3].require).to.equal(nil)
+        expect(out.stages_harvested[1]).to.equal("weak")
+        expect(#out.stages_require_gaps).to.equal(0)
+    end)
+end)
+
+describe("train_guardian_npc bare alias pin", function()
+    it("pins the bare alias for the guardian style by default", function()
+        configure()
+        local out = drive({})
+        expect(out.pin_bare_alias).to.equal(true)
+        expect(#alias_set_calls_for("guardian_duel_npc")).to.equal(1)
+        expect(alias_set_calls_for("guardian_duel_npc")[1].card_id).to.equal("card-stub-0001")
+    end)
+
+    it("leaves the bare alias alone when pin_bare_alias is false", function()
+        configure()
+        local out = drive({ pin_bare_alias = false })
+
+        expect(out.pin_bare_alias).to.equal(false)
+        expect(#alias_set_calls_for("guardian_duel_npc")).to.equal(0)
+        -- The style-specific alias is still pinned: only the shared
+        -- fallback the teacher lives on is left where it was.
+        expect(#alias_set_calls_for("guardian_duel_npc_guardian")).to.equal(1)
+        expect(out.card_id).to.equal("card-stub-0001")
+        local skipped = false
+        for _, line in ipairs(LOG_LINES) do
+            if contains(line, "left untouched") then
+                skipped = true
+            end
+        end
+        expect(skipped).to.equal(true)
+    end)
+
+    it("still skips the harvest aliases' own pinning rules", function()
+        configure()
+        LEVEL_VALUES.ci_lower = 0.20
+        local out = drive({ enable_stages = true, pin_bare_alias = false })
+
+        -- Per-band aliases are unaffected by the bare-alias switch.
+        expect(#alias_set_calls_for("guardian_duel_npc_weak")).to.equal(1)
+        expect(#alias_set_calls_for("guardian_duel_npc")).to.equal(0)
+        expect(out.stages_harvested[1]).to.equal("weak")
     end)
 end)
 

@@ -68,6 +68,7 @@
 ---     seed = 20260731,
 ---     style = "guardian",  -- required, one of guardian_duel.STYLES
 ---     temperature = 1.0,   -- default
+---     per_game = false,    -- default; true adds a `games` array per cell
 --- })
 ---
 --- local report = fight:run()
@@ -112,7 +113,9 @@
 ---   3-boss run loads each player Card 3 times). Cells are independent
 ---   measurements, so this costs load time and nothing else.
 --- - A cell is `level`'s `per_opponent` entry verbatim. A field added
----   there shows up here without a change to this file.
+---   there shows up here without a change to this file. That is how
+---   `opts.per_game = true` puts a `games` array (one record per fight
+---   of the cell) inside every cell: this runner only forwards the flag.
 ---
 --- `save()` writes the report as JSON via `alc.json_encode`, after
 --- `gameai_metrics._fs.ensure_parent_dir(path)`, so the first write into
@@ -242,6 +245,29 @@ local function decode_temperature(raw)
                 "fight_matrix: opts.temperature must be a finite positive number "
                     .. "(a fight has no greedy mode; omit the key for the default %s), got %s",
                 tostring(DEFAULT_TEMPERATURE),
+                tostring(raw)
+            ),
+            3
+        )
+    end
+    return raw
+end
+
+--- Decode the per-game record flag.
+---
+--- Forwarded to `level` as-is; the records themselves ride into every
+--- cell through the verbatim `per_opponent` transcription. Refused here
+--- when it is not a boolean so the message names the layer the caller
+--- called, and because `per_game = "false"` is truthy in Lua — reading
+--- it for truthiness would turn a typo into 200 records per cell.
+local function decode_per_game(raw)
+    if raw == nil then
+        return false
+    end
+    if type(raw) ~= "boolean" then
+        error(
+            string.format(
+                "fight_matrix: opts.per_game must be true, false or nil, got %s",
                 tostring(raw)
             ),
             3
@@ -512,6 +538,7 @@ function Fight:run()
             style = self._style,
             opponents = self._players,
             temperature = self._temperature,
+            per_game = self._per_game,
         })
         matrix[entry.alias] = row_from_level(result, self._players, entry.alias)
     end
@@ -530,6 +557,10 @@ function Fight:run()
         seed = self._seed,
         style = self._style,
         temperature = self._temperature,
+        -- Recorded so a saved report is self-describing: a cell without
+        -- `games` could otherwise mean either "the flag was off" or "a
+        -- field went missing", and the JSON alone could not say which.
+        per_game = self._per_game,
         bosses = bosses,
         players = players,
     }
@@ -611,6 +642,11 @@ end
 ---   player view is built under: one fight, one board.
 --- - `temperature` — positive finite number, default `1.0`. There is no
 ---   greedy mode; see the header for why.
+--- - `per_game` — boolean, default `false`. Forwarded to `level`, which
+---   then puts a `games` array (one record per fight, in played order)
+---   inside every cell. Off by default: the flag multiplies the report
+---   size by the cell count and a caller reading only rates has no use
+---   for it.
 ---
 ---@param opts table
 ---@return table fight
@@ -631,6 +667,7 @@ function M.new(opts)
     local n_games = decode_int(opts.n_games, DEFAULT_N_GAMES, "n_games", true)
     local seed = decode_int(opts.seed, DEFAULT_SEED, "seed", false)
     local temperature = decode_temperature(opts.temperature)
+    local per_game = decode_per_game(opts.per_game)
 
     local bosses
     if opts.collection_path ~= nil then
@@ -646,6 +683,7 @@ function M.new(opts)
         _n_games = n_games,
         _seed = seed,
         _temperature = temperature,
+        _per_game = per_game,
         _collection_path = opts.collection_path,
         _report = nil,
     }, Fight)

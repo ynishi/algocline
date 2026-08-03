@@ -89,17 +89,20 @@ M.level = require("gameai_metrics.level")
 
 --- Seat options every metric accepts, lifted out of a registry ctx.
 ---
---- `opponent_style` and `temperature` are `level`-only opts, but they are
---- lifted here rather than at the `level` registration so the ctx keys
---- stay in one place. A metric that does not read them ignores a `nil`,
---- whereas dropping them would turn a ctx that names one into a loud
---- error from `level` about an opt the caller did pass.
+--- `opponent_style`, `temperature` and `per_game` are `level`-only opts.
+--- Lifting them at the `level` registration instead would keep this
+--- helper to the two seat keys its name promises; they are lifted here
+--- anyway so the ctx keys stay in one place. A metric that does not read
+--- them ignores a `nil`, whereas dropping them would turn a ctx that
+--- names one into a loud error from `level` about an opt the caller did
+--- pass.
 local function seat_opts(ctx)
     return {
         seat = ctx.seat,
         style = ctx.style,
         opponent_style = ctx.opponent_style,
         temperature = ctx.temperature,
+        per_game = ctx.per_game,
     }
 end
 

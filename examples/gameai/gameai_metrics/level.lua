@@ -47,6 +47,10 @@
 ---     both sides read the same board.
 ---   - `temperature` — positive finite number, or `nil` (the default) for
 ---     greedy decoding. See Temperature below.
+---   - `per_game` — boolean, default `false`. When true, every
+---     `per_opponent` entry also carries the raw per-game record the
+---     means below are computed from (see Output). Off by default so an
+---     omitted opt reproduces the previous output byte for byte.
 ---
 --- ## Seats
 ---
@@ -118,10 +122,25 @@
 ---         random = {
 ---             win_rate = 0.42, ci_lower = 0.30, ci_upper = 0.55, n_games = 50,
 ---             game_length_mean = 6.4, final_hp_margin_mean = 3.1,
+---             -- only with opts.per_game = true:
+---             games = {
+---                 { outcome = 1.0, game_length = 8, final_hp_margin = 12 },
+---                 ...  -- one record per fight, in played order
+---             },
 ---         },
 ---     },
 --- }
 --- ```
+---
+--- `per_opponent[name].games` is present only under
+--- `opts.per_game = true`. It holds `n_games` records in played order —
+--- `outcome` is the same `1.0` / `0.5` / `0.0` score the win total sums,
+--- `game_length` and `final_hp_margin` are the same integers the two
+--- means average — so a consumer can recompute every mean above from the
+--- records exactly, and can read a distribution where the means only
+--- report a centre. The pool level carries no `games`: a pooled
+--- distribution is the concatenation of the per-opponent ones, and
+--- storing it twice would let the two drift.
 ---
 --- `win_rate` is the pooled rate (`wins / n_games`); since every opponent
 --- plays the same `n_games`, that is also the mean of the per-opponent
@@ -333,6 +352,24 @@ local function decode_temperature(raw)
                 "level: opts.temperature must be a finite positive number, got %s",
                 tostring(raw)
             )
+        )
+    end
+    return raw
+end
+
+--- Check a requested `per_game` flag.
+---
+--- `nil` means off, so an omitted opt keeps the output it had before the
+--- flag existed. Anything that is not a boolean is refused rather than
+--- read for truthiness: `per_game = "false"` is true in Lua, and a
+--- caller who wrote that meant the opposite of what the run would do.
+local function decode_per_game(raw)
+    if raw == nil then
+        return false
+    end
+    if type(raw) ~= "boolean" then
+        error(
+            string.format("level: opts.per_game must be true, false or nil, got %s", tostring(raw))
         )
     end
     return raw
@@ -666,15 +703,30 @@ local function game_length(state)
     return state.turn - 1
 end
 
+--- The record one finished fight contributes, kept only when
+--- `cfg.per_game` asked for it.
+---
+--- The three values are the very ones the running totals below add, read
+--- once and used twice, so a caller recomputing a mean from the records
+--- sums the same numbers in the same order.
+local function record_game(records, index, result, length, margin)
+    if records == nil then
+        return
+    end
+    records[index] = { outcome = result, game_length = length, final_hp_margin = margin }
+end
+
 --- Fights where the Card holds the player seat.
 ---
 --- Returns the win total plus the two per-fight aggregates, all summed
---- over `games` (the caller divides, so a pooled mean stays exact).
+--- over `games` (the caller divides, so a pooled mean stays exact), and
+--- — under `cfg.per_game` — the per-fight records those sums came from.
 local function play_player_seat(handle, spec, games, base_seed, cfg)
     local boss, view_style =
         boss_from(spec, base_seed, cfg.opponent_style, cfg.temperature, cfg.draws)
     local wins = 0.0
     local turns, margin = 0.0, 0.0
+    local records = cfg.per_game and {} or nil
     for g = 1, games do
         local state = duel.new_game(base_seed + g)
         while not duel.is_over(state) do
@@ -683,11 +735,15 @@ local function play_player_seat(handle, spec, games, base_seed, cfg)
             local player_action = decide_player(handle, view, cfg.temperature, cfg.draws)
             state = duel.apply(state, player_action, boss_action)
         end
-        wins = wins + outcome(duel.winner(state), "player")
-        turns = turns + game_length(state)
-        margin = margin + (state.boss.hp - state.player.hp)
+        local result = outcome(duel.winner(state), "player")
+        local length = game_length(state)
+        local hp_margin = state.boss.hp - state.player.hp
+        wins = wins + result
+        turns = turns + length
+        margin = margin + hp_margin
+        record_game(records, g, result, length, hp_margin)
     end
-    return wins, turns, margin
+    return wins, turns, margin, records
 end
 
 --- Fights where the Card holds the boss seat.
@@ -695,6 +751,7 @@ local function play_boss_seat(handle, spec, games, base_seed, style, cfg)
     local player = player_from(spec, base_seed, style, cfg.temperature, cfg.draws)
     local wins = 0.0
     local turns, margin = 0.0, 0.0
+    local records = cfg.per_game and {} or nil
     for g = 1, games do
         local state = duel.new_game(base_seed + g)
         while not duel.is_over(state) do
@@ -702,11 +759,15 @@ local function play_boss_seat(handle, spec, games, base_seed, style, cfg)
             local player_action = player(state, boss_action)
             state = duel.apply(state, player_action, boss_action)
         end
-        wins = wins + outcome(duel.winner(state), "boss")
-        turns = turns + game_length(state)
-        margin = margin + (state.boss.hp - state.player.hp)
+        local result = outcome(duel.winner(state), "boss")
+        local length = game_length(state)
+        local hp_margin = state.boss.hp - state.player.hp
+        wins = wins + result
+        turns = turns + length
+        margin = margin + hp_margin
+        record_game(records, g, result, length, hp_margin)
     end
-    return wins, turns, margin
+    return wins, turns, margin, records
 end
 
 M = function(card, opponent, n_games, seed, opts)
@@ -733,6 +794,7 @@ M = function(card, opponent, n_games, seed, opts)
     local cfg = {
         opponent_style = opponent_style,
         temperature = temperature,
+        per_game = decode_per_game(opts.per_game),
         draws = new_draws(base_seed),
     }
 
@@ -743,15 +805,17 @@ M = function(card, opponent, n_games, seed, opts)
     local total_turns, total_margin = 0.0, 0.0
     local win_rate_min
     for _, entry in ipairs(pool) do
-        local wins, turns, margin
+        local wins, turns, margin, records
         if seat == "boss" then
-            wins, turns, margin = play_boss_seat(handle, entry.spec, games, base_seed, style, cfg)
+            wins, turns, margin, records =
+                play_boss_seat(handle, entry.spec, games, base_seed, style, cfg)
         else
-            wins, turns, margin = play_player_seat(handle, entry.spec, games, base_seed, cfg)
+            wins, turns, margin, records =
+                play_player_seat(handle, entry.spec, games, base_seed, cfg)
         end
         local rate = wins / games
         local lo, hi = wilson_ci(wins, games)
-        per_opponent[entry.name] = {
+        local row = {
             win_rate = rate,
             ci_lower = lo,
             ci_upper = hi,
@@ -759,6 +823,13 @@ M = function(card, opponent, n_games, seed, opts)
             game_length_mean = turns / games,
             final_hp_margin_mean = margin / games,
         }
+        -- Assigned rather than named in the constructor so the key stays
+        -- absent (not `nil`-valued) on the default path: an encoder that
+        -- distinguishes "no key" from "null" must see the pre-flag shape.
+        if records ~= nil then
+            row.games = records
+        end
+        per_opponent[entry.name] = row
         total_wins = total_wins + wins
         total_games = total_games + games
         total_turns = total_turns + turns

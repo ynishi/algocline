@@ -275,9 +275,14 @@ end
 
 --- One canned cell. Every field `level.per_opponent` carries is present
 --- so the runner's verbatim transcription is observable field by field.
-local function make_cell(boss_alias, player, n_games)
+---
+--- `per_game` mirrors what the real `level` does with the flag: it adds
+--- a `games` array to the cell and changes nothing else. Two records are
+--- enough — the runner never reads inside them, so the assertion this
+--- fake supports is "the array rode along", not its length.
+local function make_cell(boss_alias, player, n_games, per_game)
     local win_rate = CELL_WIN_RATE[cell_key(boss_alias, player)] or 0.5
-    return {
+    local cell = {
         win_rate = win_rate,
         ci_lower = win_rate - 0.05,
         ci_upper = win_rate + 0.05,
@@ -285,6 +290,13 @@ local function make_cell(boss_alias, player, n_games)
         game_length_mean = 6.0 + win_rate,
         final_hp_margin_mean = 10.0 * win_rate - 5.0,
     }
+    if per_game then
+        cell.games = {
+            { outcome = 1.0, game_length = 7, final_hp_margin = 3 },
+            { outcome = 0.0, game_length = 9, final_hp_margin = -2 },
+        }
+    end
+    return cell
 end
 
 local function fake_level(card, opponent, n_games, seed, opts)
@@ -301,7 +313,7 @@ local function fake_level(card, opponent, n_games, seed, opts)
     local wins, total = 0.0, 0
     for _, player in ipairs(opts.opponents or {}) do
         if player ~= OMIT_PLAYER then
-            local cell = make_cell(boss_alias, player, n_games)
+            local cell = make_cell(boss_alias, player, n_games, opts.per_game)
             per_opponent[player] = cell
             wins = wins + cell.win_rate * n_games
             total = total + n_games
@@ -491,6 +503,24 @@ describe("gameai_metrics.fight_matrix.new — options", function()
         expect(err:find("temperature") ~= nil).to.equal(true)
     end)
 
+    it("refuses a non-boolean per_game", function()
+        reset_all()
+        make_boss("b1")
+        for _, bad in ipairs({ "true", "false", 1, 0 }) do
+            local ok, err = pcall(fight_matrix.new, {
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+                per_game = bad,
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("per_game") ~= nil).to.equal(true)
+            -- The check belongs to this layer, not to level: a caller
+            -- who mistyped the flag named *this* runner.
+            expect(err:find("fight_matrix") ~= nil).to.equal(true)
+        end
+    end)
+
     it("refuses an unbound boss alias", function()
         reset_all()
         make_boss("b1")
@@ -572,6 +602,43 @@ describe("gameai_metrics.fight_matrix:run — matrix shape", function()
         expect(report.matrix.boss_strong.player_sentinel.final_hp_margin_mean).to.equal(
             10.0 * 0.88 - 5.0
         )
+    end)
+
+    it("carries a per_game cell's games array through verbatim", function()
+        reset_all()
+        make_boss("b1")
+        set_win_rate("b1", "p1", 0.42)
+        local report = fight_matrix
+            .new({
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+                n_games = 2,
+                per_game = true,
+            })
+            :run()
+        local cell = report.matrix.b1.p1
+        -- The runner transcribes the cell whole, so a field `level`
+        -- added under the flag needs no code here to arrive.
+        expect(type(cell.games)).to.equal("table")
+        expect(#cell.games).to.equal(2)
+        expect(cell.games[1].outcome).to.equal(1.0)
+        expect(cell.games[2].game_length).to.equal(9)
+        expect(cell.games[2].final_hp_margin).to.equal(-2)
+        expect(cell.win_rate).to.equal(0.42)
+    end)
+
+    it("leaves the cells without a games array by default", function()
+        reset_all()
+        make_boss("b1")
+        local report = fight_matrix
+            .new({
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+            })
+            :run()
+        expect(report.matrix.b1.p1.games).to.equal(nil)
     end)
 
     it("reports meta with the axes in the order they were given", function()
@@ -664,6 +731,34 @@ describe("gameai_metrics.fight_matrix:run — level invocation", function()
         })
         fight:run()
         expect(table.concat(LEVEL_CALLS[1].opts.opponents, ",")).to.equal("p1,p2,p3")
+    end)
+
+    it("forwards opts.per_game to every level call", function()
+        reset_all()
+        make_boss("b1")
+        make_boss("b2")
+        local fight = fight_matrix.new({
+            bosses = { "b1", "b2" },
+            players = { "p1" },
+            style = BASE_STYLE,
+            per_game = true,
+        })
+        fight:run()
+        expect(#LEVEL_CALLS).to.equal(2)
+        expect(LEVEL_CALLS[1].opts.per_game).to.equal(true)
+        expect(LEVEL_CALLS[2].opts.per_game).to.equal(true)
+    end)
+
+    it("forwards per_game = false when the caller names none", function()
+        reset_all()
+        make_boss("b1")
+        local fight = fight_matrix.new({
+            bosses = { "b1" },
+            players = { "p1" },
+            style = BASE_STYLE,
+        })
+        fight:run()
+        expect(LEVEL_CALLS[1].opts.per_game).to.equal(false)
     end)
 
     it("raises when level answers without a cell for a named player", function()

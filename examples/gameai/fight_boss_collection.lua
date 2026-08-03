@@ -21,6 +21,7 @@
 --       seed            = 20260731,
 --       style           = "guardian",
 --       temperature     = 1.0,
+--       per_game        = false,
 --     },
 --   )
 --
@@ -61,6 +62,13 @@
 --   Card-vs-Card fight is one game replayed N times. "Greedy" has no
 --   spelling on this path by design; the runner refuses a non-numeric
 --   or non-positive value, and so does this driver.
+-- - `per_game` (default `false`) — when true every cell of the saved
+--   JSON also carries a `games` array: one `{outcome, game_length,
+--   final_hp_margin}` record per fight of that cell, in played order.
+--   That is the raw material for reading a cell's *distribution* rather
+--   than its means, at the cost of `n_games` records per cell in the
+--   output file. Only a boolean or nil is accepted — a truthiness read
+--   would turn the string `"false"` into the opposite of what it says.
 --
 -- ## Boss perspective
 --
@@ -183,6 +191,27 @@ local function optional_number(field, default)
     return v
 end
 
+--- Decode an optional boolean field, falling back to `default`. A
+--- non-boolean is refused rather than read for truthiness: a JSON ctx
+--- carrying the string `"false"` would otherwise switch the flag *on*,
+--- which is the one misreading a boolean opt can make silently.
+local function optional_boolean(field, default)
+    local v = ctx_field(field)
+    if v == nil then
+        return default
+    end
+    if type(v) ~= "boolean" then
+        error(
+            string.format(
+                "fight_boss_collection: ctx.%s must be a boolean or nil, got %s",
+                field,
+                type(v)
+            )
+        )
+    end
+    return v
+end
+
 --- Decode an optional string field, falling back to `default`.
 local function optional_string(field, default)
     local v = ctx_field(field)
@@ -208,6 +237,7 @@ local N_GAMES = optional_int("n_games", fm.DEFAULT_N_GAMES)
 local SEED = optional_int("seed", fm.DEFAULT_SEED)
 local STYLE = optional_string("style", "guardian")
 local TEMPERATURE = optional_number("temperature", fm.DEFAULT_TEMPERATURE)
+local PER_GAME = optional_boolean("per_game", false)
 
 local function log(msg)
     alc.log("info", "[gameai-fight] " .. msg)
@@ -231,6 +261,7 @@ local fight = fm.new({
     seed = SEED,
     style = STYLE,
     temperature = TEMPERATURE,
+    per_game = PER_GAME,
 })
 
 local report = fight:run()
@@ -240,10 +271,11 @@ local bosses = report.meta.bosses
 local players = report.meta.players
 log(
     string.format(
-        "fight: style=%s n_games=%d temperature=%s bosses=%d players=%d cells=%d -> %s",
+        "fight: style=%s n_games=%d temperature=%s per_game=%s bosses=%d players=%d cells=%d -> %s",
         report.meta.style,
         report.meta.n_games,
         fmt_num(report.meta.temperature),
+        tostring(report.meta.per_game),
         #bosses,
         #players,
         #bosses * #players,

@@ -160,6 +160,37 @@ describe("gameai_metrics registry adapter — level", function()
         expect(LEVEL_CALLS[1].opts.temperature).to.equal(nil)
     end)
 
+    it("carries ctx.per_game through seat_opts into the level opts", function()
+        reset_calls()
+        REGISTERED.level({
+            card = CARD,
+            seat = "boss",
+            style = "guardian",
+            opponents = { "random" },
+            per_game = true,
+            n_games = 2,
+        })
+        expect(#LEVEL_CALLS).to.equal(1)
+        -- Same transport failure mode as `temperature`: a dropped key
+        -- does not raise, it silently answers with the means alone and
+        -- leaves the caller reading an empty distribution.
+        expect(LEVEL_CALLS[1].opts.per_game).to.equal(true)
+    end)
+
+    it("leaves opts.per_game absent when the ctx carries none", function()
+        reset_calls()
+        REGISTERED.level({
+            card = CARD,
+            seat = "boss",
+            style = "guardian",
+            opponents = { "random" },
+        })
+        expect(#LEVEL_CALLS).to.equal(1)
+        -- `level` reads the absence as `false`; the adapter must not
+        -- invent the flag either way on the trip down.
+        expect(LEVEL_CALLS[1].opts.per_game).to.equal(nil)
+    end)
+
     it("carries ctx.opponent_style and ctx.opponent through", function()
         reset_calls()
         REGISTERED.level({

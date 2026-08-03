@@ -857,4 +857,153 @@ describe("gameai_metrics.level", function()
             expect(a.per_opponent.greedy.win_rate).to.equal(a.win_rate)
         end)
     end)
+
+    describe("per-game records", function()
+        --- Sorted key list of a table, so a spec can assert on the exact
+        --- field set rather than on the fields it thought to name.
+        local function fields_of(row)
+            local names = {}
+            for key in pairs(row) do
+                names[#names + 1] = tostring(key)
+            end
+            table.sort(names)
+            return table.concat(names, ",")
+        end
+
+        it("emits one record per fight under per_game = true", function()
+            reset()
+            local h = make_handle("b")
+            local result = level(h, "greedy", 5, 1, { per_game = true })
+            local row = result.per_opponent.greedy
+            expect(type(row.games)).to.equal("table")
+            expect(#row.games).to.equal(5)
+            for _, record in ipairs(row.games) do
+                expect(fields_of(record)).to.equal("final_hp_margin,game_length,outcome")
+                expect(record.outcome == 0.0 or record.outcome == 0.5 or record.outcome == 1.0).to.equal(
+                    true
+                )
+                expect(record.game_length).to.equal(math.floor(record.game_length))
+                expect(record.game_length >= 1).to.equal(true)
+                expect(record.game_length <= duel.TURN_LIMIT).to.equal(true)
+                expect(record.final_hp_margin).to.equal(math.floor(record.final_hp_margin))
+            end
+        end)
+
+        it("reproduces every mean of its cell exactly", function()
+            reset()
+            local h = make_handle("b")
+            local result =
+                level(h, nil, 6, 2, { opponents = { "greedy", "random" }, per_game = true })
+            for _, name in ipairs({ "greedy", "random" }) do
+                local row = result.per_opponent[name]
+                expect(#row.games).to.equal(6)
+                -- Exact equality, not a tolerance: the records are the
+                -- very values the metric summed, added back in the same
+                -- (game index) order, and all three are exact in binary
+                -- (`outcome` is 0 / 0.5 / 1, the other two are small
+                -- integers). Same addends, same order, same rounding —
+                -- so the recomputed mean is bit-identical. Summing the
+                -- records in any other order would only be *close*.
+                local wins, turns, margin = 0.0, 0.0, 0.0
+                for _, record in ipairs(row.games) do
+                    wins = wins + record.outcome
+                    turns = turns + record.game_length
+                    margin = margin + record.final_hp_margin
+                end
+                expect(wins / 6).to.equal(row.win_rate)
+                expect(turns / 6).to.equal(row.game_length_mean)
+                expect(margin / 6).to.equal(row.final_hp_margin_mean)
+            end
+        end)
+
+        it("records the boss seat on the same contract", function()
+            reset()
+            local result = level(make_boss_handle("f"), nil, 3, 1, {
+                seat = "boss",
+                style = "guardian",
+                per_game = true,
+            })
+            local row = result.per_opponent.random
+            expect(#row.games).to.equal(3)
+            local wins = 0.0
+            for _, record in ipairs(row.games) do
+                expect(fields_of(record)).to.equal("final_hp_margin,game_length,outcome")
+                wins = wins + record.outcome
+            end
+            expect(wins / 3).to.equal(row.win_rate)
+        end)
+
+        it("leaves the key absent when per_game is false, nil or omitted", function()
+            reset()
+            local h = make_handle("b")
+            local omitted = level(h, "greedy", 4, 1)
+            local off = level(h, "greedy", 4, 1, { per_game = false })
+            local explicit_nil = level(h, "greedy", 4, 1, { per_game = nil })
+            expect(omitted.per_opponent.greedy.games).to.equal(nil)
+            expect(off.per_opponent.greedy.games).to.equal(nil)
+            expect(explicit_nil.per_opponent.greedy.games).to.equal(nil)
+            -- The key is missing rather than present-and-nil, which is
+            -- what keeps the encoded output identical to the pre-flag
+            -- shape for an encoder that distinguishes the two.
+            expect(fields_of(off.per_opponent.greedy)).to.equal(
+                fields_of(omitted.per_opponent.greedy)
+            )
+        end)
+
+        it("puts no games array on the pooled result", function()
+            reset()
+            local result = level(make_handle("b"), nil, 3, 1, {
+                opponents = { "greedy", "random" },
+                per_game = true,
+            })
+            -- The pooled distribution is the concatenation of the
+            -- per-opponent ones; storing it twice would let them drift.
+            expect(result.games).to.equal(nil)
+            expect(type(result.per_opponent.greedy.games)).to.equal("table")
+            expect(type(result.per_opponent.random.games)).to.equal("table")
+        end)
+
+        it("moves no pre-existing number when the flag is turned on", function()
+            reset()
+            local h = make_handle("b")
+            local pool = { "greedy", "random" }
+            local off = level(h, nil, 4, 1, { opponents = pool })
+            local on = level(h, nil, 4, 1, { opponents = pool, per_game = true })
+            for _, key in ipairs({
+                "win_rate",
+                "ci_lower",
+                "ci_upper",
+                "wins",
+                "n_games",
+                "win_rate_min",
+                "game_length_mean",
+                "final_hp_margin_mean",
+            }) do
+                expect(on[key]).to.equal(off[key])
+            end
+            for _, name in ipairs(pool) do
+                for _, key in ipairs({
+                    "win_rate",
+                    "ci_lower",
+                    "ci_upper",
+                    "n_games",
+                    "game_length_mean",
+                    "final_hp_margin_mean",
+                }) do
+                    expect(on.per_opponent[name][key]).to.equal(off.per_opponent[name][key])
+                end
+            end
+        end)
+
+        it("refuses a non-boolean per_game", function()
+            reset()
+            local h = make_handle("b")
+            for _, bad in ipairs({ "true", "false", 1, 0, {} }) do
+                local ok, err = pcall(level, h, "greedy", 4, 1, { per_game = bad })
+                expect(ok).to.equal(false)
+                expect(err:find("per_game") ~= nil).to.equal(true)
+                expect(err:find("true, false or nil") ~= nil).to.equal(true)
+            end
+        end)
+    end)
 end)

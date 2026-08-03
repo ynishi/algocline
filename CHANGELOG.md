@@ -331,6 +331,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `examples/gameai/gameai_metrics/level.lua`: a new `opts.per_move`
+  (boolean, default off, requires `opts.per_game`) makes every
+  per-game record also carry `moves` — one `{turn, mode, intent,
+  boss_action, player_action, boss_hp, player_hp}` record per turn,
+  in played order. The values are captures of what the fight loop
+  already reads (hp is the post-`apply`, clamped value; `intent`
+  equals `view.intent`), so recording consumes no RNG and moves no
+  decode: the same run with the flag off reproduces its numbers
+  exactly. Together with the damage constants the series
+  reconstructs every delayed modifier (thorns / charge block /
+  weaken / exposure), which is what a counter-attribution analysis
+  needs. `fight_matrix` and the fight / sweep drivers forward the
+  flag (`meta.per_move` records the mode).
+
 - `examples/gameai/gameai_metrics/audit_matrix.lua`: the per-Card
   `level` view now accepts an optional decode `temperature`. Omitted
   means greedy — the exact path every earlier audit took, kept

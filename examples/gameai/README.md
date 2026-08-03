@@ -1017,7 +1017,12 @@ Two follow-up surfaces sit on top of the matrix. `ctx.per_game =
 true` makes every cell also carry its raw per-fight records —
 `{outcome, game_length, final_hp_margin}` in played order, the very
 values the cell means are computed from — so a distribution can be
-read where a mean only reports a centre.
+read where a mean only reports a centre. `ctx.per_move = true`
+(requires `per_game`) goes one level further and puts a full move
+transcript inside every per-fight record; together with the rules'
+damage constants the transcript reconstructs every delayed modifier
+exactly, which is what a per-rule counter-attribution analysis
+consumes.
 `examples/gameai/fight_boss_sweep.lua` runs the whole matrix over a
 temperature grid (`ctx.temperatures`, caller order, one shared
 seed) and writes one JSON of `{temperature, matrix}` points, with

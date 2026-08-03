@@ -1006,4 +1006,243 @@ describe("gameai_metrics.level", function()
             end
         end)
     end)
+
+    describe("per-move records", function()
+        --- Same helper as the per-game block above: the exact field set
+        --- of a record, so a spec asserts on what is there rather than
+        --- on the fields it thought to name.
+        local function fields_of(row)
+            local names = {}
+            for key in pairs(row) do
+                names[#names + 1] = tostring(key)
+            end
+            table.sort(names)
+            return table.concat(names, ",")
+        end
+
+        --- Every per-game record of every opponent of a result, so a
+        --- case can walk the transcripts without re-deriving the path.
+        local function each_game(result, names)
+            local out = {}
+            for _, name in ipairs(names) do
+                for _, record in ipairs(result.per_opponent[name].games) do
+                    out[#out + 1] = record
+                end
+            end
+            return out
+        end
+
+        it("emits one move record per played turn, in the seven-field shape", function()
+            reset()
+            local result = level(make_handle("b"), "greedy", 3, 1, {
+                per_game = true,
+                per_move = true,
+            })
+            local row = result.per_opponent.greedy
+            expect(#row.games).to.equal(3)
+            for _, record in ipairs(row.games) do
+                -- The whole per-game record gains exactly one key.
+                expect(fields_of(record)).to.equal("final_hp_margin,game_length,moves,outcome")
+                -- Bit-identical, not "about the same": `game_length` is
+                -- the turn counter the loop left behind and the
+                -- transcript is one record per iteration of that loop.
+                expect(#record.moves).to.equal(record.game_length)
+                for i, move in ipairs(record.moves) do
+                    expect(fields_of(move)).to.equal(
+                        "boss_action,boss_hp,intent,mode,player_action,player_hp,turn"
+                    )
+                    -- Turn numbers are the state's own, so they run 1, 2,
+                    -- 3 ... and a capture taken after `apply` (which
+                    -- increments the counter) would show up as an
+                    -- off-by-one here.
+                    expect(move.turn).to.equal(i)
+                    expect(type(move.mode)).to.equal("number")
+                    expect(type(move.boss_action)).to.equal("string")
+                    expect(type(move.player_action)).to.equal("string")
+                    expect(move.boss_hp).to.equal(math.floor(move.boss_hp))
+                    expect(move.player_hp).to.equal(math.floor(move.player_hp))
+                    expect(move.boss_hp >= 0).to.equal(true)
+                    expect(move.player_hp >= 0).to.equal(true)
+                end
+            end
+        end)
+
+        it("holds the three intent invariants on both seats", function()
+            reset()
+            -- The player Card pokes on every turn, so the reveal path is
+            -- exercised rather than merely reachable; the boss-seat run
+            -- alongside it reads the same rule from the mirror loop.
+            local poking = level(make_handle("p"), "greedy", 3, 1, {
+                per_game = true,
+                per_move = true,
+            })
+            local boss = level(make_boss_handle("f"), nil, 3, 1, {
+                seat = "boss",
+                style = "guardian",
+                per_game = true,
+                per_move = true,
+            })
+            local records = each_game(poking, { "greedy" })
+            for _, record in ipairs(each_game(boss, { "random" })) do
+                records[#records + 1] = record
+            end
+            local revealed_seen = false
+            for _, record in ipairs(records) do
+                local moves = record.moves
+                -- (1) A fight opens unrevealed: `new_game` sets
+                -- `revealed = false`, so no answer can be on the board.
+                expect(moves[1].intent).to.equal(duel.NO_INTENT)
+                for i = 2, #moves do
+                    -- (2) An answer is on the board exactly when the
+                    -- previous turn bought a look. This is the assertion
+                    -- that fails if the capture moved to the wrong side
+                    -- of `apply` (which sets `revealed` from the player
+                    -- action of the turn it applies).
+                    local bought = moves[i - 1].player_action == "p"
+                    expect(moves[i].intent ~= duel.NO_INTENT).to.equal(bought)
+                    -- (3) When there is an answer it is *this* turn's
+                    -- boss move — a look bought last turn shows what the
+                    -- boss is about to play, not what it played.
+                    if moves[i].intent ~= duel.NO_INTENT then
+                        revealed_seen = true
+                        expect(moves[i].intent).to.equal(moves[i].boss_action)
+                    end
+                end
+            end
+            -- Guard against a vacuous pass: at least one revealed turn
+            -- has to have been walked for (2) and (3) to mean anything.
+            expect(revealed_seen).to.equal(true)
+        end)
+
+        it("closes the last move's hp gap on the recorded final_hp_margin", function()
+            reset()
+            local result = level(make_handle("b"), nil, 4, 2, {
+                opponents = { "greedy", "random" },
+                per_game = true,
+                per_move = true,
+            })
+            for _, record in ipairs(each_game(result, { "greedy", "random" })) do
+                local last = record.moves[#record.moves]
+                -- Both sides of the equation are read after the clamp
+                -- `guardian_duel.apply` applies, so this is exact rather
+                -- than nominal-damage arithmetic.
+                expect(last.boss_hp - last.player_hp).to.equal(record.final_hp_margin)
+            end
+        end)
+
+        it("records the boss seat on the same contract", function()
+            reset()
+            local result = level(make_boss_handle("f"), nil, 3, 1, {
+                seat = "boss",
+                style = "guardian",
+                per_game = true,
+                per_move = true,
+            })
+            local row = result.per_opponent.random
+            expect(#row.games).to.equal(3)
+            for _, record in ipairs(row.games) do
+                expect(fields_of(record)).to.equal("final_hp_margin,game_length,moves,outcome")
+                expect(#record.moves).to.equal(record.game_length)
+                local last = record.moves[#record.moves]
+                expect(last.boss_hp - last.player_hp).to.equal(record.final_hp_margin)
+            end
+        end)
+
+        it("refuses per_move without per_game", function()
+            reset()
+            local h = make_handle("b")
+            local ok, err = pcall(level, h, "greedy", 4, 1, { per_move = true })
+            expect(ok).to.equal(false)
+            -- The message has to name the opt that is missing, not just
+            -- the one the caller wrote: a silent promotion of `per_game`
+            -- is exactly what this branch refuses to do.
+            expect(err:find("per_move") ~= nil).to.equal(true)
+            expect(err:find("per_game") ~= nil).to.equal(true)
+            local off = pcall(level, h, "greedy", 4, 1, { per_game = false, per_move = true })
+            expect(off).to.equal(false)
+        end)
+
+        it("refuses a non-boolean per_move", function()
+            reset()
+            local h = make_handle("b")
+            for _, bad in ipairs({ "true", "false", 1, 0, {} }) do
+                local ok, err = pcall(level, h, "greedy", 4, 1, {
+                    per_game = true,
+                    per_move = bad,
+                })
+                expect(ok).to.equal(false)
+                expect(err:find("per_move") ~= nil).to.equal(true)
+                expect(err:find("true, false or nil") ~= nil).to.equal(true)
+            end
+        end)
+
+        it("leaves the moves key absent when per_move is false, nil or omitted", function()
+            reset()
+            local h = make_handle("b")
+            local omitted = level(h, "greedy", 4, 1, { per_game = true })
+            local off = level(h, "greedy", 4, 1, { per_game = true, per_move = false })
+            local explicit_nil = level(h, "greedy", 4, 1, { per_game = true, per_move = nil })
+            for _, result in ipairs({ omitted, off, explicit_nil }) do
+                for _, record in ipairs(result.per_opponent.greedy.games) do
+                    expect(record.moves).to.equal(nil)
+                    -- The key is missing rather than present-and-nil,
+                    -- which is what keeps the encoded record identical
+                    -- to the pre-flag shape.
+                    expect(fields_of(record)).to.equal("final_hp_margin,game_length,outcome")
+                end
+            end
+        end)
+
+        it("moves no pre-existing number when the flag is turned on", function()
+            reset()
+            local h = make_handle("b")
+            local pool = { "greedy", "random" }
+            local off = level(h, nil, 4, 1, { opponents = pool, per_game = true })
+            local on = level(h, nil, 4, 1, { opponents = pool, per_game = true, per_move = true })
+            for _, key in ipairs({
+                "win_rate",
+                "ci_lower",
+                "ci_upper",
+                "wins",
+                "n_games",
+                "win_rate_min",
+                "game_length_mean",
+                "final_hp_margin_mean",
+            }) do
+                expect(on[key]).to.equal(off[key])
+            end
+            for _, name in ipairs(pool) do
+                local on_games = on.per_opponent[name].games
+                local off_games = off.per_opponent[name].games
+                expect(#on_games).to.equal(#off_games)
+                for i, record in ipairs(on_games) do
+                    -- The transcript is a read of the loop's own values,
+                    -- so a transcribed run has to replay the untranscribed
+                    -- one game for game — the same fights, not merely the
+                    -- same means.
+                    expect(record.outcome).to.equal(off_games[i].outcome)
+                    expect(record.game_length).to.equal(off_games[i].game_length)
+                    expect(record.final_hp_margin).to.equal(off_games[i].final_hp_margin)
+                end
+            end
+        end)
+
+        it("draws no extra temperature seed for the transcript", function()
+            reset()
+            local h = make_handle("a")
+            local off = level(h, "greedy", 3, 5, { temperature = 1.0, per_game = true })
+            local draws_off = #SAMPLER_CALLS
+            SAMPLER_CALLS = {}
+            local on = level(h, "greedy", 3, 5, {
+                temperature = 1.0,
+                per_game = true,
+                per_move = true,
+            })
+            -- Same count and the same per-decision seeds: the capture
+            -- calls nothing, so the run-local draw counter cannot move.
+            expect(#SAMPLER_CALLS).to.equal(draws_off)
+            expect(on.win_rate).to.equal(off.win_rate)
+            expect(SAMPLER_CALLS[1].seed).to.equal(5)
+        end)
+    end)
 end)

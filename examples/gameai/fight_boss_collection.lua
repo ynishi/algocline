@@ -22,6 +22,7 @@
 --       style           = "guardian",
 --       temperature     = 1.0,
 --       per_game        = false,
+--       per_move        = false,
 --     },
 --   )
 --
@@ -69,6 +70,17 @@
 --   than its means, at the cost of `n_games` records per cell in the
 --   output file. Only a boolean or nil is accepted — a truthiness read
 --   would turn the string `"false"` into the opposite of what it says.
+-- - `per_move` (default `false`) — when true every per-game record also
+--   carries a `moves` array: one `{turn, mode, intent, boss_action,
+--   player_action, boss_hp, player_hp}` record per turn of that fight,
+--   in played order. That is the raw material for reading *how* a cell
+--   was won rather than that it was, at the cost of one record per turn
+--   on top of the per-game ones (a fight runs a handful of turns, so
+--   the file grows by roughly that factor again). It requires
+--   `per_game = true` — the transcript is nested inside the per-game
+--   record — and the runner refuses the pair loudly rather than
+--   promoting `per_game` on the caller's behalf. Only a boolean or nil
+--   is accepted, for the reason `per_game` gives.
 --
 -- ## Boss perspective
 --
@@ -238,6 +250,7 @@ local SEED = optional_int("seed", fm.DEFAULT_SEED)
 local STYLE = optional_string("style", "guardian")
 local TEMPERATURE = optional_number("temperature", fm.DEFAULT_TEMPERATURE)
 local PER_GAME = optional_boolean("per_game", false)
+local PER_MOVE = optional_boolean("per_move", false)
 
 local function log(msg)
     alc.log("info", "[gameai-fight] " .. msg)
@@ -262,6 +275,7 @@ local fight = fm.new({
     style = STYLE,
     temperature = TEMPERATURE,
     per_game = PER_GAME,
+    per_move = PER_MOVE,
 })
 
 local report = fight:run()

@@ -191,6 +191,37 @@ describe("gameai_metrics registry adapter — level", function()
         expect(LEVEL_CALLS[1].opts.per_game).to.equal(nil)
     end)
 
+    it("carries ctx.per_move through seat_opts into the level opts", function()
+        reset_calls()
+        REGISTERED.level({
+            card = CARD,
+            seat = "boss",
+            style = "guardian",
+            opponents = { "random" },
+            per_game = true,
+            per_move = true,
+            n_games = 2,
+        })
+        expect(#LEVEL_CALLS).to.equal(1)
+        -- `seat_opts` is an allowlist: a key missing from it is dropped
+        -- in silence, so the ctx would name the transcript, no layer
+        -- would raise, and the run would answer without one.
+        expect(LEVEL_CALLS[1].opts.per_move).to.equal(true)
+        expect(LEVEL_CALLS[1].opts.per_game).to.equal(true)
+    end)
+
+    it("leaves opts.per_move absent when the ctx carries none", function()
+        reset_calls()
+        REGISTERED.level({
+            card = CARD,
+            seat = "boss",
+            style = "guardian",
+            opponents = { "random" },
+        })
+        expect(#LEVEL_CALLS).to.equal(1)
+        expect(LEVEL_CALLS[1].opts.per_move).to.equal(nil)
+    end)
+
     it("carries ctx.opponent_style and ctx.opponent through", function()
         reset_calls()
         REGISTERED.level({

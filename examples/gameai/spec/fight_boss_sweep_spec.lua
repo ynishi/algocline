@@ -278,6 +278,7 @@ local function canned_report(index, opts)
             style = opts.style,
             temperature = opts.temperature,
             per_game = opts.per_game,
+            per_move = opts.per_move,
             -- Fresh arrays every call: the driver's cross-point check
             -- has to compare element by element, not by table identity.
             bosses = copy_array(BOSSES),
@@ -587,6 +588,36 @@ describe("fight_boss_sweep — runner invocation", function()
         end
     end)
 
+    it("forwards per_move to every grid point", function()
+        configure()
+        local _, err = drive(full_ctx({
+            temperatures = { 0.25, 1.0 },
+            per_game = true,
+            per_move = true,
+        }))
+        expect(err).to.equal(nil)
+        for index = 1, 2 do
+            -- Dropping the flag here would cost nothing visible: the
+            -- sweep would run, save and summarise, minus the transcripts
+            -- the caller asked for.
+            expect(NEW_OPTS[index].per_move).to.equal(true)
+        end
+    end)
+
+    it("defaults per_move to false", function()
+        configure()
+        local _, err = drive(full_ctx({}))
+        expect(err).to.equal(nil)
+        expect(NEW_OPTS[1].per_move).to.equal(false)
+    end)
+
+    it("refuses a non-boolean per_move", function()
+        configure()
+        local _, err = drive(full_ctx({ per_move = "true" }))
+        expect(says(err, "per_move")).to.equal(true)
+        expect(says(err, "fight_boss_sweep")).to.equal(true)
+    end)
+
     it("falls back to fight_matrix.DEFAULT_* for n_games / seed", function()
         configure()
         local _, err = drive(full_ctx({}))
@@ -698,6 +729,20 @@ describe("fight_boss_sweep — meta", function()
         expect(result.meta.style).to.equal("sentinel")
         expect(result.meta.per_game).to.equal(true)
         expect(result.meta.collection_path).to.equal("workspace/gameai-harvest/collection.json")
+    end)
+
+    it("reads per_move back off the reference grid point", function()
+        configure()
+        local off, off_err = drive(full_ctx({}))
+        expect(off_err).to.equal(nil)
+        expect(off.meta.per_move).to.equal(false)
+        configure()
+        local on, on_err = drive(full_ctx({ per_game = true, per_move = true }))
+        expect(on_err).to.equal(nil)
+        -- Read back off the runner's own meta rather than echoed from
+        -- the ctx, the same path `per_game` takes: what the report
+        -- describes is what was measured.
+        expect(on.meta.per_move).to.equal(true)
     end)
 
     it("records the grid in order, as a copy of the ctx array", function()

@@ -51,6 +51,14 @@
 ---     `per_opponent` entry also carries the raw per-game record the
 ---     means below are computed from (see Output). Off by default so an
 ---     omitted opt reproduces the previous output byte for byte.
+---   - `per_move` — boolean, default `false`. When true, every per-game
+---     record also carries the move-by-move transcript of that fight
+---     (see Output). It needs `per_game = true`, because the transcript
+---     is nested inside the per-game record: naming `per_move` alone is
+---     a loud error rather than a silent promotion of `per_game`, for
+---     the reason `opponent_style` is refused when no opponent reads it
+---     — an opt that turns another one on behind the caller's back is a
+---     misreading waiting to happen.
 ---
 --- ## Seats
 ---
@@ -124,7 +132,13 @@
 ---             game_length_mean = 6.4, final_hp_margin_mean = 3.1,
 ---             -- only with opts.per_game = true:
 ---             games = {
----                 { outcome = 1.0, game_length = 8, final_hp_margin = 12 },
+---                 { outcome = 1.0, game_length = 8, final_hp_margin = 12,
+---                   -- only with opts.per_move = true:
+---                   moves = {
+---                       { turn = 1, mode = 0, intent = "-", boss_action = "c",
+---                         player_action = "p", boss_hp = 45, player_hp = 43 },
+---                       ...  -- one record per turn, `game_length` of them
+---                   } },
 ---                 ...  -- one record per fight, in played order
 ---             },
 ---         },
@@ -141,6 +155,41 @@
 --- report a centre. The pool level carries no `games`: a pooled
 --- distribution is the concatenation of the per-opponent ones, and
 --- storing it twice would let the two drift.
+---
+--- `games[i].moves` is present only under `opts.per_move = true` (which
+--- requires `per_game`). It holds one record per turn of that fight, in
+--- played order, so `#moves == game_length`. Each record is the position
+--- the two seats moved from plus what they played and what it left
+--- behind:
+---
+--- - `turn` / `mode` — `state.turn` and `state.boss.mode` **before** the
+---   turn was applied, the position both sides chose from.
+--- - `intent` — the boss answer a poke bought, `guardian_duel.NO_INTENT`
+---   (`"-"`) on a turn no poke revealed. It is the same value the player
+---   view carries (`state.revealed and boss_action`, normalised), read
+---   directly rather than through `guardian_duel.player_view`, so a
+---   transcript costs no extra call on the fight path. When it is not
+---   `"-"` it equals `boss_action` of the same record — a redundant
+---   field kept because it is the view's vocabulary a consumer reads the
+---   slot in.
+--- - `boss_action` / `player_action` — the two moves of that turn.
+--- - `boss_hp` / `player_hp` — **after** the turn was applied, clamped at
+---   zero the same way `guardian_duel.apply` clamps them, so the last
+---   record's `boss_hp - player_hp` is exactly `final_hp_margin` and a
+---   deciding blow reads as a hp that stopped at zero rather than the
+---   nominal damage that landed.
+---
+--- On the boss seat against the `"random"` player the fight builds no
+--- player view at all, so `intent` there is what a player view *would*
+--- have carried rather than something the opponent read: a
+--- counterfactual, not an observation. It is recorded anyway because the
+--- slot it names (the `(intent, mode)` pair a rule set keys on) is a
+--- property of the position, not of who looked at it.
+---
+--- The transcript is a read of values the loop already holds: it calls
+--- nothing, draws nothing, and consumes no temperature seed, so a run
+--- with `per_move = true` replays the same games as the same run
+--- without it.
 ---
 --- `win_rate` is the pooled rate (`wins / n_games`); since every opponent
 --- plays the same `n_games`, that is also the mean of the per-opponent
@@ -373,6 +422,39 @@ local function decode_per_game(raw)
         )
     end
     return raw
+end
+
+--- Check a requested `per_move` flag.
+---
+--- Read exactly like `per_game` — absent means off, a non-boolean is
+--- refused rather than tested for truthiness — because the two flags
+--- nest and a caller who mistyped one meant the other's records too.
+local function decode_per_move(raw)
+    if raw == nil then
+        return false
+    end
+    if type(raw) ~= "boolean" then
+        error(
+            string.format("level: opts.per_move must be true, false or nil, got %s", tostring(raw))
+        )
+    end
+    return raw
+end
+
+--- The transcript is nested inside the per-game record, so it cannot be
+--- asked for on its own.
+---
+--- Turning `per_game` on for the caller would answer a question they did
+--- not ask (and change the output shape they did ask for) in silence, so
+--- the mismatch is loud and names the opt that has to come with it.
+local function require_per_game_for_per_move(per_game, per_move)
+    if per_move and not per_game then
+        error(
+            "level: opts.per_move = true needs opts.per_game = true — the move transcript is "
+                .. "recorded inside each per-game record, and turning per_game on for you would "
+                .. "hand back an output shape you did not ask for"
+        )
+    end
 end
 
 --- Seed source shared by every draw of one run.
@@ -709,11 +791,45 @@ end
 --- The three values are the very ones the running totals below add, read
 --- once and used twice, so a caller recomputing a mean from the records
 --- sums the same numbers in the same order.
-local function record_game(records, index, result, length, margin)
+---
+--- `moves` is the transcript `cfg.per_move` collected, or `nil`. It is
+--- assigned rather than named in the constructor for the reason the
+--- `games` key itself is: on the default path the key stays absent, not
+--- present-and-nil, so an encoder that tells "no key" from "null" sees
+--- the pre-flag record byte for byte.
+local function record_game(records, index, result, length, margin, moves)
     if records == nil then
         return
     end
-    records[index] = { outcome = result, game_length = length, final_hp_margin = margin }
+    local record = { outcome = result, game_length = length, final_hp_margin = margin }
+    if moves ~= nil then
+        record.moves = moves
+    end
+    records[index] = record
+end
+
+--- The record one played turn contributes, kept only when `cfg.per_move`
+--- asked for it.
+---
+--- Every argument is a value the fight loop already holds: `turn`,
+--- `mode` and `intent` are read off the state the two seats moved from
+--- (before `guardian_duel.apply`), the two actions are what they played,
+--- and the hp pair is read off the state `apply` returned. Nothing here
+--- calls back into `guardian_duel` or the sampler, which is what keeps a
+--- transcribed run identical to an untranscribed one.
+local function record_move(moves, turn, mode, intent, boss_action, player_action, after)
+    if moves == nil then
+        return
+    end
+    moves[#moves + 1] = {
+        turn = turn,
+        mode = mode,
+        intent = intent,
+        boss_action = boss_action,
+        player_action = player_action,
+        boss_hp = after.boss.hp,
+        player_hp = after.player.hp,
+    }
 end
 
 --- Fights where the Card holds the player seat.
@@ -729,11 +845,20 @@ local function play_player_seat(handle, spec, games, base_seed, cfg)
     local records = cfg.per_game and {} or nil
     for g = 1, games do
         local state = duel.new_game(base_seed + g)
+        local moves = cfg.per_move and {} or nil
         while not duel.is_over(state) do
             local boss_action = boss(state.boss)
             local view = duel.player_view(state, view_style, state.revealed and boss_action or nil)
             local player_action = decide_player(handle, view, cfg.temperature, cfg.draws)
+            -- Read before `apply` moves the state on: the pair below is
+            -- the position the two seats chose from, and `intent` is the
+            -- same value `view` carries (`view_intent` normalises a
+            -- missing answer to `NO_INTENT`, which is what the `or`
+            -- spells here).
+            local turn, mode = state.turn, state.boss.mode
+            local intent = state.revealed and boss_action or duel.NO_INTENT
             state = duel.apply(state, player_action, boss_action)
+            record_move(moves, turn, mode, intent, boss_action, player_action, state)
         end
         local result = outcome(duel.winner(state), "player")
         local length = game_length(state)
@@ -741,7 +866,7 @@ local function play_player_seat(handle, spec, games, base_seed, cfg)
         wins = wins + result
         turns = turns + length
         margin = margin + hp_margin
-        record_game(records, g, result, length, hp_margin)
+        record_game(records, g, result, length, hp_margin, moves)
     end
     return wins, turns, margin, records
 end
@@ -754,10 +879,19 @@ local function play_boss_seat(handle, spec, games, base_seed, style, cfg)
     local records = cfg.per_game and {} or nil
     for g = 1, games do
         local state = duel.new_game(base_seed + g)
+        local moves = cfg.per_move and {} or nil
         while not duel.is_over(state) do
             local boss_action = decide_boss(handle, state.boss, style, cfg.temperature, cfg.draws)
             local player_action = player(state, boss_action)
+            -- Same three reads as the player seat. Against the
+            -- `"random"` player nothing on this path builds a view, so
+            -- `intent` is what a view would have carried rather than
+            -- what the opponent saw — a property of the position (see
+            -- the header).
+            local turn, mode = state.turn, state.boss.mode
+            local intent = state.revealed and boss_action or duel.NO_INTENT
             state = duel.apply(state, player_action, boss_action)
+            record_move(moves, turn, mode, intent, boss_action, player_action, state)
         end
         local result = outcome(duel.winner(state), "boss")
         local length = game_length(state)
@@ -765,7 +899,7 @@ local function play_boss_seat(handle, spec, games, base_seed, style, cfg)
         wins = wins + result
         turns = turns + length
         margin = margin + hp_margin
-        record_game(records, g, result, length, hp_margin)
+        record_game(records, g, result, length, hp_margin, moves)
     end
     return wins, turns, margin, records
 end
@@ -791,10 +925,14 @@ M = function(card, opponent, n_games, seed, opts)
         -- on the argument rather than after N games of setup.
         require_sampler()
     end
+    local per_game = decode_per_game(opts.per_game)
+    local per_move = decode_per_move(opts.per_move)
+    require_per_game_for_per_move(per_game, per_move)
     local cfg = {
         opponent_style = opponent_style,
         temperature = temperature,
-        per_game = decode_per_game(opts.per_game),
+        per_game = per_game,
+        per_move = per_move,
         draws = new_draws(base_seed),
     }
 

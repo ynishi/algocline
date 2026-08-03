@@ -69,6 +69,7 @@
 ---     style = "guardian",  -- required, one of guardian_duel.STYLES
 ---     temperature = 1.0,   -- default
 ---     per_game = false,    -- default; true adds a `games` array per cell
+---     per_move = false,    -- default; true adds a `moves` array per game
 --- })
 ---
 --- local report = fight:run()
@@ -93,8 +94,8 @@
 ---         },
 ---         ...
 ---     },
----     meta = { n_games, seed, style, temperature, bosses, players,
----              collection_path? },
+---     meta = { n_games, seed, style, temperature, per_game, per_move,
+---              bosses, players, collection_path? },
 --- }
 --- ```
 ---
@@ -115,7 +116,9 @@
 --- - A cell is `level`'s `per_opponent` entry verbatim. A field added
 ---   there shows up here without a change to this file. That is how
 ---   `opts.per_game = true` puts a `games` array (one record per fight
----   of the cell) inside every cell: this runner only forwards the flag.
+---   of the cell) inside every cell, and `opts.per_move = true` a
+---   `moves` array (one record per turn) inside every one of those:
+---   this runner only forwards the flags.
 ---
 --- `save()` writes the report as JSON via `alc.json_encode`, after
 --- `gameai_metrics._fs.ensure_parent_dir(path)`, so the first write into
@@ -274,6 +277,44 @@ local function decode_per_game(raw)
         )
     end
     return raw
+end
+
+--- Decode the per-move record flag.
+---
+--- Same treatment as `per_game`, whose records this one nests inside:
+--- forwarded to `level` as-is, refused here when it is not a boolean so
+--- the message names the layer the caller called.
+local function decode_per_move(raw)
+    if raw == nil then
+        return false
+    end
+    if type(raw) ~= "boolean" then
+        error(
+            string.format(
+                "fight_matrix: opts.per_move must be true, false or nil, got %s",
+                tostring(raw)
+            ),
+            3
+        )
+    end
+    return raw
+end
+
+--- The transcript rides inside the per-game record, so `per_move` alone
+--- has nowhere to land.
+---
+--- `level` refuses the same pair; it is refused here too so a caller who
+--- named one flag on *this* runner reads this runner's name, and so the
+--- refusal lands in `new()` rather than after the first row of fights.
+local function require_per_game_for_per_move(per_game, per_move)
+    if per_move and not per_game then
+        error(
+            "fight_matrix: opts.per_move = true needs opts.per_game = true — the move "
+                .. "transcript is recorded inside each per-game record, and turning per_game "
+                .. "on for you would hand back a report shape you did not ask for",
+            3
+        )
+    end
 end
 
 --- Normalise `opts.players` into a list of alias strings.
@@ -539,6 +580,7 @@ function Fight:run()
             opponents = self._players,
             temperature = self._temperature,
             per_game = self._per_game,
+            per_move = self._per_move,
         })
         matrix[entry.alias] = row_from_level(result, self._players, entry.alias)
     end
@@ -560,7 +602,9 @@ function Fight:run()
         -- Recorded so a saved report is self-describing: a cell without
         -- `games` could otherwise mean either "the flag was off" or "a
         -- field went missing", and the JSON alone could not say which.
+        -- `per_move` rides along for the same reason, one level down.
         per_game = self._per_game,
+        per_move = self._per_move,
         bosses = bosses,
         players = players,
     }
@@ -647,6 +691,12 @@ end
 ---   inside every cell. Off by default: the flag multiplies the report
 ---   size by the cell count and a caller reading only rates has no use
 ---   for it.
+--- - `per_move` — boolean, default `false`. Forwarded to `level`, which
+---   then puts a `moves` array (one record per turn of that fight)
+---   inside every per-game record. Requires `per_game = true`, since
+---   that is where the transcript is nested; naming it alone is a loud
+---   error here rather than a silent promotion. It multiplies the
+---   report size again, by the turns of a fight.
 ---
 ---@param opts table
 ---@return table fight
@@ -668,6 +718,8 @@ function M.new(opts)
     local seed = decode_int(opts.seed, DEFAULT_SEED, "seed", false)
     local temperature = decode_temperature(opts.temperature)
     local per_game = decode_per_game(opts.per_game)
+    local per_move = decode_per_move(opts.per_move)
+    require_per_game_for_per_move(per_game, per_move)
 
     local bosses
     if opts.collection_path ~= nil then
@@ -684,6 +736,7 @@ function M.new(opts)
         _seed = seed,
         _temperature = temperature,
         _per_game = per_game,
+        _per_move = per_move,
         _collection_path = opts.collection_path,
         _report = nil,
     }, Fight)

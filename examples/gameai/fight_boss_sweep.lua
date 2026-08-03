@@ -24,6 +24,7 @@
 --       seed            = 20260731,
 --       style           = "guardian",
 --       per_game        = false,
+--       per_move        = false,
 --     },
 --   )
 --
@@ -73,6 +74,16 @@
 --   distributions. Only a boolean or nil is accepted — a truthiness
 --   read would turn the string `"false"` into the opposite of what it
 --   says.
+-- - `per_move` (default `false`) — when true every per-game record also
+--   carries a `moves` array: one `{turn, mode, intent, boss_action,
+--   player_action, boss_hp, player_hp}` record per turn of that fight.
+--   On a sweep the cost compounds: the transcript is written for every
+--   fight of every cell of **every grid point**, so the output is
+--   roughly the per-move size of a single matrix multiplied by the
+--   number of grid points. It requires `per_game = true` (the
+--   transcript is nested inside the per-game record) and the runner
+--   refuses the pair loudly rather than promoting `per_game`. Only a
+--   boolean or nil is accepted, for the reason `per_game` gives.
 --
 -- There is deliberately no `temperature` (singular) field: this driver's
 -- whole subject is the grid, and accepting both spellings would leave a
@@ -129,7 +140,7 @@
 --         { temperature = 0.25, matrix = <fight_matrix report.matrix> },
 --         ...  -- one entry per grid point, in ctx.temperatures order
 --     },
---     meta = { n_games, seed, style, per_game, temperatures,
+--     meta = { n_games, seed, style, per_game, per_move, temperatures,
 --              bosses, players, collection_path },
 -- }
 -- ```
@@ -351,6 +362,7 @@ local N_GAMES = optional_int("n_games", fm.DEFAULT_N_GAMES)
 local SEED = optional_int("seed", fm.DEFAULT_SEED)
 local STYLE = optional_string("style", "guardian")
 local PER_GAME = optional_boolean("per_game", false)
+local PER_MOVE = optional_boolean("per_move", false)
 
 local function log(msg)
     alc.log("info", "[gameai-sweep] " .. msg)
@@ -453,6 +465,7 @@ for index, temperature in ipairs(TEMPERATURES) do
         style = STYLE,
         temperature = temperature,
         per_game = PER_GAME,
+        per_move = PER_MOVE,
     })
     local report = fight:run()
     if
@@ -492,14 +505,15 @@ local report = {
         -- than echoed from the ctx: what the report describes is what
         -- was actually run, and the invariant checks above already
         -- proved every grid point agrees on `n_games` / `seed` /
-        -- `style` / the two axes. `per_game` rides along from the same
-        -- reference point; it is a flag this driver passes unchanged to
-        -- every point, so there is no second value for it to disagree
-        -- with.
+        -- `style` / the two axes. `per_game` and `per_move` ride along
+        -- from the same reference point; they are flags this driver
+        -- passes unchanged to every point, so there is no second value
+        -- for either to disagree with.
         n_games = reference.n_games,
         seed = reference.seed,
         style = reference.style,
         per_game = reference.per_game,
+        per_move = reference.per_move,
         temperatures = TEMPERATURES,
         bosses = bosses,
         players = players,

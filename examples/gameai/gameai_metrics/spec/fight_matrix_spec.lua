@@ -280,7 +280,11 @@ end
 --- a `games` array to the cell and changes nothing else. Two records are
 --- enough — the runner never reads inside them, so the assertion this
 --- fake supports is "the array rode along", not its length.
-local function make_cell(boss_alias, player, n_games, per_game)
+---
+--- `per_move` nests one level deeper, again mirroring `level`: a `moves`
+--- array inside each per-game record. Two moves per record, for the same
+--- reason.
+local function make_cell(boss_alias, player, n_games, per_game, per_move)
     local win_rate = CELL_WIN_RATE[cell_key(boss_alias, player)] or 0.5
     local cell = {
         win_rate = win_rate,
@@ -295,6 +299,28 @@ local function make_cell(boss_alias, player, n_games, per_game)
             { outcome = 1.0, game_length = 7, final_hp_margin = 3 },
             { outcome = 0.0, game_length = 9, final_hp_margin = -2 },
         }
+        if per_move then
+            cell.games[1].moves = {
+                {
+                    turn = 1,
+                    mode = 0,
+                    intent = "-",
+                    boss_action = "c",
+                    player_action = "p",
+                    boss_hp = 45,
+                    player_hp = 43,
+                },
+                {
+                    turn = 2,
+                    mode = 0,
+                    intent = "f",
+                    boss_action = "f",
+                    player_action = "b",
+                    boss_hp = 41,
+                    player_hp = 40,
+                },
+            }
+        end
     end
     return cell
 end
@@ -313,7 +339,7 @@ local function fake_level(card, opponent, n_games, seed, opts)
     local wins, total = 0.0, 0
     for _, player in ipairs(opts.opponents or {}) do
         if player ~= OMIT_PLAYER then
-            local cell = make_cell(boss_alias, player, n_games, opts.per_game)
+            local cell = make_cell(boss_alias, player, n_games, opts.per_game, opts.per_move)
             per_opponent[player] = cell
             wins = wins + cell.win_rate * n_games
             total = total + n_games
@@ -521,6 +547,49 @@ describe("gameai_metrics.fight_matrix.new — options", function()
         end
     end)
 
+    it("refuses a non-boolean per_move", function()
+        reset_all()
+        make_boss("b1")
+        for _, bad in ipairs({ "true", "false", 1, 0 }) do
+            local ok, err = pcall(fight_matrix.new, {
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+                per_game = true,
+                per_move = bad,
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("per_move") ~= nil).to.equal(true)
+            expect(err:find("fight_matrix") ~= nil).to.equal(true)
+        end
+    end)
+
+    it("refuses per_move without per_game", function()
+        reset_all()
+        make_boss("b1")
+        local ok, err = pcall(fight_matrix.new, {
+            bosses = { "b1" },
+            players = { "p1" },
+            style = BASE_STYLE,
+            per_move = true,
+        })
+        expect(ok).to.equal(false)
+        -- Named here rather than left to `level`: the caller called this
+        -- runner, and the refusal has to land before the first row of
+        -- fights rather than after it.
+        expect(err:find("per_move") ~= nil).to.equal(true)
+        expect(err:find("per_game") ~= nil).to.equal(true)
+        expect(err:find("fight_matrix") ~= nil).to.equal(true)
+        local off = pcall(fight_matrix.new, {
+            bosses = { "b1" },
+            players = { "p1" },
+            style = BASE_STYLE,
+            per_game = false,
+            per_move = true,
+        })
+        expect(off).to.equal(false)
+    end)
+
     it("refuses an unbound boss alias", function()
         reset_all()
         make_boss("b1")
@@ -628,6 +697,46 @@ describe("gameai_metrics.fight_matrix:run — matrix shape", function()
         expect(cell.win_rate).to.equal(0.42)
     end)
 
+    it("carries a per_move game's moves array through verbatim", function()
+        reset_all()
+        make_boss("b1")
+        set_win_rate("b1", "p1", 0.42)
+        local report = fight_matrix
+            .new({
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+                n_games = 2,
+                per_game = true,
+                per_move = true,
+            })
+            :run()
+        local cell = report.matrix.b1.p1
+        -- Two levels of nesting arrive through the same verbatim cell
+        -- transcription: this runner reads neither array.
+        local moves = cell.games[1].moves
+        expect(type(moves)).to.equal("table")
+        expect(#moves).to.equal(2)
+        expect(moves[1].intent).to.equal("-")
+        expect(moves[2].boss_action).to.equal("f")
+        expect(moves[2].player_hp).to.equal(40)
+        expect(cell.games[2].moves).to.equal(nil)
+    end)
+
+    it("leaves the games records without a moves array by default", function()
+        reset_all()
+        make_boss("b1")
+        local report = fight_matrix
+            .new({
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+                per_game = true,
+            })
+            :run()
+        expect(report.matrix.b1.p1.games[1].moves).to.equal(nil)
+    end)
+
     it("leaves the cells without a games array by default", function()
         reset_all()
         make_boss("b1")
@@ -650,6 +759,28 @@ describe("gameai_metrics.fight_matrix:run — matrix shape", function()
         expect(table.concat(report.meta.bosses, ",")).to.equal(table.concat(BOSSES, ","))
         expect(table.concat(report.meta.players, ",")).to.equal(table.concat(PLAYERS, ","))
         expect(report.meta.collection_path).to.equal(nil)
+    end)
+
+    it("records both record flags in meta, so a saved report is self-describing", function()
+        reset_all()
+        make_boss("b1")
+        local off =
+            fight_matrix.new({ bosses = { "b1" }, players = { "p1" }, style = BASE_STYLE }):run()
+        expect(off.meta.per_game).to.equal(false)
+        expect(off.meta.per_move).to.equal(false)
+        local on = fight_matrix
+            .new({
+                bosses = { "b1" },
+                players = { "p1" },
+                style = BASE_STYLE,
+                per_game = true,
+                per_move = true,
+            })
+            :run()
+        expect(on.meta.per_game).to.equal(true)
+        -- Without this a reader of the JSON cannot tell a run made
+        -- without transcripts from one whose transcripts went missing.
+        expect(on.meta.per_move).to.equal(true)
     end)
 
     it("defaults n_games=200 / seed=0 / temperature=1.0", function()
@@ -759,6 +890,38 @@ describe("gameai_metrics.fight_matrix:run — level invocation", function()
         })
         fight:run()
         expect(LEVEL_CALLS[1].opts.per_game).to.equal(false)
+    end)
+
+    it("forwards opts.per_move to every level call", function()
+        reset_all()
+        make_boss("b1")
+        make_boss("b2")
+        local fight = fight_matrix.new({
+            bosses = { "b1", "b2" },
+            players = { "p1" },
+            style = BASE_STYLE,
+            per_game = true,
+            per_move = true,
+        })
+        fight:run()
+        expect(#LEVEL_CALLS).to.equal(2)
+        -- A flag decoded here but dropped on the way down would leave
+        -- the report shape unchanged and raise nowhere.
+        expect(LEVEL_CALLS[1].opts.per_move).to.equal(true)
+        expect(LEVEL_CALLS[2].opts.per_move).to.equal(true)
+    end)
+
+    it("forwards per_move = false when the caller names none", function()
+        reset_all()
+        make_boss("b1")
+        local fight = fight_matrix.new({
+            bosses = { "b1" },
+            players = { "p1" },
+            style = BASE_STYLE,
+            per_game = true,
+        })
+        fight:run()
+        expect(LEVEL_CALLS[1].opts.per_move).to.equal(false)
     end)
 
     it("raises when level answers without a cell for a named player", function()

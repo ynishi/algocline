@@ -977,6 +977,14 @@ crashed the trainer mid-run; `_fs.ensure_parent_dir` runs `mkdir
 -p` under a POSIX single-quote escape so any path the caller can
 name is safe to hand to `:save()`.
 
+The audit's per-Card `level` view optionally takes a decode
+`temperature`, which is what lets an audit and a fight differ in
+one variable at a time: a greedy audit (the default — the scripted
+opponents carry their own RNG, so greedy still has spread here)
+measures the argmax policy, an audit at `1.0` measures the same
+sampled policy a fight runs under, and the pair decomposes an
+audit-vs-fight gap into a decode effect and an opponent effect.
+
 ### Fighting a collection against player Cards
 
 `gameai_metrics.fight_matrix` is the step after the audit: instead
@@ -1004,6 +1012,19 @@ alternative to an inline `ctx.moves` array.
 driver: a harvest manifest for the boss axis, a `players` alias
 array, an `output` path, and it writes the matrix as JSON plus one
 summary line per cell.
+
+Two follow-up surfaces sit on top of the matrix. `ctx.per_game =
+true` makes every cell also carry its raw per-fight records —
+`{outcome, game_length, final_hp_margin}` in played order, the very
+values the cell means are computed from — so a distribution can be
+read where a mean only reports a centre.
+`examples/gameai/fight_boss_sweep.lua` runs the whole matrix over a
+temperature grid (`ctx.temperatures`, caller order, one shared
+seed) and writes one JSON of `{temperature, matrix}` points, with
+the non-temperature parameters asserted fixed across the grid — the
+win-rate-versus-temperature curve is what separates a Card that is
+strong everywhere from one whose strength is an artefact of one
+decode scale.
 
 ## Known limitations
 

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/gameai/fight_boss_sweep.lua` — temperature-grid driver over
+  `fight_matrix`. Takes the fight driver's ctx with `ctx.temperatures`
+  (a non-empty array of positive finite grid points, kept in caller
+  order) in place of a single temperature, runs one fight matrix per
+  grid point under one shared seed, asserts that the boss / player
+  axes and every non-temperature run parameter stayed fixed across
+  the grid (the single-variable-sweep invariant), and writes one JSON
+  (`sweep = [{temperature, matrix}, ...]` + aggregated `meta`). A
+  leftover singular `ctx.temperature` is refused loudly rather than
+  silently outvoted by the grid. Nothing is written when any grid
+  point fails. 47 spec tests.
+
 - `examples/gameai/gameai_metrics/fight_matrix.lua` — Card-vs-Card
   fight matrix runner: every boss Card of a harvest collection (or an
   explicit alias list) against every player Card of a pool.
@@ -318,6 +330,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generalises".
 
 ### Changed
+
+- `examples/gameai/gameai_metrics/audit_matrix.lua`: the per-Card
+  `level` view now accepts an optional decode `temperature`. Omitted
+  means greedy — the exact path every earlier audit took, kept
+  because the audit's scripted opponents carry their own RNG so a
+  greedy batch still has real spread (the deliberate asymmetry with
+  `fight_matrix`, where greedy has no spelling, is documented in both
+  headers). A supplied value reaches the `level` view only; the
+  `trickiness` / `style_distance` views keep their own fixed
+  `1.0`-scale semantics. `meta.temperature` records the value when
+  one was supplied. The `audit_boss_collection` driver passes
+  `ctx.temperature` through and its summary line now names the decode
+  mode (`temperature=greedy` / `=1.0`). The registry adapter's
+  forwarding of the seat opts is now pinned by its own spec
+  (`gameai_metrics/spec/registry_adapter_spec.lua`).
+
+- `examples/gameai/gameai_metrics/level.lua`: a new `opts.per_game`
+  (boolean, default off) makes every `per_opponent` entry also carry
+  `games` — one `{outcome, game_length, final_hp_margin}` record per
+  fight, in played order, holding the very values the summary means
+  are computed from, so a consumer can read a distribution where the
+  means only report a centre. Off by default the output is
+  byte-identical. `fight_matrix` forwards the flag (cells carry the
+  records verbatim, `meta.per_game` records the mode) and the fight /
+  sweep drivers expose it as `ctx.per_game`.
 
 - `examples/gameai/gameai_metrics/level.lua`: the opponent seat now
   accepts a Card on both sides. With `seat = "player"` the opponent

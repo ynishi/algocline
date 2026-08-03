@@ -27,6 +27,15 @@
 -- has is the `autoplay` mode of `guardian_player_npc`, which puts the
 -- baked Card in front of a boss and reports how the fight goes.
 --
+-- A log whose moves are not a function of the view alone puts a ceiling
+-- on `log_match` below 1.0, and the shipped sample playlog
+-- (`data/guardian_sample_playlog_train.json`) is such a log: its R6 slot
+-- is played from a per-game opening script rather than read off the
+-- board, so the same view carries contradicting labels and a greedy Card
+-- can only answer the majority move there. The rate to read for that
+-- corpus is the one over the R1-R5 rows; a sub-1.0 number is the shape
+-- of the log, not a failed bake.
+--
 -- The `D` field of a logged view is the damage the boss the human was
 -- fighting still tolerated, so the corpus is measured against that
 -- boss's threshold. A Card baked here is therefore only being asked the
@@ -42,13 +51,21 @@
 -- positions, however low the loss goes.
 --
 -- ctx:
---   moves  -- required; array of logged turns, each carrying a `player`
---             view (`{ turn, mode, boss_hp, shift_distance, hp,
---             weakened, exposed, spikes, intent }`) and a
---             `player_action`. This is the `move_log` array of a
---             finished interactive session, unchanged. A log recorded
---             before the view carried `intent` is rejected rather than
---             read: see the format check below
+--   moves  -- array of logged turns, each carrying a `player` view
+--             (`{ turn, mode, boss_hp, shift_distance, hp, weakened,
+--             exposed, spikes, intent }`) and a `player_action`. This
+--             is the `move_log` array of a finished interactive
+--             session, unchanged. A log recorded before the view
+--             carried `intent` is rejected rather than read: see the
+--             format check below. Exclusive with `moves_path`; exactly
+--             one of the two is required
+--   moves_path
+--          -- path to a JSON file holding that same array at the top
+--             level, for a log that was recorded once and is baked
+--             from disk rather than pasted into the call. The file is
+--             read, decoded through `alc.json_decode` and then follows
+--             the identical path as an inline `moves` array, format
+--             check included. Exclusive with `moves`
 --   name   -- required; slug matching ^[a-z0-9_]+$. The Card is pinned
 --             to the alias `guardian_player_npc_<name>`
 --   steps  -- Full FT steps (default 800)
@@ -86,6 +103,7 @@ local function ctx_field(k)
 end
 
 local MOVES = ctx_field("moves")
+local MOVES_PATH = ctx_field("moves_path")
 local NAME = ctx_field("name")
 local STEPS = math.floor(tonumber(ctx_field("steps")) or 800)
 local LR = tonumber(ctx_field("lr")) or 3e-3
@@ -104,11 +122,72 @@ end
 -- entry is checked by `guardian_duel.rows_from_player_moves`, which
 -- names the entry and the reason so a malformed log can be fixed
 -- without guessing.
+--
+-- The log arrives either inline (`ctx.moves`) or as a path to a JSON
+-- file holding that same array (`ctx.moves_path`). The two are
+-- exclusive rather than one falling back to the other: a call carrying
+-- both hands over two logs and no way of saying which was meant, and
+-- quietly preferring either would bake a Card out of a corpus the
+-- caller did not choose.
 
+local function load_moves_file(path)
+    if type(path) ~= "string" or path == "" then
+        error("bake_guardian_player_from_log: ctx.moves_path must be a non-empty string")
+    end
+    if type(alc) ~= "table" or type(alc.json_decode) ~= "function" then
+        error(
+            "bake_guardian_player_from_log: alc.json_decode is required to read ctx.moves_path "
+                .. "(host bridge missing)"
+        )
+    end
+    local f, open_err = io.open(path, "r")
+    if f == nil then
+        error(
+            string.format(
+                "bake_guardian_player_from_log: cannot open ctx.moves_path %q: %s",
+                path,
+                tostring(open_err)
+            )
+        )
+    end
+    local body = f:read("a")
+    f:close()
+    local ok, parsed = pcall(alc.json_decode, body)
+    if not ok then
+        error(
+            string.format(
+                "bake_guardian_player_from_log: failed to decode ctx.moves_path %q: %s",
+                path,
+                tostring(parsed)
+            )
+        )
+    end
+    if type(parsed) ~= "table" or #parsed == 0 then
+        error(
+            string.format(
+                "bake_guardian_player_from_log: ctx.moves_path %q must hold a non-empty array of "
+                    .. "logged turns at the top level",
+                path
+            )
+        )
+    end
+    return parsed
+end
+
+if MOVES ~= nil and MOVES_PATH ~= nil then
+    error(
+        "bake_guardian_player_from_log: ctx.moves (the array of logged turns) and "
+            .. "ctx.moves_path (the path to a JSON file holding that array) are exclusive; "
+            .. "pass exactly one of them"
+    )
+end
+if MOVES_PATH ~= nil then
+    MOVES = load_moves_file(MOVES_PATH)
+end
 if type(MOVES) ~= "table" or #MOVES == 0 then
     error(
-        "bake_guardian_player_from_log: ctx.moves is required and must be a non-empty array "
-            .. "of logged turns"
+        "bake_guardian_player_from_log: exactly one of ctx.moves (a non-empty array of logged "
+            .. "turns) or ctx.moves_path (the path to a JSON file holding that array) is required"
     )
 end
 if type(NAME) ~= "string" or not NAME:match("^[a-z0-9_]+$") then

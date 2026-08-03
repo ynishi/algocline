@@ -182,10 +182,81 @@ alc.math.rng_int = function(rng, min, max)
     return min + (s // 65536) % (max - min + 1)
 end
 
+-- ─── Sampler stub ───────────────────────────────────────────────────
+--
+-- `opts.temperature` draws through
+-- `alc.nn.sampler.constrained(alc.nn.sampler.temperature(t, seed),
+-- alc.nn.constraint.allow_list(ids))`. The fake below is deterministic —
+-- it always returns the lowest allowed id, which is legal by
+-- construction — so the specs can assert *what the chain was built with*
+-- (temperature, per-decision seed, mask) rather than a random outcome.
+
+local SAMPLER_CALLS = {}
+
+alc.nn.sampler = {
+    temperature = function(t, seed)
+        return { temperature = t, seed = seed }
+    end,
+    constrained = function(inner, constraint)
+        return {
+            sample = function(_, logits)
+                SAMPLER_CALLS[#SAMPLER_CALLS + 1] = {
+                    temperature = inner.temperature,
+                    seed = inner.seed,
+                    allow = constraint.ids,
+                    vocab = logits:vocab(),
+                }
+                local pick = constraint.ids[1]
+                for _, id in ipairs(constraint.ids) do
+                    if id < pick then
+                        pick = id
+                    end
+                end
+                return pick
+            end,
+        }
+    end,
+}
+
+alc.nn.constraint = {
+    allow_list = function(ids)
+        local copy = {}
+        for i, id in ipairs(ids) do
+            copy[i] = id
+        end
+        return { ids = copy }
+    end,
+}
+
+--- Run `fn` on a VM whose sampler surfaces are missing, restoring them
+--- afterwards, and report the pcall result.
+local function without_sampler(fn)
+    local sampler, constraint = alc.nn.sampler, alc.nn.constraint
+    alc.nn.sampler, alc.nn.constraint = nil, nil
+    local ok, err = pcall(fn)
+    alc.nn.sampler, alc.nn.constraint = sampler, constraint
+    return ok, err
+end
+
+--- Wrap a stub handle so every prompt it is asked to decode is recorded.
+--- The wrapper is what proves *which* view a seat built, which is the
+--- only observable difference a style basis makes.
+local function recording(handle)
+    local prompts = {}
+    local wrapped = {
+        generate_session = function(_, prompt_ids)
+            prompts[#prompts + 1] = table.concat(prompt_ids, ",")
+            return handle:generate_session(prompt_ids)
+        end,
+    }
+    return wrapped, prompts
+end
+
 local level = require("gameai_metrics.level")
 
 local function reset()
     ALIAS_TO_HANDLE = {}
+    SAMPLER_CALLS = {}
 end
 
 describe("gameai_metrics.level", function()
@@ -464,6 +535,326 @@ describe("gameai_metrics.level", function()
             })
             expect(ok).to.equal(false)
             expect(err:find("not implemented") ~= nil).to.equal(true)
+        end)
+    end)
+
+    describe("boss Card opponent (seat = player)", function()
+        it("decodes the boss seat from the Card instead of the scripted policy", function()
+            reset()
+            -- Boss vocab, not player vocab: the two alphabets address
+            -- different tables, and a mix-up decodes silently.
+            local boss_card = make_boss_handle("c")
+            ALIAS_TO_HANDLE["boss_charger"] = boss_card
+            local h = make_handle("a")
+
+            local scripted = level(h, "greedy", 4, 1)
+            local carded = level(h, "boss_charger", 4, 1, { opponent_style = "guardian" })
+
+            expect(carded.per_opponent.boss_charger.n_games).to.equal(4)
+            -- The Card was asked for a move at all...
+            expect(boss_card._last_prompt ~= nil).to.equal(true)
+            -- ...and a boss that only ever charges is not the teacher.
+            expect(carded.win_rate ~= scripted.win_rate).to.equal(true)
+        end)
+
+        it("builds the player view on the opponent_style basis", function()
+            reset()
+            ALIAS_TO_HANDLE["boss_charger"] = make_boss_handle("c")
+            local guarded, guarded_prompts = recording(make_handle("a"))
+            local rushed, rushed_prompts = recording(make_handle("a"))
+
+            level(guarded, "boss_charger", 2, 1, { opponent_style = "guardian" })
+            level(rushed, "boss_charger", 2, 1, { opponent_style = "rusher" })
+
+            -- Both fights play the same moves (the stubs are fixed), so
+            -- the states match turn for turn; only the distance field the
+            -- basis computes can differ.
+            expect(#guarded_prompts > 0).to.equal(true)
+            expect(guarded_prompts[1] ~= rushed_prompts[1]).to.equal(true)
+        end)
+
+        it("keeps the guardian view basis for the scripted opponents", function()
+            reset()
+            local a, a_prompts = recording(make_handle("a"))
+            local b, b_prompts = recording(make_handle("a"))
+            level(a, "greedy", 2, 1)
+            level(b, "random", 2, 1)
+            -- Both scripted paths encode the opening view identically,
+            -- which is the pre-Card behaviour this wire must not move.
+            expect(a_prompts[1]).to.equal(b_prompts[1])
+        end)
+
+        it("requires opponent_style for a Card opponent", function()
+            reset()
+            ALIAS_TO_HANDLE["boss_charger"] = make_boss_handle("c")
+            local ok, err = pcall(level, make_handle("a"), "boss_charger", 4, 1)
+            expect(ok).to.equal(false)
+            expect(err:find("opponent_style") ~= nil).to.equal(true)
+        end)
+
+        it("refuses opponent_style when every opponent is a scripted policy", function()
+            reset()
+            local ok, err = pcall(level, make_handle("a"), "greedy", 4, 1, {
+                opponent_style = "guardian",
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("opponent_style") ~= nil).to.equal(true)
+        end)
+
+        it('refuses opponent_style on seat = "boss"', function()
+            reset()
+            local ok, err = pcall(level, make_boss_handle("f"), nil, 4, 1, {
+                seat = "boss",
+                style = "guardian",
+                opponent_style = "guardian",
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("opponent_style") ~= nil).to.equal(true)
+        end)
+
+        it("refuses an unknown opponent_style", function()
+            reset()
+            ALIAS_TO_HANDLE["boss_charger"] = make_boss_handle("c")
+            local ok, err = pcall(level, make_handle("a"), "boss_charger", 4, 1, {
+                opponent_style = "trickster",
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("trickster") ~= nil).to.equal(true)
+        end)
+
+        it("refuses an alias no Card is bound to", function()
+            reset()
+            local ok, err = pcall(level, make_handle("a"), "ghost", 4, 1, {
+                opponent_style = "guardian",
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("not bound to any Card") ~= nil).to.equal(true)
+        end)
+
+        it("accepts a boss handle passed directly, keyed as <table>", function()
+            reset()
+            local result = level(make_handle("a"), make_boss_handle("c"), 4, 1, {
+                opponent_style = "guardian",
+            })
+            expect(type(result.per_opponent["<table>"])).to.equal("table")
+            expect(result.per_opponent["<table>"].n_games).to.equal(4)
+        end)
+    end)
+
+    describe("player Card opponent (seat = boss)", function()
+        it("decodes the player seat from the Card instead of the random policy", function()
+            reset()
+            -- Player vocab here, mirroring the boss-vocab note above.
+            local blocker = make_handle("b")
+            local heavy = make_handle("A")
+            ALIAS_TO_HANDLE["player_blocker"] = blocker
+            ALIAS_TO_HANDLE["player_heavy"] = heavy
+            local boss = make_boss_handle("f")
+
+            local opts = { seat = "boss", style = "guardian" }
+            local vs_blocker = level(boss, "player_blocker", 4, 1, opts)
+            local vs_heavy = level(boss, "player_heavy", 4, 1, opts)
+
+            expect(vs_blocker.per_opponent.player_blocker.n_games).to.equal(4)
+            expect(blocker._last_prompt ~= nil).to.equal(true)
+            -- A blocker stalls to the turn limit, a heavy attacker ends
+            -- the fight early: the seat is reading the Card, not a
+            -- scripted policy that would score both the same.
+            expect(
+                vs_blocker.per_opponent.player_blocker.game_length_mean
+                    ~= vs_heavy.per_opponent.player_heavy.game_length_mean
+            ).to.equal(true)
+        end)
+
+        it("builds the player view on opts.style", function()
+            reset()
+            local guarded, guarded_prompts = recording(make_handle("b"))
+            local rushed, rushed_prompts = recording(make_handle("b"))
+            local boss = make_boss_handle("f")
+
+            level(boss, guarded, 2, 1, { seat = "boss", style = "guardian" })
+            level(boss, rushed, 2, 1, { seat = "boss", style = "rusher" })
+
+            expect(#guarded_prompts > 0).to.equal(true)
+            expect(guarded_prompts[1] ~= rushed_prompts[1]).to.equal(true)
+        end)
+
+        it("refuses an alias no Card is bound to", function()
+            reset()
+            local ok, err = pcall(level, make_boss_handle("f"), "ghost", 4, 1, {
+                seat = "boss",
+                style = "guardian",
+            })
+            expect(ok).to.equal(false)
+            expect(err:find("not bound to any Card") ~= nil).to.equal(true)
+        end)
+
+        it("accepts a player handle passed directly, keyed as <table>", function()
+            reset()
+            local result = level(make_boss_handle("f"), make_handle("b"), 4, 1, {
+                seat = "boss",
+                style = "guardian",
+            })
+            expect(type(result.per_opponent["<table>"])).to.equal("table")
+            expect(result.per_opponent["<table>"].n_games).to.equal(4)
+        end)
+    end)
+
+    describe("temperature", function()
+        it("draws every player decision through the constrained sampler", function()
+            reset()
+            local result = level(make_handle("a"), "greedy", 2, 7, { temperature = 0.5 })
+            expect(result.n_games).to.equal(2)
+            expect(#SAMPLER_CALLS > 0).to.equal(true)
+            expect(SAMPLER_CALLS[1].temperature).to.equal(0.5)
+            -- Per-decision seed = base_seed + a run-local counter.
+            expect(SAMPLER_CALLS[1].seed).to.equal(7)
+            expect(SAMPLER_CALLS[2].seed).to.equal(8)
+            -- Masked to the four player moves, not to the vocabulary.
+            expect(#SAMPLER_CALLS[1].allow).to.equal(#MOVE_IDS)
+            for i, id in ipairs(MOVE_IDS) do
+                expect(SAMPLER_CALLS[1].allow[i]).to.equal(id)
+            end
+        end)
+
+        it("masks a boss draw to the legal moves of the state", function()
+            reset()
+            level(make_boss_handle("f"), "random", 2, 3, {
+                seat = "boss",
+                style = "guardian",
+                temperature = 1.0,
+            })
+            expect(#SAMPLER_CALLS > 0).to.equal(true)
+            local allow = SAMPLER_CALLS[1].allow
+            -- Five moves out of mode 1, six inside it — never the four
+            -- of the player alphabet.
+            expect(#allow == 5 or #allow == 6).to.equal(true)
+        end)
+
+        it("draws for both seats when the opponent is a Card too", function()
+            reset()
+            ALIAS_TO_HANDLE["boss_charger"] = make_boss_handle("c")
+            level(make_handle("a"), "boss_charger", 1, 0, {
+                opponent_style = "guardian",
+                temperature = 1.0,
+            })
+            local player_draws, boss_draws = 0, 0
+            for _, call in ipairs(SAMPLER_CALLS) do
+                if #call.allow == #MOVE_IDS then
+                    player_draws = player_draws + 1
+                else
+                    boss_draws = boss_draws + 1
+                end
+            end
+            expect(player_draws > 0).to.equal(true)
+            expect(boss_draws > 0).to.equal(true)
+        end)
+
+        it("replays the same run from the same seed", function()
+            reset()
+            local h = make_handle("a")
+            local a = level(h, "greedy", 3, 2, { temperature = 1.0 })
+            local first = #SAMPLER_CALLS
+            local b = level(h, "greedy", 3, 2, { temperature = 1.0 })
+            expect(a.win_rate).to.equal(b.win_rate)
+            expect(#SAMPLER_CALLS - first).to.equal(first)
+        end)
+
+        it("never touches the sampler when no temperature is named", function()
+            reset()
+            local greedy = level(make_handle("a"), "greedy", 4, 1)
+            expect(#SAMPLER_CALLS).to.equal(0)
+            expect(type(greedy.win_rate)).to.equal("number")
+        end)
+
+        it("refuses a non-positive or non-finite temperature", function()
+            reset()
+            local h = make_handle("a")
+            for _, bad in ipairs({ 0, -1, math.huge, 0 / 0 }) do
+                local ok, err = pcall(level, h, "greedy", 4, 1, { temperature = bad })
+                expect(ok).to.equal(false)
+                expect(err:find("temperature") ~= nil).to.equal(true)
+            end
+            local ok, err = pcall(level, h, "greedy", 4, 1, { temperature = "hot" })
+            expect(ok).to.equal(false)
+            expect(err:find("temperature") ~= nil).to.equal(true)
+        end)
+
+        it("refuses a temperature on a build without the sampler", function()
+            reset()
+            local ok, err = without_sampler(function()
+                return level(make_handle("a"), "greedy", 4, 1, { temperature = 1.0 })
+            end)
+            expect(ok).to.equal(false)
+            expect(err:find("sampler") ~= nil).to.equal(true)
+        end)
+
+        it("still answers a greedy call on a build without the sampler", function()
+            reset()
+            local ok, result = without_sampler(function()
+                return level(make_handle("a"), "greedy", 4, 1)
+            end)
+            expect(ok).to.equal(true)
+            expect(result.n_games).to.equal(4)
+        end)
+    end)
+
+    describe("game length and hp margin", function()
+        it("reports both per opponent and pooled", function()
+            reset()
+            local h = make_handle("b")
+            local result = level(h, nil, 4, 1, { opponents = { "greedy", "random" } })
+            for _, name in ipairs({ "greedy", "random" }) do
+                local row = result.per_opponent[name]
+                expect(type(row.game_length_mean)).to.equal("number")
+                expect(type(row.final_hp_margin_mean)).to.equal("number")
+                expect(row.game_length_mean >= 1).to.equal(true)
+                expect(row.game_length_mean <= duel.TURN_LIMIT).to.equal(true)
+            end
+            local mean = (
+                result.per_opponent.greedy.game_length_mean
+                + result.per_opponent.random.game_length_mean
+            ) / 2
+            expect(math.abs(result.game_length_mean - mean) < 1e-9).to.equal(true)
+            local margin = (
+                result.per_opponent.greedy.final_hp_margin_mean
+                + result.per_opponent.random.final_hp_margin_mean
+            ) / 2
+            expect(math.abs(result.final_hp_margin_mean - margin) < 1e-9).to.equal(true)
+        end)
+
+        it("reads the margin boss-minus-player, whichever seat is measured", function()
+            reset()
+            local h = make_handle("a")
+            -- Same player Card, two boss policies, one sign convention.
+            --
+            -- The teacher trades health for health and comes out ahead
+            -- of a player who never blocks: boss minus player is
+            -- positive even though the *player* seat is the measured
+            -- one, so the sign tracks the boss and not the seat.
+            local scripted = level(h, "greedy", 2, 1)
+            expect(scripted.final_hp_margin_mean > 0).to.equal(true)
+
+            -- A boss that only ever charges deals nothing and blocks
+            -- everything after the opening hit, so it ends exactly that
+            -- hit (4) behind an untouched player, for all nine turns.
+            local carded = level(h, make_boss_handle("c"), 2, 1, {
+                opponent_style = "guardian",
+            })
+            expect(carded.final_hp_margin_mean).to.equal(-4.0)
+            expect(carded.game_length_mean).to.equal(duel.TURN_LIMIT)
+        end)
+
+        it("is additive: the pre-existing fields keep their values", function()
+            reset()
+            local h = make_handle("b")
+            local a = level(h, "greedy", 4, 1)
+            local b = level(h, "greedy", 4, 1)
+            expect(a.win_rate).to.equal(b.win_rate)
+            expect(a.wins).to.equal(b.wins)
+            expect(a.n_games).to.equal(b.n_games)
+            expect(a.win_rate_min).to.equal(b.win_rate_min)
+            expect(a.per_opponent.greedy.win_rate).to.equal(a.win_rate)
         end)
     end)
 end)

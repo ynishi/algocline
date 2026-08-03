@@ -88,8 +88,19 @@ M.trickiness = require("gameai_metrics.trickiness")
 M.level = require("gameai_metrics.level")
 
 --- Seat options every metric accepts, lifted out of a registry ctx.
+---
+--- `opponent_style` and `temperature` are `level`-only opts, but they are
+--- lifted here rather than at the `level` registration so the ctx keys
+--- stay in one place. A metric that does not read them ignores a `nil`,
+--- whereas dropping them would turn a ctx that names one into a loud
+--- error from `level` about an opt the caller did pass.
 local function seat_opts(ctx)
-    return { seat = ctx.seat, style = ctx.style }
+    return {
+        seat = ctx.seat,
+        style = ctx.style,
+        opponent_style = ctx.opponent_style,
+        temperature = ctx.temperature,
+    }
 end
 
 --- Self-register into the per-VM `alc.nn.metric.registry` so the trainer

@@ -34,12 +34,67 @@
 ---    token that spells a legal move. That is greedy decoding
 ---    restricted to the legal subset.
 ---
+--- ## The noisy decode
+---
+--- Greedy decoding answers one position one way forever, which is what
+--- the determinism check fences and what makes a batch of fights a
+--- batch of copies. The noisy path answers the same position by
+--- *drawing* from the model, and it stays legal by construction rather
+--- than by a scan: a temperature sampler is wrapped in
+--- `alc.nn.constraint.allow_list` over the token ids of the moves this
+--- state allows, so every other logit is `-inf` before the draw
+--- happens.
+---
+--- The allow list is built per decision here, unlike the player seat
+--- where the four moves are a module constant: the boss legal set is a
+--- function of the state (the twin slam needs mode 1), so a mask hoisted
+--- out of the loop would offer the slam on a state that forbids it.
+---
+--- The chain is rebuilt for every decision too. That is the intended
+--- shape rather than a cost: `alc.nn.sampler.constrained` consumes both
+--- of its arguments (a sampler owns its RNG, and two handles onto one
+--- RNG would interleave draws from generations that each believe they
+--- are reproducible from their seed), so a cached chain is a spent one.
+--- The seed is therefore required rather than defaulted — the caller
+--- derives it, and a replay that derives it the same way draws the same
+--- move.
+---
+--- `raw_legal` is computed on the noisy path exactly as on the greedy
+--- one, off the ungated argmax, and on this seat it carries more than
+--- the player one does: the legal set moves with the state, so an
+--- argmax that was legal on a rolled-up boss is illegal on the same
+--- model's next position. A `raw_legal` that sags is therefore either a
+--- model that stopped answering the question or one that keeps reaching
+--- for the slam it may not play — both are the gate doing the work the
+--- draw cannot report on its own.
+---
+--- The seed is the caller's to derive. Three conventions live in this
+--- repo and they are all per-decision seeds handed to one chain, which
+--- is the semantics that has to agree; how the number is reached is the
+--- caller's layer:
+---
+--- - `gameai_metrics.level` — `base + k` for a run-local counter `k`
+---   incremented once per draw, so a whole pool replays from one seed.
+--- - `guardian_player_npc` autoplay — `seed + game * (TURN_LIMIT + 1)
+---   + turn`, a stride one wider than the longest fight, so a single
+---   turn of a single game replays without walking the fights before it.
+--- - `guardian_duel_npc` self-play — `seed * RNG_STRIDE + i` for the
+---   *player* RNG of fight `i` (`alc.math.rng_create`), the same
+---   one-stream-per-fight rule applied to a scripted opponent.
+---
 --- ## Entry contract
 ---
 --- `ctx.task` is a JSON object with a `mode` field:
 ---
 --- - `decide` — `{ state }`; returns
 ---   `action=<move> legal=true raw_legal=<bool> gated=<bool>`
+--- - `decide_noisy` — `{ state, seed, temperature? }`; draws one move
+---   under the legal mask of that state and returns
+---   `action=<move> legal=true raw_legal=<bool> noisy=true
+---   temperature=<t> seed=<n>`. `seed` is required and `temperature`
+---   defaults to 1.0. There is no `gated` field: a draw that lands away
+---   from the argmax is the sampler doing its job, not a gate stepping
+---   in.
 --- - `determinism` — `{ state }`; decodes twice through independent
 ---   sessions and returns `deterministic=<bool> action=<move>`
 --- - `selfplay` — `{ games, seed, style?, policy_source? }`; plays the
@@ -112,8 +167,9 @@ if T then
     run_entry = {
         input = T.shape({
             task = T.string:describe(
-                "JSON object with a mode field: decide / determinism / selfplay "
-                    .. "(selfplay also takes an optional style naming the teacher policy)"
+                "JSON object with a mode field: decide / decide_noisy / determinism / "
+                    .. "selfplay (decide_noisy takes the seed it draws under, selfplay "
+                    .. "an optional style naming the teacher policy)"
             ),
             card_alias = T.string:is_optional():describe(
                 "Card alias holding the tuned model, also readable from the task JSON "
@@ -166,6 +222,30 @@ local function require_nn()
         error("guardian_duel_npc: alc.nn.card is unavailable; build algocline with --features nn")
     end
     return alc.nn
+end
+
+--- The two namespaces the noisy path draws through.
+---
+--- Checked separately from `require_nn` rather than folded into it: a
+--- build old enough to have `alc.nn.card` but not
+--- `alc.nn.constraint.allow_list` can still answer every greedy mode,
+--- so the greedy caller must not be turned away by a surface only the
+--- draw needs.
+local function require_sampler()
+    local nn = require_nn()
+    if
+        type(nn.sampler) ~= "table"
+        or type(nn.sampler.temperature) ~= "function"
+        or type(nn.sampler.constrained) ~= "function"
+        or type(nn.constraint) ~= "table"
+        or type(nn.constraint.allow_list) ~= "function"
+    then
+        error(
+            "guardian_duel_npc: alc.nn.sampler.temperature / .constrained and "
+                .. "alc.nn.constraint.allow_list are required for a noisy decode"
+        )
+    end
+    return nn
 end
 
 local function require_math()
@@ -289,6 +369,135 @@ local function decide(handle, state, style)
     error("guardian_duel_npc: no legal token found in the full logit ranking")
 end
 
+--- The legal token ids of one state as a list, in
+--- `guardian_duel.legal_actions` order, which is the shape
+--- `alc.nn.constraint.allow_list` takes.
+---
+--- A second reading of the same set rather than a change to
+--- `legal_token_ids`: the greedy gate wants the id-keyed map (it walks a
+--- ranking and asks "is this one legal"), the mask wants the sequence,
+--- and the two callers are answered without either paying for the
+--- other's shape. The list is built off the `moves` the map function
+--- already returned, so both come from one `legal_actions` call and
+--- cannot drift; the empty-state and unknown-token failures are that
+--- function's, and they fire before any sampler surface is touched.
+---@param state table Boss state
+---@return integer[] ids Legal token ids, in legal-move order
+---@return table by_id Legal token id -> move, the greedy gate's map
+local function legal_token_id_list(state)
+    local by_id, moves = legal_token_ids(state)
+    local ids = {}
+    for _, action in ipairs(moves) do
+        ids[#ids + 1] = VOCAB.to_id[action]
+    end
+    return ids, by_id
+end
+
+--- Temperature a noisy decode draws at when the caller names none.
+local DEFAULT_TEMPERATURE = 1.0
+
+--- Check a requested temperature.
+---
+--- Zero is rejected rather than folded into greedy decoding: a caller
+--- who means greedy has a mode for it, and a division by zero inside
+--- the sampler is not the way to find out that they did not.
+local function decode_temperature(raw)
+    if raw == nil then
+        return DEFAULT_TEMPERATURE
+    end
+    if type(raw) ~= "number" or raw ~= raw or raw == math.huge or raw <= 0 then
+        error(
+            string.format(
+                "guardian_duel_npc: task.temperature must be a finite positive number, got %s",
+                tostring(raw)
+            )
+        )
+    end
+    return raw
+end
+
+--- Check a requested sampler seed.
+---
+--- Required, never defaulted. A default would make the draw of a given
+--- position depend on nothing the caller can write down, which is
+--- exactly the reproducibility the sampler carries its own RNG for: the
+--- caller derives the seed (a turn number, a run seed plus an index)
+--- and a replay that derives it the same way draws the same move.
+local function require_seed(raw, field)
+    if raw == nil then
+        error(
+            string.format(
+                "guardian_duel_npc: %s is required for a noisy decode; derive it from the "
+                    .. "caller's own counter so the draw can be replayed",
+                field
+            )
+        )
+    end
+    if type(raw) ~= "number" or raw ~= raw or raw == math.huge or raw < 0 then
+        error(
+            string.format(
+                "guardian_duel_npc: %s must be a non-negative finite number, got %s",
+                field,
+                tostring(raw)
+            )
+        )
+    end
+    return math.floor(raw)
+end
+
+--- One noisy decision, legal by construction.
+---
+--- The mask is applied inside the sampler rather than after it: every
+--- logit outside the state's legal ids is `-inf` before the draw, so an
+--- illegal move is not rejected and redrawn, it is not representable.
+--- The chain is built here, per decision, because
+--- `alc.nn.sampler.constrained` moves both of its arguments — a chain
+--- held across decisions would be a spent handle on the second one.
+---
+--- This is the same chain `gameai_metrics.level` builds for the boss
+--- seat (`boss_seat.legal` ids, `boss_seat.encode` prompt, one
+--- `constrained(temperature(t, seed), allow_list(ids))` per decision).
+--- The two are separate implementations on purpose — the NPC's public
+--- API is `run` / `reset_cache`, so the measurement side cannot require
+--- this one (see `gameai_metrics/boss_seat.lua`) — and
+--- `spec/guardian_duel_noisy_equivalence_spec.lua` pins them together.
+---@param handle userdata NnHandle
+---@param state table Boss state
+---@param style string Distance basis the state is encoded against
+---@param temperature number Draw temperature, already validated
+---@param seed integer Sampler seed, already validated
+---@return table decision `{ action, raw_legal }`
+local function decide_noisy(handle, state, style, temperature, seed)
+    local allow_ids, legal_ids = legal_token_id_list(state)
+    local nn = require_sampler()
+    local prompt = duel.encode(state, style) .. ">"
+    local session = handle:generate_session(duel.to_ids(prompt))
+    local logits = session:next_logits()
+
+    local raw_legal = legal_ids[logits:argmax()] ~= nil
+
+    local sampler = nn.sampler.constrained(
+        nn.sampler.temperature(temperature, seed),
+        nn.constraint.allow_list(allow_ids)
+    )
+    local id = sampler:sample(logits)
+    local action = legal_ids[id]
+    if action == nil then
+        -- Unreachable while the mask holds: the allow list is the legal
+        -- set of this very state. Kept loud so a mask that stopped
+        -- binding surfaces here rather than as an illegal move reaching
+        -- `guardian_duel.apply`.
+        error(
+            string.format(
+                "guardian_duel_npc: the constrained sampler drew token %s, "
+                    .. "which is not a legal boss move",
+                tostring(id)
+            )
+        )
+    end
+    return { action = action, raw_legal = raw_legal }
+end
+
 -- ─── Modes ──────────────────────────────────────────────────────────
 
 --- The boss state a decode request carries.
@@ -313,6 +522,29 @@ local function mode_decide(handle, req, style)
         d.action,
         tostring(d.raw_legal),
         tostring(d.gated)
+    )
+end
+
+--- Format a temperature for the summary.
+---
+--- `%g` rather than a fixed number of decimals: the field is an echo of
+--- what the caller asked for, and rounding an echo makes a sweep report
+--- a temperature nobody ran.
+local function format_temperature(t)
+    return string.format("%g", t)
+end
+
+local function mode_decide_noisy(handle, req, style)
+    local state = decode_state(req)
+    local temperature = decode_temperature(req.temperature)
+    local seed = require_seed(req.seed, "task.seed")
+    local d = decide_noisy(handle, state, style, temperature, seed)
+    return string.format(
+        "action=%s legal=true raw_legal=%s noisy=true temperature=%s seed=%d",
+        d.action,
+        tostring(d.raw_legal),
+        format_temperature(temperature),
+        seed
     )
 end
 
@@ -412,6 +644,10 @@ local COMMON_FIELDS = { mode = true, card_alias = true }
 --- a field without saying so here.
 local MODES = {
     decide = { fields = { state = true }, run = mode_decide },
+    decide_noisy = {
+        fields = { state = true, temperature = true, seed = true },
+        run = mode_decide_noisy,
+    },
     determinism = { fields = { state = true }, run = mode_determinism },
     selfplay = {
         fields = { games = true, seed = true, style = true, policy_source = true },

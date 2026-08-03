@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/gameai/gameai_metrics/fight_matrix.lua` — Card-vs-Card
+  fight matrix runner: every boss Card of a harvest collection (or an
+  explicit alias list) against every player Card of a pool.
+  `fm.new{collection_path | bosses, players, n_games, seed, style,
+  temperature}` builds the runner; `fight:run()` plays one `level`
+  call per boss row (`seat = "boss"`, the player pool as
+  `opts.opponents`) and reports one cell per pairing — boss-seat
+  `win_rate` with a Wilson CI, `game_length_mean` and
+  `final_hp_margin_mean`. A temperature is mandatory (default `1.0`):
+  the duel engine carries no RNG and its openings do not vary, so the
+  decode draw is the only source of variance a Card-vs-Card fight
+  has, and greedy has no spelling on this runner.
+  `fight:save(path)` writes the report as JSON through the shared
+  auto-mkdir helper. 33 spec tests.
+
+- `examples/gameai/fight_boss_collection.lua` — thin `alc_run` driver
+  around `fight_matrix`. Takes `ctx.collection_path` + `ctx.players`
+  + `ctx.output` (required) and the standard opt fields as
+  passthroughs; logs a one-line header plus one line per cell
+  (`win_rate` / CI / game length / hp margin) after `:save()`.
+
 - `examples/gameai/gameai_metrics/audit_matrix.lua` — post-hoc auditor
   for a boss harvest manifest. `am.new{collection_path | aliases,
   n_games, prompt_set_size, seed, style, teacher_alias}` builds an
@@ -297,6 +318,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generalises".
 
 ### Changed
+
+- `examples/gameai/gameai_metrics/level.lua`: the opponent seat now
+  accepts a Card on both sides. With `seat = "player"` the opponent
+  may be a boss Card (alias or handle), decoded through `boss_seat`
+  against a new required `opts.opponent_style`; with `seat = "boss"`
+  the opponent may be a player Card, decoded against the player view
+  of the same `opts.style` the boss reads. The reserved names
+  (`"greedy"` / `"random"`) keep their scripted policies and shadow
+  aliases of the same spelling. A new `opts.temperature` switches
+  every Card decode of a run (measured Card and Card opponent, either
+  seat) to a legal-masked draw through the
+  `alc.nn.sampler.constrained` chain, seeded per decision from
+  `seed + k`; omitted, decoding stays greedy and the pre-change
+  numbers reproduce byte for byte. The output gains
+  `game_length_mean` and `final_hp_margin_mean` (boss hp minus
+  player hp, boss-perspective on both seats), pooled and per
+  opponent; existing fields are unchanged. The metric registry
+  adapter forwards the two new opts. 24 further spec tests (51
+  total).
+
+- `examples/gameai/bake_guardian_player_from_log.lua`: the logged
+  turns can now arrive as `ctx.moves_path` — a path to a JSON file
+  holding the same array `ctx.moves` takes inline (e.g. the shipped
+  `data/guardian_sample_playlog_train.json`). The two spellings are
+  exclusive; passing both, or neither, is a loud error naming both.
+  The header also documents the `log_match` ceiling a
+  script-slotted corpus carries (a view that maps to contradicting
+  labels caps the match below 1.0 by construction — the shape of
+  the log, not a failed bake).
 
 - `examples/gameai/gameai_metrics`: the three metrics now accept a live
   handle as **userdata** as well as a table. `style_distance` /

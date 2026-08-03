@@ -977,6 +977,34 @@ crashed the trainer mid-run; `_fs.ensure_parent_dir` runs `mkdir
 -p` under a POSIX single-quote escape so any path the caller can
 name is safe to hand to `:save()`.
 
+### Fighting a collection against player Cards
+
+`gameai_metrics.fight_matrix` is the step after the audit: instead
+of describing each boss Card in isolation, it plays every boss Card
+of a collection against every player Card of a pool and reports one
+cell per pairing — boss-seat `win_rate` with a Wilson CI, plus the
+mean game length and the mean final hp margin (`boss.hp -
+player.hp`), the two numbers that tell a close brawl from a rout
+when the rate alone cannot. Both seats decode their own vocabulary
+on their own seat, so the fight stays the fixed-role game the rules
+implement.
+
+The matrix always runs under a decode temperature (default `1.0`).
+`guardian_duel` carries no RNG and its openings do not vary, so two
+greedy Cards replay one identical game N times; the decode draw is
+the only source of variance a Card-vs-Card fight has, and `1.0` is
+the same scale `trickiness` measures entropy on — an audit's
+`trickiness_norm` and the spread of a fight refer to one
+distribution. The player axis is fed by
+`bake_guardian_player_from_log.lua`, which now also accepts
+`ctx.moves_path` (a JSON file holding the logged turns, e.g. the
+shipped `data/guardian_sample_playlog_train.json`) as the exclusive
+alternative to an inline `ctx.moves` array.
+`examples/gameai/fight_boss_collection.lua` is the thin `alc_run`
+driver: a harvest manifest for the boss axis, a `players` alias
+array, an `output` path, and it writes the matrix as JSON plus one
+summary line per cell.
+
 ## Known limitations
 
 - Style compliance depends on the training budget. The defaults (800

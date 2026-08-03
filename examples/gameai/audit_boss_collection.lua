@@ -20,6 +20,7 @@
 --       seed            = 20260731,
 --       style           = "guardian",
 --       teacher_alias   = "guardian_duel_npc",
+--       temperature     = 1.0,
 --     },
 --   )
 --
@@ -50,6 +51,13 @@
 -- - `teacher_alias` (default `nil`) — when set the runner adds an
 --   `sd_teacher` view and reports `sd_teacher` per Card. Pin one to
 --   see how far each baked Card sits from the teacher policy.
+-- - `temperature` (default `nil` = greedy) — when set, the per-Card
+--   `level` view decodes at that temperature instead of greedily, and
+--   the value lands on `meta.temperature`. Pass `1.0` to read a Card
+--   on the same decode scale a `fight_matrix` run uses, which is what
+--   makes an audit and a fight differ in one variable. Only the
+--   number-ness is checked on the driver; the runner owns the
+--   positive / finite rule and the "absent means greedy" rule.
 --
 -- ## Return / log
 --
@@ -121,6 +129,29 @@ local function optional_int(field, default)
     return math.floor(v)
 end
 
+--- Decode an optional number field, falling back to `default`. Unlike
+--- `optional_int` the value keeps its fractional part — a temperature
+--- of `0.7` is a legitimate ask and flooring it would silently turn it
+--- into greedy-ish nonsense. The positive / finite check stays in the
+--- runner (`audit_matrix`'s temperature decode), which owns the
+--- "absent means greedy" rule.
+local function optional_number(field, default)
+    local v = ctx_field(field)
+    if v == nil then
+        return default
+    end
+    if type(v) ~= "number" then
+        error(
+            string.format(
+                "audit_boss_collection: ctx.%s must be a number or nil, got %s",
+                field,
+                type(v)
+            )
+        )
+    end
+    return v
+end
+
 --- Decode an optional string field, falling back to `default` (which
 --- may be `nil` for a field that has no default at all, e.g.
 --- `teacher_alias`).
@@ -148,6 +179,7 @@ local PROMPT_SET_SIZE = optional_int("prompt_set_size", am.DEFAULT_PROMPT_SET_SI
 local SEED = optional_int("seed", am.DEFAULT_SEED)
 local STYLE = optional_string("style", "guardian")
 local TEACHER_ALIAS = optional_string("teacher_alias", nil)
+local TEMPERATURE = optional_number("temperature", nil)
 
 local function log(msg)
     alc.log("info", "[gameai-audit] " .. msg)
@@ -183,22 +215,24 @@ local audit = am.new({
     seed = SEED,
     style = STYLE,
     teacher_alias = TEACHER_ALIAS,
+    temperature = TEMPERATURE,
 })
 
 local report = audit:run()
 audit:save(OUTPUT)
 
 local aliases = sorted_aliases(report.sd_matrix)
-log(
-    string.format(
-        "audit: style=%s n_games=%d prompt_set=%d aliases=%d -> %s",
-        STYLE,
-        N_GAMES,
-        report.meta.prompt_set_size,
-        #aliases,
-        OUTPUT
-    )
-)
+log(string.format(
+    "audit: style=%s n_games=%d prompt_set=%d temperature=%s aliases=%d -> %s",
+    STYLE,
+    N_GAMES,
+    report.meta.prompt_set_size,
+    -- `greedy` rather than `-`: the field distinguishes the two
+    -- decode modes at a glance when several audit runs scroll by.
+    TEMPERATURE ~= nil and string.format("%g", TEMPERATURE) or "greedy",
+    #aliases,
+    OUTPUT
+))
 
 -- Per-Card summary: one line per alias, tab-separated
 -- `alias / win_rate / sd_teacher / trickiness`. `sd_teacher` is `-`

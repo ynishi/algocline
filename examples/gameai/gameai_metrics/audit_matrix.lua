@@ -44,6 +44,33 @@
 --- gameai side is the same call `harvest_collection` made for the same
 --- reason.
 ---
+--- ## Why a temperature is optional here
+---
+--- `fight_matrix` has no spelling for greedy: two baked Cards decoding
+--- greedily replay a single game N times, so the win rate over that
+--- batch is a rate over one sample. This runner measures each Card
+--- against a *scripted* opponent (`policy_boss_random` /
+--- `policy_player_random`), and those policies carry their own RNG. A
+--- greedy Card therefore still meets a different opponent line every
+--- game: the batch has real spread and its Wilson interval stays an
+--- interval rather than collapsing to a point. The measured backing is
+--- the greedy audit already on disk — its weak band landed on a win
+--- rate of 0.075 with a Wilson interval of [0.046, 0.120] over 200
+--- games, which is an interval and not a point.
+---
+--- So `opts.temperature` is optional here and an absent key means
+--- greedy — the exact path every audit before it took, which is what
+--- keeps a greedy run comparable against the ones already saved. A
+--- caller who wants to read a Card on the same decode scale a fight
+--- uses passes `1.0` explicitly; that is what lets an audit and a
+--- fight differ in one variable at a time. The asymmetry with
+--- `fight_matrix` is deliberate and runs the other way: there greedy
+--- has no meaning, here it is a legitimate baseline.
+---
+--- A supplied value is still checked. Anything that is not a finite
+--- positive number is a caller mistake rather than a request for
+--- greedy, so it raises instead of quietly falling back.
+---
 --- ## Contract
 ---
 --- ```lua
@@ -58,6 +85,7 @@
 ---     seed = 20260731,
 ---     style = "guardian",      -- required, one of guardian_duel.STYLES
 ---     teacher_alias = "guardian_duel_npc",  -- optional
+---     temperature = 1.0,       -- optional; omitted = greedy
 --- })
 ---
 --- local report = audit:run()
@@ -83,7 +111,8 @@
 ---         [alias_i] = { [alias_j] = <number>, ... },   -- symmetric, diag 0
 ---         ...
 ---     },
----     meta = { n_games, prompt_set_size, seed, style, teacher_alias, ... },
+---     meta = { n_games, prompt_set_size, seed, style, teacher_alias,
+---              temperature, ... },   -- temperature absent when greedy
 --- }
 --- ```
 ---
@@ -208,6 +237,34 @@ local function decode_int(raw, default, field, must_be_positive)
         )
     end
     return i
+end
+
+--- Decode the optional audit temperature.
+---
+--- An absent key returns `nil` and means greedy (see the header: an
+--- audit's opponent carries its own RNG, so a greedy measurement is
+--- still a measurement with spread). `nil` travels on rather than
+--- turning into a default, so the level view config stays byte-identical
+--- to the pre-temperature audit and `level` takes its greedy path.
+---
+--- A key that *is* present is held to the same shape `fight_matrix`
+--- demands: finite, numeric and positive. Refusing it here rather than
+--- inside `level` names the layer the caller called.
+local function decode_temperature(raw)
+    if raw == nil then
+        return nil
+    end
+    if type(raw) ~= "number" or raw ~= raw or raw == math.huge or raw <= 0 then
+        error(
+            string.format(
+                "audit_matrix: opts.temperature must be a finite positive number "
+                    .. "(omit the key for a greedy audit), got %s",
+                tostring(raw)
+            ),
+            3
+        )
+    end
+    return raw
 end
 
 --- Build a prompt set of boss states by seeding fresh games. The
@@ -383,15 +440,26 @@ end
 --- The `sd_teacher` view is only added when a `teacher_alias` was
 --- supplied; without one the view would have no reference Card to
 --- measure against.
-local function build_views(style, prompt_set, teacher_alias, n_games, seed)
+---
+--- `temperature` reaches the `level` view only. `trickiness` reads its
+--- own `ctx.temperature or 1.0` in the registry adapter, so putting a
+--- key here would move the entropy axis off the scale every earlier
+--- audit measured it on; `style_distance` compares distributions the
+--- same way for the same reason. A `nil` temperature adds no key at
+--- all, which is what keeps the greedy report byte-identical.
+local function build_views(style, prompt_set, teacher_alias, n_games, seed, temperature)
+    local level_config = {
+        seat = "boss",
+        opponents = { "random" },
+        style = style,
+        n_games = n_games,
+        seed = seed,
+    }
+    if temperature ~= nil then
+        level_config.temperature = temperature
+    end
     local views = {
-        am.view("level", "level", {
-            seat = "boss",
-            opponents = { "random" },
-            style = style,
-            n_games = n_games,
-            seed = seed,
-        }),
+        am.view("level", "level", level_config),
         am.view("trickiness", "trickiness", {
             seat = "boss",
             style = style,
@@ -576,8 +644,14 @@ function Audit:run()
         }
     end
 
-    local views =
-        build_views(self._style, self._prompt_set, self._teacher_alias, self._n_games, self._seed)
+    local views = build_views(
+        self._style,
+        self._prompt_set,
+        self._teacher_alias,
+        self._n_games,
+        self._seed,
+        self._temperature
+    )
 
     local per_card = {}
     for _, card in ipairs(cards) do
@@ -607,6 +681,13 @@ function Audit:run()
     }
     if self._teacher_alias ~= nil then
         meta.teacher_alias = self._teacher_alias
+    end
+    -- Absent means greedy. Recording a `1.0` (or a literal "greedy")
+    -- for a run that never asked for one would make the two decodes
+    -- indistinguishable in the saved JSON, which is the one thing a
+    -- decode-effect comparison reads the meta for.
+    if self._temperature ~= nil then
+        meta.temperature = self._temperature
     end
     if self._collection_path ~= nil then
         meta.collection_path = self._collection_path
@@ -694,6 +775,11 @@ end
 ---   verbatim into every boss-seat view.
 --- - `teacher_alias` — optional string; when set, the runner adds an
 ---   `sd_teacher` view and reports `sd_teacher` per Card.
+--- - `temperature` — optional finite positive number, pushed into the
+---   `level` view only. Absent means greedy (see the header for why
+---   that is a legitimate baseline here and not on `fight_matrix`);
+---   present and non-positive / non-finite raises. Recorded on
+---   `meta.temperature` only when it was supplied.
 ---
 ---@param opts table
 ---@return table audit
@@ -725,6 +811,7 @@ function M.new(opts)
     local prompt_set_size =
         decode_int(opts.prompt_set_size, DEFAULT_PROMPT_SET_SIZE, "prompt_set_size", true)
     local seed = decode_int(opts.seed, DEFAULT_SEED, "seed", false)
+    local temperature = decode_temperature(opts.temperature)
 
     local prompt_set
     if opts.prompt_set ~= nil then
@@ -759,6 +846,7 @@ function M.new(opts)
         _n_games = n_games,
         _prompt_set_size = #prompt_set,
         _seed = seed,
+        _temperature = temperature,
         _prompt_set = prompt_set,
         _collection_path = opts.collection_path,
         _report = nil,

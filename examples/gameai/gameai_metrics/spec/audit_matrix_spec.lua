@@ -272,9 +272,31 @@ local function set_level(alias, win_rate, ci_lower, ci_upper)
     }
 end
 
+--- Every ctx the registry was evaluated with, in fire order (the
+--- `EVAL_CALLS` harness `spec/train_guardian_npc_spec.lua` uses for the
+--- same job). A view config is not readable from the outside, so the
+--- view-assembly specs read it where it actually lands: the ctx the
+--- metric was handed. `anymetric.observe` merges the view config with
+--- the shared ctx (`{card, step}` only here), so a key absent from
+--- both is absent on this ctx — which is exactly what "this view
+--- carries no temperature" means.
+local EVAL_CALLS = {}
+
+--- Every ctx the named metric was evaluated with, in fire order.
+local function calls_to(name)
+    local out = {}
+    for _, call in ipairs(EVAL_CALLS) do
+        if call.name == name then
+            out[#out + 1] = call.ctx
+        end
+    end
+    return out
+end
+
 alc.nn.metric = alc.nn.metric or {}
 alc.nn.metric.registry = {
     evaluate = function(name, ctx)
+        EVAL_CALLS[#EVAL_CALLS + 1] = { name = name, ctx = ctx }
         if name == "level" then
             local alias = ctx.card and ctx.card.alias
             local canned = LEVEL_BY_ALIAS[alias]
@@ -356,6 +378,10 @@ local function reset_all()
     TRICKY_BY_ALIAS = {}
     SD_TEACHER_BY_ALIAS = {}
     SD_PAIR = {}
+    -- Fire log is per-case: a leaked ctx from an earlier case would
+    -- make a "the level view carries a temperature" assertion pass off
+    -- another case's fire.
+    EVAL_CALLS = {}
     -- Re-install so the load_handle closure sees the fresh tables.
     alc.nn.card.load_handle = function(card_id)
         return HANDLES_BY_CARD_ID[card_id]
@@ -839,5 +865,198 @@ describe("gameai_metrics.audit_matrix:save", function()
         local ok, err = pcall(audit.save, audit, 42)
         expect(ok).to.equal(false)
         expect(err:find("non%-empty string") ~= nil).to.equal(true)
+    end)
+end)
+
+-- ─── Specs: temperature / view assembly ─────────────────────────────
+--
+-- Three constraints shape how these are written:
+--
+-- 1. The observable surface is the *merged* ctx, not the view config.
+--    `shared_ctx` here is `{card, step}`, so `ctx.temperature == nil`
+--    on a fire is equivalent to "the view config carried no
+--    temperature key".
+-- 2. `anymetric.observe` wraps every fire in `pcall` and turns a raise
+--    into an error record, so a wrong assertion inside a stub would be
+--    swallowed. Every case therefore captures positively: it asserts
+--    the fire count first and then reads the recorded ctx.
+-- 3. `style_distance` fires through two paths — the `sd_teacher` view
+--    (`ctx.card_b` is the teacher alias *string*) and the pair-wise
+--    matrix (`ctx.card_b` is a handle *table*). The existing stub
+--    already splits on that, and so does `sd_teacher_calls` below.
+
+--- The `sd_teacher` view fires only, i.e. the `style_distance` ctxs
+--- whose `card_b` is a teacher alias string rather than a handle.
+local function sd_teacher_calls()
+    local out = {}
+    for _, sd_ctx in ipairs(calls_to("style_distance")) do
+        if type(sd_ctx.card_b) == "string" then
+            out[#out + 1] = sd_ctx
+        end
+    end
+    return out
+end
+
+describe("gameai_metrics.audit_matrix — temperature view assembly", function()
+    --- Two audited Cards plus a pinned teacher, so all three view
+    --- kinds fire: level, trickiness and sd_teacher (per Card) and one
+    --- pair-wise style_distance for the (a, b) pair.
+    local function temp_audit(temperature)
+        reset_all()
+        seed_alias("a", { 0.5, 0.4, 0.6 }, 0.3, 0.21)
+        seed_alias("b", { 0.5, 0.4, 0.6 }, 0.3, 0.22)
+        set_sd_pair("a", "b", 0.1)
+        make_handle("teacher")
+        return audit_matrix.new({
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            teacher_alias = "teacher",
+            n_games = 50,
+            prompt_set_size = 2,
+            seed = 7,
+            temperature = temperature,
+        })
+    end
+
+    it("pushes the temperature into every level fire", function()
+        local audit = temp_audit(0.7)
+        audit:run()
+        local level_ctxs = calls_to("level")
+        -- One fire per audited Card; the count is asserted first so a
+        -- swallowed raise cannot pass as "nothing to check".
+        expect(#level_ctxs).to.equal(2)
+        for _, level_ctx in ipairs(level_ctxs) do
+            expect(level_ctx.temperature).to.equal(0.7)
+            -- The rest of the level view config is untouched.
+            expect(level_ctx.seat).to.equal("boss")
+            expect(level_ctx.style).to.equal(BASE_STYLE)
+            expect(level_ctx.n_games).to.equal(50)
+            expect(level_ctx.seed).to.equal(7)
+            expect(level_ctx.opponents[1]).to.equal("random")
+        end
+    end)
+
+    it("leaves the trickiness fires without a temperature", function()
+        local audit = temp_audit(0.7)
+        audit:run()
+        local tricky_ctxs = calls_to("trickiness")
+        expect(#tricky_ctxs).to.equal(2)
+        for _, tricky_ctx in ipairs(tricky_ctxs) do
+            -- The registry adapter reads `ctx.temperature or 1.0`, so an
+            -- absent key here keeps the entropy axis on the same scale
+            -- every earlier audit measured it on.
+            expect(tricky_ctx.temperature).to.equal(nil)
+            expect(tricky_ctx.seat).to.equal("boss")
+        end
+    end)
+
+    it("leaves the sd_teacher fires without a temperature", function()
+        local audit = temp_audit(0.7)
+        audit:run()
+        local sd_ctxs = sd_teacher_calls()
+        expect(#sd_ctxs).to.equal(2)
+        for _, sd_ctx in ipairs(sd_ctxs) do
+            expect(sd_ctx.temperature).to.equal(nil)
+            expect(sd_ctx.card_b).to.equal("teacher")
+        end
+    end)
+
+    it("leaves the pair-wise style_distance fires without a temperature", function()
+        local audit = temp_audit(0.7)
+        audit:run()
+        local pair_ctxs = {}
+        for _, sd_ctx in ipairs(calls_to("style_distance")) do
+            if type(sd_ctx.card_b) == "table" then
+                pair_ctxs[#pair_ctxs + 1] = sd_ctx
+            end
+        end
+        -- 2 * 1 / 2 = 1 unordered pair.
+        expect(#pair_ctxs).to.equal(1)
+        expect(pair_ctxs[1].temperature).to.equal(nil)
+    end)
+
+    it("records meta.temperature when one was supplied", function()
+        local audit = temp_audit(1.0)
+        local report = audit:run()
+        expect(report.meta.temperature).to.equal(1.0)
+    end)
+
+    it("omits meta.temperature and the level view key when none was supplied", function()
+        local audit = temp_audit(nil)
+        local report = audit:run()
+        expect(report.meta.temperature).to.equal(nil)
+        local level_ctxs = calls_to("level")
+        expect(#level_ctxs).to.equal(2)
+        for _, level_ctx in ipairs(level_ctxs) do
+            -- Greedy is the absence of the key, not a `1.0` default:
+            -- this is what keeps the pre-temperature report shape.
+            expect(level_ctx.temperature).to.equal(nil)
+        end
+    end)
+
+    it("refuses a zero temperature", function()
+        reset_all()
+        make_handle("a")
+        make_handle("b")
+        local ok, err = pcall(audit_matrix.new, {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            temperature = 0,
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("temperature") ~= nil).to.equal(true)
+        expect(err:find("finite positive number") ~= nil).to.equal(true)
+    end)
+
+    it("refuses a negative temperature", function()
+        reset_all()
+        make_handle("a")
+        make_handle("b")
+        local ok, err = pcall(audit_matrix.new, {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            temperature = -0.5,
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("temperature") ~= nil).to.equal(true)
+    end)
+
+    it("refuses a non-finite temperature", function()
+        reset_all()
+        make_handle("a")
+        make_handle("b")
+        local ok, err = pcall(audit_matrix.new, {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            temperature = math.huge,
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("temperature") ~= nil).to.equal(true)
+    end)
+
+    it("refuses a NaN temperature", function()
+        reset_all()
+        make_handle("a")
+        make_handle("b")
+        local ok, err = pcall(audit_matrix.new, {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            temperature = 0 / 0,
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("temperature") ~= nil).to.equal(true)
+    end)
+
+    it("refuses a non-numeric temperature", function()
+        reset_all()
+        make_handle("a")
+        make_handle("b")
+        local ok, err = pcall(audit_matrix.new, {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            temperature = "hot",
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("temperature") ~= nil).to.equal(true)
     end)
 end)

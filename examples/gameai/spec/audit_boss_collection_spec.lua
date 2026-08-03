@@ -258,6 +258,48 @@ describe("audit_boss_collection — optional defaults", function()
     end)
 end)
 
+-- ─── Specs: temperature passthrough ─────────────────────────────────
+--
+-- The driver only decodes; `audit_matrix` owns both the positive /
+-- finite rule and the "absent means greedy" rule, so the cases below
+-- check exactly two things: the value arrives unrounded, and a
+-- non-number is refused with this script's name on the message.
+
+describe("audit_boss_collection — temperature", function()
+    it("passes a fractional temperature through without flooring it", function()
+        configure()
+        local _, err = drive({
+            collection_path = "workspace/in.json",
+            output = "workspace/out.json",
+            temperature = 0.7,
+        })
+        expect(err).to.equal(nil)
+        expect(NEW_OPTS.temperature).to.equal(0.7)
+    end)
+
+    it("leaves temperature nil when ctx omits it (the runner's greedy path)", function()
+        configure()
+        local _, err = drive({
+            collection_path = "workspace/in.json",
+            output = "workspace/out.json",
+        })
+        expect(err).to.equal(nil)
+        expect(NEW_OPTS.temperature).to.equal(nil)
+    end)
+
+    it("refuses a non-numeric temperature", function()
+        configure()
+        local _, err = drive({
+            collection_path = "workspace/in.json",
+            output = "workspace/out.json",
+            temperature = "hot",
+        })
+        expect(err ~= nil).to.equal(true)
+        expect(err:find("temperature") ~= nil).to.equal(true)
+        expect(err:find("audit_boss_collection") ~= nil).to.equal(true)
+    end)
+end)
+
 -- ─── Specs: runner wiring ───────────────────────────────────────────
 
 describe("audit_boss_collection — runner wiring", function()
@@ -307,9 +349,12 @@ describe("audit_boss_collection — log summary", function()
             collection_path = "workspace/in.json",
             output = "workspace/gameai-harvest/audit_run2.json",
         })
-        expect(has_line("[gameai-audit] audit: style=guardian n_games=200 prompt_set=16 aliases=3")).to.equal(
-            true
-        )
+        expect(
+            has_line(
+                "[gameai-audit] audit: style=guardian n_games=200 prompt_set=16 "
+                    .. "temperature=greedy aliases=3"
+            )
+        ).to.equal(true)
         expect(has_line("-> workspace/gameai-harvest/audit_run2.json")).to.equal(true)
     end)
 

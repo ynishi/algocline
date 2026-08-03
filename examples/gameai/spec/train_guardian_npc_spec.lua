@@ -887,6 +887,24 @@ describe("train_guardian_npc stage band require", function()
         expect(#out.stages_require_gaps).to.equal(0)
     end)
 
+    it("ships the trickiness floor on the default mid band", function()
+        configure()
+        -- Mid-band strength, but the policy has collapsed under the
+        -- default floor of 0.57: the shipped default refuses the
+        -- harvest instead of baking a counter-farmable mid.
+        LEVEL_VALUES.ci_lower = 0.75
+        METRICS.trickiness = function()
+            return { value = 0.40, raw_mean = 1.11 }
+        end
+        local out = drive({ enable_stages = true })
+
+        expect(#SAVE_FROM_CKPT_CALLS).to.equal(0)
+        expect(#alias_set_calls_for("guardian_duel_npc_mid")).to.equal(0)
+        expect(#out.stages_harvested).to.equal(0)
+        -- The view read numbers on every fire: a refusal, not a gap.
+        expect(#out.stages_require_gaps).to.equal(0)
+    end)
+
     it("reports a require whose view never produced a numeric reading", function()
         configure()
         LEVEL_VALUES.ci_lower = 0.20
@@ -917,13 +935,17 @@ describe("train_guardian_npc stage band require", function()
         expect(out.stages_require_gaps).to.equal(nil)
     end)
 
-    it("leaves the default band schedule free of any requirement", function()
+    it("carries the trickiness floor on the default mid band only", function()
         configure()
         LEVEL_VALUES.ci_lower = 0.20
         local out = drive({ enable_stages = true })
 
+        -- The default schedule gates mid on decode entropy and nothing
+        -- else: weak and strong harvest unconditionally.
         expect(COLL_NEW_OPTS.bands[1].require).to.equal(nil)
-        expect(COLL_NEW_OPTS.bands[2].require).to.equal(nil)
+        expect(COLL_NEW_OPTS.bands[2].require.view_id).to.equal("trickiness")
+        expect(COLL_NEW_OPTS.bands[2].require.field).to.equal("value")
+        expect(COLL_NEW_OPTS.bands[2].require.min).to.equal(0.57)
         expect(COLL_NEW_OPTS.bands[3].require).to.equal(nil)
         expect(out.stages_harvested[1]).to.equal("weak")
         expect(#out.stages_require_gaps).to.equal(0)

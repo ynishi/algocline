@@ -85,11 +85,15 @@
 --                  on (`{lo=0.10, hi=0.30, weak}, {lo=0.55, hi=0.85, mid},
 --                  {lo=0.85, hi=0.98, strong}`); `strong.hi = 0.98`
 --                  is deliberately under 1.0 so an above-top break is
---                  physically reachable and terminates the run.
+--                  physically reachable and terminates the run. The
+--                  default mid band carries `require = {view_id =
+--                  "trickiness", field = "value", min = 0.57}`: mid-band
+--                  strength with a collapsed policy is the
+--                  counter-farmable shape, so an unconditional mid band
+--                  has to be asked for explicitly.
 --                  A band may add `require = {view_id, field, min}` to
 --                  make its harvest conditional on a second view of the
---                  same fire (e.g. `{view_id = "trickiness", field =
---                  "value", min = 0.57}`). The `view_id` has to name one
+--                  same fire. The `view_id` has to name one
 --                  of the three views this run observes and is checked
 --                  against them before any training budget is spent.
 --   pin_bare_alias       -- when false, the `guardian` style stops
@@ -220,7 +224,20 @@ local ENABLE_STAGES = ctx_field("enable_stages") and true or false
 local STAGE_BANDS = ctx_field("stage_bands")
     or {
         { lo = 0.10, hi = 0.30, label = "weak" },
-        { lo = 0.55, hi = 0.85, label = "mid" },
+        -- The mid band is conditional on decode entropy by default: a
+        -- mid-strength checkpoint whose policy has collapsed onto the
+        -- teacher script is exactly the shape counter players farm
+        -- (issue bef1b2dd: the counter-specific deficit halved once the
+        -- gate picked an entropic checkpoint). The floor is stated in
+        -- the view space this gate reads; the same metric over another
+        -- prompt set is a different quantity. An unconditional mid band
+        -- has to be asked for via an explicit `stage_bands`.
+        {
+            lo = 0.55,
+            hi = 0.85,
+            label = "mid",
+            require = { view_id = "trickiness", field = "value", min = 0.57 },
+        },
         { lo = 0.851, hi = 0.98, label = "strong" },
     }
 local STAGE_ALIAS_PREFIX = ctx_field("stage_alias_prefix") or "guardian_duel_npc"

@@ -1031,6 +1031,16 @@ win-rate-versus-temperature curve is what separates a Card that is
 strong everywhere from one whose strength is an artefact of one
 decode scale.
 
+The player axis itself comes from
+`gen_guardian_player_styles.lua`, which grows style corpora by
+driving the duel loop directly against the scripted boss policies
+(no Cards, no RNG): the shipped `bruiser` (intent-blind aggressor)
+and `shield` (intent-reactive defender) corpora bake into player
+Cards whose rule sets deliberately bracket the sentinel's
+buy-information-and-press style, so a matrix over the three
+separates what a boss's strength owes to its opponent's information
+use from what it owes to raw pressure.
+
 ## Known limitations
 
 - Style compliance depends on the training budget. The defaults (800

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/gameai/gen_guardian_player_styles.lua` — deterministic
+  generator for player-style training corpora, driving the duel loop
+  directly (scripted boss policies, no Cards, no nn, no RNG). Ships
+  two new styles as data files: `data/guardian_bruiser_playlog_train
+  .json` (intent-blind aggressor — one rule, heavy into the spiked
+  mode-1 window) and `data/guardian_shield_playlog_train.json`
+  (intent-reactive defender — block what is announced, never press).
+  The script also carries a sentinel-reproduction mode that regrows
+  the shipped sample playlog and verifies it entry for entry against
+  the committed file — a standing sensor for drift in the rules, the
+  canonical Cards or the generation path — and returns its rule maps
+  as data so an attribution analysis can assert its own slot
+  classifier against the corpus (compliance must be exactly 1.0 on
+  rule slots).
+
 - `examples/gameai/fight_boss_sweep.lua` — temperature-grid driver over
   `fight_matrix`. Takes the fight driver's ctx with `ctx.temperatures`
   (a non-empty array of positive finite grid points, kept in caller

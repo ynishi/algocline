@@ -352,13 +352,41 @@ alc.nn.metric.registry = {
 
 -- ─── Prompt-set / seed anchor ───────────────────────────────────────
 --
--- The runner builds a prompt set from guardian_duel.new_game, so a
--- real `guardian_duel` require is fine. The specs never pass their
--- own prompt_set (letting the default path exercise itself), except
--- where the pair-count / SD-symmetry tests want a smaller matrix and
--- provide a two-state hand-built one via the same shape.
+-- The runner samples its prompt set from real `guardian_duel` self-play
+-- (`new_game` / `apply` / the two random policies), so a real
+-- `guardian_duel` require is fine and the rules are never stubbed —
+-- the states under test have to be states the engine can actually
+-- produce. The specs never pass their own prompt_set (letting the
+-- default path exercise itself), except where the override branch or a
+-- smaller hand-built matrix is the subject.
 
 local duel = require("guardian_duel")
+
+--- Deterministic stand-in for the host RNG bridge both seats of a
+--- sampling rollout draw from. Same LCG the sibling specs use
+--- (`gameai_metrics/spec/level_spec.lua:164-183`,
+--- `spec/guardian_duel_noisy_equivalence_spec.lua:370-378`), which
+--- mirrors the host signature the engine-level harness pins
+--- (`crates/algocline-engine/tests/lua/card_duel_rules_test.lua:31-35`):
+--- `rng_int(rng, min, max)` is inclusive at both ends.
+---
+--- Only reproducibility matters here. The sampler's contract is "the
+--- same (seed, size, style) draws the same set", not "the draws are
+--- uniform", so a spec-grade generator pins everything the spec can
+--- legitimately assert.
+alc.math = alc.math or {}
+alc.math.rng_create = function(seed)
+    local state = math.floor(seed or 0)
+    if state == 0 then
+        state = 0x9E3779B9
+    end
+    return { _state = state % 2147483648 }
+end
+alc.math.rng_int = function(rng, min, max)
+    local s = (rng._state * 1103515245 + 12345) % 2147483648
+    rng._state = s
+    return min + (s // 65536) % (max - min + 1)
+end
 
 local function boss_state(seed)
     return duel.new_game(seed).boss
@@ -1058,5 +1086,312 @@ describe("gameai_metrics.audit_matrix — temperature view assembly", function()
         })
         expect(ok).to.equal(false)
         expect(err:find("temperature") ~= nil).to.equal(true)
+    end)
+end)
+
+-- ─── Specs: the rollout prompt set ──────────────────────────────────
+--
+-- The prompt set is the measurement condition of `trickiness` and
+-- `style_distance`: both average over it, so what the set contains
+-- decides what the numbers mean. The builder these specs pin replaced
+-- one that returned `guardian_duel.new_game(seed + i).boss` `size`
+-- times — sixteen separate tables that all encoded to the same single
+-- prompt, because a fight opening does not vary with its seed.
+--
+-- **The equivalence every distinctness assertion below is written on is
+-- the decode prompt `guardian_duel.encode(state, style)` under the
+-- style being measured — never table identity.** Table identity is
+-- exactly the basis on which the collapsed builder looks healthy (it
+-- allocated sixteen tables), which is what the adversarial arm at the
+-- end of this section pins.
+
+local boss_seat = require("gameai_metrics.boss_seat")
+
+--- The prompt every state in `prompt_set` will be read as, in order.
+local function encodings_of(prompt_set, style)
+    local out = {}
+    for i, state in ipairs(prompt_set) do
+        out[i] = duel.encode(state, style)
+    end
+    return out
+end
+
+--- How many *prompts* a set carries — the quantity the average has
+--- terms for, as opposed to how many tables it holds.
+local function distinct_encodings(prompt_set, style)
+    local seen, n = {}, 0
+    for _, prompt in ipairs(encodings_of(prompt_set, style)) do
+        if seen[prompt] == nil then
+            seen[prompt] = true
+            n = n + 1
+        end
+    end
+    return n
+end
+
+--- How many distinct *tables* a set holds. Only used by the adversarial
+--- arm, to show what a spec written on the wrong equivalence would have
+--- measured.
+local function distinct_tables(prompt_set)
+    local seen, n = {}, 0
+    for _, state in ipairs(prompt_set) do
+        if seen[state] == nil then
+            seen[state] = true
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function mode_counts(prompt_set)
+    local counts = { [0] = 0, [1] = 0 }
+    for _, state in ipairs(prompt_set) do
+        counts[state.mode] = counts[state.mode] + 1
+    end
+    return counts[0], counts[1]
+end
+
+local function as_set(list)
+    local out = {}
+    for _, value in ipairs(list) do
+        out[value] = true
+    end
+    return out
+end
+
+--- The builder this section replaced, restated here so the adversarial
+--- arm can run the same assertion against it. Kept literal on purpose:
+--- an arm that only describes the old behaviour proves nothing.
+local function legacy_build_prompt_set(seed, size)
+    local out = {}
+    for i = 1, size do
+        out[i] = duel.new_game(seed + i).boss
+    end
+    return out
+end
+
+describe("gameai_metrics.audit_matrix — rollout prompt set", function()
+    it("draws `size` states that are distinct decode prompts under the measured style", function()
+        local set, composition = audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE)
+        expect(#set).to.equal(16)
+        expect(distinct_encodings(set, BASE_STYLE)).to.equal(16)
+        expect(composition.distinct).to.equal(16)
+    end)
+
+    it("keys the set on the style being measured, not on a fixed basis", function()
+        -- Every style has to produce a set that is distinct *under that
+        -- style*: the encoded distance field is measured against the
+        -- style's own shift threshold, so the prompt a state is read as
+        -- depends on the basis.
+        for _, style in ipairs(duel.STYLES) do
+            local set = audit_matrix._build_prompt_set(20260731, 12, style)
+            expect(distinct_encodings(set, style)).to.equal(12)
+        end
+        -- And the key really does move with the basis, so a sampler
+        -- that de-duplicated on a hard-coded "guardian" would be
+        -- keying on prompts the measurement never reads.
+        local turtle_set = audit_matrix._build_prompt_set(20260731, 12, "turtle")
+        local basis_differs = 0
+        for _, state in ipairs(turtle_set) do
+            if duel.encode(state, "turtle") ~= duel.encode(state, BASE_STYLE) then
+                basis_differs = basis_differs + 1
+            end
+        end
+        expect(basis_differs > 0).to.equal(true)
+    end)
+
+    it("splits the set half mode 0 / half mode 1 whatever the seed", function()
+        -- The composition is what makes two runs of this audit
+        -- comparable to each other: a mix that drifted with the seed
+        -- would make every run a different quantity.
+        for _, seed in ipairs({ 0, 7, 20260731, 20260804, 20260811 }) do
+            local set, composition = audit_matrix._build_prompt_set(seed, 16, BASE_STYLE)
+            local mode0, mode1 = mode_counts(set)
+            expect(mode0).to.equal(8)
+            expect(mode1).to.equal(8)
+            expect(composition.mode0_count).to.equal(8)
+            expect(composition.mode1_count).to.equal(8)
+            expect(composition.distinct).to.equal(16)
+        end
+    end)
+
+    it("gives an odd size's extra slot to mode 0", function()
+        local set = audit_matrix._build_prompt_set(20260731, 7, BASE_STYLE)
+        local mode0, mode1 = mode_counts(set)
+        expect(mode0).to.equal(4)
+        expect(mode1).to.equal(3)
+    end)
+
+    it("draws the same set twice for the same seed / size / style", function()
+        local first =
+            encodings_of(audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE), BASE_STYLE)
+        local second =
+            encodings_of(audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE), BASE_STYLE)
+        expect(#first).to.equal(16)
+        for i = 1, #first do
+            expect(second[i]).to.equal(first[i])
+        end
+    end)
+
+    it("draws a different set for a different seed, apart from the shared opening", function()
+        local a = encodings_of(audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE), BASE_STYLE)
+        local b = encodings_of(audit_matrix._build_prompt_set(20260804, 16, BASE_STYLE), BASE_STYLE)
+        local in_a, in_b = as_set(a), as_set(b)
+        -- Every fight opens on the same board, so this one prompt is in
+        -- every set the sampler can build; "the sets differ" is a claim
+        -- about the rest.
+        local opening = duel.encode(duel.new_game(1).boss, BASE_STYLE)
+        expect(in_a[opening]).to.equal(true)
+        expect(in_b[opening]).to.equal(true)
+        local only_in_a = 0
+        for _, prompt in ipairs(a) do
+            if prompt ~= opening and in_b[prompt] == nil then
+                only_in_a = only_in_a + 1
+            end
+        end
+        expect(only_in_a > 0).to.equal(true)
+    end)
+
+    it("takes at most four states from one rollout", function()
+        local _, composition = audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE)
+        -- Sixteen states at four per fight cannot come from fewer than
+        -- four fights. Without the cap the first two rollouts would
+        -- cover the set (a fight runs up to TURN_LIMIT turns), and the
+        -- sixteen states would be two correlated trajectories.
+        expect(composition.games_consumed >= 4).to.equal(true)
+        expect(composition.games_consumed <= audit_matrix.ROLLOUT_GAME_CAP).to.equal(true)
+    end)
+
+    it("raises naming the short stratum when the rollout budget runs out", function()
+        local ok, err = pcall(audit_matrix._build_prompt_set, 20260731, 100000, BASE_STYLE)
+        expect(ok).to.equal(false)
+        expect(err:find("rollout budget", 1, true) ~= nil).to.equal(true)
+        expect(err:find("mode 0: ", 1, true) ~= nil).to.equal(true)
+        expect(err:find("mode 1: ", 1, true) ~= nil).to.equal(true)
+        expect(err:find(BASE_STYLE, 1, true) ~= nil).to.equal(true)
+    end)
+
+    it("returns engine-produced states only, never hand-built tables", function()
+        local set = audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE)
+        local _, mode1 = mode_counts(set)
+        -- A mode-1 state cannot be opened into: it exists only after a
+        -- `duel.apply` played the roll-up, so its presence is the proof
+        -- the states came off a real fight rather than a literal.
+        expect(mode1 > 0).to.equal(true)
+        for i, state in ipairs(set) do
+            boss_seat.require_state(state, string.format("spec: prompt_set[%d]", i))
+            -- `block` / `thorns` are engine bookkeeping that `encode`
+            -- never reads, so a hand-written state table in a spec
+            -- routinely omits them; `new_game` and `apply` never do.
+            expect(type(state.block)).to.equal("number")
+            expect(type(state.thorns)).to.equal("number")
+            expect(state.turn >= 1).to.equal(true)
+            expect(state.turn <= duel.TURN_LIMIT).to.equal(true)
+        end
+    end)
+
+    it("adversarial: the replaced builder fails the same distinctness assertion", function()
+        local legacy = legacy_build_prompt_set(20260731, 16)
+        expect(#legacy).to.equal(16)
+        -- Sixteen separate tables: an assertion written on table
+        -- identity would have called this set healthy and shipped the
+        -- collapse. This line is here to pin that the identity basis is
+        -- the wrong one, not to endorse it.
+        expect(distinct_tables(legacy)).to.equal(16)
+        -- On the basis the measurement actually reads — the decode
+        -- prompt under the audited style — the same set is one state
+        -- written down sixteen times, so the assertion arm (a) uses
+        -- goes red on it.
+        expect(distinct_encodings(legacy, BASE_STYLE)).to.equal(1)
+        -- The same assertion, same helper, on the current builder.
+        local sampled = audit_matrix._build_prompt_set(20260731, 16, BASE_STYLE)
+        expect(distinct_encodings(sampled, BASE_STYLE)).to.equal(16)
+    end)
+end)
+
+-- ─── Specs: prompt-set provenance on the report ─────────────────────
+
+describe("gameai_metrics.audit_matrix — prompt set provenance", function()
+    local function provenance_audit(opts)
+        reset_all()
+        seed_alias("a", { 0.5, 0.4, 0.6 }, 0.3)
+        seed_alias("b", { 0.5, 0.4, 0.6 }, 0.3)
+        set_sd_pair("a", "b", 0.1)
+        local new_opts = {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            n_games = 10,
+            seed = 20260731,
+        }
+        for key, value in pairs(opts or {}) do
+            new_opts[key] = value
+        end
+        return audit_matrix.new(new_opts)
+    end
+
+    it("records a sampled set as rollout_v1 with its measured composition", function()
+        local audit = provenance_audit({ prompt_set_size = 8 })
+        local report = audit:run()
+        expect(report.meta.prompt_set_source).to.equal("rollout_v1")
+        expect(report.meta.prompt_set_size).to.equal(8)
+        local composition = report.meta.prompt_set_composition
+        expect(composition.mode0_count).to.equal(4)
+        expect(composition.mode1_count).to.equal(4)
+        expect(composition.distinct).to.equal(8)
+        expect(composition.games_consumed >= 2).to.equal(true)
+    end)
+
+    it("hands the sampled set to the trickiness / style_distance views", function()
+        local audit = provenance_audit({ prompt_set_size = 8 })
+        audit:run()
+        local tricky_ctxs = calls_to("trickiness")
+        expect(#tricky_ctxs).to.equal(2)
+        for _, tricky_ctx in ipairs(tricky_ctxs) do
+            expect(#tricky_ctx.prompt_set).to.equal(8)
+            expect(distinct_encodings(tricky_ctx.prompt_set, BASE_STYLE)).to.equal(8)
+        end
+    end)
+
+    it("de-duplicates against the audited style, not against guardian", function()
+        local audit = provenance_audit({ prompt_set_size = 8, style = "turtle" })
+        audit:run()
+        local tricky_ctxs = calls_to("trickiness")
+        expect(#tricky_ctxs).to.equal(2)
+        for _, tricky_ctx in ipairs(tricky_ctxs) do
+            expect(tricky_ctx.style).to.equal("turtle")
+            expect(distinct_encodings(tricky_ctx.prompt_set, "turtle")).to.equal(8)
+        end
+    end)
+
+    it("uses a caller-supplied prompt_set verbatim and reports it as caller", function()
+        local supplied = { boss_state(1), boss_state(2) }
+        local audit = provenance_audit({ prompt_set = supplied, prompt_set_size = 8 })
+        local report = audit:run()
+        -- The override wins over prompt_set_size, exactly as before.
+        expect(report.meta.prompt_set_size).to.equal(2)
+        expect(report.meta.prompt_set_source).to.equal("caller")
+        -- No composition: the runner did not draw this set and has
+        -- nothing measured to report about it.
+        expect(report.meta.prompt_set_composition).to.equal(nil)
+        local tricky_ctxs = calls_to("trickiness")
+        expect(#tricky_ctxs).to.equal(2)
+        for _, tricky_ctx in ipairs(tricky_ctxs) do
+            -- Verbatim means the very table, not an equal one: a caller
+            -- passing `check_states` means those states in that order.
+            expect(rawequal(tricky_ctx.prompt_set, supplied)).to.equal(true)
+        end
+    end)
+
+    it("refuses an empty caller-supplied prompt_set", function()
+        reset_all()
+        make_handle("a")
+        make_handle("b")
+        local ok, err = pcall(audit_matrix.new, {
+            aliases = { "a", "b" },
+            style = BASE_STYLE,
+            prompt_set = {},
+        })
+        expect(ok).to.equal(false)
+        expect(err:find("prompt_set") ~= nil).to.equal(true)
     end)
 end)

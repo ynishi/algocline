@@ -71,6 +71,75 @@
 --- positive number is a caller mistake rather than a request for
 --- greedy, so it raises instead of quietly falling back.
 ---
+--- ## The prompt set (and why its numbers do not compare backwards)
+---
+--- `trickiness` and `style_distance` are averages over the prompt set:
+--- each Card is read at every state in it and the per-state values are
+--- meaned. The set is therefore the measurement condition, not an
+--- implementation detail — the same metric read over a different set is
+--- a different quantity, and its values, its thresholds and its history
+--- do not carry across.
+---
+--- That matters here because the set built by this runner changed. It
+--- used to be `guardian_duel.new_game(seed + i).boss` repeated
+--- `prompt_set_size` times, and a fight opening is the same board for
+--- every seed (`new_game` varies nothing but the recorded seed), so the
+--- set was one state written down N times: the average had one term and
+--- the entropy / divergence axes read a single opening rather than a
+--- policy. Every audit written before this change measured that. Its
+--- `trickiness_norm` / `sd_teacher` / `sd_matrix` numbers are readings
+--- of another quantity and **must not** be compared against the ones
+--- this runner produces now — not as a delta, not as a threshold, not
+--- as a trend.
+---
+--- What replaces it is a rollout sampler:
+---
+--- - **Both seats move at random**, from `alc.math.rng_create` seeded
+---   off the audit `seed`. A random walk reaches mode / cycle / damage
+---   combinations a scripted line never enters, which is the coverage
+---   an entropy axis wants.
+--- - **The RNG stream is namespaced** (`seed * 7919 + game`) so it
+---   never coincides with the stream the `level` view opens on the same
+---   `seed` (`alc.math.rng_create(seed)`).
+--- - **The set is stratified by boss mode**: half the states come from
+---   mode 0 (the style walking its cycle), half from mode 1 (rolled up,
+---   the slam pending), odd sizes giving the extra slot to mode 0. The
+---   two modes have systematically different answer entropy, so an
+---   unstratified "first N distinct states" set would let the mode mix
+---   drift with the seed — and a set whose composition moves with the
+---   seed is, again, a different quantity per run. Fixing the mix is
+---   what makes two runs of this audit comparable to each other.
+--- - **One rollout contributes at most four states**, so a set is drawn
+---   from several independent trajectories rather than from one.
+--- - **States are de-duplicated on `guardian_duel.encode(state, style)`
+---   under the audited `style`** — the same basis the measurement reads
+---   them on. The encoded distance field is measured against the
+---   style's own shift threshold, so two states that are distinct
+---   prompts under one style can be the same prompt under another;
+---   keying on anything but the style being audited would let duplicate
+---   prompts into the average.
+--- - **The search stops after 200 rollouts** and raises, naming which
+---   stratum came up short. A set that could not be filled is a loud
+---   error rather than a short average.
+---
+--- Every state in the set is one the engine produced — `new_game`
+--- followed by `guardian_duel.apply` — so it carries the bookkeeping
+--- (`block` / `thorns`) and the field consistency a hand-written table
+--- can silently get wrong.
+---
+--- One state is in every set the sampler builds regardless of seed: the
+--- opening `C0M0H9D3L0T1`, because every fight starts there. Two sets
+--- drawn under different seeds therefore agree on that element and are
+--- expected to differ on the rest.
+---
+--- The set the run actually used is recorded on the report:
+--- `meta.prompt_set_source` is `"rollout_v1"` for a sampled set and
+--- `"caller"` for one handed in through `opts.prompt_set`, and a
+--- sampled set adds `meta.prompt_set_composition` with the measured
+--- `mode0_count` / `mode1_count` / `games_consumed` / `distinct`. Two
+--- saved audits are comparable only when both carry the same source and
+--- the same composition.
+---
 --- ## Contract
 ---
 --- ```lua
@@ -111,8 +180,11 @@
 ---         [alias_i] = { [alias_j] = <number>, ... },   -- symmetric, diag 0
 ---         ...
 ---     },
----     meta = { n_games, prompt_set_size, seed, style, teacher_alias,
+---     meta = { n_games, prompt_set_size, prompt_set_source,
+---              prompt_set_composition, seed, style, teacher_alias,
 ---              temperature, ... },   -- temperature absent when greedy
+---                                    -- composition absent for a
+---                                    -- caller-supplied prompt set
 --- }
 --- ```
 ---
@@ -149,6 +221,37 @@ M.meta = {
 local DEFAULT_N_GAMES = 200
 local DEFAULT_PROMPT_SET_SIZE = 16
 local DEFAULT_SEED = 0
+
+--- `meta.prompt_set_source` tag of a set this runner sampled. The
+--- version suffix is part of the tag on purpose: a later sampler that
+--- changes the collection rule produces a different measurement
+--- condition, and an artifact has to say which one it was read under
+--- rather than leave two incomparable runs looking alike.
+local PROMPT_SET_SOURCE_ROLLOUT = "rollout_v1"
+
+--- `meta.prompt_set_source` tag of a set the caller handed in. The
+--- runner knows nothing about how it was drawn, so it reports the fact
+--- rather than a composition it did not measure.
+local PROMPT_SET_SOURCE_CALLER = "caller"
+
+--- Stride between the audit seed and the rollout RNG stream, so the
+--- states are sampled from a different stream than the one the `level`
+--- view opens on the same seed (`alc.math.rng_create(seed)`). The
+--- constant is the one `guardian_duel.build_corpus` /
+--- `guardian_duel.sample_states` already namespace their playout
+--- streams with.
+local ROLLOUT_RNG_STRIDE = 7919
+
+--- Rollouts the sampler may spend before it gives up. A set of the
+--- default size fills in a handful of games, so this is a backstop
+--- against a stratum that never appears rather than a working budget.
+local ROLLOUT_GAME_CAP = 200
+
+--- States one rollout may contribute. A fight lasts at most
+--- `guardian_duel.TURN_LIMIT` turns and its states are strongly
+--- correlated, so a cap spreads a set across independent trajectories
+--- instead of letting the first two fights fill it.
+local ROLLOUT_STATES_PER_GAME = 4
 
 -- ─── Host bridges ───────────────────────────────────────────────────
 
@@ -192,6 +295,28 @@ local function require_registry()
         )
     end
     return reg
+end
+
+--- The RNG bridge both seats of a sampling rollout draw from.
+---
+--- `guardian_duel.policy_player_random` / `policy_boss_random` reach
+--- for the same two functions, so checking them here names the missing
+--- bridge at the layer the caller called rather than three frames down
+--- inside the rules package.
+local function require_rng_bridge()
+    if
+        type(alc) ~= "table"
+        or type(alc.math) ~= "table"
+        or type(alc.math.rng_create) ~= "function"
+        or type(alc.math.rng_int) ~= "function"
+    then
+        error(
+            "audit_matrix: alc.math.rng_create / alc.math.rng_int are required to sample the "
+                .. "prompt set (host bridge missing); pass opts.prompt_set to supply one instead",
+            0
+        )
+    end
+    return alc.math
 end
 
 local function require_card_alias_bridge()
@@ -267,18 +392,112 @@ local function decode_temperature(raw)
     return raw
 end
 
---- Build a prompt set of boss states by seeding fresh games. The
---- caller-supplied `opts.prompt_set` overrides this (so an audit can
---- reuse the exact `check_states` a training run measured against),
---- but when it is absent the runner produces `prompt_set_size` states
---- deterministically from `seed`. Each seed lands a mode-0 opening
---- state; that is the same shape `boss_seat.require_state` accepts.
-local function build_prompt_set(seed, size)
-    local out = {}
-    for i = 1, size do
-        out[i] = duel.new_game(seed + i).boss
+--- Sample a prompt set of boss states from random self-play.
+---
+--- See the header (`## The prompt set`) for why the set is built this
+--- way and why its numbers do not compare against the ones the
+--- pre-rollout runner produced. The rule, in one place:
+---
+--- - `size` is split into `ceil(size/2)` mode-0 states and
+---   `floor(size/2)` mode-1 states, so the mode mix is fixed by the
+---   requested size rather than by the seed;
+--- - each rollout plays both seats at random off
+---   `alc.math.rng_create(seed * ROLLOUT_RNG_STRIDE + game)` and may
+---   contribute at most `ROLLOUT_STATES_PER_GAME` states;
+--- - a state joins its stratum only when `duel.encode(state, style)`
+---   — the prompt the measurement will read it as — has not been taken
+---   yet;
+--- - the walk stops once both strata are full, and raises after
+---   `ROLLOUT_GAME_CAP` rollouts naming the stratum that came up short.
+---
+--- The whole walk is a function of `(seed, size, style)`, so two runs
+--- with the same three arguments produce the same set.
+---
+--- The caller-supplied `opts.prompt_set` overrides this entirely (so an
+--- audit can reuse the exact `check_states` a training run measured
+--- against).
+---@param seed integer Audit seed
+---@param size integer States to collect
+---@param style string Audited style; the basis states are keyed on
+---@return table[] prompt_set `size` boss states, mode-0 stratum first
+---@return table composition `{ mode0_count, mode1_count, games_consumed, distinct }`
+local function build_prompt_set(seed, size, style)
+    local math_ns = require_rng_bridge()
+
+    local targets = {}
+    targets[1] = math.floor(size / 2)
+    targets[0] = size - targets[1]
+    local buckets = { [0] = {}, [1] = {} }
+
+    local taken_prompts = {}
+    local games = 0
+    while games < ROLLOUT_GAME_CAP and (#buckets[0] < targets[0] or #buckets[1] < targets[1]) do
+        games = games + 1
+        local g = duel.new_game(seed + games)
+        local rng = math_ns.rng_create(seed * ROLLOUT_RNG_STRIDE + games)
+        local adopted = 0
+        while not duel.is_over(g) and adopted < ROLLOUT_STATES_PER_GAME do
+            local state = g.boss
+            local bucket = buckets[state.mode]
+            if #bucket < targets[state.mode] then
+                local prompt = duel.encode(state, style)
+                if taken_prompts[prompt] == nil then
+                    taken_prompts[prompt] = true
+                    bucket[#bucket + 1] = state
+                    adopted = adopted + 1
+                end
+            end
+            g = duel.apply(g, duel.policy_player_random(rng), duel.policy_boss_random(state, rng))
+        end
     end
-    return out
+
+    if #buckets[0] < targets[0] or #buckets[1] < targets[1] then
+        error(
+            string.format(
+                "audit_matrix: the prompt-set sampler spent its %d-rollout budget without "
+                    .. "filling both strata (mode 0: %d/%d, mode 1: %d/%d) for style %q at "
+                    .. "seed %d; a short set would silently average over fewer states, so this "
+                    .. "raises instead",
+                ROLLOUT_GAME_CAP,
+                #buckets[0],
+                targets[0],
+                #buckets[1],
+                targets[1],
+                style,
+                seed
+            ),
+            3
+        )
+    end
+
+    local out = {}
+    for mode = 0, 1 do
+        for _, state in ipairs(buckets[mode]) do
+            out[#out + 1] = state
+        end
+    end
+
+    -- `distinct` is counted back off the finished set rather than
+    -- restated from the de-duplication above: the composition is a
+    -- measurement of what the run will average over, and a measurement
+    -- that only echoes the code that produced it cannot catch that code
+    -- going wrong.
+    local seen, distinct = {}, 0
+    for _, state in ipairs(out) do
+        local prompt = duel.encode(state, style)
+        if seen[prompt] == nil then
+            seen[prompt] = true
+            distinct = distinct + 1
+        end
+    end
+
+    local composition = {
+        mode0_count = #buckets[0],
+        mode1_count = #buckets[1],
+        games_consumed = games,
+        distinct = distinct,
+    }
+    return out, composition
 end
 
 --- Normalise `opts.aliases` into a `{alias, card_id}` pair list.
@@ -676,9 +895,24 @@ function Audit:run()
     local meta = {
         n_games = self._n_games,
         prompt_set_size = #self._prompt_set,
+        -- Which measurement condition this report was read under. Two
+        -- audits are comparable only when both the source and (for a
+        -- sampled set) the composition agree; see the header.
+        prompt_set_source = self._prompt_set_source,
         seed = self._seed,
         style = self._style,
     }
+    local composition = self._prompt_set_composition
+    if composition ~= nil then
+        -- Copied out so the saved report cannot be mutated through the
+        -- runner (and the runner cannot be mutated through the report).
+        meta.prompt_set_composition = {
+            mode0_count = composition.mode0_count,
+            mode1_count = composition.mode1_count,
+            games_consumed = composition.games_consumed,
+            distinct = composition.distinct,
+        }
+    end
     if self._teacher_alias ~= nil then
         meta.teacher_alias = self._teacher_alias
     end
@@ -765,12 +999,20 @@ end
 ---   supplied per-fire below via the level view config.
 --- - `prompt_set_size` — integer, size of the boss-state prompt set
 ---   used by the `trickiness` and `style_distance` views (default
----   `16`). Ignored when `opts.prompt_set` is supplied.
+---   `16`). Half of it is drawn from mode 0 and half from mode 1 (an
+---   odd size gives the extra slot to mode 0). Ignored when
+---   `opts.prompt_set` is supplied.
 --- - `prompt_set` — optional array of boss states. When absent the
----   runner builds one deterministically from `seed` so an audit
----   remains reproducible without a manifest-side prompt set.
---- - `seed` — integer, seeds both the built-in prompt set and the
----   pair-wise SD evaluation (default `0`).
+---   runner samples one from random self-play, deterministically from
+---   `seed` (see the header), so an audit remains reproducible without
+---   a manifest-side prompt set. A supplied set is used verbatim and
+---   reported as `meta.prompt_set_source = "caller"`; the runner
+---   neither de-duplicates nor stratifies it, because a caller passing
+---   `check_states` means *those* states.
+--- - `seed` — integer, seeds the prompt-set rollouts, the `level` view
+---   and the pair-wise SD evaluation (default `0`). The rollout stream
+---   is namespaced away from the `level` one, so the two never draw the
+---   same numbers.
 --- - `style` — required, one of `guardian_duel.STYLES`. Passed
 ---   verbatim into every boss-seat view.
 --- - `teacher_alias` — optional string; when set, the runner adds an
@@ -813,14 +1055,16 @@ function M.new(opts)
     local seed = decode_int(opts.seed, DEFAULT_SEED, "seed", false)
     local temperature = decode_temperature(opts.temperature)
 
-    local prompt_set
+    local prompt_set, prompt_set_source, prompt_set_composition
     if opts.prompt_set ~= nil then
         if type(opts.prompt_set) ~= "table" or #opts.prompt_set == 0 then
             error("audit_matrix.new: opts.prompt_set must be a non-empty array of boss states", 2)
         end
         prompt_set = opts.prompt_set
+        prompt_set_source = PROMPT_SET_SOURCE_CALLER
     else
-        prompt_set = build_prompt_set(seed, prompt_set_size)
+        prompt_set, prompt_set_composition = build_prompt_set(seed, prompt_set_size, style)
+        prompt_set_source = PROMPT_SET_SOURCE_ROLLOUT
     end
 
     local cards
@@ -848,6 +1092,8 @@ function M.new(opts)
         _seed = seed,
         _temperature = temperature,
         _prompt_set = prompt_set,
+        _prompt_set_source = prompt_set_source,
+        _prompt_set_composition = prompt_set_composition,
         _collection_path = opts.collection_path,
         _report = nil,
     }, Audit)
@@ -857,5 +1103,16 @@ end
 M.DEFAULT_N_GAMES = DEFAULT_N_GAMES
 M.DEFAULT_PROMPT_SET_SIZE = DEFAULT_PROMPT_SET_SIZE
 M.DEFAULT_SEED = DEFAULT_SEED
+M.PROMPT_SET_SOURCE_ROLLOUT = PROMPT_SET_SOURCE_ROLLOUT
+M.PROMPT_SET_SOURCE_CALLER = PROMPT_SET_SOURCE_CALLER
+M.ROLLOUT_GAME_CAP = ROLLOUT_GAME_CAP
+M.ROLLOUT_STATES_PER_GAME = ROLLOUT_STATES_PER_GAME
+
+--- The prompt-set sampler, exposed for the spec that pins its
+--- collection rule (`spec/audit_matrix_spec.lua`). It is reachable
+--- through `M.new` for every other purpose; the underscore says the
+--- name is not part of the runner's contract, the way
+--- `card_duel_tournament._aggregate` does for the same reason.
+M._build_prompt_set = build_prompt_set
 
 return M

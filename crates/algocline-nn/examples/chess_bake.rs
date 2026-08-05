@@ -42,7 +42,7 @@
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -497,6 +497,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     eprintln!("[bake] shape written to {}", shape_path.display());
+    print_retrieval_command(&ckpt_dir, &prefix);
     println!("{}", ckpt_path.display());
     Ok(())
+}
+
+/// Prints the command that copies this run's output off the machine.
+///
+/// A rented GPU is deleted at the end of the session and takes its disk
+/// with it. Two runs have already been lost that way — the weights
+/// existed, nobody pulled them, the pod went away. The run itself is the
+/// only place that knows the directory and the prefix, so it is the
+/// place to say how to fetch them, at the moment the operator is looking
+/// at the output and deciding whether to shut the machine down.
+///
+/// RunPod exports the SSH endpoint into the pod's environment; when it
+/// is absent (a local run, or another host) the placeholders stay in
+/// and the line is still a usable template.
+fn print_retrieval_command(ckpt_dir: &Path, prefix: &str) {
+    let ip = env::var("RUNPOD_PUBLIC_IP").unwrap_or_else(|_| "<public-ip>".into());
+    let port = env::var("RUNPOD_TCP_PORT_22").unwrap_or_else(|_| "<ssh-port>".into());
+    eprintln!(
+        "\n[bake] pull this before deleting the pod, then ls the local copy:\n\
+         \x20 scp -i <ssh-key> -P {port} \
+         'root@{ip}:{dir}/{prefix}*' <local-dir>/\n\
+         \x20 ls -la <local-dir>/{prefix}*\n",
+        dir = ckpt_dir.display(),
+    );
 }

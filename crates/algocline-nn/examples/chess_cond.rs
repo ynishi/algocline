@@ -126,6 +126,16 @@ struct GammaStats {
     top1: Vec<Mean>,
     /// Positions where the bands disagree on the top move.
     top1_differs: usize,
+    /// How far ahead the leader was, where the bands disagreed.
+    ///
+    /// A flip counted on a first place that led the second by a
+    /// hair says nothing about the condition: two orderings of a
+    /// near-tie are one arithmetic step apart. This records the gap
+    /// between first and second within each band's legal-normalised
+    /// distribution, at exactly the positions the flip count is
+    /// drawn from, so the count can be read against the margin that
+    /// produced it.
+    flip_margin: Mean,
 }
 
 fn main() -> ExitCode {
@@ -234,6 +244,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             legal_mass: Mean::default(),
             top1: vec![Mean::default(); n_bands],
             top1_differs: 0,
+            flip_margin: Mean::default(),
         })
         .collect();
 
@@ -332,6 +343,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if tops.iter().any(|t| *t != tops[0]) {
                             stats.top1_differs += 1;
+                            for d in &dists {
+                                let mut sorted = d.clone();
+                                sorted.sort_by(|a, b| b.total_cmp(a));
+                                stats.flip_margin.push(
+                                    (sorted[0] - sorted.get(1).copied().unwrap_or(0.0)) as f64,
+                                );
+                            }
                         }
                         stats
                             .widest_js
@@ -418,8 +436,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         shape.bands[n_bands - 1].token
     );
     println!(
-        "{:>6} {:>10} {:>11} {:>11} top1 match by band",
-        "gamma", "JS bits", "legal mass", "top1 flips"
+        "{:>6} {:>10} {:>11} {:>11} {:>12} top1 match by band",
+        "gamma", "JS bits", "legal mass", "top1 flips", "flip margin"
     );
     for stats in &sweep {
         let matches: Vec<String> = stats
@@ -431,11 +449,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         println!(
-            "{:>6.2} {:>10.4} {:>11.4} {:>10.2}% {}",
+            "{:>6.2} {:>10.4} {:>11.4} {:>10.2}% {:>12.6} {}",
             stats.gamma,
             stats.widest_js.value().unwrap_or(f64::NAN),
             stats.legal_mass.value().unwrap_or(f64::NAN),
             100.0 * stats.top1_differs as f64 / n,
+            stats.flip_margin.value().unwrap_or(f64::NAN),
             matches.join("  ")
         );
     }

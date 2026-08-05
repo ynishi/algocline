@@ -1,37 +1,51 @@
-//! Measure whether a condition token changes how the model plays.
+//! Measure what a condition token does, and what amplifying it does.
 //!
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --example chess_cond -- <ckpt.safetensors> <holdout.pgn> [side] [max_positions] [walk_band]
+//! cargo run --release --example chess_cond -- <ckpt> <holdout.pgn> [side] [max_positions] [walk_band] [gammas]
 //! ```
+//!
+//! `gammas` is a comma-separated guidance sweep, default
+//! `1,1.5,2,3,4,6,8`. One is the unguided model, so the sweep always
+//! contains the baseline it is read against.
 //!
 //! # Why not move match
 //!
-//! Top-1 move match is the wrong instrument for this question. On a
-//! 236,800-row two-band checkpoint it read 0.2088 asked as the low band
-//! against low-band games and 0.2080 asked as the high band — a
-//! difference of 0.0008 — while the same model, in the Open Sicilian
-//! after 3...cxd4, put 0.116 on Qxd4 as the low band and 0.018 as the
-//! high one. Both bands answer Nxd4 first, so top-1 sees nothing; the
-//! 6x change sits underneath it.
+//! Top-1 move match cannot see a condition token. On the two-band
+//! checkpoint it read 0.2088 asked as the low band against low-band
+//! games and 0.2080 asked as the high band — 0.0008 apart — while the
+//! same model in the Open Sicilian after 3...cxd4 put 0.116 on Qxd4 as
+//! the low band and 0.018 as the high one. Both bands answer Nxd4
+//! first, so top-1 sees nothing and the 6x change sits underneath it.
 //!
 //! What separates the bands is the shape of the distribution, so that
-//! is what gets measured: the Jensen-Shannon divergence between the
+//! is what gets measured: Jensen-Shannon divergence between the
 //! model's legal-move distributions under each token, at the same
-//! position. In bits, so 0 means identical and 1 means disjoint.
+//! position, in bits so the bound is `[0, 1]`.
 //!
-//! # The reference it is read against
+//! # The references it is read against
 //!
-//! A divergence has no meaning alone. Each band is also compared to a
-//! uniform draw over the same legal moves, which is what the model
-//! would look like knowing nothing. A band-to-band divergence that is
-//! a small fraction of the band-to-uniform one says the token moves
-//! the distribution slightly; one of the same order says it moves it
-//! as much as knowing chess does.
+//! A divergence has no meaning alone. Each band is also measured
+//! against a uniform draw over the same legal moves, which is what the
+//! model looks like knowing nothing — a band-to-band figure that is a
+//! small fraction of that says the token nudges the distribution, one
+//! of the same order says it moves it as much as knowing chess does.
 //!
-//! Divergences are also split by whether the two bands agree on the
-//! top move, since that is exactly the split move match is blind to.
+//! Divergences are split by whether the bands agree on the top move,
+//! since that is precisely the split move match is blind to, and by
+//! depth, since a condition carried by one token at the far left of the
+//! row may or may not survive to move 40.
+//!
+//! # The sweep
+//!
+//! Guidance ([`algocline_nn::chess::guide`]) amplifies whatever the
+//! token was doing. Raising gamma should raise the divergence; the
+//! question is what it costs, so legal-move mass and fidelity to the
+//! human move are reported alongside it at every gamma. Over-guidance
+//! is a documented failure mode and here it has an obvious shape —
+//! extrapolated logits are under no obligation to stay on moves that
+//! exist in the position.
 
 use std::env;
 use std::fs::File;
@@ -46,6 +60,7 @@ use cozy_chess::Board;
 use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::corpus::ScoredSide;
 use algocline_nn::chess::filter::GameFilter;
+use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
 use algocline_nn::chess::ModelShape;
@@ -53,24 +68,30 @@ use algocline_nn::metric::{self, MetricError};
 
 /// Jensen-Shannon divergence in bits, via [`algocline_nn::metric::js`].
 ///
-/// The crate's implementation reports nats and is already covered by
-/// its own tests; bits are what a reader wants here, since the bound
-/// becomes `[0, 1]` — zero when the two distributions agree everywhere,
-/// one when they put their mass on disjoint moves.
+/// The crate's implementation reports nats and carries its own tests;
+/// bits are what a reader wants here, since the bound becomes `[0, 1]`
+/// — zero when two distributions agree everywhere, one when they put
+/// their mass on disjoint moves.
 fn js_bits(p: &[f32], q: &[f32]) -> Result<f64, MetricError> {
     Ok(metric::js(p, q)? as f64 / std::f64::consts::LN_2)
 }
 
-/// Renormalise a slice to sum to one, or fall back to uniform when it
-/// carries no mass at all.
+/// Softmax over a logit row.
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+    let total: f32 = exp.iter().sum();
+    exp.iter().map(|e| e / total).collect()
+}
+
+/// Renormalise to sum to one, or fall back to uniform on no mass.
 ///
-/// `metric::js` validates that its inputs are proper distributions, so
-/// the renormalisation is a precondition rather than a nicety: the raw
-/// softmax over the legal subset sums to whatever mass the model left
-/// there.
+/// `metric::js` validates that its inputs are distributions, so this
+/// is a precondition rather than a nicety: the softmax restricted to
+/// the legal subset sums to whatever mass the model left there.
 fn normalise(v: &[f32]) -> Vec<f32> {
     let total: f32 = v.iter().sum();
-    if total <= 0.0 {
+    if total <= 0.0 || !total.is_finite() {
         return vec![1.0 / v.len() as f32; v.len()];
     }
     v.iter().map(|x| x / total).collect()
@@ -78,7 +99,7 @@ fn normalise(v: &[f32]) -> Vec<f32> {
 
 /// Running mean, kept as a pair so an empty set reads as absent rather
 /// than as zero.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Mean {
     sum: f64,
     n: usize,
@@ -94,6 +115,19 @@ impl Mean {
     }
 }
 
+/// Everything accumulated at one guidance strength.
+struct GammaStats {
+    gamma: f32,
+    /// Divergence between the first and last band.
+    widest_js: Mean,
+    /// Softmax mass landing on legal moves, averaged over bands.
+    legal_mass: Mean,
+    /// Share of positions where a band's top move equals the human's.
+    top1: Vec<Mean>,
+    /// Positions where the bands disagree on the top move.
+    top1_differs: usize,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -104,11 +138,29 @@ fn main() -> ExitCode {
     }
 }
 
+/// Resolve a band argument against the checkpoint's own band list.
+fn resolve_band(shape: &ModelShape, arg: &str) -> Result<String, String> {
+    let token = if arg.starts_with('<') {
+        arg.to_string()
+    } else {
+        format!("<elo:{arg}>")
+    };
+    match shape.band(&token) {
+        Some(_) => Ok(token),
+        None => Err(format!(
+            "checkpoint has no band {token}; it carries {:?}",
+            shape.band_tokens()
+        )),
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let ckpt: PathBuf = args
         .next()
-        .ok_or("usage: chess_cond <ckpt> <holdout.pgn> [side] [max_positions] [walk_band]")?
+        .ok_or(
+            "usage: chess_cond <ckpt> <holdout.pgn> [side] [max_positions] [walk_band] [gammas]",
+        )?
         .into();
     let pgn = args.next().ok_or("missing holdout pgn path")?;
     let side = match args.next().as_deref() {
@@ -117,10 +169,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("both") => ScoredSide::Both,
         Some(other) => return Err(format!("unknown side {other:?}").into()),
     };
-    // 600 keeps one run inside a minute on a laptop CPU. Every position
-    // costs one forward pass per band.
+    // Every position costs one forward per band, and the gamma sweep
+    // rides on those same forwards, so the sweep is nearly free.
     let max_positions: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(600);
-    let walk_band = args.next();
+    let walk_band = args.next().filter(|s| s != "-");
+    let gammas: Vec<f32> = args
+        .next()
+        .unwrap_or_else(|| "1,1.5,2,3,4,6,8".into())
+        .split(',')
+        .map(|s| s.trim().parse::<f32>())
+        .collect::<Result<_, _>>()?;
 
     let shape = ModelShape::load(&ckpt)?;
     if shape.bands.len() < 2 {
@@ -145,45 +203,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
 
-    // Which games the positions are drawn from. Left open by default:
-    // the question is how the token changes play, not how well it
-    // matches any particular population.
+    // Which games the positions come from. Left open by default: the
+    // question is how the token changes play, not how well it matches
+    // any one population. Setting it makes the fidelity column mean
+    // something, since then the humans being matched are the band's.
     let mut filter = GameFilter::accept_all()
         .decided_on_the_board()
         .with_min_base_seconds(180)
         .with_ply_bounds(10, None);
-    if let Some(arg) = &walk_band {
-        let token = if arg.starts_with('<') {
-            arg.clone()
-        } else {
-            format!("<elo:{arg}>")
-        };
-        let band = shape
-            .band(&token)
-            .ok_or_else(|| format!("checkpoint has no band {token}"))?;
-        filter = filter.with_rating_band(band.min, band.max);
-    }
+    let walk_token = match &walk_band {
+        Some(arg) => {
+            let token = resolve_band(&shape, arg)?;
+            let band = shape.band(&token).expect("resolved");
+            filter = filter.with_rating_band(band.min, band.max);
+            Some(token)
+        }
+        None => None,
+    };
 
     let mut reader = PgnReader::new(BufReader::new(File::open(&pgn)?));
     let t0 = Instant::now();
     let mut positions = 0usize;
     let mut games = 0usize;
-    let mut top1_differs = 0usize;
 
-    // Pairwise band-to-band, plus each band against a uniform draw.
-    let mut pair_js: Vec<Mean> = (0..n_bands * n_bands).map(|_| Mean::default()).collect();
-    let mut pair_js_agree: Vec<Mean> = (0..n_bands * n_bands).map(|_| Mean::default()).collect();
-    let mut pair_js_differ: Vec<Mean> = (0..n_bands * n_bands).map(|_| Mean::default()).collect();
-    let mut uniform_js: Vec<Mean> = (0..n_bands).map(|_| Mean::default()).collect();
-    let mut all_pair_js: Vec<f64> = Vec::new();
-    // The condition is one token at the far left of the row. If its
-    // influence is carried by attention across the whole sequence, a
-    // decay with depth is what a weak channel looks like — Maia-2 does
-    // not prepend at all, it injects skill into the network
-    // (arXiv:2409.20553), which is the shape of the remedy if this
-    // decays.
+    let mut sweep: Vec<GammaStats> = gammas
+        .iter()
+        .map(|g| GammaStats {
+            gamma: *g,
+            widest_js: Mean::default(),
+            legal_mass: Mean::default(),
+            top1: vec![Mean::default(); n_bands],
+            top1_differs: 0,
+        })
+        .collect();
+
+    // Detail at the unguided model: every pair, and the depth profile
+    // of the widest one.
+    let mut pair_js: Vec<Mean> = vec![Mean::default(); n_bands * n_bands];
+    let mut pair_js_agree: Vec<Mean> = vec![Mean::default(); n_bands * n_bands];
+    let mut pair_js_differ: Vec<Mean> = vec![Mean::default(); n_bands * n_bands];
+    let mut uniform_js: Vec<Mean> = vec![Mean::default(); n_bands];
     let ply_edges = [0usize, 10, 20, 30, 40, usize::MAX];
-    let mut by_ply: Vec<Mean> = (0..ply_edges.len() - 1).map(|_| Mean::default()).collect();
+    let mut by_ply: Vec<Mean> = vec![Mean::default(); ply_edges.len() - 1];
 
     while positions < max_positions {
         let Some(game) = reader.next_game()? else {
@@ -212,10 +273,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ScoredSide::Black => !ply.is_multiple_of(2),
             };
             if scored && positions < max_positions {
-                let legal_ids = legal_move_ids(&board, &vocab);
-                if legal_ids.len() >= 2 {
-                    // One forward for all bands: the rows differ only in
-                    // the condition token, so they batch cleanly.
+                let legal = legal_moves(&board, &vocab);
+                if legal.len() >= 2 {
+                    // One forward for all bands: the rows differ only
+                    // in the condition token, so they batch cleanly.
                     let rows: Vec<Vec<u32>> = band_ids
                         .iter()
                         .map(|id| {
@@ -226,57 +287,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
                     let width = rows[0].len();
-                    let flat: Vec<u32> = rows.concat();
-                    let input = Tensor::from_vec(flat, (n_bands, width), &cfg.device)?;
-                    let logits = model.forward(&input)?;
+                    let input = Tensor::from_vec(rows.concat(), (n_bands, width), &cfg.device)?;
+                    let out = model.forward(&input)?;
+                    let band_logits: Vec<Vec<f32>> = (0..n_bands)
+                        .map(|b| out.i((b, width - 1))?.to_vec1::<f32>())
+                        .collect::<Result<_, _>>()?;
+                    let reference = mean_logits(&band_logits);
 
-                    let mut dists: Vec<Vec<f32>> = Vec::with_capacity(n_bands);
-                    for b in 0..n_bands {
-                        let last = logits.i((b, width - 1))?;
-                        let probs = candle_nn::ops::softmax(&last, 0)?.to_vec1::<f32>()?;
-                        let over_legal: Vec<f32> =
-                            legal_ids.iter().map(|id| probs[*id as usize]).collect();
-                        dists.push(normalise(&over_legal));
-                    }
+                    let played_at = legal.iter().position(|(uci, _)| *uci == played);
 
-                    let uniform = vec![1.0f32 / legal_ids.len() as f32; legal_ids.len()];
-                    for (b, d) in dists.iter().enumerate() {
-                        uniform_js[b].push(js_bits(d, &uniform)?);
-                    }
-
-                    let argmax = |d: &Vec<f32>| {
-                        d.iter()
-                            .enumerate()
-                            .max_by(|a, b| a.1.total_cmp(b.1))
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)
-                    };
-                    let tops: Vec<usize> = dists.iter().map(argmax).collect();
-
-                    for i in 0..n_bands {
-                        for j in (i + 1)..n_bands {
-                            let d = js_bits(&dists[i], &dists[j])?;
-                            pair_js[i * n_bands + j].push(d);
-                            if tops[i] == tops[j] {
-                                pair_js_agree[i * n_bands + j].push(d);
-                            } else {
-                                pair_js_differ[i * n_bands + j].push(d);
-                            }
-                            if i == 0 && j == n_bands - 1 {
-                                // The widest pair is the one with the
-                                // clearest signal, so depth is read off
-                                // that one.
-                                all_pair_js.push(d);
-                                let bucket = ply_edges
-                                    .windows(2)
-                                    .position(|w| ply >= w[0] && ply < w[1])
-                                    .unwrap_or(0);
-                                by_ply[bucket].push(d);
+                    for stats in sweep.iter_mut() {
+                        let mut dists = Vec::with_capacity(n_bands);
+                        for logits in &band_logits {
+                            let guided = guide_logits(logits, &reference, stats.gamma);
+                            let probs = softmax(&guided);
+                            let on_legal: Vec<f32> =
+                                legal.iter().map(|(_, id)| probs[*id as usize]).collect();
+                            stats.legal_mass.push(on_legal.iter().sum::<f32>() as f64);
+                            dists.push(normalise(&on_legal));
+                        }
+                        let tops: Vec<usize> = dists.iter().map(|d| argmax(d)).collect();
+                        for (b, top) in tops.iter().enumerate() {
+                            if let Some(want) = played_at {
+                                stats.top1[b].push(if *top == want { 1.0 } else { 0.0 });
                             }
                         }
-                    }
-                    if tops.iter().any(|t| *t != tops[0]) {
-                        top1_differs += 1;
+                        if tops.iter().any(|t| *t != tops[0]) {
+                            stats.top1_differs += 1;
+                        }
+                        stats
+                            .widest_js
+                            .push(js_bits(&dists[0], &dists[n_bands - 1])?);
+
+                        // The unguided pass also fills the detail.
+                        if stats.gamma == 1.0 {
+                            let uniform = vec![1.0f32 / legal.len() as f32; legal.len()];
+                            for (b, d) in dists.iter().enumerate() {
+                                uniform_js[b].push(js_bits(d, &uniform)?);
+                            }
+                            for i in 0..n_bands {
+                                for j in (i + 1)..n_bands {
+                                    let d = js_bits(&dists[i], &dists[j])?;
+                                    pair_js[i * n_bands + j].push(d);
+                                    if tops[i] == tops[j] {
+                                        pair_js_agree[i * n_bands + j].push(d);
+                                    } else {
+                                        pair_js_differ[i * n_bands + j].push(d);
+                                    }
+                                    if i == 0 && j == n_bands - 1 {
+                                        let bucket = ply_edges
+                                            .windows(2)
+                                            .position(|w| ply >= w[0] && ply < w[1])
+                                            .unwrap_or(0);
+                                        by_ply[bucket].push(d);
+                                    }
+                                }
+                            }
+                        }
                     }
                     positions += 1;
                 }
@@ -298,58 +365,79 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("ckpt       {}", ckpt.display());
     println!("holdout    {pgn}");
     println!(
-        "walk       {} positions from {games} games, side {side:?}{}",
-        positions,
-        walk_band.map(|b| format!(", band {b}")).unwrap_or_default()
+        "walk       {positions} positions from {games} games, side {side:?}{}",
+        walk_token
+            .as_ref()
+            .map(|t| format!(", games of {t}"))
+            .unwrap_or_default()
     );
     println!("elapsed    {:.1?}", t0.elapsed());
+
     println!();
-    println!("JS divergence in bits (0 = identical, 1 = disjoint)");
+    println!(
+        "guidance sweep (widest pair {} vs {})",
+        shape.bands[0].token,
+        shape.bands[n_bands - 1].token
+    );
+    println!(
+        "{:>6} {:>10} {:>11} {:>11} top1 match by band",
+        "gamma", "JS bits", "legal mass", "top1 flips"
+    );
+    for stats in &sweep {
+        let matches: Vec<String> = stats
+            .top1
+            .iter()
+            .map(|m| match m.value() {
+                Some(v) => format!("{v:.4}"),
+                None => "  -   ".to_string(),
+            })
+            .collect();
+        println!(
+            "{:>6.2} {:>10.4} {:>11.4} {:>10.2}% {}",
+            stats.gamma,
+            stats.widest_js.value().unwrap_or(f64::NAN),
+            stats.legal_mass.value().unwrap_or(f64::NAN),
+            100.0 * stats.top1_differs as f64 / n,
+            matches.join("  ")
+        );
+    }
+    println!("bands in order: {:?}", shape.band_tokens());
+
+    println!();
+    println!("unguided detail — JS divergence in bits (0 = identical, 1 = disjoint)");
     for i in 0..n_bands {
         for j in (i + 1)..n_bands {
-            let m = &pair_js[i * n_bands + j];
             println!(
                 "  {} vs {}   mean {:.4}",
                 shape.bands[i].token,
                 shape.bands[j].token,
-                m.value().unwrap_or(f64::NAN)
+                pair_js[i * n_bands + j].value().unwrap_or(f64::NAN)
             );
             if let Some(v) = pair_js_agree[i * n_bands + j].value() {
                 println!(
-                    "    where top-1 agrees   {:.4}  (n={})",
-                    v,
+                    "    where top-1 agrees   {v:.4}  (n={})",
                     pair_js_agree[i * n_bands + j].n
                 );
             }
             if let Some(v) = pair_js_differ[i * n_bands + j].value() {
                 println!(
-                    "    where top-1 differs  {:.4}  (n={})",
-                    v,
+                    "    where top-1 differs  {v:.4}  (n={})",
                     pair_js_differ[i * n_bands + j].n
                 );
             }
         }
     }
     println!();
-    println!("reference: each band against a uniform draw over the same legal moves");
+    println!("  each band against a uniform draw over the same legal moves:");
     for (b, m) in uniform_js.iter().enumerate() {
         println!(
-            "  {} vs uniform   {:.4}",
+            "    {} vs uniform   {:.4}",
             shape.bands[b].token,
             m.value().unwrap_or(f64::NAN)
         );
     }
     println!();
-    println!(
-        "top-1 differs between bands: {:.2}% of positions",
-        100.0 * top1_differs as f64 / n
-    );
-    println!();
-    println!(
-        "widest pair ({} vs {}) by depth:",
-        shape.bands[0].token,
-        shape.bands[n_bands - 1].token
-    );
+    println!("  widest pair by depth:");
     for (b, m) in by_ply.iter().enumerate() {
         let hi = ply_edges[b + 1];
         let label = if hi == usize::MAX {
@@ -358,35 +446,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             format!("ply {}-{}", ply_edges[b], hi - 1)
         };
         match m.value() {
-            Some(v) => println!("  {label:<12} {v:.4}  (n={})", m.n),
-            None => println!("  {label:<12} (no positions)"),
+            Some(v) => println!("    {label:<12} {v:.4}  (n={})", m.n),
+            None => println!("    {label:<12} (no positions)"),
         }
-    }
-    println!();
-    if !all_pair_js.is_empty() {
-        all_pair_js.sort_by(|a, b| a.total_cmp(b));
-        let at = |q: f64| all_pair_js[((all_pair_js.len() - 1) as f64 * q) as usize];
-        println!(
-            "first pair spread: p50 {:.4}  p90 {:.4}  p99 {:.4}  max {:.4}",
-            at(0.50),
-            at(0.90),
-            at(0.99),
-            all_pair_js[all_pair_js.len() - 1]
-        );
     }
     Ok(())
 }
 
-/// Vocabulary ids of every legal move in a position.
-fn legal_move_ids(board: &Board, vocab: &MoveVocab) -> Vec<u32> {
-    let mut ids = Vec::new();
+/// Index of the largest entry.
+fn argmax(d: &[f32]) -> usize {
+    d.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Legal moves in a position, with their vocabulary ids.
+fn legal_moves(board: &Board, vocab: &MoveVocab) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
     board.generate_moves(|moves| {
         for mv in moves {
-            if let Some(id) = vocab.id_of(&uci_standard(board, mv)) {
-                ids.push(id);
+            let uci = uci_standard(board, mv);
+            if let Some(id) = vocab.id_of(&uci) {
+                out.push((uci, id));
             }
         }
         false
     });
-    ids
+    out
 }

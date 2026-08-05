@@ -25,6 +25,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use cozy_chess::Board;
 
 use algocline_nn::arch::Gpt2Model;
+use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard};
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
 use algocline_nn::chess::ModelShape;
@@ -113,12 +114,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
 
+    // Guidance strength. Read from the environment because the move
+    // list is variadic and cannot share the tail of the argument list.
+    // One is the unguided model; above one the band token's effect is
+    // amplified (see `chess::guide`).
+    let gamma: f32 = env::var("CHESS_GAMMA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+
     // Only the last ctx tokens fit; the model sees the tail.
     let window: Vec<u32> = row.iter().rev().take(shape.ctx).rev().copied().collect();
-    let input = Tensor::from_vec(window.clone(), (1, window.len()), &cfg.device)?;
-    let logits = model.forward(&input)?;
-    let last = logits.i((0, window.len() - 1))?;
-    let probs = candle_nn::ops::softmax(&last, 0)?.to_vec1::<f32>()?;
+    let guided_band = band_token.as_ref().filter(|_| gamma != 1.0);
+    let probs = if let Some(asked) = guided_band {
+        // Guidance needs the other bands to build the reference it
+        // extrapolates away from, so every band is run at this
+        // position and the requested one is pushed away from their
+        // mean.
+        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(shape.bands.len());
+        let mut asked_at = 0usize;
+        for (i, band) in shape.bands.iter().enumerate() {
+            let id = vocab.id_of(&band.token).ok_or("band token missing")?;
+            let mut r = window.clone();
+            r[1] = id; // position 1 is the condition token
+            if &band.token == asked {
+                asked_at = i;
+            }
+            rows.push(r);
+        }
+        let n = rows.len();
+        let input = Tensor::from_vec(rows.concat(), (n, window.len()), &cfg.device)?;
+        let out = model.forward(&input)?;
+        let per_band: Vec<Vec<f32>> = (0..n)
+            .map(|b| out.i((b, window.len() - 1))?.to_vec1::<f32>())
+            .collect::<Result<_, _>>()?;
+        let reference = mean_logits(&per_band);
+        let guided = guide_logits(&per_band[asked_at], &reference, gamma);
+        let t = Tensor::from_vec(guided, (vocab.model_vocab_size(),), &cfg.device)?;
+        candle_nn::ops::softmax(&t, 0)?.to_vec1::<f32>()?
+    } else {
+        let input = Tensor::from_vec(window.clone(), (1, window.len()), &cfg.device)?;
+        let logits = model.forward(&input)?;
+        let last = logits.i((0, window.len() - 1))?;
+        candle_nn::ops::softmax(&last, 0)?.to_vec1::<f32>()?
+    };
 
     // Rank the legal moves by the model's mass, and note how much mass
     // fell outside the legal set.
@@ -151,6 +190,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let raw_token = vocab.token_of(raw_id).unwrap_or("(none)");
     let raw_legal = legal.iter().any(|(uci, _)| uci == raw_token);
 
+    println!("gamma      {gamma}");
     println!("ply        {}", history.len());
     println!("to move    {:?}", board.side_to_move());
     println!("history    {}", history.join(" "));

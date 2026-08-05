@@ -176,6 +176,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut pair_js_differ: Vec<Mean> = (0..n_bands * n_bands).map(|_| Mean::default()).collect();
     let mut uniform_js: Vec<Mean> = (0..n_bands).map(|_| Mean::default()).collect();
     let mut all_pair_js: Vec<f64> = Vec::new();
+    // The condition is one token at the far left of the row. If its
+    // influence is carried by attention across the whole sequence, a
+    // decay with depth is what a weak channel looks like — Maia-2 does
+    // not prepend at all, it injects skill into the network
+    // (arXiv:2409.20553), which is the shape of the remedy if this
+    // decays.
+    let ply_edges = [0usize, 10, 20, 30, 40, usize::MAX];
+    let mut by_ply: Vec<Mean> = (0..ply_edges.len() - 1).map(|_| Mean::default()).collect();
 
     while positions < max_positions {
         let Some(game) = reader.next_game()? else {
@@ -254,8 +262,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 pair_js_differ[i * n_bands + j].push(d);
                             }
-                            if i == 0 && j == 1 {
+                            if i == 0 && j == n_bands - 1 {
+                                // The widest pair is the one with the
+                                // clearest signal, so depth is read off
+                                // that one.
                                 all_pair_js.push(d);
+                                let bucket = ply_edges
+                                    .windows(2)
+                                    .position(|w| ply >= w[0] && ply < w[1])
+                                    .unwrap_or(0);
+                                by_ply[bucket].push(d);
                             }
                         }
                     }
@@ -328,6 +344,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "top-1 differs between bands: {:.2}% of positions",
         100.0 * top1_differs as f64 / n
     );
+    println!();
+    println!(
+        "widest pair ({} vs {}) by depth:",
+        shape.bands[0].token,
+        shape.bands[n_bands - 1].token
+    );
+    for (b, m) in by_ply.iter().enumerate() {
+        let hi = ply_edges[b + 1];
+        let label = if hi == usize::MAX {
+            format!("ply {}+", ply_edges[b])
+        } else {
+            format!("ply {}-{}", ply_edges[b], hi - 1)
+        };
+        match m.value() {
+            Some(v) => println!("  {label:<12} {v:.4}  (n={})", m.n),
+            None => println!("  {label:<12} (no positions)"),
+        }
+    }
+    println!();
     if !all_pair_js.is_empty() {
         all_pair_js.sort_by(|a, b| a.total_cmp(b));
         let at = |q: f64| all_pair_js[((all_pair_js.len() - 1) as f64 * q) as usize];

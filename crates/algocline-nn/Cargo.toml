@@ -13,6 +13,23 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+# Chess rules for the PGN ingestion path (`src/pgn.rs`): legal move
+# generation is what turns a SAN token such as `Nf3` into a concrete
+# move, because SAN records only the destination and leaves the origin
+# to be recovered from the position. Hand-writing that means
+# re-implementing castling, en passant, promotion and pin detection —
+# a large surface with no cheap self-check.
+#
+# License is the reason this is `cozy-chess` and not `shakmaty`:
+# shakmaty (and its sibling `pgn-reader`) is GPL-3.0-or-later, which
+# cannot be linked into this workspace's `MIT OR Apache-2.0`
+# distribution. `cozy-chess` is MIT and carries legal movegen, FEN and
+# `GameStatus`. It has no SAN support, so SAN resolution lives in
+# `src/pgn.rs`.
+#
+# This crate is only linked when the engine's `nn` feature is on, so
+# the dependency stays inside that feature by construction.
+cozy-chess = "0.3"
 # CPU by default. The optional `nn-cuda` feature turns on candle's CUDA
 # backend; on a CUDA-less dev host that feature only compiles behind an
 # `nvcc` toolchain. candle-core / candle-nn are released in lockstep;
@@ -137,4 +154,12 @@ nn-metal = [
 # Kept out of the crate's public API surface.
 [[example]]
 name = "nn_medium_gpu_smoke"
+required-features = []
+
+# Corpus self-check for the PGN reader (`src/pgn.rs`): replays a real
+# PGN file and asserts every SAN token resolves to exactly one legal
+# move. Needs no GPU and no candle work — it is the verification path
+# for chess ingestion.
+[[example]]
+name = "pgn_san_check"
 required-features = []

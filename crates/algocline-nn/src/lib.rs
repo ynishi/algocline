@@ -32,6 +32,7 @@ pub mod card;
 mod hub;
 pub mod merged;
 pub mod metric;
+pub mod pgn;
 pub mod sampling;
 pub mod tokenizer;
 pub mod train;

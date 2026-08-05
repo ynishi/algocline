@@ -28,11 +28,13 @@
 
 use std::io::BufRead;
 
+use cozy_chess::{Board, Move};
 use thiserror::Error;
 
 use crate::chess::filter::GameFilter;
-use crate::chess::pgn::{game_to_uci, PgnError, PgnReader};
+use crate::chess::pgn::{game_to_uci, uci_standard, PgnError, PgnReader};
 use crate::chess::vocab::{MoveVocab, BOS};
+use crate::train::{Batch, Dataset, DatasetError, DatasetOpts};
 
 /// What to do with a game longer than the row limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -371,6 +373,153 @@ pub fn build_rows<R: BufRead>(
     Ok(Corpus { rows, masks, stats })
 }
 
+/// Rows plus, for every position, the moves that were legal there.
+///
+/// # Why this exists
+///
+/// Cross-entropy over the whole vocabulary makes the model spend
+/// capacity learning which moves are illegal. Measured on a trained
+/// checkpoint: 1.59 of 4.52 nats — a third of the objective — went on
+/// keeping mass off moves that did not exist in the position. Decoding
+/// then throws that work away, because it walks the ranking against
+/// the legal set regardless of what the model believed.
+///
+/// Restricting the loss to the legal moves spends that third on the
+/// question that survives to inference: which of the available moves
+/// to play.
+///
+/// # Cost
+///
+/// The legal sets are not stored. Holding them for a 600,000-row
+/// corpus would take gigabytes, so each batch replays its own rows —
+/// about 66 move generations per row, which is microseconds against a
+/// step that takes a hundred milliseconds.
+pub struct LegalMaskedDataset {
+    rows: Vec<(Vec<u32>, Vec<f32>)>,
+    /// Vocabulary id of each move, in the enumeration order a board
+    /// replay produces them.
+    vocab: MoveVocab,
+    /// Tokens that are not moves and can never be a legal answer.
+    prefix_len: usize,
+    opts: DatasetOpts,
+    cursor: usize,
+}
+
+impl LegalMaskedDataset {
+    /// Wrap rows that begin with `prefix_len` non-move tokens.
+    ///
+    /// `prefix_len` is 1 for `[BOS, moves..]` and 2 when a condition
+    /// token follows the BOS: those positions hold no move, so no legal
+    /// set applies to them and they are left unrestricted.
+    pub fn new(
+        rows: Vec<(Vec<u32>, Vec<f32>)>,
+        vocab: MoveVocab,
+        prefix_len: usize,
+        opts: DatasetOpts,
+    ) -> Self {
+        Self {
+            rows,
+            vocab,
+            prefix_len,
+            opts,
+            cursor: 0,
+        }
+    }
+
+    /// Rows held.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Replay one row, collecting the legal ids at every position.
+    ///
+    /// A position whose token is not a move it can reach — the prefix,
+    /// the padding past the game's end, or anything after a token the
+    /// board cannot play — gets an empty set, which the training loop
+    /// reads as "do not restrict this position".
+    fn legal_sets(&self, row: &[u32]) -> Vec<Vec<u32>> {
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); row.len()];
+        let mut board = Board::default();
+        for pos in self.prefix_len..row.len() {
+            let mut ids = Vec::new();
+            let mut played: Option<Move> = None;
+            board.generate_moves(|moves| {
+                for mv in moves {
+                    if let Some(id) = self.vocab.id_of(&uci_standard(&board, mv)) {
+                        if id == row[pos] {
+                            played = Some(mv);
+                        }
+                        ids.push(id);
+                    }
+                }
+                false
+            });
+            match played {
+                // Only a position whose own token is one of the legal
+                // moves may be restricted. Restricting a position whose
+                // target is not in the set — padding past the end of
+                // the game — would score the target at negative
+                // infinity, and an infinity multiplied by that
+                // position's zero loss weight is NaN, not zero.
+                Some(mv) => {
+                    out[pos] = ids;
+                    board.play_unchecked(mv);
+                }
+                // Padding, or a token this position cannot produce.
+                // Everything after is unreachable, so the sets stop
+                // here rather than being invented.
+                None => break,
+            }
+        }
+        out
+    }
+}
+
+impl Dataset for LegalMaskedDataset {
+    fn next_batch(&mut self) -> Result<Option<Batch>, DatasetError> {
+        if self.cursor >= self.rows.len() {
+            return Ok(None);
+        }
+        let start = self.cursor;
+        let end = (start + self.opts.batch_size).min(self.rows.len());
+        self.cursor = end;
+        let ctx = self.opts.ctx_len;
+        let pad = self.opts.pad_id;
+
+        let mut input_ids = Vec::with_capacity(end - start);
+        let mut loss_mask = Vec::with_capacity(end - start);
+        let mut allowed = Vec::with_capacity(end - start);
+        for (row, mask) in &self.rows[start..end] {
+            let padded: Vec<u32> = row
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(pad))
+                .take(ctx)
+                .collect();
+            let padded_mask: Vec<f32> = mask
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0.0))
+                .take(ctx)
+                .collect();
+            allowed.push(self.legal_sets(&padded));
+            input_ids.push(padded);
+            loss_mask.push(padded_mask);
+        }
+
+        Ok(Some(Batch {
+            input_ids,
+            loss_mask: Some(loss_mask),
+            is_last: end == self.rows.len(),
+            allowed_ids: Some(allowed),
+        }))
+    }
+
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.rows.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +834,72 @@ mod tests {
         assert_eq!(c.rows.len(), 2);
         // The third game was never read.
         assert_eq!(c.stats.games_read, 2);
+    }
+
+    #[test]
+    fn legal_sets_hold_the_move_that_was_played_and_only_legal_ones() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 2. Nf3 Nc6 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        let rows = c.into_teacher_rows();
+        let ds = LegalMaskedDataset::new(
+            rows.clone(),
+            MoveVocab::new(&[]).unwrap(),
+            1, // [BOS, moves..]
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 8,
+                ..Default::default()
+            },
+        );
+        let sets = ds.legal_sets(&{
+            let mut r = rows[0].0.clone();
+            r.resize(8, 0);
+            r
+        });
+
+        // Position 0 is BOS: no move belongs there.
+        assert!(sets[0].is_empty());
+        // Position 1 is White's first move: twenty legal moves exist,
+        // and the one actually played is among them.
+        assert_eq!(sets[1].len(), 20);
+        assert!(sets[1].contains(&vocab.id_of("e2e4").unwrap()));
+        // A move that is not legal from the start position is absent.
+        assert!(!sets[1].contains(&vocab.id_of("e2e5").unwrap()));
+        // Position 2 is Black's reply, from a different position, so
+        // the set differs.
+        assert!(sets[2].contains(&vocab.id_of("e7e5").unwrap()));
+        assert!(!sets[2].contains(&vocab.id_of("e2e4").unwrap()));
+    }
+
+    #[test]
+    fn the_batch_carries_one_legal_set_per_position() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 2. Nf3 Nc6 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        let mut ds = LegalMaskedDataset::new(
+            c.into_teacher_rows(),
+            MoveVocab::new(&[]).unwrap(),
+            1,
+            DatasetOpts {
+                batch_size: 4,
+                ctx_len: 8,
+                ..Default::default()
+            },
+        );
+        let batch = ds.next_batch().unwrap().expect("a batch");
+        let allowed = batch.allowed_ids.expect("legal sets");
+        assert_eq!(allowed.len(), batch.input_ids.len());
+        assert_eq!(allowed[0].len(), 8);
+        // Past the end of the game the row is padding, which no legal
+        // set covers.
+        assert!(allowed[0][7].is_empty());
     }
 
     #[test]

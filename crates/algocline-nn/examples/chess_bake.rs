@@ -52,15 +52,15 @@ use candle_nn::{VarBuilder, VarMap};
 
 use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::corpus::{
-    build_rows, ConditionBand, ConditionSpec, CorpusOptions, ScoredSide,
+    build_rows, ConditionBand, ConditionSpec, CorpusOptions, LegalMaskedDataset, ScoredSide,
 };
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::ModelShape;
 use algocline_nn::train::{
-    run_full_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, Loss, ScheduleKind,
-    TeacherCardDataset, TrainingLease,
+    allowed_logit_mask, run_full_ft, CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss,
+    ScheduleKind, TeacherCardDataset, TrainingLease,
 };
 
 /// Read a `usize` from the environment, falling back to `default`.
@@ -112,43 +112,63 @@ fn shuffle<T>(rows: &mut [T], rng: &mut Rng) {
     }
 }
 
-/// Mean masked cross-entropy over a set of rows, without training.
+/// Mean cross-entropy over the legal moves, on held-out rows.
 ///
-/// The same loss the trainer optimises, so the two curves are directly
-/// comparable.
+/// **Always** restricted to the legal moves, whichever objective the
+/// run trained under. Scoring a legal-masked model over the whole
+/// vocabulary would charge it for mass on moves it was never asked to
+/// suppress, and scoring an unmasked one the same way would credit it
+/// for work decoding does for free. The legal-restricted number is
+/// what both models are ultimately for, so it is the one that makes
+/// the two comparable.
 fn eval_loss(
     model: &Gpt2Model,
     rows: &[(Vec<u32>, Vec<f32>)],
+    vocab: &MoveVocab,
     ctx: usize,
     batch: usize,
     device: &Device,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     let loss = CrossEntropyLoss::new();
+    let mut ds = LegalMaskedDataset::new(
+        rows.to_vec(),
+        vocab.clone(),
+        2,
+        DatasetOpts {
+            batch_size: batch,
+            ctx_len: ctx,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        },
+    );
     let mut total = 0f64;
     let mut counted = 0usize;
-    for chunk in rows.chunks(batch) {
-        let width = ctx;
-        let mut ids: Vec<u32> = Vec::with_capacity(chunk.len() * width);
-        let mut mask: Vec<f32> = Vec::with_capacity(chunk.len() * width);
-        for (row, m) in chunk {
-            for i in 0..width {
-                ids.push(row.get(i).copied().unwrap_or(0));
-                mask.push(m.get(i).copied().unwrap_or(0.0));
-            }
-        }
-        let full = Tensor::from_vec(ids, (chunk.len(), width), device)?;
-        let full_mask = Tensor::from_vec(mask, (chunk.len(), width), device)?;
-        // Same shift the training loop applies: inputs are all but the
-        // last token, targets and mask are all but the first.
+    while let Some(b) = ds.next_batch()? {
+        let rows_in = b.input_ids.len();
+        let width = b.input_ids[0].len();
+        let flat: Vec<u32> = b.input_ids.concat();
+        let flat_mask: Vec<f32> = b
+            .loss_mask
+            .as_ref()
+            .expect("teacher rows carry a loss mask")
+            .concat();
+        let full = Tensor::from_vec(flat, (rows_in, width), device)?;
+        let full_mask = Tensor::from_vec(flat_mask, (rows_in, width), device)?;
+        // Same shift the training loop applies.
         let inputs = full.narrow(1, 0, width - 1)?.contiguous()?;
         let targets = full.narrow(1, 1, width - 1)?.contiguous()?;
         let m = full_mask.narrow(1, 1, width - 1)?.contiguous()?;
         let logits = model.forward(&inputs)?;
+        let logits = match allowed_logit_mask(&b, width, logits.dim(2)?, device)? {
+            Some(am) => logits.broadcast_add(&am)?,
+            None => logits,
+        };
         let l = loss
             .compute(&logits, &targets, Some(&m))?
             .to_scalar::<f32>()?;
-        total += l as f64 * chunk.len() as f64;
-        counted += chunk.len();
+        total += l as f64 * rows_in as f64;
+        counted += rows_in;
     }
     if counted == 0 {
         return Err("validation set is empty".into());
@@ -309,16 +329,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let vocab_size = vocab.model_vocab_size();
-    let mut dataset = TeacherCardDataset::from_rows(
-        rows,
-        DatasetOpts {
-            batch_size: batch,
-            ctx_len: shape.ctx,
-            shuffle: false,
-            pad_id: 0,
-            text_field: "text".into(),
-        },
-    )?;
+    let ds_opts = DatasetOpts {
+        batch_size: batch,
+        ctx_len: shape.ctx,
+        shuffle: false,
+        pad_id: 0,
+        text_field: "text".into(),
+    };
+    // Restricting the loss to the legal moves is opt-in so the two
+    // objectives can be compared on the same corpus and the same seed.
+    let legal_mask = env::var("CHESS_LEGAL_MASK").as_deref() == Ok("1");
+    let mut dataset: Box<dyn Dataset + Send> = if legal_mask {
+        eprintln!(
+            "[bake] loss restricted to legal moves (measured: 1.59 of 4.52 nats \
+             otherwise goes on suppressing illegal ones, which decoding gives free)"
+        );
+        Box::new(LegalMaskedDataset::new(
+            rows,
+            MoveVocab::new(&tokens)?,
+            // [BOS, band, moves..] — two tokens before the first move.
+            2,
+            ds_opts,
+        ))
+    } else {
+        Box::new(TeacherCardDataset::from_rows(rows, ds_opts)?)
+    };
 
     // CUDA when the build has it, so the same example serves the pod.
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
@@ -384,7 +419,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ckpt = run_full_ft(
         &model,
         &vm,
-        &mut dataset,
+        dataset.as_mut(),
         &ft_cfg,
         &CrossEntropyLoss::new(),
         &ckpt_dir,
@@ -424,7 +459,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "[bake] scoring {} validation rows against each checkpoint…",
             val.len()
         );
-        let final_val = eval_loss(&model, val, shape.ctx, batch, &cfg.device)?;
+        let final_val = eval_loss(&model, val, &vocab, shape.ctx, batch, &cfg.device)?;
         let mut curve: Vec<(usize, f32)> = Vec::new();
         if eval_every > 0 {
             let mut step = eval_every;
@@ -432,7 +467,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let p = ckpt_dir.join(format!("{prefix}-step{step}.safetensors"));
                 if p.exists() {
                     let m = Gpt2Model::from_safetensors_file(&cfg, &p)?;
-                    curve.push((step, eval_loss(&m, val, shape.ctx, batch, &cfg.device)?));
+                    curve.push((
+                        step,
+                        eval_loss(&m, val, &vocab, shape.ctx, batch, &cfg.device)?,
+                    ));
                 }
                 step += eval_every;
             }

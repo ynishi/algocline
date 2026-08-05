@@ -494,6 +494,19 @@ where
             } else {
                 logits.to_dtype(DType::F32)?
             };
+            // Remove the ids this target could not have taken, so the
+            // loss scores the choice among the ones it could. Applied
+            // after the F32 cast: negative infinity in BF16 would not
+            // survive the conversion cleanly.
+            let logits = match allowed_logit_mask(
+                &batch,
+                batch.input_ids[0].len(),
+                logits.dim(2)?,
+                &device,
+            )? {
+                Some(m) => logits.broadcast_add(&m)?,
+                None => logits,
+            };
             let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
 
             let loss_val: f32 = loss.to_scalar()?;
@@ -898,6 +911,199 @@ fn batch_to_input_target(
     };
 
     Ok((inputs, targets, mask))
+}
+
+/// Magnitude of the penalty applied to a disallowed id.
+///
+/// Large enough that `exp` of it underflows to zero in f32, so the
+/// softmax behaves as if the id were absent — and finite, which
+/// negative infinity is not. An infinite log-probability multiplied by
+/// a zero loss weight is NaN rather than zero, so a single disallowed
+/// target at a position the loss ignores would otherwise poison the
+/// whole batch. That is not hypothetical: it is what the first run of
+/// this code did, on the padding past the end of every game.
+const DISALLOWED_LOGIT: f32 = -1e9;
+
+/// Additive logit mask that removes every id a target may not take.
+///
+/// Returns `[batch, seq - 1, vocab]` of `0.0` on allowed ids and
+/// [`DISALLOWED_LOGIT`] elsewhere, aligned with the targets: entry `k`
+/// governs the prediction of `input_ids[k + 1]`, so it reads
+/// `allowed_ids[row][k + 1]`.
+///
+/// Added to the logits before the softmax, this makes the loss score
+/// the choice among the allowed ids rather than the choice among all
+/// of them. A position with no allowed ids is left unmasked, which is
+/// how a producer says "this position is not constrained".
+pub fn allowed_logit_mask(
+    batch: &Batch,
+    seq: usize,
+    vocab: usize,
+    device: &Device,
+) -> CandleResult<Option<Tensor>> {
+    let Some(allowed) = batch.allowed_ids.as_ref() else {
+        return Ok(None);
+    };
+    let rows = batch.input_ids.len();
+    if allowed.len() != rows {
+        return Err(candle_core::Error::Msg(format!(
+            "allowed_ids row count {} != batch size {rows}",
+            allowed.len()
+        )));
+    }
+    let width = seq - 1;
+    let mut flat = vec![DISALLOWED_LOGIT; rows * width * vocab];
+    for (r, row) in allowed.iter().enumerate() {
+        for k in 0..width {
+            let base = (r * width + k) * vocab;
+            match row.get(k + 1) {
+                Some(ids) if !ids.is_empty() => {
+                    for id in ids {
+                        let i = *id as usize;
+                        if i >= vocab {
+                            return Err(candle_core::Error::Msg(format!(
+                                "allowed id {i} is outside vocab {vocab}"
+                            )));
+                        }
+                        flat[base + i] = 0.0;
+                    }
+                }
+                // No set for this position: leave every id available.
+                _ => flat[base..base + vocab].fill(0.0),
+            }
+        }
+    }
+    Ok(Some(Tensor::from_vec(flat, (rows, width, vocab), device)?))
+}
+
+#[cfg(test)]
+mod allowed_logit_mask_tests {
+    use super::*;
+
+    fn batch_with(allowed: Option<Vec<Vec<Vec<u32>>>>) -> Batch {
+        Batch {
+            input_ids: vec![vec![1, 2, 3]],
+            loss_mask: None,
+            is_last: true,
+            allowed_ids: allowed,
+        }
+    }
+
+    #[test]
+    fn no_sets_means_no_mask() {
+        let b = batch_with(None);
+        let m = allowed_logit_mask(&b, 3, 5, &Device::Cpu).unwrap();
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn allowed_ids_are_untouched_and_the_rest_are_pushed_down() {
+        // Position 1 allows {0, 4}; position 2 allows {2}. Entry k of
+        // the mask governs the target at input position k + 1, so the
+        // sets read from index 1 upward.
+        let b = batch_with(Some(vec![vec![vec![], vec![0, 4], vec![2]]]));
+        let m = allowed_logit_mask(&b, 3, 5, &Device::Cpu)
+            .unwrap()
+            .expect("a mask");
+        assert_eq!(m.dims(), &[1, 2, 5]);
+        let v = m.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // k = 0 reads allowed[1] = {0, 4}
+        assert_eq!(v[0], 0.0);
+        assert_eq!(v[1], DISALLOWED_LOGIT);
+        assert_eq!(v[2], DISALLOWED_LOGIT);
+        assert_eq!(v[3], DISALLOWED_LOGIT);
+        assert_eq!(v[4], 0.0);
+        // k = 1 reads allowed[2] = {2}
+        assert_eq!(v[5], DISALLOWED_LOGIT);
+        assert_eq!(v[7], 0.0);
+        // Finite throughout: an infinity here becomes NaN the moment a
+        // zero loss weight multiplies it.
+        assert!(v.iter().all(|x| x.is_finite()), "got {v:?}");
+    }
+
+    #[test]
+    fn a_disallowed_target_costs_a_lot_but_does_not_produce_nan() {
+        // The failure this constant exists to prevent: a position whose
+        // target is not in its allowed set, weighted zero by the loss
+        // mask. With negative infinity the product is NaN and the whole
+        // batch is lost.
+        use crate::train::loss::{CrossEntropyLoss, Loss};
+        let logits = Tensor::from_vec(vec![0.0f32; 8], (1, 2, 4), &Device::Cpu).unwrap();
+        // Target 3 at both positions, but only {0, 1} allowed.
+        let targets = Tensor::from_vec(vec![3u32, 3], (1, 2), &Device::Cpu).unwrap();
+        let weights = Tensor::from_vec(vec![0.0f32, 0.0], (1, 2), &Device::Cpu).unwrap();
+        let b = batch_with(Some(vec![vec![vec![], vec![0, 1], vec![0, 1]]]));
+        let m = allowed_logit_mask(&b, 3, 4, &Device::Cpu)
+            .unwrap()
+            .expect("a mask");
+        let l = CrossEntropyLoss::new()
+            .compute(&logits.broadcast_add(&m).unwrap(), &targets, Some(&weights))
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(l.is_finite(), "loss went to {l}");
+    }
+
+    #[test]
+    fn an_empty_set_leaves_the_position_unrestricted() {
+        // Every logit must stay finite: an all-negative-infinity row
+        // would send the softmax to NaN and poison the whole batch.
+        let b = batch_with(Some(vec![vec![vec![], vec![], vec![]]]));
+        let m = allowed_logit_mask(&b, 3, 4, &Device::Cpu)
+            .unwrap()
+            .expect("a mask");
+        let v = m.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(v.iter().all(|x| *x == 0.0), "got {v:?}");
+    }
+
+    #[test]
+    fn an_id_outside_the_vocabulary_is_refused() {
+        let b = batch_with(Some(vec![vec![vec![], vec![9], vec![]]]));
+        let e = allowed_logit_mask(&b, 3, 4, &Device::Cpu).unwrap_err();
+        assert!(e.to_string().contains("outside vocab"), "got {e}");
+    }
+
+    #[test]
+    fn a_row_count_mismatch_is_refused() {
+        let b = batch_with(Some(vec![]));
+        let e = allowed_logit_mask(&b, 3, 4, &Device::Cpu).unwrap_err();
+        assert!(e.to_string().contains("row count"), "got {e}");
+    }
+
+    #[test]
+    fn masking_lowers_the_loss_it_is_scored_against() {
+        // The point of the mask: mass on ids the target could not take
+        // stops being charged. Same logits, same target, one masked.
+        use crate::train::loss::{CrossEntropyLoss, Loss};
+        let logits = Tensor::from_vec(
+            vec![1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            (1, 2, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let targets = Tensor::from_vec(vec![0u32, 0], (1, 2), &Device::Cpu).unwrap();
+        let loss = CrossEntropyLoss::new();
+
+        let plain = loss
+            .compute(&logits, &targets, None)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        // Uniform over four ids.
+        assert!((plain - 4f32.ln()).abs() < 1e-5, "got {plain}");
+
+        let b = batch_with(Some(vec![vec![vec![], vec![0, 1], vec![0, 1]]]));
+        let m = allowed_logit_mask(&b, 3, 4, &Device::Cpu)
+            .unwrap()
+            .expect("a mask");
+        let masked = loss
+            .compute(&logits.broadcast_add(&m).unwrap(), &targets, None)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        // Uniform over the two that remain.
+        assert!((masked - 2f32.ln()).abs() < 1e-5, "got {masked}");
+    }
 }
 
 #[cfg(test)]

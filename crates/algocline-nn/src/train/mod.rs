@@ -79,8 +79,8 @@ pub use data::{
     TokenizedDataset,
 };
 pub use fullft::{
-    run_distill, run_full_ft, run_lora_ft, CkptControl, CkptHook, CkptInfo, DistillLossKind,
-    DistillSpec, FullFtConfig, TrainError, TrainingLease, TrainingLeaseGuard,
+    allowed_logit_mask, run_distill, run_full_ft, run_lora_ft, CkptControl, CkptHook, CkptInfo,
+    DistillLossKind, DistillSpec, FullFtConfig, TrainError, TrainingLease, TrainingLeaseGuard,
 };
 pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};
 pub use mixed::MixedAdamW;

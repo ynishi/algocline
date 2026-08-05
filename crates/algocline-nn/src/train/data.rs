@@ -128,6 +128,22 @@ pub struct Batch {
     /// `true` when this is the final batch of the source and the
     /// caller may want to skip a gradient step (or scale the loss).
     pub is_last: bool,
+    /// Per-position sets of token ids the target is allowed to take,
+    /// indexed `[row][position]`.
+    ///
+    /// `None` (every dataset that does not model a constrained action
+    /// space) leaves the loss ranging over the whole vocabulary.
+    /// `Some` restricts it: the training loop drives every id outside
+    /// the set to negative infinity before the softmax, so the model is
+    /// scored only on choosing among the moves that exist.
+    ///
+    /// This matters wherever decoding already enforces the constraint.
+    /// A chess model measured here spent 1.59 of its 4.52 nats keeping
+    /// mass off illegal moves — a third of the objective — and the
+    /// decoder throws that work away, because it walks the ranking
+    /// against the legal set no matter what the model believed.
+    #[allow(clippy::type_complexity)]
+    pub allowed_ids: Option<Vec<Vec<Vec<u32>>>>,
 }
 
 /// Streaming batch iterator.
@@ -188,6 +204,7 @@ impl TokenizedDataset {
             input_ids,
             loss_mask: None,
             is_last: end == self.rows.len(),
+            allowed_ids: None,
         })
     }
 }
@@ -339,6 +356,7 @@ impl Dataset for JsonlDataset {
                 input_ids,
                 loss_mask: None,
                 is_last: end == self.buffer.len(),
+                allowed_ids: None,
             }));
         }
 
@@ -358,6 +376,7 @@ impl Dataset for JsonlDataset {
             input_ids,
             loss_mask: None,
             is_last: short_batch,
+            allowed_ids: None,
         }))
     }
 
@@ -577,6 +596,7 @@ impl Dataset for ParquetDataset {
                 input_ids,
                 loss_mask: None,
                 is_last: end == self.buffer.len(),
+                allowed_ids: None,
             }));
         }
 
@@ -596,6 +616,7 @@ impl Dataset for ParquetDataset {
             input_ids,
             loss_mask: None,
             is_last: short_batch,
+            allowed_ids: None,
         }))
     }
 
@@ -747,6 +768,7 @@ impl Dataset for TeacherCardDataset {
             input_ids,
             loss_mask: Some(loss_mask),
             is_last: end == self.rows.len(),
+            allowed_ids: None,
         }))
     }
 

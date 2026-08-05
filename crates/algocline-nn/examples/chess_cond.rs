@@ -246,6 +246,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ply_edges = [0usize, 10, 20, 30, 40, usize::MAX];
     let mut by_ply: Vec<Mean> = vec![Mean::default(); ply_edges.len() - 1];
 
+    // Where the training loss actually goes. The trainer optimises
+    // cross-entropy over the whole vocabulary, so every nat spent
+    // keeping mass off illegal moves is a nat not spent on preferring
+    // one legal move over another — and decoding throws that work away,
+    // because it walks the ranking against the legal set regardless.
+    //
+    // Splitting it says whether masking illegal moves during training
+    // would help. `ce_full` is what the trainer sees. `ce_legal` is the
+    // same model renormalised over the legal moves, i.e. what it would
+    // score if legality were free. `ce_uniform` is a uniform draw over
+    // the same legal moves. If `ce_legal` still loses to `ce_uniform`,
+    // the burden is not legality — it is that the preferences are
+    // wrong, and masking would move the loss without fixing anything.
+    let mut ce_full: Vec<Mean> = vec![Mean::default(); n_bands];
+    let mut ce_legal: Vec<Mean> = vec![Mean::default(); n_bands];
+    let mut ce_uniform = Mean::default();
+    let mut legal_count = Mean::default();
+
     while positions < max_positions {
         let Some(game) = reader.next_game()? else {
             break;
@@ -321,6 +339,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                         // The unguided pass also fills the detail.
                         if stats.gamma == 1.0 {
+                            // Loss decomposition, on the move actually
+                            // played: what the trainer sees, what it
+                            // would see if legality were free, and what
+                            // a uniform draw over the legal moves costs.
+                            if let Some(want) = played_at {
+                                ce_uniform.push((legal.len() as f64).ln());
+                                legal_count.push(legal.len() as f64);
+                                for (b, logits) in band_logits.iter().enumerate() {
+                                    let probs = softmax(logits);
+                                    let p_true = probs[legal[want].1 as usize] as f64;
+                                    let mass: f64 = legal
+                                        .iter()
+                                        .map(|(_, id)| probs[*id as usize] as f64)
+                                        .sum();
+                                    if p_true > 0.0 && mass > 0.0 {
+                                        ce_full[b].push(-p_true.ln());
+                                        ce_legal[b].push(-(p_true / mass).ln());
+                                    }
+                                }
+                            }
                             let uniform = vec![1.0f32 / legal.len() as f32; legal.len()];
                             for (b, d) in dists.iter().enumerate() {
                                 uniform_js[b].push(js_bits(d, &uniform)?);
@@ -426,6 +464,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
+    println!();
+    println!("  where the loss goes (nats, on the move actually played):");
+    println!(
+        "    legal moves per position   {:.1}",
+        legal_count.value().unwrap_or(f64::NAN)
+    );
+    println!(
+        "    uniform over legal         {:.4}  <- the bar any model has to beat",
+        ce_uniform.value().unwrap_or(f64::NAN)
+    );
+    for b in 0..n_bands {
+        println!(
+            "    {}  full vocab {:.4}   renormalised over legal {:.4}",
+            shape.bands[b].token,
+            ce_full[b].value().unwrap_or(f64::NAN),
+            ce_legal[b].value().unwrap_or(f64::NAN)
+        );
     }
     println!();
     println!("  each band against a uniform draw over the same legal moves:");

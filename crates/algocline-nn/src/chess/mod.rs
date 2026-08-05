@@ -13,6 +13,13 @@
 //! - [`vocab`] fixes the token alphabet from the board's geometry, so
 //!   the same move always carries the same id no matter which slice of
 //!   an archive was read.
+//! - [`filter`] decides which games belong in a corpus. This is also
+//!   where a playing style comes from: imitating players in a rating
+//!   band is the one mechanism known to reproduce how they move.
+//! - [`corpus`] runs the stages in order — tags, replay, length,
+//!   encode — and reports what happened to every game it read.
 
+pub mod corpus;
+pub mod filter;
 pub mod pgn;
 pub mod vocab;

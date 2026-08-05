@@ -163,3 +163,10 @@ required-features = []
 [[example]]
 name = "pgn_san_check"
 required-features = []
+
+# End of the ingestion path: a PGN archive in, rating-banded token rows
+# out, with every game read accounted for as a row or a named
+# rejection.
+[[example]]
+name = "chess_corpus_build"
+required-features = []

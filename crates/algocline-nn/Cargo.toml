@@ -181,3 +181,10 @@ required-features = []
 [[example]]
 name = "chess_play"
 required-features = []
+
+# Scores a checkpoint against games it never trained on: move match
+# against the human move, plus how much of the raw distribution lands
+# on legal moves.
+[[example]]
+name = "chess_eval"
+required-features = []

@@ -20,6 +20,32 @@
 //! Measure before scaling: the earlier Othello work spent an hour of
 //! someone else's machine finding that out.
 //!
+//! # Resuming
+//!
+//! `CHESS_INIT_FROM=<path.safetensors>` starts the run from an existing
+//! checkpoint rather than from a random initialisation, which is what
+//! makes an interrupted run recoverable and a curriculum expressible as
+//! two runs.
+//!
+//! The checkpoint has to describe the same model, and two separate
+//! checks say so. The weights themselves are matched name by name and
+//! shape by shape, which catches a changed `CHESS_DIM`, `CHESS_LAYERS`
+//! or `CHESS_CTX`. That is not enough on its own, because two of the
+//! dials move no tensor whatsoever: a changed band list leaves the
+//! condition tokens on ids `2..2+n` whatever they are named, with a
+//! vocabulary that rounds to 2048 for any band count this program can
+//! be given, and a changed `CHESS_HEADS` only reshapes what `c_attn`
+//! already produces — that projection is `dim -> 3*dim` at four heads
+//! and at eight alike. So the shape file written beside the checkpoint
+//! is compared field by field first, heads and band list included, and
+//! a disagreement stops the run before training. Resuming a `1600-1799`
+//! model as `1100-1299` is therefore an error, not a run whose
+//! embedding row 2 quietly means something else than it did yesterday.
+//!
+//! Every checkpoint carries its own shape file, written as it lands,
+//! so the pairing survives an interrupted run and cannot be rewritten
+//! by a later run that happens to share the filename.
+//!
 //! # Validation
 //!
 //! Pass a second PGN and the run holds nothing back from it — it is
@@ -59,8 +85,9 @@ use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::ModelShape;
 use algocline_nn::train::{
-    allowed_logit_mask, run_full_ft, CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss,
-    ScheduleKind, TeacherCardDataset, TrainingLease,
+    allowed_logit_mask, restore_into, run_full_ft, CkptControl, CkptHook, CkptInfo,
+    CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss, ScheduleKind, TeacherCardDataset,
+    TrainingLease,
 };
 
 /// Read a `usize` from the environment, falling back to `default`.
@@ -213,6 +240,110 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     Ok(out)
 }
 
+/// Render a band list for an error message.
+fn describe_bands(bands: &[ConditionBand]) -> String {
+    bands
+        .iter()
+        .map(|b| format!("{}-{} as {}", b.min, b.max, b.token))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every field on which a checkpoint's recorded shape differs from the
+/// one this run is configured for.
+///
+/// Field by field rather than one equality test so the message can name
+/// what moved. An operator who resumed with the wrong `CHESS_DIM`
+/// wants to read "dim is 128 in the checkpoint and 256 here", not that
+/// two structs differed.
+fn shape_disagreements(want: &ModelShape, found: &ModelShape) -> Vec<String> {
+    let mut out = Vec::new();
+    for (label, w, f) in [
+        ("layers", want.layers, found.layers),
+        ("heads", want.heads, found.heads),
+        ("dim", want.dim, found.dim),
+        ("ctx", want.ctx, found.ctx),
+        ("vocab", want.vocab, found.vocab),
+    ] {
+        if w != f {
+            out.push(format!("{label} is {f} in the checkpoint and {w} here"));
+        }
+    }
+    if want.bands != found.bands {
+        out.push(format!(
+            "bands are [{}] in the checkpoint and [{}] here",
+            describe_bands(&found.bands),
+            describe_bands(&want.bands)
+        ));
+    }
+    out
+}
+
+/// The checkpoint a `CHESS_INIT_FROM` resume starts from, or `None` for
+/// a random initialisation.
+///
+/// Resolved next to the argument parsing rather than at the restore
+/// itself, which sits below the corpus read: a mistyped path or a
+/// checkpoint of another shape should cost seconds, and the corpus read
+/// is minutes on a real Lichess slice. This is the same reason the
+/// validation PGN is opened before training rather than after.
+///
+/// The shape file is required, not preferred. Its absence cannot be
+/// waved through, because the check it carries is the only one there
+/// is for the bands: `restore_into` compares names, shapes and dtypes,
+/// and a changed band list leaves all three identical. Proceeding
+/// without the sidecar would restore a `1600-1799` model into a run
+/// configured as `1100-1299` and report a flawless resume, which is the
+/// exact silence this check exists to remove.
+fn resume_from(want: &ModelShape) -> Result<Option<PathBuf>, String> {
+    let raw = match env::var_os("CHESS_INIT_FROM") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if raw.is_empty() {
+        // `CHESS_INIT_FROM=` is how a shell blanks a variable it has
+        // already exported, so it means "no resume" rather than "resume
+        // from the file named ''" — which would only surface as an
+        // unreadable empty path further down. Said out loud, because an
+        // operator who meant to pass a path should see that none
+        // arrived.
+        eprintln!("[bake] CHESS_INIT_FROM is set but empty; starting from a random initialisation");
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(raw);
+    if !path.is_file() {
+        return Err(format!(
+            "CHESS_INIT_FROM={} is not a readable file",
+            path.display()
+        ));
+    }
+
+    // Every checkpoint carries its own shape file, the periodic ones
+    // included, so this is a plain lookup with no filename arithmetic
+    // in it — and the same lookup `chess_play` and the other readers
+    // do, rather than a rule only this program knows.
+    let found = ModelShape::load(&path).map_err(|e| {
+        format!(
+            "CHESS_INIT_FROM={}: cannot read the shape written beside it, so there is no way \
+             to tell which bands it was trained on — the weights carry the band count only as \
+             a vocabulary size, and that rounds to the same power of two either way. {e}",
+            path.display()
+        )
+    })?;
+
+    let disagreements = shape_disagreements(want, &found);
+    if !disagreements.is_empty() {
+        return Err(format!(
+            "CHESS_INIT_FROM={} was trained at a different shape: {}. Resuming anyway would \
+             train from weights that mean something else than this run assumes",
+            path.display(),
+            disagreements.join("; ")
+        ));
+    }
+    Ok(Some(path))
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -267,6 +398,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok("cosine") | Ok("cosine_with_warmup") | Err(_) => ScheduleKind::CosineWithWarmup,
         Ok(other) => return Err(format!("unknown CHESS_SCHEDULE {other:?}").into()),
     };
+
+    // Resolved here, before the corpus read, so a bad path or a
+    // checkpoint of another shape stops the run in seconds. The restore
+    // itself has to wait for the model to exist and stays below.
+    let init_from = resume_from(&shape)?;
+    if let Some(p) = &init_from {
+        eprintln!("[bake] resuming from {}", p.display());
+    }
 
     // The band is selected by the condition rather than by the filter:
     // a game outside every band is rejected when its token is resolved,
@@ -367,6 +506,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
     let model = Gpt2Model::new(&cfg, vb)?;
 
+    // The resume itself. `resume_from` has already established that the
+    // file exists and that its shape file agrees with this run down to
+    // the band list; what is left is the weights, and the restore is
+    // the strict one so that a name or shape the sidecar did not cover
+    // is an error rather than a variable quietly left at its random
+    // initialisation. A permissive load would report success and train
+    // from noise, with a training loss that looks like a fresh run
+    // because it would be one.
+    if let Some(init_from) = &init_from {
+        let report = restore_into(&vm, init_from)?;
+        eprintln!("[bake] init: {}", report.summary());
+        if !report.unused_from_file.is_empty() {
+            eprintln!(
+                "[bake] init: {} tensor(s) in the checkpoint are not part of this model \
+                 and were ignored: {}",
+                report.unused_from_file.len(),
+                report.unused_from_file.join(", ")
+            );
+        }
+    }
+
     // Validation rows, built from a month the training slice cannot
     // contain. Read before training so a bad path fails in seconds
     // rather than after the run.
@@ -403,7 +563,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         weight_decay: 0.0,
         ckpt_every: eval_every,
         // Every periodic checkpoint is scored afterwards, so none of
-        // them may be rotated away. The hook cannot do the scoring
+        // them may be rotated away. The hook below writes each
+        // checkpoint's shape file, but it cannot do the scoring
         // itself: `CkptHook` is `'static`, and the model is not.
         ckpt_keep: steps.checked_div(eval_every).map_or(1, |n| n + 2),
     };
@@ -414,6 +575,87 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .join("_");
     let prefix = format!("chess-{band_label}-{side:?}").to_lowercase();
+
+    // The shape rides with every checkpoint, written the moment the
+    // checkpoint itself lands. The weights alone do not say how many
+    // layers produced them, nor how many heads split them, nor which
+    // band each condition id stands for, and a reader that guesses
+    // wrong either fails on a tensor name or — for the heads and for
+    // the bands — does not fail at all. `c_attn` is `dim -> 3*dim`
+    // whichever head count reshapes it, so no name-and-shape check
+    // downstream can recover what this file records.
+    //
+    // One sidecar per checkpoint rather than one per run, because a
+    // per-run file describes the most recent run that *started*.
+    // `prefix` is built from the bands and the side alone, so two runs
+    // that differ only in CHESS_HEADS share every filename: writing
+    // the shape up front would leave the second run's heads sitting
+    // beside the first run's weights the moment the second was
+    // interrupted, and every reader (the resume here, chess_play,
+    // chess_eval, chess_cond, chess_match) would believe it. Written
+    // from one `ModelShape` value inside one process, a checkpoint and
+    // its shape file cannot disagree.
+    //
+    // Three residual gaps, all far narrower than the one this closes.
+    // A crash in the moment between `save_step` returning and this
+    // hook running leaves the previous sidecar next to a new
+    // checkpoint. Rotation unlinks step checkpoints without their
+    // shape files, leaving inert orphans nothing reads. And the shape
+    // write itself can fail — the arm below, which is the one that has
+    // actually been hit.
+    //
+    // That arm has to sweep. A failed `save` after a successful
+    // `save_step` means new weights sit at a name an earlier run with
+    // these bands may already have written a shape file for, and that
+    // stale file would outlive the aborted run: not a window of
+    // microseconds but a permanent mispairing, and one a later resume
+    // would accept whenever the operator's CHESS_HEADS happens to
+    // match what the old file says. Removing it turns the durable
+    // state into a checkpoint with no shape, which every reader
+    // refuses. The removal's own outcome rides on the error message
+    // rather than being dropped, since a sweep that silently failed
+    // would leave exactly the state it was supposed to prevent.
+    let shape_for_ckpt = shape.clone();
+    let on_ckpt: CkptHook = Box::new(move |info: &CkptInfo| {
+        match shape_for_ckpt.save(&info.ckpt_path) {
+            Ok(_) => Ok(CkptControl::Continue),
+            Err(e) => {
+                let stale = ModelShape::path_for(&info.ckpt_path);
+                let swept = match std::fs::remove_file(&stale) {
+                    // Deliberately silent about which run wrote what
+                    // was removed: it may be an earlier run's file, or
+                    // this one's own half-written JSON if the failure
+                    // came part-way through the write. Either way the
+                    // checkpoint is left with no shape rather than one
+                    // it does not match.
+                    Ok(()) => format!(
+                        "; the shape file at {} was removed, so this checkpoint now has none \
+                         rather than one written for a different model",
+                        stale.display()
+                    ),
+                    Err(r) if r.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(r) => format!(
+                        "; and a shape file at {} could not be removed ({r}) — if it predates \
+                         this run it now describes weights it was not written for, so delete it \
+                         by hand before reading this checkpoint",
+                        stale.display()
+                    ),
+                };
+                // The weights are on disk and cost whatever the run has
+                // cost so far. The abort skips the retrieval hint at
+                // the end of the program, so this is the only place
+                // that can say the checkpoint survived and what it
+                // still needs.
+                Err(format!(
+                    "{e}{swept}. The checkpoint itself was written and is intact at {}; it is \
+                     unusable until a shape file sits beside it, and the `[bake] model …` line \
+                     above carries every field that file needs",
+                    info.ckpt_path.display()
+                ))
+            }
+        }
+    });
+
     eprintln!("[bake] training {steps} steps at batch {batch}…");
     let t0 = Instant::now();
     let ckpt = run_full_ft(
@@ -425,7 +667,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ckpt_dir,
         &prefix,
         Arc::new(TrainingLease::new()),
-        None,
+        Some(on_ckpt),
     )?;
     let elapsed = t0.elapsed();
 
@@ -445,11 +687,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ckpt.train_loss,
         min_loss
     );
-    // The shape rides with the checkpoint: the weights alone do not
-    // say how many layers produced them, and a reader that guesses
-    // wrong either fails on a tensor name or, worse, does not.
+
+    // The final checkpoint's own sidecar, written once the run has
+    // actually produced one. After `run_full_ft` and not before: until
+    // it returns, `<prefix>.safetensors` is still whatever an earlier
+    // run with these bands left there, and putting this run's shape
+    // beside those weights would describe them with a configuration
+    // that never produced them.
     let ckpt_path = ckpt_dir.join(format!("{prefix}.safetensors"));
     let shape_path = shape.save(&ckpt_path)?;
+    eprintln!("[bake] shape written to {}", shape_path.display());
 
     // The validation curve. Scored after the fact from the periodic
     // checkpoints, which is what says whether the run stopped because
@@ -496,7 +743,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    eprintln!("[bake] shape written to {}", shape_path.display());
     print_retrieval_command(&ckpt_dir, &prefix);
     println!("{}", ckpt_path.display());
     Ok(())
@@ -514,6 +760,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// RunPod exports the SSH endpoint into the pod's environment; when it
 /// is absent (a local run, or another host) the placeholders stay in
 /// and the line is still a usable template.
+///
+/// The key is a placeholder rather than a path. Which private key opens
+/// a given host is the operator's business and not something to publish
+/// with the source: naming one here would put a specific key file of a
+/// specific machine into a public repository, which says more about that
+/// machine than a template needs to.
 fn print_retrieval_command(ckpt_dir: &Path, prefix: &str) {
     let ip = env::var("RUNPOD_PUBLIC_IP").unwrap_or_else(|_| "<public-ip>".into());
     let port = env::var("RUNPOD_TCP_PORT_22").unwrap_or_else(|_| "<ssh-port>".into());

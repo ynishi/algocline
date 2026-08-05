@@ -87,7 +87,14 @@ impl ScoredSide {
 }
 
 /// A range of an integer tag mapped to a condition token.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// Comparable because the band list is the part of a model's identity
+/// that its tensors do not carry: the tokens occupy ids `2..2+n`
+/// whatever the strings say, and the vocabulary rounds up to the same
+/// power of two for any plausible number of them. A resume that wants
+/// to know whether a checkpoint was trained on the bands it is being
+/// asked for has to compare the bands themselves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConditionBand {
     /// Inclusive lower bound.
     pub min: i64,

@@ -8,8 +8,10 @@
 //!   default used by Full FT. A distillation follow-up plugs in the
 //!   same trait.
 //! - [`scheduler`] — cosine-with-warmup learning-rate schedule.
-//! - [`ckpt`] — rotating safetensors [`ckpt::CheckpointStore`] and the
-//!   [`Checkpoint`] record type used by the caller.
+//! - [`ckpt`] — rotating safetensors [`ckpt::CheckpointStore`], the
+//!   [`Checkpoint`] record type used by the caller, and
+//!   [`ckpt::restore_into`], which puts a checkpoint back into a
+//!   trainable `VarMap` after checking that it describes the same model.
 //! - [`fullft`] — [`fullft::run_full_ft`] entry point: `forward → loss →
 //!   backward → optimizer step`, with per-step LR from the scheduler
 //!   and rotating checkpoints from the store.
@@ -73,7 +75,10 @@ pub trait DeviceView {
     fn device(&self) -> &candle_core::Device;
 }
 
-pub use ckpt::{checkpoint_from_path, CheckpointStore};
+pub use ckpt::{
+    checkpoint_from_path, restore_into, restore_into_partial, ApplyStage, CheckpointStore,
+    RestoreError, RestoreReport, TensorMismatch,
+};
 pub use data::{
     Batch, Dataset, DatasetError, DatasetOpts, JsonlDataset, ParquetDataset, TeacherCardDataset,
     TokenizedDataset,

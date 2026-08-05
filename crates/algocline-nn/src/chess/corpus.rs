@@ -48,6 +48,42 @@ pub enum Overlong {
     Truncate,
 }
 
+/// Whose moves the loss is scored on.
+///
+/// A game is one row holding both players' moves, so without a mask a
+/// model trained on it learns to play both sides. That is fine while
+/// the corpus is symmetric — a band filter that puts both players in
+/// the same range makes the two sides the same population — and wrong
+/// as soon as it is not. "White is a 2000, Black is anyone" is a
+/// perfectly good corpus, and every Black move in it is evidence about
+/// a player who is not being modelled.
+///
+/// The mask is per position: `1.0` where the row holds a move by the
+/// scored side, `0.0` elsewhere. `Loss::compute` averages over the
+/// scored positions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScoredSide {
+    /// Score every move. No mask is emitted.
+    #[default]
+    Both,
+    /// Score White's moves only.
+    White,
+    /// Score Black's moves only.
+    Black,
+}
+
+impl ScoredSide {
+    /// Whether the move at `move_index` (0-based, White to move on
+    /// even indices) is scored.
+    fn scores(&self, move_index: usize) -> bool {
+        match self {
+            ScoredSide::Both => true,
+            ScoredSide::White => move_index.is_multiple_of(2),
+            ScoredSide::Black => !move_index.is_multiple_of(2),
+        }
+    }
+}
+
 /// A range of an integer tag mapped to a condition token.
 #[derive(Debug, Clone)]
 pub struct ConditionBand {
@@ -104,6 +140,8 @@ pub struct CorpusOptions {
     /// Condition token derivation, or `None` for an unconditional
     /// corpus.
     pub condition: Option<ConditionSpec>,
+    /// Whose moves the loss is scored on.
+    pub scored_side: ScoredSide,
 }
 
 impl Default for CorpusOptions {
@@ -114,6 +152,7 @@ impl Default for CorpusOptions {
             max_len: None,
             overlong: Overlong::default(),
             condition: None,
+            scored_side: ScoredSide::default(),
         }
     }
 }
@@ -134,6 +173,12 @@ pub struct CorpusStats {
     pub rejected_by_condition: usize,
     /// Dropped because the row exceeded `max_len`.
     pub dropped_overlong: usize,
+    /// Dropped because the scored side had no move left in the row.
+    ///
+    /// A row the loss cannot score trains as a zero-gradient no-op
+    /// while still advancing the step, so it is rejected here rather
+    /// than passed on.
+    pub rejected_unscorable: usize,
     /// Kept but cut down to `max_len`.
     pub truncated: usize,
     /// Games whose moves could not be replayed.
@@ -169,16 +214,53 @@ pub enum CorpusError {
     },
 }
 
+/// The rows a build produced, and what it did with everything else.
+#[derive(Debug, Clone, Default)]
+pub struct Corpus {
+    /// Token id rows, one per kept game.
+    pub rows: Vec<Vec<u32>>,
+    /// Per-position loss masks, aligned row for row with [`rows`].
+    ///
+    /// `None` when [`ScoredSide::Both`] was asked for, since then every
+    /// position is scored and a mask of all ones carries no
+    /// information.
+    ///
+    /// [`rows`]: Corpus::rows
+    pub masks: Option<Vec<Vec<f32>>>,
+    /// What happened to every game read.
+    pub stats: CorpusStats,
+}
+
+impl Corpus {
+    /// Pair rows with their masks for
+    /// [`crate::train::data::TeacherCardDataset::from_rows`].
+    ///
+    /// When no mask was produced, every position is scored, so an
+    /// all-ones mask is synthesised — the dataset takes pairs, and a
+    /// uniformly scored row is exactly what all ones means.
+    pub fn into_teacher_rows(self) -> Vec<(Vec<u32>, Vec<f32>)> {
+        match self.masks {
+            Some(masks) => self.rows.into_iter().zip(masks).collect(),
+            None => self
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let mask = vec![1.0f32; row.len()];
+                    (row, mask)
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Read games and encode the ones that pass the filter.
-///
-/// Returns the rows and an account of what happened to everything
-/// else.
 pub fn build_rows<R: BufRead>(
     reader: &mut PgnReader<R>,
     vocab: &MoveVocab,
     opts: &CorpusOptions,
-) -> Result<(Vec<Vec<u32>>, CorpusStats), CorpusError> {
+) -> Result<Corpus, CorpusError> {
     let mut rows: Vec<Vec<u32>> = Vec::new();
+    let mut masks: Vec<Vec<f32>> = Vec::new();
     let mut stats = CorpusStats::default();
 
     while rows.len() < opts.max_rows {
@@ -232,16 +314,23 @@ pub fn build_rows<R: BufRead>(
         }
 
         let mut row = Vec::with_capacity(moves.len() + 2);
+        let mut mask = Vec::with_capacity(moves.len() + 2);
         row.push(BOS);
+        mask.push(0.0f32);
         if let Some(id) = condition_id {
             row.push(id);
+            // The condition token is given, not predicted: scoring it
+            // would train the model to guess which band it is playing
+            // as.
+            mask.push(0.0);
         }
-        for mv in &moves {
+        for (i, mv) in moves.iter().enumerate() {
             let id = vocab.id_of(mv).ok_or_else(|| CorpusError::UnknownToken {
                 kind: "move",
                 token: mv.clone(),
             })?;
             row.push(id);
+            mask.push(if opts.scored_side.scores(i) { 1.0 } else { 0.0 });
         }
 
         if let Some(max_len) = opts.max_len {
@@ -253,18 +342,33 @@ pub fn build_rows<R: BufRead>(
                     }
                     Overlong::Truncate => {
                         row.truncate(max_len);
+                        mask.truncate(max_len);
                         stats.truncated += 1;
                     }
                 }
             }
         }
 
+        // Position 0 gates no target — the training loop shifts the
+        // mask alongside the targets — so a row whose only scored
+        // positions are there scores nothing. Such a row would train
+        // as a zero-gradient step that still counts as a step.
+        if opts.scored_side != ScoredSide::Both && !mask.iter().skip(1).any(|m| *m != 0.0) {
+            stats.rejected_unscorable += 1;
+            continue;
+        }
+
         stats.tokens += row.len();
         rows.push(row);
+        masks.push(mask);
     }
 
     stats.rows = rows.len();
-    Ok((rows, stats))
+    let masks = match opts.scored_side {
+        ScoredSide::Both => None,
+        _ => Some(masks),
+    };
+    Ok(Corpus { rows, masks, stats })
 }
 
 #[cfg(test)]
@@ -288,18 +392,120 @@ mod tests {
         MoveVocab::new(&["<elo:low>".to_string(), "<elo:high>".to_string()]).unwrap()
     }
 
+    fn build(text: String, vocab: &MoveVocab, opts: &CorpusOptions) -> Corpus {
+        let mut reader = PgnReader::new(Cursor::new(text));
+        build_rows(&mut reader, vocab, opts).unwrap()
+    }
+
     #[test]
     fn a_row_is_bos_then_the_moves() {
-        let text = pgn(&[("1500", "Normal", "1. e4 e5 1-0")]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = MoveVocab::new(&[]).unwrap();
-        let (rows, stats) = build_rows(&mut reader, &vocab, &CorpusOptions::default()).unwrap();
-        assert_eq!(stats.rows, 1);
-        assert_eq!(rows[0].len(), 3);
-        assert_eq!(rows[0][0], BOS);
-        assert_eq!(rows[0][1], vocab.id_of("e2e4").unwrap());
-        assert_eq!(rows[0][2], vocab.id_of("e7e5").unwrap());
-        assert_eq!(stats.tokens, 3);
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        assert_eq!(c.stats.rows, 1);
+        assert_eq!(c.rows[0].len(), 3);
+        assert_eq!(c.rows[0][0], BOS);
+        assert_eq!(c.rows[0][1], vocab.id_of("e2e4").unwrap());
+        assert_eq!(c.rows[0][2], vocab.id_of("e7e5").unwrap());
+        assert_eq!(c.stats.tokens, 3);
+        // Scoring both sides needs no mask.
+        assert!(c.masks.is_none());
+    }
+
+    #[test]
+    fn scoring_one_side_marks_only_that_sides_moves() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let text = pgn(&[("1500", "Normal", "1. e4 e5 2. Nf3 Nc6 1-0")]);
+
+        let white = build(
+            text.clone(),
+            &vocab,
+            &CorpusOptions {
+                scored_side: ScoredSide::White,
+                ..Default::default()
+            },
+        );
+        // [BOS, e2e4, e7e5, g1f3, b8c6]
+        assert_eq!(white.masks.unwrap()[0], vec![0.0, 1.0, 0.0, 1.0, 0.0]);
+
+        let black = build(
+            text,
+            &vocab,
+            &CorpusOptions {
+                scored_side: ScoredSide::Black,
+                ..Default::default()
+            },
+        );
+        assert_eq!(black.masks.unwrap()[0], vec![0.0, 0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn the_condition_token_is_given_not_scored() {
+        let vocab = vocab_with_bands();
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                scored_side: ScoredSide::White,
+                condition: Some(ConditionSpec {
+                    key: "WhiteElo".to_string(),
+                    bands: vec![ConditionBand {
+                        min: 0,
+                        max: 1599,
+                        token: "<elo:low>".to_string(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        );
+        // [BOS, <elo:low>, e2e4, e7e5]
+        assert_eq!(c.masks.unwrap()[0], vec![0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_row_the_loss_cannot_score_is_rejected() {
+        // One ply: White moves, Black never does, so scoring Black
+        // leaves nothing. min_plies is relaxed so the row reaches the
+        // scorability check rather than the length filter.
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                scored_side: ScoredSide::Black,
+                ..Default::default()
+            },
+        );
+        assert!(c.rows.is_empty());
+        assert_eq!(c.stats.rejected_unscorable, 1);
+    }
+
+    #[test]
+    fn teacher_rows_pair_ids_with_masks() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                scored_side: ScoredSide::White,
+                ..Default::default()
+            },
+        );
+        let paired = c.into_teacher_rows();
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].0.len(), paired[0].1.len());
+
+        // Without a mask every position is scored, so all ones.
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        let paired = c.into_teacher_rows();
+        assert_eq!(paired[0].1, vec![1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -310,77 +516,83 @@ mod tests {
             ("1500", "Normal", "1. e4 e5 1-0"),
             ("1500", "Time forfeit", "1. Qz9 1-0"),
         ]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = MoveVocab::new(&[]).unwrap();
-        let opts = CorpusOptions {
-            filter: GameFilter::accept_all().decided_on_the_board(),
-            ..Default::default()
-        };
-        let (rows, stats) = build_rows(&mut reader, &vocab, &opts).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(stats.rejected_by_tags, 1);
-        assert_eq!(stats.replay_failures, 0);
+        let c = build(
+            text,
+            &vocab,
+            &CorpusOptions {
+                filter: GameFilter::accept_all().decided_on_the_board(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.rows.len(), 1);
+        assert_eq!(c.stats.rejected_by_tags, 1);
+        assert_eq!(c.stats.replay_failures, 0);
     }
 
     #[test]
     fn a_replay_failure_is_counted_and_kept() {
-        let text = pgn(&[("1500", "Normal", "1. Qh6 1-0")]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = MoveVocab::new(&[]).unwrap();
-        let (rows, stats) = build_rows(&mut reader, &vocab, &CorpusOptions::default()).unwrap();
-        assert!(rows.is_empty());
-        assert_eq!(stats.replay_failures, 1);
-        assert!(stats.first_replay_failure.is_some());
+        let c = build(
+            pgn(&[("1500", "Normal", "1. Qh6 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        assert!(c.rows.is_empty());
+        assert_eq!(c.stats.replay_failures, 1);
+        assert!(c.stats.first_replay_failure.is_some());
     }
 
     #[test]
     fn the_condition_token_sits_right_after_bos() {
-        let text = pgn(&[("1500", "Normal", "1. e4 e5 1-0")]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = vocab_with_bands();
-        let opts = CorpusOptions {
-            condition: Some(ConditionSpec {
-                key: "WhiteElo".to_string(),
-                bands: vec![
-                    ConditionBand {
-                        min: 0,
-                        max: 1599,
-                        token: "<elo:low>".to_string(),
-                    },
-                    ConditionBand {
-                        min: 1600,
-                        max: 4000,
-                        token: "<elo:high>".to_string(),
-                    },
-                ],
-            }),
-            ..Default::default()
-        };
-        let (rows, _) = build_rows(&mut reader, &vocab, &opts).unwrap();
-        assert_eq!(rows[0][0], BOS);
-        assert_eq!(rows[0][1], vocab.id_of("<elo:low>").unwrap());
-        assert_eq!(rows[0][2], vocab.id_of("e2e4").unwrap());
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                condition: Some(ConditionSpec {
+                    key: "WhiteElo".to_string(),
+                    bands: vec![
+                        ConditionBand {
+                            min: 0,
+                            max: 1599,
+                            token: "<elo:low>".to_string(),
+                        },
+                        ConditionBand {
+                            min: 1600,
+                            max: 4000,
+                            token: "<elo:high>".to_string(),
+                        },
+                    ],
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.rows[0][0], BOS);
+        assert_eq!(c.rows[0][1], vocab.id_of("<elo:low>").unwrap());
+        assert_eq!(c.rows[0][2], vocab.id_of("e2e4").unwrap());
     }
 
     #[test]
     fn a_game_outside_every_band_is_rejected() {
-        let text = pgn(&[("2500", "Normal", "1. e4 e5 1-0")]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = vocab_with_bands();
-        let opts = CorpusOptions {
-            condition: Some(ConditionSpec {
-                key: "WhiteElo".to_string(),
-                bands: vec![ConditionBand {
-                    min: 0,
-                    max: 1599,
-                    token: "<elo:low>".to_string(),
-                }],
-            }),
-            ..Default::default()
-        };
-        let (rows, stats) = build_rows(&mut reader, &vocab, &opts).unwrap();
-        assert!(rows.is_empty());
-        assert_eq!(stats.rejected_by_condition, 1);
+        let c = build(
+            pgn(&[("2500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                condition: Some(ConditionSpec {
+                    key: "WhiteElo".to_string(),
+                    bands: vec![ConditionBand {
+                        min: 0,
+                        max: 1599,
+                        token: "<elo:low>".to_string(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(c.rows.is_empty());
+        assert_eq!(c.stats.rejected_by_condition, 1);
     }
 
     #[test]
@@ -414,43 +626,65 @@ mod tests {
         let text = pgn(&[("1500", "Normal", "1. e4 e5 2. Nf3 Nc6 1-0")]);
         let vocab = MoveVocab::new(&[]).unwrap();
 
-        let drop_opts = CorpusOptions {
-            max_len: Some(3),
-            ..Default::default()
-        };
-        let mut reader = PgnReader::new(Cursor::new(text.clone()));
-        let (rows, stats) = build_rows(&mut reader, &vocab, &drop_opts).unwrap();
-        assert!(rows.is_empty());
-        assert_eq!(stats.dropped_overlong, 1);
+        let dropped = build(
+            text.clone(),
+            &vocab,
+            &CorpusOptions {
+                max_len: Some(3),
+                ..Default::default()
+            },
+        );
+        assert!(dropped.rows.is_empty());
+        assert_eq!(dropped.stats.dropped_overlong, 1);
 
-        let truncate_opts = CorpusOptions {
-            max_len: Some(3),
-            overlong: Overlong::Truncate,
-            ..Default::default()
-        };
-        let mut reader = PgnReader::new(Cursor::new(text));
-        let (rows, stats) = build_rows(&mut reader, &vocab, &truncate_opts).unwrap();
-        assert_eq!(rows[0].len(), 3);
-        assert_eq!(stats.truncated, 1);
+        let cut = build(
+            text,
+            &vocab,
+            &CorpusOptions {
+                max_len: Some(3),
+                overlong: Overlong::Truncate,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cut.rows[0].len(), 3);
+        assert_eq!(cut.stats.truncated, 1);
+    }
+
+    #[test]
+    fn a_truncated_row_keeps_its_mask_the_same_length() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 2. Nf3 Nc6 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                max_len: Some(3),
+                overlong: Overlong::Truncate,
+                scored_side: ScoredSide::White,
+                ..Default::default()
+            },
+        );
+        let masks = c.masks.unwrap();
+        assert_eq!(c.rows[0].len(), masks[0].len());
     }
 
     #[test]
     fn reading_stops_at_max_rows() {
-        let text = pgn(&[
-            ("1500", "Normal", "1. e4 e5 1-0"),
-            ("1500", "Normal", "1. d4 d5 1-0"),
-            ("1500", "Normal", "1. c4 c5 1-0"),
-        ]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = MoveVocab::new(&[]).unwrap();
-        let opts = CorpusOptions {
-            max_rows: 2,
-            ..Default::default()
-        };
-        let (rows, stats) = build_rows(&mut reader, &vocab, &opts).unwrap();
-        assert_eq!(rows.len(), 2);
+        let c = build(
+            pgn(&[
+                ("1500", "Normal", "1. e4 e5 1-0"),
+                ("1500", "Normal", "1. d4 d5 1-0"),
+                ("1500", "Normal", "1. c4 c5 1-0"),
+            ]),
+            &vocab,
+            &CorpusOptions {
+                max_rows: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.rows.len(), 2);
         // The third game was never read.
-        assert_eq!(stats.games_read, 2);
+        assert_eq!(c.stats.games_read, 2);
     }
 
     #[test]
@@ -460,18 +694,22 @@ mod tests {
             ("1500", "Time forfeit", "1. d4 d5 1-0"),
             ("1500", "Normal", "1. Qh6 1-0"),
         ]);
-        let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = MoveVocab::new(&[]).unwrap();
-        let opts = CorpusOptions {
-            filter: GameFilter::accept_all().decided_on_the_board(),
-            ..Default::default()
-        };
-        let (_, s) = build_rows(&mut reader, &vocab, &opts).unwrap();
+        let s = build(
+            text,
+            &vocab,
+            &CorpusOptions {
+                filter: GameFilter::accept_all().decided_on_the_board(),
+                ..Default::default()
+            },
+        )
+        .stats;
         let accounted = s.rows
             + s.rejected_by_tags
             + s.rejected_by_length
             + s.rejected_by_condition
             + s.dropped_overlong
+            + s.rejected_unscorable
             + s.replay_failures;
         assert_eq!(accounted, s.games_read);
     }

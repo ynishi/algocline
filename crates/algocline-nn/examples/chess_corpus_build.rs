@@ -22,7 +22,9 @@ use std::io::BufReader;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use algocline_nn::chess::corpus::{build_rows, ConditionBand, ConditionSpec, CorpusOptions};
+use algocline_nn::chess::corpus::{
+    build_rows, ConditionBand, ConditionSpec, CorpusOptions, ScoredSide,
+};
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::vocab::MoveVocab;
@@ -41,6 +43,15 @@ fn main() -> ExitCode {
     let min_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1600);
     let max_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1799);
     let max_rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let scored_side = match args.next().as_deref() {
+        None | Some("both") => ScoredSide::Both,
+        Some("white") => ScoredSide::White,
+        Some("black") => ScoredSide::Black,
+        Some(other) => {
+            eprintln!("unknown side {other:?}: expected both, white or black");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let band_token = format!("<elo:{min_elo}-{max_elo}>");
     let vocab = match MoveVocab::new(std::slice::from_ref(&band_token)) {
@@ -67,6 +78,7 @@ fn main() -> ExitCode {
                 token: band_token.clone(),
             }],
         }),
+        scored_side,
         ..Default::default()
     };
 
@@ -80,14 +92,16 @@ fn main() -> ExitCode {
     let mut reader = PgnReader::new(BufReader::new(file));
 
     let start = Instant::now();
-    let (rows, stats) = match build_rows(&mut reader, &vocab, &opts) {
-        Ok(pair) => pair,
+    let corpus = match build_rows(&mut reader, &vocab, &opts) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("corpus build failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     let elapsed = start.elapsed();
+    let rows = &corpus.rows;
+    let stats = &corpus.stats;
 
     println!("band       {min_elo}-{max_elo}  (token {band_token})");
     println!(
@@ -102,6 +116,7 @@ fn main() -> ExitCode {
     println!("  rejected by length {}", stats.rejected_by_length);
     println!("  outside every band {}", stats.rejected_by_condition);
     println!("  dropped overlong   {}", stats.dropped_overlong);
+    println!("  nothing to score   {}", stats.rejected_unscorable);
     println!("  replay failures    {}", stats.replay_failures);
     println!("  rows kept          {}", stats.rows);
     if let Some(first) = &stats.first_replay_failure {
@@ -132,6 +147,23 @@ fn main() -> ExitCode {
             .filter_map(|id| vocab.token_of(*id))
             .collect();
         println!("row[0]     {}", head.join(" "));
+        match &corpus.masks {
+            Some(masks) => {
+                let scored: usize = masks
+                    .iter()
+                    .map(|m| m.iter().filter(|v| **v != 0.0).count())
+                    .sum();
+                println!(
+                    "scored     {scored} of {} positions ({:.1}%), side {scored_side:?}",
+                    stats.tokens,
+                    100.0 * scored as f64 / stats.tokens as f64
+                );
+                let head: Vec<String> =
+                    masks[0].iter().take(8).map(|m| format!("{m:.0}")).collect();
+                println!("mask[0]    {}", head.join(" "));
+            }
+            None => println!("scored     every position (side Both, no mask)"),
+        }
     }
 
     // Every game read must land in exactly one bucket. A mismatch here
@@ -141,6 +173,7 @@ fn main() -> ExitCode {
         + stats.rejected_by_length
         + stats.rejected_by_condition
         + stats.dropped_overlong
+        + stats.rejected_unscorable
         + stats.replay_failures;
     if accounted != stats.games_read {
         println!(

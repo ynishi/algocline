@@ -194,3 +194,10 @@ required-features = []
 [[example]]
 name = "chess_cond"
 required-features = []
+
+# Plays the condition tokens against each other and against random
+# play, which is the only way to ask whether a condition carries
+# strength rather than just a different set of preferences.
+[[example]]
+name = "chess_match"
+required-features = []

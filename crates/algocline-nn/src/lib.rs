@@ -29,10 +29,10 @@
 
 pub mod arch;
 pub mod card;
+pub mod chess;
 mod hub;
 pub mod merged;
 pub mod metric;
-pub mod pgn;
 pub mod sampling;
 pub mod tokenizer;
 pub mod train;

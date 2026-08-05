@@ -34,7 +34,8 @@ use std::io::BufReader;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use algocline_nn::pgn::{game_to_uci, san_tokens, PgnReader};
+use algocline_nn::chess::pgn::{game_to_uci, san_tokens, PgnReader};
+use algocline_nn::chess::vocab::MoveVocab;
 
 /// Report how large a vocabulary is and how much of the corpus its
 /// most common entries cover.
@@ -173,6 +174,37 @@ fn main() -> ExitCode {
     report_lengths(&mut lengths);
     report_vocab("SAN", &san_counts);
     report_vocab("UCI", &uci_counts);
+
+    // The generated alphabet has to cover the corpus. A move observed
+    // in real play with no id would be a hole in the enumeration, and
+    // it would surface as a silently dropped ply rather than an error.
+    let vocab = match MoveVocab::new(&[]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cannot build vocabulary: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let missing: Vec<&String> = uci_counts
+        .keys()
+        .filter(|t| vocab.id_of(t).is_none())
+        .collect();
+    println!(
+        "vocab      {} ids ({} used by this corpus, model size {})",
+        vocab.len(),
+        uci_counts.len(),
+        vocab.model_vocab_size()
+    );
+    if !missing.is_empty() {
+        for t in missing.iter().take(max_print) {
+            eprintln!("MISSING from vocabulary: {t}");
+        }
+        println!(
+            "VERDICT    FAILED — {} observed moves have no id",
+            missing.len()
+        );
+        return ExitCode::FAILURE;
+    }
 
     if failed == 0 {
         println!("VERDICT    OK — every SAN token resolved to exactly one legal move");

@@ -45,6 +45,35 @@ use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader}
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
 use algocline_nn::chess::ModelShape;
 
+/// Resolve a band argument against the checkpoint's own band list.
+///
+/// `-` means unconditioned, valid only when the checkpoint carries no
+/// bands. Anything else must name a band it was trained with.
+fn resolve_band(shape: &ModelShape, arg: &str) -> Result<Option<String>, String> {
+    if arg == "-" {
+        return if shape.bands.is_empty() {
+            Ok(None)
+        } else {
+            Err(format!(
+                "this checkpoint is conditional; pass one of {:?}",
+                shape.band_tokens()
+            ))
+        };
+    }
+    let token = if arg.starts_with('<') {
+        arg.to_string()
+    } else {
+        format!("<elo:{arg}>")
+    };
+    match shape.band(&token) {
+        Some(_) => Ok(Some(token)),
+        None => Err(format!(
+            "checkpoint has no band {token}; it carries {:?}",
+            shape.band_tokens()
+        )),
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -59,11 +88,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let ckpt: PathBuf = args
         .next()
-        .ok_or("usage: chess_eval <ckpt> <holdout.pgn> [min_elo] [max_elo] [side] [max_positions]")?
+        .ok_or("usage: chess_eval <ckpt> <holdout.pgn> <ask_band> <measure_band> [side] [max_positions]")?
         .into();
     let pgn = args.next().ok_or("missing holdout pgn path")?;
-    let min_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1600);
-    let max_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1799);
+    // Two bands, deliberately separate. `ask` is what the model is told
+    // to play as; `measure` is whose games it is scored against.
+    // Setting them to different values is the cross-comparison that
+    // says whether the condition token does anything: a model that
+    // ignores it scores the same either way.
+    let ask_arg = args.next().unwrap_or_else(|| "-".into());
+    let measure_arg = args.next().unwrap_or_else(|| ask_arg.clone());
     let side = match args.next().as_deref() {
         None | Some("white") => ScoredSide::White,
         Some("black") => ScoredSide::Black,
@@ -72,26 +106,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let max_positions: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
 
-    let band_token = format!("<elo:{min_elo}-{max_elo}>");
-    let vocab = MoveVocab::new(std::slice::from_ref(&band_token))?;
-    let band_id = vocab.id_of(&band_token).ok_or("band token missing")?;
     let shape = ModelShape::load(&ckpt)?;
-    if shape.vocab != vocab.model_vocab_size() {
-        return Err(format!(
-            "checkpoint was trained with vocab {} but this band builds {}",
-            shape.vocab,
-            vocab.model_vocab_size()
-        )
-        .into());
-    }
+    let vocab = MoveVocab::new(&shape.band_tokens())?;
+    let ask = resolve_band(&shape, &ask_arg)?;
+    let measure = resolve_band(&shape, &measure_arg)?;
+    let ask_id = match &ask {
+        Some(token) => Some(vocab.id_of(token).ok_or("ask band token missing")?),
+        None => None,
+    };
     let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
 
-    let filter = GameFilter::accept_all()
-        .with_rating_band(min_elo, max_elo)
+    let mut filter = GameFilter::accept_all()
         .decided_on_the_board()
         .with_min_base_seconds(180)
         .with_ply_bounds(10, None);
+    if let Some(token) = &measure {
+        let band = shape.band(token).ok_or("measure band missing")?;
+        filter = filter.with_rating_band(band.min, band.max);
+    }
 
     let mut reader = PgnReader::new(BufReader::new(File::open(&pgn)?));
     let t0 = Instant::now();
@@ -117,7 +150,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         games += 1;
 
         let mut board = Board::default();
-        let mut row: Vec<u32> = vec![BOS, band_id];
+        let mut row: Vec<u32> = vec![BOS];
+        if let Some(id) = ask_id {
+            row.push(id);
+        }
         for (ply, token) in tokens.iter().enumerate() {
             let Ok(mv) = resolve_san(&board, token) else {
                 break;
@@ -187,7 +223,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n = positions as f64;
     println!("ckpt       {}", ckpt.display());
     println!("holdout    {pgn}");
-    println!("side       {side:?}  band {min_elo}-{max_elo}");
+    println!(
+        "side       {side:?}  asked as {}  measured against {}",
+        ask.as_deref().unwrap_or("(none)"),
+        measure.as_deref().unwrap_or("(any)")
+    );
     println!(
         "games      {games}   positions {positions}   in {:.1?}",
         t0.elapsed()

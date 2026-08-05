@@ -3,7 +3,7 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --example chess_play -- <ckpt.safetensors> <min_elo> <max_elo> [moves...]
+//! cargo run --release --example chess_play -- <ckpt.safetensors> <band|-> [moves...]
 //! ```
 //!
 //! Moves may be UCI (`e2e4`) or SAN (`Nf3`); both are resolved against
@@ -29,6 +29,38 @@ use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
 use algocline_nn::chess::ModelShape;
 
+/// Pick which band the model plays as.
+///
+/// `-` means unconditioned, which is only valid for a checkpoint that
+/// was trained without bands. Anything else must name a band the
+/// checkpoint carries: asking for one it was never trained on would
+/// index a token it has no meaning for.
+fn resolve_band(shape: &ModelShape, arg: &str) -> Result<Option<String>, String> {
+    if arg == "-" {
+        return if shape.bands.is_empty() {
+            Ok(None)
+        } else {
+            Err(format!(
+                "this checkpoint is conditional; pass one of {:?}",
+                shape.band_tokens()
+            ))
+        };
+    }
+    // Accept either the token or the bare range.
+    let token = if arg.starts_with('<') {
+        arg.to_string()
+    } else {
+        format!("<elo:{arg}>")
+    };
+    match shape.band(&token) {
+        Some(_) => Ok(Some(token)),
+        None => Err(format!(
+            "checkpoint has no band {token}; it carries {:?}",
+            shape.band_tokens()
+        )),
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -43,18 +75,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let ckpt: PathBuf = args
         .next()
-        .ok_or("usage: chess_play <ckpt.safetensors> [min_elo] [max_elo] [moves...]")?
+        .ok_or("usage: chess_play <ckpt.safetensors> <band|-> [moves...]")?
         .into();
-    let min_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1600);
-    let max_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1799);
+    let shape = ModelShape::load(&ckpt)?;
+    let band_arg = args.next().unwrap_or_else(|| "-".into());
     let played: Vec<String> = args.collect();
 
-    let band_token = format!("<elo:{min_elo}-{max_elo}>");
-    let vocab = MoveVocab::new(std::slice::from_ref(&band_token))?;
+    // The vocabulary is rebuilt from the checkpoint's own band list, so
+    // the ids line up with what it was trained on rather than with
+    // whatever the caller happened to type.
+    let tokens = shape.band_tokens();
+    let vocab = MoveVocab::new(&tokens)?;
+    let band_token = resolve_band(&shape, &band_arg)?;
 
     // Replay what has been played so far, accepting either notation.
     let mut board = Board::default();
-    let mut row: Vec<u32> = vec![BOS, vocab.id_of(&band_token).ok_or("band token missing")?];
+    let mut row: Vec<u32> = vec![BOS];
+    if let Some(token) = &band_token {
+        row.push(vocab.id_of(token).ok_or("band token missing")?);
+    }
     let mut history: Vec<String> = Vec::new();
     for token in &played {
         let mv = match move_from_uci_standard(&board, token) {
@@ -71,16 +110,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         history.push(uci);
     }
 
-    let shape = ModelShape::load(&ckpt)?;
-    if shape.vocab != vocab.model_vocab_size() {
-        return Err(format!(
-            "checkpoint was trained with vocab {} but this band builds {}; \
-             the band arguments do not match the checkpoint",
-            shape.vocab,
-            vocab.model_vocab_size()
-        )
-        .into());
-    }
     let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
 

@@ -6,8 +6,13 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --example chess_bake -- <path.pgn> <min_elo> <max_elo> <max_rows> <steps> <side>
+//! cargo run --release --example chess_bake -- <path.pgn> <bands> <max_rows> <steps> <side> [ckpt_dir]
 //! ```
+//!
+//! `bands` is one or more rating ranges: `1600-1799`, or
+//! `1100-1299,1900-2099` to train one model that can be asked for
+//! either. Each band gets a condition token prefixed to its games, and
+//! a game outside every band is dropped.
 //!
 //! One run is meant to finish in tens of seconds on a laptop CPU.
 //! `steps * batch` is what decides that, and the corpus needs at least
@@ -50,6 +55,43 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Parse `1100-1299,1900-2099` into condition bands.
+///
+/// Several bands in one corpus is the interesting case: the model sees
+/// which band it is playing as, so one checkpoint can be asked for
+/// either. Baking a model per band answers a different and weaker
+/// question, since two separately trained models differ for every
+/// reason at once.
+fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        let (lo, hi) = part
+            .split_once('-')
+            .ok_or_else(|| format!("band {part:?} is not a min-max range"))?;
+        let min: i64 = lo
+            .trim()
+            .parse()
+            .map_err(|_| format!("band {part:?} has an unreadable minimum"))?;
+        let max: i64 = hi
+            .trim()
+            .parse()
+            .map_err(|_| format!("band {part:?} has an unreadable maximum"))?;
+        if min > max {
+            return Err(format!("band {part:?} is inverted"));
+        }
+        out.push(ConditionBand {
+            min,
+            max,
+            token: format!("<elo:{min}-{max}>"),
+        });
+    }
+    if out.is_empty() {
+        return Err("no bands given".into());
+    }
+    Ok(out)
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -63,10 +105,10 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let path = args.next().ok_or(
-        "usage: chess_bake <path.pgn> [min_elo] [max_elo] [max_rows] [steps] [side] [ckpt_dir]",
+        "usage: chess_bake <path.pgn> <bands> [max_rows] [steps] [side] [ckpt_dir]\n\
+         bands is comma-separated ranges, e.g. 1600-1799 or 1100-1299,1900-2099",
     )?;
-    let min_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1600);
-    let max_elo: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1799);
+    let bands = parse_bands(&args.next().unwrap_or_else(|| "1600-1799".into()))?;
     let max_rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4000);
     let steps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(100);
     let side = match args.next().as_deref() {
@@ -77,19 +119,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let ckpt_dir: PathBuf = args.next().unwrap_or_else(|| "/tmp".into()).into();
 
-    let band_token = format!("<elo:{min_elo}-{max_elo}>");
-    let vocab = MoveVocab::new(std::slice::from_ref(&band_token))?;
+    let tokens: Vec<String> = bands.iter().map(|b| b.token.clone()).collect();
+    let vocab = MoveVocab::new(&tokens)?;
 
-    let mut shape = ModelShape::compact(vocab.model_vocab_size(), Some(band_token.clone()));
+    let mut shape = ModelShape::compact(vocab.model_vocab_size(), bands.clone());
     shape.layers = env_usize("CHESS_LAYERS", shape.layers);
     shape.heads = env_usize("CHESS_HEADS", shape.heads);
     shape.dim = env_usize("CHESS_DIM", shape.dim);
     shape.ctx = env_usize("CHESS_CTX", shape.ctx);
     let batch = env_usize("CHESS_BATCH", 32);
 
+    // The band is selected by the condition rather than by the filter:
+    // a game outside every band is rejected when its token is resolved,
+    // which is one code path instead of keeping a filter and a band
+    // list in agreement.
     let opts = CorpusOptions {
         filter: GameFilter::accept_all()
-            .with_rating_band(min_elo, max_elo)
             .decided_on_the_board()
             .with_min_base_seconds(180)
             .with_ply_bounds(10, None),
@@ -97,11 +142,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_len: Some(shape.ctx),
         condition: Some(ConditionSpec {
             key: "WhiteElo".to_string(),
-            bands: vec![ConditionBand {
-                min: min_elo,
-                max: max_elo,
-                token: band_token.clone(),
-            }],
+            bands: bands.clone(),
         }),
         scored_side: side,
         ..Default::default()
@@ -165,7 +206,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ckpt_keep: 1,
     };
 
-    let prefix = format!("chess-{min_elo}-{max_elo}-{side:?}").to_lowercase();
+    let band_label = bands
+        .iter()
+        .map(|b| format!("{}-{}", b.min, b.max))
+        .collect::<Vec<_>>()
+        .join("_");
+    let prefix = format!("chess-{band_label}-{side:?}").to_lowercase();
     eprintln!("[bake] training {steps} steps at batch {batch}…");
     let t0 = Instant::now();
     let ckpt = run_full_ft(

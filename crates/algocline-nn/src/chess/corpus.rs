@@ -85,7 +85,7 @@ impl ScoredSide {
 }
 
 /// A range of an integer tag mapped to a condition token.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConditionBand {
     /// Inclusive lower bound.
     pub min: i64,

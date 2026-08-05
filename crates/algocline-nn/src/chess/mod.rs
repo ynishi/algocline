@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arch::Gpt2Config;
+use crate::chess::corpus::ConditionBand;
 
 /// Context window, in tokens.
 ///
@@ -80,8 +81,14 @@ pub struct ModelShape {
     pub ctx: usize,
     /// Vocabulary size the model was built with.
     pub vocab: usize,
-    /// Condition token the corpus was built with, if any.
-    pub band_token: Option<String>,
+    /// Condition bands the corpus was built with, in vocabulary order.
+    ///
+    /// Empty for an unconditional model. More than one is the point of
+    /// the mechanism: a single checkpoint that plays as whichever band
+    /// is prefixed to the sequence, which is how Allie reproduced a
+    /// rating scale from one model rather than one model per band.
+    #[serde(default)]
+    pub bands: Vec<ConditionBand>,
 }
 
 /// Failure while reading or writing a shape file.
@@ -107,15 +114,25 @@ pub enum ShapeError {
 
 impl ModelShape {
     /// The shape the local measurements sized this path for.
-    pub fn compact(vocab: usize, band_token: Option<String>) -> Self {
+    pub fn compact(vocab: usize, bands: Vec<ConditionBand>) -> Self {
         Self {
             layers: LAYERS,
             heads: HEADS,
             dim: DIM,
             ctx: CTX,
             vocab,
-            band_token,
+            bands,
         }
+    }
+
+    /// Find a band by its token.
+    pub fn band(&self, token: &str) -> Option<&ConditionBand> {
+        self.bands.iter().find(|b| b.token == token)
+    }
+
+    /// The condition tokens, in vocabulary order.
+    pub fn band_tokens(&self) -> Vec<String> {
+        self.bands.iter().map(|b| b.token.clone()).collect()
     }
 
     /// Build the model config this shape describes.

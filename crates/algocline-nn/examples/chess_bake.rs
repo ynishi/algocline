@@ -238,6 +238,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let seed = env_usize("CHESS_SEED", 20260805) as u64;
     let eval_every = env_usize("CHESS_EVAL_EVERY", 0);
     let val_rows_cap = env_usize("CHESS_VAL_ROWS", 3000);
+    // A cosine schedule decays the rate to nearly zero at the end, so a
+    // validation curve run under it always flattens — whether or not
+    // the model converged. `constant` removes that confound: under a
+    // fixed rate, a flat tail is the model, not the schedule.
+    let schedule = match env::var("CHESS_SCHEDULE").as_deref() {
+        Ok("constant") | Ok("const") => ScheduleKind::Constant,
+        Ok("cosine") | Ok("cosine_with_warmup") | Err(_) => ScheduleKind::CosineWithWarmup,
+        Ok(other) => return Err(format!("unknown CHESS_SCHEDULE {other:?}").into()),
+    };
 
     // The band is selected by the condition rather than by the filter:
     // a game outside every band is rejected when its token is resolved,
@@ -315,7 +324,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     let cfg = shape.config(device, DType::F32);
     eprintln!(
-        "[bake] model layers={} heads={} dim={} ctx={} vocab={} side={side:?}",
+        "[bake] model layers={} heads={} dim={} ctx={} vocab={} side={side:?} \
+         lr={lr} schedule={schedule:?}",
         cfg.layers, cfg.heads, cfg.dim, cfg.ctx, cfg.vocab
     );
     let vm = VarMap::new();
@@ -354,7 +364,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         grad_accum: 1,
         steps,
         warmup: steps.min(10),
-        schedule: ScheduleKind::CosineWithWarmup,
+        schedule,
         weight_decay: 0.0,
         ckpt_every: eval_every,
         // Every periodic checkpoint is scored afterwards, so none of

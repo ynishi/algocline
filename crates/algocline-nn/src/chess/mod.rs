@@ -24,7 +24,11 @@ pub mod filter;
 pub mod pgn;
 pub mod vocab;
 
+use std::path::{Path, PathBuf};
+
 use candle_core::{DType, Device};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::arch::Gpt2Config;
 
@@ -52,22 +56,113 @@ pub const HEADS: usize = 4;
 /// ablations, where 512 at one layer beat narrower models at four.
 pub const DIM: usize = 128;
 
-/// The model shape this ingestion path is sized for.
+/// The shape a checkpoint was trained at, written alongside it.
 ///
-/// Both the bake and the player must build the same shape or the
-/// checkpoint reloads into a different model, so the sizing lives here
-/// rather than being repeated at each call site.
-pub fn model_config(vocab_size: usize, device: Device, dtype: DType) -> Gpt2Config {
-    Gpt2Config {
-        layers: LAYERS,
-        heads: HEADS,
-        dim: DIM,
-        ctx: CTX,
-        vocab: vocab_size,
-        dtype,
-        device,
-        eps: 1e-5,
-        moe: None,
-        custom: None,
+/// A checkpoint is a bag of tensors; nothing in it says how many
+/// layers or how wide they were. Rebuild it at the wrong shape and the
+/// load either fails on a tensor name or, worse, succeeds against a
+/// model that is not the one that was trained. Carrying the shape next
+/// to the weights is what lets a bake change size without every reader
+/// having to be changed with it.
+///
+/// The band token is here for the same reason: it decides the
+/// vocabulary layout, so a player that guesses it wrong indexes into
+/// the wrong ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelShape {
+    /// Transformer blocks.
+    pub layers: usize,
+    /// Attention heads.
+    pub heads: usize,
+    /// Hidden size.
+    pub dim: usize,
+    /// Context window in tokens.
+    pub ctx: usize,
+    /// Vocabulary size the model was built with.
+    pub vocab: usize,
+    /// Condition token the corpus was built with, if any.
+    pub band_token: Option<String>,
+}
+
+/// Failure while reading or writing a shape file.
+#[derive(Debug, Error)]
+pub enum ShapeError {
+    /// The file could not be read or written.
+    #[error("shape file {path}: {message}")]
+    Io {
+        /// Path involved.
+        path: String,
+        /// Underlying message.
+        message: String,
+    },
+    /// The file is not valid shape JSON.
+    #[error("shape file {path} is not readable as a shape: {message}")]
+    Parse {
+        /// Path involved.
+        path: String,
+        /// Underlying message.
+        message: String,
+    },
+}
+
+impl ModelShape {
+    /// The shape the local measurements sized this path for.
+    pub fn compact(vocab: usize, band_token: Option<String>) -> Self {
+        Self {
+            layers: LAYERS,
+            heads: HEADS,
+            dim: DIM,
+            ctx: CTX,
+            vocab,
+            band_token,
+        }
+    }
+
+    /// Build the model config this shape describes.
+    pub fn config(&self, device: Device, dtype: DType) -> Gpt2Config {
+        Gpt2Config {
+            layers: self.layers,
+            heads: self.heads,
+            dim: self.dim,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            dtype,
+            device,
+            eps: 1e-5,
+            moe: None,
+            custom: None,
+        }
+    }
+
+    /// The path a checkpoint's shape file sits at.
+    pub fn path_for(ckpt: &Path) -> PathBuf {
+        ckpt.with_extension("shape.json")
+    }
+
+    /// Write the shape beside a checkpoint.
+    pub fn save(&self, ckpt: &Path) -> Result<PathBuf, ShapeError> {
+        let path = Self::path_for(ckpt);
+        let body = serde_json::to_string_pretty(self).map_err(|e| ShapeError::Parse {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        std::fs::write(&path, body).map_err(|e| ShapeError::Io {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(path)
+    }
+
+    /// Read the shape written beside a checkpoint.
+    pub fn load(ckpt: &Path) -> Result<Self, ShapeError> {
+        let path = Self::path_for(ckpt);
+        let body = std::fs::read_to_string(&path).map_err(|e| ShapeError::Io {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        serde_json::from_str(&body).map_err(|e| ShapeError::Parse {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })
     }
 }

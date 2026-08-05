@@ -27,7 +27,7 @@ use cozy_chess::Board;
 use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard};
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::{model_config, CTX};
+use algocline_nn::chess::ModelShape;
 
 fn main() -> ExitCode {
     match run() {
@@ -71,11 +71,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         history.push(uci);
     }
 
-    let cfg = model_config(vocab.model_vocab_size(), Device::Cpu, DType::F32);
+    let shape = ModelShape::load(&ckpt)?;
+    if shape.vocab != vocab.model_vocab_size() {
+        return Err(format!(
+            "checkpoint was trained with vocab {} but this band builds {}; \
+             the band arguments do not match the checkpoint",
+            shape.vocab,
+            vocab.model_vocab_size()
+        )
+        .into());
+    }
+    let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
 
-    // Only the last CTX tokens fit; the model sees the tail.
-    let window: Vec<u32> = row.iter().rev().take(CTX).rev().copied().collect();
+    // Only the last ctx tokens fit; the model sees the tail.
+    let window: Vec<u32> = row.iter().rev().take(shape.ctx).rev().copied().collect();
     let input = Tensor::from_vec(window.clone(), (1, window.len()), &cfg.device)?;
     let logits = model.forward(&input)?;
     let last = logits.i((0, window.len() - 1))?;

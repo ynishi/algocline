@@ -33,14 +33,22 @@ use algocline_nn::chess::corpus::{
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::vocab::MoveVocab;
-use algocline_nn::chess::{model_config, CTX};
+use algocline_nn::chess::ModelShape;
 use algocline_nn::train::{
     run_full_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, ScheduleKind, TeacherCardDataset,
     TrainingLease,
 };
 
-/// Rows per optimizer step.
-const BATCH: usize = 32;
+/// Read a `usize` from the environment, falling back to `default`.
+///
+/// The shape and the training dials are environment-driven so a GPU
+/// run can be scaled without editing the source the pod cloned.
+fn env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -72,6 +80,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let band_token = format!("<elo:{min_elo}-{max_elo}>");
     let vocab = MoveVocab::new(std::slice::from_ref(&band_token))?;
 
+    let mut shape = ModelShape::compact(vocab.model_vocab_size(), Some(band_token.clone()));
+    shape.layers = env_usize("CHESS_LAYERS", shape.layers);
+    shape.heads = env_usize("CHESS_HEADS", shape.heads);
+    shape.dim = env_usize("CHESS_DIM", shape.dim);
+    shape.ctx = env_usize("CHESS_CTX", shape.ctx);
+    let batch = env_usize("CHESS_BATCH", 32);
+
     let opts = CorpusOptions {
         filter: GameFilter::accept_all()
             .with_rating_band(min_elo, max_elo)
@@ -79,7 +94,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_min_base_seconds(180)
             .with_ply_bounds(10, None),
         max_rows,
-        max_len: Some(CTX),
+        max_len: Some(shape.ctx),
         condition: Some(ConditionSpec {
             key: "WhiteElo".to_string(),
             bands: vec![ConditionBand {
@@ -105,10 +120,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The loop consumes `steps * batch` rows and refuses to run short.
-    let needed = steps * BATCH + BATCH;
+    let needed = steps * batch + batch;
     if corpus.stats.rows < needed {
         return Err(format!(
-            "corpus has {} rows but {steps} steps at batch {BATCH} need {needed}; \
+            "corpus has {} rows but {steps} steps at batch {batch} need {needed}; \
              read a longer slice or lower steps",
             corpus.stats.rows
         )
@@ -119,15 +134,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut dataset = TeacherCardDataset::from_rows(
         corpus.into_teacher_rows(),
         DatasetOpts {
-            batch_size: BATCH,
-            ctx_len: CTX,
+            batch_size: batch,
+            ctx_len: shape.ctx,
             shuffle: false,
             pad_id: 0,
             text_field: "text".into(),
         },
     )?;
 
-    let cfg = model_config(vocab_size, Device::Cpu, DType::F32);
+    // CUDA when the build has it, so the same example serves the pod.
+    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    let cfg = shape.config(device, DType::F32);
     eprintln!(
         "[bake] model layers={} heads={} dim={} ctx={} vocab={} side={side:?}",
         cfg.layers, cfg.heads, cfg.dim, cfg.ctx, cfg.vocab
@@ -138,7 +155,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let ft_cfg = FullFtConfig {
         lr: 3e-3,
-        batch_size: BATCH,
+        batch_size: batch,
         grad_accum: 1,
         steps,
         warmup: steps.min(10),
@@ -149,7 +166,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let prefix = format!("chess-{min_elo}-{max_elo}-{side:?}").to_lowercase();
-    eprintln!("[bake] training {steps} steps at batch {BATCH}…");
+    eprintln!("[bake] training {steps} steps at batch {batch}…");
     let t0 = Instant::now();
     let ckpt = run_full_ft(
         &model,
@@ -180,9 +197,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ckpt.train_loss,
         min_loss
     );
-    println!(
-        "{}",
-        ckpt_dir.join(format!("{prefix}.safetensors")).display()
-    );
+    // The shape rides with the checkpoint: the weights alone do not
+    // say how many layers produced them, and a reader that guesses
+    // wrong either fails on a tensor name or, worse, does not.
+    let ckpt_path = ckpt_dir.join(format!("{prefix}.safetensors"));
+    let shape_path = shape.save(&ckpt_path)?;
+    eprintln!("[bake] shape written to {}", shape_path.display());
+    println!("{}", ckpt_path.display());
     Ok(())
 }

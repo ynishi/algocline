@@ -43,7 +43,7 @@ use algocline_nn::chess::corpus::ScoredSide;
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::{model_config, CTX};
+use algocline_nn::chess::ModelShape;
 
 fn main() -> ExitCode {
     match run() {
@@ -75,7 +75,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let band_token = format!("<elo:{min_elo}-{max_elo}>");
     let vocab = MoveVocab::new(std::slice::from_ref(&band_token))?;
     let band_id = vocab.id_of(&band_token).ok_or("band token missing")?;
-    let cfg = model_config(vocab.model_vocab_size(), Device::Cpu, DType::F32);
+    let shape = ModelShape::load(&ckpt)?;
+    if shape.vocab != vocab.model_vocab_size() {
+        return Err(format!(
+            "checkpoint was trained with vocab {} but this band builds {}",
+            shape.vocab,
+            vocab.model_vocab_size()
+        )
+        .into());
+    }
+    let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
 
     let filter = GameFilter::accept_all()
@@ -121,7 +130,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ScoredSide::Black => !ply.is_multiple_of(2),
             };
             if scored && positions < max_positions && row.len() >= 2 {
-                let window: Vec<u32> = row.iter().rev().take(CTX).rev().copied().collect();
+                let window: Vec<u32> = row.iter().rev().take(shape.ctx).rev().copied().collect();
                 let input = Tensor::from_vec(window.clone(), (1, window.len()), &cfg.device)?;
                 let logits = model.forward(&input)?;
                 let last = logits.i((0, window.len() - 1))?;

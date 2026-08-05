@@ -200,8 +200,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if raw_legal { "legal" } else { "ILLEGAL" }
     );
     println!("legal mass {:.4} of the distribution", legal_mass);
-    println!("top 5 legal:");
-    for (uci, p) in legal.iter().take(5) {
+    // How many of the ranked moves to show. Five is enough to see what
+    // the model wants to play; asking a question about a specific move
+    // — does this band fall for this trap? — needs the whole ranking,
+    // because the interesting move is usually the one that did not make
+    // the cut.
+    let shown: usize = env::var("CHESS_SHOW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+        .min(legal.len());
+    println!("top {shown} legal:");
+    for (uci, p) in legal.iter().take(shown) {
         let share = if legal_mass > 0.0 {
             p / legal_mass
         } else {

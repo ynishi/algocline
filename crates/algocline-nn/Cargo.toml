@@ -170,3 +170,14 @@ required-features = []
 [[example]]
 name = "chess_corpus_build"
 required-features = []
+
+# Trains one model on a banded corpus and writes a checkpoint.
+[[example]]
+name = "chess_bake"
+required-features = []
+
+# Plays the checkpoint: given the moves so far, reports the move it
+# picks and the distribution behind it.
+[[example]]
+name = "chess_play"
+required-features = []

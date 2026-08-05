@@ -549,6 +549,38 @@ pub fn uci_standard(board: &Board, mv: Move) -> String {
     format!("{from}{file}{rank}")
 }
 
+/// Read a standard-chess UCI move against a position.
+///
+/// The inverse of [`uci_standard`], and needed for the same reason:
+/// castling is written `e1g1` everywhere outside this crate, while
+/// `cozy_chess` wants `e1h1`. A plain `Move` parse accepts the string
+/// and then fails `is_legal`, which reads as "that move is not
+/// available" rather than "that spelling is not understood".
+///
+/// Returns `None` when the string does not name a legal move here.
+pub fn move_from_uci_standard(board: &Board, uci: &str) -> Option<Move> {
+    if let Ok(mv) = uci.parse::<Move>() {
+        if board.is_legal(mv) {
+            return Some(mv);
+        }
+    }
+    // A king stepping two files is castling in the standard spelling.
+    let bytes = uci.as_bytes();
+    if bytes.len() != 4 {
+        return None;
+    }
+    let from: Square = uci.get(0..2)?.parse().ok()?;
+    if board.piece_on(from) != Some(Piece::King) {
+        return None;
+    }
+    let file_step = (bytes[2] as i8 - bytes[0] as i8).abs();
+    if file_step != 2 {
+        return None;
+    }
+    let kingside = bytes[2] > bytes[0];
+    resolve_castling(board, uci, kingside).ok()
+}
+
 /// Replay a movetext from the standard start position and return the
 /// moves in UCI.
 ///
@@ -621,6 +653,27 @@ mod tests {
     fn reads_promotion() {
         let uci = game_to_uci("1. e4 d5 2. exd5 c6 3. dxc6 Nf6 4. cxb7 Bg4 5. bxa8=Q").unwrap();
         assert_eq!(uci.last(), Some(&"b7a8q".to_string()));
+    }
+
+    #[test]
+    fn standard_uci_castling_reads_back() {
+        // uci_standard writes e1g1; reading it must return the move
+        // cozy-chess encodes as e1h1, and the round trip must close.
+        let mut board = Board::default();
+        for mv in game_to_uci("1. e4 e5 2. Nf3 Nf6 3. Bc4 Bc5").unwrap() {
+            let parsed = move_from_uci_standard(&board, &mv).expect("legal");
+            board.play_unchecked(parsed);
+        }
+        let castle = move_from_uci_standard(&board, "e1g1").expect("castling");
+        assert_eq!(uci_standard(&board, castle), "e1g1");
+    }
+
+    #[test]
+    fn an_unavailable_move_reads_as_none() {
+        let board = Board::default();
+        assert!(move_from_uci_standard(&board, "e1g1").is_none());
+        assert!(move_from_uci_standard(&board, "e2e5").is_none());
+        assert!(move_from_uci_standard(&board, "nonsense").is_none());
     }
 
     #[test]

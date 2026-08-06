@@ -60,7 +60,7 @@ use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::uci_standard;
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::ModelShape;
+use algocline_nn::chess::{CondEncoding, ModelShape};
 
 /// A seat: either a band of the model, or uniform random legal play.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -430,7 +430,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let shape = ModelShape::load(&ckpt)?;
+    // Prefix-conditioned only: each seat's band is written into the row
+    // in `Engine::choose`.
+    //
+    // That row is still tail-sliced, so past ply 126 both seats play
+    // unconditioned and the arms measure one policy against itself.
+    // Guidance goes with it: with every band's row identical,
+    // `guide_logits(c, r, γ) = r + γ(c − r)` has `c == r` and returns
+    // `c` whatever γ says, so a run asked for γ=4 is silently unguided
+    // from that ply on.
+    //
+    // Games here run to the 200-ply cap, so this is not a rare regime —
+    // it is left because the head-to-head arm was already retired on
+    // its own evidence (86-88% of games ended in repetition) and no
+    // conclusion in the current plan rests on this program.
+    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
     if shape.bands.len() < 2 {
         return Err("this checkpoint carries fewer than two bands".into());
     }

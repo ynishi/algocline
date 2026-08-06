@@ -62,8 +62,9 @@ use algocline_nn::chess::corpus::ScoredSide;
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
-use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::ModelShape;
+use algocline_nn::chess::vocab::MoveVocab;
+use algocline_nn::chess::window::{play_row, COND_PREFIX_LEN};
+use algocline_nn::chess::{CondEncoding, ModelShape};
 use algocline_nn::metric::{self, MetricError};
 
 /// Jensen-Shannon divergence in bits, via [`algocline_nn::metric::js`].
@@ -190,7 +191,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.trim().parse::<f32>())
         .collect::<Result<_, _>>()?;
 
-    let shape = ModelShape::load(&ckpt)?;
+    // This program builds the band into the row, so it can only read a
+    // checkpoint that was trained to look for it there. A per-position
+    // checkpoint carries the same tensors under the same names and
+    // would produce a complete set of numbers from a model that was
+    // never told which band it is playing as.
+    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
     if shape.bands.len() < 2 {
         return Err(format!(
             "this checkpoint carries {} band(s); comparing conditions needs at least 2",
@@ -254,7 +260,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut pair_js_agree: Vec<Mean> = vec![Mean::default(); n_bands * n_bands];
     let mut pair_js_differ: Vec<Mean> = vec![Mean::default(); n_bands * n_bands];
     let mut uniform_js: Vec<Mean> = vec![Mean::default(); n_bands];
-    let ply_edges = [0usize, 10, 20, 30, 40, usize::MAX];
+    // Depth buckets. The last edge is not a round number: it separates
+    // the plies whose row reaches the context window from the rest.
+    //
+    // The edge enters the committed source here. The figures in
+    // `style-transfer-2026-08-06.md` were taken with the same edge
+    // applied as a local edit that was never committed, so this is the
+    // first time the two agree.
+    //
+    // It is `ctx - 2` — 126 at the shipped ctx of 128 — and that is
+    // deliberately one short of where truncation begins. A row is
+    // `[BOS, band] + moves`, so ply 126 makes exactly 128 tokens and
+    // still fits whole; truncation starts at ply 127. The bucket
+    // therefore admits one unwindowed ply, which is why 2026-04 read
+    // 0.0004 there rather than zero. Keeping the off-by-one rather
+    // than fixing it, because the published deep figures were computed
+    // against this boundary and moving it would make them
+    // incomparable.
+    //
+    // What the bucket *means* has changed, though. It used to hold the
+    // positions where the condition had been lost: the window was a
+    // plain tail slice, it dropped `[BOS, band]` first, every band saw
+    // the same row, and the divergence there was zero by construction
+    // rather than by measurement. `play_row` keeps the prefix, so
+    // those positions now measure distance like every other bucket.
+    const DEPTH_EDGES: [usize; 5] = [0, 10, 20, 30, 40];
+    let mut ply_edges: Vec<usize> = DEPTH_EDGES.to_vec();
+    // Derived from the configured ctx rather than written as 126, so a
+    // run with CHESS_CTX set does not silently bucket against a
+    // boundary from another shape. Dropped when it would not increase
+    // (a ctx small enough to overlap the fixed edges), since the
+    // bucket search assumes they ascend.
+    let overflow_edge = shape.ctx.saturating_sub(COND_PREFIX_LEN);
+    if overflow_edge > DEPTH_EDGES[4] {
+        ply_edges.push(overflow_edge);
+    }
+    ply_edges.push(usize::MAX);
     let mut by_ply: Vec<Mean> = vec![Mean::default(); ply_edges.len() - 1];
 
     // Where the training loss actually goes. The trainer optimises
@@ -309,12 +350,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let rows: Vec<Vec<u32>> = band_ids
                         .iter()
                         .map(|id| {
-                            let mut row = vec![BOS, *id];
-                            row.extend_from_slice(&moves_so_far);
-                            let start = row.len().saturating_sub(shape.ctx);
-                            row[start..].to_vec()
+                            play_row(Some(*id), &moves_so_far, shape.ctx).map(|w| w.into_tokens())
                         })
-                        .collect();
+                        .collect::<Result<_, _>>()?;
                     let width = rows[0].len();
                     let input = Tensor::from_vec(rows.concat(), (n_bands, width), &cfg.device)?;
                     let out = model.forward(&input)?;

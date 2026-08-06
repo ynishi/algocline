@@ -27,8 +27,9 @@ use cozy_chess::Board;
 use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard};
-use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::ModelShape;
+use algocline_nn::chess::vocab::MoveVocab;
+use algocline_nn::chess::window::play_row;
+use algocline_nn::chess::{CondEncoding, ModelShape};
 
 /// Pick which band the model plays as.
 ///
@@ -78,7 +79,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: chess_play <ckpt.safetensors> <band|-> [moves...]")?
         .into();
-    let shape = ModelShape::load(&ckpt)?;
+    // The band is played by writing it into the row, so a checkpoint
+    // conditioned the other way is refused rather than played with its
+    // condition ignored — the moves would look ordinary either way.
+    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
     let band_arg = args.next().unwrap_or_else(|| "-".into());
     let played: Vec<String> = args.collect();
 
@@ -91,10 +95,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Replay what has been played so far, accepting either notation.
     let mut board = Board::default();
-    let mut row: Vec<u32> = vec![BOS];
-    if let Some(token) = &band_token {
-        row.push(vocab.id_of(token).ok_or("band token missing")?);
-    }
+    let band_id = match &band_token {
+        Some(token) => Some(vocab.id_of(token).ok_or("band token missing")?),
+        None => None,
+    };
+    let mut moves: Vec<u32> = Vec::new();
     let mut history: Vec<String> = Vec::new();
     for token in &played {
         let mv = match move_from_uci_standard(&board, token) {
@@ -107,7 +112,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let id = vocab
             .id_of(&uci)
             .ok_or_else(|| format!("move {uci} is not in the vocabulary"))?;
-        row.push(id);
+        moves.push(id);
         history.push(uci);
     }
 
@@ -123,8 +128,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1.0);
 
-    // Only the last ctx tokens fit; the model sees the tail.
-    let window: Vec<u32> = row.iter().rev().take(shape.ctx).rev().copied().collect();
+    // A game longer than the context window is cut down to fit, keeping
+    // `[BOS, band]` and windowing the moves. 3.8% of games — about one
+    // in 26 — do not fit whole, with a ply p90 of 109 and a maximum of
+    // 276, and the tail slice this replaces dropped exactly the two
+    // tokens that are not moves, so from that ply on the model played
+    // unconditioned without saying so.
+    //
+    // `play_row` decides the prefix length from the band itself, so the
+    // window cannot disagree with the guidance rewrite below about
+    // which position the condition is at.
+    let window = play_row(band_id, &moves, shape.ctx)?;
+    let width = window.len();
     let guided_band = band_token.as_ref().filter(|_| gamma != 1.0);
     let probs = if let Some(asked) = guided_band {
         // Guidance needs the other bands to build the reference it
@@ -135,27 +150,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut asked_at = 0usize;
         for (i, band) in shape.bands.iter().enumerate() {
             let id = vocab.id_of(&band.token).ok_or("band token missing")?;
-            let mut r = window.clone();
-            r[1] = id; // position 1 is the condition token
+            // Lands on the condition, or refuses: `Window` knows
+            // whether it has one. The same write against a tail-sliced
+            // `Vec` put a band id on top of a real move of the position
+            // being evaluated (issue 8f9a96df).
+            rows.push(window.with_band(id)?.into_tokens());
             if &band.token == asked {
                 asked_at = i;
             }
-            rows.push(r);
         }
         let n = rows.len();
-        let input = Tensor::from_vec(rows.concat(), (n, window.len()), &cfg.device)?;
+        let input = Tensor::from_vec(rows.concat(), (n, width), &cfg.device)?;
         let out = model.forward(&input)?;
         let per_band: Vec<Vec<f32>> = (0..n)
-            .map(|b| out.i((b, window.len() - 1))?.to_vec1::<f32>())
+            .map(|b| out.i((b, width - 1))?.to_vec1::<f32>())
             .collect::<Result<_, _>>()?;
         let reference = mean_logits(&per_band);
         let guided = guide_logits(&per_band[asked_at], &reference, gamma);
         let t = Tensor::from_vec(guided, (vocab.model_vocab_size(),), &cfg.device)?;
         candle_nn::ops::softmax(&t, 0)?.to_vec1::<f32>()?
     } else {
-        let input = Tensor::from_vec(window.clone(), (1, window.len()), &cfg.device)?;
+        let input = Tensor::from_vec(window.tokens().to_vec(), (1, width), &cfg.device)?;
         let logits = model.forward(&input)?;
-        let last = logits.i((0, window.len() - 1))?;
+        let last = logits.i((0, width - 1))?;
         candle_nn::ops::softmax(&last, 0)?.to_vec1::<f32>()?
     };
 

@@ -97,6 +97,12 @@ fn kitchen_sink_a_backward_reaches_every_base_var() {
             kv_heads: Some(1), // MQA — c_attn out = 16 + 2·8 = 32
             window: Some(4),
             untied_head: true,
+            // Off: the conditioning table is only read by
+            // `forward_conditioned`, so a model built with one and
+            // driven through the plain forward below would register a
+            // Var no gradient reaches — which is what the coverage
+            // assertion at the end of this test exists to catch.
+            cond_slots: None,
         },
     );
     let (vm, grads) = masked_backward(&cfg);

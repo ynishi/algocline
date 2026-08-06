@@ -193,6 +193,24 @@ pub struct Gpt2Custom {
     /// every axis.)
     #[serde(default)]
     pub untied_head: bool,
+    /// `Some(n)` = a conditioning table of `n` rows (`cond_wte`,
+    /// `[n, dim]`), whose row the caller selects per forward through
+    /// [`super::gpt2::Gpt2Model::forward_conditioned`]; the vector is
+    /// added at every position. `None` (reference) = no such table and
+    /// no conditioning entry point.
+    ///
+    /// A table of its own rather than a reuse of `wte`, because the LM
+    /// head is tied to `wte` on the reference topology
+    /// (`untied_head: false`). Adding a `wte` row to the residual
+    /// stream at every position raises that token's logit at every
+    /// position, and the token is never a target after the front of the
+    /// row, so the loss would push the same vector back down — the
+    /// model's cheapest answers being to shrink the vector or to have
+    /// the blocks subtract it out, both of which erase the condition
+    /// being studied. `cond_wte` is read by nothing but this addition,
+    /// so nothing pulls against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cond_slots: Option<usize>,
 }
 
 impl Gpt2Custom {
@@ -221,6 +239,11 @@ impl Gpt2Custom {
         if self.window == Some(0) {
             return Err(candle_core::Error::Msg(
                 "gpt2 custom: window must be ≥ 1 (use None for full causal)".into(),
+            ));
+        }
+        if self.cond_slots == Some(0) {
+            return Err(candle_core::Error::Msg(
+                "gpt2 custom: cond_slots must be ≥ 1 (use None for an unconditioned model)".into(),
             ));
         }
         if self.placement == NormPlacement::PostLn && self.residual == ResidualKind::Parallel {
@@ -340,6 +363,7 @@ mod tests {
             kv_heads: Some(1),
             window: Some(4),
             untied_head: true,
+            cond_slots: Some(3),
         };
         let json = serde_json::to_value(&spec).expect("serialize");
         let back: Gpt2Custom = serde_json::from_value(json.clone()).expect("deserialize");
@@ -349,6 +373,7 @@ mod tests {
         assert_eq!(back.kv_heads, Some(1));
         assert_eq!(back.window, Some(4));
         assert!(back.untied_head);
+        assert_eq!(back.cond_slots, Some(3));
     }
 
     /// An empty table deserializes to the reference spec, and absent

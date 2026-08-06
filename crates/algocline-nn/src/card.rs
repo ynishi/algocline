@@ -872,6 +872,7 @@ mod tests {
                 kv_heads: Some(1),
                 window: Some(4),
                 untied_head: true,
+                cond_slots: Some(3),
             },
             moe: Some(NnMoeBranch {
                 n_experts: 4,

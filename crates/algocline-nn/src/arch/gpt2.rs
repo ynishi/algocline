@@ -10,6 +10,8 @@
 //!
 //! - `wte` — token embedding (`vocab × dim`)
 //! - `wpe` — learned positional embedding (`ctx × dim`)
+//! - `cond_wte` — optional conditioning table (`cond_slots × dim`),
+//!   added at every position by [`Gpt2Model::forward_conditioned`]
 //! - `h.<i>.ln_1` / `ln_2` — pre-LayerNorm (dim)
 //! - `h.<i>.attn.c_attn` — fused Q/K/V projection (`dim → 3·dim`)
 //! - `h.<i>.attn.c_proj` — attention output projection (`dim → dim`)
@@ -68,6 +70,55 @@ const KNOWN_TARGET_MODULES: [&str; 6] = ["q_proj", "k_proj", "v_proj", "o_proj",
 /// softmax gives. Training from there saturates the softmax rather than
 /// descending. Measured on `examples/init_loss_probe.rs`.
 pub(crate) const INIT_STDEV: f64 = 0.02;
+
+/// Overwrite every registered parameter with values a seed decides, so
+/// a test can assert on numbers a forward pass actually produces.
+///
+/// candle has no `Device::set_seed` on this version and the crate does
+/// not seed its initialisers, so a model built by [`Gpt2Model::new`] is
+/// different on every run. A test that thresholds a difference between
+/// two such forwards is thresholding a random draw; this makes the
+/// draw the test's own.
+///
+/// Norm weights are held at one and every bias at zero rather than
+/// being randomised, because a norm scaled by a number near zero would
+/// make the model degenerate in a way no real initialisation is.
+#[cfg(test)]
+pub(crate) fn fill_deterministic(vm: &VarMap, seed: u64) -> CandleResult<()> {
+    let data = vm
+        .data()
+        .lock()
+        .map_err(|_| candle_core::Error::Msg("fill_deterministic: VarMap lock poisoned".into()))?;
+    // `HashMap` iteration order is arbitrary and the generator is
+    // sequential, so the names have to be walked in a fixed order for
+    // the fill to be reproducible.
+    let mut names: Vec<&String> = data.keys().collect();
+    names.sort();
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // [-0.05, 0.05), the order of magnitude the real initialiser
+        // draws at (INIT_STDEV = 0.02).
+        ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
+    };
+    for name in names {
+        let var = &data[name];
+        let n = var.shape().elem_count();
+        let values: Vec<f32> = if name.ends_with(".bias") {
+            vec![0.0; n]
+        } else if name.contains("ln_") {
+            vec![1.0; n]
+        } else {
+            (0..n).map(|_| next()).collect()
+        };
+        let t =
+            Tensor::from_vec(values, var.shape().clone(), var.device())?.to_dtype(var.dtype())?;
+        var.set(&t)?;
+    }
+    Ok(())
+}
 
 /// Embedding table drawn from `N(0, INIT_STDEV)` instead of candle-nn's
 /// `N(0, 1)` default.
@@ -661,6 +712,45 @@ impl Block {
     }
 }
 
+/// A row of a model's conditioning table.
+///
+/// The point of the wrapper is that the number inside cannot be
+/// supplied by a caller. Rows are `0..cond_slots`, and a condition
+/// that means something to the caller almost always has a *second*
+/// numbering — most obviously a token id, when the condition also
+/// appears in the sequence. The two ranges are different and they
+/// overlap, so an id passed where a row is wanted selects a real but
+/// wrong row: the range check passes, the forward pass succeeds, and
+/// the model is conditioned on something else with nothing downstream
+/// able to report it.
+///
+/// So the constructor is crate-private, and a caller obtains one from
+/// whatever holds the mapping — for the chess models in this crate,
+/// [`crate::chess::ModelShape::band_index`], whose documentation has
+/// the arithmetic of the overlap. Every consumer outside this crate,
+/// the chess examples included, goes through such a producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CondIndex(u32);
+
+impl CondIndex {
+    /// Wrap a table row.
+    ///
+    /// Named for what the argument has to be rather than `new`,
+    /// because `new` reads as acceptable at a call site holding the
+    /// wrong number and `from_table_row` does not. Crate-private, so
+    /// no consumer outside this crate can reach it at all — but the
+    /// in-crate training path is exactly the code holding both
+    /// numberings, and there a name is the whole of the guard.
+    pub(crate) fn from_table_row(row: u32) -> Self {
+        Self(row)
+    }
+
+    /// The row this index selects.
+    pub fn row(self) -> u32 {
+        self.0
+    }
+}
+
 /// GPT-2 forward-only model.
 ///
 /// Constructed via [`Gpt2Model::new`] (random init from a [`VarBuilder`])
@@ -691,6 +781,10 @@ pub struct Gpt2Model {
     /// `lm_head.weight`), present iff `untied_head`. `None` = head
     /// tied to `wte` (reference).
     lm_head: Option<Tensor>,
+    /// Conditioning table (`[cond_slots, dim]`, VarMap name
+    /// `cond_wte.weight`), present iff [`Gpt2Custom::cond_slots`] is
+    /// set. Read only by [`Self::forward_conditioned`].
+    cond_wte: Option<Embedding>,
     cfg: Gpt2Config,
 }
 
@@ -787,6 +881,13 @@ impl Gpt2Model {
         } else {
             None
         };
+        // Conditioning table. Small (`slots × dim`) and read by nothing
+        // but `forward_conditioned`, which is what keeps it out of the
+        // tug-of-war `wte` would be in — see `Gpt2Custom::cond_slots`.
+        let cond_wte = match custom.cond_slots {
+            Some(slots) => Some(gpt2_embedding(slots, cfg.dim, vs.pp("cond_wte"))?),
+            None => None,
+        };
         let causal_mask = build_causal_mask(cfg.ctx, custom.window, &cfg.device, cfg.dtype)?;
         Ok(Self {
             wte,
@@ -797,6 +898,7 @@ impl Gpt2Model {
             rope,
             alibi,
             lm_head,
+            cond_wte,
             cfg: cfg.clone(),
         })
     }
@@ -936,7 +1038,70 @@ impl Gpt2Model {
     /// output is `[batch, seq, vocab]` — the raw logits (softmax is left
     /// to the training loss / sampling caller).
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        self.forward_inner(xs, None).map(|(logits, _)| logits)
+        self.forward_inner(xs, None, None).map(|(logits, _)| logits)
+    }
+
+    /// Forward pass with a condition embedding added at **every**
+    /// position rather than carried by a token at the front of the row.
+    ///
+    /// `conds` holds one [`CondIndex`] per row of `xs`;
+    /// `cond_wte[conds[i]]` is added to row `i` at every position, next
+    /// to where the learned positional embedding is added. Output shape
+    /// is unchanged. Requires [`Gpt2Custom::cond_slots`] to have been
+    /// set when the model was built.
+    ///
+    /// # Why the condition is an argument
+    ///
+    /// The alternative — read it out of a fixed position in `xs` — is
+    /// what the chess readers used to assume, and it does not survive a
+    /// row longer than `ctx`: whatever windowing the caller applies can
+    /// move an ordinary token into that slot, and the model would
+    /// condition on it without any observable difference from a real
+    /// condition. As an argument there is no position for windowing to
+    /// disturb.
+    ///
+    /// The table's rows are numbered from zero and the band tokens are
+    /// not, so the two numberings overlap without meaning the same
+    /// thing; [`CondIndex`] is what keeps a caller from passing one for
+    /// the other, and its documentation has the arithmetic.
+    ///
+    /// # Why a table of its own
+    ///
+    /// The band ids are vocabulary entries, so reusing `wte` was the
+    /// tempting choice: it adds no tensor, which would leave the
+    /// safetensors key set identical between this convention and the
+    /// prefix one. It is also wrong on the reference topology, where
+    /// the LM head is tied to `wte`
+    /// ([`Gpt2Custom::untied_head`] `== false`). A `wte` row added to
+    /// the residual stream at every position raises that token's logit
+    /// at every position; the band token is a target nowhere but the
+    /// front of the row, so a full-vocabulary cross-entropy pushes it
+    /// straight back down. The model can comply by shrinking the
+    /// vector or by having the blocks subtract it out of the stream,
+    /// and both destroy the signal the caller is trying to measure —
+    /// more so here than under a prefix, since here it happens at every
+    /// position rather than one, which would make an arm difference
+    /// attributable to weight tying rather than to where the condition
+    /// attaches. `cond_wte` is read by nothing but this addition.
+    ///
+    /// The cost is that the two conventions are no longer identical on
+    /// disk: this one carries `cond_wte.weight`, `cond_slots × dim`
+    /// parameters. That makes [`crate::chess::ModelShape::encoding`] a
+    /// second line of defence rather than the only one, and it is a
+    /// difference in parameter count between arms, which belongs in the
+    /// confound table of whatever compares them.
+    ///
+    /// # Errors
+    ///
+    /// - The model was built without a conditioning table.
+    /// - `conds.len()` is not `batch`.
+    /// - Any index is outside `[0, cond_slots)` — reachable when the
+    ///   index came from a `ModelShape` with more bands than the model
+    ///   has rows, which is a crossed pair rather than a typo.
+    /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
+    pub fn forward_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
+        self.forward_inner(xs, Some(conds), None)
+            .map(|(logits, _)| logits)
     }
 
     /// Forward pass that also returns the summed MoE load-balancing
@@ -944,7 +1109,7 @@ impl Gpt2Model {
     /// composing the total loss). `None` on a dense (non-MoE) model,
     /// so existing callers of [`Self::forward`] see no change.
     pub fn forward_with_aux(&self, xs: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
-        self.forward_inner(xs, None)
+        self.forward_inner(xs, None, None)
     }
 
     /// Probe variant of [`Self::forward_with_aux`] that additionally
@@ -957,13 +1122,14 @@ impl Gpt2Model {
         xs: &Tensor,
     ) -> CandleResult<(Tensor, Option<Tensor>, Vec<Tensor>)> {
         let mut probs = Vec::new();
-        let (logits, aux) = self.forward_inner(xs, Some(&mut probs))?;
+        let (logits, aux) = self.forward_inner(xs, None, Some(&mut probs))?;
         Ok((logits, aux, probs))
     }
 
     fn forward_inner(
         &self,
         xs: &Tensor,
+        conds: Option<&[CondIndex]>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
         let (b, t) = xs.dims2()?;
@@ -985,6 +1151,13 @@ impl Gpt2Model {
             // attention; NoPos has none by design.
             None => tok_emb,
         };
+        // The condition, if the caller passed one. Added here, beside
+        // the positional embedding, so it is present at every position
+        // instead of decaying with distance from a token at the front.
+        if let Some(conds) = conds {
+            let cond_emb = self.condition_embedding(conds, b)?; // [B, 1, D]
+            h = h.broadcast_add(&cond_emb)?;
+        }
         // ALiBi score bias for the active prefix: [H, t, t] =
         // -slopes ⊙ (i - j). Constant tensors — no gradient tracking.
         let alibi_bias = match &self.alibi {
@@ -1019,6 +1192,49 @@ impl Gpt2Model {
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
         Ok((logits, aux_sum))
+    }
+
+    /// The per-row condition vectors, shaped `[batch, 1, dim]` so they
+    /// broadcast across the sequence.
+    ///
+    /// The indices arrive as a host slice rather than as a `Tensor`:
+    /// every caller has them on the host anyway, and it makes the
+    /// arity and range checks free. Range in particular has to be
+    /// checked here — candle's CPU backend rejects an out-of-range
+    /// `index_select`, but leaving it to the backend would mean the
+    /// accelerator builds decide whether a bad index is an error or a
+    /// silently conditioned run.
+    fn condition_embedding(&self, conds: &[CondIndex], batch: usize) -> CandleResult<Tensor> {
+        let table = self.cond_wte.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "gpt2 forward: this model has no conditioning table; build it with \
+                 `custom.cond_slots = Some(n)` to use forward_conditioned"
+                    .into(),
+            )
+        })?;
+        if conds.len() != batch {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: {} condition index/indices for a batch of {batch}; \
+                 pass one per row",
+                conds.len()
+            )));
+        }
+        let slots = self
+            .cfg
+            .custom
+            .as_ref()
+            .and_then(|c| c.cond_slots)
+            .unwrap_or(0);
+        if let Some(bad) = conds.iter().find(|i| i.row() as usize >= slots) {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: condition index {} is outside the {slots}-row \
+                 conditioning table",
+                bad.row()
+            )));
+        }
+        let rows: Vec<u32> = conds.iter().map(|i| i.row()).collect();
+        let ids = Tensor::from_vec(rows, (batch,), &self.cfg.device)?;
+        table.forward(&ids)?.unsqueeze(1) // [B, 1, D]
     }
 
     /// Wrap the model's per-block linear projections with LoRA
@@ -1303,7 +1519,7 @@ fn build_alibi_consts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::LoraConfig;
+    use crate::arch::{max_abs_diff_f32, LoraConfig};
     use candle_nn::VarMap;
 
     #[test]
@@ -1443,6 +1659,227 @@ mod tests {
             moe: None,
             custom: None,
         }
+    }
+
+    /// A model wide enough in `ctx` to put a position far from the
+    /// front of the row, which is where the condition has to arrive,
+    /// and carrying a conditioning table.
+    fn conditioning_cfg(slots: Option<usize>) -> Gpt2Config {
+        Gpt2Config {
+            layers: 1,
+            heads: 2,
+            dim: 16,
+            ctx: 128,
+            vocab: 64,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(Gpt2Custom {
+                cond_slots: slots,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A conditioned model whose weights a seed decides, so the
+    /// assertions below are on numbers rather than on a draw.
+    fn conditioning_model(cfg: &Gpt2Config) -> Gpt2Model {
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(cfg, vs).unwrap();
+        fill_deterministic(&varmap, 0x0801_2026).unwrap();
+        model
+    }
+
+    /// Phase 0-1, and the claim being tested is a comparative one.
+    ///
+    /// "The condition changes the output far from the front of the row"
+    /// is true of a prefix token too — decayed, but non-zero — so on
+    /// its own it does not distinguish the two mechanisms. What is
+    /// specific to conditioning at every position is that the effect
+    /// does not fall off with distance.
+    ///
+    /// So the test measures both. It takes the same model and the same
+    /// two positions, and compares (a) two conditions passed as
+    /// arguments against (b) two rows differing only in the token at
+    /// position 1, which is the prefix mechanism this replaces. The
+    /// per-position ratio has to sit inside a band around 1 and the
+    /// prefix ratio has to sit below it — the counterfactual is run
+    /// rather than asserted in a comment, which is what makes the band
+    /// a measured margin instead of a chosen one.
+    #[test]
+    fn conditioned_forward_does_not_decay_with_distance() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+
+        let seq: Vec<u32> = (0..120u32).map(|i| 8 + i % 40).collect();
+        let far = seq.len() - 1;
+        let near = 1;
+        let ids = Tensor::from_slice(&seq, (1, seq.len()), &cfg.device).unwrap();
+        let at = |out: &Tensor, pos: usize| out.i((0, pos)).unwrap();
+
+        let plain = model.forward(&ids).unwrap();
+        let low = model
+            .forward_conditioned(&ids, &[CondIndex::from_table_row(0)])
+            .unwrap();
+        let high = model
+            .forward_conditioned(&ids, &[CondIndex::from_table_row(1)])
+            .unwrap();
+
+        let plain_vs_low = max_abs_diff_f32(&at(&plain, far), &at(&low, far)).unwrap();
+        assert!(
+            plain_vs_low > 1e-4,
+            "a condition that changes nothing at position {far} is not a condition \
+             (max abs diff {plain_vs_low})"
+        );
+
+        let far_gap = max_abs_diff_f32(&at(&low, far), &at(&high, far)).unwrap();
+        assert!(
+            far_gap > 1e-4,
+            "two conditions produced the same logits at position {far} (gap {far_gap})"
+        );
+        let near_gap = max_abs_diff_f32(&at(&low, near), &at(&high, near)).unwrap();
+        let per_position = far_gap / near_gap;
+
+        // The counterfactual: the condition carried by a token at
+        // position 1, which is what the rest of this work is measuring
+        // the decay of.
+        let mut prefix_a = seq.clone();
+        prefix_a[near] = 2;
+        let mut prefix_b = seq.clone();
+        prefix_b[near] = 3;
+        let out_a = model
+            .forward(&Tensor::from_slice(&prefix_a, (1, seq.len()), &cfg.device).unwrap())
+            .unwrap();
+        let out_b = model
+            .forward(&Tensor::from_slice(&prefix_b, (1, seq.len()), &cfg.device).unwrap())
+            .unwrap();
+        let prefix_far = max_abs_diff_f32(&at(&out_a, far), &at(&out_b, far)).unwrap();
+        let prefix_near = max_abs_diff_f32(&at(&out_a, near), &at(&out_b, near)).unwrap();
+        let prefix_ratio = prefix_far / prefix_near;
+
+        assert!(
+            (0.5..=2.0).contains(&per_position),
+            "the condition's effect at position {far} was {per_position}x its effect at \
+             position {near} (near {near_gap}, far {far_gap}); a mechanism that fades \
+             with distance is the one this replaces"
+        );
+        // The two mechanisms have to be *separated*, not merely on
+        // opposite sides of a boundary: bounding one below 0.5 and the
+        // other above it passes at 0.499 against 0.501, which is two
+        // indistinguishable mechanisms. So the assertion is on the
+        // ratio between them.
+        //
+        // Observed 0.840 against 0.0033, a separation of some 250x, so
+        // a floor of 10 is nowhere near either side.
+        //
+        // That 250 belongs to *this* model and does not travel. It is
+        // one layer at dim 16, untrained, so attention is near uniform
+        // and the prefix's `far/near` is mostly dilution over the
+        // sequence — roughly `1/T`. The trained 4-layer prefix decay
+        // measured on held-out play is 0.0272 -> 0.0021, a ratio of
+        // about 0.077, some 23x larger than the 0.0033 here. The claim
+        // this test makes is ordinal (an argument does not fade where
+        // a prefix does), not a prediction of the margin.
+        let separation = per_position / prefix_ratio;
+        assert!(
+            separation > 10.0,
+            "the two mechanisms are {separation}x apart: argument {per_position} \
+             (near {near_gap}, far {far_gap}) against prefix {prefix_ratio} \
+             (near {prefix_near}, far {prefix_far}); below a factor of ten they are not \
+             telling us apart from what they replace"
+        );
+    }
+
+    /// One index per row, or the caller does not know which row it
+    /// meant.
+    #[test]
+    fn conditioned_forward_rejects_a_condition_per_batch_mismatch() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (2, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned(&ids, &[CondIndex::from_table_row(0)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("one per row"), "{msg}");
+    }
+
+    /// An index past the end of the table is a caller mistake that no
+    /// downstream reading would reveal, so it is refused by name.
+    #[test]
+    fn conditioned_forward_rejects_an_index_outside_the_table() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned(&ids, &[CondIndex::from_table_row(4)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("conditioning table"), "{msg}");
+    }
+
+    /// A model built without the table cannot be conditioned, and says
+    /// so rather than ignoring the argument.
+    #[test]
+    fn conditioned_forward_needs_a_table() {
+        let cfg = conditioning_cfg(None);
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned(&ids, &[CondIndex::from_table_row(0)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("no conditioning table"), "{msg}");
+    }
+
+    /// The table is not tied to the LM head, so it is not registered
+    /// under a name any other part of the model reads. Its absence
+    /// from an unconditioned model is what makes a checkpoint of one
+    /// convention fail to restore into the other.
+    #[test]
+    fn the_conditioning_table_is_a_parameter_of_its_own() {
+        let cfg = conditioning_cfg(Some(3));
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let _ = Gpt2Model::new(&cfg, vs).unwrap();
+        let data = varmap.data().lock().unwrap();
+        let table = data
+            .get("cond_wte.weight")
+            .expect("a conditioned model registers cond_wte.weight");
+        assert_eq!(table.shape().dims(), &[3, cfg.dim]);
+
+        let plain_cfg = conditioning_cfg(None);
+        let plain_map = VarMap::new();
+        let plain_vs = VarBuilder::from_varmap(&plain_map, plain_cfg.dtype, &plain_cfg.device);
+        let _ = Gpt2Model::new(&plain_cfg, plain_vs).unwrap();
+        assert!(!plain_map
+            .data()
+            .lock()
+            .unwrap()
+            .contains_key("cond_wte.weight"));
+    }
+
+    /// Each row takes its own condition: two rows with the same tokens
+    /// and different indices must not come out the same.
+    #[test]
+    fn conditioned_forward_applies_a_condition_per_row() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let row: Vec<u32> = (0..40u32).map(|i| 8 + i % 20).collect();
+        let mut both = row.clone();
+        both.extend_from_slice(&row);
+        let ids = Tensor::from_slice(&both, (2, row.len()), &cfg.device).unwrap();
+        let out = model
+            .forward_conditioned(
+                &ids,
+                &[CondIndex::from_table_row(0), CondIndex::from_table_row(1)],
+            )
+            .unwrap();
+        let last = row.len() - 1;
+        let gap = max_abs_diff_f32(&out.i((0, last)).unwrap(), &out.i((1, last)).unwrap()).unwrap();
+        assert!(gap > 1e-4, "both rows were conditioned the same way");
     }
 
     #[test]

@@ -36,11 +36,19 @@
 //! vocabulary that rounds to 2048 for any band count this program can
 //! be given, and a changed `CHESS_HEADS` only reshapes what `c_attn`
 //! already produces — that projection is `dim -> 3*dim` at four heads
-//! and at eight alike. So the shape file written beside the checkpoint
-//! is compared field by field first, heads and band list included, and
-//! a disagreement stops the run before training. Resuming a `1600-1799`
-//! model as `1100-1299` is therefore an error, not a run whose
-//! embedding row 2 quietly means something else than it did yesterday.
+//! and at eight alike. `CHESS_COND_EVERY` does move a tensor, the
+//! `cond_wte` table, but only in one direction does that help: a
+//! prefix checkpoint restored into a per-position run is missing
+//! `cond_wte.weight` and `restore_into` refuses it, while a
+//! per-position checkpoint restored into a prefix run carries one
+//! tensor the model does not want, which `restore_into` accepts and
+//! reports as unused. In that second direction the shape file is the
+//! only thing standing between the operator and a resume from weights
+//! trained under another rule. So it is compared field by field first,
+//! heads, band list and conditioning included, and a disagreement
+//! stops the run before training. Resuming a `1600-1799` model as
+//! `1100-1299` is therefore an error, not a run whose embedding row 2
+//! quietly means something else than it did yesterday.
 //!
 //! Every checkpoint carries its own shape file, written as it lands,
 //! so the pairing survives an interrupted run and cannot be rewritten
@@ -83,7 +91,7 @@ use algocline_nn::chess::corpus::{
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::vocab::MoveVocab;
-use algocline_nn::chess::ModelShape;
+use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError};
 use algocline_nn::train::{
     allowed_logit_mask, restore_into, run_full_ft, CkptControl, CkptHook, CkptInfo,
     CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss, ScheduleKind, TeacherCardDataset,
@@ -276,6 +284,15 @@ fn shape_disagreements(want: &ModelShape, found: &ModelShape) -> Vec<String> {
             describe_bands(&want.bands)
         ));
     }
+    // Nothing in the weights records this, and the two conventions
+    // train different models out of the same tensors, so resuming
+    // across it would continue one run's model under the other's rule.
+    if want.encoding != found.encoding {
+        out.push(format!(
+            "conditioning is {} in the checkpoint and {} here",
+            found.encoding, want.encoding
+        ));
+    }
     out
 }
 
@@ -323,7 +340,7 @@ fn resume_from(want: &ModelShape) -> Result<Option<PathBuf>, String> {
     // included, so this is a plain lookup with no filename arithmetic
     // in it — and the same lookup `chess_play` and the other readers
     // do, rather than a rule only this program knows.
-    let found = ModelShape::load(&path).map_err(|e| {
+    let found = ModelShape::load_any(&path).map_err(|e| {
         format!(
             "CHESS_INIT_FROM={}: cannot read the shape written beside it, so there is no way \
              to tell which bands it was trained on — the weights carry the band count only as \
@@ -342,6 +359,31 @@ fn resume_from(want: &ModelShape) -> Result<Option<PathBuf>, String> {
         ));
     }
     Ok(Some(path))
+}
+
+/// Remove one shape file, and say what happened to it.
+///
+/// Deliberately silent about which run wrote what was removed: it may
+/// be an earlier run's file, or this run's own half-written JSON if the
+/// failure came part-way through the write. Either way the point is
+/// that no file describing the wrong model is left beside the weights.
+/// An empty string means there was nothing there, which is the common
+/// case and not worth a line of output.
+fn sweep_one(path: &Path) -> String {
+    match std::fs::remove_file(path) {
+        Ok(()) => format!(
+            "; the shape file at {} was removed, so it can no longer be read as describing \
+             these weights",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => format!(
+            "; and a shape file at {} could not be removed ({e}) — if it predates this run it \
+             now describes weights it was not written for, so delete it by hand before reading \
+             this checkpoint",
+            path.display()
+        ),
+    }
 }
 
 fn main() -> ExitCode {
@@ -380,6 +422,52 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     shape.heads = env_usize("CHESS_HEADS", shape.heads);
     shape.dim = env_usize("CHESS_DIM", shape.dim);
     shape.ctx = env_usize("CHESS_CTX", shape.ctx);
+    // Which conditioning convention this run trains under. It goes into
+    // the shape file because that is where a reader can act on it
+    // before loading anything.
+    //
+    // Every arm is spelled out. `Err(_) => Prefix` would fold
+    // `NotUnicode` — a variable that *is* set, to something this
+    // program cannot read — in with "not set at all", and the run would
+    // then train prefix-conditioned and label itself prefix-
+    // conditioned with nothing anywhere recording that the operator
+    // asked for something else.
+    shape.encoding = match env::var("CHESS_COND_EVERY") {
+        Ok(v) => match v.as_str() {
+            "1" => CondEncoding::EveryPosition,
+            "0" => CondEncoding::Prefix,
+            // A shell blanks an exported variable by setting it empty,
+            // so this means "not asked for" — said out loud for the
+            // same reason `resume_from` says it about CHESS_INIT_FROM.
+            "" => {
+                eprintln!("[bake] CHESS_COND_EVERY is set but empty; conditioning by prefix token");
+                CondEncoding::Prefix
+            }
+            other => return Err(format!("unknown CHESS_COND_EVERY {other:?}; pass 0 or 1").into()),
+        },
+        Err(env::VarError::NotPresent) => CondEncoding::Prefix,
+        Err(e @ env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "CHESS_COND_EVERY is set to something this program cannot read ({e}); pass 0 or 1"
+            )
+            .into())
+        }
+    };
+    if shape.encoding == CondEncoding::EveryPosition {
+        // The model can do it — `Gpt2Model::forward_conditioned` takes
+        // the band as an argument — but the training loop still drives
+        // the model through `Module::forward`, which has nowhere to put
+        // one. Running anyway would train a prefix-conditioned model
+        // and write `every_position` beside it, which is the one thing
+        // the encoding field exists to prevent: from there on, every
+        // reader would believe the label rather than the weights.
+        return Err(
+            "CHESS_COND_EVERY=1 is recognised but the training loop does not yet pass the \
+             band to the model (verification plan 02, Phase 0-2 / I5). Running now would \
+             label prefix-conditioned weights as per-position"
+                .into(),
+        );
+    }
     let batch = env_usize("CHESS_BATCH", 32);
     let lr = env_f64("CHESS_LR", 3e-3);
     // More than one pass over the rows is what lets a run continue past
@@ -604,42 +692,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // write itself can fail — the arm below, which is the one that has
     // actually been hit.
     //
-    // That arm has to sweep. A failed `save` after a successful
-    // `save_step` means new weights sit at a name an earlier run with
-    // these bands may already have written a shape file for, and that
-    // stale file would outlive the aborted run: not a window of
-    // microseconds but a permanent mispairing, and one a later resume
-    // would accept whenever the operator's CHESS_HEADS happens to
-    // match what the old file says. Removing it turns the durable
-    // state into a checkpoint with no shape, which every reader
-    // refuses. The removal's own outcome rides on the error message
-    // rather than being dropped, since a sweep that silently failed
-    // would leave exactly the state it was supposed to prevent.
+    // That arm has to sweep, and what it sweeps depends on how `save`
+    // failed — the two failures leave opposite states:
+    //
+    // - the **write** failed. New weights now sit at a name an earlier
+    //   run with these bands may already have written a shape file
+    //   for, under either convention, and that stale file would
+    //   outlive the aborted run: not a window of microseconds but a
+    //   permanent mispairing, and one a later resume would accept
+    //   whenever the operator's CHESS_HEADS happens to match what the
+    //   old file says. Both names are swept, because a run of the
+    //   other convention could have left either, and what is wanted is
+    //   a checkpoint with no shape at all — which every reader
+    //   refuses;
+    // - the write **succeeded** and the sweep inside `save` failed.
+    //   The file `save` wrote is correct and current; what is left
+    //   over is the other convention's. Removing this run's own file
+    //   here would leave that stale one alone beside the new weights,
+    //   which is not "a checkpoint with no shape" but a checkpoint
+    //   with the *wrong* shape — accepted by every reader, and by the
+    //   mmapped loader too, which asks only for the tensors its model
+    //   wants and never notices `cond_wte.weight` sitting unrequested.
+    //   So that branch removes the stale name, and if it cannot, both
+    //   files remain and `load_any` refuses the pair as ambiguous.
+    //
+    // Every removal's own outcome rides on the error message rather
+    // than being dropped, since a sweep that silently failed would
+    // leave exactly the state it was supposed to prevent.
     let shape_for_ckpt = shape.clone();
     let on_ckpt: CkptHook = Box::new(move |info: &CkptInfo| {
         match shape_for_ckpt.save(&info.ckpt_path) {
             Ok(_) => Ok(CkptControl::Continue),
             Err(e) => {
-                let stale = ModelShape::path_for(&info.ckpt_path);
-                let swept = match std::fs::remove_file(&stale) {
-                    // Deliberately silent about which run wrote what
-                    // was removed: it may be an earlier run's file, or
-                    // this one's own half-written JSON if the failure
-                    // came part-way through the write. Either way the
-                    // checkpoint is left with no shape rather than one
-                    // it does not match.
-                    Ok(()) => format!(
-                        "; the shape file at {} was removed, so this checkpoint now has none \
-                         rather than one written for a different model",
-                        stale.display()
-                    ),
-                    Err(r) if r.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(r) => format!(
-                        "; and a shape file at {} could not be removed ({r}) — if it predates \
-                         this run it now describes weights it was not written for, so delete it \
-                         by hand before reading this checkpoint",
-                        stale.display()
-                    ),
+                let swept = match &e {
+                    ShapeError::SweepFailed { stale, .. } => sweep_one(stale),
+                    _ => {
+                        let mine =
+                            ModelShape::path_for_encoding(&info.ckpt_path, shape_for_ckpt.encoding);
+                        let theirs = ModelShape::path_for_encoding(
+                            &info.ckpt_path,
+                            shape_for_ckpt.encoding.other(),
+                        );
+                        format!("{}{}", sweep_one(&mine), sweep_one(&theirs))
+                    }
                 };
                 // The weights are on disk and cost whatever the run has
                 // cost so far. The abort skips the retrieval hint at
@@ -648,8 +743,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // still needs.
                 Err(format!(
                     "{e}{swept}. The checkpoint itself was written and is intact at {}; it is \
-                     unusable until a shape file sits beside it, and the `[bake] model …` line \
-                     above carries every field that file needs",
+                     unusable until exactly one correct shape file sits beside it, and the \
+                     `[bake] model …` line above carries every field that file needs",
                     info.ckpt_path.display()
                 ))
             }

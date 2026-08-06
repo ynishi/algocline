@@ -43,7 +43,7 @@ use algocline_nn::chess::corpus::ScoredSide;
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::ModelShape;
+use algocline_nn::chess::{CondEncoding, ModelShape};
 
 /// Resolve a band argument against the checkpoint's own band list.
 ///
@@ -106,7 +106,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let max_positions: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
 
-    let shape = ModelShape::load(&ckpt)?;
+    // Prefix-conditioned only: the band is written into the row below.
+    //
+    // The window on that row is still a plain tail slice, so on a game
+    // past ply 126 the band falls out of it and the position is scored
+    // unconditioned. Left as it is on purpose — the repair landed in
+    // `chess_cond` and `chess_play`, which are what the conditioning
+    // measurement and the playing session run on, and move match here
+    // is not read against either.
+    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
     let vocab = MoveVocab::new(&shape.band_tokens())?;
     let ask = resolve_band(&shape, &ask_arg)?;
     let measure = resolve_band(&shape, &measure_arg)?;

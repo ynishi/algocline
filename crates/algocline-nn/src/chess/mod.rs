@@ -18,11 +18,15 @@
 //!   band is the one mechanism known to reproduce how they move.
 //! - [`corpus`] runs the stages in order — tags, replay, length,
 //!   encode — and reports what happened to every game it read.
+//! - [`train`] hands a banded corpus to the conditioned training loop,
+//!   turning each row's band into the conditioning-table row the model
+//!   indexes by.
 
 pub mod corpus;
 pub mod filter;
 pub mod guide;
 pub mod pgn;
+pub mod train;
 pub mod vocab;
 pub mod window;
 

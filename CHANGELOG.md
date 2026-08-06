@@ -344,6 +344,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unseen one, across two runs. See README "Proving the bake
   generalises".
 
+### Changed — **BREAKING**: `algocline_nn::train::Batch` gained a `conds` field
+
+`Batch` carries an optional per-row conditioning index, so a training
+loop can tell the model which condition each row was written under.
+The struct has no `#[non_exhaustive]`, so any code that builds a
+`Batch` with a struct literal — a hand-written `Dataset`, most likely —
+stops compiling until the field is named. Field reads are unaffected;
+an exhaustive struct pattern (`let Batch { input_ids, loss_mask,
+is_last, allowed_ids } = batch;`) needs the new field or a `..`.
+
+Two error enums grew arms in the same change and neither is
+`#[non_exhaustive]`, so a downstream exhaustive `match` breaks the
+same way: `TrainError` gained `MissingConditions` and
+`UnexpectedConditions`, `DatasetError` gained
+`ConditionCountMismatch`. Add the arms or a `_`. The crate already
+treats this surface as real — `TrainError::GradAccumUnsupported` is
+retained dead for a release cycle rather than removed, for exactly
+this reason.
+
+Before:
+
+```rust
+Ok(Some(Batch {
+    input_ids,
+    loss_mask: None,
+    is_last,
+    allowed_ids: None,
+}))
+```
+
+After:
+
+```rust
+Ok(Some(Batch {
+    input_ids,
+    loss_mask: None,
+    is_last,
+    allowed_ids: None,
+    conds: None,          // unconditioned; behaviour unchanged
+}))
+```
+
+Migrate steps:
+
+1. Add `conds: None` to every `Batch` literal. That is the whole
+   migration for a dataset that does not condition — `None` is what
+   every existing dataset produces and what `run_full_ft` expects.
+2. To condition, attach one `CondIndex` per row via
+   `TeacherCardDataset::with_conditions` (or
+   `chess::corpus::LegalMaskedDataset::with_conditions`) and drive the
+   run with `run_conditioned_ft`. A `CondIndex` comes only from
+   `ModelShape::band_index`; a token id is not one, because table rows
+   and vocabulary ids are both `u32` and their ranges overlap.
+
+`run_full_ft` and `run_lora_ft` keep their signatures and their
+bounds. Both pairings the entry points cannot serve are errors rather
+than silent ignores: a batch carrying conditions at `run_full_ft` is
+`TrainError::UnexpectedConditions`, and a batch carrying none at
+`run_conditioned_ft` is `TrainError::MissingConditions`. Either
+fallback would train one convention while the checkpoint is labelled
+the other — and since both `with_conditions` constructors are public
+and return a plain `Dataset`, the mismatched pairing is expressible
+from outside this crate in both directions.
+
+### Changed — **BREAKING**: `chess::corpus::Corpus` always carries its masks
+
+`Corpus::masks` is a `Vec<Vec<f32>>` rather than an
+`Option<Vec<Vec<f32>>>`, and `Corpus::into_teacher_rows` returns
+`Result<Vec<TeacherRow>, CorpusError>` rather than a bare `Vec` of
+`(ids, mask)` pairs. `TeacherRow::into_pairs` recovers the old shape
+for the datasets that take it.
+
+`ScoredSide::Both` used to return no mask, and the all-ones mask
+synthesised in its place **scored one position it should not have**:
+the one that predicts the condition token from `BOS`. That is the only
+place a conditioned model can fit the band token itself, which pulls
+the conditioning vector towards that token's embedding — the coupling
+`cond_wte` was separated from `wte` to avoid (`Gpt2Custom::cond_slots`).
+`Both` now emits `[0.0, 0.0, 1.0, …]` like every other side: it scores
+every *move*, and neither `BOS` nor the condition token is one. Runs
+with `side = both` will see a slightly different loss as a result;
+`white` / `black` runs are unchanged.
+
+Two consequences of keeping the mask. A row with no scored position is
+now rejected as `rejected_unscorable` under `Both` as well, instead of
+reaching the dataset and aborting the run as a fully masked row — it
+takes a game of no moves at all, so only a corpus built with no lower
+ply bound can produce one. And the join in `into_teacher_rows` refuses
+a length disagreement between the three per-row lists rather than
+substituting an invented mask, which reads afterwards exactly like a
+mask that was meant.
+
+The join refuses two shapes, and both are new `CorpusError` variants:
+`RaggedCorpus` when the three per-row lists disagree in length, and
+`RaggedRow` when one row's mask is not the length of its ids —
+which `LegalMaskedDataset` would otherwise pad or truncate into
+silently unscored positions on the `CHESS_LEGAL_MASK=1` path.
+`CorpusError` is not `#[non_exhaustive]` either, so a downstream
+exhaustive `match` needs both arms or a `_`.
+
 ### Changed
 
 - `examples/gameai/gameai_metrics/level.lua`: a new `opts.per_move`

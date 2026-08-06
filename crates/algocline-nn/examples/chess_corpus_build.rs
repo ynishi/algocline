@@ -147,23 +147,20 @@ fn main() -> ExitCode {
             .filter_map(|id| vocab.token_of(*id))
             .collect();
         println!("row[0]     {}", head.join(" "));
-        match &corpus.masks {
-            Some(masks) => {
-                let scored: usize = masks
-                    .iter()
-                    .map(|m| m.iter().filter(|v| **v != 0.0).count())
-                    .sum();
-                println!(
-                    "scored     {scored} of {} positions ({:.1}%), side {scored_side:?}",
-                    stats.tokens,
-                    100.0 * scored as f64 / stats.tokens as f64
-                );
-                let head: Vec<String> =
-                    masks[0].iter().take(8).map(|m| format!("{m:.0}")).collect();
-                println!("mask[0]    {}", head.join(" "));
-            }
-            None => println!("scored     every position (side Both, no mask)"),
-        }
+        // Every side carries a mask, `Both` included: it scores every
+        // move, and `BOS` and the condition token are not moves.
+        let masks = &corpus.masks;
+        let scored: usize = masks
+            .iter()
+            .map(|m| m.iter().filter(|v| **v != 0.0).count())
+            .sum();
+        println!(
+            "scored     {scored} of {} positions ({:.1}%), side {scored_side:?}",
+            stats.tokens,
+            100.0 * scored as f64 / stats.tokens as f64
+        );
+        let head: Vec<String> = masks[0].iter().take(8).map(|m| format!("{m:.0}")).collect();
+        println!("mask[0]    {}", head.join(" "));
     }
 
     // Every game read must land in exactly one bucket. A mismatch here

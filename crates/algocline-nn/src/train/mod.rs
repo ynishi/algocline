@@ -75,6 +75,48 @@ pub trait DeviceView {
     fn device(&self) -> &candle_core::Device;
 }
 
+/// A model that can be told which condition each row of a batch
+/// carries.
+///
+/// Sits beside [`DeviceView`] for the same reason that one does: the
+/// training loop needs something `candle_nn::Module` does not offer.
+/// `Module::forward` takes the ids and nothing else, so a loop driving
+/// a model through it has nowhere to put a condition — which is why
+/// [`fullft::run_conditioned_ft`] is generic over this instead.
+///
+/// A separate trait rather than a widened `Module`, because most
+/// architectures have no condition to be told about.
+/// [`crate::arch::TinyLlamaModel`] does not implement this and grows
+/// nothing from its existence; the compiler keeps it out of the
+/// conditioned entry point, which is a better place for that fact than
+/// a runtime error raised half-way through a run.
+pub trait ConditionedForward {
+    /// Forward `xs` (`[batch, seq]` token ids) with one condition per
+    /// row, returning `[batch, seq, vocab]` logits.
+    ///
+    /// One index **per row**, because a batch mixes conditions: a
+    /// single index for the whole batch would condition most rows on
+    /// some other row's band, and every shape downstream would still
+    /// line up.
+    ///
+    /// The argument is a [`crate::arch::CondIndex`] rather than a
+    /// number because the numbering a caller holds is usually a
+    /// different one — a token id, most often — and the two ranges
+    /// overlap without meaning the same thing. Its documentation has
+    /// the arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined, but `conds.len() != batch` and an index
+    /// outside the implementation's table are expected to be refused
+    /// rather than absorbed.
+    fn forward_conditioned_rows(
+        &self,
+        xs: &candle_core::Tensor,
+        conds: &[crate::arch::CondIndex],
+    ) -> candle_core::Result<candle_core::Tensor>;
+}
+
 pub use ckpt::{
     checkpoint_from_path, restore_into, restore_into_partial, ApplyStage, CheckpointStore,
     RestoreError, RestoreReport, TensorMismatch,
@@ -84,8 +126,9 @@ pub use data::{
     TokenizedDataset,
 };
 pub use fullft::{
-    allowed_logit_mask, run_distill, run_full_ft, run_lora_ft, CkptControl, CkptHook, CkptInfo,
-    DistillLossKind, DistillSpec, FullFtConfig, TrainError, TrainingLease, TrainingLeaseGuard,
+    allowed_logit_mask, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, CkptControl,
+    CkptHook, CkptInfo, DistillLossKind, DistillSpec, FullFtConfig, TrainError, TrainingLease,
+    TrainingLeaseGuard,
 };
 pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};
 pub use mixed::MixedAdamW;

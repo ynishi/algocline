@@ -14,6 +14,28 @@
 //! either. Each band gets a condition token prefixed to its games, and
 //! a game outside every band is dropped.
 //!
+//! # Where the condition reaches the model
+//!
+//! By default the band is a token at the front of the row and the model
+//! reads it like any other token, so its influence has to travel the
+//! length of the sequence through attention. That influence was
+//! measured to decay with depth: band divergence falls to about a tenth
+//! between the opening and ply 40-125.
+//!
+//! `CHESS_COND_EVERY=1` trains the other convention. The band is passed
+//! to the forward pass as an argument, one per row of the batch, and
+//! the vector it selects out of a conditioning table of its own is
+//! added at *every* position — so there is no distance for it to decay
+//! over. The row is unchanged: it still begins `[BOS, band]`, so the
+//! two arms train on the same corpus, the same row lengths and the same
+//! token counts, and "the rows differed" is not among the things an arm
+//! difference could be put down to.
+//!
+//! Which convention a run used is written into its shape file, and
+//! every reader refuses a checkpoint of the other one. The two differ
+//! by a single small tensor otherwise, so a reader that guessed would
+//! get a full set of plausible numbers rather than an error.
+//!
 //! One run is meant to finish in tens of seconds on a laptop CPU.
 //! `steps * batch` is what decides that, and the corpus needs at least
 //! that many rows, so raising either raises the wall clock directly.
@@ -84,18 +106,20 @@ use std::time::Instant;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
-use algocline_nn::arch::Gpt2Model;
+use algocline_nn::arch::{CondIndex, Gpt2Model};
 use algocline_nn::chess::corpus::{
     build_rows, ConditionBand, ConditionSpec, CorpusOptions, LegalMaskedDataset, ScoredSide,
+    TeacherRow,
 };
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
+use algocline_nn::chess::train::{cond_table, row_conditions};
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError};
 use algocline_nn::train::{
-    allowed_logit_mask, restore_into, run_full_ft, CkptControl, CkptHook, CkptInfo,
-    CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss, ScheduleKind, TeacherCardDataset,
-    TrainingLease,
+    allowed_logit_mask, restore_into, run_conditioned_ft, run_full_ft, CkptControl, CkptHook,
+    CkptInfo, CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss, ScheduleKind,
+    TeacherCardDataset, TrainingLease,
 };
 
 /// Read a `usize` from the environment, falling back to `default`.
@@ -156,17 +180,25 @@ fn shuffle<T>(rows: &mut [T], rng: &mut Rng) {
 /// for work decoding does for free. The legal-restricted number is
 /// what both models are ultimately for, so it is the one that makes
 /// the two comparable.
+///
+/// `conds` carries the band of every row when the run conditions at
+/// every position, and is `None` otherwise. It is not optional in the
+/// sense of being a nicety: scoring a per-position model through the
+/// plain forward would run it in a state it never trained in — with the
+/// condition vector absent from every position — and report the result
+/// as a validation loss.
 fn eval_loss(
     model: &Gpt2Model,
-    rows: &[(Vec<u32>, Vec<f32>)],
+    rows: &[TeacherRow],
+    conds: Option<&[CondIndex]>,
     vocab: &MoveVocab,
     ctx: usize,
     batch: usize,
     device: &Device,
 ) -> Result<f32, Box<dyn std::error::Error>> {
     let loss = CrossEntropyLoss::new();
-    let mut ds = LegalMaskedDataset::new(
-        rows.to_vec(),
+    let ds = LegalMaskedDataset::new(
+        TeacherRow::into_pairs(rows.to_vec()),
         vocab.clone(),
         2,
         DatasetOpts {
@@ -177,6 +209,10 @@ fn eval_loss(
             text_field: "text".into(),
         },
     );
+    let mut ds = match conds {
+        Some(conds) => ds.with_conditions(conds.to_vec())?,
+        None => ds,
+    };
     let mut total = 0f64;
     let mut counted = 0usize;
     while let Some(b) = ds.next_batch()? {
@@ -194,7 +230,12 @@ fn eval_loss(
         let inputs = full.narrow(1, 0, width - 1)?.contiguous()?;
         let targets = full.narrow(1, 1, width - 1)?.contiguous()?;
         let m = full_mask.narrow(1, 1, width - 1)?.contiguous()?;
-        let logits = model.forward(&inputs)?;
+        // The same entry point the run trained through, so the model is
+        // scored in the state it was trained in.
+        let logits = match b.conds.as_deref() {
+            Some(conds) => model.forward_conditioned(&inputs, conds)?,
+            None => model.forward(&inputs)?,
+        };
         let logits = match allowed_logit_mask(&b, width, logits.dim(2)?, device)? {
             Some(am) => logits.broadcast_add(&am)?,
             None => logits,
@@ -453,21 +494,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .into())
         }
     };
-    if shape.encoding == CondEncoding::EveryPosition {
-        // The model can do it — `Gpt2Model::forward_conditioned` takes
-        // the band as an argument — but the training loop still drives
-        // the model through `Module::forward`, which has nowhere to put
-        // one. Running anyway would train a prefix-conditioned model
-        // and write `every_position` beside it, which is the one thing
-        // the encoding field exists to prevent: from there on, every
-        // reader would believe the label rather than the weights.
-        return Err(
-            "CHESS_COND_EVERY=1 is recognised but the training loop does not yet pass the \
-             band to the model (verification plan 02, Phase 0-2 / I5). Running now would \
-             label prefix-conditioned weights as per-position"
-                .into(),
-        );
-    }
+    // Whether every row's band is passed to the forward pass. Read once
+    // here so the rest of the run asks this rather than the shape, and
+    // so the two cannot drift apart within one run.
+    let per_position = shape.encoding == CondEncoding::EveryPosition;
     let batch = env_usize("CHESS_BATCH", 32);
     let lr = env_f64("CHESS_LR", 3e-3);
     // More than one pass over the rows is what lets a run continue past
@@ -495,6 +525,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[bake] resuming from {}", p.display());
     }
 
+    // One `ConditionSpec` value for the whole run. Every row's band is
+    // an ordinal into *this* list, and `cond_table` below turns those
+    // ordinals into conditioning-table rows against the same value —
+    // so the two ends cannot be different lists that happen to be the
+    // same length.
+    let spec = ConditionSpec {
+        key: "WhiteElo".to_string(),
+        bands: bands.clone(),
+    };
+
     // The band is selected by the condition rather than by the filter:
     // a game outside every band is rejected when its token is resolved,
     // which is one code path instead of keeping a filter and a band
@@ -506,10 +546,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_ply_bounds(10, None),
         max_rows,
         max_len: Some(shape.ctx),
-        condition: Some(ConditionSpec {
-            key: "WhiteElo".to_string(),
-            bands: bands.clone(),
-        }),
+        condition: Some(spec.clone()),
         scored_side: side,
         ..Default::default()
     };
@@ -530,9 +567,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // walks its rows once in order, so repetition has to be materialised
     // here; re-shuffling per epoch keeps the second pass from replaying
     // the first batch for batch.
-    let base = corpus.into_teacher_rows();
+    let base = corpus.into_teacher_rows()?;
     let mut rng = Rng::new(seed);
-    let mut rows: Vec<(Vec<u32>, Vec<f32>)> = Vec::with_capacity(base.len() * epochs);
+    let mut rows: Vec<TeacherRow> = Vec::with_capacity(base.len() * epochs);
     for _ in 0..epochs {
         let mut pass = base.clone();
         shuffle(&mut pass, &mut rng);
@@ -563,6 +600,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         pad_id: 0,
         text_field: "text".into(),
     };
+
+    // Which conditioning-table row each band occupies, and from that,
+    // which row every corpus row trains under. Both are resolved
+    // through the band's token rather than through its position in a
+    // list or its id in the vocabulary — the three numberings overlap
+    // and none of them is the others (`chess::train`).
+    //
+    // Built here, from `rows` as they now stand, so the shuffle and the
+    // epoch replication above are already accounted for: a row and the
+    // band it trains under cannot be one apart.
+    let table = if per_position {
+        Some(cond_table(&shape, &spec)?)
+    } else {
+        None
+    };
+    let train_conds = match &table {
+        Some(table) => Some(row_conditions(&rows, table)?),
+        None => None,
+    };
+
     // Restricting the loss to the legal moves is opt-in so the two
     // objectives can be compared on the same corpus and the same seed.
     let legal_mask = env::var("CHESS_LEGAL_MASK").as_deref() == Ok("1");
@@ -571,15 +628,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "[bake] loss restricted to legal moves (measured: 1.59 of 4.52 nats \
              otherwise goes on suppressing illegal ones, which decoding gives free)"
         );
-        Box::new(LegalMaskedDataset::new(
-            rows,
+        let ds = LegalMaskedDataset::new(
+            TeacherRow::into_pairs(rows),
             MoveVocab::new(&tokens)?,
             // [BOS, band, moves..] — two tokens before the first move.
             2,
             ds_opts,
-        ))
+        );
+        match train_conds {
+            Some(conds) => Box::new(ds.with_conditions(conds)?),
+            None => Box::new(ds),
+        }
     } else {
-        Box::new(TeacherCardDataset::from_rows(rows, ds_opts)?)
+        let ds = TeacherCardDataset::from_rows(TeacherRow::into_pairs(rows), ds_opts)?;
+        match train_conds {
+            Some(conds) => Box::new(ds.with_conditions(conds)?),
+            None => Box::new(ds),
+        }
     };
 
     // CUDA when the build has it, so the same example serves the pod.
@@ -618,7 +683,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Validation rows, built from a month the training slice cannot
     // contain. Read before training so a bad path fails in seconds
     // rather than after the run.
-    let val_rows: Option<Vec<(Vec<u32>, Vec<f32>)>> = match &val_pgn {
+    let val_rows: Option<Vec<TeacherRow>> = match &val_pgn {
         Some(p) => {
             let val_opts = CorpusOptions {
                 max_rows: val_rows_cap,
@@ -630,7 +695,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "[bake] validation: {} rows from {} games of {p}",
                 c.stats.rows, c.stats.games_read
             );
-            Some(c.into_teacher_rows())
+            Some(c.into_teacher_rows()?)
         }
         None => {
             eprintln!(
@@ -639,6 +704,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             None
         }
+    };
+    // Held-out rows are conditioned the same way the training rows
+    // were, through the same table.
+    let val_conds = match (&table, &val_rows) {
+        (Some(table), Some(val)) => Some(row_conditions(val, table)?),
+        _ => None,
     };
 
     let ft_cfg = FullFtConfig {
@@ -751,19 +822,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    eprintln!("[bake] training {steps} steps at batch {batch}…");
+    eprintln!(
+        "[bake] training {steps} steps at batch {batch}, conditioning by {}…",
+        shape.encoding
+    );
     let t0 = Instant::now();
-    let ckpt = run_full_ft(
-        &model,
-        &vm,
-        dataset.as_mut(),
-        &ft_cfg,
-        &CrossEntropyLoss::new(),
-        &ckpt_dir,
-        &prefix,
-        Arc::new(TrainingLease::new()),
-        Some(on_ckpt),
-    )?;
+    // The two entry points differ in one thing: whether the band
+    // reaches the model. `run_conditioned_ft` takes each batch's own
+    // per-row indices and refuses a batch that carries none, so a run
+    // that lost its conditions somewhere upstream stops rather than
+    // training unconditioned under a checkpoint labelled otherwise.
+    let loss_fn = CrossEntropyLoss::new();
+    let lease = Arc::new(TrainingLease::new());
+    let ckpt = if per_position {
+        run_conditioned_ft(
+            &model,
+            &vm,
+            dataset.as_mut(),
+            &ft_cfg,
+            &loss_fn,
+            &ckpt_dir,
+            &prefix,
+            lease,
+            Some(on_ckpt),
+        )?
+    } else {
+        run_full_ft(
+            &model,
+            &vm,
+            dataset.as_mut(),
+            &ft_cfg,
+            &loss_fn,
+            &ckpt_dir,
+            &prefix,
+            lease,
+            Some(on_ckpt),
+        )?
+    };
     let elapsed = t0.elapsed();
 
     let min_loss = ckpt
@@ -801,7 +896,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "[bake] scoring {} validation rows against each checkpoint…",
             val.len()
         );
-        let final_val = eval_loss(&model, val, &vocab, shape.ctx, batch, &cfg.device)?;
+        let val_conds = val_conds.as_deref();
+        let final_val = eval_loss(
+            &model,
+            val,
+            val_conds,
+            &vocab,
+            shape.ctx,
+            batch,
+            &cfg.device,
+        )?;
         let mut curve: Vec<(usize, f32)> = Vec::new();
         if eval_every > 0 {
             let mut step = eval_every;
@@ -811,7 +915,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let m = Gpt2Model::from_safetensors_file(&cfg, &p)?;
                     curve.push((
                         step,
-                        eval_loss(&m, val, &vocab, shape.ctx, batch, &cfg.device)?,
+                        eval_loss(&m, val, val_conds, &vocab, shape.ctx, batch, &cfg.device)?,
                     ));
                 }
                 step += eval_every;

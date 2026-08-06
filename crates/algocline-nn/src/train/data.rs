@@ -26,6 +26,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use crate::arch::CondIndex;
 use crate::tokenizer::{HfTokenizer, TokenizerError};
 
 /// Errors surfaced by dataset iterators.
@@ -72,6 +73,23 @@ pub enum DatasetError {
         ctx_len: usize,
         /// Untruncated mask length of the offending row.
         row_len: usize,
+    },
+    /// A per-row conditioning list was attached to a dataset holding a
+    /// different number of rows.
+    ///
+    /// Refused rather than zipped to the shorter of the two: the pairing
+    /// is positional, so a length disagreement means some row would be
+    /// conditioned on another row's band, and the batch shapes would
+    /// still line up.
+    #[error(
+        "{conds} condition(s) for {rows} row(s) — the pairing is positional, \
+         so it takes exactly one per row"
+    )]
+    ConditionCountMismatch {
+        /// Conditions handed over.
+        conds: usize,
+        /// Rows the dataset holds.
+        rows: usize,
     },
 }
 
@@ -144,6 +162,37 @@ pub struct Batch {
     /// against the legal set no matter what the model believed.
     #[allow(clippy::type_complexity)]
     pub allowed_ids: Option<Vec<Vec<Vec<u32>>>>,
+    /// Which condition each row of this batch was recorded under, one
+    /// entry per row of `input_ids`.
+    ///
+    /// `None` for every dataset that models no condition, which leaves
+    /// the training loop driving the model through `Module::forward`
+    /// exactly as before. `Some` is what
+    /// [`crate::train::run_conditioned_ft`] hands to
+    /// [`crate::train::ConditionedForward`].
+    ///
+    /// The two entry points refuse the pairing they cannot serve rather
+    /// than ignoring this field: `Some` at [`crate::train::run_full_ft`]
+    /// is [`crate::train::TrainError::UnexpectedConditions`], and `None`
+    /// at `run_conditioned_ft` is `MissingConditions`. A run that
+    /// silently dropped a condition attached per row, or silently
+    /// trained without one, would still write a checkpoint labelled the
+    /// way the caller meant it.
+    ///
+    /// Per row rather than per batch because a batch mixes conditions:
+    /// the corpus is shuffled, so consecutive rows are unrelated games
+    /// and one index for the batch would condition most of them on some
+    /// other row's band.
+    ///
+    /// A [`CondIndex`] rather than the condition's token id. The two
+    /// numberings overlap — band tokens start at vocabulary id 2 while
+    /// the conditioning table's rows start at 0 — so an id passed here
+    /// would select a real but wrong row, and nothing downstream could
+    /// report it. The type keeps that substitution from being
+    /// expressible; producing one goes through whatever holds the
+    /// mapping, which for the chess models is
+    /// [`crate::chess::ModelShape::band_index`].
+    pub conds: Option<Vec<CondIndex>>,
 }
 
 /// Streaming batch iterator.
@@ -205,6 +254,7 @@ impl TokenizedDataset {
             loss_mask: None,
             is_last: end == self.rows.len(),
             allowed_ids: None,
+            conds: None,
         })
     }
 }
@@ -357,6 +407,7 @@ impl Dataset for JsonlDataset {
                 loss_mask: None,
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
+                conds: None,
             }));
         }
 
@@ -377,6 +428,7 @@ impl Dataset for JsonlDataset {
             loss_mask: None,
             is_last: short_batch,
             allowed_ids: None,
+            conds: None,
         }))
     }
 
@@ -597,6 +649,7 @@ impl Dataset for ParquetDataset {
                 loss_mask: None,
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
+                conds: None,
             }));
         }
 
@@ -617,6 +670,7 @@ impl Dataset for ParquetDataset {
             loss_mask: None,
             is_last: short_batch,
             allowed_ids: None,
+            conds: None,
         }))
     }
 
@@ -675,6 +729,9 @@ fn pad_or_truncate_mask(mask: &[f32], ctx: usize) -> Vec<f32> {
 pub struct TeacherCardDataset {
     rows: Vec<Vec<u32>>,
     masks: Vec<Vec<f32>>,
+    /// One condition per row, or `None` for an unconditioned dataset.
+    /// See [`TeacherCardDataset::with_conditions`].
+    conds: Option<Vec<CondIndex>>,
     opts: DatasetOpts,
     cursor: usize,
 }
@@ -735,9 +792,39 @@ impl TeacherCardDataset {
         Ok(Self {
             rows: ids,
             masks,
+            conds: None,
             opts,
             cursor: 0,
         })
+    }
+
+    /// Attach the condition each row was recorded under, in row order.
+    ///
+    /// Every batch then carries the slice of these belonging to its own
+    /// rows, which is what [`crate::train::run_conditioned_ft`] passes
+    /// to the model.
+    ///
+    /// Applied to the built dataset rather than taken by
+    /// [`Self::from_rows`] so the unconditioned constructor keeps its
+    /// signature — most callers have no condition to give. The pairing
+    /// is positional and stays that way: this dataset walks its rows in
+    /// the order it was handed them and never reorders, so a caller
+    /// that shuffles has to shuffle the row and its condition as one
+    /// unit before either reaches here.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::ConditionCountMismatch`] when the list is not
+    /// exactly one entry per row.
+    pub fn with_conditions(mut self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
+        if conds.len() != self.rows.len() {
+            return Err(DatasetError::ConditionCountMismatch {
+                conds: conds.len(),
+                rows: self.rows.len(),
+            });
+        }
+        self.conds = Some(conds);
+        Ok(self)
     }
 
     /// Rows currently held by this dataset.
@@ -769,6 +856,9 @@ impl Dataset for TeacherCardDataset {
             loss_mask: Some(loss_mask),
             is_last: end == self.rows.len(),
             allowed_ids: None,
+            // The same `start..end` the rows were taken with, so a row
+            // and its condition cannot come apart here.
+            conds: self.conds.as_ref().map(|c| c[start..end].to_vec()),
         }))
     }
 

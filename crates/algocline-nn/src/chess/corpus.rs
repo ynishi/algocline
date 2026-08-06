@@ -31,6 +31,7 @@ use std::io::BufRead;
 use cozy_chess::{Board, Move};
 use thiserror::Error;
 
+use crate::arch::CondIndex;
 use crate::chess::filter::GameFilter;
 use crate::chess::pgn::{game_to_uci, uci_standard, PgnError, PgnReader};
 use crate::chess::vocab::{MoveVocab, BOS};
@@ -63,9 +64,22 @@ pub enum Overlong {
 /// The mask is per position: `1.0` where the row holds a move by the
 /// scored side, `0.0` elsewhere. `Loss::compute` averages over the
 /// scored positions only.
+///
+/// [`ScoredSide::Both`] scores every *move* — which is not the same
+/// thing as scoring every position, and the difference is why a mask is
+/// emitted for it too. `BOS` and the condition token are not moves
+/// under any side, and the position before the condition token asks the
+/// model to predict which band it is about to be told it is playing as.
+/// An all-ones mask scores that, over the whole vocabulary; the model
+/// can only fit the band's marginal from a prefix token, unless it is
+/// also being conditioned at every position, in which case it can fit
+/// it exactly — and does so by pulling the conditioning vector towards
+/// the band token's own embedding, which is the coupling the separate
+/// `cond_wte` table exists to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScoredSide {
-    /// Score every move. No mask is emitted.
+    /// Score every move — which is not every position; see the type
+    /// doc.
     #[default]
     Both,
     /// Score White's moves only.
@@ -119,14 +133,20 @@ pub struct ConditionSpec {
 }
 
 impl ConditionSpec {
-    /// Find the token for a game, or `None` when the tag is absent,
-    /// unparsable, or outside every band.
-    fn token_for(&self, game: &crate::chess::pgn::PgnGame) -> Option<&str> {
+    /// Find the band a game falls in, as a position in [`Self::bands`],
+    /// or `None` when the tag is absent, unparsable, or outside every
+    /// band.
+    ///
+    /// The position rather than the token, because both are wanted: the
+    /// token goes into the row, and the position is what a model shape
+    /// turns into a conditioning-table row. Deriving one from the other
+    /// later would mean searching the band list by string for every
+    /// game.
+    fn band_for(&self, game: &crate::chess::pgn::PgnGame) -> Option<usize> {
         let value = game.tag_i64(&self.key)?;
         self.bands
             .iter()
-            .find(|b| value >= b.min && value <= b.max)
-            .map(|b| b.token.as_str())
+            .position(|b| value >= b.min && value <= b.max)
     }
 }
 
@@ -182,11 +202,15 @@ pub struct CorpusStats {
     pub rejected_by_condition: usize,
     /// Dropped because the row exceeded `max_len`.
     pub dropped_overlong: usize,
-    /// Dropped because the scored side had no move left in the row.
+    /// Dropped because the row holds no position the loss can score.
     ///
     /// A row the loss cannot score trains as a zero-gradient no-op
     /// while still advancing the step, so it is rejected here rather
     /// than passed on.
+    ///
+    /// Usually a one-sided [`ScoredSide`] over a row with no move by
+    /// that side; under [`ScoredSide::Both`] it takes a row with no
+    /// moves at all, since the prefix is unscored under every side.
     pub rejected_unscorable: usize,
     /// Kept but cut down to `max_len`.
     pub truncated: usize,
@@ -221,6 +245,51 @@ pub enum CorpusError {
         /// The token with no id.
         token: String,
     },
+    /// The per-row lists a [`Corpus`] holds are not the same length.
+    ///
+    /// The three are positional, so a shorter one means some row would
+    /// be joined to another game's mask or band — or, if the join
+    /// invented a substitute, to one that never existed. Refused rather
+    /// than truncated to the shortest, which would drop rows from the
+    /// end without saying so.
+    #[error(
+        "corpus: {rows} row(s), {masks} mask(s), {bands:?} band(s) — the three lists are \
+         positional, so a row is nothing without its own"
+    )]
+    RaggedCorpus {
+        /// Token rows held.
+        rows: usize,
+        /// Loss masks held.
+        masks: usize,
+        /// Band ordinals held, or `None` for an unconditional corpus.
+        bands: Option<usize>,
+    },
+    /// One row and its mask are not the same length.
+    ///
+    /// The sibling of [`Self::RaggedCorpus`] one level in: the lists
+    /// can hold the right number of entries while an entry is the wrong
+    /// shape, and the mask is positional against its own row, so a
+    /// disagreement scores the wrong positions.
+    ///
+    /// Refused here because only one of the two paths downstream would
+    /// catch it: [`crate::train::TeacherCardDataset::from_rows`] does,
+    /// while [`LegalMaskedDataset`] pads and truncates the ids and the
+    /// mask to the context window independently — a short mask becomes
+    /// unscored positions and a long one loses its tail, both in
+    /// silence, on the `CHESS_LEGAL_MASK=1` path.
+    #[error(
+        "corpus row {index}: {ids} token(s) but {mask} mask position(s) — a mask is \
+         positional against its own row, so one of a different length scores the wrong \
+         positions"
+    )]
+    RaggedRow {
+        /// 0-based row index.
+        index: usize,
+        /// Token ids in the row.
+        ids: usize,
+        /// Mask positions paired with it.
+        mask: usize,
+    },
 }
 
 /// The rows a build produced, and what it did with everything else.
@@ -230,35 +299,116 @@ pub struct Corpus {
     pub rows: Vec<Vec<u32>>,
     /// Per-position loss masks, aligned row for row with [`rows`].
     ///
-    /// `None` when [`ScoredSide::Both`] was asked for, since then every
-    /// position is scored and a mask of all ones carries no
-    /// information.
+    /// Always present, [`ScoredSide::Both`] included. That side scores
+    /// every move, and the prefix positions — `BOS` and the condition
+    /// token — hold no move under any side, so "all ones" was never a
+    /// correct summary of it. See [`ScoredSide`] for what an all-ones
+    /// mask costs a conditioned run.
     ///
     /// [`rows`]: Corpus::rows
-    pub masks: Option<Vec<Vec<f32>>>,
+    pub masks: Vec<Vec<f32>>,
+    /// Which band each row fell in, as a position in
+    /// [`ConditionSpec::bands`], aligned row for row with [`rows`].
+    ///
+    /// `None` for an unconditional corpus.
+    ///
+    /// Recorded here because here is where it is known for certain: the
+    /// band is what the build resolved from the game's own tags in
+    /// order to prefix the row with it. Any later reader has to recover
+    /// it from a position in the row instead, and that position is not
+    /// dependable — a row longer than the context window is cut, and
+    /// the tail slice moves an ordinary move into it.
+    ///
+    /// [`rows`]: Corpus::rows
+    pub bands: Option<Vec<usize>>,
     /// What happened to every game read.
     pub stats: CorpusStats,
 }
 
-impl Corpus {
-    /// Pair rows with their masks for
-    /// [`crate::train::data::TeacherCardDataset::from_rows`].
+/// One row of a corpus, with everything the trainer needs about it.
+///
+/// The three travel as one value because the caller shuffles them and
+/// lays down several epochs, and a row separated from its band or its
+/// mask by a reordering would be trained under another game's, with
+/// every shape still lining up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeacherRow {
+    /// Token ids: `BOS`, the band token if the corpus is conditional,
+    /// then the moves.
+    pub ids: Vec<u32>,
+    /// Per-position loss mask, the same length as [`Self::ids`].
+    pub mask: Vec<f32>,
+    /// Position of this row's band in [`ConditionSpec::bands`], or
+    /// `None` for an unconditional corpus.
     ///
-    /// When no mask was produced, every position is scored, so an
-    /// all-ones mask is synthesised — the dataset takes pairs, and a
-    /// uniformly scored row is exactly what all ones means.
-    pub fn into_teacher_rows(self) -> Vec<(Vec<u32>, Vec<f32>)> {
-        match self.masks {
-            Some(masks) => self.rows.into_iter().zip(masks).collect(),
-            None => self
-                .rows
-                .into_iter()
-                .map(|row| {
-                    let mask = vec![1.0f32; row.len()];
-                    (row, mask)
-                })
-                .collect(),
+    /// An ordinal into the band list, not a token id and not a
+    /// conditioning-table row. A token id would select the wrong table
+    /// row if it were ever handed over as one (band tokens start at
+    /// vocabulary id 2, table rows at 0), and the table row belongs to
+    /// the model's [`crate::chess::ModelShape`], which the corpus does
+    /// not have. [`crate::chess::train::cond_table`] does that
+    /// conversion, in one place.
+    pub band: Option<usize>,
+}
+
+impl Corpus {
+    /// Join the three per-row lists into [`TeacherRow`] values.
+    ///
+    /// # Errors
+    ///
+    /// [`CorpusError::RaggedCorpus`] when the lists are not the same
+    /// length, and [`CorpusError::RaggedRow`] when a row and its mask
+    /// are not. [`build_rows`] cannot produce either state — it appends
+    /// to all three under one condition and truncates a row and its
+    /// mask together — but the fields are public, and the join is where
+    /// the guarantee that a row travels with its own mask and band is
+    /// actually established, [`TeacherRow::mask`]'s own documented
+    /// length included.
+    ///
+    /// Substituting for a missing entry is what would make the failure
+    /// silent: an invented all-ones mask scores the prefix positions
+    /// this module deliberately zeroed, and reads afterwards exactly
+    /// like a mask that was meant.
+    pub fn into_teacher_rows(self) -> Result<Vec<TeacherRow>, CorpusError> {
+        let bands_len = self.bands.as_ref().map(|b| b.len());
+        if self.masks.len() != self.rows.len() || bands_len.is_some_and(|n| n != self.rows.len()) {
+            return Err(CorpusError::RaggedCorpus {
+                rows: self.rows.len(),
+                masks: self.masks.len(),
+                bands: bands_len,
+            });
         }
+        let mut bands = self.bands.unwrap_or_default().into_iter();
+        self.rows
+            .into_iter()
+            .zip(self.masks)
+            .enumerate()
+            .map(|(index, (ids, mask))| {
+                if ids.len() != mask.len() {
+                    return Err(CorpusError::RaggedRow {
+                        index,
+                        ids: ids.len(),
+                        mask: mask.len(),
+                    });
+                }
+                Ok(TeacherRow {
+                    ids,
+                    mask,
+                    band: bands.next(),
+                })
+            })
+            .collect()
+    }
+}
+
+impl TeacherRow {
+    /// The `(ids, mask)` pairs the datasets take, in row order.
+    ///
+    /// The bands are dropped here rather than being forgotten silently:
+    /// [`crate::chess::train::row_conditions`] resolves them first, and
+    /// what it returns is positional against the same order.
+    pub fn into_pairs(rows: Vec<TeacherRow>) -> Vec<(Vec<u32>, Vec<f32>)> {
+        rows.into_iter().map(|r| (r.ids, r.mask)).collect()
     }
 }
 
@@ -270,6 +420,7 @@ pub fn build_rows<R: BufRead>(
 ) -> Result<Corpus, CorpusError> {
     let mut rows: Vec<Vec<u32>> = Vec::new();
     let mut masks: Vec<Vec<f32>> = Vec::new();
+    let mut bands: Vec<usize> = Vec::new();
     let mut stats = CorpusStats::default();
 
     while rows.len() < opts.max_rows {
@@ -286,16 +437,17 @@ pub fn build_rows<R: BufRead>(
         // Resolve the condition before replaying: a game with no band
         // cannot enter a conditional corpus, and finding that out
         // costs one tag lookup instead of a full replay.
-        let condition_id = match &opts.condition {
-            Some(spec) => match spec.token_for(&game) {
-                Some(token) => {
+        let condition = match &opts.condition {
+            Some(spec) => match spec.band_for(&game) {
+                Some(band) => {
+                    let token = spec.bands[band].token.as_str();
                     let id = vocab
                         .id_of(token)
                         .ok_or_else(|| CorpusError::UnknownToken {
                             kind: "condition",
                             token: token.to_string(),
                         })?;
-                    Some(id)
+                    Some((band, id))
                 }
                 None => {
                     stats.rejected_by_condition += 1;
@@ -326,7 +478,7 @@ pub fn build_rows<R: BufRead>(
         let mut mask = Vec::with_capacity(moves.len() + 2);
         row.push(BOS);
         mask.push(0.0f32);
-        if let Some(id) = condition_id {
+        if let Some((_, id)) = condition {
             row.push(id);
             // The condition token is given, not predicted: scoring it
             // would train the model to guess which band it is playing
@@ -362,7 +514,15 @@ pub fn build_rows<R: BufRead>(
         // mask alongside the targets — so a row whose only scored
         // positions are there scores nothing. Such a row would train
         // as a zero-gradient step that still counts as a step.
-        if opts.scored_side != ScoredSide::Both && !mask.iter().skip(1).any(|m| *m != 0.0) {
+        //
+        // Checked for every side, not only the one-sided ones. Under
+        // `Both` the mask used to be discarded, so the check could not
+        // have meant anything; now that it is kept, a row of no moves
+        // at all — reachable when the filter sets no lower ply bound —
+        // is unscorable under `Both` in exactly the same way, and is
+        // rejected here rather than a few stages later where it would
+        // abort the whole run.
+        if !mask.iter().skip(1).any(|m| *m != 0.0) {
             stats.rejected_unscorable += 1;
             continue;
         }
@@ -370,14 +530,22 @@ pub fn build_rows<R: BufRead>(
         stats.tokens += row.len();
         rows.push(row);
         masks.push(mask);
+        // Pushed only here, after every rejection above, so the band
+        // list stays index-for-index with the rows rather than with the
+        // games read.
+        if let Some((band, _)) = condition {
+            bands.push(band);
+        }
     }
 
     stats.rows = rows.len();
-    let masks = match opts.scored_side {
-        ScoredSide::Both => None,
-        _ => Some(masks),
-    };
-    Ok(Corpus { rows, masks, stats })
+    let bands = opts.condition.as_ref().map(|_| bands);
+    Ok(Corpus {
+        rows,
+        masks,
+        bands,
+        stats,
+    })
 }
 
 /// Rows plus, for every position, the moves that were legal there.
@@ -408,6 +576,9 @@ pub struct LegalMaskedDataset {
     vocab: MoveVocab,
     /// Tokens that are not moves and can never be a legal answer.
     prefix_len: usize,
+    /// One condition per row, or `None` for an unconditioned dataset.
+    /// See [`LegalMaskedDataset::with_conditions`].
+    conds: Option<Vec<CondIndex>>,
     opts: DatasetOpts,
     cursor: usize,
 }
@@ -428,9 +599,32 @@ impl LegalMaskedDataset {
             rows,
             vocab,
             prefix_len,
+            conds: None,
             opts,
             cursor: 0,
         }
+    }
+
+    /// Attach the condition each row was recorded under, in row order.
+    ///
+    /// The counterpart of
+    /// [`crate::train::TeacherCardDataset::with_conditions`], with the
+    /// same positional pairing and the same reason for being applied
+    /// after construction rather than taken by the constructor.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::ConditionCountMismatch`] when the list is not
+    /// exactly one entry per row.
+    pub fn with_conditions(mut self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
+        if conds.len() != self.rows.len() {
+            return Err(DatasetError::ConditionCountMismatch {
+                conds: conds.len(),
+                rows: self.rows.len(),
+            });
+        }
+        self.conds = Some(conds);
+        Ok(self)
     }
 
     /// Rows held.
@@ -519,6 +713,9 @@ impl Dataset for LegalMaskedDataset {
             loss_mask: Some(loss_mask),
             is_last: end == self.rows.len(),
             allowed_ids: Some(allowed),
+            // Sliced with the same `start..end` as the rows, so a row
+            // and its condition cannot come apart here.
+            conds: self.conds.as_ref().map(|c| c[start..end].to_vec()),
         }))
     }
 
@@ -567,8 +764,42 @@ mod tests {
         assert_eq!(c.rows[0][1], vocab.id_of("e2e4").unwrap());
         assert_eq!(c.rows[0][2], vocab.id_of("e7e5").unwrap());
         assert_eq!(c.stats.tokens, 3);
-        // Scoring both sides needs no mask.
-        assert!(c.masks.is_none());
+        // `Both` scores every move, and `BOS` is not one.
+        assert_eq!(c.masks[0], vec![0.0, 1.0, 1.0]);
+    }
+
+    /// The prefix is unscored under every side, so the position that
+    /// asks the model to predict the condition token it is about to be
+    /// given never enters the loss.
+    ///
+    /// `Both` used to discard its mask, and the all-ones mask
+    /// synthesised in its place scored exactly that position. It is the
+    /// one place a conditioned model can fit the band token itself,
+    /// which pulls the conditioning vector towards that token's
+    /// embedding — the coupling `cond_wte` was separated from `wte` to
+    /// avoid.
+    #[test]
+    fn the_prefix_is_unscored_under_both_sides_too() {
+        let vocab = vocab_with_bands();
+        let spec = ConditionSpec {
+            key: "WhiteElo".to_string(),
+            bands: vec![ConditionBand {
+                min: 0,
+                max: 1599,
+                token: "<elo:low>".to_string(),
+            }],
+        };
+        let c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions {
+                scored_side: ScoredSide::Both,
+                condition: Some(spec),
+                ..Default::default()
+            },
+        );
+        // [BOS, <elo:low>, e2e4, e7e5]
+        assert_eq!(c.masks[0], vec![0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -585,7 +816,7 @@ mod tests {
             },
         );
         // [BOS, e2e4, e7e5, g1f3, b8c6]
-        assert_eq!(white.masks.unwrap()[0], vec![0.0, 1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(white.masks[0], vec![0.0, 1.0, 0.0, 1.0, 0.0]);
 
         let black = build(
             text,
@@ -595,7 +826,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(black.masks.unwrap()[0], vec![0.0, 0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(black.masks[0], vec![0.0, 0.0, 1.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -618,7 +849,7 @@ mod tests {
             },
         );
         // [BOS, <elo:low>, e2e4, e7e5]
-        assert_eq!(c.masks.unwrap()[0], vec![0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(c.masks[0], vec![0.0, 0.0, 1.0, 0.0]);
     }
 
     #[test]
@@ -650,18 +881,127 @@ mod tests {
                 ..Default::default()
             },
         );
-        let paired = c.into_teacher_rows();
+        let paired = c.into_teacher_rows().expect("the lists agree");
         assert_eq!(paired.len(), 1);
-        assert_eq!(paired[0].0.len(), paired[0].1.len());
+        assert_eq!(paired[0].ids.len(), paired[0].mask.len());
+        // An unconditional corpus has no band to carry.
+        assert_eq!(paired[0].band, None);
 
-        // Without a mask every position is scored, so all ones.
+        // `Both` scores every move and neither prefix token.
         let c = build(
             pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
             &vocab,
             &CorpusOptions::default(),
         );
-        let paired = c.into_teacher_rows();
-        assert_eq!(paired[0].1, vec![1.0, 1.0, 1.0]);
+        let paired = c.into_teacher_rows().expect("the lists agree");
+        assert_eq!(paired[0].mask, vec![0.0, 1.0, 1.0]);
+    }
+
+    /// The join is where a row is tied to its own mask and band, so a
+    /// disagreement between the three lists is refused there rather
+    /// than papered over with a substitute.
+    ///
+    /// `build_rows` cannot produce this state; the fields are public,
+    /// so the join cannot assume it did.
+    #[test]
+    fn a_corpus_whose_lists_disagree_is_refused() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let mut c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        c.masks.clear();
+        let err = c.into_teacher_rows().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CorpusError::RaggedCorpus {
+                    rows: 1,
+                    masks: 0,
+                    bands: None
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// And the same one level in: the lists can hold the right number
+    /// of entries while a mask is the wrong length for its own row.
+    ///
+    /// Only one of the two dataset paths would have caught this.
+    /// `LegalMaskedDataset` pads and truncates the ids and the mask to
+    /// the context window independently, so a short mask turns into
+    /// unscored positions without a word.
+    #[test]
+    fn a_row_whose_mask_is_the_wrong_length_is_refused() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let mut c = build(
+            pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
+            &vocab,
+            &CorpusOptions::default(),
+        );
+        c.masks[0].pop();
+        let err = c.into_teacher_rows().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CorpusError::RaggedRow {
+                    index: 0,
+                    ids: 3,
+                    mask: 2
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The band a row was built under travels with the row, so nothing
+    /// downstream has to read it back out of a position the context
+    /// window can move.
+    #[test]
+    fn a_conditional_corpus_records_which_band_each_row_fell_in() {
+        let vocab = vocab_with_bands();
+        let spec = ConditionSpec {
+            key: "WhiteElo".to_string(),
+            bands: vec![
+                ConditionBand {
+                    min: 0,
+                    max: 1599,
+                    token: "<elo:low>".to_string(),
+                },
+                ConditionBand {
+                    min: 1600,
+                    max: 4000,
+                    token: "<elo:high>".to_string(),
+                },
+            ],
+        };
+        let c = build(
+            pgn(&[
+                ("1800", "Normal", "1. e4 e5 1-0"),
+                ("1500", "Normal", "1. d4 d5 1-0"),
+                // Rejected by the replay, so it must not shift the
+                // bands of the rows that follow it.
+                ("1500", "Normal", "1. Qh6 1-0"),
+                ("1800", "Normal", "1. c4 c5 1-0"),
+            ]),
+            &vocab,
+            &CorpusOptions {
+                condition: Some(spec),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.stats.replay_failures, 1);
+        assert_eq!(c.bands.as_deref(), Some([1usize, 0, 1].as_slice()));
+
+        // And the ordinal names the band whose token the row carries.
+        let rows = c.into_teacher_rows().expect("the lists agree");
+        let tokens = ["<elo:low>", "<elo:high>"];
+        for row in &rows {
+            let band = row.band.expect("a conditional corpus bands every row");
+            assert_eq!(row.ids[1], vocab.id_of(tokens[band]).unwrap());
+        }
     }
 
     #[test]
@@ -819,8 +1159,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let masks = c.masks.unwrap();
-        assert_eq!(c.rows[0].len(), masks[0].len());
+        assert_eq!(c.rows[0].len(), c.masks[0].len());
     }
 
     #[test]
@@ -851,9 +1190,10 @@ mod tests {
             &vocab,
             &CorpusOptions::default(),
         );
-        let rows = c.into_teacher_rows();
+        let rows = c.into_teacher_rows().expect("the lists agree");
+        let first = rows[0].ids.clone();
         let ds = LegalMaskedDataset::new(
-            rows.clone(),
+            TeacherRow::into_pairs(rows),
             MoveVocab::new(&[]).unwrap(),
             1, // [BOS, moves..]
             DatasetOpts {
@@ -863,7 +1203,7 @@ mod tests {
             },
         );
         let sets = ds.legal_sets(&{
-            let mut r = rows[0].0.clone();
+            let mut r = first;
             r.resize(8, 0);
             r
         });
@@ -891,7 +1231,7 @@ mod tests {
             &CorpusOptions::default(),
         );
         let mut ds = LegalMaskedDataset::new(
-            c.into_teacher_rows(),
+            TeacherRow::into_pairs(c.into_teacher_rows().expect("the lists agree")),
             MoveVocab::new(&[]).unwrap(),
             1,
             DatasetOpts {

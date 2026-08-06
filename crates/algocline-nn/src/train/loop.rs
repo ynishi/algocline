@@ -24,14 +24,14 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{LoraConfig, LoraWrappable};
+use crate::arch::{CondIndex, LoraConfig, LoraWrappable};
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
 use crate::train::mixed::MixedAdamW;
 use crate::train::scheduler::{ScheduleKind, Scheduler};
 use crate::train::Checkpoint;
-use crate::train::DeviceView;
+use crate::train::{ConditionedForward, DeviceView};
 
 /// Optimizer flavour selected by the parameter dtype (design §7.1).
 ///
@@ -248,6 +248,50 @@ pub enum TrainError {
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
+    /// A conditioned run met a batch carrying no conditions.
+    ///
+    /// Refused rather than fallen back to the plain forward. The
+    /// fallback would train an unconditioned model under a run that
+    /// labels its checkpoint as conditioned, and from there every
+    /// reader believes the label rather than the weights — the whole
+    /// reason [`crate::chess::ModelShape::encoding`] exists.
+    #[error(
+        "conditioned training: a batch of {rows} row(s) arrived with no conditions attached; \
+         the dataset has to carry one per row (`with_conditions`)"
+    )]
+    MissingConditions {
+        /// Rows in the offending batch.
+        rows: usize,
+    },
+    /// An unconditioned run met a batch that carries conditions.
+    ///
+    /// The mirror of [`Self::MissingConditions`], and refused for the
+    /// same reason rather than by ignoring them. `Module::forward`
+    /// takes the ids alone, so a conditioned dataset handed to
+    /// [`run_full_ft`] trains a model that never sees the condition —
+    /// while the caller, having gone to the trouble of attaching one
+    /// per row, has every reason to believe otherwise. Both datasets
+    /// that can carry conditions are public and implement `Dataset`,
+    /// so this pairing is expressible and therefore has to be an
+    /// error; [`run_conditioned_ft`] is the entry point that consumes
+    /// them.
+    #[error(
+        "unconditioned training: a batch of {rows} row(s) arrived carrying {conds} \
+         condition(s), which `Module::forward` has nowhere to put; use `run_conditioned_ft` \
+         for a dataset built with `with_conditions`"
+    )]
+    UnexpectedConditions {
+        /// Rows in the offending batch. The same quantity
+        /// [`Self::MissingConditions`] reports, read off the same
+        /// tensor, so the two mirrors are comparable.
+        rows: usize,
+        /// Conditions the batch carried. Equal to `rows` for every
+        /// dataset in this crate — both `with_conditions` constructors
+        /// enforce one per row — but a hand-written `Dataset` is under
+        /// no such obligation, and then the two numbers are the whole
+        /// diagnosis.
+        conds: usize,
+    },
     /// An `on_ckpt` hook returned an error. The trainer writes the
     /// terminal `<prefix>.safetensors` before propagating so callers
     /// still have last-good weights on disk, but the returned
@@ -369,8 +413,17 @@ where
     // step/save loop with `run_lora_ft` via `run_ft_core`; the only
     // difference is which VarMap the optimizer holds and which VarMap
     // the checkpoint store saves.
+    //
+    // `ForwardPass::Plain` is also what tells the loop that a batch
+    // carrying conditions is a mistake rather than something to ignore.
+    // `Module::forward` takes the ids alone, so this entry cannot
+    // consume one — but the datasets that produce them are public, so a
+    // conditioned dataset can arrive here, and silently dropping the
+    // conditions is the same failure `run_conditioned_ft` refuses from
+    // the other side.
     run_ft_core(
-        model,
+        model.device(),
+        ForwardPass::Plain(&mut |xs| model.forward(xs).map_err(TrainError::from)),
         varmap,
         varmap,
         dataset,
@@ -383,8 +436,115 @@ where
     )
 }
 
+/// Run Full FT training with a condition supplied per row of every
+/// batch.
+///
+/// The same loop as [`run_full_ft`] — same optimizer, schedule,
+/// checkpoint rotation and hook — differing only in how a batch reaches
+/// the model: through
+/// [`ConditionedForward::forward_conditioned_rows`] with the batch's
+/// own [`Batch::conds`], rather than through `Module::forward`.
+///
+/// # Why a second entry point rather than a flag
+///
+/// The two paths need different things of the model. `run_full_ft`'s
+/// bound is `Module + DeviceView`, which every architecture here
+/// satisfies; conditioning needs a table most of them do not have.
+/// Widening the single entry point would have made every model answer
+/// for a concept it does not carry, and the answer would have been a
+/// runtime error raised after the corpus was read. Two entries put the
+/// same refusal in the type checker.
+///
+/// # Errors
+///
+/// As [`run_full_ft`], plus [`TrainError::MissingConditions`] when a
+/// batch arrives without them — refused rather than falling back to the
+/// plain forward, because a run that quietly trained unconditioned
+/// would still write a checkpoint labelled as conditioned. The mirror
+/// refusal, [`TrainError::UnexpectedConditions`], guards the other
+/// entry point.
+#[allow(clippy::too_many_arguments)]
+pub fn run_conditioned_ft<M>(
+    model: &M,
+    varmap: &VarMap,
+    dataset: &mut dyn Dataset,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    ckpt_dir: &Path,
+    ckpt_prefix: &str,
+    lease: Arc<TrainingLease>,
+    hook: Option<CkptHook>,
+) -> Result<Checkpoint, TrainError>
+where
+    M: ConditionedForward + DeviceView,
+{
+    run_ft_core(
+        model.device(),
+        ForwardPass::PerRow(&mut |xs, conds| {
+            model
+                .forward_conditioned_rows(xs, conds)
+                .map_err(TrainError::from)
+        }),
+        varmap,
+        varmap,
+        dataset,
+        cfg,
+        loss_fn,
+        ckpt_dir,
+        ckpt_prefix,
+        lease,
+        hook,
+    )
+}
+
+/// How one micro-batch reaches the model, and what the caller expects
+/// of the batch.
+///
+/// The loop holds this rather than the model itself, so the two entry
+/// points can require different things of it — `Module` on one side,
+/// [`ConditionedForward`] on the other — without either bound leaking
+/// into the shared loop or into the other entry's callers.
+///
+/// It is an enum rather than one callback taking `Option`, because the
+/// variant is also the caller's **declared intent**, and that is what
+/// lets the loop refuse both mismatches rather than only the one the
+/// model happens to notice. A callback that quietly ignored an
+/// unexpected condition would put the loop back where
+/// [`TrainError::UnexpectedConditions`] came from, and each closure
+/// here is total in its own case: neither has an arm for a batch it was
+/// not built for.
+enum ForwardPass<'a> {
+    /// `Module::forward` — the ids alone. A batch carrying conditions
+    /// is [`TrainError::UnexpectedConditions`].
+    Plain(&'a mut PlainForward<'a>),
+    /// [`ConditionedForward::forward_conditioned_rows`] — one index per
+    /// row. A batch carrying none is
+    /// [`TrainError::MissingConditions`].
+    PerRow(&'a mut PerRowForward<'a>),
+}
+
+/// The ids of one micro-batch to its logits.
+///
+/// The lifetime is the closure's own: it borrows the model, so it does
+/// not outlive the call that built it. Naming it is what keeps the
+/// alias from defaulting the trait object to `'static`, which no entry
+/// point here could satisfy.
+type PlainForward<'a> = dyn FnMut(&Tensor) -> Result<Tensor, TrainError> + 'a;
+
+/// The same, with the condition each row of the batch carries.
+type PerRowForward<'a> = dyn FnMut(&Tensor, &[CondIndex]) -> Result<Tensor, TrainError> + 'a;
+
 /// Shared inner training loop.
 ///
+/// - `device` — where the batch tensors are built. The model's own, so
+///   the caller reads it off the model rather than being trusted to
+///   pick one.
+/// - `forward` — how a micro-batch reaches the model, and what the
+///   caller expects of it. See [`ForwardPass`]: the loop is written
+///   against the callback so the entry points can differ in what they
+///   demand of the model without this function knowing about either,
+///   and it checks each batch against the variant rather than letting
+///   a disagreement pass as a silent ignore.
 /// - `opt_vm` — VarMap whose variables get optimizer updates. In a
 ///   Full FT run this is the same map as the model was constructed
 ///   against; in a LoRA run it is the fresh LoRA-only map returned by
@@ -395,8 +555,9 @@ where
 ///   parameter so a future full-vs-delta save-side split can flip
 ///   independently.
 #[allow(clippy::too_many_arguments)]
-fn run_ft_core<M>(
-    model: &M,
+fn run_ft_core(
+    device: &Device,
+    mut forward: ForwardPass<'_>,
     opt_vm: &VarMap,
     save_vm: &VarMap,
     dataset: &mut dyn Dataset,
@@ -406,10 +567,7 @@ fn run_ft_core<M>(
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
     mut hook: Option<CkptHook>,
-) -> Result<Checkpoint, TrainError>
-where
-    M: Module + DeviceView,
-{
+) -> Result<Checkpoint, TrainError> {
     if cfg.steps == 0 {
         return Err(TrainError::ZeroSteps);
     }
@@ -453,7 +611,7 @@ where
     let ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
 
-    let device = model.device().clone();
+    let device = device.clone();
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
 
@@ -482,7 +640,29 @@ where
             })?;
 
             let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
-            let logits = model.forward(&inputs)?;
+            // The batch's own conditions against the caller's declared
+            // intent. Both disagreements are refused: a conditioned run
+            // over a conditionless batch would train unconditioned
+            // under a checkpoint labelled otherwise, and an
+            // unconditioned run over a conditioned batch would drop a
+            // condition the caller attached per row. `inputs` is the
+            // batch after the target shift, so its first dimension is
+            // still the row count.
+            let logits = match (&mut forward, batch.conds.as_deref()) {
+                (ForwardPass::Plain(plain), None) => plain(&inputs)?,
+                (ForwardPass::PerRow(per_row), Some(conds)) => per_row(&inputs, conds)?,
+                (ForwardPass::Plain(_), Some(conds)) => {
+                    return Err(TrainError::UnexpectedConditions {
+                        rows: inputs.dim(0)?,
+                        conds: conds.len(),
+                    })
+                }
+                (ForwardPass::PerRow(_), None) => {
+                    return Err(TrainError::MissingConditions {
+                        rows: inputs.dim(0)?,
+                    })
+                }
+            };
             // Mixed precision: the loss (log_softmax + NLL reduction)
             // is always scored in F32 — BF16's 8 mantissa bits are too
             // coarse for a mean over thousands of log-probs.
@@ -716,8 +896,14 @@ where
     // (add ~14.5 MB from the 4× MLP widening). The previous
     // "< 20 MB" figure only held for the attention-only variant and
     // has been corrected to reflect both cases.
+    //
+    // `base` is reborrowed immutably for the rest of the run: the LoRA
+    // wrap above is the only mutation it needs, and the forward
+    // callback holds the model from here on.
+    let base: &M = base;
     run_ft_core(
-        base,
+        base.device(),
+        ForwardPass::Plain(&mut |xs| base.forward(xs).map_err(TrainError::from)),
         &lora_vm,
         &lora_vm,
         dataset,
@@ -986,6 +1172,7 @@ mod allowed_logit_mask_tests {
             loss_mask: None,
             is_last: true,
             allowed_ids: allowed,
+            conds: None,
         }
     }
 
@@ -1752,5 +1939,549 @@ mod tests {
             2 * 7 * 2,
             "TinyLlama wrap_lora via LoraWrappable must register 2 layers × 7 targets × 2 = 28 vars"
         );
+    }
+}
+
+/// The conditioned entry point, and the one invariant behind it that
+/// nothing else holds: the condition a row trains under is its own.
+///
+/// Everything else about the mechanism is pinned elsewhere — the table
+/// row a band resolves to by
+/// `chess::ModelShape::every_band_maps_to_its_own_table_row`, the
+/// forward pass's arithmetic by `arch::gpt2`'s conditioning tests. What
+/// lives only here is the path from a dataset's rows to the model's
+/// argument, which is positional the whole way and therefore silent
+/// when it slips.
+#[cfg(test)]
+mod conditioned_tests {
+    use super::*;
+    use crate::arch::gpt2::Gpt2Config;
+    use crate::arch::{CondIndex, Gpt2Custom, Gpt2Model};
+    use crate::train::data::{DatasetOpts, TeacherCardDataset};
+    use crate::train::loss::CrossEntropyLoss;
+    use candle_core::IndexOp;
+    use candle_nn::VarBuilder;
+    use std::cell::RefCell;
+    use tempfile::TempDir;
+
+    const CTX: usize = 6;
+    const VOCAB: usize = 32;
+    const BANDS: usize = 2;
+
+    /// One row as [`TeacherCardDataset::from_rows`] takes it: token ids
+    /// beside their per-position loss mask.
+    type TeacherRowPair = (Vec<u32>, Vec<f32>);
+
+    /// A tiny model carrying a conditioning table of `BANDS` rows.
+    fn conditioned_model() -> (VarMap, Gpt2Model) {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: CTX,
+            vocab: VOCAB,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(Gpt2Custom {
+                cond_slots: Some(BANDS),
+                ..Default::default()
+            }),
+        };
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vb).unwrap();
+        (vm, model)
+    }
+
+    /// Rows shaped the way a conditioned chess corpus builds them —
+    /// `[BOS, band token, moves…]`, the first two positions unscored —
+    /// paired with the table rows their bands resolve to.
+    ///
+    /// The band token's id is `2 + band`, which is what makes this
+    /// fixture worth its length: the ids and the table rows are both
+    /// small integers over overlapping ranges, so a plumbing that
+    /// handed one over as the other would still run.
+    fn banded_rows(bands: &[usize]) -> (Vec<TeacherRowPair>, Vec<CondIndex>) {
+        let mut rows = Vec::with_capacity(bands.len());
+        let mut conds = Vec::with_capacity(bands.len());
+        for band in bands {
+            let token = 2 + *band as u32;
+            // Each band plays its own move, so there is something for
+            // the condition to be informative about.
+            let mv = band_move(*band);
+            rows.push((
+                vec![1, token, mv, mv, mv, mv],
+                vec![0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            ));
+            conds.push(CondIndex::from_table_row(*band as u32));
+        }
+        (rows, conds)
+    }
+
+    /// The token every row of [`hidden_band_rows`] carries where a
+    /// chess row would carry its band. One value for both bands, so it
+    /// tells the model nothing.
+    const HIDDEN: u32 = 2;
+
+    /// Rows whose prefix is identical across bands, so the **argument
+    /// is the only band signal in the run**.
+    ///
+    /// [`banded_rows`] keeps the band token in position 1, the way a
+    /// chess corpus does — which means a model can tell the bands apart
+    /// there whether or not the conditioning channel does anything at
+    /// all. These rows remove that second route: both bands share the
+    /// prompt `[BOS, HIDDEN]` and differ only in their continuation, so
+    /// nothing but `cond_wte` can separate them.
+    fn hidden_band_rows(bands: &[usize]) -> (Vec<TeacherRowPair>, Vec<CondIndex>) {
+        let mut rows = Vec::with_capacity(bands.len());
+        let mut conds = Vec::with_capacity(bands.len());
+        for band in bands {
+            let mv = band_move(*band);
+            rows.push((
+                vec![1, HIDDEN, mv, mv, mv, mv],
+                vec![0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            ));
+            conds.push(CondIndex::from_table_row(*band as u32));
+        }
+        (rows, conds)
+    }
+
+    /// The move a band plays. Distinct per band and nothing else about
+    /// the row is, which is what makes the argmax assertions below a
+    /// statement about the condition.
+    fn band_move(band: usize) -> u32 {
+        if band == 0 {
+            10
+        } else {
+            20
+        }
+    }
+
+    fn opts_for(batch_size: usize) -> DatasetOpts {
+        DatasetOpts {
+            batch_size,
+            ctx_len: CTX,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        }
+    }
+
+    fn dataset(bands: &[usize], batch_size: usize) -> TeacherCardDataset {
+        let (rows, conds) = banded_rows(bands);
+        TeacherCardDataset::from_rows(rows, opts_for(batch_size))
+            .expect("rows are well formed")
+            .with_conditions(conds)
+            .expect("one condition per row")
+    }
+
+    /// One id's logit out of a `[vocab]` row.
+    fn logit_of(row: &Tensor, id: u32) -> f32 {
+        row.i(id as usize)
+            .expect("id within the vocabulary")
+            .to_scalar()
+            .expect("a scalar logit")
+    }
+
+    /// Every value of the conditioning table, flattened.
+    fn cond_wte_values(vm: &VarMap) -> Vec<f32> {
+        let data = vm.data().lock().expect("varmap lock");
+        let var = data
+            .get("cond_wte.weight")
+            .expect("a conditioned model registers cond_wte.weight");
+        var.as_tensor()
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("to_vec1")
+    }
+
+    fn cfg_for(steps: usize, batch_size: usize, lr: f64) -> FullFtConfig {
+        FullFtConfig {
+            lr,
+            batch_size,
+            grad_accum: 1,
+            steps,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 0,
+            ckpt_keep: 1,
+        }
+    }
+
+    /// Records the conditions it is handed, then answers with the real
+    /// model's logits so gradients still flow and the run is a run.
+    struct Recorder<'a> {
+        inner: &'a Gpt2Model,
+        seen: RefCell<Vec<Vec<u32>>>,
+    }
+
+    impl DeviceView for Recorder<'_> {
+        fn device(&self) -> &Device {
+            DeviceView::device(self.inner)
+        }
+    }
+
+    impl ConditionedForward for Recorder<'_> {
+        fn forward_conditioned_rows(
+            &self,
+            xs: &Tensor,
+            conds: &[CondIndex],
+        ) -> CandleResult<Tensor> {
+            self.seen
+                .borrow_mut()
+                .push(conds.iter().map(|c| c.row()).collect());
+            self.inner.forward_conditioned(xs, conds)
+        }
+    }
+
+    /// Answers the plain forward and refuses the conditioned one, so a
+    /// run that reached the conditioning path could not finish quietly.
+    struct PlainOnly<'a> {
+        inner: &'a Gpt2Model,
+    }
+
+    impl Module for PlainOnly<'_> {
+        fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+            self.inner.forward(xs)
+        }
+    }
+
+    impl DeviceView for PlainOnly<'_> {
+        fn device(&self) -> &Device {
+            DeviceView::device(self.inner)
+        }
+    }
+
+    impl ConditionedForward for PlainOnly<'_> {
+        fn forward_conditioned_rows(
+            &self,
+            _xs: &Tensor,
+            _conds: &[CondIndex],
+        ) -> CandleResult<Tensor> {
+            Err(candle_core::Error::Msg(
+                "the unconditioned entry point reached the conditioning path".into(),
+            ))
+        }
+    }
+
+    /// The invariant with nothing else behind it: each row is
+    /// conditioned on the band it was recorded under.
+    ///
+    /// The pattern is deliberately asymmetric across two batches, so
+    /// three separate ways of being wrong are all visible — one index
+    /// for the whole batch (`[1, 1]` then `[0, 0]`), an off-by-one
+    /// through the row list (`[0, 0]` then `[1, ?]`), and the band's
+    /// token id in place of its table row (`[3, 2]` then `[2, 3]`).
+    #[test]
+    fn every_row_is_conditioned_on_its_own_band() {
+        let (vm, model) = conditioned_model();
+        let recorder = Recorder {
+            inner: &model,
+            seen: RefCell::new(Vec::new()),
+        };
+        let mut ds = dataset(&[1, 0, 0, 1], 2);
+        let tmp = TempDir::new().unwrap();
+
+        run_conditioned_ft(
+            &recorder,
+            &vm,
+            &mut ds,
+            &cfg_for(2, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "own_band",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("a conditioned run over conditioned rows must complete");
+
+        assert_eq!(
+            recorder.seen.into_inner(),
+            vec![vec![1, 0], vec![0, 1]],
+            "each row must arrive under its own band, in row order"
+        );
+    }
+
+    /// And the same rows train: the loss moves under the conditioned
+    /// entry point, so the path is not merely well-plumbed but live.
+    #[test]
+    fn a_conditioned_run_reduces_loss() {
+        let (vm, model) = conditioned_model();
+        let pattern: Vec<usize> = std::iter::repeat_n([0usize, 1, 1, 0], 60)
+            .flatten()
+            .collect();
+        let mut ds = dataset(&pattern, 4);
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+
+        // The loss the untrained model starts at, scored through the
+        // same entry point the run uses **and under the same mask** —
+        // the fixture's prefix positions are unscored during training,
+        // so a baseline taken over every position would be a different
+        // statistic and the threshold below would not mean what it
+        // says.
+        let (rows, conds) = banded_rows(&[0, 1]);
+        let ids: Vec<u32> = rows.iter().flat_map(|(r, _)| r.clone()).collect();
+        let masks: Vec<f32> = rows.iter().flat_map(|(_, m)| m.clone()).collect();
+        let full = Tensor::from_vec(ids, (2, CTX), &Device::Cpu).unwrap();
+        let full_mask = Tensor::from_vec(masks, (2, CTX), &Device::Cpu).unwrap();
+        let inputs = full.narrow(1, 0, CTX - 1).unwrap().contiguous().unwrap();
+        let targets = full.narrow(1, 1, CTX - 1).unwrap().contiguous().unwrap();
+        // The same shift `batch_to_input_target` applies to the mask.
+        let weights = full_mask
+            .narrow(1, 1, CTX - 1)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let baseline = loss
+            .compute(
+                &model.forward_conditioned(&inputs, &conds).unwrap(),
+                &targets,
+                Some(&weights),
+            )
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        let ckpt = run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(50, 4, 8e-3),
+            &loss,
+            tmp.path(),
+            "cond_train",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("training must complete");
+
+        let min_loss = *ckpt.metrics.get("min_train_loss").expect("min_train_loss");
+        assert!(
+            min_loss < baseline * 0.7,
+            "expected min_train_loss ({min_loss}) < 0.7 * baseline ({baseline})"
+        );
+        assert!(ckpt.train_loss.is_finite(), "got {}", ckpt.train_loss);
+        assert!(tmp.path().join("cond_train.safetensors").exists());
+    }
+
+    /// A conditioned run over a dataset that carries no conditions is
+    /// refused rather than falling through to the plain forward. The
+    /// fallback would train an unconditioned model under a run that
+    /// labels its checkpoint as conditioned.
+    #[test]
+    fn a_conditioned_run_refuses_a_batch_without_conditions() {
+        let (vm, model) = conditioned_model();
+        let (rows, _) = banded_rows(&[0, 1]);
+        let mut ds =
+            TeacherCardDataset::from_rows(rows, opts_for(2)).expect("rows are well formed");
+        let tmp = TempDir::new().unwrap();
+
+        let err = run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(1, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "no_conds",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::MissingConditions { rows: 2 }),
+            "{err:?}"
+        );
+    }
+
+    /// The condition is a live channel, not merely a plumbed one.
+    ///
+    /// Every other test here would pass with `cond_wte` inert, because
+    /// their rows carry the band token at position 1 and a model can
+    /// read it there. These rows do not: both bands share the prompt
+    /// `[BOS, HIDDEN]`, so the argument is the only thing that
+    /// separates them, and the model can only fit the two continuations
+    /// by putting the difference through the conditioning table.
+    ///
+    /// This is the property H14 and H15 rest on. Without it the
+    /// experiment could report a per-position arm that never used its
+    /// per-position channel.
+    #[test]
+    fn the_condition_is_the_only_band_signal_when_the_row_hides_it() {
+        let (vm, model) = conditioned_model();
+        let before = cond_wte_values(&vm);
+
+        let pattern: Vec<usize> = std::iter::repeat_n([0usize, 1, 1, 0], 250)
+            .flatten()
+            .collect();
+        let (rows, conds) = hidden_band_rows(&pattern);
+        let mut ds = TeacherCardDataset::from_rows(rows, opts_for(4))
+            .expect("rows are well formed")
+            .with_conditions(conds)
+            .expect("one condition per row");
+        let tmp = TempDir::new().unwrap();
+
+        run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(200, 4, 8e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "hidden_band",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("training must complete");
+
+        // The table took gradient. A channel that never moved could not
+        // have carried anything.
+        let after = cond_wte_values(&vm);
+        assert_ne!(
+            before, after,
+            "cond_wte never moved, so the conditioning channel took no gradient"
+        );
+
+        // And what it carries is the band: the same prompt continues
+        // differently under each condition.
+        //
+        // The comparison is between the two bands' own moves rather
+        // than against the whole vocabulary. Both say the channel
+        // separates the bands; only the second also depends on what the
+        // other 30 ids happened to do under an initialisation this
+        // crate cannot seed (`CHESS_SEED` reaches the shuffle, and
+        // candle exposes no `Device::set_seed` here), which would put
+        // the strictest assertion in the suite on its least controlled
+        // axis.
+        let prompt = Tensor::from_vec(vec![1u32, HIDDEN], (1, 2), &Device::Cpu).unwrap();
+        for band in [0usize, 1] {
+            let logits = model
+                .forward_conditioned(&prompt, &[CondIndex::from_table_row(band as u32)])
+                .unwrap();
+            let next = logits.i((0, 1)).unwrap();
+            let own = logit_of(&next, band_move(band));
+            let other = logit_of(&next, band_move(1 - band));
+            assert!(
+                own > other,
+                "under band {band} the shared prompt scores its own move {} at {own} and the \
+                 other band's {} at {other}",
+                band_move(band),
+                band_move(1 - band)
+            );
+        }
+    }
+
+    /// The unconditioned entry point is untouched by all of this: it
+    /// drives `Module::forward` and never the conditioning path, which
+    /// is asserted by giving it a model whose conditioning path is an
+    /// error.
+    #[test]
+    fn an_unconditioned_run_never_reaches_the_conditioning_path() {
+        let (vm, model) = conditioned_model();
+        let plain = PlainOnly { inner: &model };
+        let mut ds = overfit_dataset();
+        let tmp = TempDir::new().unwrap();
+
+        run_full_ft(
+            &plain,
+            &vm,
+            &mut ds,
+            &cfg_for(5, 1, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "plain_only",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("the unconditioned entry must not touch the conditioning path");
+    }
+
+    /// And it refuses a batch that carries conditions rather than
+    /// dropping them.
+    ///
+    /// The datasets that produce conditions are public and implement
+    /// `Dataset`, so this pairing is expressible — and ignoring it
+    /// would be the same silence `run_conditioned_ft` refuses from the
+    /// other side: a caller that attached a condition to every row,
+    /// training a model that never sees one.
+    #[test]
+    fn an_unconditioned_run_refuses_a_batch_that_carries_conditions() {
+        let (vm, model) = conditioned_model();
+        let mut ds = dataset(&[0, 1, 1, 0], 2);
+        let tmp = TempDir::new().unwrap();
+
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(1, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "unexpected_conds",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::UnexpectedConditions { rows: 2, conds: 2 }),
+            "{err:?}"
+        );
+    }
+
+    /// The same dataset, batched two ways, hands over the same
+    /// conditions in the same row order — the slice a batch carries is
+    /// taken with the same bounds as its rows.
+    #[test]
+    fn the_conditions_a_batch_carries_are_its_own_rows() {
+        for batch_size in [1usize, 2, 3] {
+            let mut ds = dataset(&[1, 0, 1], batch_size);
+            let mut seen: Vec<u32> = Vec::new();
+            while let Some(batch) = ds.next_batch().expect("batch") {
+                let conds = batch
+                    .conds
+                    .expect("a conditioned dataset conditions every batch");
+                assert_eq!(
+                    conds.len(),
+                    batch.input_ids.len(),
+                    "one condition per row of the batch"
+                );
+                seen.extend(conds.iter().map(|c| c.row()));
+            }
+            assert_eq!(seen, vec![1, 0, 1], "batch size {batch_size}");
+        }
+    }
+
+    /// A condition list that is not one per row is refused at
+    /// attachment, where the caller can still see which two lengths
+    /// disagreed.
+    #[test]
+    fn a_condition_list_of_the_wrong_length_is_refused() {
+        let (rows, mut conds) = banded_rows(&[0, 1, 0]);
+        conds.pop();
+        let err = TeacherCardDataset::from_rows(rows, opts_for(1))
+            .expect("rows are well formed")
+            .with_conditions(conds)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DatasetError::ConditionCountMismatch { conds: 2, rows: 3 }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The overfit corpus the unconditioned tests use, borrowed so this
+    /// module's unconditioned case trains on the same thing they do.
+    fn overfit_dataset() -> crate::train::data::TokenizedDataset {
+        crate::train::data::TokenizedDataset::new(
+            std::iter::repeat_n(vec![1u32, 2, 3, 4, 5, 6], 400).collect(),
+            opts_for(1),
+        )
     }
 }

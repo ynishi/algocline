@@ -1319,6 +1319,21 @@ impl crate::train::DeviceView for Gpt2Model {
     }
 }
 
+/// Delegate to the inherent [`Gpt2Model::forward_conditioned`] so the
+/// conditioned training entry ([`crate::train::run_conditioned_ft`]) can
+/// drive this model without naming it.
+///
+/// The trait method is spelled differently from the inherent one on
+/// purpose. Sharing the name would leave every call site resolving to
+/// whichever the compiler prefers — the inherent one — which is right
+/// here and silently wrong the day an implementor writes the delegation
+/// the other way round and recurses.
+impl crate::train::ConditionedForward for Gpt2Model {
+    fn forward_conditioned_rows(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
+        Gpt2Model::forward_conditioned(self, xs, conds)
+    }
+}
+
 /// Delegate to the inherent [`Gpt2Model::wrap_lora`] so the generic
 /// [`crate::train::run_lora_ft`] loop can drive LoRA fine-tuning on any
 /// `M: candle_nn::Module + crate::train::DeviceView + LoraWrappable`.

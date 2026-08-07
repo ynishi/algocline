@@ -16,15 +16,45 @@
 //! number is the one that says something about the model: the move
 //! actually played is legal by construction, because the ranking is
 //! walked against the legal set before anything is chosen.
+//!
+//! # Both conditioning conventions
+//!
+//! This reader accepts either. It used to refuse a per-position
+//! checkpoint, which meant the one step that asks whether the model is
+//! any good as an *opponent* — playing it, by hand, as each band — could
+//! not be run against the per-position arm at all. That is the step this
+//! project has twice skipped and twice regretted: a boss that passed
+//! every indicator and lost to one repeated action, and a chess model
+//! that declined a free knight while its numbers looked fine.
+//!
+//! The row is the same under both conventions, `[BOS, band] + moves`.
+//! What differs is that the per-position arm is *also* handed the band
+//! as an index into a conditioning table of its own. Both facts live in
+//! [`algocline_nn::chess::batch::BandBatch`], which pairs each row with
+//! the conditioning that belongs to it and owns the only forward — in
+//! the library rather than here, so that the construction this file
+//! depends on is under test and shared with `chess_cond` instead of
+//! written out twice.
+//!
+//! # The regime this program is the one to reach
+//!
+//! A human game passes 126 plies about one time in 26 — 96.2% of games
+//! fit whole in a 128-token context — and unlike the measurement path
+//! this one has no bound at all. Past that ply the row is windowed, and
+//! the tail slice this replaced dropped `BOS` and the band first, so the
+//! model played unconditioned without saying so. `play_row` keeps the
+//! prefix; under per-position the band also arrives as an argument,
+//! which no amount of windowing can touch.
 
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 use cozy_chess::Board;
 
 use algocline_nn::arch::Gpt2Model;
+use algocline_nn::chess::batch::BandBatch;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard};
 use algocline_nn::chess::vocab::MoveVocab;
@@ -79,10 +109,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: chess_play <ckpt.safetensors> <band|-> [moves...]")?
         .into();
-    // The band is played by writing it into the row, so a checkpoint
-    // conditioned the other way is refused rather than played with its
-    // condition ignored — the moves would look ordinary either way.
-    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
+    // Either conditioning convention. This used to be
+    // `load_as(.., Prefix)`, which refused a per-position checkpoint —
+    // and this is the program the plan's last step plays the adopted arm
+    // with, so refusing here meant the adoption decision would rest on
+    // indicators alone for one of the two arms. `Batch` below carries
+    // the branch; nothing else in this file consults the encoding.
+    let shape = ModelShape::load_any(&ckpt)?;
     let band_arg = args.next().unwrap_or_else(|| "-".into());
     let played: Vec<String> = args.collect();
 
@@ -139,42 +172,52 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // window cannot disagree with the guidance rewrite below about
     // which position the condition is at.
     let window = play_row(band_id, &moves, shape.ctx)?;
-    let width = window.len();
     let guided_band = band_token.as_ref().filter(|_| gamma != 1.0);
-    let probs = if let Some(asked) = guided_band {
+    let logits: Vec<f32> = if let Some(asked) = guided_band {
         // Guidance needs the other bands to build the reference it
-        // extrapolates away from, so every band is run at this
-        // position and the requested one is pushed away from their
-        // mean.
-        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(shape.bands.len());
-        let mut asked_at = 0usize;
-        for (i, band) in shape.bands.iter().enumerate() {
-            let id = vocab.id_of(&band.token).ok_or("band token missing")?;
-            // Lands on the condition, or refuses: `Window` knows
-            // whether it has one. The same write against a tail-sliced
-            // `Vec` put a band id on top of a real move of the position
-            // being evaluated (issue 8f9a96df).
-            rows.push(window.with_band(id)?.into_tokens());
-            if &band.token == asked {
-                asked_at = i;
-            }
-        }
-        let n = rows.len();
-        let input = Tensor::from_vec(rows.concat(), (n, width), &cfg.device)?;
-        let out = model.forward(&input)?;
-        let per_band: Vec<Vec<f32>> = (0..n)
-            .map(|b| out.i((b, width - 1))?.to_vec1::<f32>())
-            .collect::<Result<_, _>>()?;
+        // extrapolates away from, so every band is run at this position
+        // and the requested one is pushed away from their mean.
+        //
+        // The reference is the same object under both conventions, and
+        // deliberately so. `mean_logits` averages the model's output
+        // under each band it carries — the population the bands were
+        // split out of — and nothing in that description mentions how
+        // the band reached the model.
+        //
+        // Under per-position there is a second candidate: run the batch
+        // without its conditioning indices. That is not an unconditional
+        // branch either. It removes one of the two channels the band
+        // arrives through and leaves a row that still carries the band
+        // token at position 1, so what comes back is a partially
+        // conditioned model — and one trained with neither channel
+        // missing, since nothing here uses condition dropout. Off
+        // distribution in a way the band mean is not, and on top of that
+        // a different reference on one arm than on the other would make
+        // the two arms' guided numbers incomparable, which is the one
+        // thing the comparison exists to avoid.
+        let batch = BandBatch::over_bands(&window, &shape, &vocab)?;
+        let per_band = batch.logits(&model, &cfg.device)?;
+        let asked_at = shape
+            .bands
+            .iter()
+            .position(|b| &b.token == asked)
+            .ok_or_else(|| format!("band {asked} is not among this checkpoint's"))?;
+        let conditioned = per_band
+            .get(asked_at)
+            .ok_or("the band batch came back short")?;
         let reference = mean_logits(&per_band);
-        let guided = guide_logits(&per_band[asked_at], &reference, gamma);
-        let t = Tensor::from_vec(guided, (vocab.model_vocab_size(),), &cfg.device)?;
-        candle_nn::ops::softmax(&t, 0)?.to_vec1::<f32>()?
+        guide_logits(conditioned, &reference, gamma)
     } else {
-        let input = Tensor::from_vec(window.tokens().to_vec(), (1, width), &cfg.device)?;
-        let logits = model.forward(&input)?;
-        let last = logits.i((0, width - 1))?;
-        candle_nn::ops::softmax(&last, 0)?.to_vec1::<f32>()?
+        let batch = BandBatch::single(&window, &shape, band_token.as_deref())?;
+        batch
+            .logits(&model, &cfg.device)?
+            .into_iter()
+            .next()
+            .ok_or("the single-row batch came back empty")?
     };
+    let width = logits.len();
+    let t = Tensor::from_vec(logits, (width,), &cfg.device)?;
+    let probs = candle_nn::ops::softmax(&t, 0)?.to_vec1::<f32>()?;
 
     // Rank the legal moves by the model's mass, and note how much mass
     // fell outside the legal set.
@@ -207,6 +250,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let raw_token = vocab.token_of(raw_id).unwrap_or("(none)");
     let raw_legal = legal.iter().any(|(uci, _)| uci == raw_token);
 
+    // Printed because this is the step where a person plays the model by
+    // hand and has to be able to tell that the band actually reached it.
+    // "The same position gives different moves under the two bands" is
+    // the check, and it is worth nothing if the two runs silently played
+    // as the same band.
+    println!(
+        "band       {}  ({} conditioning{})",
+        band_token.as_deref().unwrap_or("(none)"),
+        shape.encoding,
+        match shape.encoding {
+            CondEncoding::Prefix => String::new(),
+            CondEncoding::EveryPosition => format!(
+                ", table row {}",
+                band_token
+                    .as_deref()
+                    .and_then(|t| shape.band_index(t))
+                    .map(|c| c.row().to_string())
+                    .unwrap_or_else(|| "-".into())
+            ),
+        }
+    );
     println!("gamma      {gamma}");
     println!("ply        {}", history.len());
     println!("to move    {:?}", board.side_to_move());

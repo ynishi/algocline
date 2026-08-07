@@ -1,0 +1,1275 @@
+//! What one walk saw, position by position, so that several walks can
+//! be read together afterwards.
+//!
+//! # Why a file
+//!
+//! `chess_cond` prints a summary of a walk, and a summary is enough to
+//! read a run by. It is not enough to *judge* one. The hypotheses in the
+//! plan are differences **across arms scored on the same positions** —
+//! `flip(perpos) - flip(prefix)`, and a decay ratio one arm's against
+//! another's — and each arm is a separate checkpoint scored in a
+//! separate process. Two summaries cannot be subtracted with an error
+//! bar on the result, because by then the positions each number came
+//! from have been averaged away.
+//!
+//! So the walk also writes out what it saw at each position, and the
+//! statistics are assembled from several of those files
+//! ([`crate::chess::steerability`]).
+//!
+//! # Why the game index is on every record
+//!
+//! Those 3,000 positions come from roughly 95 games, and positions
+//! inside one game are not independent draws. Every error bar in the
+//! plan is therefore a bootstrap that resamples **games**, which is only
+//! expressible if each position remembers the game it came from. Nothing
+//! else in the walk retained that.
+//!
+//! # Why the arms can be trusted to line up
+//!
+//! `chess_cond`'s walk is model-independent: it steps through the PGN,
+//! and a position enters the sample when the board offers at least two
+//! legal moves. Nothing in that decision consults the checkpoint. Two
+//! arms walked over the same holdout with the same side and the same
+//! cap therefore visit the same positions in the same order.
+//!
+//! That is an argument, not a guarantee — a different holdout file, a
+//! different cap, or a checkpoint with a different band list would all
+//! produce files that still parse. [`AlignedArms`] checks the sequence
+//! of `(game, ply)` pairs rather than trusting it, and refuses the set
+//! outright rather than joining on whatever prefix happens to match.
+//!
+//! # Format
+//!
+//! JSON Lines: the first line is a [`WalkHeader`], every line after it a
+//! [`PositionRecord`]. One line per position keeps the file greppable
+//! and lets a partial read say which position it stopped at; the header
+//! carries what a reader needs before it can interpret any of them,
+//! including the context window that fixes the depth buckets.
+//!
+//! The file is written whole at the end of a walk rather than streamed,
+//! so the counts in the header are the counts in the file and a run that
+//! died half way leaves no file to be mistaken for a short one.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::chess::CondEncoding;
+
+/// Format version carried in every header.
+///
+/// Bumped when a field changes meaning. A reader refuses a version it
+/// does not know rather than interpreting unfamiliar fields as absent,
+/// which is the same stance [`crate::chess::ModelShape`] takes for the
+/// same reason.
+pub const FORMAT_VERSION: u32 = 1;
+
+/// What a walk was, so its records can be interpreted and compared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalkHeader {
+    /// [`FORMAT_VERSION`] at the time of writing.
+    pub version: u32,
+    /// Checkpoint that was scored.
+    pub ckpt: String,
+    /// Holdout PGN that was walked.
+    pub holdout: String,
+    /// Which side's positions were scored, as
+    /// [`crate::chess::corpus::ScoredSide`] renders it.
+    pub side: String,
+    /// How the checkpoint was conditioned.
+    pub encoding: CondEncoding,
+    /// Context window the rows were cut to.
+    ///
+    /// Here because it fixes a depth bucket edge: a conditioned row is
+    /// `[BOS, band] + moves`, so a row stops fitting at ply `ctx - 1`
+    /// and the deep bucket has to end at `ctx - 2` to keep the windowed
+    /// regime out of it. A reader that assumed 128 would silently mix
+    /// the two on a run with another context size.
+    pub ctx: usize,
+    /// Condition tokens, in vocabulary order. Flip rate is defined
+    /// against the first of them, so two arms with different band lists
+    /// are not measuring the same quantity.
+    pub bands: Vec<String>,
+    /// Guidance strengths swept, in the order the per-position records
+    /// carry them.
+    pub gammas: Vec<f32>,
+    /// Positions in the file.
+    pub positions: usize,
+    /// Games the walk accepted, including any that contributed no
+    /// position. [`AlignedArms::games`] reports the clustering figure,
+    /// which counts only games that did contribute.
+    pub games: usize,
+}
+
+/// One position, under every guidance strength the walk swept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PositionRecord {
+    /// Index of the game this position came from, counting accepted
+    /// games from zero. The bootstrap's cluster.
+    pub game: usize,
+    /// Ply within the game, counting from zero. The depth bucket.
+    pub ply: usize,
+    /// One entry per gamma in [`WalkHeader::gammas`], in that order.
+    pub at: Vec<GammaRecord>,
+}
+
+/// What one position looked like at one guidance strength.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GammaRecord {
+    /// Whether any band's top legal move differed from the first
+    /// band's. The per-position term the flip rate is the mean of.
+    pub flipped: bool,
+    /// Jensen-Shannon divergence in bits between the first and last
+    /// band's legal-move distributions.
+    pub widest_js: f64,
+    /// Softmax mass landing on legal moves, meaned over the bands.
+    /// Recorded because `§5.1`'s third validity gate is checked at every
+    /// gamma and is therefore a per-gamma quantity like the others.
+    pub legal_mass: f64,
+    /// Whether each band's top legal move equalled the human's, one
+    /// entry per band.
+    ///
+    /// `None` where the move actually played is not in the vocabulary,
+    /// so there is nothing to match against. Absent rather than false:
+    /// counting an unscoreable position as a miss would drag the top-1
+    /// figure down by however many of them there were.
+    pub top1: Option<Vec<bool>>,
+}
+
+/// Just enough of a header to decide whether this build can read the
+/// rest of it.
+///
+/// Unknown fields are allowed here and denied on [`WalkHeader`], which
+/// is the whole point: a file from a later format has to be able to
+/// announce its version before this build objects to anything else
+/// about it.
+#[derive(Debug, Deserialize)]
+struct VersionProbe {
+    version: u32,
+}
+
+/// One walk: its header and every position it saw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Walk {
+    /// What the walk was.
+    pub header: WalkHeader,
+    /// What it saw, in visit order.
+    pub records: Vec<PositionRecord>,
+}
+
+/// Why a record file could not be written or read back.
+#[derive(Debug, Error)]
+pub enum RecordError {
+    /// The file could not be opened, written or read.
+    #[error("record file {path}: {message}")]
+    Io {
+        /// Path involved.
+        path: String,
+        /// Underlying IO message.
+        message: String,
+    },
+
+    /// A line is not the JSON this format expects.
+    #[error("record file {path}, line {line}: {message}")]
+    Parse {
+        /// Path involved.
+        path: String,
+        /// One-based line number.
+        line: usize,
+        /// Underlying serde message.
+        message: String,
+    },
+
+    /// The file holds nothing, so not even the header is there.
+    #[error("record file {path} is empty; a walk writes a header even when it saw no positions")]
+    Empty {
+        /// Path involved.
+        path: String,
+    },
+
+    /// The header names a format this build does not know.
+    #[error(
+        "record file {path} is format version {found}, and this build reads version {expected}; \
+         a field may have changed meaning, so it is refused rather than read as though it had not"
+    )]
+    Version {
+        /// Path involved.
+        path: String,
+        /// Version this build writes and reads.
+        expected: u32,
+        /// Version the file declares.
+        found: u32,
+    },
+
+    /// The header's position count and the number of record lines
+    /// disagree, so the file is not the whole walk.
+    #[error(
+        "record file {path} declares {declared} position(s) and carries {found}; \
+         the run that wrote it did not finish"
+    )]
+    Truncated {
+        /// Path involved.
+        path: String,
+        /// What the header claims.
+        declared: usize,
+        /// What the file holds.
+        found: usize,
+    },
+
+    /// A record carries a different number of gammas than the header
+    /// swept, so the two cannot be zipped.
+    #[error(
+        "record file {path}, position {index}: the header swept {expected} gamma(s) and this \
+         record carries {found}"
+    )]
+    GammaCount {
+        /// Path involved.
+        path: String,
+        /// Zero-based position index.
+        index: usize,
+        /// Gammas the header declares.
+        expected: usize,
+        /// Gammas the record carries.
+        found: usize,
+    },
+}
+
+impl Walk {
+    /// Write the walk as JSON Lines.
+    ///
+    /// # Errors
+    ///
+    /// The file could not be created or written, or a record could not
+    /// be serialised.
+    pub fn write_jsonl(&self, path: &Path) -> Result<(), RecordError> {
+        let io = |e: std::io::Error| RecordError::Io {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        };
+        let file = File::create(path).map_err(io)?;
+        let mut out = BufWriter::new(file);
+        let header = serde_json::to_string(&self.header).map_err(|e| RecordError::Parse {
+            path: path.display().to_string(),
+            line: 1,
+            message: e.to_string(),
+        })?;
+        writeln!(out, "{header}").map_err(io)?;
+        for (index, record) in self.records.iter().enumerate() {
+            let line = serde_json::to_string(record).map_err(|e| RecordError::Parse {
+                path: path.display().to_string(),
+                line: index + 2,
+                message: e.to_string(),
+            })?;
+            writeln!(out, "{line}").map_err(io)?;
+        }
+        // Flushed explicitly: a `BufWriter` dropped with buffered bytes
+        // discards the write error, which would leave a short file
+        // reported as a complete one.
+        out.flush().map_err(io)?;
+        Ok(())
+    }
+
+    /// Read a walk back.
+    ///
+    /// # Errors
+    ///
+    /// Any of [`RecordError`]. In particular the file is refused when
+    /// the header's counts do not match its contents, rather than being
+    /// read as a shorter walk.
+    pub fn read_jsonl(path: &Path) -> Result<Self, RecordError> {
+        let display = path.display().to_string();
+        let file = File::open(path).map_err(|e| RecordError::Io {
+            path: display.clone(),
+            message: e.to_string(),
+        })?;
+        let mut lines = BufReader::new(file).lines();
+
+        let first = match lines.next() {
+            Some(line) => line.map_err(|e| RecordError::Io {
+                path: display.clone(),
+                message: e.to_string(),
+            })?,
+            None => return Err(RecordError::Empty { path: display }),
+        };
+        // The version is read on its own first, from a probe that allows
+        // unknown fields. `WalkHeader` denies them, so a version 2 file
+        // that merely *added* one would fail as an unreadable line with
+        // a serde message and never reach the clear refusal that exists
+        // for exactly that case: the field meant to catch a future
+        // format would be defeated by the strictness sitting beside it.
+        let probe: VersionProbe = serde_json::from_str(&first).map_err(|e| RecordError::Parse {
+            path: display.clone(),
+            line: 1,
+            message: e.to_string(),
+        })?;
+        if probe.version != FORMAT_VERSION {
+            return Err(RecordError::Version {
+                path: display,
+                expected: FORMAT_VERSION,
+                found: probe.version,
+            });
+        }
+        let header: WalkHeader = serde_json::from_str(&first).map_err(|e| RecordError::Parse {
+            path: display.clone(),
+            line: 1,
+            message: e.to_string(),
+        })?;
+
+        let mut records = Vec::with_capacity(header.positions);
+        for (offset, line) in lines.enumerate() {
+            let line = line.map_err(|e| RecordError::Io {
+                path: display.clone(),
+                message: e.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: PositionRecord =
+                serde_json::from_str(&line).map_err(|e| RecordError::Parse {
+                    path: display.clone(),
+                    line: offset + 2,
+                    message: e.to_string(),
+                })?;
+            if record.at.len() != header.gammas.len() {
+                return Err(RecordError::GammaCount {
+                    path: display,
+                    index: offset,
+                    expected: header.gammas.len(),
+                    found: record.at.len(),
+                });
+            }
+            records.push(record);
+        }
+        if records.len() != header.positions {
+            return Err(RecordError::Truncated {
+                path: display,
+                declared: header.positions,
+                found: records.len(),
+            });
+        }
+        Ok(Self { header, records })
+    }
+
+    /// Index of `gamma` in this walk's sweep.
+    ///
+    /// Compared by bit pattern rather than by tolerance: the value came
+    /// out of the same parse of the same string on both sides, so an
+    /// exact match is the honest test and a tolerance would let 1.0 and
+    /// 1.0000001 be treated as the same sweep entry.
+    pub fn gamma_index(&self, gamma: f32) -> Option<usize> {
+        self.header.gammas.iter().position(|g| *g == gamma)
+    }
+}
+
+/// Why several walks could not be read as one position stream.
+#[derive(Debug, Error, PartialEq)]
+pub enum AlignError {
+    /// Fewer arms than the comparison needs.
+    #[error("comparing arms needs at least {needed}, and {found} were given")]
+    TooFewArms {
+        /// How many the caller supplied.
+        found: usize,
+        /// How many are required.
+        needed: usize,
+    },
+
+    /// Two arms carry the same name, so a role lookup would be
+    /// ambiguous.
+    #[error("two arms are both named {name:?}")]
+    DuplicateArm {
+        /// The repeated name.
+        name: String,
+    },
+
+    /// The arms swept different band lists, so their flip rates are not
+    /// the same quantity: the rate counts a disagreement with the
+    /// *first* band across however many bands there are.
+    #[error(
+        "arm {arm:?} carries bands {found:?} and arm {reference:?} carries {expected:?}; \
+         flip rate is defined against the first band over all of them, so these are not \
+         comparable numbers"
+    )]
+    BandsDiffer {
+        /// Arm that disagreed.
+        arm: String,
+        /// Arm it was compared against.
+        reference: String,
+        /// Bands the reference carries.
+        expected: Vec<String>,
+        /// Bands this arm carries.
+        found: Vec<String>,
+    },
+
+    /// The arms swept different guidance strengths.
+    #[error("arm {arm:?} swept gammas {found:?} and arm {reference:?} swept {expected:?}")]
+    GammasDiffer {
+        /// Arm that disagreed.
+        arm: String,
+        /// Arm it was compared against.
+        reference: String,
+        /// Gammas the reference swept.
+        expected: Vec<f32>,
+        /// Gammas this arm swept.
+        found: Vec<f32>,
+    },
+
+    /// The arms were cut to different context windows, so the depth
+    /// buckets do not line up.
+    #[error(
+        "arm {arm:?} was walked at ctx {found} and arm {reference:?} at {expected}; \
+         the deep bucket ends at ctx - 2, so these arms bucket depth differently"
+    )]
+    CtxDiffers {
+        /// Arm that disagreed.
+        arm: String,
+        /// Arm it was compared against.
+        reference: String,
+        /// Context window of the reference.
+        expected: usize,
+        /// Context window of this arm.
+        found: usize,
+    },
+
+    /// The arms hold different numbers of positions.
+    #[error(
+        "arm {arm:?} holds {found} position(s) and arm {reference:?} holds {expected}; \
+         these arms were not scored on the same walk"
+    )]
+    PositionCountDiffers {
+        /// Arm that disagreed.
+        arm: String,
+        /// Arm it was compared against.
+        reference: String,
+        /// Positions in the reference.
+        expected: usize,
+        /// Positions in this arm.
+        found: usize,
+    },
+
+    /// The arms hold the same number of positions, and they are not the
+    /// same positions.
+    #[error(
+        "arm {arm:?} has game {found_game} ply {found_ply} at index {index}, where arm \
+         {reference:?} has game {expected_game} ply {expected_ply}; joining these would \
+         subtract two arms' numbers at positions that are not the same position"
+    )]
+    PositionDiffers {
+        /// Arm that disagreed.
+        arm: String,
+        /// Arm it was compared against.
+        reference: String,
+        /// Where in the stream they parted.
+        index: usize,
+        /// Game the reference has there.
+        expected_game: usize,
+        /// Ply the reference has there.
+        expected_ply: usize,
+        /// Game this arm has there.
+        found_game: usize,
+        /// Ply this arm has there.
+        found_ply: usize,
+    },
+
+    /// A named arm is not among those supplied.
+    #[error("no arm named {name:?}; the arms given are {available:?}")]
+    UnknownArm {
+        /// Name that was asked for.
+        name: String,
+        /// Names that are present.
+        available: Vec<String>,
+    },
+
+    /// Two arms were scored from the same checkpoint.
+    ///
+    /// Every statistic downstream still comes out well-formed, which is
+    /// the problem. Two arms of one checkpoint have identical records,
+    /// so their difference is identically zero **in every bootstrap
+    /// draw** — and if the pair is the two per-position runs, the
+    /// same-arm gap that the two-arm margin has to beat vanishes and the
+    /// confirm criterion silently becomes an interval on the margin
+    /// alone. The floor is the one thing the plan calls undroppable, and
+    /// its only visible trace would be a printed `G = 0.000000`.
+    #[error(
+        "arms {a:?} and {b:?} were both scored from checkpoint {ckpt}; their records are \
+         identical, so every difference between them is zero in every draw — and if these are \
+         the two runs whose gap is the floor, the floor has silently gone to zero"
+    )]
+    SameCheckpoint {
+        /// First arm sharing the checkpoint.
+        a: String,
+        /// Second arm sharing the checkpoint.
+        b: String,
+        /// The checkpoint both name.
+        ckpt: String,
+    },
+
+    /// Two arms produced byte-for-byte the same records.
+    ///
+    /// The check [`AlignError::SameCheckpoint`] should have made and
+    /// cannot: that one compares the path a caller typed, and the same
+    /// weights reach two arms under two spellings all the time — a
+    /// relative path against an absolute one, a symlink, or a
+    /// `perpos-b` directory that is a copy of `perpos` because an `scp`
+    /// went wrong. Distinct strings, identical encoding, identical
+    /// positions, and a difference of zero in every draw.
+    ///
+    /// Identical weights produce identical records, so this compares the
+    /// thing that matters rather than a name for it. The comparison is
+    /// by value; a record holding a `NaN` would compare unequal to
+    /// itself and slip through, but a `NaN` in a divergence or a legal
+    /// mass is a defect that shows up long before this.
+    ///
+    /// This is the failure that already ran undetected once: the same
+    /// checkpoint was passed as two arms, the same-arm gap came out
+    /// identically zero, and the confirm criterion `M - G` silently
+    /// became an interval on `M` alone — the floor gone, with the output
+    /// still complete and the refute criterion still behaving.
+    #[error(
+        "arms {a:?} and {b:?} produced identical records over all {positions} position(s), so \
+         they were scored from the same weights however they were named; every difference \
+         between them is zero in every draw, and if these are the two runs whose gap is the \
+         floor, the floor has silently gone to zero"
+    )]
+    IdenticalRecords {
+        /// First arm of the pair.
+        a: String,
+        /// Second arm of the pair.
+        b: String,
+        /// Positions they agree on.
+        positions: usize,
+    },
+
+    /// The arms were not walked over the same held-out material.
+    ///
+    /// Distinct from [`AlignError::PositionDiffers`], which catches the
+    /// same thing later and less clearly: a different month usually
+    /// yields a different `(game, ply)` sequence, but nothing guarantees
+    /// it does, and "these are two months" is a better message than
+    /// "position 1,417 disagrees".
+    #[error(
+        "arm {arm:?} was walked over {field} {found:?} and arm {reference:?} over {expected:?}; \
+         a difference between arms is only a difference if both were scored on the same material"
+    )]
+    HoldoutDiffers {
+        /// Arm that disagreed.
+        arm: String,
+        /// Arm it was compared against.
+        reference: String,
+        /// Which header field differed: `holdout` or `side`.
+        field: &'static str,
+        /// What the reference carries.
+        expected: String,
+        /// What this arm carries.
+        found: String,
+    },
+
+    /// The gamma asked for is not one the arms swept.
+    ///
+    /// Its own variant because gamma is a command-line argument and a
+    /// typo is a likely operator error; reporting it as a disagreement
+    /// between two arms — one of them fabricated from the argument —
+    /// sends the reader looking for a mismatch between files that agree.
+    #[error("gamma {gamma} was not swept; these arms carry {swept:?}")]
+    GammaNotSwept {
+        /// Gamma the caller asked for.
+        gamma: f32,
+        /// Gammas the walk actually swept.
+        swept: Vec<f32>,
+    },
+
+    /// The walks carry no positions at all.
+    #[error("the arms carry no positions, so there is nothing to compare")]
+    NoPositions,
+}
+
+/// Several arms, checked to describe one position stream.
+///
+/// Construction is the check. Everything downstream can then index the
+/// arms by position without asking again whether index *i* means the
+/// same position in each of them.
+#[derive(Debug, Clone)]
+pub struct AlignedArms {
+    names: Vec<String>,
+    walks: Vec<Walk>,
+    /// Dense cluster index per position, shared by every arm.
+    clusters: Vec<usize>,
+    /// How many distinct games contributed a position.
+    games: usize,
+}
+
+impl AlignedArms {
+    /// Check that `named` arms describe the same positions, and keep
+    /// them.
+    ///
+    /// The first arm is the reference every other is compared against;
+    /// which one holds that role does not affect the verdict, only which
+    /// side of a disagreement the message calls expected.
+    ///
+    /// # Errors
+    ///
+    /// Any of [`AlignError`]. Nothing is joined partially: a
+    /// disagreement at position 2,999 of 3,000 refuses the whole set.
+    pub fn new(named: Vec<(String, Walk)>) -> Result<Self, AlignError> {
+        if named.is_empty() {
+            return Err(AlignError::TooFewArms {
+                found: 0,
+                needed: 1,
+            });
+        }
+        let mut names: Vec<String> = Vec::with_capacity(named.len());
+        let mut walks: Vec<Walk> = Vec::with_capacity(named.len());
+        for (name, walk) in named {
+            if names.contains(&name) {
+                return Err(AlignError::DuplicateArm { name });
+            }
+            names.push(name);
+            walks.push(walk);
+        }
+
+        // `names` and `walks` are pushed in lockstep above and both are
+        // non-empty, so these two cannot miss; the `ok_or` keeps the
+        // function free of indexing panics regardless.
+        let reference_name = names.first().cloned().ok_or(AlignError::TooFewArms {
+            found: 0,
+            needed: 1,
+        })?;
+        let reference = walks.first().ok_or(AlignError::TooFewArms {
+            found: 0,
+            needed: 1,
+        })?;
+
+        // Provenance first, so that a whole-file disagreement is
+        // reported as one rather than as a mismatch at some position
+        // deep inside it.
+        for (i, (name_a, walk_a)) in names.iter().zip(walks.iter()).enumerate() {
+            for (name_b, walk_b) in names.iter().zip(walks.iter()).skip(i + 1) {
+                if walk_a.header.ckpt == walk_b.header.ckpt {
+                    return Err(AlignError::SameCheckpoint {
+                        a: name_a.clone(),
+                        b: name_b.clone(),
+                        ckpt: walk_a.header.ckpt.clone(),
+                    });
+                }
+            }
+        }
+
+        for (name, walk) in names.iter().zip(walks.iter()).skip(1) {
+            for (field, expected, found) in [
+                ("holdout", &reference.header.holdout, &walk.header.holdout),
+                ("side", &reference.header.side, &walk.header.side),
+            ] {
+                if expected != found {
+                    return Err(AlignError::HoldoutDiffers {
+                        arm: name.clone(),
+                        reference: reference_name.clone(),
+                        field,
+                        expected: expected.clone(),
+                        found: found.clone(),
+                    });
+                }
+            }
+            if walk.header.bands != reference.header.bands {
+                return Err(AlignError::BandsDiffer {
+                    arm: name.clone(),
+                    reference: reference_name.clone(),
+                    expected: reference.header.bands.clone(),
+                    found: walk.header.bands.clone(),
+                });
+            }
+            if walk.header.gammas != reference.header.gammas {
+                return Err(AlignError::GammasDiffer {
+                    arm: name.clone(),
+                    reference: reference_name.clone(),
+                    expected: reference.header.gammas.clone(),
+                    found: walk.header.gammas.clone(),
+                });
+            }
+            if walk.header.ctx != reference.header.ctx {
+                return Err(AlignError::CtxDiffers {
+                    arm: name.clone(),
+                    reference: reference_name.clone(),
+                    expected: reference.header.ctx,
+                    found: walk.header.ctx,
+                });
+            }
+            if walk.records.len() != reference.records.len() {
+                return Err(AlignError::PositionCountDiffers {
+                    arm: name.clone(),
+                    reference: reference_name.clone(),
+                    expected: reference.records.len(),
+                    found: walk.records.len(),
+                });
+            }
+            for (index, (want, got)) in reference
+                .records
+                .iter()
+                .zip(walk.records.iter())
+                .enumerate()
+            {
+                if want.game != got.game || want.ply != got.ply {
+                    return Err(AlignError::PositionDiffers {
+                        arm: name.clone(),
+                        reference: reference_name.clone(),
+                        index,
+                        expected_game: want.game,
+                        expected_ply: want.ply,
+                        found_game: got.game,
+                        found_ply: got.ply,
+                    });
+                }
+            }
+        }
+
+        if reference.records.is_empty() {
+            return Err(AlignError::NoPositions);
+        }
+
+        // After the sequence check, because until it has passed a
+        // difference between two arms' records could be a difference of
+        // position sets rather than of weights, and the message for that
+        // is the other one. By here every arm holds the same positions
+        // in the same order, so records that still agree everywhere came
+        // from the same model.
+        for (i, (name_a, walk_a)) in names.iter().zip(walks.iter()).enumerate() {
+            for (name_b, walk_b) in names.iter().zip(walks.iter()).skip(i + 1) {
+                if walk_a.records == walk_b.records {
+                    return Err(AlignError::IdenticalRecords {
+                        a: name_a.clone(),
+                        b: name_b.clone(),
+                        positions: walk_a.records.len(),
+                    });
+                }
+            }
+        }
+
+        // Game ids are the walk's own numbering, which skips any game
+        // that was accepted and then contributed nothing. The bootstrap
+        // resamples `0..games`, so they are renumbered densely here —
+        // over the games that actually carry positions, which is the
+        // cluster set `§5.2` describes.
+        let mut dense: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut clusters = Vec::with_capacity(reference.records.len());
+        for record in &reference.records {
+            let next = dense.len();
+            let ix = *dense.entry(record.game).or_insert(next);
+            clusters.push(ix);
+        }
+        let games = dense.len();
+
+        Ok(Self {
+            names,
+            walks,
+            clusters,
+            games,
+        })
+    }
+
+    /// Read each `(name, path)` and align what comes back.
+    ///
+    /// # Errors
+    ///
+    /// A file could not be read ([`RecordError`]), or the arms do not
+    /// describe one position stream ([`AlignError`]).
+    pub fn read(named: &[(String, PathBuf)]) -> Result<Self, ArmsError> {
+        let mut walks = Vec::with_capacity(named.len());
+        for (name, path) in named {
+            walks.push((name.clone(), Walk::read_jsonl(path)?));
+        }
+        Ok(Self::new(walks)?)
+    }
+
+    /// Arm names, in the order they were supplied.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// The walk an arm holds.
+    ///
+    /// # Errors
+    ///
+    /// No arm carries that name.
+    pub fn walk(&self, name: &str) -> Result<&Walk, AlignError> {
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .and_then(|ix| self.walks.get(ix))
+            .ok_or_else(|| AlignError::UnknownArm {
+                name: name.to_string(),
+                available: self.names.clone(),
+            })
+    }
+
+    /// Positions in the shared stream.
+    pub fn positions(&self) -> usize {
+        self.clusters.len()
+    }
+
+    /// Games that contributed at least one position — the cluster count
+    /// every bootstrap here resamples over.
+    pub fn games(&self) -> usize {
+        self.games
+    }
+
+    /// Cluster index of each position, in stream order.
+    pub fn clusters(&self) -> &[usize] {
+        &self.clusters
+    }
+
+    /// Context window the arms were walked at.
+    ///
+    /// Equal across arms by construction; [`AlignedArms::new`] refuses
+    /// the set otherwise.
+    pub fn ctx(&self) -> usize {
+        self.walks.first().map(|w| w.header.ctx).unwrap_or_default()
+    }
+
+    /// Index of `gamma` in the shared sweep.
+    ///
+    /// # Errors
+    ///
+    /// No arm swept that gamma.
+    pub fn gamma_index(&self, gamma: f32) -> Result<usize, AlignError> {
+        let reference = self.walks.first().ok_or(AlignError::TooFewArms {
+            found: 0,
+            needed: 1,
+        })?;
+        reference
+            .gamma_index(gamma)
+            .ok_or_else(|| AlignError::GammaNotSwept {
+                gamma,
+                swept: reference.header.gammas.clone(),
+            })
+    }
+}
+
+/// Either half of "read these files and line them up".
+#[derive(Debug, Error)]
+pub enum ArmsError {
+    /// A file could not be read.
+    #[error(transparent)]
+    Record(#[from] RecordError),
+    /// The files do not describe one position stream.
+    #[error(transparent)]
+    Align(#[from] AlignError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    pub(super) fn header(positions: usize, games: usize) -> WalkHeader {
+        WalkHeader {
+            version: FORMAT_VERSION,
+            ckpt: "/root/ckpt/perpos/run.safetensors".into(),
+            holdout: "holdout-2026-05.pgn".into(),
+            side: "White".into(),
+            encoding: CondEncoding::Prefix,
+            ctx: 128,
+            bands: vec![
+                "<elo:1100-1299>".into(),
+                "<elo:1500-1699>".into(),
+                "<elo:1900-2099>".into(),
+            ],
+            gammas: vec![1.0, 4.0],
+            positions,
+            games,
+        }
+    }
+
+    pub(super) fn gamma_record(flipped: bool, js: f64) -> GammaRecord {
+        GammaRecord {
+            flipped,
+            widest_js: js,
+            legal_mass: 0.5,
+            top1: Some(vec![flipped, false, true]),
+        }
+    }
+
+    /// Label a walk as an arm, giving it a checkpoint of its own.
+    ///
+    /// Every arm needs a distinct one: two arms scored from the same
+    /// checkpoint have identical records, so every difference between
+    /// them is zero in every draw, and `AlignedArms` refuses the pair
+    /// rather than let a floor collapse quietly.
+    pub(super) fn arm(name: &str, mut walk: Walk) -> (String, Walk) {
+        walk.header.ckpt = format!("/root/ckpt/{name}/run.safetensors");
+        (name.to_string(), walk)
+    }
+
+    /// A walk of `games` games, each holding `per_game` positions, with
+    /// every gamma entry the same.
+    pub(super) fn walk(games: usize, per_game: usize, flipped: bool) -> Walk {
+        let mut records = Vec::new();
+        for game in 0..games {
+            for ply in 0..per_game {
+                records.push(PositionRecord {
+                    game,
+                    ply: ply * 2,
+                    at: vec![gamma_record(flipped, 0.02), gamma_record(flipped, 0.05)],
+                });
+            }
+        }
+        Walk {
+            header: header(records.len(), games),
+            records,
+        }
+    }
+
+    #[test]
+    fn a_walk_survives_a_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("perpos.jsonl");
+        let original = walk(3, 4, true);
+        original.write_jsonl(&path).unwrap();
+        let back = Walk::read_jsonl(&path).unwrap();
+        assert_eq!(back, original);
+    }
+
+    /// One line per position, plus the header, so the file can be
+    /// counted and grepped.
+    #[test]
+    fn the_file_is_one_line_per_position_behind_a_header() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("perpos.jsonl");
+        let original = walk(2, 5, false);
+        original.write_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1 + 10);
+    }
+
+    #[test]
+    fn a_file_from_another_format_version_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("old.jsonl");
+        let mut original = walk(1, 1, false);
+        original.header.version = FORMAT_VERSION + 1;
+        original.write_jsonl(&path).unwrap();
+        assert!(matches!(
+            Walk::read_jsonl(&path),
+            Err(RecordError::Version { .. })
+        ));
+    }
+
+    /// The case the version probe exists for, which the test above
+    /// cannot reach: a later format that merely **adds** a field.
+    ///
+    /// `WalkHeader` denies unknown fields, so without the probe this
+    /// arrives as an unreadable line carrying a serde message about
+    /// `cond_scale`, and the clear refusal that exists for exactly this
+    /// is never reached. Written as a raw line rather than through
+    /// `write_jsonl`, because this build cannot serialise a field it
+    /// does not have.
+    #[test]
+    fn a_later_format_that_adds_a_field_is_refused_as_a_version() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v2.jsonl");
+        let body = format!(
+            r#"{{"version": {}, "ckpt": "c", "holdout": "h", "side": "White", "encoding": "prefix", "ctx": 128, "bands": [], "gammas": [1.0], "positions": 0, "games": 0, "cond_scale": 2.0}}"#,
+            FORMAT_VERSION + 1
+        );
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+        let err = Walk::read_jsonl(&path);
+        assert!(
+            matches!(
+                err,
+                Err(RecordError::Version {
+                    expected: FORMAT_VERSION,
+                    ..
+                })
+            ),
+            "an added field must not hide the version: {err:?}"
+        );
+    }
+
+    /// And a file of *this* version with an unknown field is still a
+    /// parse failure, so the probe has not turned the strictness off —
+    /// it has only let the version be read first.
+    #[test]
+    fn an_unknown_field_at_the_current_version_is_still_a_parse_failure() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("odd.jsonl");
+        let body = format!(
+            r#"{{"version": {FORMAT_VERSION}, "ckpt": "c", "holdout": "h", "side": "White", "encoding": "prefix", "ctx": 128, "bands": [], "gammas": [1.0], "positions": 0, "games": 0, "cond_scale": 2.0}}"#
+        );
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+        assert!(matches!(
+            Walk::read_jsonl(&path),
+            Err(RecordError::Parse { line: 1, .. })
+        ));
+    }
+
+    /// A run that died half way leaves a header claiming more positions
+    /// than the file holds. Refused rather than read as a short walk,
+    /// which would silently change the sample every arm is compared on.
+    #[test]
+    fn a_short_file_is_refused_rather_than_read_as_a_short_walk() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("short.jsonl");
+        let mut original = walk(2, 3, false);
+        original.header.positions = 99;
+        original.write_jsonl(&path).unwrap();
+        assert!(matches!(
+            Walk::read_jsonl(&path),
+            Err(RecordError::Truncated {
+                declared: 99,
+                found: 6,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert!(matches!(
+            Walk::read_jsonl(&path),
+            Err(RecordError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn arms_over_the_same_positions_align() {
+        let arms = AlignedArms::new(vec![
+            arm("perpos", walk(4, 5, true)),
+            arm("prefix", walk(4, 5, false)),
+        ])
+        .unwrap();
+        assert_eq!(arms.positions(), 20);
+        assert_eq!(arms.games(), 4);
+        assert_eq!(arms.ctx(), 128);
+        assert_eq!(arms.clusters().first(), Some(&0));
+        assert_eq!(arms.clusters().last(), Some(&3));
+        assert_eq!(arms.gamma_index(4.0).unwrap(), 1);
+        // And a gamma nobody swept is reported as that, not as a
+        // disagreement between two arms one of which does not exist.
+        assert!(matches!(
+            arms.gamma_index(2.0),
+            Err(AlignError::GammaNotSwept { gamma: 2.0, .. })
+        ));
+    }
+
+    /// The refusal this type exists for: two arms with the same number
+    /// of positions that are not the same positions.
+    #[test]
+    fn arms_scored_on_different_positions_are_refused() {
+        let mut other = walk(4, 5, false);
+        // Same shape, one position from a different ply — a walk over a
+        // different holdout, or with a different filter, looks like this.
+        other.records[7].ply = 999;
+        let err = AlignedArms::new(vec![arm("perpos", walk(4, 5, true)), arm("prefix", other)])
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AlignError::PositionDiffers {
+                    index: 7,
+                    expected_ply: 4,
+                    found_ply: 999,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn arms_of_different_lengths_are_refused() {
+        let err = AlignedArms::new(vec![
+            arm("perpos", walk(4, 5, true)),
+            arm("prefix", walk(4, 4, false)),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AlignError::PositionCountDiffers {
+                    expected: 20,
+                    found: 16,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Flip rate counts a disagreement with the first band across all of
+    /// them, so a differing band list is a differing statistic even when
+    /// the positions match.
+    #[test]
+    fn arms_with_different_bands_are_refused() {
+        let mut other = walk(2, 2, false);
+        other.header.bands.pop();
+        let err = AlignedArms::new(vec![arm("a", walk(2, 2, true)), arm("b", other)]).unwrap_err();
+        assert!(matches!(err, AlignError::BandsDiffer { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn arms_with_different_gammas_are_refused() {
+        let mut other = walk(2, 2, false);
+        other.header.gammas = vec![1.0, 2.0];
+        let err = AlignedArms::new(vec![arm("a", walk(2, 2, true)), arm("b", other)]).unwrap_err();
+        assert!(matches!(err, AlignError::GammasDiffer { .. }), "{err:?}");
+    }
+
+    /// The deep bucket ends at `ctx - 2`, so two arms walked at
+    /// different context sizes do not bucket depth the same way.
+    #[test]
+    fn arms_walked_at_different_contexts_are_refused() {
+        let mut other = walk(2, 2, false);
+        other.header.ctx = 192;
+        let err = AlignedArms::new(vec![arm("a", walk(2, 2, true)), arm("b", other)]).unwrap_err();
+        assert!(matches!(err, AlignError::CtxDiffers { .. }), "{err:?}");
+    }
+
+    /// The one that a whole end-to-end run walked straight past: pass
+    /// the same checkpoint twice and every number is well-formed, while
+    /// the difference between those two arms is zero in every draw. If
+    /// the pair is the two per-position runs, the same-arm gap the
+    /// margin has to beat is gone and the confirm criterion has quietly
+    /// become an interval on the margin alone.
+    #[test]
+    fn two_arms_from_the_same_checkpoint_are_refused() {
+        let err = AlignedArms::new(vec![
+            ("perpos".to_string(), walk(3, 4, true)),
+            ("perpos-b".to_string(), walk(3, 4, true)),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AlignError::SameCheckpoint {
+                    ref a,
+                    ref b,
+                    ..
+                } if a == "perpos" && b == "perpos-b"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The guard `SameCheckpoint` cannot be: the same weights under two
+    /// spellings — a relative path, a symlink, a directory copied by a
+    /// bad `scp` — pass the string check and still have a gap of zero in
+    /// every draw.
+    ///
+    /// This is the failure that ran undetected once, so the fixture is
+    /// the shape it took: two arms whose records agree everywhere.
+    #[test]
+    fn two_arms_with_identical_records_are_refused_however_they_were_named() {
+        let err = AlignedArms::new(vec![
+            arm("perpos", walk(3, 4, true)),
+            // A different path, the same weights.
+            arm("perpos-b", walk(3, 4, true)),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AlignError::IdenticalRecords {
+                    ref a,
+                    ref b,
+                    positions: 12,
+                } if a == "perpos" && b == "perpos-b"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// And one position of difference is enough to pass it, so the
+    /// guard is not refusing two genuinely distinct checkpoints that
+    /// happen to agree often.
+    #[test]
+    fn one_differing_position_is_enough_to_be_two_arms() {
+        let mut other = walk(3, 4, true);
+        other.records[5].at[0].flipped = false;
+        AlignedArms::new(vec![
+            arm("perpos", walk(3, 4, true)),
+            arm("perpos-b", other),
+        ])
+        .expect("two arms that differ anywhere are two arms");
+    }
+
+    /// A difference between arms is only a difference if both were
+    /// scored on the same material. Caught on the header rather than
+    /// forty positions into the sequence.
+    #[test]
+    fn arms_walked_over_different_holdouts_are_refused() {
+        let mut other = walk(2, 2, false);
+        other.header.holdout = "holdout-2026-04.pgn".into();
+        let err = AlignedArms::new(vec![arm("a", walk(2, 2, true)), arm("b", other)]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AlignError::HoldoutDiffers {
+                    field: "holdout",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn arms_walked_over_different_sides_are_refused() {
+        let mut other = walk(2, 2, false);
+        other.header.side = "Black".into();
+        let err = AlignedArms::new(vec![arm("a", walk(2, 2, true)), arm("b", other)]).unwrap_err();
+        assert!(
+            matches!(err, AlignError::HoldoutDiffers { field: "side", .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn two_arms_of_the_same_name_are_refused() {
+        let err = AlignedArms::new(vec![
+            ("perpos".into(), walk(2, 2, true)),
+            ("perpos".into(), walk(2, 2, false)),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AlignError::DuplicateArm {
+                name: "perpos".into()
+            }
+        );
+    }
+
+    /// Game ids skip whenever an accepted game contributed nothing, and
+    /// the bootstrap needs a dense `0..games`.
+    #[test]
+    fn sparse_game_ids_are_renumbered_densely() {
+        let mut w = walk(1, 1, false);
+        w.records = vec![
+            PositionRecord {
+                game: 3,
+                ply: 0,
+                at: vec![gamma_record(false, 0.0), gamma_record(false, 0.0)],
+            },
+            PositionRecord {
+                game: 3,
+                ply: 2,
+                at: vec![gamma_record(false, 0.0), gamma_record(false, 0.0)],
+            },
+            PositionRecord {
+                game: 9,
+                ply: 0,
+                at: vec![gamma_record(false, 0.0), gamma_record(false, 0.0)],
+            },
+        ];
+        w.header.positions = 3;
+        let arms = AlignedArms::new(vec![arm("a", w)]).unwrap();
+        assert_eq!(arms.clusters(), &[0, 0, 1]);
+        assert_eq!(arms.games(), 2);
+    }
+}

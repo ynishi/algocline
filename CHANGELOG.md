@@ -344,6 +344,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unseen one, across two runs. See README "Proving the bake
   generalises".
 
+- `train::ckpt::restore_into` / `restore_into_partial` — start a run
+  from weights it already has. Both verify before they write: one pass
+  compares every name, shape and dtype against the live `VarMap`,
+  collecting every disagreement rather than the first, and returns
+  without touching a tensor if any were found; a second applies. The
+  map's lock is held across both, so a concurrent registration cannot
+  land between them. A rejected restore therefore leaves the map
+  exactly as it was — with one exception, `RestoreError::Apply`, which
+  fires part-way through writing and names the variables already
+  updated. `restore_into` demands that every registered name be in the
+  file; `restore_into_partial` allows some to be absent, for restoring
+  a base model into a map that also holds untrained LoRA legs, and
+  lists every name it skipped. A map that shares no name with the file
+  is an error either way, since a restore that writes nothing has not
+  resumed anything. Tensors in the file the map does not register are
+  reported, not rejected. `RestoreReport` carries `registered_count` /
+  `restored_count` / `is_complete` / `summary`.
+
+  The checkpoint is mmapped for the call, so the caller warrants that
+  nothing writes to the path while it runs — a write under a live
+  mapping is undefined behaviour and no check inside can detect one.
+
+- `chess::CondEncoding` and the reader plumbing around it. A checkpoint
+  now records which convention it was trained under — `Prefix` (the
+  band as token 1 of the row) or `EveryPosition` (the band's vector
+  added at every position from a separate `cond_wte` table) — and the
+  two land at different sidecar names, `<ckpt>.shape.json` and
+  `<ckpt>.shape2.json`, so an older build cannot read a newer
+  checkpoint by accident. `ModelShape::load_as` demands one convention,
+  `load_any` accepts either and reports which; `path_for_encoding`
+  names the sidecar; `require_encoding` checks a shape already in hand.
+  `ShapeError` gained `EncodingMismatch`, `AmbiguousSidecar` (both
+  sidecars present for one checkpoint — refused rather than resolved by
+  precedence) and `SweepFailed`.
+
+- `chess::window::Window` — a row as `[BOS, band] + tail(ctx - 2)`
+  rather than `tail(ctx)`. The tail slice it replaced dropped `BOS` and
+  the band first, which are the two tokens that are not moves, so once
+  a game outran the context window every band saw the same row and the
+  condition provably did nothing there. The row's shape was unchanged,
+  so a caller that believed position 1 held the band went on believing
+  it — `chess_play`'s guidance path wrote a band id over a real move at
+  any gamma other than one (issue `8f9a96df`). `Window` exists so the
+  prefix kind travels with the tokens: fields are private and
+  `set_band` / `with_band` refuse a row that carries no band, so the
+  ambiguity a bare `Vec<u32>` had is not expressible. `play_row` builds
+  one; `BAND_POS`, `COND_PREFIX_LEN` and `PLAIN_PREFIX_LEN` name the
+  offsets. How often it matters belongs to the caller: training drops
+  overlong games outright and held-out replay reaches the regime in 1
+  position of 3,000 on 2026-05 and 27 of 3,000 on 2026-04, but the
+  playing path has no bound — 3.8% of games do not fit whole in a
+  128-token context, ply p90 109, maximum 276.
+
+- `chess::batch::BandBatch` — the batch both readers build to run one
+  position under several bands. `single` for one row, `over_bands` for
+  every band a checkpoint carries; `logits` runs the model through
+  whichever forward the encoding calls for. Extracted from
+  `chess_play`, which had built it inline while `chess_cond` built its
+  own; the two are now one implementation.
+
+- `chess::records` — the on-disk form of a scoring walk, as JSON Lines.
+  `WalkHeader` (checkpoint, encoding, holdout, gammas, ctx, position
+  count) then one `PositionRecord` per position, each carrying its game
+  index and a `GammaRecord` per gamma. A file whose record count
+  disagrees with its header is `RecordError::Truncated`, so a write that
+  died part-way is caught rather than read as a shorter walk.
+  `AlignedArms::read` takes several arms and refuses any set that cannot
+  be compared — among them different holdouts, different band lists,
+  different gamma sweeps, different ctx, a different position count, a
+  different `(game, ply)` sequence, and two arms that are secretly one
+  checkpoint, either by path or by their records agreeing at every
+  position. That last refusal exists because the failure happened: two
+  arms sharing a checkpoint produce a complete set of well-formed
+  numbers with the noise floor silently zero.
+
+- `metric::bootstrap::cluster_bootstrap` — resampling over clusters
+  rather than over rows. Positions from one game are not independent,
+  so an interval computed per position is too narrow. Takes a
+  `ClusterTally` and a statistic, returns an `Interval` with a
+  percentile band and `excludes_zero_from_above` / `_below`. A draw the
+  statistic cannot evaluate is dropped and counted rather than
+  silently treated as zero. Deterministic from its seed: every term of
+  a compound statistic is recomputed inside the same draw, so no scalar
+  is frozen across resamples.
+
+- `chess::steerability` and `examples/chess_stats.rs` — scoring several
+  arms against each other. `flip_rate` / `top1_match` / `legal_mass`
+  per arm; `gate_top1` / `gate_legal_mass` as validity gates against
+  the prefix arm; `h14` (does per-position conditioning move more moves
+  than prefix, measured against a same-encoding replicate as the noise
+  floor) and `h15` (does the condition survive deeper into the game).
+  `check_roles` verifies every arm's encoding fits the role it was
+  handed *before* anything is computed or printed, so a swapped pair
+  produces no output rather than a plausible table read against the
+  wrong baseline.
+
+- `chess::COND_TABLE_TENSOR`, and a cross-check in
+  `ModelShape::load_any`: the encoding a sidecar declares is verified
+  against the weights themselves — `cond_wte.weight` is present in the
+  safetensors file iff the encoding is `EveryPosition` — rather than
+  taken on the sidecar's word. A checkpoint that ends up beside a stale
+  sidecar (a hand copy, a lost `shape2.json`, an `scp` that took one
+  file and not the other) used to load as the wrong convention and be
+  scored with the condition delivered through one channel instead of
+  two, silently. `ShapeError` gained `EncodingContradictsWeights` and
+  `WeightsUnreadable`.
+
+  **Precondition change**: `load_any` — and `load_as`, which routes
+  through it — now require the weights file to be readable, because
+  that is what makes the check unconditional. A shape read purely for
+  metadata, with no checkpoint beside it, now fails where it used to
+  return.
+
 ### Changed — **BREAKING**: `algocline_nn::train::Batch` gained a `conds` field
 
 `Batch` carries an optional per-row conditioning index, so a training

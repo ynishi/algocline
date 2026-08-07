@@ -260,8 +260,10 @@ mod tests {
     use super::*;
     use crate::arch::gpt2::fill_deterministic;
     use crate::arch::{max_abs_diff_f32, Gpt2Config, Gpt2Model};
+    use crate::chess::corpus::ConditionBand;
     use crate::chess::pgn::{move_from_uci_standard, uci_standard};
     use crate::chess::vocab::MoveVocab;
+    use crate::chess::{CondEncoding, ModelShape};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::{VarBuilder, VarMap};
     use cozy_chess::Board;
@@ -504,6 +506,92 @@ mod tests {
         assert!(
             spread > 1e-5,
             "the bands produced the same logits at ply 130 (spread {spread})"
+        );
+    }
+
+    /// The same question under per-position conditioning, at the same
+    /// ply, because the interactive path reaches this regime and has no
+    /// bound at all — about one human game in 26 passes 126 plies.
+    ///
+    /// Two assertions:
+    ///
+    /// - the **same** windowed row under two different conditioning rows
+    ///   gives different logits, so the band arrives through a channel
+    ///   windowing cannot touch. Under the prefix convention the band is
+    ///   token 1 and a tail slice can eat it; here it is an argument,
+    ///   and there is no position for a window to disturb;
+    /// - and dropping the condition changes the answer, so that a reader
+    ///   dropping it is detectable at all.
+    ///
+    /// **What this does not test** is any reader. It builds a model in
+    /// place and calls the two forwards directly, so reverting an
+    /// example to a plain `forward` leaves it green. The construction a
+    /// reader performs is tested in [`crate::chess::batch`], which is
+    /// where that construction now lives for exactly this reason.
+    ///
+    /// Built through `ModelShape::config` and `ModelShape::band_index`
+    /// rather than by hand, so it exercises the same two producers the
+    /// readers use: a table sized from the band list, and the only way
+    /// to obtain a `CondIndex` from outside the model code.
+    #[test]
+    fn the_condition_reaches_a_per_position_model_at_ply_130() {
+        let vocab = vocab();
+        let moves = knight_shuffle(130, &vocab);
+        let low_id = band_id(BANDS[0], &vocab);
+        let window = play_row(Some(low_id), &moves, CTX).unwrap();
+        assert_eq!(window.len(), CTX, "a 130-ply game should be windowed");
+        assert_eq!(window.band(), Some(low_id));
+
+        let mut shape = ModelShape::compact(
+            vocab.model_vocab_size(),
+            BANDS
+                .iter()
+                .map(|token| ConditionBand {
+                    min: 0,
+                    max: 0,
+                    token: (*token).to_string(),
+                })
+                .collect(),
+        );
+        shape.encoding = CondEncoding::EveryPosition;
+        let cfg = shape.config(Device::Cpu, DType::F32);
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        // Seeded, so the thresholds below are a property of these
+        // weights rather than of whatever the initialiser drew.
+        fill_deterministic(&varmap, 0x0806_2026).unwrap();
+
+        // The same row twice. Only the conditioning argument differs, so
+        // whatever separates the two outputs came through it.
+        let low = shape.band_index(BANDS[0]).expect("a row for the low band");
+        let high = shape.band_index(BANDS[1]).expect("a row for the high band");
+        assert_ne!(low.row(), high.row(), "two bands, two table rows");
+        let mut rows = window.tokens().to_vec();
+        rows.extend_from_slice(window.tokens());
+        let input = Tensor::from_vec(rows, (2, CTX), &cfg.device).unwrap();
+
+        let conditioned = model.forward_conditioned(&input, &[low, high]).unwrap();
+        let spread = max_abs_diff_f32(
+            &conditioned.i((0, CTX - 1)).unwrap(),
+            &conditioned.i((1, CTX - 1)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            spread > 1e-5,
+            "the conditioning argument did nothing at ply 130 (spread {spread})"
+        );
+
+        let plain = model.forward(&input).unwrap();
+        let dropped = max_abs_diff_f32(
+            &conditioned.i((0, CTX - 1)).unwrap(),
+            &plain.i((0, CTX - 1)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            dropped > 1e-5,
+            "dropping the condition changed nothing, so nothing here could catch a reader \
+             that drops it (spread {dropped})"
         );
     }
 }

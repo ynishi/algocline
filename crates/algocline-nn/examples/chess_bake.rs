@@ -781,11 +781,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     //   over is the other convention's. Removing this run's own file
     //   here would leave that stale one alone beside the new weights,
     //   which is not "a checkpoint with no shape" but a checkpoint
-    //   with the *wrong* shape — accepted by every reader, and by the
-    //   mmapped loader too, which asks only for the tensors its model
-    //   wants and never notices `cond_wte.weight` sitting unrequested.
-    //   So that branch removes the stale name, and if it cannot, both
-    //   files remain and `load_any` refuses the pair as ambiguous.
+    //   with the *wrong* shape. That state is refused rather than
+    //   scored — `load_any` compares the recorded encoding against
+    //   whether `cond_wte.weight` is in the file, and a stale sidecar
+    //   of the other convention contradicts it by construction — but a
+    //   contradiction is something an operator then has to work out,
+    //   where a swept name leaves a plain "no shape file". So that
+    //   branch removes the stale name, and if it cannot, both files
+    //   remain and `load_any` refuses the pair as ambiguous.
     //
     // Every removal's own outcome rides on the error message rather
     // than being dropped, since a sweep that silently failed would

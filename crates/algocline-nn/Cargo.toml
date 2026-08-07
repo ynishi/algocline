@@ -195,6 +195,15 @@ required-features = []
 name = "chess_cond"
 required-features = []
 
+# Reads several `chess_cond` walks together and puts error bars on the
+# differences between them. Separate from `chess_cond` because each arm
+# is a separate checkpoint scored in a separate process, and a summary
+# cannot be subtracted from another summary with an interval on the
+# result.
+[[example]]
+name = "chess_stats"
+required-features = []
+
 # Plays the condition tokens against each other and against random
 # play, which is the only way to ask whether a condition carries
 # strength rather than just a different set of preferences.

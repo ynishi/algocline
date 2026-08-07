@@ -78,6 +78,29 @@ test-nn:
     cargo test -p algocline-engine --features nn --test gameai_smoke_test
     cargo test -p algocline-engine --features nn --test gameai_ckpt_metric_e2e
 
+# Tests whose subject is release-mode behaviour, and which therefore cannot
+# run under `just test` / `just ci` (both dev profile, `debug_assertions` on).
+#
+# The case that motivated this: `ClusterTally::over` trips a `debug_assert!`
+# on a draw naming an unknown cluster, and in release returns `None` for the
+# whole draw instead — dropping it would shrink the resample, and fewer
+# observations narrow the interval, so the failure would make a number look
+# *more* precise. Only one of those two branches is reachable per profile,
+# and the release one had no recipe that ran it.
+#
+# Scoped to `algocline-nn`'s lib rather than the workspace: the release-only
+# tests all live in `metric::bootstrap`, and a whole-workspace release build
+# costs minutes to reach the same one test.
+#
+# Deliberately NOT in `ci`: it costs a release compile of candle, and nothing
+# here is on a path a caller can reach (the bootstrap fills every draw from
+# `below(clusters)`, and every `ClusterTally` in `chess::steerability` is
+# sized from the same game count the bootstrap resamples). Run it when
+# touching `metric::bootstrap`.
+[group('allow-agent')]
+test-release:
+    cargo test -p algocline-nn --release --lib
+
 # Clippy for the nn-feature layer. `just clippy` runs the default (nn off)
 # workspace clippy; this recipe closes the gap for the `--features nn` code
 # paths (`crates/algocline-engine/src/bridge/nn_card.rs` +

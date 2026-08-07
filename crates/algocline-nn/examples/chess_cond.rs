@@ -3,12 +3,44 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --example chess_cond -- <ckpt> <holdout.pgn> [side] [max_positions] [walk_band] [gammas]
+//! cargo run --release --example chess_cond -- <ckpt> <holdout.pgn> [side] [max_positions] [walk_band] [gammas] [records.jsonl]
 //! ```
 //!
 //! `gammas` is a comma-separated guidance sweep, default
 //! `1,1.5,2,3,4,6,8`. One is the unguided model, so the sweep always
 //! contains the baseline it is read against.
+//!
+//! # The summary and the records are for different readers
+//!
+//! What this prints is what a person reads while a run is going. It has
+//! moved with the measurement rather than staying put. Two changes are
+//! unconditional: the header now names the conditioning convention the
+//! checkpoint records, and the walk line separates the games that
+//! contributed a position from the games the filter accepted, because
+//! those two counts are different numbers and the error bars resample
+//! the first. A third is not — passing the seventh argument adds a
+//! `records` line naming the file and the counts written to it, so an
+//! operator can see the walk landed without opening it. Anyone diffing
+//! an old run's output against a new one meets all three. What
+//! `records.jsonl` holds is what a
+//! *second* run of this program has to be joined against, and a summary
+//! cannot serve that purpose: every hypothesis in the plan is a
+//! difference between arms scored on the same positions, and by the time
+//! a mean has been printed the positions it came from are gone.
+//!
+//! So passing a seventh argument also writes one line per position —
+//! the game it came from, its ply, and per gamma whether the bands
+//! flipped, how far apart the widest pair was, and which bands matched
+//! the human. `chess_stats` reads several of those files, checks they
+//! describe the same positions, and puts error bars on the differences
+//! ([`algocline_nn::chess::records`],
+//! [`algocline_nn::chess::steerability`]).
+//!
+//! Without the game index the error bars are not available at all: 3,000
+//! positions come from roughly 95 games and positions within one game
+//! are correlated, so a bootstrap has to resample games rather than
+//! positions and nothing else here retained which game a position was
+//! from.
 //!
 //! # Why not move match
 //!
@@ -54,17 +86,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device};
 use cozy_chess::Board;
 
 use algocline_nn::arch::Gpt2Model;
+use algocline_nn::chess::batch::BandBatch;
 use algocline_nn::chess::corpus::ScoredSide;
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
+use algocline_nn::chess::records::{GammaRecord, PositionRecord, Walk, WalkHeader, FORMAT_VERSION};
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::window::{play_row, COND_PREFIX_LEN};
-use algocline_nn::chess::{CondEncoding, ModelShape};
+use algocline_nn::chess::ModelShape;
 use algocline_nn::metric::{self, MetricError};
 
 /// Jensen-Shannon divergence in bits, via [`algocline_nn::metric::js`].
@@ -170,7 +204,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ckpt: PathBuf = args
         .next()
         .ok_or(
-            "usage: chess_cond <ckpt> <holdout.pgn> [side] [max_positions] [walk_band] [gammas]",
+            "usage: chess_cond <ckpt> <holdout.pgn> [side] [max_positions] [walk_band] \
+             [gammas] [records.jsonl]",
         )?
         .into();
     let pgn = args.next().ok_or("missing holdout pgn path")?;
@@ -190,13 +225,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .map(|s| s.trim().parse::<f32>())
         .collect::<Result<_, _>>()?;
+    // Absent by default: a walk that only wants the summary should not
+    // have to name a file it will never read.
+    let records_path: Option<PathBuf> = args.next().filter(|s| s != "-").map(PathBuf::from);
 
-    // This program builds the band into the row, so it can only read a
-    // checkpoint that was trained to look for it there. A per-position
-    // checkpoint carries the same tensors under the same names and
-    // would produce a complete set of numbers from a model that was
-    // never told which band it is playing as.
-    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
+    // Either conditioning convention. This used to be
+    // `load_as(.., Prefix)`, which refused a per-position checkpoint —
+    // and Phase 5 measures the per-position arm with this program, so
+    // that refusal made the plan unable to run its own measurement step.
+    //
+    // What the two conventions share is the row. Under both, a position
+    // is `[BOS, band] + moves`: the per-position arm keeps the band
+    // token deliberately, so that the two arms train on the same corpus
+    // with the same row lengths. What differs is one extra channel — the
+    // band also arrives as an argument to the forward pass, indexing a
+    // conditioning table of its own.
+    let shape = ModelShape::load_any(&ckpt)?;
     if shape.bands.len() < 2 {
         return Err(format!(
             "this checkpoint carries {} band(s); comparing conditions needs at least 2",
@@ -241,6 +285,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let mut positions = 0usize;
     let mut games = 0usize;
+    // Games that contributed at least one position. This is the one the
+    // error bars resample, and it is not `games` — see the increment.
+    let mut scoring_games = 0usize;
 
     let mut sweep: Vec<GammaStats> = gammas
         .iter()
@@ -316,6 +363,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut ce_uniform = Mean::default();
     let mut legal_count = Mean::default();
 
+    // Per-position records, kept only when a file was asked for. Held in
+    // memory and written once at the end rather than streamed, so that
+    // the header's counts are the file's counts and a run that died half
+    // way leaves nothing that could be mistaken for a shorter walk.
+    let mut records: Vec<PositionRecord> = Vec::new();
+    let recording = records_path.is_some();
+
     while positions < max_positions {
         let Some(game) = reader.next_game()? else {
             break;
@@ -327,7 +381,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if tokens.len() < 10 {
             continue;
         }
+        // Taken before the increment so it counts accepted games from
+        // zero. This is the bootstrap's cluster: positions inside one
+        // game share an opening and a pair of players, so an error bar
+        // that resampled positions would report a precision the sample
+        // does not have.
+        let game_index = games;
         games += 1;
+        // A game can pass the filter and still contribute nothing — the
+        // replay breaks, or the cap is reached mid-game. Those games are
+        // in `games` and are not clusters, so both counts are kept and
+        // both are printed.
+        let mut contributed = false;
 
         let mut board = Board::default();
         let mut moves_so_far: Vec<u32> = Vec::new();
@@ -345,41 +410,64 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if scored && positions < max_positions {
                 let legal = legal_moves(&board, &vocab);
                 if legal.len() >= 2 {
-                    // One forward for all bands: the rows differ only
-                    // in the condition token, so they batch cleanly.
-                    let rows: Vec<Vec<u32>> = band_ids
-                        .iter()
-                        .map(|id| {
-                            play_row(Some(*id), &moves_so_far, shape.ctx).map(|w| w.into_tokens())
-                        })
-                        .collect::<Result<_, _>>()?;
-                    let width = rows[0].len();
-                    let input = Tensor::from_vec(rows.concat(), (n_bands, width), &cfg.device)?;
-                    let out = model.forward(&input)?;
-                    let band_logits: Vec<Vec<f32>> = (0..n_bands)
-                        .map(|b| out.i((b, width - 1))?.to_vec1::<f32>())
-                        .collect::<Result<_, _>>()?;
+                    // One forward for all bands: the rows differ only in
+                    // the condition token, so they batch cleanly.
+                    //
+                    // `BandBatch` is what decides whether the band also
+                    // reaches the model as a forward argument, from the
+                    // checkpoint's own recorded encoding. Shared with
+                    // `chess_play` rather than written out here, because
+                    // this is the decision that produces ordinary-looking
+                    // moves from a model that was never told which band
+                    // it is, and one implementation under test beats two
+                    // that agree today.
+                    //
+                    // Guidance is untouched by the choice. Its reference
+                    // is the mean over the band rows' logits — the
+                    // population the bands were split out of — and that
+                    // is the same object however the band reached the
+                    // model. So `mean_logits` and `guide_logits` below
+                    // read the same way on both arms, and the sweep
+                    // still rides on these forwards rather than adding
+                    // any.
+                    let window = play_row(Some(band_ids[0]), &moves_so_far, shape.ctx)?;
+                    let batch = BandBatch::over_bands(&window, &shape, &vocab)?;
+                    let band_logits = batch.logits(&model, &cfg.device)?;
                     let reference = mean_logits(&band_logits);
 
                     let played_at = legal.iter().position(|(uci, _)| *uci == played);
+                    let mut gamma_records: Vec<GammaRecord> =
+                        Vec::with_capacity(if recording { sweep.len() } else { 0 });
 
                     for stats in sweep.iter_mut() {
                         let mut dists = Vec::with_capacity(n_bands);
+                        let mut mass_over_bands = 0.0f64;
                         for logits in &band_logits {
                             let guided = guide_logits(logits, &reference, stats.gamma);
                             let probs = softmax(&guided);
                             let on_legal: Vec<f32> =
                                 legal.iter().map(|(_, id)| probs[*id as usize]).collect();
-                            stats.legal_mass.push(on_legal.iter().sum::<f32>() as f64);
+                            let mass = on_legal.iter().sum::<f32>() as f64;
+                            stats.legal_mass.push(mass);
+                            mass_over_bands += mass;
                             dists.push(normalise(&on_legal));
                         }
                         let tops: Vec<usize> = dists.iter().map(|d| argmax(d)).collect();
-                        for (b, top) in tops.iter().enumerate() {
-                            if let Some(want) = played_at {
-                                stats.top1[b].push(if *top == want { 1.0 } else { 0.0 });
+                        // Hoisted out of the accumulators below because
+                        // the per-position record needs the same three
+                        // quantities the summary means over, and reading
+                        // them back off a `Mean` is not possible.
+                        let top1: Option<Vec<bool>> =
+                            played_at.map(|want| tops.iter().map(|t| *t == want).collect());
+                        let flipped = tops.iter().any(|t| *t != tops[0]);
+                        let widest = js_bits(&dists[0], &dists[n_bands - 1])?;
+
+                        if let Some(matched) = &top1 {
+                            for (b, hit) in matched.iter().enumerate() {
+                                stats.top1[b].push(if *hit { 1.0 } else { 0.0 });
                             }
                         }
-                        if tops.iter().any(|t| *t != tops[0]) {
+                        if flipped {
                             stats.top1_differs += 1;
                             for d in &dists {
                                 let mut sorted = d.clone();
@@ -389,9 +477,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         }
-                        stats
-                            .widest_js
-                            .push(js_bits(&dists[0], &dists[n_bands - 1])?);
+                        stats.widest_js.push(widest);
+                        if recording {
+                            gamma_records.push(GammaRecord {
+                                flipped,
+                                widest_js: widest,
+                                legal_mass: mass_over_bands / n_bands as f64,
+                                top1,
+                            });
+                        }
 
                         // The unguided pass also fills the detail.
                         if stats.gamma == 1.0 {
@@ -439,7 +533,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    if recording {
+                        records.push(PositionRecord {
+                            game: game_index,
+                            ply,
+                            at: gamma_records,
+                        });
+                    }
                     positions += 1;
+                    contributed = true;
                 }
             }
 
@@ -449,6 +551,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             moves_so_far.push(id);
         }
+        if contributed {
+            scoring_games += 1;
+        }
     }
 
     if positions == 0 {
@@ -457,9 +562,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n = positions as f64;
 
     println!("ckpt       {}", ckpt.display());
+    println!("encoding   {} conditioning", shape.encoding);
     println!("holdout    {pgn}");
+    // Two game counts, named apart. `scoring_games` is the clustering
+    // figure — the one every error bar resamples and the one
+    // `chess_stats` reports — while `games` counts everything the filter
+    // accepted, including games that broke on replay or arrived after
+    // the cap. Printing one number under the word "games" left the two
+    // tools able to disagree with no indication which was which.
     println!(
-        "walk       {positions} positions from {games} games, side {side:?}{}",
+        "walk       {positions} positions from {scoring_games} scoring game(s) \
+         ({games} accepted by the filter), side {side:?}{}",
         walk_token
             .as_ref()
             .map(|t| format!(", games of {t}"))
@@ -562,6 +675,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some(v) => println!("    {label:<12} {v:.4}  (n={})", m.n),
             None => println!("    {label:<12} (no positions)"),
         }
+    }
+
+    // Written after the summary rather than before it. Both orders
+    // return the error, and this one has already put the run's numbers
+    // on stdout by the time a failing write is reported — the walk is
+    // minutes of work and the summary is the part a person reads.
+    if let Some(path) = &records_path {
+        let walk = Walk {
+            header: WalkHeader {
+                version: FORMAT_VERSION,
+                ckpt: ckpt.display().to_string(),
+                holdout: pgn.clone(),
+                side: format!("{side:?}"),
+                encoding: shape.encoding,
+                ctx: shape.ctx,
+                bands: shape.band_tokens(),
+                gammas: gammas.clone(),
+                positions: records.len(),
+                games,
+            },
+            records,
+        };
+        walk.write_jsonl(path)?;
+        println!();
+        println!(
+            "records    {} position(s) from {scoring_games} scoring game(s) -> {}",
+            walk.records.len(),
+            path.display()
+        );
     }
     Ok(())
 }

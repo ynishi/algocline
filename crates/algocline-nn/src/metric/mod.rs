@@ -30,6 +30,17 @@
 //! consume these outputs as if they were meaningful. Every validation
 //! failure surfaces as a typed [`MetricError`] variant carrying enough
 //! context for the caller to locate and fix the source.
+//!
+//! # Sibling: error bars
+//!
+//! [`bootstrap`] sits beside the four primitives rather than inside the
+//! measurement that needed it first. It answers a different question —
+//! how precisely a statistic was measured, given that its observations
+//! arrive in correlated groups — and nothing in it is chess-specific,
+//! so burying it in the chess module would leave the next consumer
+//! copying it.
+
+pub mod bootstrap;
 
 use thiserror::Error;
 

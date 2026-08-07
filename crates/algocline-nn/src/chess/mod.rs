@@ -21,11 +21,31 @@
 //! - [`train`] hands a banded corpus to the conditioned training loop,
 //!   turning each row's band into the conditioning-table row the model
 //!   indexes by.
+//!
+//! Reading a checkpoint has one:
+//!
+//! - [`batch`] pairs the rows fed to the model with the conditioning
+//!   that belongs to them, and owns the forward. The band reaches a
+//!   per-position model through two channels at once, and a reader that
+//!   supplied one and forgot the other would produce ordinary-looking
+//!   moves from a model that was never told which band it is.
+//!
+//! Measurement has two of its own:
+//!
+//! - [`records`] writes out what one scoring walk saw at each position,
+//!   with the game it came from, so that several checkpoints scored in
+//!   separate processes can be read together afterwards.
+//! - [`steerability`] assembles the pre-registered hypotheses from
+//!   those records, with error bars that resample games rather than
+//!   positions.
 
+pub mod batch;
 pub mod corpus;
 pub mod filter;
 pub mod guide;
 pub mod pgn;
+pub mod records;
+pub mod steerability;
 pub mod train;
 pub mod vocab;
 pub mod window;
@@ -63,15 +83,26 @@ pub const HEADS: usize = 4;
 /// ablations, where 512 at one layer beat narrower models at four.
 pub const DIM: usize = 128;
 
+/// The one tensor that tells the two conditioning conventions apart on
+/// disk: the table [`crate::arch::Gpt2Model::forward_conditioned`]
+/// indexes into.
+///
+/// A per-position checkpoint carries it and a prefix one does not, which
+/// is what makes the recorded [`CondEncoding`] checkable against the
+/// weights themselves rather than only against a file sitting next to
+/// them. The name is the one [`crate::arch::Gpt2Model::new`] registers,
+/// so the two move together or the load fails on the name.
+pub const COND_TABLE_TENSOR: &str = "cond_wte.weight";
+
 /// How a checkpoint was told which band it is playing as.
 ///
 /// The two conventions are close enough on disk that a reader which
 /// guesses gets a plausible distribution out of the wrong one rather
 /// than an error. They differ by one tensor — see
-/// [`CondEncoding::EveryPosition`] — so a strict weight load catches a
-/// crossed pair as well, but only once it is loaded and only in one
-/// direction. This field is what makes the refusal happen first and in
-/// both directions.
+/// [`CondEncoding::EveryPosition`] — which is what
+/// [`ModelShape::load_any`] cross-checks the recorded value against, so
+/// that a sidecar describing other weights is caught rather than
+/// believed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CondEncoding {
@@ -224,8 +255,12 @@ pub enum ShapeError {
     /// current, and the one named by `stale` is what has to go. A
     /// caller that treated this like a failed write and removed
     /// `written` would leave the stale sidecar alone beside the new
-    /// weights — a checkpoint that reads as the wrong convention,
-    /// which is worse than one that does not read at all.
+    /// weights, which is a checkpoint describing itself as the
+    /// convention it is not. [`ModelShape::load_any`] refuses that
+    /// pairing on the weights themselves, so it is caught rather than
+    /// scored — but what it leaves an operator with is a contradiction
+    /// to work out, where keeping `written` and losing `stale` leaves a
+    /// checkpoint that simply loads.
     ///
     /// The paths are `PathBuf` rather than strings because this is the
     /// one variant a caller is expected to act on.
@@ -246,6 +281,59 @@ pub enum ShapeError {
         /// Underlying IO message.
         message: String,
     },
+    /// The weights themselves could not be read, so the recorded
+    /// encoding could not be checked against them.
+    ///
+    /// Distinct from [`ShapeError::Io`], which is about the sidecar. A
+    /// shape read beside weights that are not there describes nothing,
+    /// and every caller of [`ModelShape::load_any`] goes on to load
+    /// those weights — so this refuses at the point where the path is
+    /// still in hand rather than several steps later.
+    #[error(
+        "checkpoint {path}: the weights could not be read to check the shape against ({message})"
+    )]
+    WeightsUnreadable {
+        /// Checkpoint involved.
+        path: String,
+        /// Underlying message.
+        message: String,
+    },
+    /// The sidecar and the weights disagree about how the checkpoint was
+    /// conditioned.
+    ///
+    /// This is the one route the sidecar scheme cannot see on its own. A
+    /// per-position checkpoint that ends up beside only a stale
+    /// `*.shape.json` — hand-copied, or an `scp` that took one sidecar
+    /// and not the other — is not ambiguous and is not a mismatch
+    /// against the caller: it reads as prefix, and a prefix reader
+    /// agrees with it. Nothing further along notices, because the
+    /// readers load weights through a mmapped `VarBuilder`, which asks
+    /// only for the names its model wants and never sees
+    /// [`COND_TABLE_TENSOR`] sitting in the file unrequested.
+    ///
+    /// Both directions are real. A per-position checkpoint read as
+    /// prefix is scored with the condition delivered through one channel
+    /// instead of two; a prefix checkpoint read as per-position asks for
+    /// a table that is not there, which the weight load would refuse —
+    /// but only after the shape has already decided how the rows are
+    /// built.
+    #[error(
+        "checkpoint {path} has a sidecar recording {declared} conditioning, but its weights are \
+         {implied}: `{tensor}` is present in a per-position checkpoint and in no other. One of \
+         the two belongs to a different run — a sidecar left behind by a copy is the usual \
+         cause — and reading it anyway scores these weights under the wrong convention with \
+         every number well-formed"
+    )]
+    EncodingContradictsWeights {
+        /// Checkpoint involved.
+        path: String,
+        /// What the sidecar records.
+        declared: CondEncoding,
+        /// What the presence or absence of [`COND_TABLE_TENSOR`] says.
+        implied: CondEncoding,
+        /// The tensor the two were compared over.
+        tensor: &'static str,
+    },
     /// One checkpoint, two shape files, one per conditioning
     /// convention.
     ///
@@ -264,6 +352,36 @@ pub enum ShapeError {
         /// Per-position sidecar.
         second: String,
     },
+}
+
+/// Which convention the weights on disk were built under, read from the
+/// tensor names rather than from anything written beside them.
+///
+/// The safetensors header is a name-to-descriptor map at the front of
+/// the file, so this reads the header and nothing else: no tensor is
+/// materialised and the mapping is dropped on return.
+///
+/// This is deliberately not the reader the models load through.
+/// `VarBuilder` answers "is the tensor I asked for here", which cannot
+/// see a tensor nobody asked for — and an unrequested
+/// [`COND_TABLE_TENSOR`] is exactly the state a stale prefix sidecar
+/// leaves behind.
+fn encoding_of_weights(ckpt: &Path) -> Result<CondEncoding, ShapeError> {
+    // SAFETY: the same discipline every other safetensors load in this
+    // crate follows — the file must not be truncated while the mapping
+    // is alive. It is created and dropped inside this call, and the
+    // checkpoints this reads are written once and then only read.
+    let weights =
+        unsafe { candle_core::safetensors::MmapedSafetensors::new(ckpt) }.map_err(|e| {
+            ShapeError::WeightsUnreadable {
+                path: ckpt.display().to_string(),
+                message: e.to_string(),
+            }
+        })?;
+    Ok(match weights.get(COND_TABLE_TENSOR).is_ok() {
+        true => CondEncoding::EveryPosition,
+        false => CondEncoding::Prefix,
+    })
 }
 
 impl ModelShape {
@@ -424,10 +542,70 @@ impl ModelShape {
     /// conditioning convention it was written under.
     ///
     /// Named for what it does rather than for being the default, so
-    /// that [`Self::load_as`] is the shorter thing to reach for. The
-    /// one caller that wants this is `chess_bake`'s resume check, which
-    /// has to be able to read a checkpoint of either convention in
-    /// order to compare it against the run's own.
+    /// that [`Self::load_as`] is the shorter thing to reach for. Three
+    /// callers want it, and all three can genuinely handle either
+    /// convention:
+    ///
+    /// - `chess_bake`'s resume check, which has to read a checkpoint of
+    ///   either convention in order to compare it against the run's own;
+    /// - `chess_cond`, which scores both — the row it builds is the same
+    ///   `[BOS, band] + moves` under each, and the encoding decides only
+    ///   whether the band is *also* passed to the forward pass as an
+    ///   index into `cond_wte`;
+    /// - `chess_play`, which plays both, and is the interesting one: its
+    ///   branch lives in [`crate::chess::batch::BandBatch`] rather than
+    ///   at the call site, so the encoding is consulted once for the two
+    ///   forwards that file needs.
+    ///
+    /// It is not a loophole around [`Self::load_as`]. A caller that
+    /// supports one convention has to say which, because the failure it
+    /// prevents is silent: the two conventions produce a complete set of
+    /// plausible numbers from each other's weights. Reach for this only
+    /// when the code after it branches on [`Self::encoding`].
+    ///
+    /// # Why the weights are opened here
+    ///
+    /// Everything above rests on the sidecar being the one that belongs
+    /// to these weights, and a single sidecar cannot say so. A stale
+    /// `*.shape.json` beside per-position weights is not ambiguous and
+    /// not a mismatch — it reads as prefix and a prefix reader agrees
+    /// with it. So the recorded encoding is checked against the weights
+    /// themselves: [`COND_TABLE_TENSOR`] is present exactly for
+    /// [`CondEncoding::EveryPosition`], and any other pairing is
+    /// [`ShapeError::EncodingContradictsWeights`].
+    ///
+    /// It sits here rather than in a verification function each reader
+    /// calls because this is already the single funnel — [`Self::load_as`]
+    /// goes through it, so every reader in the workspace is covered by
+    /// one call site rather than by five that each have to remember.
+    ///
+    /// That is a narrowed surface, not an impossibility, and the
+    /// difference is worth stating because an earlier version of this
+    /// paragraph claimed the stronger thing. `ModelShape` is `pub` and
+    /// derives `Deserialize`, and [`Self::path_for`] and
+    /// [`Self::path_for_encoding`] are `pub`, so a reader that reaches
+    /// for `serde_json::from_str` on a sidecar path never arrives here
+    /// and is checked by nothing. Closing that would mean the shape can
+    /// only be built by a constructor that has seen the weights —
+    /// sealing the `Deserialize` behind a private wire type. Until then
+    /// this covers the readers that exist, and the way past it is a
+    /// route someone has to take deliberately.
+    ///
+    /// The cost is one extra open of the checkpoint, header only: the
+    /// mapping made here is dropped before this returns and no tensor is
+    /// materialised, and it happens once per checkpoint per run.
+    ///
+    /// The corollary is that the weights have to exist. A shape read
+    /// beside a checkpoint that is not there describes nothing, and every
+    /// caller of this loads those weights within a few lines; the one
+    /// that does not, `chess_bake`'s resume check, has already tested the
+    /// path with `is_file`.
+    ///
+    /// # Errors
+    ///
+    /// Both sidecars are present, neither is readable as a shape, the
+    /// weights cannot be opened, or the weights say the checkpoint was
+    /// conditioned the other way.
     pub fn load_any(ckpt: &Path) -> Result<Self, ShapeError> {
         let prefix_path = Self::path_for_encoding(ckpt, CondEncoding::Prefix);
         let other_path = Self::path_for_encoding(ckpt, CondEncoding::EveryPosition);
@@ -438,10 +616,11 @@ impl ModelShape {
         // single-name scheme it replaced: it returned a stale prefix
         // shape for a per-position checkpoint, so `require_encoding`
         // compared the caller against the wrong file and agreed with
-        // it. The weight load does not catch that either — the readers
-        // go through a mmapped `VarBuilder`, which asks for the names
-        // the model wants and never notices `cond_wte.weight` sitting
-        // in the file unrequested.
+        // it. Nothing downstream catches that either — the readers go
+        // through a mmapped `VarBuilder`, which asks for the names the
+        // model wants and never notices `cond_wte.weight` sitting in
+        // the file unrequested, which is why the cross-check below has
+        // to look at the name list itself.
         let path = match (prefix_path.is_file(), other_path.is_file()) {
             (true, true) => {
                 return Err(ShapeError::AmbiguousSidecar {
@@ -456,10 +635,20 @@ impl ModelShape {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        serde_json::from_str(&body).map_err(|e| ShapeError::Parse {
+        let shape: Self = serde_json::from_str(&body).map_err(|e| ShapeError::Parse {
             path: path.display().to_string(),
             message: e.to_string(),
-        })
+        })?;
+        let implied = encoding_of_weights(ckpt)?;
+        if implied != shape.encoding {
+            return Err(ShapeError::EncodingContradictsWeights {
+                path: ckpt.display().to_string(),
+                declared: shape.encoding,
+                implied,
+                tensor: COND_TABLE_TENSOR,
+            });
+        }
+        Ok(shape)
     }
 
     /// Read the shape and refuse it unless it was conditioned the way
@@ -512,6 +701,34 @@ mod tests {
         shape
     }
 
+    /// Weights beside a checkpoint, under the convention `encoding`
+    /// names.
+    ///
+    /// Two tensors is enough: nothing here builds a model, and what the
+    /// cross-check reads is the name list in the safetensors header. The
+    /// per-position file carries [`COND_TABLE_TENSOR`] and the prefix
+    /// one does not, which is the whole of the difference on disk.
+    fn write_weights(ckpt: &Path, encoding: CondEncoding) {
+        use candle_core::Tensor;
+        use std::collections::HashMap;
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        let zeros = |rows: usize| Tensor::zeros((rows, 4), DType::F32, &Device::Cpu).unwrap();
+        tensors.insert("wte.weight".into(), zeros(8));
+        if encoding == CondEncoding::EveryPosition {
+            tensors.insert(COND_TABLE_TENSOR.into(), zeros(2));
+        }
+        candle_core::safetensors::save(&tensors, ckpt).expect("weights on disk");
+    }
+
+    /// A checkpoint and the sidecar that belongs to it.
+    fn a_checkpoint(dir: &Path, encoding: CondEncoding) -> PathBuf {
+        let ckpt = dir.join("run.safetensors");
+        write_weights(&ckpt, encoding);
+        a_shape(encoding).save(&ckpt).unwrap();
+        ckpt
+    }
+
     #[test]
     fn compact_defaults_to_the_prefix_convention() {
         assert_eq!(
@@ -523,8 +740,7 @@ mod tests {
     #[test]
     fn the_encoding_survives_a_round_trip() {
         let tmp = TempDir::new().unwrap();
-        let ckpt = tmp.path().join("run.safetensors");
-        a_shape(CondEncoding::EveryPosition).save(&ckpt).unwrap();
+        let ckpt = a_checkpoint(tmp.path(), CondEncoding::EveryPosition);
         let back = ModelShape::load_any(&ckpt).unwrap();
         assert_eq!(back.encoding, CondEncoding::EveryPosition);
     }
@@ -557,7 +773,10 @@ mod tests {
     fn a_second_bake_under_the_other_encoding_is_not_readable_as_the_first() {
         let tmp = TempDir::new().unwrap();
         let ckpt = tmp.path().join("run.safetensors");
+        write_weights(&ckpt, CondEncoding::Prefix);
         a_shape(CondEncoding::Prefix).save(&ckpt).unwrap();
+        // The second bake replaces the weights as well as the sidecar.
+        write_weights(&ckpt, CondEncoding::EveryPosition);
         a_shape(CondEncoding::EveryPosition).save(&ckpt).unwrap();
         assert!(
             !ModelShape::path_for(&ckpt).exists(),
@@ -688,8 +907,7 @@ mod tests {
     #[test]
     fn a_per_position_checkpoint_is_refused_by_a_prefix_reader() {
         let tmp = TempDir::new().unwrap();
-        let ckpt = tmp.path().join("run.safetensors");
-        a_shape(CondEncoding::EveryPosition).save(&ckpt).unwrap();
+        let ckpt = a_checkpoint(tmp.path(), CondEncoding::EveryPosition);
         let msg = match ModelShape::load_as(&ckpt, CondEncoding::Prefix) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected the mismatch to be refused"),
@@ -703,10 +921,93 @@ mod tests {
     #[test]
     fn a_prefix_checkpoint_is_refused_by_a_per_position_reader() {
         let tmp = TempDir::new().unwrap();
-        let ckpt = tmp.path().join("run.safetensors");
-        a_shape(CondEncoding::Prefix).save(&ckpt).unwrap();
+        let ckpt = a_checkpoint(tmp.path(), CondEncoding::Prefix);
         let err = ModelShape::load_as(&ckpt, CondEncoding::EveryPosition);
         assert!(matches!(err, Err(ShapeError::EncodingMismatch { .. })));
+    }
+
+    /// The route the sidecar scheme cannot see: weights that condition
+    /// every position, beside a prefix sidecar left over from another
+    /// run.
+    ///
+    /// Nothing else refuses this. There is one sidecar, so it is not
+    /// ambiguous; it says prefix, so a prefix reader agrees with it; and
+    /// the weight load asks only for the tensors its model wants, so
+    /// `cond_wte.weight` sits there unrequested and unnoticed. Scored,
+    /// it delivers the condition through one channel instead of two and
+    /// every number that comes out is well-formed.
+    #[test]
+    fn a_stale_prefix_sidecar_beside_per_position_weights_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        write_weights(&ckpt, CondEncoding::EveryPosition);
+        let body = serde_json::to_string(&a_shape(CondEncoding::Prefix)).unwrap();
+        std::fs::write(ModelShape::path_for(&ckpt), body).unwrap();
+
+        let err = ModelShape::load_any(&ckpt).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShapeError::EncodingContradictsWeights {
+                    declared: CondEncoding::Prefix,
+                    implied: CondEncoding::EveryPosition,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // And through the entry point a reader actually uses, where the
+        // caller and the sidecar agree with each other and are both
+        // wrong about these weights.
+        assert!(ModelShape::load_as(&ckpt, CondEncoding::Prefix).is_err());
+    }
+
+    /// The other direction: prefix weights beside a per-position
+    /// sidecar, which is what a copy that took `run.shape2.json` and
+    /// the wrong checkpoint leaves.
+    ///
+    /// The weight load would refuse this one eventually — it asks for a
+    /// table that is not there — but only after the shape has already
+    /// decided how the rows are built and what the forward is called
+    /// with.
+    #[test]
+    fn a_per_position_sidecar_beside_prefix_weights_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        write_weights(&ckpt, CondEncoding::Prefix);
+        let body = serde_json::to_string(&a_shape(CondEncoding::EveryPosition)).unwrap();
+        std::fs::write(
+            ModelShape::path_for_encoding(&ckpt, CondEncoding::EveryPosition),
+            body,
+        )
+        .unwrap();
+
+        let err = ModelShape::load_any(&ckpt).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShapeError::EncodingContradictsWeights {
+                    declared: CondEncoding::EveryPosition,
+                    implied: CondEncoding::Prefix,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A sidecar with no weights beside it describes nothing, and says
+    /// so here rather than a few lines later in whichever reader asked.
+    #[test]
+    fn a_shape_beside_absent_weights_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        a_shape(CondEncoding::Prefix).save(&ckpt).unwrap();
+        let err = ModelShape::load_any(&ckpt).unwrap_err();
+        assert!(
+            matches!(err, ShapeError::WeightsUnreadable { .. }),
+            "{err:?}"
+        );
     }
 
     /// Every checkpoint baked before the field existed has a sidecar
@@ -715,6 +1016,7 @@ mod tests {
     fn a_sidecar_with_no_encoding_field_loads_as_prefix() {
         let tmp = TempDir::new().unwrap();
         let ckpt = tmp.path().join("run.safetensors");
+        write_weights(&ckpt, CondEncoding::Prefix);
         let body = r#"{
             "layers": 4,
             "heads": 6,

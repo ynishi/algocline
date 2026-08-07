@@ -419,6 +419,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms sharing a checkpoint produce a complete set of well-formed
   numbers with the noise floor silently zero.
 
+  The format is at version 2, and a reader accepts the range
+  `MIN_READABLE_VERSION ..= FORMAT_VERSION` rather than one exact
+  version. The two constants are separate so that the floor has to be
+  raised deliberately: a range is only sound while every version in it
+  is the same shape plus fields that default, and a change that
+  reinterprets an existing field has to move `MIN_READABLE_VERSION` in
+  the same commit. Nothing enforces that — it is a rule someone
+  follows.
+
+  Version 2 adds `GammaRecord::top2_margin`: the reference band's gap
+  between its top two legal moves, renormalised over the legal set, at
+  that gamma. It is written and not yet read. The flip rate — the share
+  of positions where changing the band changes the top-ranked move —
+  depends on how close those two already were, so a sharper model flips
+  less for the same conditioning. Arms from one run share a training
+  setup and therefore a confidence regime, which is what makes their
+  flip rates comparable; two *formulations* do not, and comparing them
+  without the margin would read sharpness as steerability. `None` means
+  the line was written at version 1, not that the margin was undefined.
+
 - `metric::bootstrap::cluster_bootstrap` — resampling over clusters
   rather than over rows. Positions from one game are not independent,
   so an interval computed per position is too narrow. Takes a

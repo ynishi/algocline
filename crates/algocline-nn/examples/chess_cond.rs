@@ -95,7 +95,9 @@ use algocline_nn::chess::corpus::ScoredSide;
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
-use algocline_nn::chess::records::{GammaRecord, PositionRecord, Walk, WalkHeader, FORMAT_VERSION};
+use algocline_nn::chess::records::{
+    top2_margin, GammaRecord, PositionRecord, Walk, WalkHeader, FORMAT_VERSION,
+};
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::window::{play_row, COND_PREFIX_LEN};
 use algocline_nn::chess::ModelShape;
@@ -469,12 +471,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if flipped {
                             stats.top1_differs += 1;
+                            // The arithmetic the record carries, over a
+                            // different selection: every band, and only
+                            // where a flip happened. Sharing the function
+                            // rather than repeating the sort is what keeps
+                            // the summary and the records from drifting
+                            // into two definitions of one word.
+                            //
+                            // It replaced a local sort that read
+                            // `sorted[0] - sorted.get(1).unwrap_or(0.0)`.
+                            // The two agree on every distribution this
+                            // loop can be handed and differ on one it
+                            // cannot: a single entry, where the old form
+                            // returned the entry and this returns 1.0.
+                            // The walk enters only under `legal.len() >= 2`
+                            // and `dists` entries carry that length, so
+                            // the differing case is unreachable from here
+                            // — which is a property of the guard above,
+                            // not of these two expressions.
                             for d in &dists {
-                                let mut sorted = d.clone();
-                                sorted.sort_by(|a, b| b.total_cmp(a));
-                                stats.flip_margin.push(
-                                    (sorted[0] - sorted.get(1).copied().unwrap_or(0.0)) as f64,
-                                );
+                                stats.flip_margin.push(top2_margin(d));
                             }
                         }
                         stats.widest_js.push(widest);
@@ -484,6 +500,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 widest_js: widest,
                                 legal_mass: mass_over_bands / n_bands as f64,
                                 top1,
+                                // From `dists[0]` — the same array
+                                // `tops[0]` was taken from, and already
+                                // renormalised over the legal moves by
+                                // `normalise` above. Read off it here
+                                // rather than recomputed, so the margin
+                                // and the flip it belongs to cannot come
+                                // to describe different distributions.
+                                top2_margin: Some(top2_margin(&dists[0])),
                             });
                         }
 

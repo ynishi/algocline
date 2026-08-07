@@ -824,6 +824,10 @@ mod tests {
                         widest_js: js(ply),
                         legal_mass: 0.9,
                         top1: Some(vec![true, false, false]),
+                        // Absent throughout these fixtures: nothing here
+                        // reads the margin, and a number no assertion
+                        // depends on would read as though one did.
+                        top2_margin: None,
                     }],
                 });
             }
@@ -1000,6 +1004,7 @@ mod tests {
                     widest_js: 0.02,
                     legal_mass: 0.9,
                     top1: Some(vec![true, false, false]),
+                    top2_margin: None,
                 }],
             })
             .collect();
@@ -1325,6 +1330,7 @@ mod tests {
                                 widest_js: js,
                                 legal_mass: 0.83,
                                 top1: Some(vec![true, false, false]),
+                                top2_margin: None,
                             })
                             .collect(),
                     })

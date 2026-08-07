@@ -60,13 +60,34 @@ use thiserror::Error;
 
 use crate::chess::CondEncoding;
 
-/// Format version carried in every header.
+/// Format version carried in every header, and the version this build
+/// writes.
 ///
-/// Bumped when a field changes meaning. A reader refuses a version it
-/// does not know rather than interpreting unfamiliar fields as absent,
-/// which is the same stance [`crate::chess::ModelShape`] takes for the
-/// same reason.
-pub const FORMAT_VERSION: u32 = 1;
+/// Version 2 added [`GammaRecord::top2_margin`] and changed nothing
+/// else. A reader accepts [`MIN_READABLE_VERSION`] through this and
+/// refuses anything outside that range rather than interpreting
+/// unfamiliar fields as absent, which is the same stance
+/// [`crate::chess::ModelShape`] takes for the same reason.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Oldest version this build still reads.
+///
+/// A version 1 record carries no `top2_margin`, and the field defaults
+/// to `None`, so a version 1 file parses into exactly what it said
+/// rather than into a fabricated number. That matters concretely: the
+/// walks Phase 5 was confirmed on are version 1 files, and refusing
+/// them to gain a field nothing reads yet would discard the evidence
+/// for a settled result.
+///
+/// It is a constant of its own rather than a `1` written into the
+/// comparison because it has to be **raised by hand** the first time a
+/// bump is not purely additive. Accepting a range is sound only while
+/// every version in it is the same shape plus fields that default: a
+/// change that reinterprets an existing field leaves an old file
+/// parsing cleanly into something it never meant, and has to move this
+/// floor in the same commit that makes it. Nothing here enforces that.
+/// It is a rule whoever bumps [`FORMAT_VERSION`] has to follow.
+pub const MIN_READABLE_VERSION: u32 = 1;
 
 /// What a walk was, so its records can be interpreted and compared.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,6 +162,95 @@ pub struct GammaRecord {
     /// counting an unscoreable position as a miss would drag the top-1
     /// figure down by however many of them there were.
     pub top1: Option<Vec<bool>>,
+    /// The reference band's top-two margin among legal moves, at this
+    /// gamma.
+    ///
+    /// Take the first band's distribution, restrict it to the legal
+    /// moves, renormalise it to sum to one, and subtract the second
+    /// largest entry from the largest. [`top2_margin`] is the
+    /// computation, and its edge case is documented there.
+    ///
+    /// The first band because that is the band [`GammaRecord::flipped`]
+    /// is defined against — a flip is any band's top legal move
+    /// differing from the *first* band's — so this says how contestable
+    /// the reference ranking was.
+    ///
+    /// Not a threshold anything crosses. The band that flips has its own
+    /// guided distribution and its argmax is taken there, not against
+    /// this number; a wide gap here can still be flipped by a band that
+    /// ranks the position differently throughout. What it measures is
+    /// how near the reference came to ranking differently by itself,
+    /// which is the quantity that makes flip rates comparable or not.
+    ///
+    /// Renormalised because the raw distribution puts most of its mass
+    /// on illegal moves and that share varies by arm; a margin read off
+    /// the raw distribution would carry the legal mass with it.
+    ///
+    /// Per gamma because guidance changes the distribution, so how
+    /// contestable the ranking is, is a per-gamma quantity like the
+    /// others.
+    ///
+    /// # Why it is here
+    ///
+    /// Whether a flip happens depends on how close the top two legal
+    /// moves already were, so a more confident model flips less for the
+    /// same conditioning strength. Within one experiment that is
+    /// harmless — the arms share a training setup and therefore a
+    /// confidence regime, and the comparison between them is fair. It
+    /// stops being harmless the moment two *formulations* are compared,
+    /// a legal mask on or off or legality supplied as an input, because
+    /// those change how sharp the distribution is and flip rate would
+    /// then be measuring sharpness as much as steerability. This is
+    /// recorded so that the comparison can be made when it arrives;
+    /// nothing reads it yet.
+    ///
+    /// `None` on a record written at format version 1, before the field
+    /// existed: a version 1 file is still read
+    /// ([`MIN_READABLE_VERSION`]), and it has nothing to say here.
+    ///
+    /// That is why the field is optional, and no writer of a real walk
+    /// produces `None` at version 2 — `chess_cond` is the only one, and
+    /// it always writes `Some`. It is not an invariant of the type
+    /// though: test fixtures in [`crate::chess::steerability`] build
+    /// version 2 records with `None`, because nothing reads the field
+    /// and filling it would be inventing a number to satisfy a shape.
+    /// A reader that starts using it has to decide what `None` means to
+    /// it rather than assume the version tells it.
+    #[serde(default)]
+    pub top2_margin: Option<f64>,
+}
+
+/// Largest entry of a legal-move distribution, less the second largest.
+///
+/// `over_legal` is expected to be renormalised over the legal moves
+/// already — the same array the top move is chosen from, so that the
+/// margin and the flip it belongs to cannot come from two different
+/// distributions.
+///
+/// # Fewer than two entries
+///
+/// A distribution over one move has no second largest. Returns `1.0`
+/// there: the decision is maximally forced and no flip is possible at
+/// it. `None` is the other option and is worse — a forced position
+/// excluded from the margin while still counting in the flip-rate
+/// denominator would make the two quantities describe different
+/// samples.
+///
+/// The empty slice takes the same branch. It is not a distribution and
+/// has no margin at all; `1.0` is returned rather than a panic because
+/// this function is total, not because the value means anything there.
+///
+/// Neither case arises from the walk that feeds this. `chess_cond`
+/// admits a position only when it offers at least two legal moves that
+/// are in the vocabulary (`if legal.len() >= 2`), so both are filtered
+/// out before any distribution is built.
+pub fn top2_margin(over_legal: &[f32]) -> f64 {
+    let mut sorted = over_legal.to_vec();
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    match (sorted.first(), sorted.get(1)) {
+        (Some(first), Some(second)) => (first - second) as f64,
+        _ => 1.0,
+    }
 }
 
 /// Just enough of a header to decide whether this build can read the
@@ -194,16 +304,20 @@ pub enum RecordError {
         path: String,
     },
 
-    /// The header names a format this build does not know.
+    /// The header names a version outside the range this build reads.
     #[error(
-        "record file {path} is format version {found}, and this build reads version {expected}; \
-         a field may have changed meaning, so it is refused rather than read as though it had not"
+        "record file {path} is format version {found}, and this build reads versions \
+         {readable_from} through {expected}; outside that range a field may have changed \
+         meaning, so it is refused rather than read as though it had not"
     )]
     Version {
         /// Path involved.
         path: String,
-        /// Version this build writes and reads.
+        /// Newest version this build reads, which is also the one it
+        /// writes ([`FORMAT_VERSION`]).
         expected: u32,
+        /// Oldest version this build reads ([`MIN_READABLE_VERSION`]).
+        readable_from: u32,
         /// Version the file declares.
         found: u32,
     },
@@ -299,20 +413,27 @@ impl Walk {
             None => return Err(RecordError::Empty { path: display }),
         };
         // The version is read on its own first, from a probe that allows
-        // unknown fields. `WalkHeader` denies them, so a version 2 file
-        // that merely *added* one would fail as an unreadable line with
-        // a serde message and never reach the clear refusal that exists
-        // for exactly that case: the field meant to catch a future
-        // format would be defeated by the strictness sitting beside it.
+        // unknown fields. `WalkHeader` denies them, so a file from a
+        // later version that merely *added* one to the header would fail
+        // as an unreadable line with a serde message and never reach the
+        // clear refusal that exists for exactly that case: the field
+        // meant to catch a future format would be defeated by the
+        // strictness sitting beside it.
         let probe: VersionProbe = serde_json::from_str(&first).map_err(|e| RecordError::Parse {
             path: display.clone(),
             line: 1,
             message: e.to_string(),
         })?;
-        if probe.version != FORMAT_VERSION {
+        // A range rather than an equality, so that the walks written at
+        // version 1 stay readable. What makes that sound is that every
+        // version in the range is this shape with later fields absent,
+        // and `MIN_READABLE_VERSION` documents whose job it is to keep
+        // that true.
+        if probe.version < MIN_READABLE_VERSION || probe.version > FORMAT_VERSION {
             return Err(RecordError::Version {
                 path: display,
                 expected: FORMAT_VERSION,
+                readable_from: MIN_READABLE_VERSION,
                 found: probe.version,
             });
         }
@@ -890,6 +1011,7 @@ mod tests {
             widest_js: js,
             legal_mass: 0.5,
             top1: Some(vec![flipped, false, true]),
+            top2_margin: Some(0.125),
         }
     }
 
@@ -956,6 +1078,106 @@ mod tests {
             Walk::read_jsonl(&path),
             Err(RecordError::Version { .. })
         ));
+    }
+
+    /// And the other end of the range, which the test above cannot
+    /// reach: a version below the floor is refused just as a version
+    /// above the ceiling is. The range is bounded on both sides rather
+    /// than being "anything up to what I write", which is what will
+    /// matter the day [`MIN_READABLE_VERSION`] is raised — that is the
+    /// moment files which used to read have to stop reading.
+    #[test]
+    fn a_version_below_the_floor_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v0.jsonl");
+        let mut original = walk(1, 1, false);
+        original.header.version = MIN_READABLE_VERSION - 1;
+        original.write_jsonl(&path).unwrap();
+        let err = Walk::read_jsonl(&path);
+        assert!(
+            matches!(
+                err,
+                Err(RecordError::Version {
+                    found: 0,
+                    readable_from: MIN_READABLE_VERSION,
+                    expected: FORMAT_VERSION,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The whole reason the version check became a range: six walks
+    /// written at version 1 are the evidence for a confirmed result, and
+    /// a bump that made them unreadable would throw it away. A version 1
+    /// record carries no `top2_margin` and reads back as `None` — the
+    /// absence it actually is, not a fabricated number.
+    ///
+    /// Written as raw lines rather than through `write_jsonl`, because
+    /// this build cannot serialise a record without the field.
+    #[test]
+    fn a_version_1_file_still_reads_with_the_new_field_absent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v1.jsonl");
+        let header = r#"{"version": 1, "ckpt": "c", "holdout": "h", "side": "White", "encoding": "prefix", "ctx": 128, "bands": ["<lo>", "<hi>"], "gammas": [1.0], "positions": 1, "games": 1}"#;
+        let record = r#"{"game": 0, "ply": 4, "at": [{"flipped": true, "widest_js": 0.02, "legal_mass": 0.9, "top1": [true, false]}]}"#;
+        std::fs::write(&path, format!("{header}\n{record}\n")).unwrap();
+        let walk = Walk::read_jsonl(&path).expect("a version 1 walk is still readable");
+        assert_eq!(walk.header.version, 1);
+        assert_eq!(walk.records.len(), 1);
+        assert!(walk.records[0].at[0].flipped);
+        assert_eq!(walk.records[0].at[0].top2_margin, None);
+    }
+
+    /// And a record written now carries the margin through the file and
+    /// back, rather than the field existing only in memory.
+    #[test]
+    fn a_current_record_round_trips_its_margin() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v2.jsonl");
+        let mut original = walk(1, 1, true);
+        original.records[0].at[0].top2_margin = Some(0.375);
+        original.write_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"top2_margin\":0.375"), "{body}");
+        let back = Walk::read_jsonl(&path).unwrap();
+        assert_eq!(back.header.version, FORMAT_VERSION);
+        assert_eq!(back.records[0].at[0].top2_margin, Some(0.375));
+    }
+
+    /// The margin is the first minus the second, over the distribution
+    /// as given. Hand-built so the answer is arithmetic rather than
+    /// whatever the code happens to produce: the two largest entries are
+    /// 0.5 and 0.3, in neither the first nor the last position.
+    #[test]
+    fn the_margin_is_the_gap_between_the_top_two() {
+        let d = [0.1f32, 0.5, 0.05, 0.3, 0.05];
+        assert!((top2_margin(&d) - 0.2).abs() < 1e-6, "{}", top2_margin(&d));
+    }
+
+    /// A tie at the top is a margin of zero, which is the case the
+    /// figure exists to expose: a flip counted there crossed nothing.
+    #[test]
+    fn a_tie_at_the_top_is_a_margin_of_zero() {
+        let d = [0.4f32, 0.4, 0.2];
+        assert_eq!(top2_margin(&d), 0.0);
+    }
+
+    /// One legal move is a forced decision with no second place. It
+    /// reads as `1.0` rather than as absent, so that a forced position
+    /// counts in the margin and in the flip-rate denominator alike.
+    #[test]
+    fn a_single_legal_move_is_a_margin_of_one() {
+        // 0.7 rather than 1.0: a lone entry of 1.0 cannot tell the
+        // constant apart from an implementation that returned the
+        // largest entry, so the assertion would have passed either way
+        // and the name would not have been earned.
+        assert_eq!(top2_margin(&[0.7f32]), 1.0);
+        assert_eq!(top2_margin(&[1.0f32]), 1.0);
+        // The empty slice takes the same branch. Documented as total
+        // rather than meaningful: the walk cannot produce either.
+        assert_eq!(top2_margin(&[]), 1.0);
     }
 
     /// The case the version probe exists for, which the test above

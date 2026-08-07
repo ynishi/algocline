@@ -276,6 +276,7 @@ mod tests {
     use crate::arch::max_abs_diff_f32;
     use crate::chess::corpus::ConditionBand;
     use crate::chess::pgn::{move_from_uci_standard, uci_standard};
+    use crate::chess::vocab::BOS;
     use crate::chess::window::play_row;
     use candle_core::{DType, Device};
     use candle_nn::{VarBuilder, VarMap};
@@ -440,6 +441,84 @@ mod tests {
             dropped > 1e-5,
             "dropping the conditioning argument changed nothing, so this test could not \
              catch a reader that drops it (spread {dropped})"
+        );
+    }
+
+    /// The prefix arm, at the depth where it used to stop working.
+    ///
+    /// `two_bands_differ_at_ply_130` over in [`crate::chess::window`]
+    /// shows the two *rows* differ there. This shows the model reads
+    /// that difference, which is a separate claim: a row can differ at
+    /// a token the model then ignores, and on this arm that token is
+    /// the band's only channel — there is no argument to fall back on.
+    ///
+    /// The second half is what makes this a fence rather than an
+    /// observation. Under the tail slice `play_row` replaced,
+    /// `[BOS, band] + moves` cut to its last `ctx` tokens loses both
+    /// prefix tokens first, so every band yields the same row and the
+    /// condition can do nothing at all. That construction is rebuilt
+    /// here and asserted dead, so the half above is attributable to the
+    /// windowing repair rather than to these particular weights.
+    ///
+    /// This arm is the one to fence: three of the four rows in the
+    /// plan's decision table adopt prefix as the operating point, so it
+    /// is most likely what a person ends up playing against.
+    #[test]
+    fn the_prefix_band_still_reaches_the_model_at_ply_130() {
+        let vocab = vocab();
+        let shape = shape(CondEncoding::Prefix, &vocab);
+        let (model, device) = model_for(&shape);
+        let window = deep_window(&vocab);
+
+        let batch = BandBatch::over_bands(&window, &shape, &vocab).unwrap();
+        assert!(!batch.is_conditioned(), "the prefix arm takes no argument");
+        let logits = batch.logits(&model, &device).unwrap();
+
+        let device_tensor = |v: &Vec<f32>| Tensor::from_vec(v.clone(), (v.len(),), &device);
+        let spread = max_abs_diff_f32(
+            &device_tensor(&logits[0]).unwrap(),
+            &device_tensor(&logits[1]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            spread > 1e-5,
+            "the two bands produced the same logits at ply 130, so the band in the row \
+             reached nothing (spread {spread})"
+        );
+
+        // The construction this window replaced: keep the last `ctx`
+        // tokens of the whole row and let the prefix fall off the front.
+        let moves = knight_shuffle(130, &vocab);
+        let tail_rows: Vec<Vec<u32>> = BANDS
+            .iter()
+            .map(|token| {
+                let band = vocab.id_of(token).expect("a band token");
+                let mut row = vec![BOS, band];
+                row.extend_from_slice(&moves);
+                row[row.len() - CTX..].to_vec()
+            })
+            .collect();
+        assert_eq!(
+            tail_rows[0], tail_rows[1],
+            "a tail slice at this depth should leave the bands indistinguishable; if it \
+             does not, this game is too short to exercise the regime and the assertion \
+             below proves nothing"
+        );
+
+        let naive = BandBatch {
+            rows: tail_rows,
+            conds: None,
+        };
+        let naive_logits = naive.logits(&model, &device).unwrap();
+        let naive_spread = max_abs_diff_f32(
+            &device_tensor(&naive_logits[0]).unwrap(),
+            &device_tensor(&naive_logits[1]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            naive_spread, 0.0,
+            "identical rows must give identical logits; a difference here means the \
+             comparison above is measuring something other than the band"
         );
     }
 

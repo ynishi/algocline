@@ -96,7 +96,7 @@ use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader};
 use algocline_nn::chess::records::{
-    top2_margin, GammaRecord, PositionRecord, Walk, WalkHeader, FORMAT_VERSION,
+    ce_over_legal, top2_margin, GammaRecord, PositionRecord, Walk, WalkHeader, FORMAT_VERSION,
 };
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::window::{play_row, COND_PREFIX_LEN};
@@ -449,6 +449,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                     for stats in sweep.iter_mut() {
                         let mut dists = Vec::with_capacity(n_bands);
+                        // The same guided rows as `dists`, before the
+                        // softmax, restricted to the legal moves. Kept
+                        // because the cost of the played move is taken
+                        // in log space: `dists` is `f32`, and an entry
+                        // that underflowed there would read as an
+                        // infinite cost. `ce_over_legal` says the rest.
+                        let mut legal_logits: Vec<Vec<f32>> = Vec::with_capacity(n_bands);
                         let mut mass_over_bands = 0.0f64;
                         for logits in &band_logits {
                             let guided = guide_logits(logits, &reference, stats.gamma);
@@ -458,6 +465,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             let mass = on_legal.iter().sum::<f32>() as f64;
                             stats.legal_mass.push(mass);
                             mass_over_bands += mass;
+                            legal_logits
+                                .push(legal.iter().map(|(_, id)| guided[*id as usize]).collect());
                             dists.push(normalise(&on_legal));
                         }
                         let tops: Vec<usize> = dists.iter().map(|d| argmax(d)).collect();
@@ -467,6 +476,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // them back off a `Mean` is not possible.
                         let top1: Option<Vec<bool>> =
                             played_at.map(|want| tops.iter().map(|t| *t == want).collect());
+                        // Absent under the same condition as `top1`,
+                        // and from the same lookup: with the played
+                        // move outside the vocabulary there is nothing
+                        // to match a top move against and nothing to
+                        // take the log of. `ce_over_legal` returns
+                        // `None` only for an index past the end of its
+                        // row, and `want` came from searching the list
+                        // these rows were built from, so the `collect`
+                        // below does not drop a band on its own.
+                        //
+                        // Computed whether or not a record file was
+                        // asked for, because the summary's
+                        // "renormalised over legal" line is this same
+                        // quantity at gamma 1 and now reads it from
+                        // here.
+                        let ce: Option<Vec<f64>> = played_at.and_then(|want| {
+                            legal_logits
+                                .iter()
+                                .map(|row| ce_over_legal(row, want))
+                                .collect()
+                        });
                         let flipped = tops.iter().any(|t| *t != tops[0]);
                         let widest = js_bits(&dists[0], &dists[n_bands - 1])?;
 
@@ -506,6 +536,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 widest_js: widest,
                                 legal_mass: mass_over_bands / n_bands as f64,
                                 top1,
+                                ce: ce.clone(),
                                 // From `dists[0]` — the same array
                                 // `tops[0]` was taken from, and already
                                 // renormalised over the legal moves by
@@ -529,13 +560,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 for (b, logits) in band_logits.iter().enumerate() {
                                     let probs = softmax(logits);
                                     let p_true = probs[legal[want].1 as usize] as f64;
-                                    let mass: f64 = legal
-                                        .iter()
-                                        .map(|(_, id)| probs[*id as usize] as f64)
-                                        .sum();
-                                    if p_true > 0.0 && mass > 0.0 {
+                                    // The legal-mass guard that used to
+                                    // stand beside this one is implied
+                                    // by it: `p_true` is one of the
+                                    // non-negative terms of that sum, so
+                                    // a positive `p_true` is a positive
+                                    // mass. It was dropped along with
+                                    // the sum it guarded.
+                                    if p_true > 0.0 {
                                         ce_full[b].push(-p_true.ln());
-                                        ce_legal[b].push(-(p_true / mass).ln());
+                                        // The renormalised figure is
+                                        // the per-position cost the
+                                        // records now carry, at gamma
+                                        // 1 where guidance is the
+                                        // identity. Read from there
+                                        // rather than recomputed as
+                                        // `-(p_true / mass).ln()`, so
+                                        // that the summary line and the
+                                        // record cannot come to mean
+                                        // two different things by one
+                                        // word — the same reason
+                                        // `top2_margin` is a shared
+                                        // function.
+                                        //
+                                        // The same quantity, not the
+                                        // same bits. Two reasons, both
+                                        // small: it is taken in log
+                                        // space rather than as a ratio
+                                        // of `f32` sums, and it reads
+                                        // the guided row, where
+                                        // `r + 1*(c-r)` recovers `c` to
+                                        // within a rounding step rather
+                                        // than exactly.
+                                        if let Some(cost) = ce.as_ref().and_then(|v| v.get(b)) {
+                                            ce_legal[b].push(*cost);
+                                        }
                                     }
                                 }
                             }
@@ -567,6 +626,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         records.push(PositionRecord {
                             game: game_index,
                             ply,
+                            // The same set every band's row above was
+                            // restricted to, so a reader of `ce` can
+                            // read it against `ln(n_legal)` — what a
+                            // uniform draw over these moves would have
+                            // cost.
+                            n_legal: Some(legal.len()),
                             at: gamma_records,
                         });
                     }

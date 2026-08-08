@@ -63,21 +63,29 @@ use crate::chess::CondEncoding;
 /// Format version carried in every header, and the version this build
 /// writes.
 ///
-/// Version 2 added [`GammaRecord::top2_margin`] and changed nothing
-/// else. A reader accepts [`MIN_READABLE_VERSION`] through this and
-/// refuses anything outside that range rather than interpreting
-/// unfamiliar fields as absent, which is the same stance
-/// [`crate::chess::ModelShape`] takes for the same reason.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version 2 added [`GammaRecord::top2_margin`]. Version 3 added
+/// [`GammaRecord::ce`] and [`PositionRecord::n_legal`]. Neither bump
+/// changed a field that already existed. A reader accepts
+/// [`MIN_READABLE_VERSION`] through this and refuses anything outside
+/// that range rather than interpreting unfamiliar fields as absent,
+/// which is the same stance [`crate::chess::ModelShape`] takes for the
+/// same reason.
+///
+/// This is also the constant a reader consults to ask **whether a
+/// walk was in a position to write a given field**. The fields added
+/// after version 1 are all `Option`, and their `None` says what it
+/// says about the position rather than about the format; the version
+/// is where the format question is answered. See [`GammaRecord::ce`].
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Oldest version this build still reads.
 ///
-/// A version 1 record carries no `top2_margin`, and the field defaults
-/// to `None`, so a version 1 file parses into exactly what it said
-/// rather than into a fabricated number. That matters concretely: the
-/// walks Phase 5 was confirmed on are version 1 files, and refusing
-/// them to gain a field nothing reads yet would discard the evidence
-/// for a settled result.
+/// A version 1 record carries no `top2_margin`, no `ce` and no
+/// `n_legal`, and all three default to `None`, so a version 1 file
+/// parses into exactly what it said rather than into a fabricated
+/// number. That matters concretely: the walks Phase 5 was confirmed on
+/// are version 1 files, and refusing them to gain fields nothing reads
+/// yet would discard the evidence for a settled result.
 ///
 /// It is a constant of its own rather than a `1` written into the
 /// comparison because it has to be **raised by hand** the first time a
@@ -136,6 +144,26 @@ pub struct PositionRecord {
     pub game: usize,
     /// Ply within the game, counting from zero. The depth bucket.
     pub ply: usize,
+    /// How many legal moves the position offered.
+    ///
+    /// Here and not on [`GammaRecord`] because the legal set is a
+    /// property of the board: guidance changes how the mass is spread
+    /// over those moves and not which moves they are. Per gamma it
+    /// would be the same number written once per sweep entry, which
+    /// invites a reader to wonder which of them to trust.
+    ///
+    /// Recorded because a cross-entropy is read against the cost of a
+    /// uniform draw over the same moves, and that bar is `ln(n_legal)`.
+    /// Without it a reader of [`GammaRecord::ce`] can say a position
+    /// was expensive but not whether it was expensive for its size.
+    ///
+    /// `None` on a record written before format version 3. Whether a
+    /// walk was in a position to write it is a question about the
+    /// format, so ask it of [`WalkHeader::version`] rather than of this
+    /// field — the same reading [`GammaRecord::ce`] documents at
+    /// length.
+    #[serde(default)]
+    pub n_legal: Option<usize>,
     /// One entry per gamma in [`WalkHeader::gammas`], in that order.
     pub at: Vec<GammaRecord>,
 }
@@ -162,6 +190,55 @@ pub struct GammaRecord {
     /// counting an unscoreable position as a miss would drag the top-1
     /// figure down by however many of them there were.
     pub top1: Option<Vec<bool>>,
+    /// What the move actually played cost each band, in nats, at this
+    /// gamma.
+    ///
+    /// The negative natural log of the probability that band gives the
+    /// played move, once its distribution is restricted to the legal
+    /// moves and renormalised. [`ce_over_legal`] is the computation.
+    /// One entry per band, in [`WalkHeader::bands`] order, as
+    /// [`GammaRecord::top1`] is.
+    ///
+    /// Per gamma because guidance changes the distribution, and per
+    /// band for the reason `top1` is: the two answer the same question
+    /// at different resolutions — which band ranked the human's move
+    /// first, and how much mass each of them put on it.
+    ///
+    /// Renormalised over the legal moves rather than read off the full
+    /// vocabulary, so that a band which spends more of its mass on
+    /// illegal moves is not charged for that here. The full-vocabulary
+    /// figure is a different quantity and `chess_cond` prints it
+    /// beside this one in its summary.
+    ///
+    /// # `None`
+    ///
+    /// The position could not be scored: the move actually played is
+    /// not in the vocabulary, so there is no entry to take a log of.
+    /// The same condition that makes `top1` absent, and in `chess_cond`
+    /// the same lookup — both come from the played move's index in the
+    /// legal list, and the rows this is computed over are built from
+    /// that same list, so the index is in range whenever it exists.
+    /// That is an argument about the writer and not a property of this
+    /// type, which will hold whatever a caller puts in it.
+    ///
+    /// **Not** a statement about the format. A record written before
+    /// version 3 has no `ce` at all and reads back as `None` too, and
+    /// the two are indistinguishable here by design: the field says
+    /// what the walk found, and a reader that needs to know whether a
+    /// walk was in a position to look asks [`WalkHeader::version`] for
+    /// `>= 3` instead. Collapsing both readings into one `Option` is
+    /// what leaves [`GammaRecord::top2_margin`]'s absence ambiguous;
+    /// the ambiguity is settled here by moving the format question out
+    /// of the field rather than by giving the field a third state.
+    ///
+    /// # Why it is here
+    ///
+    /// The next experiment's power calculation needs the per-game
+    /// variance of this quantity, and no walk has ever recorded it —
+    /// the fields beside it say where the mass went and how the moves
+    /// ranked, not what the human's move cost. Nothing reads it yet.
+    #[serde(default)]
+    pub ce: Option<Vec<f64>>,
     /// The reference band's top-two margin among legal moves, at this
     /// gamma.
     ///
@@ -216,8 +293,65 @@ pub struct GammaRecord {
     /// and filling it would be inventing a number to satisfy a shape.
     /// A reader that starts using it has to decide what `None` means to
     /// it rather than assume the version tells it.
+    ///
+    /// Whether a walk was **in a position** to write the field is the
+    /// one part of that a reader can settle without guessing:
+    /// [`WalkHeader::version`] of `>= 2` says the format had it. The
+    /// same route works for the fields added since, and is the only
+    /// route [`GammaRecord::ce`] offers.
     #[serde(default)]
     pub top2_margin: Option<f64>,
+}
+
+/// Cross-entropy at the move that was played, over the legal moves.
+///
+/// `legal_logits` holds one logit per legal move, in the order the
+/// legal moves are listed, and `played` is the played move's index in
+/// that list. The result is the negative natural log of the
+/// probability that move receives once the distribution is restricted
+/// to those moves and renormalised: the log-sum-exp of the row, less
+/// the played move's own logit.
+///
+/// Shift-invariant, because it is a renormalised quantity — adding a
+/// constant to every legal logit leaves the answer alone. A row of
+/// equal logits returns `ln(n)`, the cost of a uniform draw over `n`
+/// moves, which is the bar `chess_cond` reads its loss decomposition
+/// against.
+///
+/// # Why from logits rather than from the renormalised probabilities
+///
+/// They are the same number, until an entry underflows. The walk's
+/// distributions are `f32` softmaxes, and a legal move far enough
+/// below the row's maximum lands on exactly zero there; `-ln(0)` is an
+/// infinity, `serde_json` writes a non-finite float as `null`, and a
+/// `Vec<f64>` does not read `null` back — so a walk that recorded one
+/// would write a file its own reader refuses. In log space the same
+/// position reads as a large finite number, which is what it is.
+///
+/// # `None`
+///
+/// `played` is past the end of the row. A caller whose index came from
+/// searching the same list the row was built from will not reach it.
+/// One that pairs a row with another position's index reaches it only
+/// when that position had more legal moves; otherwise the index lands
+/// inside the row and this returns a number for the wrong move. The
+/// check is a bound, not an agreement between the two.
+pub fn ce_over_legal(legal_logits: &[f32], played: usize) -> Option<f64> {
+    let target = f64::from(*legal_logits.get(played)?);
+    // Subtracting the maximum before exponentiating, for the reason
+    // any softmax does: a row of large logits overflows otherwise, and
+    // the shift cancels in the result.
+    let max = f64::from(
+        legal_logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max),
+    );
+    let total: f64 = legal_logits
+        .iter()
+        .map(|l| (f64::from(*l) - max).exp())
+        .sum();
+    Some(max + total.ln() - target)
 }
 
 /// Largest entry of a legal-move distribution, less the second largest.
@@ -1011,6 +1145,7 @@ mod tests {
             widest_js: js,
             legal_mass: 0.5,
             top1: Some(vec![flipped, false, true]),
+            ce: Some(vec![1.5, 2.0, 2.5]),
             top2_margin: Some(0.125),
         }
     }
@@ -1035,6 +1170,7 @@ mod tests {
                 records.push(PositionRecord {
                     game,
                     ply: ply * 2,
+                    n_legal: Some(31),
                     at: vec![gamma_record(flipped, 0.02), gamma_record(flipped, 0.05)],
                 });
             }
@@ -1111,13 +1247,13 @@ mod tests {
     /// The whole reason the version check became a range: six walks
     /// written at version 1 are the evidence for a confirmed result, and
     /// a bump that made them unreadable would throw it away. A version 1
-    /// record carries no `top2_margin` and reads back as `None` — the
-    /// absence it actually is, not a fabricated number.
+    /// record carries none of the fields added since and reads them back
+    /// as `None` — the absence it actually is, not a fabricated number.
     ///
     /// Written as raw lines rather than through `write_jsonl`, because
-    /// this build cannot serialise a record without the field.
+    /// this build cannot serialise a record without those fields.
     #[test]
-    fn a_version_1_file_still_reads_with_the_new_field_absent() {
+    fn a_version_1_file_still_reads_with_the_later_fields_absent() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("v1.jsonl");
         let header = r#"{"version": 1, "ckpt": "c", "holdout": "h", "side": "White", "encoding": "prefix", "ctx": 128, "bands": ["<lo>", "<hi>"], "gammas": [1.0], "positions": 1, "games": 1}"#;
@@ -1128,6 +1264,8 @@ mod tests {
         assert_eq!(walk.records.len(), 1);
         assert!(walk.records[0].at[0].flipped);
         assert_eq!(walk.records[0].at[0].top2_margin, None);
+        assert_eq!(walk.records[0].at[0].ce, None);
+        assert_eq!(walk.records[0].n_legal, None);
     }
 
     /// And a record written now carries the margin through the file and
@@ -1144,6 +1282,129 @@ mod tests {
         let back = Walk::read_jsonl(&path).unwrap();
         assert_eq!(back.header.version, FORMAT_VERSION);
         assert_eq!(back.records[0].at[0].top2_margin, Some(0.375));
+    }
+
+    /// The version 3 pair, through the file and back. Asserted on the
+    /// text as well as on the parse, so that a field which round-tripped
+    /// only because both ends dropped it would still fail here.
+    #[test]
+    fn a_current_record_round_trips_its_cost_and_its_legal_count() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v3.jsonl");
+        let mut original = walk(1, 1, true);
+        original.records[0].n_legal = Some(29);
+        original.records[0].at[0].ce = Some(vec![0.5, 1.25, 2.0]);
+        original.write_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"n_legal\":29"), "{body}");
+        assert!(body.contains("\"ce\":[0.5,1.25,2.0]"), "{body}");
+        let back = Walk::read_jsonl(&path).unwrap();
+        assert_eq!(back.header.version, FORMAT_VERSION);
+        assert_eq!(back.records[0].n_legal, Some(29));
+        assert_eq!(back.records[0].at[0].ce, Some(vec![0.5, 1.25, 2.0]));
+    }
+
+    /// A position the walk could not score carries neither per-band
+    /// figure: the played move is not in the vocabulary, so there is no
+    /// top move to match it against and no probability to take a log of.
+    /// Both absences survive the round trip, rather than one of them
+    /// coming back as a number.
+    #[test]
+    fn an_unscoreable_position_keeps_both_of_its_absences() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("unscoreable.jsonl");
+        let mut original = walk(1, 1, true);
+        original.records[0].at[0].top1 = None;
+        original.records[0].at[0].ce = None;
+        original.write_jsonl(&path).unwrap();
+        let back = Walk::read_jsonl(&path).unwrap();
+        assert_eq!(back.records[0].at[0].top1, None);
+        assert_eq!(back.records[0].at[0].ce, None);
+    }
+
+    /// What the doc says, on a distribution whose answer is arithmetic.
+    /// Two legal moves at logits `0` and `ln 3` are a 1:3 split, so the
+    /// first costs `ln 4` and the second `ln(4/3)`.
+    #[test]
+    fn the_cost_is_the_negative_log_of_the_renormalised_probability() {
+        // Spelled as `ln 3` rather than as 1.0986, so that the row and
+        // the expected answers below are the same arithmetic written
+        // twice rather than a constant and a hope.
+        let row = [0.0f32, 3.0f32.ln()];
+        let want_first = 4.0f64.ln();
+        let want_second = (4.0f64 / 3.0).ln();
+        let first = ce_over_legal(&row, 0).expect("index 0 is in the row");
+        let second = ce_over_legal(&row, 1).expect("index 1 is in the row");
+        assert!((first - want_first).abs() < 1e-6, "{first} vs {want_first}");
+        assert!(
+            (second - want_second).abs() < 1e-6,
+            "{second} vs {want_second}"
+        );
+    }
+
+    /// It is a renormalised quantity, so only the gaps between the
+    /// logits matter: the same row shifted bodily costs the same. The
+    /// shift is 800, which is also what makes this the test that the
+    /// log-sum-exp subtracts its maximum — `exp(800)` is an infinity in
+    /// `f64`, so a row summed without that step returns one too.
+    ///
+    /// Every logit here is a dyadic rational, so the shifted row is the
+    /// unshifted one to the bit. An earlier version of this test used
+    /// `ln 3` and shifted by 80, where the `f32` sum rounds the
+    /// fraction away and the two rows are no longer the same shape —
+    /// it failed by 1.7e-6 on a property that holds.
+    #[test]
+    fn the_cost_ignores_a_constant_added_to_every_legal_logit() {
+        let low = [0.0f32, 0.5, -2.0];
+        let high: Vec<f32> = low.iter().map(|l| l + 800.0).collect();
+        for played in 0..low.len() {
+            let a = ce_over_legal(&low, played).expect("in range");
+            let b = ce_over_legal(&high, played).expect("in range");
+            assert!(b.is_finite(), "played {played}: {b}");
+            assert!((a - b).abs() < 1e-9, "played {played}: {a} vs {b}");
+        }
+    }
+
+    /// A row of equal logits is a uniform draw, and costs `ln(n)` — the
+    /// bar `chess_cond` reads its loss decomposition against, and the
+    /// reason `n_legal` is recorded beside the cost.
+    #[test]
+    fn a_flat_row_costs_the_uniform_draw() {
+        for n in 1..6usize {
+            let row = vec![0.4f32; n];
+            let got = ce_over_legal(&row, 0).expect("in range");
+            let want = (n as f64).ln();
+            assert!((got - want).abs() < 1e-9, "n = {n}: {got} vs {want}");
+        }
+    }
+
+    /// Out of range is the one absence the computation itself reports,
+    /// and the empty row is the same case rather than a special one.
+    #[test]
+    fn a_played_index_past_the_row_has_no_cost() {
+        assert_eq!(ce_over_legal(&[0.0, 1.0], 2), None);
+        assert_eq!(ce_over_legal(&[], 0), None);
+    }
+
+    /// Why the cost is computed in log space rather than as `-ln(p)` off
+    /// the renormalised probabilities: an underflowed entry would make
+    /// it infinite, and this is what an infinite entry does to the file.
+    /// `serde_json` writes a non-finite float as `null`, and reading a
+    /// `Vec<f64>` back from `null` fails — a walk would write a file its
+    /// own reader refuses.
+    #[test]
+    fn an_infinite_cost_would_write_a_file_the_reader_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("infinite.jsonl");
+        let mut original = walk(1, 1, true);
+        original.records[0].at[0].ce = Some(vec![f64::INFINITY, 1.0, 2.0]);
+        original.write_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"ce\":[null,1.0,2.0]"), "{body}");
+        assert!(matches!(
+            Walk::read_jsonl(&path),
+            Err(RecordError::Parse { line: 2, .. })
+        ));
     }
 
     /// The margin is the first minus the second, over the distribution
@@ -1476,16 +1737,19 @@ mod tests {
             PositionRecord {
                 game: 3,
                 ply: 0,
+                n_legal: Some(31),
                 at: vec![gamma_record(false, 0.0), gamma_record(false, 0.0)],
             },
             PositionRecord {
                 game: 3,
                 ply: 2,
+                n_legal: Some(31),
                 at: vec![gamma_record(false, 0.0), gamma_record(false, 0.0)],
             },
             PositionRecord {
                 game: 9,
                 ply: 0,
+                n_legal: Some(31),
                 at: vec![gamma_record(false, 0.0), gamma_record(false, 0.0)],
             },
         ];

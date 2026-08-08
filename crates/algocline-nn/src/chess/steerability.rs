@@ -819,14 +819,17 @@ mod tests {
                 records.push(PositionRecord {
                     game,
                     ply,
+                    // Absent throughout these fixtures, as the margin
+                    // and the per-band cost below are: nothing here
+                    // reads any of the three, and a number no assertion
+                    // depends on would read as though one did.
+                    n_legal: None,
                     at: vec![GammaRecord {
                         flipped: flip(game, ix),
                         widest_js: js(ply),
                         legal_mass: 0.9,
                         top1: Some(vec![true, false, false]),
-                        // Absent throughout these fixtures: nothing here
-                        // reads the margin, and a number no assertion
-                        // depends on would read as though one did.
+                        ce: None,
                         top2_margin: None,
                     }],
                 });
@@ -999,11 +1002,13 @@ mod tests {
             .map(|ix| PositionRecord {
                 game: 4,
                 ply: ix * 2,
+                n_legal: None,
                 at: vec![GammaRecord {
                     flipped: true,
                     widest_js: 0.02,
                     legal_mass: 0.9,
                     top1: Some(vec![true, false, false]),
+                    ce: None,
                     top2_margin: None,
                 }],
             })
@@ -1323,6 +1328,7 @@ mod tests {
                     records.push(PositionRecord {
                         game,
                         ply,
+                        n_legal: None,
                         at: SWEEP
                             .iter()
                             .map(|_| GammaRecord {
@@ -1330,6 +1336,7 @@ mod tests {
                                 widest_js: js,
                                 legal_mass: 0.83,
                                 top1: Some(vec![true, false, false]),
+                                ce: None,
                                 top2_margin: None,
                             })
                             .collect(),

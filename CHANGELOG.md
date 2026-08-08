@@ -419,7 +419,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms sharing a checkpoint produce a complete set of well-formed
   numbers with the noise floor silently zero.
 
-  The format is at version 2, and a reader accepts the range
+  The format is at version 3, and a reader accepts the range
   `MIN_READABLE_VERSION ..= FORMAT_VERSION` rather than one exact
   version. The two constants are separate so that the floor has to be
   raised deliberately: a range is only sound while every version in it
@@ -427,6 +427,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reinterprets an existing field has to move `MIN_READABLE_VERSION` in
   the same commit. Nothing enforces that — it is a rule someone
   follows.
+
+  Version 3 adds `GammaRecord::ce` and `PositionRecord::n_legal`. `ce`
+  is the negative log probability of the move actually played, under
+  each band's distribution restricted to the legal moves and
+  renormalised — computed in log space as `logsumexp(row) - row[played]`
+  rather than as `-ln(p)` off a softmax, because an underflowed `f32`
+  entry would make the cost infinite and an infinite entry is not
+  survivable in this format. `n_legal` sits on the position rather than
+  the gamma: guidance changes the distribution, not the board.
+
+  **`None` on either means the position could not be scored** — the move
+  played is outside the vocabulary, which is why `top1` is optional for
+  the same reason. It does **not** mean the record is old. A reader that
+  needs these fields asks `WalkHeader::version >= 3`; keeping the format
+  question off the field is what lets `ce`'s absence agree with `top1`'s.
 
   Version 2 adds `GammaRecord::top2_margin`: the reference band's gap
   between its top two legal moves, renormalised over the legal set, at

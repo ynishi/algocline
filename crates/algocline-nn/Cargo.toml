@@ -204,6 +204,17 @@ required-features = []
 name = "chess_stats"
 required-features = []
 
+# The same for the legality experiment's five arms. Separate from
+# `chess_stats` rather than four more arguments on it: the two arm sets
+# are judged under different pre-registered criteria (their own role
+# check, their own top-1 tolerance), so one program would have to branch
+# on how many paths it was handed — and the branch is where a check gets
+# skipped for whichever set took the other one. The six walks plan 02
+# was judged on also keep the program that produced their figures.
+[[example]]
+name = "chess_legality"
+required-features = []
+
 # Plays the condition tokens against each other and against random
 # play, which is the only way to ask whether a condition carries
 # strength rather than just a different set of preferences.

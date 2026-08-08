@@ -1,11 +1,27 @@
-//! The two pre-registered statistics, assembled from several arms'
-//! records over one resample of the games.
+//! The pre-registered statistics, assembled from several arms' records
+//! over one resample of the games.
 //!
 //! Steerability is how far behaviour moves when the conditioning input
 //! changes. Two questions were fixed before any of it was measured:
 //! whether conditioning at every position changes the played move more
 //! often than a prefix token does (H14), and whether it also reaches
 //! further down the game (H15).
+//!
+//! # The legality experiment
+//!
+//! A second set of arms asks a different question: what handing the
+//! model the rules frees, rather than where the condition attaches.
+//! Every arm of it is prefix-conditioned, so the axis they differ on is
+//! whether the legal set reached the forward pass — [`h21`] on the cost
+//! of the played move, [`h20`] on whether steerability survives it, and
+//! [`h19`] as a manipulation check that carries no verdict because its
+//! direction was known before the data arrived.
+//!
+//! Those arms have their own role check ([`check_legality_roles`]) and
+//! their own top-1 tolerance ([`gate_top1_legality`]), rather than the
+//! H14/H15 ones widened to cover both sets. A check that passes on two
+//! arm sets pins neither, and the arms plan 02 was judged under keep
+//! the criteria they were judged under.
 //!
 //! # Both are differences, and neither is a difference of two intervals
 //!
@@ -57,7 +73,9 @@ use thiserror::Error;
 use crate::chess::records::{AlignError, AlignedArms, GammaRecord};
 use crate::chess::window::COND_PREFIX_LEN;
 use crate::chess::CondEncoding;
-use crate::metric::bootstrap::{cluster_bootstrap, BootstrapError, ClusterTally, Interval};
+use crate::metric::bootstrap::{
+    cluster_bootstrap, cluster_bootstrap_signed, BootstrapError, ClusterTally, Interval, CONFIDENCE,
+};
 
 /// Arm trained with the band conditioning every position.
 pub const PERPOS: &str = "perpos";
@@ -69,6 +87,55 @@ pub const PREFIX: &str = "prefix";
 /// Second per-position run, differing from [`PERPOS`] only in the
 /// shuffle seed. The gap between the two is the same-arm gap `G`.
 pub const PERPOS_B: &str = "perpos-b";
+
+/// The legality experiment's control: the arm plan 02 already baked,
+/// under its own name.
+///
+/// Not a second checkpoint. `§3.1` makes every arm of that experiment
+/// prefix-conditioned — `Gpt2Custom::validate` refuses a model carrying
+/// both a conditioning table and a legality table, so a legality arm
+/// cannot also be per-position — and the control is therefore the
+/// prefix arm rather than anything new. Spelled as its own constant
+/// because a reader of [`h19`] should not have to know that the string
+/// is shared to see which role is meant.
+pub const CONTROL: &str = PREFIX;
+
+/// Legality experiment, treatment arm `A`: loss over the legal moves,
+/// legality **not** supplied as an input.
+pub const ARM_A: &str = "A";
+
+/// Second run of [`ARM_A`], differing only in the shuffle seed.
+pub const ARM_A_B: &str = "A-b";
+
+/// Legality experiment, treatment arm `AB`: loss over the legal moves
+/// **and** the legal ids handed to the forward pass.
+///
+/// Its distance from [`ARM_A`] is the one comparison in `§4` that is
+/// neither circular nor already known in direction: the two train on
+/// the same objective and differ only in whether the legal set reaches
+/// the model.
+pub const ARM_AB: &str = "AB";
+
+/// Second run of [`ARM_AB`], differing only in the shuffle seed.
+pub const ARM_AB_B: &str = "AB-b";
+
+/// The legality experiment's five arms, in the order `§3.3` lists them.
+pub const LEGALITY_ARMS: [&str; 5] = [CONTROL, ARM_A, ARM_A_B, ARM_AB, ARM_AB_B];
+
+/// What each of those five arms' checkpoints must have been, on both
+/// axes.
+///
+/// Every one of them is prefix-conditioned, so the encoding alone
+/// separates nothing: the axis that tells the arms apart is the second,
+/// and it is the one a header could not state before format version 4.
+/// See [`check_legality_roles`].
+pub const LEGALITY_ROLES: [(&str, CondEncoding, bool); 5] = [
+    (CONTROL, CondEncoding::Prefix, false),
+    (ARM_A, CondEncoding::Prefix, false),
+    (ARM_A_B, CondEncoding::Prefix, false),
+    (ARM_AB, CondEncoding::Prefix, true),
+    (ARM_AB_B, CondEncoding::Prefix, true),
+];
 
 /// Bootstrap draws.
 ///
@@ -91,6 +158,76 @@ pub const TOP1_GATE: f64 = 0.02;
 /// The third validity gate, checked at every gamma because over-guidance
 /// drains legal mass and that is its documented shape.
 pub const LEGAL_MASS_GATE: f64 = 0.20;
+
+/// How far a legality arm's mean top-1 match may sit from the control's.
+///
+/// Wider than [`TOP1_GATE`] by design, not by drift. `§5.1` widens it
+/// because the same-recipe seed gap on top-1 was measured at 0.0146 and
+/// 0.0093, so a 0.02 tolerance can be tripped by the shuffle seed alone
+/// — every other criterion in that plan carries a floor and this one
+/// did not. Recorded before any arm of the set was baked, and applied
+/// rather than tuned.
+pub const TOP1_GATE_LEGALITY: f64 = 0.03;
+
+/// Oldest record format that carries `ce` and `top2_margin`.
+///
+/// `§5.1`'s third admission item asks that every record carry both, and
+/// asks it of the **format version** rather than of the fields. Their
+/// `None` says the position could not be scored, which is a fact about
+/// the position; a walk from a stale binary has no `ce` at all, which
+/// is a fact about the run. Probing the fields would collapse the two
+/// and read a whole stale walk as a walk of unscoreable positions. See
+/// [`crate::chess::records::GammaRecord::ce`], which documents the same
+/// split from the other side.
+pub const SCOREABLE_VERSION: u32 = 3;
+
+/// Oldest record format whose header can state the legality axis.
+///
+/// [`crate::chess::records::WalkHeader::legal_input`] arrived at
+/// version 4, and before it the field parses as `false` whatever the
+/// checkpoint was. Checking the value alone therefore protects only the
+/// slots whose role calls for `true`: a version 3 walk of a legality
+/// checkpoint dropped into [`ARM_A`], [`ARM_A_B`] or [`CONTROL`] passes
+/// on the default, having said nothing.
+///
+/// Requiring the version closes that from the other side. A walk older
+/// than this is unverifiable on the axis in **either** direction rather
+/// than merely unstated in one, and is refused as such.
+///
+/// The residual it removes pointed the safe way: a legality checkpoint
+/// standing in for `A` puts two like arms on the two sides of `D`,
+/// which pushes the difference toward zero and so toward an
+/// undetermined verdict rather than toward a confirmation. That is a
+/// direction and not a guarantee, and an undetermined verdict reached
+/// that way is indistinguishable from an honest one. The check is one
+/// comparison.
+pub const LEGALITY_AXIS_VERSION: u32 = 4;
+
+/// Games the floor `§5.3` measured is quoted at, and the anchor of the
+/// curve [`Resolution::at`] reads.
+///
+/// Not the walk's own target. `§5.3` sizes the walk at 6,200 positions,
+/// which lands near 204 games for a floor near 0.05 nats. This pair is
+/// where the measurement is stated; the walk's own floor is that
+/// measurement carried along the curve, not a second calculation.
+pub const PLANNED_GAMES: usize = 180;
+
+/// Minimum detectable effect on `ce_legal`, in nats, at
+/// [`PLANNED_GAMES`].
+///
+/// **Measured rather than derived**, and it moved when it was measured.
+/// `§5.3`'s first table solved for the effect from the standard
+/// deviation of *per-game* means — equal weight per game — while
+/// `ce_legal` aggregates sum-over-sum, so a long game counts for more.
+/// Those are two different estimators, and the first put this figure at
+/// 0.05: optimistic, in the direction that admits verdicts. The number
+/// here is the re-measurement, made by running the estimator itself
+/// over bootstrap draws of the 2026-05 records, aggregating exactly as
+/// [`ClusterTally::mean_over`] does.
+pub const PLANNED_EFFECT: f64 = 0.0533;
+
+/// Strata the flip-rate comparison is cut into — quartiles, so four.
+pub const STRATA: usize = 4;
 
 /// Plies the shallow depth bucket covers: the opening.
 pub const SHALLOW_BUCKET: (usize, usize) = (0, 10);
@@ -169,6 +306,120 @@ pub enum StatError {
         /// What the arm's header records.
         found: CondEncoding,
     },
+
+    /// An arm is playing a role its checkpoint's legality axis does not
+    /// fit.
+    ///
+    /// [`StatError::WrongEncodingForRole`]'s counterpart, and the one
+    /// that matters for the legality experiment: every arm there is
+    /// prefix-conditioned, so the encoding separates none of them and
+    /// this is the only axis a swap could show up on. Exchange `A` and
+    /// `AB` on a command line and `D = ce_legal(A) - ce_legal(AB)`
+    /// changes sign while every figure stays well-formed.
+    ///
+    /// This is a disagreement between what the header **says** and what
+    /// the role needs, so it is about a walk whose header could say
+    /// something. Every path in this module that produces it reads the
+    /// format version first and returns
+    /// [`StatError::RecordsPredateLegalityAxis`] for a walk older than
+    /// [`LEGALITY_AXIS_VERSION`], so a defaulted `false` does not
+    /// arrive here dressed as a recorded one. See
+    /// [`crate::chess::records::WalkHeader::legal_input`].
+    #[error(
+        "arm {arm:?} was scored from a checkpoint whose header records legality-as-input = \
+         {found}, and that role calls for {want}; the arms of this set differ on no other axis, \
+         so a swap here leaves every number well-formed and reverses what the difference means"
+    )]
+    WrongLegalInputForRole {
+        /// Arm whose legality axis does not fit its role.
+        arm: &'static str,
+        /// What the role requires.
+        want: bool,
+        /// What the arm's header records.
+        found: bool,
+    },
+
+    /// An arm's walk predates the header field that states the legality
+    /// axis.
+    ///
+    /// Separate from [`StatError::WrongLegalInputForRole`] because the
+    /// two have different remedies: that one says a file is in the
+    /// wrong slot, this one says the file cannot answer the question in
+    /// any slot and has to be walked again by a current build.
+    ///
+    /// It is what closes the default's remaining gap. Before format
+    /// version 4 the field parses as `false` whatever the checkpoint
+    /// was, so reading the value alone only ever refuses a slot that
+    /// requires `true` — the [`ARM_AB`] pair — while the same stale
+    /// walk of the same legality checkpoint passes in [`ARM_A`],
+    /// [`ARM_A_B`] or [`CONTROL`] on a default it never recorded.
+    #[error(
+        "arm {arm:?} was walked at record format version {found}, and checking its legality \
+         axis needs {needed} or later; before that the header could not state the axis at all \
+         and reads false whatever the checkpoint was, so a slot whose role calls for false \
+         would admit it on a default rather than on anything the walk recorded"
+    )]
+    RecordsPredateLegalityAxis {
+        /// Arm whose walk is too old to state the axis.
+        arm: &'static str,
+        /// Version its header declares.
+        found: u32,
+        /// Oldest version that carries the field.
+        needed: u32,
+    },
+
+    /// An arm's records predate the fields a statistic reads.
+    ///
+    /// `§5.1`'s third admission item. A version 1 or 2 walk reaching a
+    /// run that needs `ce` means a stale binary wrote it, and every
+    /// position in it would read as unscoreable — a `ce_legal` over
+    /// nothing rather than a refusal, if the fields were probed instead
+    /// of the version.
+    #[error(
+        "arm {arm:?} was walked at record format version {found}, and reading its cost per band \
+         needs {needed} or later; a stale binary wrote it, and every position in it would \
+         otherwise read as one the walk could not score"
+    )]
+    RecordsPredateScoring {
+        /// Arm whose walk is too old.
+        arm: &'static str,
+        /// Version its header declares.
+        found: u32,
+        /// Oldest version that carries the fields.
+        needed: u32,
+    },
+
+    /// A margin stratum caught no position for one of the arms, so the
+    /// flip rate inside it is a rate of nothing.
+    ///
+    /// Reachable when the pooled margins are heavily tied — every cut
+    /// point equal, so three of the four strata are empty — or when one
+    /// arm's margins sit entirely on one side of a cut the pool placed
+    /// from the other arm's.
+    #[error(
+        "stratum {stratum} of the pooled top-two margin holds no position for arm {arm}, so the \
+         flip rate inside it is a rate of nothing; the cut points are quantiles of the two \
+         compared arms' margins pooled, and heavily tied margins can leave a stratum empty"
+    )]
+    EmptyStratum {
+        /// Which of the [`STRATA`] strata, counting from zero.
+        stratum: usize,
+        /// Arm that had nothing in it.
+        arm: &'static str,
+    },
+
+    /// No position in the two compared arms carries a `top2_margin`, so
+    /// there is nothing to cut strata on.
+    #[error(
+        "neither arm {a:?} nor arm {b:?} carries a top-two margin at any position, so the \
+         strata have no cut points; the margin arrived at record format version 2"
+    )]
+    NoMargins {
+        /// First arm of the pool.
+        a: &'static str,
+        /// Second arm of the pool.
+        b: &'static str,
+    },
 }
 
 /// Check every canonical role at once, before anything is computed.
@@ -216,6 +467,123 @@ fn require_roles(
                 arm,
                 want: *want,
                 found,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Check every canonical role of the **legality** experiment, on both
+/// axes, before anything is computed.
+///
+/// A separate entry point from [`check_roles`] rather than a widening
+/// of it. That one names `perpos` / `prefix` / `perpos-b` and the arms
+/// here are `prefix` / `A` / `A-b` / `AB` / `AB-b`; bending it to take
+/// either set would leave a check that passes on both and therefore
+/// pins neither. The arms plan 02 already walked keep the check they
+/// were judged under.
+///
+/// Both axes are verified for every arm:
+///
+/// - **encoding** is [`CondEncoding::Prefix`] for all five. `§3.1`
+///   makes that a constraint and not a choice — a model carrying both
+///   a conditioning table and a legality table is refused at
+///   construction — so an arm here that is per-position conditioned is
+///   not this experiment's arm at all.
+/// - **legality as input** is true for exactly [`ARM_AB`] and
+///   [`ARM_AB_B`]. This is the axis the whole set differs on, and until
+///   record format version 4 a header could not state it: two walks
+///   that differ in the only way that matters produced headers that
+///   could not be told apart, and this check was blind to precisely the
+///   swap it exists for.
+/// - **the walk is new enough to have stated it** —
+///   [`LEGALITY_AXIS_VERSION`]. Without this the axis is only half
+///   checked, since a stale walk's default `false` is indistinguishable
+///   from a recorded one and passes wherever `false` is what the role
+///   wants.
+///
+/// What is still **not** distinguished, and cannot be: which of `A` and
+/// `A-b` is which, or of `AB` and `AB-b`. They are two runs of one
+/// recipe differing only in a shuffle seed, which nothing in a record
+/// records. Exchanging a pair leaves the floor untouched — it is
+/// symmetric in the pair — and makes the difference the other
+/// replicate's, which is a second reading of one experiment rather than
+/// a wrong one. See [`h21`].
+///
+/// # Errors
+///
+/// One of the five arms is missing, its conditioning does not fit its
+/// role ([`StatError::WrongEncodingForRole`]), its walk predates the
+/// header field that states the axis
+/// ([`StatError::RecordsPredateLegalityAxis`]), or its legality axis
+/// does not fit ([`StatError::WrongLegalInputForRole`]).
+pub fn check_legality_roles(arms: &AlignedArms) -> Result<(), StatError> {
+    require_kinds(arms, &LEGALITY_ROLES)
+}
+
+/// Both axes of a checkpoint's kind, per arm.
+///
+/// Encoding first, so that a set handed over with the wrong experiment
+/// entirely is reported as that rather than as a legality mismatch.
+/// Then the format version, and only then the legality axis itself: a
+/// walk older than [`LEGALITY_AXIS_VERSION`] has no answer on that axis
+/// to disagree with, and reporting it as a mismatch would send a reader
+/// looking for a file in the wrong slot when the fix is to walk it
+/// again. This is also what makes the check symmetric — the value alone
+/// refuses only the slots that require `true`.
+fn require_kinds(
+    arms: &AlignedArms,
+    roles: &[(&'static str, CondEncoding, bool)],
+) -> Result<(), StatError> {
+    for (arm, want_encoding, want_legal) in roles {
+        let header = &arms.walk(arm)?.header;
+        if header.encoding != *want_encoding {
+            return Err(StatError::WrongEncodingForRole {
+                arm,
+                want: *want_encoding,
+                found: header.encoding,
+            });
+        }
+        if header.version < LEGALITY_AXIS_VERSION {
+            return Err(StatError::RecordsPredateLegalityAxis {
+                arm,
+                found: header.version,
+                needed: LEGALITY_AXIS_VERSION,
+            });
+        }
+        if header.legal_input != *want_legal {
+            return Err(StatError::WrongLegalInputForRole {
+                arm,
+                want: *want_legal,
+                found: header.legal_input,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `§5.1` item 3: every named arm's records carry `ce` and
+/// `top2_margin`.
+///
+/// Asked of [`crate::chess::records::WalkHeader::version`] and not of
+/// the fields. Their `None` is a statement about a position the walk
+/// could not score; a walk from a stale binary has no such field at
+/// all, and probing the fields would read that whole walk as a walk of
+/// unscoreable positions — a `ce_legal` over nothing, or a stratum
+/// boundary drawn from no margins, rather than a refusal.
+///
+/// # Errors
+///
+/// A named arm is missing, or its walk predates
+/// [`SCOREABLE_VERSION`].
+pub fn check_scoreable(arms: &AlignedArms, roles: &[&'static str]) -> Result<(), StatError> {
+    for arm in roles {
+        let found = arms.walk(arm)?.header.version;
+        if found < SCOREABLE_VERSION {
+            return Err(StatError::RecordsPredateScoring {
+                arm,
+                found,
+                needed: SCOREABLE_VERSION,
             });
         }
     }
@@ -295,6 +663,27 @@ fn top1_mean(at: &GammaRecord) -> Option<f64> {
     Some(hits / per_band.len() as f64)
 }
 
+/// What the played move cost, in nats, meaned over the bands.
+///
+/// The mean over bands is pinned by `§4` rather than left to the
+/// caller, because the three bands span 0.047 nats on one of plan 02's
+/// arm-months — the same order as the seed gap the criteria are floored
+/// by — so leaving the choice open would leave a choice on the floor's
+/// own scale.
+///
+/// `None` where the played move is not in the vocabulary, so there was
+/// no probability to take a log of. Absent rather than zero, as
+/// [`top1_mean`] is: a cost of zero is a certainty, and counting an
+/// unscoreable position as one would drag the figure down by however
+/// many of them there were.
+fn ce_mean(at: &GammaRecord) -> Option<f64> {
+    let per_band = at.ce.as_ref()?;
+    if per_band.is_empty() {
+        return None;
+    }
+    Some(per_band.iter().sum::<f64>() / per_band.len() as f64)
+}
+
 /// Share of positions where at least one band's top legal move differed
 /// from the first band's, with a cluster bootstrap over games.
 ///
@@ -360,6 +749,36 @@ pub fn top1_match(
     let matches = tally(arms, arm, gamma_ix, top1_mean)?;
     Ok(cluster_bootstrap(arms.games(), draws, seed, |draw| {
         matches.mean_over(draw)
+    })?)
+}
+
+/// Cross-entropy on the played move over the legal moves, meaned over
+/// the bands and then over the positions of the resampled games, with a
+/// cluster bootstrap.
+///
+/// The per-arm figure `§4`'s `ce_legal(arm)` names. Reported on its own
+/// for a reader; the hypotheses do **not** subtract two of these, since
+/// two separately bootstrapped quantities carry no joint distribution —
+/// see [`h21`], which recomputes both sides inside one draw.
+///
+/// # Errors
+///
+/// The arm or gamma is not among those walked, or the resampling
+/// refused. In particular a walk whose records predate
+/// [`SCOREABLE_VERSION`] carries no cost at any position and arrives
+/// here as an undefined statistic; [`check_scoreable`] is what turns
+/// that into a message about the run.
+pub fn ce_legal(
+    arms: &AlignedArms,
+    arm: &str,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<Interval, StatError> {
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let cost = tally(arms, arm, gamma_ix, ce_mean)?;
+    Ok(cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        cost.mean_over(draw)
     })?)
 }
 
@@ -450,6 +869,59 @@ pub fn gate_top1(
     Ok(Gate {
         interval,
         tolerance: TOP1_GATE,
+    })
+}
+
+/// The legality experiment's only computed admission gate: mean top-1
+/// match, as a difference against the control.
+///
+/// `§5.1` item 2, at [`TOP1_GATE_LEGALITY`]. A separate function from
+/// [`gate_top1`] rather than a parameter added to it: the tolerance is
+/// pre-registered per experiment, and a tolerance a caller passes in is
+/// a tolerance that can be raised once the difference has been seen.
+/// The arms plan 02 was judged on keep [`TOP1_GATE`].
+///
+/// # What this set does *not* gate on
+///
+/// **Competence.** Plan 02's `ce_legal < ce_uniform` is deliberately
+/// absent, and its absence is a finding rather than an omission
+/// (`§2.1`): it fails on all six of plan 02's arm-months, it tests
+/// calibration while being read as competence, and any full-vocabulary
+/// objective fails it structurally — so carrying it here would exclude
+/// the control. It must not reappear under another name, which is why
+/// this doc says so rather than leaving the gate merely missing.
+///
+/// **Legal mass.** With legality as an input the model can put all its
+/// mass on legal moves trivially, so the quantity stops discriminating
+/// (`§4.1`). [`gate_legal_mass`] is not part of this set's admission.
+///
+/// The baseline is guarded as in [`gate_top1`], on both axes: the
+/// control has to be prefix-conditioned **and** to have had no legality
+/// input, since a legality checkpoint in the control slot would make
+/// every row here a difference against a treatment arm.
+///
+/// # Errors
+///
+/// As [`gate_top1`], with the baseline's legality axis checked as well
+/// — including that its walk was new enough to state one
+/// ([`LEGALITY_AXIS_VERSION`]).
+pub fn gate_top1_legality(
+    arms: &AlignedArms,
+    arm: &str,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<Gate, StatError> {
+    require_kinds(arms, &[(CONTROL, CondEncoding::Prefix, false)])?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let subject = tally(arms, arm, gamma_ix, top1_mean)?;
+    let baseline = tally(arms, CONTROL, gamma_ix, top1_mean)?;
+    let interval = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        Some(subject.mean_over(draw)? - baseline.mean_over(draw)?)
+    })?;
+    Ok(Gate {
+        interval,
+        tolerance: TOP1_GATE_LEGALITY,
     })
 }
 
@@ -763,6 +1235,739 @@ pub fn h15(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H1
     })
 }
 
+/// How small an effect the walk that produced a verdict could have
+/// separated.
+///
+/// `§5.3` fixes the walk at 6,200 positions for a minimum detectable
+/// effect near 0.05 nats **at ~204 games**, and the game count is an
+/// outcome rather than a setting: a position enters the sample when the
+/// board offers at least two legal moves, games run 7 to 83 positions
+/// with a coefficient of variation of 0.54, so 6,200 positions land
+/// *near* 204 games rather than on it. A verdict read against the
+/// plan's estimate is a verdict read against a number the run did not
+/// have.
+///
+/// So this is carried beside every judged difference. An undetermined
+/// result at a floor of 0.09 nats and one at 0.04 are different
+/// findings — the first says the instrument was blunt, the second that
+/// the effect is small — and the two are indistinguishable if only the
+/// verdict is reported.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Resolution {
+    /// Games the interval actually resampled.
+    pub games: usize,
+    /// Smallest difference in nats this many games can separate.
+    pub effect: f64,
+    /// Games the curve is anchored at ([`PLANNED_GAMES`]).
+    pub planned_games: usize,
+    /// The floor `§5.3` measured, at that many games.
+    ///
+    /// Carried so a report can put the walk's own floor beside the one
+    /// the plan was written against. They differ whenever the game
+    /// count does, which is most of the time — the walk is sized in
+    /// positions.
+    pub planned_effect: f64,
+}
+
+impl Resolution {
+    /// The resolution `games` games buy.
+    ///
+    /// # The curve, and where its one point came from
+    ///
+    /// `§5.3` gives a table rather than a formula:
+    ///
+    /// | games | effect |
+    /// |---|---|
+    /// | 99 | 0.0718 nats |
+    /// | 180 | 0.0533 nats |
+    /// | 204 | 0.0500 nats |
+    /// | 1,080 | 0.0217 nats |
+    ///
+    /// One row of it is a measurement and the rest is a shape. The
+    /// measured row is the first — the walk's own 99 games, where
+    /// running the estimator over bootstrap draws put the floor at
+    /// 0.0280 with a half-interval of 0.0438. A minimum detectable
+    /// effect scales as `1/sqrt(n)` at a fixed paired standard
+    /// deviation, whatever the power and level behind it, since those
+    /// enter only as a constant; every other row is that scaling
+    /// applied to that point.
+    ///
+    /// So reproducing the table is **not** two calculations agreeing,
+    /// and is not offered as evidence that this floor is right. It says
+    /// this reads the same curve the plan does — which is the property
+    /// worth holding, because the number a verdict is judged against
+    /// has to be the one pre-registered rather than one this file
+    /// arrived at. The constant is written at 180 games rather than at
+    /// the measured 99 because that is where `§4` quotes it, so the
+    /// 99-game row comes back to a tenth of a percent rather than
+    /// exactly: the table prints four decimals and the round trip
+    /// through them is what that tenth of a percent is.
+    ///
+    /// It is a curve and not the calculation behind it, and what it
+    /// reports is a **lower bound on the floor** rather than the floor.
+    /// Two things it does not model — the t-quantile at small `n`, and
+    /// any drift in positions per game — push the same way, so a walk's
+    /// true resolution is no better than this and may be worse.
+    ///
+    /// `None` for zero games, where there is no resolution to report.
+    /// Unreachable from a built [`AlignedArms`], which refuses a set
+    /// with no positions, and total anyway.
+    pub fn at(games: usize) -> Option<Self> {
+        (games > 0).then(|| Self {
+            games,
+            effect: PLANNED_EFFECT * (PLANNED_GAMES as f64 / games as f64).sqrt(),
+            planned_games: PLANNED_GAMES,
+            planned_effect: PLANNED_EFFECT,
+        })
+    }
+
+    /// Whether an effect of this size is at or above the resolution.
+    ///
+    /// Compared on magnitude, so it governs a refutation exactly as it
+    /// governs a confirmation: an effect too small to separate is too
+    /// small in either direction.
+    pub fn resolves(&self, effect: f64) -> bool {
+        effect.abs() >= self.effect
+    }
+}
+
+/// H21: does handing the model the legal set add what masking the loss
+/// does not?
+///
+/// `D = ce_legal(A) - ce_legal(AB)`, positive meaning `AB` puts more
+/// probability on the move a human played. The two arms train on the
+/// same objective and differ only in whether the legal set reaches the
+/// forward pass, which is what makes this the one judged comparison in
+/// the plan whose direction is not already known (`§4`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct H21 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// `ce_legal(A)` on the sample as walked.
+    pub ce_a: f64,
+    /// `ce_legal(A-b)`, the replicate of `A`.
+    pub ce_a_b: f64,
+    /// `ce_legal(AB)`.
+    pub ce_ab: f64,
+    /// `ce_legal(AB-b)`, the replicate of `AB`.
+    pub ce_ab_b: f64,
+    /// `D`, on the sample as walked.
+    pub difference: f64,
+    /// `F`, on the sample as walked: the larger of the two same-recipe
+    /// seed gaps.
+    pub floor: f64,
+    /// Interval on `D - F`. Confirmed when it excludes zero from above.
+    pub confirm: Interval,
+    /// Interval on `D + F`. Refuted when it excludes zero from below.
+    pub refute: Interval,
+    /// What the walk that produced this could separate.
+    pub resolution: Resolution,
+    /// Positions the arms share.
+    pub positions: usize,
+    /// Games those positions came from — the clusters resampled.
+    pub games: usize,
+}
+
+impl H21 {
+    /// Whether the effect is large enough for this walk to have
+    /// separated it.
+    ///
+    /// `§4` fixes a minimum detectable effect and says an effect below
+    /// it reads undetermined **however clean the point estimate looks**
+    /// — recorded in the hypothesis so that a result document cannot
+    /// report a margin under the floor as a near miss. The floor is
+    /// read off the games actually resampled rather than off the plan's
+    /// estimate of them ([`Resolution`]).
+    pub fn resolved(&self) -> bool {
+        self.resolution.resolves(self.difference)
+    }
+
+    /// Whether the confirm interval clears zero from above, at an
+    /// effect this walk could separate.
+    pub fn confirmed(&self) -> bool {
+        self.resolved() && self.confirm.excludes_zero_from_above()
+    }
+
+    /// Whether the refute interval clears zero from below, at an effect
+    /// this walk could separate.
+    pub fn refuted(&self) -> bool {
+        self.resolved() && self.refute.excludes_zero_from_below()
+    }
+
+    /// The verdict on one month, in the three-way form the decision
+    /// table partitions outcomes with. A month is only judged when both
+    /// months agree, which is the caller's business, not this type's.
+    pub fn verdict(&self) -> &'static str {
+        match (self.confirmed(), self.refuted()) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H21 from the four treatment arms.
+///
+/// # Why the two criteria are mirrored
+///
+/// `D - F` for the confirmation and `D + F` for the refutation, as
+/// [`h14`]'s are. Under the null that the two arms predict equally well
+/// `E[D] = 0` while `F` is a strictly positive gap between two real
+/// checkpoints, so `D - F` converges to something negative: a refute
+/// branch keyed on it would fire whenever `AB` merely failed to win,
+/// including when the two arms were exactly equal. `D + F` asks the
+/// intended question — worse by more than both observed same-recipe
+/// gaps.
+///
+/// # The floor is matched, not borrowed
+///
+/// `F = max(|AB - AB-b|, |A - A-b|)`, recomputed inside every draw.
+/// Both sides of the comparison are replicated, so both gaps are
+/// observed and neither side's floor is inferred from the other's.
+/// Nothing is frozen as a scalar: a gap held constant across the draws
+/// would report a precision one pair of runs does not carry.
+///
+/// A max over two remains a max over two. Under exchangeability a third
+/// run exceeds it about a third of the time, so a confirmed H21 reads
+/// **"the margin exceeds both observed same-recipe gaps"** and never
+/// "clears the seed floor".
+///
+/// # What a swap between a pair's two runs does
+///
+/// [`ARM_A`] and [`ARM_A_B`] are two runs of one recipe, and nothing in
+/// a record says which is which. Exchanging them leaves `F` alone — it
+/// is symmetric in the pair — and makes `D` the other replicate's
+/// difference against `AB`: two equally good readings of one
+/// experiment. The same holds for the `AB` pair. A swap **across** the
+/// pairs is a different matter entirely, reverses the sign of `D`, and
+/// is what [`check_legality_roles`] refuses.
+///
+/// # Errors
+///
+/// One of the four arms is missing, an arm's checkpoint does not fit
+/// its role on either axis or its walk is too old to state the second
+/// one ([`LEGALITY_AXIS_VERSION`]), the gamma was not swept, or the
+/// resampling refused. A walk that predates [`SCOREABLE_VERSION`]
+/// carries no cost and arrives as an undefined statistic — call
+/// [`check_scoreable`] first for a message that says so.
+pub fn h21(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H21, StatError> {
+    require_kinds(
+        arms,
+        &[
+            (ARM_A, CondEncoding::Prefix, false),
+            (ARM_A_B, CondEncoding::Prefix, false),
+            (ARM_AB, CondEncoding::Prefix, true),
+            (ARM_AB_B, CondEncoding::Prefix, true),
+        ],
+    )?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let a = tally(arms, ARM_A, gamma_ix, ce_mean)?;
+    let a_b = tally(arms, ARM_A_B, gamma_ix, ce_mean)?;
+    let ab = tally(arms, ARM_AB, gamma_ix, ce_mean)?;
+    let ab_b = tally(arms, ARM_AB_B, gamma_ix, ce_mean)?;
+
+    // One draw, every term. A caller cannot reach a second resample
+    // from inside this, so the difference and the floor cannot be
+    // estimated against different game lists.
+    let difference_and_floor = |draw: &[usize]| -> Option<(f64, f64)> {
+        let plain = a.mean_over(draw)?;
+        let plain_b = a_b.mean_over(draw)?;
+        let legal = ab.mean_over(draw)?;
+        let legal_b = ab_b.mean_over(draw)?;
+        Some((
+            plain - legal,
+            (legal - legal_b).abs().max((plain - plain_b).abs()),
+        ))
+    };
+
+    let confirm = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        difference_and_floor(draw).map(|(d, f)| d - f)
+    })?;
+    let refute = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        difference_and_floor(draw).map(|(d, f)| d + f)
+    })?;
+
+    let whole: Vec<usize> = (0..arms.games()).collect();
+    let (difference, floor) =
+        difference_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+    // Unreachable after the bootstraps above, which refuse a zero
+    // cluster count outright; total rather than indexed into.
+    let resolution = Resolution::at(arms.games()).ok_or(BootstrapError::NoClusters)?;
+    Ok(H21 {
+        gamma,
+        ce_a: a.total().mean().unwrap_or(f64::NAN),
+        ce_a_b: a_b.total().mean().unwrap_or(f64::NAN),
+        ce_ab: ab.total().mean().unwrap_or(f64::NAN),
+        ce_ab_b: ab_b.total().mean().unwrap_or(f64::NAN),
+        difference,
+        floor,
+        confirm,
+        refute,
+        resolution,
+        positions: arms.positions(),
+        games: arms.games(),
+    })
+}
+
+/// One band of contestability, and what the two arms did inside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stratum {
+    /// Which of the [`STRATA`] strata, counting from zero.
+    pub index: usize,
+    /// Lowest margin in the band, or `None` for the open end.
+    pub low: Option<f64>,
+    /// Cut point the band stops below, or `None` for the open end.
+    pub high: Option<f64>,
+    /// Flip rate of [`ARM_A`] inside it, on the sample as walked.
+    pub flip_a: f64,
+    /// Flip rate of [`ARM_AB`] inside it.
+    pub flip_ab: f64,
+    /// Positions of `A` the band caught.
+    pub positions_a: usize,
+    /// Positions of `AB` it caught.
+    ///
+    /// Not the same number as [`Self::positions_a`], and not meant to
+    /// be. The cut points are common, so a uniformly sharper arm puts
+    /// more of its positions in the high bands — which is the
+    /// difference the strata are there to hold still rather than to
+    /// remove.
+    pub positions_ab: usize,
+    /// `F_flip` inside the band, on the sample as walked.
+    pub floor: f64,
+    /// Interval on `flip(AB) - flip(A) + F_flip`.
+    pub interval: Interval,
+    /// Share of the draws that reached zero from above — the one-sided
+    /// level the Holm correction is applied to.
+    pub p_below_zero: f64,
+    /// Threshold Holm handed this band, given where its level ranked
+    /// among the four.
+    pub holm_threshold: f64,
+    /// Whether the band refutes, **after** the correction.
+    pub refuted: bool,
+    /// Whether the band confirms: the interval above zero, uncorrected.
+    ///
+    /// No correction, and not by oversight. A confirmation needs every
+    /// band to clear zero, so the four are combined by intersection and
+    /// the joint claim is already at the level each part is tested at —
+    /// correcting would make a criterion that fires less often than it
+    /// says it does.
+    pub confirmed: bool,
+}
+
+/// H20: does handing over the legal set cost steerability?
+///
+/// Flip rate, stratified. The raw rate is confounded across
+/// formulations (`§2`): a sharper model flips less under the same
+/// conditioning, and a legal mask or a legality input changes how sharp
+/// the distribution is, so an unstratified comparison would read
+/// sharpness as steerability.
+///
+/// A **non-inferiority** test rather than a detection one, because
+/// `§3.1` puts every arm on the prefix channel and plan 02 measured
+/// that channel at 15.2% flip against per-position's 49.0%. The
+/// question is whether steerability survives, not whether it grows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct H20 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// The three quartile cut points, in ascending order.
+    pub cuts: [f64; STRATA - 1],
+    /// The four bands, in ascending order of margin.
+    pub strata: [Stratum; STRATA],
+    /// Level each band's Holm threshold was derived from.
+    pub alpha: f64,
+    /// Positions the arms share.
+    pub positions: usize,
+    /// Games those positions came from.
+    pub games: usize,
+}
+
+impl H20 {
+    /// Whether every band clears zero from above.
+    pub fn confirmed(&self) -> bool {
+        self.strata.iter().all(|s| s.confirmed)
+    }
+
+    /// Whether any band refutes after the correction.
+    ///
+    /// **On this month only.** `§4` also requires that the *same* band
+    /// refute in both months, which no single month's statistic can
+    /// answer — see [`Self::refuting`], which is what a caller
+    /// intersects.
+    pub fn refuted(&self) -> bool {
+        self.strata.iter().any(|s| s.refuted)
+    }
+
+    /// Which bands refute, band by band.
+    ///
+    /// The form the two-month rule needs. `§4` refutes when a band
+    /// clears zero from below in **both** months, so a caller holding
+    /// two of these takes the elementwise conjunction and asks whether
+    /// anything survives it. A summary verdict per month cannot answer
+    /// that: two months refuting in different bands would read as two
+    /// refutations and agree on nothing.
+    pub fn refuting(&self) -> [bool; STRATA] {
+        std::array::from_fn(|i| self.strata.get(i).is_some_and(|s| s.refuted))
+    }
+
+    /// The verdict on one month, in the three-way form.
+    ///
+    /// The two branches read the same quantity in opposite tails, at
+    /// levels that do not meet: a confirmation needs every band's
+    /// interval above zero, which puts every band's `p_below_zero` at
+    /// or above `1 - alpha`, and no Holm threshold is above `alpha`.
+    /// So a confirmed month has nothing left to refute with.
+    pub fn verdict(&self) -> &'static str {
+        match (self.confirmed(), self.refuted()) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H20 from the four treatment arms.
+///
+/// # Why the cut points are pooled and common
+///
+/// The quartiles are taken over `A`'s and `AB`'s `top2_margin` values
+/// **pooled**, and the resulting three cut points are then applied to
+/// both arms. Not per-arm quantiles: those match on rank rather than on
+/// contestability, so a uniformly sharper arm's own Q1 sits at a higher
+/// absolute margin and the sharpness difference moves inside every
+/// stratum instead of being removed.
+///
+/// The consequence is that the bands hold **different positions for the
+/// two arms**, and that is intended. This is a comparison at matched
+/// contestability, not a paired comparison of the same positions;
+/// [`Stratum::positions_a`] and [`Stratum::positions_ab`] are reported
+/// separately so a reader can see by how much.
+///
+/// The two replicates are placed against the same cut points, since a
+/// floor measured on a differently drawn band would not be this band's
+/// floor.
+///
+/// # The direction the tolerance points
+///
+/// The quantity is `flip(AB) - flip(A) + F_flip`, so `F_flip` **widens**
+/// the tolerance: a noisier replicate pair makes "steerability
+/// survives" easier to declare. In [`h21`] the floor points the other
+/// way. `§4` records this asymmetry and does not fix it — a confirm
+/// here is the weaker of the two claims, and `F_flip` being a max over
+/// two pairs biases it further in that direction.
+///
+/// # Errors
+///
+/// One of the four arms is missing, an arm's checkpoint does not fit
+/// its role or its walk is too old to state the legality axis
+/// ([`LEGALITY_AXIS_VERSION`]), the gamma was not swept, no position
+/// carries a margin ([`StatError::NoMargins`]), a band caught nothing
+/// for one of the arms ([`StatError::EmptyStratum`]), or the resampling
+/// refused.
+pub fn h20(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H20, StatError> {
+    require_kinds(
+        arms,
+        &[
+            (ARM_A, CondEncoding::Prefix, false),
+            (ARM_A_B, CondEncoding::Prefix, false),
+            (ARM_AB, CondEncoding::Prefix, true),
+            (ARM_AB_B, CondEncoding::Prefix, true),
+        ],
+    )?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+
+    let mut pooled = margins(arms, ARM_A, gamma_ix)?;
+    pooled.extend(margins(arms, ARM_AB, gamma_ix)?);
+    if pooled.is_empty() {
+        return Err(StatError::NoMargins {
+            a: ARM_A,
+            b: ARM_AB,
+        });
+    }
+    let cuts = quartile_cuts(&mut pooled);
+
+    let a = flips_by_stratum(arms, ARM_A, gamma_ix, &cuts)?;
+    let a_b = flips_by_stratum(arms, ARM_A_B, gamma_ix, &cuts)?;
+    let ab = flips_by_stratum(arms, ARM_AB, gamma_ix, &cuts)?;
+    let ab_b = flips_by_stratum(arms, ARM_AB_B, gamma_ix, &cuts)?;
+
+    let whole: Vec<usize> = (0..arms.games()).collect();
+    let mut intervals: Vec<Interval> = Vec::with_capacity(STRATA);
+    let mut levels = [1.0f64; STRATA];
+    let mut points: Vec<(f64, f64, f64)> = Vec::with_capacity(STRATA);
+    let mut counts: Vec<(usize, usize)> = Vec::with_capacity(STRATA);
+
+    for stratum in 0..STRATA {
+        // Every one of these is in range — the arrays are `[_; STRATA]`
+        // and so is the loop — and taken by `get` rather than by index
+        // so that this function carries no panic.
+        let missing = |arm: &'static str| StatError::EmptyStratum { stratum, arm };
+        let in_a = a.get(stratum).ok_or_else(|| missing(ARM_A))?;
+        let in_a_b = a_b.get(stratum).ok_or_else(|| missing(ARM_A_B))?;
+        let in_ab = ab.get(stratum).ok_or_else(|| missing(ARM_AB))?;
+        let in_ab_b = ab_b.get(stratum).ok_or_else(|| missing(ARM_AB_B))?;
+        for (arm, tally) in [
+            (ARM_A, in_a),
+            (ARM_A_B, in_a_b),
+            (ARM_AB, in_ab),
+            (ARM_AB_B, in_ab_b),
+        ] {
+            if tally.total().n == 0 {
+                return Err(StatError::EmptyStratum { stratum, arm });
+            }
+        }
+        // Every band is read off the same seed, so the four are four
+        // readings of one resample of games rather than four
+        // independent ones — the same discipline the terms inside a
+        // band are held to.
+        let margin_and_floor = |draw: &[usize]| -> Option<(f64, f64, f64)> {
+            let plain = in_a.mean_over(draw)?;
+            let plain_b = in_a_b.mean_over(draw)?;
+            let legal = in_ab.mean_over(draw)?;
+            let legal_b = in_ab_b.mean_over(draw)?;
+            Some((
+                legal,
+                plain,
+                (legal - legal_b).abs().max((plain - plain_b).abs()),
+            ))
+        };
+        let signed = cluster_bootstrap_signed(arms.games(), draws, seed, |draw| {
+            margin_and_floor(draw).map(|(ab, a, f)| ab - a + f)
+        })?;
+        let (flip_ab, flip_a, floor) =
+            margin_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+        if let Some(slot) = levels.get_mut(stratum) {
+            *slot = signed.p_below_zero;
+        }
+        intervals.push(signed.interval);
+        points.push((flip_a, flip_ab, floor));
+        counts.push((in_a.total().n, in_ab.total().n));
+    }
+
+    // One-sided, because a refutation is a claim about one direction.
+    // At this level, uncorrected, it is the statement the 95% interval
+    // already makes.
+    let alpha = (1.0 - CONFIDENCE) / 2.0;
+    let (rejected, thresholds) = holm(levels, alpha);
+
+    let strata = std::array::from_fn(|i| {
+        let (flip_a, flip_ab, floor) = points.get(i).copied().unwrap_or((f64::NAN, f64::NAN, 0.0));
+        let (positions_a, positions_ab) = counts.get(i).copied().unwrap_or((0, 0));
+        let interval = intervals.get(i).copied().unwrap_or(Interval {
+            point: f64::NAN,
+            low: f64::NAN,
+            high: f64::NAN,
+            draws: 0,
+            undefined_draws: 0,
+            clusters: arms.games(),
+            seed,
+        });
+        Stratum {
+            index: i,
+            low: i.checked_sub(1).and_then(|c| cuts.get(c).copied()),
+            high: cuts.get(i).copied(),
+            flip_a,
+            flip_ab,
+            positions_a,
+            positions_ab,
+            floor,
+            interval,
+            p_below_zero: levels.get(i).copied().unwrap_or(1.0),
+            holm_threshold: thresholds.get(i).copied().unwrap_or(0.0),
+            refuted: rejected.get(i).copied().unwrap_or(false),
+            confirmed: interval.excludes_zero_from_above(),
+        }
+    });
+
+    Ok(H20 {
+        gamma,
+        cuts,
+        strata,
+        alpha,
+        positions: arms.positions(),
+        games: arms.games(),
+    })
+}
+
+/// Every `top2_margin` an arm recorded at one gamma, positions that
+/// carry none left out.
+fn margins(arms: &AlignedArms, arm: &str, gamma_ix: usize) -> Result<Vec<f64>, StatError> {
+    let walk = arms.walk(arm)?;
+    Ok(walk
+        .records
+        .iter()
+        .filter_map(|r| r.at.get(gamma_ix).and_then(|at| at.top2_margin))
+        .collect())
+}
+
+/// The three quartile cut points of `pooled`, which is sorted in place.
+///
+/// Nearest-rank, as [`crate::metric::bootstrap`]'s percentiles are: the
+/// `k`-th cut is the value at rank `floor(k/4 * n)`. Ties are not broken
+/// — a pool where more than a quarter of the margins share a value puts
+/// two cut points on that value, and the band between them is empty.
+/// That is reported as [`StatError::EmptyStratum`] rather than papered
+/// over, since a band holding nothing cannot carry a flip rate.
+fn quartile_cuts(pooled: &mut [f64]) -> [f64; STRATA - 1] {
+    pooled.sort_by(f64::total_cmp);
+    let n = pooled.len();
+    std::array::from_fn(|k| {
+        let rank = ((k + 1) as f64 / STRATA as f64 * n as f64).floor() as usize;
+        pooled
+            .get(rank.min(n.saturating_sub(1)))
+            .copied()
+            .unwrap_or(f64::NAN)
+    })
+}
+
+/// Which band a margin falls in, against common cut points.
+///
+/// Half-open upwards: a margin equal to a cut point belongs to the band
+/// above it, so the bands partition the line and no position is counted
+/// twice.
+fn stratum_of(margin: f64, cuts: &[f64; STRATA - 1]) -> usize {
+    cuts.iter().filter(|cut| margin >= **cut).count()
+}
+
+/// One arm's flips, tallied into the bands by that arm's own margins.
+fn flips_by_stratum(
+    arms: &AlignedArms,
+    arm: &str,
+    gamma_ix: usize,
+    cuts: &[f64; STRATA - 1],
+) -> Result<[ClusterTally; STRATA], StatError> {
+    let walk = arms.walk(arm)?;
+    let mut out: [ClusterTally; STRATA] = std::array::from_fn(|_| ClusterTally::new(arms.games()));
+    for (record, cluster) in walk.records.iter().zip(arms.clusters()) {
+        let Some(at) = record.at.get(gamma_ix) else {
+            continue;
+        };
+        // A position with no margin cannot be placed at a
+        // contestability, so it leaves the comparison rather than
+        // landing in an end band by default.
+        let Some(margin) = at.top2_margin else {
+            continue;
+        };
+        // At most `cuts.len()` cuts can sit at or below a margin, so
+        // the index is inside the array; the `get_mut` keeps this free
+        // of indexing panics regardless.
+        if let Some(tally) = out.get_mut(stratum_of(margin, cuts)) {
+            tally.push(*cluster, if at.flipped { 1.0 } else { 0.0 })?;
+        }
+    }
+    Ok(out)
+}
+
+/// Holm-Bonferroni across the bands.
+///
+/// Step-down: the smallest level is compared against `alpha/m`, the
+/// next against `alpha/(m-1)`, and so on, stopping at the first that
+/// does not clear its threshold. Valid under arbitrary dependence
+/// between the bands, which matters here because they are four readings
+/// of one resample of the same games.
+///
+/// Returns the rejections and the threshold each band was compared
+/// against, both in the bands' own order rather than in ranked order.
+fn holm(levels: [f64; STRATA], alpha: f64) -> ([bool; STRATA], [f64; STRATA]) {
+    let mut order: [usize; STRATA] = std::array::from_fn(|i| i);
+    order.sort_by(|a, b| {
+        let (a, b) = (levels.get(*a), levels.get(*b));
+        match (a, b) {
+            (Some(a), Some(b)) => a.total_cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    });
+    let mut rejected = [false; STRATA];
+    let mut thresholds = [0.0f64; STRATA];
+    let mut still_rejecting = true;
+    for (rank, band) in order.iter().enumerate() {
+        let threshold = alpha / (STRATA - rank) as f64;
+        if let Some(slot) = thresholds.get_mut(*band) {
+            *slot = threshold;
+        }
+        let clears = levels.get(*band).is_some_and(|level| *level <= threshold);
+        if still_rejecting && clears {
+            if let Some(slot) = rejected.get_mut(*band) {
+                *slot = true;
+            }
+        } else {
+            still_rejecting = false;
+        }
+    }
+    (rejected, thresholds)
+}
+
+/// H19: the manipulation check, which carries no verdict.
+///
+/// `ce_legal(control) - ce_legal(A)`. `A` optimises `ce_legal` and the
+/// control does not, so a difference is expected by construction —
+/// `handoff.md:52` already measured it at 0.48 nats. It is here to say
+/// the bake did what the flag claims, and a figure far from 0.48 is a
+/// signal that something is wrong with the run rather than a finding.
+///
+/// # Why this type has no `verdict`
+///
+/// Not an omission and not a convention to be observed. A hypothesis
+/// whose direction is known before the data arrives cannot be confirmed
+/// by the data arriving in that direction, and revision 2 of the plan
+/// made exactly that mistake — it judged this comparison, so confirm
+/// carried no information and refute was unreachable. A type that
+/// cannot express a verdict here is what stops the mistake from being
+/// available: there is no `confirmed`, no `refuted` and no `verdict` to
+/// call, so a caller that wanted one would have to write it itself and
+/// would be visibly the author of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct H19 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// `ce_legal(control)` on the sample as walked.
+    pub ce_control: f64,
+    /// `ce_legal(A)`.
+    pub ce_a: f64,
+    /// The difference, on the sample as walked.
+    pub difference: f64,
+    /// Interval on the difference, over one set of game resamples.
+    pub interval: Interval,
+    /// Positions the arms share.
+    pub positions: usize,
+    /// Games those positions came from.
+    pub games: usize,
+}
+
+/// Assemble H19 from the control and `A`.
+///
+/// # Errors
+///
+/// [`CONTROL`] or [`ARM_A`] is missing, either checkpoint does not fit
+/// its role or was walked too early to state the legality axis
+/// ([`LEGALITY_AXIS_VERSION`]), the gamma was not swept, or the
+/// resampling refused.
+pub fn h19(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H19, StatError> {
+    require_kinds(
+        arms,
+        &[
+            (CONTROL, CondEncoding::Prefix, false),
+            (ARM_A, CondEncoding::Prefix, false),
+        ],
+    )?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let control = tally(arms, CONTROL, gamma_ix, ce_mean)?;
+    let a = tally(arms, ARM_A, gamma_ix, ce_mean)?;
+
+    let interval = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        Some(control.mean_over(draw)? - a.mean_over(draw)?)
+    })?;
+    Ok(H19 {
+        gamma,
+        ce_control: control.total().mean().unwrap_or(f64::NAN),
+        ce_a: a.total().mean().unwrap_or(f64::NAN),
+        difference: interval.point,
+        interval,
+        positions: arms.positions(),
+        games: arms.games(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +1984,7 @@ mod tests {
             holdout: "holdout-2026-05.pgn".into(),
             side: "White".into(),
             encoding: CondEncoding::Prefix,
+            legal_input: false,
             ctx: 128,
             bands: vec!["<lo>".into(), "<mid>".into(), "<hi>".into()],
             gammas: GAMMAS.to_vec(),
@@ -1416,6 +2622,1186 @@ mod tests {
              statistics     {stats_elapsed:.1?}  (15 per-arm intervals + H14 + H15 = 18 bootstraps)\n  \
              total          {total:.1?}"
         );
+    }
+
+    // ---- the legality experiment -------------------------------------
+    //
+    // Its arms are all prefix-conditioned, so nothing above tells them
+    // apart and the fixtures below are built on the axis that does.
+
+    /// The four margins the strata fixtures use.
+    ///
+    /// Dyadic rationals, so every value and every quartile cut point is
+    /// exact in `f64` and an assertion about a cut is arithmetic rather
+    /// than a tolerance. Spread evenly, so pooling two arms that carry
+    /// the same set puts the three cuts at the second, third and fourth
+    /// of them.
+    const MARGINS: [f64; 4] = [0.125, 0.25, 0.375, 0.5];
+
+    /// A walk carrying what the legality statistics read: a cost per
+    /// band, a flip, and a top-two margin.
+    ///
+    /// The cost is the same in all three bands, so the mean over them
+    /// is the number the fixture names and a test's arithmetic is the
+    /// test's own rather than the fixture's.
+    fn legality_walk(
+        games: usize,
+        per_game: usize,
+        ce: impl Fn(usize, usize) -> f64,
+        flip: impl Fn(usize, usize) -> bool,
+        margin: impl Fn(usize) -> f64,
+    ) -> Walk {
+        let mut records = Vec::new();
+        for game in 0..games {
+            for ix in 0..per_game {
+                records.push(PositionRecord {
+                    game,
+                    ply: ix * 2,
+                    n_legal: Some(30),
+                    at: vec![GammaRecord {
+                        flipped: flip(game, ix),
+                        widest_js: 0.02,
+                        legal_mass: 0.9,
+                        top1: Some(vec![true, false, false]),
+                        ce: Some(vec![ce(game, ix); 3]),
+                        top2_margin: Some(margin(ix)),
+                    }],
+                });
+            }
+        }
+        Walk {
+            header: header(records.len(), games),
+            records,
+        }
+    }
+
+    /// A walk at one constant cost, whose flip and margin are keyed on
+    /// the position within the game.
+    ///
+    /// Sixteen positions a game against four margin values makes each
+    /// band catch four positions per game, so a flip rule keyed on `ix`
+    /// is a constant rate **inside every band and in every resample** —
+    /// which is what makes the answers assertable rather than merely
+    /// bounded.
+    fn banded_walk(
+        games: usize,
+        per_game: usize,
+        cost: f64,
+        flip: impl Fn(usize) -> bool,
+        margin: impl Fn(usize) -> Option<f64>,
+    ) -> Walk {
+        let mut records = Vec::new();
+        for game in 0..games {
+            for ix in 0..per_game {
+                records.push(PositionRecord {
+                    game,
+                    ply: ix * 2,
+                    n_legal: Some(30),
+                    at: vec![GammaRecord {
+                        flipped: flip(ix),
+                        widest_js: 0.02,
+                        legal_mass: 0.9,
+                        top1: Some(vec![true, false, false]),
+                        ce: Some(vec![cost; 3]),
+                        top2_margin: margin(ix),
+                    }],
+                });
+            }
+        }
+        Walk {
+            header: header(records.len(), games),
+            records,
+        }
+    }
+
+    /// Label a walk as one of the legality arms: its own checkpoint,
+    /// prefix conditioning, and the legality axis its role calls for.
+    ///
+    /// The axis is set from the name rather than passed in, so a
+    /// fixture cannot quietly build an arm whose header disagrees with
+    /// the slot it is about to go into — the tests that want that
+    /// disagreement build it in the open.
+    fn legality_arm(name: &'static str, mut walk: Walk) -> (String, Walk) {
+        walk.header.ckpt = format!("/root/ckpt/{name}/run.safetensors");
+        walk.header.encoding = CondEncoding::Prefix;
+        walk.header.legal_input = matches!(name, ARM_AB | ARM_AB_B);
+        (name.to_string(), walk)
+    }
+
+    fn four_arms(a: Walk, a_b: Walk, ab: Walk, ab_b: Walk) -> AlignedArms {
+        AlignedArms::new(vec![
+            legality_arm(ARM_A, a),
+            legality_arm(ARM_A_B, a_b),
+            legality_arm(ARM_AB, ab),
+            legality_arm(ARM_AB_B, ab_b),
+        ])
+        .expect("the fixture arms share a position stream")
+    }
+
+    /// Four arms whose per-band cost is a constant each, which fixes
+    /// `D` and `F` by arithmetic: every draw sees the same means, so
+    /// both intervals are degenerate at their point estimates.
+    fn arms_at_costs(a: f64, a_b: f64, ab: f64, ab_b: f64) -> AlignedArms {
+        let walk = |cost: f64, phase: usize| {
+            legality_walk(
+                8,
+                12,
+                move |_, _| cost,
+                // The flip pattern differs per arm so that two arms
+                // sharing a cost are still two arms: `AlignedArms`
+                // refuses a set whose records agree everywhere.
+                move |_, ix| ix % 4 == phase,
+                |ix| MARGINS[ix % MARGINS.len()],
+            )
+        };
+        four_arms(walk(a, 0), walk(a_b, 1), walk(ab, 2), walk(ab_b, 3))
+    }
+
+    /// `§5.3`'s table, read off the curve this implements.
+    ///
+    /// Not two calculations agreeing. One row of that table is a
+    /// measurement and every other row is `1/sqrt(n)` applied to it, so
+    /// what this checks is that the code reads the same curve the plan
+    /// does — which is the property that matters, since the floor a
+    /// verdict is judged against has to be the pre-registered one
+    /// rather than one this file arrived at.
+    ///
+    /// The anchor is written at 180 games while the measurement was
+    /// made at 99, so the 99-game row returns through the table's four
+    /// printed decimals rather than exactly. The test says by how much.
+    #[test]
+    fn the_resolution_reproduces_the_plans_own_table() {
+        let planned = Resolution::at(PLANNED_GAMES).expect("the anchor");
+        assert_eq!(planned.effect, PLANNED_EFFECT);
+
+        for (games, printed) in [(99usize, 0.0718), (204, 0.0500), (1080, 0.0217)] {
+            let row = Resolution::at(games).expect("a row of the table");
+            assert!(
+                (row.effect / printed - 1.0).abs() < 0.005,
+                "{games} games: {} against the table's {printed}, more than half a percent apart",
+                row.effect
+            );
+        }
+
+        // And the values themselves, so that moving the anchor has to
+        // be done deliberately rather than absorbed by the tolerance
+        // above.
+        let at = |games: usize| Resolution::at(games).expect("a row").effect;
+        assert!((at(99) - 0.071_870).abs() < 1e-6, "{}", at(99));
+        assert!((at(204) - 0.050_067).abs() < 1e-6, "{}", at(204));
+        assert!((at(1080) - 0.021_760).abs() < 1e-6, "{}", at(1080));
+    }
+
+    /// Fewer games, blunter instrument. The point of carrying it at
+    /// all: the walk is sized in positions and the game count is an
+    /// outcome, so a run that lands at 150 games has a higher floor
+    /// than the plan's estimate and a verdict has to be read against
+    /// the one it got.
+    #[test]
+    fn the_resolution_falls_away_as_the_games_do() {
+        let short = Resolution::at(150).expect("a short walk");
+        let planned = Resolution::at(PLANNED_GAMES).expect("the planned walk");
+        let long = Resolution::at(400).expect("a long walk");
+        assert!(short.effect > planned.effect, "{short:?} vs {planned:?}");
+        assert!(long.effect < planned.effect, "{long:?} vs {planned:?}");
+        assert_eq!(short.planned_games, PLANNED_GAMES);
+        assert_eq!(short.planned_effect, PLANNED_EFFECT);
+        assert_eq!(Resolution::at(0), None);
+
+        // On magnitude, so it governs a refutation as it governs a
+        // confirmation.
+        assert!(planned.resolves(PLANNED_EFFECT));
+        assert!(planned.resolves(-PLANNED_EFFECT));
+        assert!(!planned.resolves(PLANNED_EFFECT - 0.001));
+        assert!(!planned.resolves(-(PLANNED_EFFECT - 0.001)));
+    }
+
+    /// H21 on a fixture whose answer is arithmetic: `A` costs 1.0 a
+    /// position and `AB` costs nothing, so `D = 1`; the two replicates
+    /// sit 0.24 and 0.12 from their partners, so `F = 0.24`.
+    ///
+    /// Every position carries the same cost, so every draw sees the
+    /// same means and both intervals are degenerate — which is what
+    /// makes the endpoints assertable rather than merely bounded.
+    #[test]
+    fn h21_assembles_from_four_arms_with_a_known_answer() {
+        let arms = arms_at_costs(1.0, 1.24, 0.0, 0.12);
+        let result = h21(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert!((result.ce_a - 1.0).abs() < 1e-12);
+        assert!((result.ce_ab - 0.0).abs() < 1e-12);
+        assert!((result.difference - 1.0).abs() < 1e-12);
+        assert!((result.floor - 0.24).abs() < 1e-12, "{}", result.floor);
+        assert!((result.confirm.point - 0.76).abs() < 1e-12);
+        assert!((result.refute.point - 1.24).abs() < 1e-12);
+        assert_eq!(result.positions, 96);
+        assert_eq!(result.games, 8);
+        assert_eq!(result.resolution.games, 8);
+        assert!(result.resolved(), "{:?}", result.resolution);
+        assert!(result.confirmed());
+        assert!(!result.refuted());
+        assert_eq!(result.verdict(), "confirmed");
+        assert_eq!(result.confirm.seed, SEED);
+    }
+
+    /// The mirrored criteria, on the null `§4` describes: the two arms
+    /// predict equally well, so `D` is zero while `F` is a real
+    /// positive gap between two runs.
+    ///
+    /// `D - F` is then negative — which is why it cannot be the refute
+    /// test — and `D + F` positive, so the refute branch does not fire.
+    /// Asserted on the interval itself and not only on the verdict, so
+    /// that the test would still catch a refute keyed on the wrong side
+    /// if the resolution gate below it were removed.
+    #[test]
+    fn under_the_null_h21s_refute_branch_does_not_fire() {
+        let arms = arms_at_costs(0.4, 0.64, 0.4, 0.52);
+        let result = h21(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert!(
+            (result.difference - 0.0).abs() < 1e-12,
+            "{}",
+            result.difference
+        );
+        assert!(
+            result.floor > 0.0,
+            "the two runs should differ: {}",
+            result.floor
+        );
+        assert!(
+            result.confirm.point < 0.0,
+            "D - F is negative under the null, which is why it is not the refute test"
+        );
+        assert!(result.refute.point > 0.0);
+        assert!(
+            !result.refute.excludes_zero_from_below(),
+            "the null must not be reported as a refutation: {:?}",
+            result.refute
+        );
+        assert!(!result.confirm.excludes_zero_from_above());
+        assert!(!result.refuted());
+        assert!(!result.confirmed());
+        assert_eq!(result.verdict(), "undetermined");
+    }
+
+    /// An arm that predicts worse by more than both observed
+    /// same-recipe gaps is refuted: `AB` costs 1.0 where `A` costs
+    /// nothing, so `D = -1` against a floor of 0.24.
+    #[test]
+    fn an_arm_worse_by_more_than_the_floor_refutes_h21() {
+        let arms = arms_at_costs(0.0, 0.24, 1.0, 1.12);
+        let result = h21(&arms, 1.0, DRAWS, SEED).unwrap();
+        assert!((result.difference + 1.0).abs() < 1e-12);
+        assert!((result.floor - 0.24).abs() < 1e-12);
+        assert!((result.refute.point + 0.76).abs() < 1e-12);
+        assert!(result.resolved());
+        assert!(result.refuted());
+        assert!(!result.confirmed());
+        assert_eq!(result.verdict(), "refuted");
+    }
+
+    /// The case `§4` records the minimum detectable effect for: an
+    /// effect that is real, in the right direction, cleanly above its
+    /// floor and above zero in every draw — and still too small for the
+    /// walk that measured it.
+    ///
+    /// `D = 0.1` against a floor of 0.02, so the confirm interval
+    /// clears zero and would read as a confirmation on the interval
+    /// alone. Eight games resolve 0.253 nats, so it reads undetermined.
+    /// This is what stops a result document reporting a margin under
+    /// the floor as a near miss.
+    #[test]
+    fn an_effect_below_the_resolution_reads_undetermined_however_clean() {
+        let arms = arms_at_costs(0.1, 0.12, 0.0, 0.01);
+        let result = h21(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert!((result.difference - 0.1).abs() < 1e-9);
+        assert!((result.floor - 0.02).abs() < 1e-9, "{}", result.floor);
+        assert!(
+            result.confirm.excludes_zero_from_above(),
+            "the interval itself is clean: {:?}",
+            result.confirm
+        );
+        assert!(
+            result.resolution.effect > result.difference,
+            "the walk must be blunter than the effect for this test to be about anything: \
+             {:?} vs {}",
+            result.resolution,
+            result.difference
+        );
+        assert!(!result.resolved());
+        assert!(!result.confirmed());
+        assert!(!result.refuted());
+        assert_eq!(result.verdict(), "undetermined");
+    }
+
+    /// The floor's own case, kept apart from the resolution's: an
+    /// effect in the right direction, large enough for this walk to
+    /// separate, and smaller than the larger of the two same-recipe
+    /// seed gaps.
+    ///
+    /// `D = 0.3` against `F = 0.5`, at eight games resolving 0.253. So
+    /// `resolved` is true and the verdict is still undetermined, which
+    /// is what says the floor did the refusing here rather than the
+    /// resolution. A confirmed H21 has to exceed **both** observed
+    /// gaps, and this exceeds neither.
+    #[test]
+    fn an_effect_smaller_than_the_seed_floor_confirms_nothing() {
+        let arms = arms_at_costs(0.3, 0.8, 0.0, 0.1);
+        let result = h21(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert!((result.difference - 0.3).abs() < 1e-9);
+        assert!((result.floor - 0.5).abs() < 1e-9, "{}", result.floor);
+        assert!(
+            result.resolved(),
+            "the walk must resolve this effect for the test to be about the floor: {:?} vs {}",
+            result.resolution,
+            result.difference
+        );
+        assert!(
+            result.confirm.point < 0.0,
+            "D - F is negative below the floor: {:?}",
+            result.confirm
+        );
+        assert!(result.refute.point > 0.0);
+        assert!(!result.confirmed());
+        assert!(!result.refuted());
+        assert_eq!(result.verdict(), "undetermined");
+    }
+
+    /// Both intervals of one H21 come from the same draws in the same
+    /// order, so a relation holding draw by draw survives into the
+    /// **endpoints**.
+    ///
+    /// The fixture fixes `F` at 0.24 in every resample — each replicate
+    /// sits a constant distance from its partner at every position — so
+    /// `refute = confirm + 2F` at every draw. The margin does vary,
+    /// because `A`'s cost differs game to game while `AB`'s does not,
+    /// so the intervals have width and the equality is not vacuous.
+    ///
+    /// The point estimates are deliberately not what is asserted: their
+    /// difference is arithmetic on one call over the whole sample, and
+    /// would hold just as exactly if the two intervals came from
+    /// unrelated seeds.
+    #[test]
+    fn the_two_h21_intervals_are_two_readings_of_one_set_of_draws() {
+        let vary = |game: usize, _: usize| 0.5 + (game % 5) as f64 * 0.125;
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let arms = four_arms(
+            legality_walk(8, 12, vary, |_, ix| ix % 4 == 0, margin),
+            legality_walk(
+                8,
+                12,
+                move |g, i| vary(g, i) + 0.24,
+                |_, ix| ix % 4 == 1,
+                margin,
+            ),
+            legality_walk(8, 12, |_, _| 0.2, |_, ix| ix % 4 == 2, margin),
+            legality_walk(8, 12, |_, _| 0.32, |_, ix| ix % 4 == 3, margin),
+        );
+        let result = h21(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert_eq!(result.confirm.seed, result.refute.seed);
+        assert_eq!(result.confirm.draws, result.refute.draws);
+        assert!(
+            (result.floor - 0.24).abs() < 1e-9,
+            "the floor should be the larger, constant gap: {}",
+            result.floor
+        );
+        assert!(
+            result.confirm.low < result.confirm.high,
+            "an interval of zero width would make the endpoint equality vacuous: {:?}",
+            result.confirm
+        );
+        for (refute_end, confirm_end, which) in [
+            (result.refute.low, result.confirm.low, "low"),
+            (result.refute.high, result.confirm.high, "high"),
+        ] {
+            assert!(
+                (refute_end - (confirm_end + 2.0 * result.floor)).abs() < 1e-9,
+                "the {which} ends should sit exactly 2F apart, which they only do if the two \
+                 intervals rank the same draws: {refute_end} vs {confirm_end}"
+            );
+        }
+    }
+
+    #[test]
+    fn h21_without_all_four_arms_is_refused() {
+        let walk = |cost: f64, phase: usize| {
+            legality_walk(
+                4,
+                8,
+                move |_, _| cost,
+                move |_, ix| ix % 4 == phase,
+                |ix| MARGINS[ix % MARGINS.len()],
+            )
+        };
+        let arms = AlignedArms::new(vec![
+            legality_arm(ARM_A, walk(1.0, 0)),
+            legality_arm(ARM_A_B, walk(1.2, 1)),
+            legality_arm(ARM_AB, walk(0.0, 2)),
+        ])
+        .unwrap();
+        let err = h21(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(err, StatError::Align(AlignError::UnknownArm { .. })),
+            "{err:?}"
+        );
+    }
+
+    /// The hole this set is built around. Every arm is
+    /// prefix-conditioned, so the encoding check passes on a swap of
+    /// `A` and `AB` and every figure downstream stays well-formed while
+    /// `D` changes sign. The legality axis is what refuses it — and
+    /// could not, before the header recorded it.
+    #[test]
+    fn an_arm_on_the_wrong_side_of_the_legality_axis_is_refused() {
+        let walk = |cost: f64, phase: usize| {
+            legality_walk(
+                6,
+                8,
+                move |_, _| cost,
+                move |_, ix| ix % 4 == phase,
+                |ix| MARGINS[ix % MARGINS.len()],
+            )
+        };
+        // The two treatment files handed over the other way round,
+        // which is what a swap on a command line produces. The control
+        // is present so that the up-front check below reaches the swap
+        // rather than stopping at a missing arm.
+        let (_, plain) = legality_arm(ARM_A, walk(1.0, 0));
+        let (_, legal) = legality_arm(ARM_AB, walk(0.0, 2));
+        let arms = AlignedArms::new(vec![
+            legality_arm(CONTROL, walk(1.4, 4)),
+            (ARM_A.to_string(), legal),
+            (ARM_A_B.to_string(), legality_arm(ARM_A_B, walk(1.2, 1)).1),
+            (ARM_AB.to_string(), plain),
+            (ARM_AB_B.to_string(), legality_arm(ARM_AB_B, walk(0.1, 3)).1),
+        ])
+        .unwrap();
+
+        // Both encodings are `Prefix`, so the check that catches a role
+        // swap in the other experiment sees nothing wrong here.
+        assert!(require_roles(
+            &arms,
+            &[
+                (ARM_A, CondEncoding::Prefix),
+                (ARM_AB, CondEncoding::Prefix)
+            ]
+        )
+        .is_ok());
+
+        let err = h21(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::WrongLegalInputForRole {
+                    arm: ARM_A,
+                    want: false,
+                    found: true,
+                }
+            ),
+            "{err:?}"
+        );
+        // And before anything is computed, which is what a program that
+        // prints as it goes needs — on the same variant, so that this
+        // half of the test cannot pass on some unrelated refusal.
+        let up_front = check_legality_roles(&arms).unwrap_err();
+        assert!(
+            matches!(
+                up_front,
+                StatError::WrongLegalInputForRole {
+                    arm: ARM_A,
+                    want: false,
+                    found: true,
+                }
+            ),
+            "{up_front:?}"
+        );
+    }
+
+    /// A legality arm walked by a build that predates the header field
+    /// is refused rather than believed — **in every slot**, which is
+    /// what reading the value alone could not do.
+    ///
+    /// Before version 4 the field parses as `false` whatever the
+    /// checkpoint was. Comparing that `false` against the role refuses
+    /// a stale walk only where the role calls for `true`: the same
+    /// stale walk of the same legality checkpoint, put in `A`, `A-b` or
+    /// the control, agrees with what its role wanted and passes having
+    /// said nothing. So the refusal is keyed on the version, and both
+    /// slots are asserted here — the second is the one that used to
+    /// pass.
+    #[test]
+    fn a_legality_arm_walked_before_the_field_existed_is_refused() {
+        let walk =
+            |cost: f64, phase: usize| banded_walk(6, 8, cost, move |ix| ix % 5 == phase, cycled);
+        // What a version 3 walk parses into: the axis unrecorded, so
+        // read back as false whatever the checkpoint was.
+        let five = |stale: &'static str| {
+            let named: Vec<(String, Walk)> = [
+                (CONTROL, 1.5, 0),
+                (ARM_A, 1.0, 1),
+                (ARM_A_B, 1.1, 2),
+                (ARM_AB, 0.8, 3),
+                (ARM_AB_B, 0.9, 4),
+            ]
+            .into_iter()
+            .map(|(name, cost, phase)| {
+                let (slot, mut w) = legality_arm(name, walk(cost, phase));
+                if name == stale {
+                    w.header.version = 3;
+                    w.header.legal_input = false;
+                }
+                (slot, w)
+            })
+            .collect();
+            AlignedArms::new(named).expect("the fixture arms share a position stream")
+        };
+
+        // The `A` slot first: it is the one the value check admits.
+        for slot in [ARM_A, ARM_AB] {
+            let err = check_legality_roles(&five(slot)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StatError::RecordsPredateLegalityAxis {
+                        arm,
+                        found: 3,
+                        needed: LEGALITY_AXIS_VERSION,
+                    } if arm == slot
+                ),
+                "{slot}: {err:?}"
+            );
+        }
+
+        // And why the `A` slot needs the version rather than the value:
+        // there the stale default is exactly what the role requires, so
+        // the value check has nothing to object to.
+        let arms = five(ARM_A);
+        assert!(!arms.walk(ARM_A).unwrap().header.legal_input);
+        assert_eq!(LEGALITY_ROLES[1], (ARM_A, CondEncoding::Prefix, false));
+    }
+
+    /// `§5.1` item 3, asked of the version rather than of the fields.
+    #[test]
+    fn a_walk_that_predates_the_scored_fields_is_refused() {
+        let arms = arms_at_costs(1.0, 1.24, 0.0, 0.12);
+        assert!(check_scoreable(&arms, &[ARM_A, ARM_A_B, ARM_AB, ARM_AB_B]).is_ok());
+
+        let mut named: Vec<(String, Walk)> = [ARM_A, ARM_A_B, ARM_AB, ARM_AB_B]
+            .iter()
+            .map(|role| ((*role).to_string(), arms.walk(role).unwrap().clone()))
+            .collect();
+        if let Some((_, walk)) = named.first_mut() {
+            walk.header.version = 2;
+        }
+        let stale = AlignedArms::new(named).unwrap();
+        let err = check_scoreable(&stale, &[ARM_A, ARM_A_B, ARM_AB, ARM_AB_B]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::RecordsPredateScoring {
+                    arm: ARM_A,
+                    found: 2,
+                    needed: SCOREABLE_VERSION,
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The two role checks are not interchangeable, which is why there
+    /// are two of them: each refuses the other's arm set.
+    #[test]
+    fn the_two_role_checks_each_refuse_the_others_arm_set() {
+        let legality = arms_at_costs(1.0, 1.24, 0.0, 0.12);
+        check_legality_roles(&legality).expect_err("the control is missing from this set");
+        assert!(check_roles(&legality).is_err());
+
+        let conditioning = three_arms(
+            walk(6, 12, |_, _| true, |_| 0.02),
+            walk(6, 12, |_, _| false, |_| 0.02),
+            walk(6, 12, |g, ix| !(g == 0 && ix == 0), |_| 0.02),
+        );
+        check_roles(&conditioning).expect("the canonical roles");
+        assert!(check_legality_roles(&conditioning).is_err());
+    }
+
+    /// The five roles as they should be, so the refusals above are not
+    /// passing for want of the check ever succeeding.
+    #[test]
+    fn the_five_legality_roles_pass_the_up_front_check() {
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let walk = |cost: f64, phase: usize| {
+            legality_walk(6, 8, move |_, _| cost, move |_, ix| ix % 5 == phase, margin)
+        };
+        let arms = AlignedArms::new(vec![
+            legality_arm(CONTROL, walk(1.5, 0)),
+            legality_arm(ARM_A, walk(1.0, 1)),
+            legality_arm(ARM_A_B, walk(1.1, 2)),
+            legality_arm(ARM_AB, walk(0.8, 3)),
+            legality_arm(ARM_AB_B, walk(0.9, 4)),
+        ])
+        .unwrap();
+        check_legality_roles(&arms).expect("the canonical legality roles");
+        check_scoreable(&arms, &LEGALITY_ARMS).expect("records written by this build");
+
+        // The control is the prefix arm under another name, and both
+        // spellings reach the same walk.
+        assert_eq!(CONTROL, PREFIX);
+        assert_eq!(arms.walk(CONTROL).unwrap(), arms.walk(PREFIX).unwrap());
+    }
+
+    /// H19 is reported and not judged. Its direction is known before
+    /// the data arrives — `A` optimises this quantity and the control
+    /// does not — so there is no `confirmed`, no `refuted` and no
+    /// `verdict` on the type to call.
+    #[test]
+    fn h19_reports_a_difference_without_a_verdict() {
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let walk = |cost: f64, phase: usize| {
+            legality_walk(6, 8, move |_, _| cost, move |_, ix| ix % 5 == phase, margin)
+        };
+        let arms = AlignedArms::new(vec![
+            legality_arm(CONTROL, walk(1.48, 0)),
+            legality_arm(ARM_A, walk(1.0, 1)),
+        ])
+        .unwrap();
+        let result = h19(&arms, 1.0, DRAWS, SEED).unwrap();
+        assert!((result.ce_control - 1.48).abs() < 1e-12);
+        assert!((result.ce_a - 1.0).abs() < 1e-12);
+        assert!((result.difference - 0.48).abs() < 1e-12);
+        assert_eq!(result.interval.point, result.difference);
+        assert_eq!(result.games, 6);
+        assert_eq!(result.positions, 48);
+    }
+
+    /// The control slot is guarded on both axes, since a legality
+    /// checkpoint there would make H19 a difference against a treatment
+    /// arm while every figure stayed well-formed.
+    #[test]
+    fn h19_refuses_a_legality_checkpoint_in_the_control_slot() {
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let walk = |cost: f64, phase: usize| {
+            legality_walk(6, 8, move |_, _| cost, move |_, ix| ix % 5 == phase, margin)
+        };
+        let (_, mut control) = legality_arm(CONTROL, walk(1.48, 0));
+        control.header.legal_input = true;
+        let arms = AlignedArms::new(vec![
+            (CONTROL.to_string(), control),
+            legality_arm(ARM_A, walk(1.0, 1)),
+        ])
+        .unwrap();
+        let err = h19(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::WrongLegalInputForRole {
+                    arm: CONTROL,
+                    want: false,
+                    found: true,
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The margin every strata fixture uses: [`MARGINS`] cycled.
+    fn cycled(ix: usize) -> Option<f64> {
+        MARGINS.get(ix % MARGINS.len()).copied()
+    }
+
+    /// Four arms for the strata fixtures, differing in their flip rules
+    /// and — so that two arms sharing a rule are still two arms — in a
+    /// per-band cost nothing in H20 reads.
+    fn stratified_arms(
+        flip_a: impl Fn(usize) -> bool,
+        flip_a_b: impl Fn(usize) -> bool,
+        flip_ab: impl Fn(usize) -> bool,
+        flip_ab_b: impl Fn(usize) -> bool,
+    ) -> AlignedArms {
+        four_arms(
+            banded_walk(8, 16, 1.0, flip_a, cycled),
+            banded_walk(8, 16, 1.1, flip_a_b, cycled),
+            banded_walk(8, 16, 0.9, flip_ab, cycled),
+            banded_walk(8, 16, 0.8, flip_ab_b, cycled),
+        )
+    }
+
+    /// H20 on a fixture whose every band answers the same way: `AB`
+    /// flips everywhere and `A` nowhere, so the margin is `+1` in each
+    /// band; each replicate flips on half its band's positions, so
+    /// `F_flip` is 0.5 in each.
+    ///
+    /// The cut points are the second, third and fourth of [`MARGINS`],
+    /// because the two compared arms carry the same set and pooling
+    /// them leaves the quartiles where a single copy would.
+    #[test]
+    fn h20_cuts_common_strata_and_reads_a_known_answer() {
+        let arms = stratified_arms(|_| false, |ix| ix < 8, |_| true, |ix| ix >= 8);
+        let result = h20(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert_eq!(result.cuts, [MARGINS[1], MARGINS[2], MARGINS[3]]);
+        assert_eq!(result.positions, 128);
+        assert_eq!(result.games, 8);
+        for band in &result.strata {
+            assert_eq!(band.positions_a, 32, "{band:?}");
+            assert_eq!(band.positions_ab, 32, "{band:?}");
+            assert!((band.flip_a - 0.0).abs() < 1e-12, "{band:?}");
+            assert!((band.flip_ab - 1.0).abs() < 1e-12, "{band:?}");
+            assert!((band.floor - 0.5).abs() < 1e-12, "{band:?}");
+            assert!((band.interval.point - 1.5).abs() < 1e-12, "{band:?}");
+            assert!(band.confirmed, "{band:?}");
+            assert!(!band.refuted, "{band:?}");
+        }
+        // Bands are half-open upwards and cover the line.
+        assert_eq!(result.strata[0].low, None);
+        assert_eq!(result.strata[0].high, Some(MARGINS[1]));
+        assert_eq!(result.strata[3].low, Some(MARGINS[3]));
+        assert_eq!(result.strata[3].high, None);
+
+        assert!(result.confirmed());
+        assert!(!result.refuted());
+        assert_eq!(result.verdict(), "confirmed");
+        assert_eq!(result.refuting(), [false; STRATA]);
+    }
+
+    /// A cost larger than the floor refutes, in every band, and the
+    /// bands are reported one by one so the caller can intersect two
+    /// months rather than two summaries.
+    ///
+    /// `AB` flips on a quarter of each band against `A`'s everywhere,
+    /// so the margin is `-0.75` against a floor of 0.5.
+    #[test]
+    fn a_cost_larger_than_the_floor_refutes_h20() {
+        let arms = stratified_arms(|_| true, |ix| ix < 8, |ix| ix < 4, |ix| ix < 4);
+        let result = h20(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        for band in &result.strata {
+            assert!((band.flip_a - 1.0).abs() < 1e-12, "{band:?}");
+            assert!((band.flip_ab - 0.25).abs() < 1e-12, "{band:?}");
+            assert!((band.floor - 0.5).abs() < 1e-12, "{band:?}");
+            assert!((band.interval.point + 0.25).abs() < 1e-12, "{band:?}");
+            assert!(band.refuted, "{band:?}");
+            assert!(!band.confirmed, "{band:?}");
+        }
+        assert!(result.refuted());
+        assert!(!result.confirmed());
+        assert_eq!(result.verdict(), "refuted");
+        assert_eq!(result.refuting(), [true; STRATA]);
+
+        // The correction is applied rather than the bare level: four
+        // bands, so the thresholds step 0.025/4, /3, /2, /1.
+        let mut thresholds: Vec<f64> = result.strata.iter().map(|s| s.holm_threshold).collect();
+        thresholds.sort_by(f64::total_cmp);
+        assert!((thresholds[0] - result.alpha / 4.0).abs() < 1e-12);
+        assert!((thresholds[1] - result.alpha / 3.0).abs() < 1e-12);
+        assert!((thresholds[2] - result.alpha / 2.0).abs() < 1e-12);
+        assert!((thresholds[3] - result.alpha).abs() < 1e-12);
+        assert!((result.alpha - (1.0 - CONFIDENCE) / 2.0).abs() < 1e-12);
+
+        // The reported levels and thresholds are the ones the verdicts
+        // came from. On this fixture that is the whole of what it says:
+        // every band's flip rate is the same in every resample, so
+        // every level is exactly zero and corrected and uncorrected
+        // cannot disagree. The fixture where they do is
+        // `the_correction_and_the_bare_interval_disagree`.
+        assert_eq!(result.strata.map(|s| s.p_below_zero), [0.0; STRATA]);
+        let levels: [f64; STRATA] = std::array::from_fn(|i| result.strata[i].p_below_zero);
+        let (rejected, _) = holm(levels, result.alpha);
+        for (band, want) in result.strata.iter().zip(rejected) {
+            assert_eq!(band.refuted, want, "{band:?}");
+        }
+    }
+
+    /// The one fixture where the correction changes an answer: every
+    /// band refutes on its own interval, and none refutes once the four
+    /// are corrected together.
+    ///
+    /// Every other H20 fixture here keys its flips on the position
+    /// alone, so a band's rate is the same in every resample and its
+    /// level is exactly zero or one. Corrected and uncorrected coincide
+    /// on all of them, and none of them would notice a `refuted` read
+    /// off `Interval::excludes_zero_from_below` instead of off Holm.
+    ///
+    /// Here one game in eight carries the whole disagreement: `A` flips
+    /// on none of that game's positions and seven eighths of every
+    /// other game's, `AB` the other way round. A draw's sign therefore
+    /// turns on how many times that one game is picked — the quantity
+    /// clears zero at four or more, which is 1.1% of draws in
+    /// expectation and 1.2% at this seed. That is under the uncorrected
+    /// 2.5% and over Holm's tightest 0.625%, so the two answers differ,
+    /// and the month reads undetermined where the bare interval would
+    /// read refuted.
+    ///
+    /// The floor is held at exactly 0.125 in every draw — each
+    /// replicate flips on one more of its band's eight positions than
+    /// its partner does, in every game, so the gap survives resampling
+    /// unchanged and the sign above is arithmetic rather than an
+    /// accident of which games were drawn.
+    #[test]
+    fn the_correction_and_the_bare_interval_disagree() {
+        /// Flip the first `count(game)` positions of each band.
+        ///
+        /// Thirty-two positions a game against four margin values puts
+        /// eight of each band in every game, and they arrive in order,
+        /// so `count` is the band's flip count for that game exactly.
+        fn banded(count: impl Fn(usize) -> usize) -> impl Fn(usize, usize) -> bool {
+            move |game, ix| ix / MARGINS.len() < count(game)
+        }
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let arms = four_arms(
+            legality_walk(
+                8,
+                32,
+                |_, _| 1.0,
+                banded(|g| if g == 0 { 0 } else { 7 }),
+                margin,
+            ),
+            legality_walk(
+                8,
+                32,
+                |_, _| 1.1,
+                banded(|g| if g == 0 { 1 } else { 8 }),
+                margin,
+            ),
+            legality_walk(
+                8,
+                32,
+                |_, _| 0.9,
+                banded(|g| if g == 0 { 6 } else { 0 }),
+                margin,
+            ),
+            legality_walk(
+                8,
+                32,
+                |_, _| 0.8,
+                banded(|g| if g == 0 { 7 } else { 1 }),
+                margin,
+            ),
+        );
+        let result = h20(&arms, 1.0, DRAWS, SEED).unwrap();
+        let tightest = result.alpha / STRATA as f64;
+
+        for band in &result.strata {
+            assert_eq!(band.positions_a, 64, "{band:?}");
+            assert_eq!(band.positions_ab, 64, "{band:?}");
+            assert!((band.floor - 0.125).abs() < 1e-12, "{band:?}");
+            // On the sample as walked each game appears once: `A` flips
+            // on 49 of its 64, `AB` on 6.
+            assert!((band.flip_a - 49.0 / 64.0).abs() < 1e-12, "{band:?}");
+            assert!((band.flip_ab - 6.0 / 64.0).abs() < 1e-12, "{band:?}");
+            assert!(
+                (band.interval.point + 35.0 / 64.0).abs() < 1e-12,
+                "{band:?}"
+            );
+
+            assert!(
+                band.interval.excludes_zero_from_below(),
+                "uncorrected, this band refutes: {band:?}"
+            );
+            assert!(
+                band.p_below_zero > tightest,
+                "and its level fails Holm's tightest threshold {tightest}: {band:?}"
+            );
+            assert!(
+                band.p_below_zero < result.alpha,
+                "while clearing the uncorrected one: {band:?}"
+            );
+            assert!(!band.refuted, "so the correction refuses it: {band:?}");
+            assert!(!band.confirmed, "{band:?}");
+        }
+
+        assert!(!result.refuted());
+        assert_eq!(result.refuting(), [false; STRATA]);
+        assert_eq!(
+            result.verdict(),
+            "undetermined",
+            "a verdict read off the intervals alone would say refuted"
+        );
+
+        // The step-down is what refuses the band handed the uncorrected
+        // threshold: its own level clears the threshold it was given,
+        // and it is rejected anyway only if the procedure never halted.
+        let loosest = result
+            .strata
+            .iter()
+            .max_by(|a, b| a.holm_threshold.total_cmp(&b.holm_threshold))
+            .expect("four bands");
+        assert!((loosest.holm_threshold - result.alpha).abs() < 1e-12);
+        assert!(
+            loosest.p_below_zero <= loosest.holm_threshold,
+            "{loosest:?}"
+        );
+        assert!(!loosest.refuted, "{loosest:?}");
+    }
+
+    /// The asymmetry `§4` records and does not fix: a real cost that is
+    /// smaller than the floor reads as "steerability survives".
+    ///
+    /// `AB` flips on three quarters of each band against `A`'s
+    /// everywhere, so it genuinely flips less — a margin of `-0.25`
+    /// against a floor of 0.5, which the tolerance absorbs. A confirm
+    /// here is the weaker of the plan's two claims, and this is why.
+    #[test]
+    fn a_cost_smaller_than_the_floor_still_confirms_h20() {
+        let arms = stratified_arms(|_| true, |ix| ix < 8, |ix| ix < 12, |ix| ix < 12);
+        let result = h20(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        for band in &result.strata {
+            assert!(
+                band.flip_ab < band.flip_a,
+                "the cost has to be real for this test to be about anything: {band:?}"
+            );
+            assert!(
+                (band.flip_ab - band.flip_a + 0.25).abs() < 1e-12,
+                "{band:?}"
+            );
+            assert!((band.floor - 0.5).abs() < 1e-12, "{band:?}");
+            assert!((band.interval.point - 0.25).abs() < 1e-12, "{band:?}");
+            assert!(band.confirmed, "{band:?}");
+            assert!(!band.refuted, "{band:?}");
+        }
+        assert_eq!(result.verdict(), "confirmed");
+    }
+
+    /// Under the null the two arms flip alike, and the criterion is
+    /// `margin + F_flip`, so a confirm fires on a positive floor alone.
+    /// That is `§4`'s recorded asymmetry rather than a defect, and it
+    /// is asserted here so that removing the floor would be visible as
+    /// a change of verdict rather than as a shift in a number.
+    ///
+    /// What must **not** happen under the null is a refutation.
+    #[test]
+    fn under_the_null_h20_does_not_refute() {
+        let arms = stratified_arms(|ix| ix < 8, |ix| ix < 4, |ix| ix >= 8, |ix| ix >= 12);
+        let result = h20(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        for band in &result.strata {
+            assert!((band.flip_a - 0.5).abs() < 1e-12, "{band:?}");
+            assert!((band.flip_ab - 0.5).abs() < 1e-12, "{band:?}");
+            assert!((band.floor - 0.25).abs() < 1e-12, "{band:?}");
+            assert!(!band.refuted, "the null must not refute: {band:?}");
+        }
+        assert!(!result.refuted());
+        assert_eq!(result.refuting(), [false; STRATA]);
+    }
+
+    /// The strata hold different positions for the two arms, and that
+    /// is the design rather than a defect: the cut points are common,
+    /// so a uniformly sharper arm puts more of its positions in the
+    /// high bands. Per-arm quantiles would match on rank and move the
+    /// sharpness difference inside every band instead of holding it
+    /// still.
+    #[test]
+    fn a_sharper_arm_fills_the_high_bands_rather_than_matching_on_rank() {
+        // `AB` is sharper over three quarters of each game: those
+        // positions' margins are one step up from `A`'s, and the last
+        // four are left alone so that the bottom band still catches
+        // something for it.
+        let sharper = |ix: usize| {
+            if ix < 12 {
+                MARGINS
+                    .get((ix % MARGINS.len() + 1).min(MARGINS.len() - 1))
+                    .copied()
+            } else {
+                cycled(ix)
+            }
+        };
+        let arms = four_arms(
+            banded_walk(8, 16, 1.0, |ix| ix % 4 == 0, cycled),
+            banded_walk(8, 16, 1.1, |ix| ix % 4 == 1, cycled),
+            banded_walk(8, 16, 0.9, |ix| ix % 4 == 2, sharper),
+            banded_walk(8, 16, 0.8, |ix| ix % 4 == 3, sharper),
+        );
+        let result = h20(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        let lowest = &result.strata[0];
+        let highest = &result.strata[STRATA - 1];
+        assert!(
+            lowest.positions_ab < lowest.positions_a,
+            "the sharper arm should be under-represented at the bottom: {lowest:?}"
+        );
+        assert!(
+            highest.positions_ab > highest.positions_a,
+            "and over-represented at the top: {highest:?}"
+        );
+        // The bands still partition each arm's positions: nothing is
+        // counted twice and nothing carrying a margin is dropped.
+        let total_a: usize = result.strata.iter().map(|s| s.positions_a).sum();
+        let total_ab: usize = result.strata.iter().map(|s| s.positions_ab).sum();
+        assert_eq!(total_a, result.positions);
+        assert_eq!(total_ab, result.positions);
+    }
+
+    /// A band that catches nothing for one of the arms says so, rather
+    /// than reporting a flip rate over no positions.
+    #[test]
+    fn an_empty_band_is_refused() {
+        // Every margin identical, so all three cut points land on the
+        // same value and the three bands below it are empty.
+        let flat = |_: usize| Some(0.25);
+        let arms = four_arms(
+            banded_walk(4, 8, 1.0, |ix| ix % 4 == 0, flat),
+            banded_walk(4, 8, 1.1, |ix| ix % 4 == 1, flat),
+            banded_walk(4, 8, 0.9, |ix| ix % 4 == 2, flat),
+            banded_walk(4, 8, 0.8, |ix| ix % 4 == 3, flat),
+        );
+        let err = h20(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::EmptyStratum {
+                    stratum: 0,
+                    arm: ARM_A
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A set carrying no margin at all is reported as that, rather than
+    /// as an empty band: the margin arrived at record format version 2,
+    /// and a version 1 walk reaching here has nothing to cut on.
+    #[test]
+    fn a_set_with_no_margins_has_no_cut_points() {
+        let none = |_: usize| None;
+        let arms = four_arms(
+            banded_walk(4, 8, 1.0, |ix| ix % 4 == 0, none),
+            banded_walk(4, 8, 1.1, |ix| ix % 4 == 1, none),
+            banded_walk(4, 8, 0.9, |ix| ix % 4 == 2, none),
+            banded_walk(4, 8, 0.8, |ix| ix % 4 == 3, none),
+        );
+        let err = h20(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::NoMargins {
+                    a: ARM_A,
+                    b: ARM_AB
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// What the correction is for: a band whose level would refute on
+    /// its own does not refute once it is one of four.
+    ///
+    /// 0.02 clears the uncorrected 0.025 — which is the statement a 95%
+    /// interval lying below zero makes — and fails Holm's first
+    /// threshold of 0.00625. Without the correction the plan's "refute
+    /// in any stratum" would be a criterion that fires roughly four
+    /// times as often as it claims to.
+    #[test]
+    fn holm_refuses_a_band_that_would_refute_on_its_own() {
+        let alpha = (1.0 - CONFIDENCE) / 2.0;
+        let (rejected, thresholds) = holm([0.02, 0.5, 0.5, 0.5], alpha);
+        assert!(0.02 < alpha, "the band clears the uncorrected level");
+        assert_eq!(rejected, [false; STRATA]);
+        assert!((thresholds[0] - alpha / 4.0).abs() < 1e-12);
+    }
+
+    /// And it does reject, so the test above is not passing for want of
+    /// the correction ever letting anything through.
+    #[test]
+    fn holm_rejects_a_band_that_clears_its_own_threshold() {
+        let alpha = (1.0 - CONFIDENCE) / 2.0;
+        let (rejected, _) = holm([0.001, 0.5, 0.5, 0.5], alpha);
+        assert_eq!(rejected, [true, false, false, false]);
+
+        // All four at once, which is what the fixtures above produce.
+        let (all, _) = holm([0.0; STRATA], alpha);
+        assert_eq!(all, [true; STRATA]);
+    }
+
+    /// Step-down, not step-up: the procedure stops at the first band
+    /// that fails its threshold, and rejects nothing after it even when
+    /// a later band would clear the threshold it was handed.
+    ///
+    /// Levels 0.0001 and 0.001 clear 0.00625 and 0.00833. 0.02 then
+    /// fails 0.0125 and the procedure halts — so 0.024, which sits
+    /// under its own 0.025, is refused. Without the halt this would be
+    /// a per-band test wearing a correction's name.
+    #[test]
+    fn holm_stops_at_the_first_band_that_fails_its_threshold() {
+        let alpha = (1.0 - CONFIDENCE) / 2.0;
+        let (rejected, thresholds) = holm([0.000_1, 0.02, 0.001, 0.024], alpha);
+        assert_eq!(rejected, [true, false, true, false]);
+        assert!(
+            0.024 <= thresholds[3],
+            "the last band clears the threshold it was handed ({}) and is still not rejected",
+            thresholds[3]
+        );
+        assert!((thresholds[3] - alpha).abs() < 1e-12);
+        assert!((thresholds[1] - alpha / 2.0).abs() < 1e-12);
+    }
+
+    /// The legality set's top-1 tolerance is wider than plan 02's, and
+    /// the widening is load-bearing rather than cosmetic: this arm sits
+    /// 0.0208 from the control, which the seed alone can produce
+    /// (0.0146 / 0.0093 were measured), so plan 02's 0.02 would exclude
+    /// it and `§5.1`'s 0.03 admits it.
+    #[test]
+    fn the_legality_top1_gate_admits_what_the_narrower_one_would_exclude() {
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let mut subject = legality_walk(8, 12, |_, _| 1.0, |_, ix| ix % 4 == 1, margin);
+        // Every position scores 1 of 3 bands; six of the 96 score 2,
+        // so this arm's mean sits exactly 2/96 above the control's —
+        // 0.02083, inside 0.03 and outside 0.02.
+        for record in subject.records.iter_mut().take(6) {
+            for at in record.at.iter_mut() {
+                at.top1 = Some(vec![true, true, false]);
+            }
+        }
+        let control = legality_walk(8, 12, |_, _| 1.2, |_, ix| ix % 4 == 0, margin);
+        let arms = AlignedArms::new(vec![
+            legality_arm(CONTROL, control),
+            legality_arm(ARM_A, subject),
+        ])
+        .unwrap();
+
+        let wide = gate_top1_legality(&arms, ARM_A, 1.0, DRAWS, SEED).unwrap();
+        assert_eq!(wide.tolerance, TOP1_GATE_LEGALITY);
+        assert!(
+            (wide.interval.point - 2.0 / 96.0).abs() < 1e-12,
+            "{:?}",
+            wide.interval
+        );
+        assert!(wide.passes(), "{wide:?}");
+        assert_eq!(wide.verdict(), "pass");
+
+        // The same arms under plan 02's tolerance, which is the gate
+        // `§5.1` widened and the reason it did.
+        let narrow = gate_top1(&arms, ARM_A, 1.0, DRAWS, SEED).unwrap();
+        assert_eq!(narrow.tolerance, TOP1_GATE);
+        assert_eq!(narrow.interval, wide.interval);
+        assert!(!narrow.passes(), "{narrow:?}");
+        const { assert!(TOP1_GATE_LEGALITY > TOP1_GATE) };
+    }
+
+    /// The gate is a difference on one draw, so the control against
+    /// itself is identically zero and the gate is degenerate at pass.
+    #[test]
+    fn the_legality_gate_is_a_difference_against_the_control() {
+        let margin = |ix: usize| MARGINS[ix % MARGINS.len()];
+        let arms = AlignedArms::new(vec![
+            legality_arm(
+                CONTROL,
+                legality_walk(6, 8, |_, _| 1.2, |_, ix| ix % 4 == 0, margin),
+            ),
+            legality_arm(
+                ARM_AB,
+                legality_walk(6, 8, |_, _| 0.9, |_, ix| ix % 4 == 2, margin),
+            ),
+        ])
+        .unwrap();
+        let gate = gate_top1_legality(&arms, CONTROL, 1.0, DRAWS, SEED).unwrap();
+        assert_eq!(gate.interval.point, 0.0);
+        assert_eq!(gate.interval.low, 0.0);
+        assert_eq!(gate.interval.high, 0.0);
+        assert!(gate.passes());
     }
 
     /// Reproducibility, end to end: the same seed gives the same

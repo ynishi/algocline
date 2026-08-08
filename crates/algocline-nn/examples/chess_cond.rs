@@ -863,6 +863,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 holdout: pgn.clone(),
                 side: format!("{side:?}"),
                 encoding: shape.encoding,
+                // The other axis of the checkpoint's kind. Both are
+                // taken from the shape this walk actually loaded, so a
+                // reader downstream checks an arm's role against what
+                // the sidecar recorded rather than against a file name.
+                legal_input: shape.legal_input,
                 ctx: shape.ctx,
                 bands: shape.band_tokens(),
                 gammas: gammas.clone(),

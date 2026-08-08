@@ -428,6 +428,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same commit. Nothing enforces that — it is a rule someone
   follows.
 
+  Version 4 adds `WalkHeader::legal_input`. Without it two walks that
+  differ in the only way that matters can produce headers that cannot be
+  told apart: an arm set may be entirely prefix-conditioned and separated
+  only by whether legality was an input, and the role check exists to
+  catch an arm in the wrong slot. Swapping two such arms flips a
+  hypothesis' sign with nothing to say so.
+
+  A plain `bool` rather than an `Option`, because `false` is **correct**
+  for every earlier record and not a placeholder for one: the readers
+  refused legality checkpoints until they learned to recover the sets,
+  so no such walk exists below version 4. The gap that leaves is a walk
+  written between those two commits, which reports `false` whatever its
+  checkpoint was — so the legality arm set requires version 4 outright,
+  the axis being merely unstated below it rather than known absent.
+
   Version 3 adds `GammaRecord::ce` and `PositionRecord::n_legal`. `ce`
   is the negative log probability of the move actually played, under
   each band's distribution restricted to the legal moves and
@@ -554,6 +569,41 @@ eighth was until this change.
 
 `CHESS_LEGAL_MASK` and `CHESS_SCHEDULE` now refuse unknown values
 instead of reading them as off. `CHESS_LEGAL_MASK=true` meant *off*.
+
+- `chess::steerability` gained the hypotheses for a second experiment,
+  and `examples/chess_legality` runs them. `h21` compares two arms that
+  share a training objective and differ only in whether the legal set
+  reached the forward pass; `h20` asks whether that costs steerability;
+  `h19` is a manipulation check and **has no verdict at all** — no
+  `confirmed`, no `refuted`, no `verdict` on the type, since its
+  direction is known by construction and a convention would invite one
+  to be read anyway.
+
+  Three things the criteria carry that the arithmetic does not force:
+
+  - the **floor** is the larger of two same-recipe seed gaps,
+    recomputed inside every draw rather than frozen — a difference of
+    two separately bootstrapped quantities says nothing about the gap
+    between them
+  - `h20`'s strata are **common cut points on the pooled margin**, not
+    each arm's own quantiles. Per-arm quantiles match on rank rather
+    than on contestability, so a uniformly sharper arm keeps its
+    advantage inside every stratum and the confound survives the
+    stratification intact
+  - a verdict requires the **walk to resolve the effect**. `Resolution`
+    reports the smallest difference the game count could have
+    distinguished, and `confirmed` / `refuted` are false below it
+    however clean the interval looks
+
+  `cluster_bootstrap_signed` returns the achieved one-sided level
+  alongside the interval, so a Holm step-down can tighten per stratum
+  without `CONFIDENCE` becoming a parameter — a level chosen per call is
+  a level that can be widened after the interval has been seen.
+
+  A second example rather than more arguments on the first: the two arm
+  sets are judged under different pre-registered criteria, so one
+  program would branch on argument count, and the branch is where a
+  check gets skipped for whichever set took the other path.
 
 - `metric::bootstrap::cluster_bootstrap` — resampling over clusters
   rather than over rows. Positions from one game are not independent,

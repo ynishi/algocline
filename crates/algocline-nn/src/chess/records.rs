@@ -64,28 +64,35 @@ use crate::chess::CondEncoding;
 /// writes.
 ///
 /// Version 2 added [`GammaRecord::top2_margin`]. Version 3 added
-/// [`GammaRecord::ce`] and [`PositionRecord::n_legal`]. Neither bump
-/// changed a field that already existed. A reader accepts
-/// [`MIN_READABLE_VERSION`] through this and refuses anything outside
-/// that range rather than interpreting unfamiliar fields as absent,
-/// which is the same stance [`crate::chess::ModelShape`] takes for the
-/// same reason.
+/// [`GammaRecord::ce`] and [`PositionRecord::n_legal`]. Version 4 added
+/// [`WalkHeader::legal_input`]. No bump has changed a field that
+/// already existed. A reader accepts [`MIN_READABLE_VERSION`] through
+/// this and refuses anything outside that range rather than
+/// interpreting unfamiliar fields as absent, which is the same stance
+/// [`crate::chess::ModelShape`] takes for the same reason.
 ///
 /// This is also the constant a reader consults to ask **whether a
 /// walk was in a position to write a given field**. The fields added
-/// after version 1 are all `Option`, and their `None` says what it
-/// says about the position rather than about the format; the version
-/// is where the format question is answered. See [`GammaRecord::ce`].
-pub const FORMAT_VERSION: u32 = 3;
+/// after version 1 to a *record* are all `Option`, and their `None`
+/// says what it says about the position rather than about the format;
+/// the version is where the format question is answered. See
+/// [`GammaRecord::ce`]. Version 4's addition is to the *header* and is
+/// a plain `bool`, for a reason that field documents: there the default
+/// is not a stand-in for an unanswered question.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Oldest version this build still reads.
 ///
 /// A version 1 record carries no `top2_margin`, no `ce` and no
 /// `n_legal`, and all three default to `None`, so a version 1 file
 /// parses into exactly what it said rather than into a fabricated
-/// number. That matters concretely: the walks Phase 5 was confirmed on
-/// are version 1 files, and refusing them to gain fields nothing reads
-/// yet would discard the evidence for a settled result.
+/// number. Its header carries no `legal_input` either, and that one
+/// defaults to `false` — a value rather than an absence, which is
+/// sound here only because of the argument
+/// [`WalkHeader::legal_input`] makes and not as a general licence.
+/// That matters concretely: the walks Phase 5 was confirmed on are
+/// version 1 files, and refusing them to gain fields nothing reads yet
+/// would discard the evidence for a settled result.
 ///
 /// It is a constant of its own rather than a `1` written into the
 /// comparison because it has to be **raised by hand** the first time a
@@ -112,6 +119,47 @@ pub struct WalkHeader {
     pub side: String,
     /// How the checkpoint was conditioned.
     pub encoding: CondEncoding,
+    /// Whether the checkpoint was handed the ids allowed at each
+    /// position, as [`crate::chess::ModelShape::legal_input`] records
+    /// it.
+    ///
+    /// The other axis of [`crate::chess::ShapeKind`], and here for the
+    /// reason [`Self::encoding`] is: an arm's role in a comparison is a
+    /// claim about how its checkpoint was trained, and a header that
+    /// cannot state the claim cannot be checked against it. The next
+    /// experiment's five arms are **all** prefix-conditioned and differ
+    /// only on this axis, so without it two walks that differ in the
+    /// only way that matters produce headers that cannot be told apart
+    /// — and [`crate::chess::steerability::check_legality_roles`],
+    /// which exists to catch an arm in the wrong slot, would be blind
+    /// to the swap that reverses what its margin means.
+    ///
+    /// # Why a plain `bool` rather than an `Option`
+    ///
+    /// `false` is what a record written before version 4 *means*, not a
+    /// stand-in for something it failed to say. No reader in this crate
+    /// would open a legality checkpoint before `4080715`, so no walk of
+    /// one can have been written at version 1, 2 or 3. That is the
+    /// difference from [`GammaRecord::ce`], where the absence of the
+    /// field and the absence of a value are two different facts and an
+    /// `Option` has to carry both.
+    ///
+    /// The argument leaves one gap, and this does not try to close it
+    /// with a third state. A walk written from `4080715` itself — after
+    /// the readers opened and before this field existed — reads back
+    /// `false` whatever its checkpoint was. Such a walk is refused
+    /// rather than believed, and refused on its **version** rather than
+    /// on this value:
+    /// [`crate::chess::steerability::check_legality_roles`] requires
+    /// [`crate::chess::steerability::LEGALITY_AXIS_VERSION`] of every
+    /// arm it checks. Reading the value alone would not do, and that is
+    /// the whole reason the version is read: it refuses only the slots
+    /// that call for `true`, so the same stale walk of the same
+    /// legality checkpoint would pass wherever `false` is what the role
+    /// wanted. The default is honest where it is right; the version is
+    /// what makes it loud where it is not.
+    #[serde(default)]
+    pub legal_input: bool,
     /// Context window the rows were cut to.
     ///
     /// Here because it fixes a depth bucket edge: a conditioned row is
@@ -1127,6 +1175,7 @@ mod tests {
             holdout: "holdout-2026-05.pgn".into(),
             side: "White".into(),
             encoding: CondEncoding::Prefix,
+            legal_input: false,
             ctx: 128,
             bands: vec![
                 "<elo:1100-1299>".into(),
@@ -1266,6 +1315,60 @@ mod tests {
         assert_eq!(walk.records[0].at[0].top2_margin, None);
         assert_eq!(walk.records[0].at[0].ce, None);
         assert_eq!(walk.records[0].n_legal, None);
+        // The header's version 4 field, which defaults to a value
+        // rather than to an absence. `false` is what this walk means:
+        // no reader would open a legality checkpoint when it was
+        // written.
+        assert!(!walk.header.legal_input);
+    }
+
+    /// The version 4 field, through the file and back, asserted on the
+    /// text as well as on the parse so that a field which round-tripped
+    /// only because both ends dropped it would still fail here.
+    #[test]
+    fn a_current_header_round_trips_its_legality_axis() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v4.jsonl");
+        let mut original = walk(1, 1, true);
+        original.header.legal_input = true;
+        original.write_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"legal_input\":true"), "{body}");
+        let back = Walk::read_jsonl(&path).unwrap();
+        assert_eq!(back.header.version, FORMAT_VERSION);
+        assert!(back.header.legal_input);
+    }
+
+    /// Two walks that differ only on the legality axis are two
+    /// different headers, which is the whole point of the field: before
+    /// version 4 these two parsed into the same `WalkHeader`.
+    #[test]
+    fn the_legality_axis_makes_two_otherwise_identical_headers_differ() {
+        let plain = header(0, 0);
+        let mut legal = header(0, 0);
+        legal.legal_input = true;
+        assert_ne!(plain, legal);
+        // And on the same axis the encoding already occupied, so the
+        // two are recorded independently rather than one standing in
+        // for the other.
+        assert_eq!(plain.encoding, legal.encoding);
+    }
+
+    /// The gap the field's doc names, as behaviour: a header written
+    /// before the field existed reads back `false` whatever its
+    /// checkpoint was. Recorded here so that the claim
+    /// `steerability::check_legality_roles` is built on — that such a
+    /// walk arrives as `false` and has to be refused rather than
+    /// believed — rests on a test and not on a paragraph.
+    #[test]
+    fn a_header_written_before_the_field_reads_back_false() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v3.jsonl");
+        let header = r#"{"version": 3, "ckpt": "c", "holdout": "h", "side": "White", "encoding": "prefix", "ctx": 128, "bands": ["<lo>", "<hi>"], "gammas": [1.0], "positions": 0, "games": 0}"#;
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let walk = Walk::read_jsonl(&path).expect("a version 3 walk is still readable");
+        assert_eq!(walk.header.version, 3);
+        assert!(!walk.header.legal_input);
     }
 
     /// And a record written now carries the margin through the file and

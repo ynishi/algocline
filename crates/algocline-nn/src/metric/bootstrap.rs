@@ -403,6 +403,99 @@ pub fn cluster_bootstrap(
     seed: u64,
     stat: impl Fn(&[usize]) -> Option<f64>,
 ) -> Result<Interval, BootstrapError> {
+    let (point, mut values, undefined_draws) = resample(clusters, draws, seed, stat)?;
+    let (low, high) = percentile_interval(&mut values);
+    Ok(Interval {
+        point,
+        low,
+        high,
+        draws: values.len(),
+        undefined_draws,
+        clusters,
+        seed,
+    })
+}
+
+/// An interval and the one-sided levels the same draws also carry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SignedInterval {
+    /// The percentile interval, exactly as [`cluster_bootstrap`] would
+    /// have produced it from these draws.
+    pub interval: Interval,
+    /// Share of the usable draws that landed **at or above** zero: the
+    /// one-sided achieved level for the claim that the quantity is
+    /// below zero.
+    ///
+    /// Draws at exactly zero count here, and in
+    /// [`Self::p_above_zero`] as well. The two therefore need not sum
+    /// to one, and each is the conservative reading of its own claim.
+    pub p_below_zero: f64,
+    /// Share at or below zero: the level for the claim that the
+    /// quantity is above zero.
+    pub p_above_zero: f64,
+}
+
+/// [`cluster_bootstrap`], with the one-sided levels kept.
+///
+/// The interval is the same object the plain call returns, from the
+/// same draws in the same order. What is added is the pair of levels,
+/// which exist for one reason: a multiplicity correction has to tighten
+/// the level per hypothesis, and [`CONFIDENCE`] is deliberately not a
+/// parameter — a level that could be chosen per call is a level that
+/// could be widened after the interval had been seen. Reporting the
+/// achieved level instead leaves the fixed one fixed and lets the
+/// caller compare it against whatever threshold its correction hands
+/// down.
+///
+/// At the uncorrected level the two agree, up to the rounding of a
+/// nearest-rank endpoint: a 95% percentile interval lying wholly below
+/// zero is the statement that under 2.5% of the draws reached zero.
+///
+/// # Errors
+///
+/// As [`cluster_bootstrap`].
+pub fn cluster_bootstrap_signed(
+    clusters: usize,
+    draws: usize,
+    seed: u64,
+    stat: impl Fn(&[usize]) -> Option<f64>,
+) -> Result<SignedInterval, BootstrapError> {
+    let (point, mut values, undefined_draws) = resample(clusters, draws, seed, stat)?;
+    // Counted before the sort, though the count does not depend on the
+    // order; taking them here keeps the two readings of one resample
+    // visibly the same list.
+    let usable = values.len() as f64;
+    let at_or_above = values.iter().filter(|v| **v >= 0.0).count() as f64;
+    let at_or_below = values.iter().filter(|v| **v <= 0.0).count() as f64;
+    let (low, high) = percentile_interval(&mut values);
+    Ok(SignedInterval {
+        interval: Interval {
+            point,
+            low,
+            high,
+            draws: values.len(),
+            undefined_draws,
+            clusters,
+            seed,
+        },
+        p_below_zero: at_or_above / usable,
+        p_above_zero: at_or_below / usable,
+    })
+}
+
+/// The draw loop both entry points share: the point estimate, the
+/// usable draw values, and how many draws fell apart.
+///
+/// # Errors
+///
+/// - `clusters` or `draws` is zero.
+/// - `stat` is undefined on the whole sample, or on every draw of it.
+fn resample(
+    clusters: usize,
+    draws: usize,
+    seed: u64,
+    stat: impl Fn(&[usize]) -> Option<f64>,
+) -> Result<(f64, Vec<f64>, usize), BootstrapError> {
     if clusters == 0 {
         return Err(BootstrapError::NoClusters);
     }
@@ -435,17 +528,7 @@ pub fn cluster_bootstrap(
     if values.is_empty() {
         return Err(BootstrapError::EveryDrawUndefined { draws });
     }
-
-    let (low, high) = percentile_interval(&mut values);
-    Ok(Interval {
-        point,
-        low,
-        high,
-        draws: values.len(),
-        undefined_draws,
-        clusters,
-        seed,
-    })
+    Ok((point, values, undefined_draws))
 }
 
 /// The [`CONFIDENCE`] percentile interval of `values`, which is sorted
@@ -733,6 +816,57 @@ mod tests {
         .unwrap();
         assert_eq!(interval.undefined_draws, 50);
         assert_eq!(interval.draws, 50);
+    }
+
+    /// The signed call is the plain one with two more numbers read off
+    /// the same draws, so the interval it carries has to be identical —
+    /// not merely close.
+    #[test]
+    fn the_signed_call_returns_the_same_interval_as_the_plain_one() {
+        let tally = blocked(&[0.2, -0.1, 0.4, 0.9, -0.3], 6);
+        let plain = cluster_bootstrap(5, 500, 21, |draw| tally.mean_over(draw)).unwrap();
+        let signed = cluster_bootstrap_signed(5, 500, 21, |draw| tally.mean_over(draw)).unwrap();
+        assert_eq!(signed.interval, plain);
+    }
+
+    /// The levels say what the interval says, at the level the interval
+    /// is drawn at. A quantity comfortably above zero has essentially no
+    /// draws at or below it, and its interval clears zero from above;
+    /// negate it and both statements turn over.
+    #[test]
+    fn the_levels_agree_with_the_interval_they_came_from() {
+        let above = blocked(&[0.5, 0.6, 0.4, 0.55, 0.45], 6);
+        let signed = cluster_bootstrap_signed(5, 2000, 3, |draw| above.mean_over(draw)).unwrap();
+        assert!(signed.interval.excludes_zero_from_above());
+        assert_eq!(signed.p_above_zero, 0.0);
+        assert_eq!(signed.p_below_zero, 1.0);
+
+        let below = blocked(&[-0.5, -0.6, -0.4, -0.55, -0.45], 6);
+        let signed = cluster_bootstrap_signed(5, 2000, 3, |draw| below.mean_over(draw)).unwrap();
+        assert!(signed.interval.excludes_zero_from_below());
+        assert_eq!(signed.p_below_zero, 0.0);
+        assert_eq!(signed.p_above_zero, 1.0);
+    }
+
+    /// A quantity straddling zero has a level in between, and neither
+    /// end of the interval clears it — which is what makes the two
+    /// assertions above evidence of anything.
+    #[test]
+    fn a_quantity_straddling_zero_has_a_level_in_between() {
+        let tally = blocked(&[-1.0, -0.5, 0.0, 0.5, 1.0], 4);
+        let signed = cluster_bootstrap_signed(5, 2000, 9, |draw| tally.mean_over(draw)).unwrap();
+        assert!(!signed.interval.excludes_zero_from_above());
+        assert!(!signed.interval.excludes_zero_from_below());
+        assert!(
+            signed.p_below_zero > 0.05 && signed.p_below_zero < 0.95,
+            "{signed:?}"
+        );
+        // A draw at exactly zero counts towards both levels, so they
+        // sum to at least one rather than to exactly one.
+        assert!(
+            signed.p_below_zero + signed.p_above_zero >= 1.0,
+            "{signed:?}"
+        );
     }
 
     /// Percentile ranks land where the doc comment says they do.

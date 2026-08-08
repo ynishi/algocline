@@ -36,6 +36,16 @@
 //! depends on is under test and shared with `chess_cond` instead of
 //! written out twice.
 //!
+//! # And a checkpoint that was handed the rules
+//!
+//! It accepts those too. Such a checkpoint reads the ids legal at each
+//! position, so it needs a set for every position of the row rather than
+//! only for the board in front of it — and the replay this program does
+//! in order to reach the position is what supplies them, mapped onto the
+//! row by [`algocline_nn::chess::window::Window::legal_sets`]. Past the
+//! ply where a game outgrows the context that mapping is not the
+//! identity, which is where its documentation starts.
+//!
 //! # The regime this program is the one to reach
 //!
 //! A human game passes 126 plies about one time in 26 — 96.2% of games
@@ -57,9 +67,9 @@ use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::batch::BandBatch;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard};
-use algocline_nn::chess::vocab::MoveVocab;
+use algocline_nn::chess::vocab::{legal_ids, MoveVocab};
 use algocline_nn::chess::window::play_row;
-use algocline_nn::chess::{open_reader_shape, CondEncoding, ModelShape};
+use algocline_nn::chess::{CondEncoding, ModelShape};
 
 /// Pick which band the model plays as.
 ///
@@ -116,13 +126,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // indicators alone for one of the two arms. `Batch` below carries
     // the branch; nothing else in this file consults the encoding.
     //
-    // The other axis, which this reader does not yet serve, is refused
-    // inside the entry point below. A checkpoint trained with the legal
-    // moves supplied at every position needs them supplied here too, and
-    // the sets this file generates are for the position on the board
-    // rather than for every position of a row that windowing may have
-    // cut the history off from.
-    let shape = open_reader_shape(&ckpt)?;
+    // The other axis too, which this reader used to be refused on. A
+    // checkpoint trained with the legal moves supplied at every position
+    // needs them supplied here as well — for every position of the row,
+    // not only for the board in front of it — and past the ply where a
+    // game outgrows the context the row no longer carries the history
+    // the earlier ones would come from. They are taken from the replay
+    // below, which this file performs anyway in order to reach the
+    // position, and mapped onto the row by `Window::legal_sets`.
+    //
+    // `BandBatch` is where the requirement is enforced: it takes the
+    // sets as an argument and refuses a legality checkpoint that arrives
+    // without them, so opening the shape without a gate skips nothing.
+    let shape = ModelShape::load_any(&ckpt)?;
     let band_arg = args.next().unwrap_or_else(|| "-".into());
     let played: Vec<String> = args.collect();
 
@@ -141,6 +157,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut moves: Vec<u32> = Vec::new();
     let mut history: Vec<String> = Vec::new();
+    // The ids legal at each ply, entry `m` being the position reached
+    // after `m` moves — collected only for a checkpoint that reads them,
+    // so an ordinary one replays exactly as it did.
+    let wants_legal = shape.legal_input;
+    let mut at_ply: Vec<Vec<u32>> = Vec::new();
     for token in &played {
         let mv = match move_from_uci_standard(&board, token) {
             Some(mv) => mv,
@@ -148,12 +169,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("cannot read move {token:?}: {e}"))?,
         };
         let uci = uci_standard(&board, mv);
+        // Before the move is played: this is the set `uci` was drawn
+        // from, which is what the position it sits at was choosing among.
+        if wants_legal {
+            at_ply.push(legal_ids(&board, &vocab));
+        }
         board.play_unchecked(mv);
         let id = vocab
             .id_of(&uci)
             .ok_or_else(|| format!("move {uci} is not in the vocabulary"))?;
         moves.push(id);
         history.push(uci);
+    }
+    // And the position on the board now, which is the set the move this
+    // program is about to choose is drawn from.
+    if wants_legal {
+        at_ply.push(legal_ids(&board, &vocab));
     }
 
     let cfg = shape.config(Device::Cpu, DType::F32);
@@ -179,6 +210,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // window cannot disagree with the guidance rewrite below about
     // which position the condition is at.
     let window = play_row(band_id, &moves, shape.ctx)?;
+    // One list for the row, whichever branch below builds the batch: the
+    // per-band rows differ only at the band token, which holds no move.
+    // On a windowed row the row's first move is the game's `start`-th,
+    // and mapping that is `legal_sets`'s business rather than this
+    // file's.
+    //
+    // `moves.len()` is how many plies `at_ply` is supposed to cover, and
+    // it is passed rather than left to be inferred: `legal_sets` aligns
+    // by taking the tail, so a history that covered more plies than this
+    // row was built from would map every position later in the game than
+    // the token it describes, with every length still agreeing. The two
+    // come from the same replay above, one entry per move plus the
+    // position on the board, and this is what makes that a stated
+    // contract rather than a property of where the pushes sit.
+    let sets = match wants_legal {
+        true => Some(window.legal_sets(&at_ply, moves.len())?),
+        false => None,
+    };
     let guided_band = band_token.as_ref().filter(|_| gamma != 1.0);
     let logits: Vec<f32> = if let Some(asked) = guided_band {
         // Guidance needs the other bands to build the reference it
@@ -202,7 +251,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // a different reference on one arm than on the other would make
         // the two arms' guided numbers incomparable, which is the one
         // thing the comparison exists to avoid.
-        let batch = BandBatch::over_bands(&window, &shape, &vocab)?;
+        let batch = BandBatch::over_bands(&window, &shape, &vocab, sets.as_deref())?;
         let per_band = batch.logits(&model, &cfg.device)?;
         let asked_at = shape
             .bands
@@ -215,7 +264,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let reference = mean_logits(&per_band);
         guide_logits(conditioned, &reference, gamma)
     } else {
-        let batch = BandBatch::single(&window, &shape, band_token.as_deref())?;
+        let batch = BandBatch::single(&window, &shape, band_token.as_deref(), sets.as_deref())?;
         batch
             .logits(&model, &cfg.device)?
             .into_iter()
@@ -278,6 +327,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
     );
+    // Only for a checkpoint that has the axis, so playing an ordinary
+    // one prints what it always printed. For one that does, this says
+    // the channel it was trained with is being fed — a person playing
+    // the model by hand has no other sight of it, and a row scored
+    // without it would produce entirely ordinary-looking moves.
+    if wants_legal {
+        println!(
+            "legality   supplied at every position of a {}-token row",
+            window.len()
+        );
+    }
     println!("gamma      {gamma}");
     println!("ply        {}", history.len());
     println!("to move    {:?}", board.side_to_move());

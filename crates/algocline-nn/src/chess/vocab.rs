@@ -37,7 +37,10 @@
 
 use std::collections::HashMap;
 
+use cozy_chess::Board;
 use thiserror::Error;
+
+use crate::chess::pgn::uci_standard;
 
 /// Padding id. Rows shorter than the context window are filled with it.
 pub const PAD: u32 = 0;
@@ -140,6 +143,42 @@ impl MoveVocab {
     pub fn token_of(&self, id: u32) -> Option<&str> {
         self.tokens.get(id as usize).map(String::as_str)
     }
+}
+
+/// The ids of the moves legal in a position, in the order the board's
+/// move generator produces them.
+///
+/// A move the vocabulary does not carry is dropped rather than reported.
+/// That is the same treatment
+/// [`crate::chess::corpus::LegalMaskedDataset`] gives it while recording
+/// the sets a run trains on, and the two lists are meant to agree: a
+/// reader supplying a legality input to a checkpoint is supplying what
+/// that checkpoint was trained to read.
+///
+/// A test walks one game through both and compares position for
+/// position (`the_readers_sets_are_the_ones_the_dataset_records`). What
+/// that pins is the **alignment**: which positions of a row carry a set
+/// and which are left empty, that a reader's list runs one entry past
+/// the row where the dataset's stops, and that entry `p` means the same
+/// thing on both sides.
+///
+/// It does not pin the enumeration. Both sides reach it by the same
+/// three calls in the same order — `generate_moves`, then
+/// [`uci_standard`], then [`MoveVocab::id_of`] — so a defect in the
+/// generator's order, or in either mapping, appears identically in both
+/// lists and the comparison passes. Sharing this function with the
+/// dataset would cost the alignment check and nothing else.
+pub fn legal_ids(board: &Board, vocab: &MoveVocab) -> Vec<u32> {
+    let mut out = Vec::new();
+    board.generate_moves(|moves| {
+        for mv in moves {
+            if let Some(id) = vocab.id_of(&uci_standard(board, mv)) {
+                out.push(id);
+            }
+        }
+        false
+    });
+    out
 }
 
 /// Every UCI move the board's geometry permits, in a fixed order.

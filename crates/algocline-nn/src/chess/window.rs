@@ -28,6 +28,12 @@
 //! The unconditioned case is the same repair with a one-token prefix,
 //! since `BOS` is no more optional than the band is.
 //!
+//! The same cut is what makes the legal moves at each of a row's
+//! positions hard to recover: the row no longer carries the history the
+//! dropped plies would be replayed from. [`Window::legal_sets`] maps a
+//! replayed game onto the positions this row does hold, for a reader
+//! feeding a checkpoint that was trained with those sets as input.
+//!
 //! [`Window`] exists so that the prefix kind travels with the tokens.
 //! A bare `Vec<u32>` cannot say whether position 1 is a band or a move,
 //! which is the ambiguity the original defect lived in — a function
@@ -80,6 +86,44 @@ pub enum WindowError {
     NotConditioned {
         /// Prefix the window was built with.
         prefix_len: usize,
+    },
+    /// The replayed history does not reach back to the first move this
+    /// window kept.
+    ///
+    /// The window holds the **last** moves of the game, so recovering
+    /// the set each of them was drawn from needs the game replayed at
+    /// least that far. Aligning a shorter list to whatever it does hold
+    /// would attach every set to a different ply than the one it belongs
+    /// to.
+    #[error(
+        "this window keeps {moves_in_window} move(s) and the history covers {plies} ply/plies, \
+         so it does not reach the first move the window kept"
+    )]
+    HistoryTooShort {
+        /// Moves this window kept.
+        moves_in_window: usize,
+        /// Plies the caller said its history covers.
+        plies: usize,
+    },
+    /// The history does not hold one entry per ply plus the position
+    /// they lead to, so it is not the history of the game it is said to
+    /// be.
+    ///
+    /// [`Window::legal_sets`] maps by taking the **tail** of the list,
+    /// which cannot see a list that is too long: every set would then
+    /// describe a position later in the game than the token it is
+    /// attached to, and every length downstream would still agree. This
+    /// is the check that sees it.
+    #[error(
+        "a history of {plies} ply/plies has to hold {} legal set(s) — one per ply, plus the \
+         position they lead to — and {given} were supplied",
+        plies + 1
+    )]
+    HistoryLengthMismatch {
+        /// Plies the caller said its history covers.
+        plies: usize,
+        /// Entries the caller supplied.
+        given: usize,
     },
 }
 
@@ -170,6 +214,102 @@ impl Window {
     pub fn with_band(&self, band_id: u32) -> Result<Self, WindowError> {
         let mut out = self.clone();
         out.set_band(band_id)?;
+        Ok(out)
+    }
+
+    /// The ids legal at each of this row's positions, in the convention
+    /// the training path records them in.
+    ///
+    /// `at_ply[m]` is the set of ids legal in the position reached after
+    /// `m` moves of the game — equivalently, the set the game's `m`-th
+    /// move was drawn from — and its last entry is the set the move
+    /// about to be played is drawn from. A caller that replayed the game
+    /// to the position it is scoring holds exactly that list, one entry
+    /// per ply plus the position it is standing on.
+    ///
+    /// The result has `len() + 1` entries: one per token of the row,
+    /// plus one for the position past its end, which is the one the
+    /// model answers at. Entry `p` is the set the token at row position
+    /// `p` was drawn from, and the prefix positions get the empty set —
+    /// they hold no move, which is what
+    /// [`crate::chess::corpus::LegalMaskedDataset`] writes there and
+    /// what the forward pass reads as "nothing is known to be legal
+    /// here".
+    ///
+    /// # The mapping, and where the off-by-one hides
+    ///
+    /// A windowed row is `[prefix] + moves[start..]`, so entry `p` is
+    /// `at_ply[start + p - prefix_len]` — not `at_ply[p]`, and not
+    /// `at_ply[p - prefix_len]`. `start` is `plies` minus the moves this
+    /// window kept, so it is zero exactly when the row still holds every
+    /// move the history covers. A game that fits whole therefore cannot
+    /// tell a correct mapping from one that indexes by row position: on
+    /// such a row the two are the same function.
+    ///
+    /// Nor does `start > 0` make them always disagree. The two read
+    /// different plies, and two plies can offer the same moves — a
+    /// knight walked out and back reaches the opening position again
+    /// every four plies, which is how the first draft of the test for
+    /// this passed against a mapping that was wrong.
+    ///
+    /// What the forward pass reads at a position is this list shifted by
+    /// one — [`crate::chess::batch::BandBatch`] applies the same offset
+    /// [`crate::train::legal_input_sets`] applies to the same
+    /// convention, because the set the model may answer from at position
+    /// `p` is the set the token at `p + 1` was drawn from. So on a
+    /// conditioned row the **band**, at position 1, is handed entry 2 —
+    /// `at_ply[start]`, the board after `start` moves have been played,
+    /// which is the opening position only when `start` is zero. Off by
+    /// one in either direction the sets are still legal-move sets of
+    /// real positions and every length still agrees.
+    ///
+    /// # Why the ply count is an argument
+    ///
+    /// The alignment is a tail: `start` is counted back from the end of
+    /// `at_ply`. That refuses a history too **short** and would accept
+    /// one too **long** — mapping every entry to a position later in the
+    /// game than the token it is attached to. Nothing downstream can see
+    /// it. The lengths agree, the width check in
+    /// [`crate::chess::batch::BandBatch`] passes, the ids are real moves
+    /// of real positions, and the model answers.
+    ///
+    /// So the length is not inferred from `at_ply`. The caller states how
+    /// many plies its history is supposed to cover, from its own move
+    /// list — the same list the row was built from — and this checks the
+    /// two against each other. A caller that accumulates `at_ply` over a
+    /// whole game and then scores an earlier position of it gets
+    /// [`WindowError::HistoryLengthMismatch`] rather than a wrong set at
+    /// every position of the row.
+    ///
+    /// Passing `at_ply.len() - 1` restores the hole, since that is
+    /// exactly the number being checked.
+    ///
+    /// # Errors
+    ///
+    /// The history does not hold one entry per ply plus the position they
+    /// lead to, or it covers fewer plies than the moves this window kept.
+    pub fn legal_sets(
+        &self,
+        at_ply: &[Vec<u32>],
+        plies: usize,
+    ) -> Result<Vec<Vec<u32>>, WindowError> {
+        // One entry per ply, plus the position they lead to.
+        if at_ply.len() != plies + 1 {
+            return Err(WindowError::HistoryLengthMismatch {
+                plies,
+                given: at_ply.len(),
+            });
+        }
+        let moves_in_window = self.tokens.len().saturating_sub(self.prefix_len);
+        if plies < moves_in_window {
+            return Err(WindowError::HistoryTooShort {
+                moves_in_window,
+                plies,
+            });
+        }
+        let start = plies - moves_in_window;
+        let mut out = vec![Vec::new(); self.prefix_len];
+        out.extend(at_ply[start..].iter().cloned());
         Ok(out)
     }
 
@@ -463,6 +603,165 @@ mod tests {
         assert!(
             !BANDS.contains(&clobbered),
             "the tail slice held {clobbered} at the condition slot, which the rewrite overwrote"
+        );
+    }
+
+    /// One entry per ply, carrying the ply number, so that a mapping
+    /// error reads as the ply it landed on rather than as a set of
+    /// chess moves that looks like any other.
+    fn ply_marks(plies: usize) -> Vec<Vec<u32>> {
+        (0..=plies).map(|m| vec![m as u32]).collect()
+    }
+
+    /// A row that fits whole: every move keeps the set it was drawn
+    /// from, and the prefix holds none.
+    #[test]
+    fn an_unwindowed_row_maps_each_move_to_its_own_ply() {
+        let moves: Vec<u32> = (1000..1010).collect();
+        let window = play_row(Some(7), &moves, CTX).unwrap();
+        let sets = window
+            .legal_sets(&ply_marks(moves.len()), moves.len())
+            .unwrap();
+
+        assert_eq!(
+            sets.len(),
+            window.len() + 1,
+            "one per token, plus the answer"
+        );
+        assert!(sets[0].is_empty(), "BOS holds no move");
+        assert!(sets[BAND_POS].is_empty(), "the band holds no move");
+        for (i, _) in moves.iter().enumerate() {
+            assert_eq!(
+                sets[COND_PREFIX_LEN + i],
+                vec![i as u32],
+                "move {i} should carry the set it was drawn from"
+            );
+        }
+        assert_eq!(
+            sets[window.len()],
+            vec![moves.len() as u32],
+            "the entry past the row is the position the model answers at"
+        );
+    }
+
+    /// The same on a row the window cut, which is the case the identity
+    /// mapping gets wrong: the row's first move is not the game's.
+    ///
+    /// 130 plies at `ctx` 128 keeps `128 - 2 = 126` of them, so the row
+    /// starts at ply 4. A reader that indexed `at_ply` by row position
+    /// would hand every position a set four plies stale — still a set of
+    /// chess moves, still the right shape, still scored without a word.
+    #[test]
+    fn a_windowed_row_starts_at_the_ply_the_window_starts_at() {
+        let vocab = vocab();
+        let moves = knight_shuffle(130, &vocab);
+        let window = play_row(Some(band_id(BANDS[0], &vocab)), &moves, CTX).unwrap();
+        assert_eq!(window.len(), CTX, "a 130-ply game should be windowed");
+
+        let sets = window
+            .legal_sets(&ply_marks(moves.len()), moves.len())
+            .unwrap();
+        let start = moves.len() - (CTX - COND_PREFIX_LEN);
+        assert_eq!(start, 4);
+        assert_eq!(
+            sets[COND_PREFIX_LEN],
+            vec![start as u32],
+            "the row's first move was drawn from the board after {start} moves"
+        );
+        assert_ne!(
+            sets[COND_PREFIX_LEN],
+            vec![0],
+            "indexing by row position would have put the opening here"
+        );
+        assert_eq!(
+            sets[window.len()],
+            vec![moves.len() as u32],
+            "and the last entry is still the position on the board"
+        );
+    }
+
+    /// A history that does not reach the first move the window kept is
+    /// refused rather than aligned to whatever it does hold.
+    #[test]
+    fn a_history_shorter_than_the_window_is_refused() {
+        let moves: Vec<u32> = (1000..1010).collect();
+        let window = play_row(Some(7), &moves, CTX).unwrap();
+        let short = moves.len() - 1;
+        assert_eq!(
+            window.legal_sets(&ply_marks(short), short),
+            Err(WindowError::HistoryTooShort {
+                moves_in_window: 10,
+                plies: 9,
+            })
+        );
+        // And the exact length is enough: 10 moves need 11 entries.
+        assert!(window
+            .legal_sets(&ply_marks(moves.len()), moves.len())
+            .is_ok());
+    }
+
+    /// The other direction, which the tail alignment cannot see on its
+    /// own: a history covering **more** plies than the row was built
+    /// from.
+    ///
+    /// This is the failure the mapping exists to prevent and the one
+    /// nothing downstream can catch — the lengths still agree, the sets
+    /// are still real positions', and the model still answers. The
+    /// obvious refactor produces it: accumulate `at_ply` for a whole
+    /// game once, then score each position out of the same list.
+    #[test]
+    fn a_history_longer_than_the_row_was_built_from_is_refused() {
+        let moves: Vec<u32> = (1000..1010).collect();
+        let window = play_row(Some(7), &moves, CTX).unwrap();
+        assert_eq!(
+            window.legal_sets(&ply_marks(20), moves.len()),
+            Err(WindowError::HistoryLengthMismatch {
+                plies: 10,
+                given: 21,
+            })
+        );
+    }
+
+    /// And what that refusal stands in front of, which is why the ply
+    /// count has to come from the caller's own move list.
+    ///
+    /// The same over-long history, accepted by a caller that also
+    /// mis-states the count: the row's first move is handed the board
+    /// after ten moves rather than after none, every length agrees, and
+    /// nothing says a word.
+    #[test]
+    fn a_mis_stated_ply_count_maps_the_row_to_the_wrong_plies() {
+        let moves: Vec<u32> = (1000..1010).collect();
+        let window = play_row(Some(7), &moves, CTX).unwrap();
+        let honest = window
+            .legal_sets(&ply_marks(moves.len()), moves.len())
+            .unwrap();
+        let mis_stated = window.legal_sets(&ply_marks(20), 20).unwrap();
+        assert_eq!(
+            honest.len(),
+            mis_stated.len(),
+            "the lengths agree, which is why nothing downstream sees this"
+        );
+        assert_eq!(honest[COND_PREFIX_LEN], vec![0]);
+        assert_eq!(mis_stated[COND_PREFIX_LEN], vec![10]);
+    }
+
+    /// An unconditioned row has one prefix token rather than two, and
+    /// the mapping is derived from the window's own prefix rather than
+    /// from a constant.
+    #[test]
+    fn an_unconditioned_row_maps_from_its_own_prefix() {
+        let moves: Vec<u32> = (1000..1010).collect();
+        let window = play_row(None, &moves, CTX).unwrap();
+        let sets = window
+            .legal_sets(&ply_marks(moves.len()), moves.len())
+            .unwrap();
+        assert_eq!(sets.len(), window.len() + 1);
+        assert!(sets[0].is_empty(), "BOS holds no move");
+        assert_eq!(
+            sets[PLAIN_PREFIX_LEN],
+            vec![0],
+            "the first move sits one token in, not two"
         );
     }
 

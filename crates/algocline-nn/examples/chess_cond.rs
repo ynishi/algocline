@@ -10,6 +10,22 @@
 //! `1,1.5,2,3,4,6,8`. One is the unguided model, so the sweep always
 //! contains the baseline it is read against.
 //!
+//! # A checkpoint that was handed the rules
+//!
+//! This walk scores both kinds: the ordinary one, and one trained with
+//! the ids legal at each position supplied to the forward pass. The
+//! second needs a set for **every** position of the row, and past the
+//! ply where a game outgrows the context the row no longer carries the
+//! history the earlier ones would be recovered from — so they are taken
+//! from the replay this walk already performs, one move generation per
+//! ply, and mapped onto the row by
+//! [`algocline_nn::chess::window::Window::legal_sets`].
+//!
+//! All of that sits behind a check on the checkpoint's own axis, so a
+//! walk of an ordinary one does none of it. The header gains a line only
+//! for a checkpoint that has the axis, so the walks already on disk stay
+//! comparable to a new one line for line.
+//!
 //! # The summary and the records are for different readers
 //!
 //! What this prints is what a person reads while a run is going. It has
@@ -98,9 +114,9 @@ use algocline_nn::chess::pgn::{resolve_san, san_tokens, uci_standard, PgnReader}
 use algocline_nn::chess::records::{
     ce_over_legal, top2_margin, GammaRecord, PositionRecord, Walk, WalkHeader, FORMAT_VERSION,
 };
-use algocline_nn::chess::vocab::MoveVocab;
+use algocline_nn::chess::vocab::{legal_ids, MoveVocab};
 use algocline_nn::chess::window::{play_row, COND_PREFIX_LEN};
-use algocline_nn::chess::{open_reader_shape, ModelShape};
+use algocline_nn::chess::ModelShape;
 use algocline_nn::metric::{self, MetricError};
 
 /// Jensen-Shannon divergence in bits, via [`algocline_nn::metric::js`].
@@ -243,12 +259,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // band also arrives as an argument to the forward pass, indexing a
     // conditioning table of its own.
     //
-    // Not the legality axis, though. A checkpoint trained with the legal
-    // moves supplied at every position has to be scored with them
-    // supplied, and this walk builds its legal set for the position it
-    // is standing on rather than for every position of the row. That
-    // refusal is inside the entry point below rather than beside it.
-    let shape = open_reader_shape(&ckpt)?;
+    // Either legality convention as well, which is what
+    // `open_reader_shape` used to refuse here. A checkpoint trained with
+    // the legal moves supplied at every position has to be scored with
+    // them supplied, and this walk generates a set for the position it
+    // is standing on. The rest are recovered from the replay the walk is
+    // already doing: it steps the board ply by ply, so keeping the ids
+    // legal at each one gives `Window::legal_sets` what it needs to map
+    // them onto a row the context window may have cut the front off.
+    //
+    // Nothing is skipped by opening the shape without a gate. `BandBatch`
+    // takes the sets as a constructor argument and refuses a legality
+    // checkpoint that arrives without them, so the requirement is met at
+    // the point where the rows are built rather than at the point where
+    // the file is opened.
+    let shape = ModelShape::load_any(&ckpt)?;
     if shape.bands.len() < 2 {
         return Err(format!(
             "this checkpoint carries {} band(s); comparing conditions needs at least 2",
@@ -267,6 +292,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect::<Result<_, _>>()?;
     let n_bands = band_ids.len();
+    // Whether this walk has to recover the legal sets for every position
+    // of every row. Read once, and every piece of that work is behind
+    // it, so a checkpoint without the axis does none of it.
+    let wants_legal = shape.legal_input;
 
     let cfg = shape.config(Device::Cpu, DType::F32);
     let model = Gpt2Model::from_safetensors_file(&cfg, &ckpt)?;
@@ -404,11 +433,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut board = Board::default();
         let mut moves_so_far: Vec<u32> = Vec::new();
+        // The ids legal at each ply of this game, entry `m` being the
+        // position reached after `m` moves. Filled from the replay this
+        // loop already performs, so a legality checkpoint needs no
+        // second pass over the game and a checkpoint without the axis
+        // does none of it.
+        //
+        // One move generation per ply, against `n_bands` forwards per
+        // scored position. `LegalMaskedDataset` makes the same trade on
+        // the training side, where the generations are microseconds
+        // against a step of a hundred milliseconds. What it costs a walk
+        // is not measured — the recorded walks carry no legality line —
+        // so no figure is quoted here.
+        let mut at_ply: Vec<Vec<u32>> = Vec::new();
         for (ply, token) in tokens.iter().enumerate() {
             let Ok(mv) = resolve_san(&board, token) else {
                 break;
             };
             let played = uci_standard(&board, mv);
+            // Before the scoring block, so that by the time a position
+            // at ply `p` is scored this holds `p + 1` entries: one per
+            // move played, plus the position they led to. Stated to
+            // `legal_sets` below as `moves_so_far.len()` and checked
+            // there, so moving this push no longer mis-maps in silence.
+            if wants_legal {
+                at_ply.push(legal_ids(&board, &vocab));
+            }
 
             let scored = match side {
                 ScoredSide::Both => true,
@@ -439,7 +489,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // still rides on these forwards rather than adding
                     // any.
                     let window = play_row(Some(band_ids[0]), &moves_so_far, shape.ctx)?;
-                    let batch = BandBatch::over_bands(&window, &shape, &vocab)?;
+                    // One list for the row, shared by every band's copy
+                    // of it: the rows differ only at the band token,
+                    // which holds no move. `legal_sets` is what knows
+                    // that the row's first move is the game's `start`-th
+                    // once the window has cut the front off.
+                    //
+                    // `moves_so_far.len()` is how many plies `at_ply` is
+                    // supposed to cover, and passing it is what makes
+                    // the alignment checked rather than inferred. The
+                    // mapping takes the tail of `at_ply`, so a list that
+                    // covered more of the game than this row was built
+                    // from would attach every set to a later position
+                    // than the token it describes and every length would
+                    // still agree. What holds the two together is a push
+                    // at the top of this loop against a push at the
+                    // bottom, 250 lines apart; this states the relation
+                    // instead of relying on it.
+                    let sets = match wants_legal {
+                        true => Some(window.legal_sets(&at_ply, moves_so_far.len())?),
+                        false => None,
+                    };
+                    let batch = BandBatch::over_bands(&window, &shape, &vocab, sets.as_deref())?;
                     let band_logits = batch.logits(&model, &cfg.device)?;
                     let reference = mean_logits(&band_logits);
 
@@ -658,6 +729,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("ckpt       {}", ckpt.display());
     println!("encoding   {} conditioning", shape.encoding);
+    // Printed only for the checkpoints that have it, so that a walk of
+    // an ordinary one prints what it printed before and the six walks
+    // already on disk stay comparable line for line. For the ones that
+    // do, this is the operator's only sight of a channel that changes
+    // every number without changing the shape of anything.
+    if wants_legal {
+        println!("legality   supplied at every position");
+    }
     println!("holdout    {pgn}");
     // Two game counts, named apart. `scoring_games` is the clustering
     // figure — the one every error bar resamples and the one

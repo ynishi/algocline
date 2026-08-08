@@ -477,12 +477,16 @@ pub enum ShapeError {
     /// The checkpoint was trained with a legality input and the caller
     /// cannot supply one.
     ///
-    /// The readers generate the legal moves already — it is how they
-    /// rank what the model produced — but handing them to the forward
-    /// pass means having them for every position of the row, including
-    /// the ones a windowed row no longer carries the history for. Until
-    /// a reader does that, it says so here rather than scoring the
-    /// model with the channel absent from every position.
+    /// Every reader generates the legal moves for the position in front
+    /// of it — it is how they rank what the model produced — but handing
+    /// them to the forward pass means having them for **every** position
+    /// of the row, including the ones a windowed row no longer carries
+    /// the history for. `chess_cond` and `chess_play` recover those by
+    /// replaying the game and mapping it onto the row
+    /// ([`crate::chess::window::Window::legal_sets`]), so they no longer
+    /// come here. `chess_eval` and `chess_match` do not, and this is
+    /// what they say instead of scoring the model with the channel
+    /// absent from every position.
     #[error(
         "checkpoint {path} was trained with the legal ids supplied at every position, and this \
          reader does not supply them; scoring it anyway would run the model in a state it never \
@@ -732,20 +736,24 @@ impl ModelShape {
     /// conditioning convention it was written under.
     ///
     /// Named for what it does rather than for being the default, so
-    /// that [`Self::load_as`] is the shorter thing to reach for. Two
-    /// callers want it, and both can genuinely handle either
-    /// convention:
+    /// that [`Self::load_as`] is the shorter thing to reach for. The
+    /// callers that want it can all genuinely handle either convention:
     ///
     /// - `chess_bake`'s resume check, which has to read a checkpoint of
     ///   either convention in order to compare it against the run's own,
     ///   and which is not a reader — it goes on to train, so the
     ///   legality gate in [`crate::chess::open_reader_shape`] would be
     ///   wrong for it;
-    /// - [`crate::chess::open_reader_shape`], which the readers that
-    ///   branch on the encoding come through: `chess_cond`, whose row is
-    ///   the same `[BOS, band] + moves` under each convention, and
-    ///   `chess_play`, whose branch lives in
-    ///   [`crate::chess::batch::BandBatch`] rather than at the call site.
+    /// - `chess_cond` and `chess_play`, which handle either conditioning
+    ///   convention — the row is the same `[BOS, band] + moves` under
+    ///   both, and the branch lives in
+    ///   [`crate::chess::batch::BandBatch`] rather than at the call site
+    ///   — and either value of [`Self::legal_input`], since they recover
+    ///   the sets a legality checkpoint reads. `BandBatch` requires
+    ///   those of them, so the gate they skip here is one they meet
+    ///   there;
+    /// - [`crate::chess::open_reader_shape`], which is this plus that
+    ///   gate, for the readers that cannot supply the sets.
     ///
     /// It is not a loophole around [`Self::load_as`]. A caller that
     /// supports one convention has to say which, because the failure it
@@ -892,13 +900,14 @@ impl ModelShape {
     /// the one direction that has a caller: a reader with no legality
     /// input to give. There is no `require_legal_input` to pair with
     /// it because nothing here asserts the opposite — a reader that can
-    /// supply the sets branches on [`Self::legal_input`] and gives them
-    /// to the forward pass that takes them, and handing them to a model
-    /// with no table is refused by that forward pass rather than here.
+    /// supply the sets hands them to
+    /// [`crate::chess::batch::BandBatch`], which requires them exactly
+    /// when [`Self::legal_input`] is set and refuses them otherwise.
     ///
-    /// Readers reach this through [`crate::chess::open_reader_shape`]
-    /// rather than calling it themselves, so that the refusal is part
-    /// of opening a checkpoint rather than a second line beside it.
+    /// The readers that cannot supply the sets reach this through
+    /// [`crate::chess::open_reader_shape`] rather than calling it
+    /// themselves, so that the refusal is part of opening a checkpoint
+    /// rather than a second line beside it.
     pub fn require_no_legal_input(&self, ckpt: &Path) -> Result<(), ShapeError> {
         if self.legal_input {
             return Err(ShapeError::LegalInputUnsupported {
@@ -909,31 +918,43 @@ impl ModelShape {
     }
 }
 
-/// Open the shape beside a checkpoint a **reader** is about to score or
-/// play, refusing the kinds no reader in this workspace can handle.
+/// Open the shape beside a checkpoint a reader that supplies **no**
+/// legality input is about to score or play, refusing the kinds it
+/// cannot handle.
 ///
 /// The gate this adds is [`ModelShape::require_no_legal_input`]. A
 /// checkpoint trained with the legal ids at every position has to be
-/// scored with them supplied, and no reader here supplies a set for
-/// every position of a row — the sets they have are for the position in
-/// front of them, and a windowed row no longer carries the history the
-/// rest would be recovered from. Until one of them can do that, such a
-/// checkpoint is turned away.
+/// scored with them supplied, which means having a set for every
+/// position of the row rather than only for the position in front of
+/// the reader — a windowed row no longer carries the history the rest
+/// would be recovered from.
 ///
-/// # Why this exists rather than two calls at each reader
+/// Two readers recover it, by replaying the game and mapping it onto
+/// the row: `chess_cond` and `chess_play` go through
+/// [`ModelShape::load_any`] and hand the sets to
+/// [`crate::chess::batch::BandBatch`], which is where the requirement
+/// is enforced for them — it takes the sets as a constructor argument
+/// and refuses a legality checkpoint without them. `chess_eval` and
+/// `chess_match` do not, and come through here.
 ///
-/// The refusal was four call sites, one per reader, each a line the
-/// author had to remember to write after loading the shape — and
-/// deleting any one of them left the workspace compiling and every test
-/// passing. The totality is the point of the refusal, so it belongs on
-/// the way in rather than beside it: a reader that gets its shape here
-/// cannot skip the gate, because there is no second call to omit.
+/// # Why this exists rather than a call beside each reader
+///
+/// The refusal was a call site per reader, each a line the author had to
+/// remember to write after loading the shape — and deleting any one of
+/// them left the workspace compiling and every test passing. So it
+/// belongs on the way in rather than beside it: a reader that gets its
+/// shape here cannot skip the gate, because there is no second call to
+/// omit.
 ///
 /// It is a narrowing rather than a closure, and the distinction matters
 /// the same way it does on [`ModelShape::load_any`]. That function
-/// stays `pub`, because `chess_bake`'s resume path is not a reader and
-/// legitimately handles either kind, so a fifth reader **can** be
-/// written against it. What it cannot do is go through here and forget.
+/// stays `pub` — `chess_bake`'s resume path is not a reader, and the two
+/// readers that supply the sets need it — so a reader **can** be written
+/// against it and be checked by nothing here. If it builds its rows with
+/// [`crate::chess::batch::BandBatch`], what it meets there is a
+/// constructor that will not take a legality shape without the sets; if
+/// it calls a forward pass directly, the model refuses one. What no
+/// reader can do is come through this function and forget.
 ///
 /// # Errors
 ///

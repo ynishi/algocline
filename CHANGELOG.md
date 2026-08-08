@@ -490,15 +490,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one is numbers, not an error, so the constructor is where it is
     caught
 
-  `ShapeError::LegalInputUnsupported`: `chess_cond`, `chess_play`,
-  `chess_eval` and `chess_match` all refuse these checkpoints. They
-  generate legal moves for the position in front of them, not for every
-  position of a windowed row, and recovering the rest needs a replay
-  this change does not do. All four now open through
-  `chess::open_reader_shape`, so the refusal is one tested line rather
-  than four untested ones — though `load_any` stays public for
-  `chess_bake`'s resume, so a reader written against it is checked by
-  nothing.
+  `chess_cond` and `chess_play` read these checkpoints;
+  `chess_eval` and `chess_match` refuse them with
+  `ShapeError::LegalInputUnsupported` through `chess::open_reader_shape`,
+  which is the right resting state for a reader nothing on the
+  measurement path calls. `load_any` stays public for `chess_bake`'s
+  resume, so a reader written against it is checked by nothing.
+
+  A reader's row is windowed — past the context window it is
+  `[BOS, band] + tail(moves)` — and the input needs a set for every
+  position of it, so `Window::legal_sets` maps a replayed game onto the
+  row. **An off-by-one here hides**: a set one ply stale is still a
+  plausible set of chess moves, the model answers, and every number
+  downstream is well-formed. Under `[BOS, band] + moves[start..]` the
+  band position is handed the board after `start` moves, not the
+  opening — the two coincide on a row that fits whole, which is why a
+  test on a short game cannot tell a window-blind mapping from a correct
+  one.
+
+  `legal_sets` takes the ply count its history is supposed to cover and
+  refuses a mismatch (`WindowError::HistoryLengthMismatch`). A history
+  too short was already refused; one too long used to be accepted, and
+  every set would then have described a position later in the game than
+  the token it was attached to, with the lengths still agreeing and the
+  batch's width check unable to see it.
 
 ### Changed — **BREAKING**: `ModelShape::path_for_encoding` → `path_for_kind`
 

@@ -59,7 +59,7 @@ use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::{move_from_uci_standard, resolve_san, uci_standard};
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::window::play_row;
-use algocline_nn::chess::{CondEncoding, ModelShape};
+use algocline_nn::chess::{open_reader_shape, CondEncoding, ModelShape};
 
 /// Pick which band the model plays as.
 ///
@@ -115,7 +115,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // with, so refusing here meant the adoption decision would rest on
     // indicators alone for one of the two arms. `Batch` below carries
     // the branch; nothing else in this file consults the encoding.
-    let shape = ModelShape::load_any(&ckpt)?;
+    //
+    // The other axis, which this reader does not yet serve, is refused
+    // inside the entry point below. A checkpoint trained with the legal
+    // moves supplied at every position needs them supplied here too, and
+    // the sets this file generates are for the position on the board
+    // rather than for every position of a row that windowing may have
+    // cut the history off from.
+    let shape = open_reader_shape(&ckpt)?;
     let band_arg = args.next().unwrap_or_else(|| "-".into());
     let played: Vec<String> = args.collect();
 

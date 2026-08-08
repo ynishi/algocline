@@ -83,7 +83,7 @@ pub const HEADS: usize = 4;
 /// ablations, where 512 at one layer beat narrower models at four.
 pub const DIM: usize = 128;
 
-/// The one tensor that tells the two conditioning conventions apart on
+/// The tensor that tells the two conditioning conventions apart on
 /// disk: the table [`crate::arch::Gpt2Model::forward_conditioned`]
 /// indexes into.
 ///
@@ -93,6 +93,18 @@ pub const DIM: usize = 128;
 /// them. The name is the one [`crate::arch::Gpt2Model::new`] registers,
 /// so the two move together or the load fails on the name.
 pub const COND_TABLE_TENSOR: &str = "cond_wte.weight";
+
+/// The tensor that says a checkpoint was trained with the ids allowed
+/// at each position handed to it as input: the table
+/// [`crate::arch::Gpt2Model::forward_legal`] reads.
+///
+/// [`COND_TABLE_TENSOR`]'s counterpart on the other axis, and checked
+/// the same way — the presence of this name in the weights against what
+/// [`ModelShape::legal_input`] records. The two axes are independent on
+/// disk even though no forward pass in this build reads both
+/// (`Gpt2Custom::validate` refuses a model asking for the pair), so the
+/// cross-check treats them as two questions rather than one.
+pub const LEGAL_TABLE_TENSOR: &str = "legal_wte.weight";
 
 /// How a checkpoint was told which band it is playing as.
 ///
@@ -129,26 +141,97 @@ pub enum CondEncoding {
     EveryPosition,
 }
 
-impl CondEncoding {
-    /// The convention this one is not.
-    ///
-    /// Two variants, so "the other one" is well defined; a third would
-    /// have to make the sidecar sweep in [`ModelShape::save`] and the
-    /// ambiguity check in [`ModelShape::load_any`] enumerate instead.
-    pub fn other(self) -> Self {
-        match self {
-            CondEncoding::Prefix => CondEncoding::EveryPosition,
-            CondEncoding::EveryPosition => CondEncoding::Prefix,
-        }
-    }
-}
-
 impl std::fmt::Display for CondEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CondEncoding::Prefix => write!(f, "prefix"),
             CondEncoding::EveryPosition => write!(f, "every-position"),
         }
+    }
+}
+
+/// The axes a checkpoint's shape file has to be told apart by, and
+/// therefore what its name is built from.
+///
+/// Both axes change what the model reads at every position, and on
+/// both the same direction of misreading is silent: a sidecar that does
+/// not mention the axis builds a model without that table, the tensor
+/// sits in the file unrequested, and every number that comes out looks
+/// ordinary. That is what the naming is for.
+///
+/// What happens in the other direction is not the same on the two. A
+/// model built with `cond_wte` and driven through the plain forward
+/// runs, and its moves look no different — the whole reason
+/// [`CondEncoding`] is recorded. A model built with `legal_wte` and
+/// handed no sets is refused by the forward pass. The sidecar name is
+/// the outer guard either way — see
+/// [`ModelShape::path_for_kind`] — and the tensors are the inner one:
+/// [`COND_TABLE_TENSOR`] and [`LEGAL_TABLE_TENSOR`] are each present
+/// for exactly one value of their axis, which is what
+/// [`ModelShape::load_any`] checks the sidecar against.
+///
+/// Four combinations exist here even though `Gpt2Custom::validate`
+/// refuses to build a model for one of them (conditioning together with
+/// a legality input). [`ModelShape::save`] will write that name anyway
+/// if a shape asks for it — it validates nothing — so enumerating the
+/// product rather than the buildable subset is what keeps the sweep
+/// there and the ambiguity check in [`ModelShape::load_any`] total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapeKind {
+    /// How the band reaches the model.
+    pub encoding: CondEncoding,
+    /// Whether the model is handed the ids allowed at each position.
+    pub legal_input: bool,
+}
+
+impl ShapeKind {
+    /// Every combination, in a fixed order.
+    pub const ALL: [ShapeKind; 4] = [
+        ShapeKind {
+            encoding: CondEncoding::Prefix,
+            legal_input: false,
+        },
+        ShapeKind {
+            encoding: CondEncoding::EveryPosition,
+            legal_input: false,
+        },
+        ShapeKind {
+            encoding: CondEncoding::Prefix,
+            legal_input: true,
+        },
+        ShapeKind {
+            encoding: CondEncoding::EveryPosition,
+            legal_input: true,
+        },
+    ];
+
+    /// The file extension a shape of this kind is written under.
+    ///
+    /// `shape.json` is the name every build of this program, past and
+    /// present, looks for; the rest are deliberately names an older
+    /// build does not look for. See [`ModelShape::path_for_kind`].
+    pub fn suffix(self) -> &'static str {
+        match (self.encoding, self.legal_input) {
+            (CondEncoding::Prefix, false) => "shape.json",
+            (CondEncoding::EveryPosition, false) => "shape2.json",
+            (CondEncoding::Prefix, true) => "shape-legal.json",
+            (CondEncoding::EveryPosition, true) => "shape2-legal.json",
+        }
+    }
+
+    /// The kinds this one is not.
+    pub fn others(self) -> Vec<ShapeKind> {
+        Self::ALL.iter().copied().filter(|k| *k != self).collect()
+    }
+}
+
+impl std::fmt::Display for ShapeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.encoding)?;
+        if self.legal_input {
+            write!(f, " with a legality input")?;
+        }
+        Ok(())
     }
 }
 
@@ -202,6 +285,28 @@ pub struct ModelShape {
     /// convention returns numbers that look like measurements.
     #[serde(default)]
     pub encoding: CondEncoding,
+    /// Whether the model was handed the ids allowed at each position
+    /// while it trained
+    /// ([`crate::arch::Gpt2Model::forward_legal`]).
+    ///
+    /// Recorded for the reason [`Self::encoding`] is: the difference on
+    /// disk is one tensor, and a reader that scored such a checkpoint
+    /// without supplying the input would be running a model in a state
+    /// it never trained in, with every number well-formed.
+    ///
+    /// Omitted from the file when false, so a checkpoint of the
+    /// ordinary kind is written exactly as it was before this field
+    /// existed — and so a build that predates the field meets the key
+    /// only on the checkpoints it must not read. `deny_unknown_fields`
+    /// then makes that a refusal, for builds new enough to carry it;
+    /// [`Self::path_for_kind`] is what covers the older ones.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legal_input: bool,
+}
+
+/// `skip_serializing_if` for a plain `bool` field.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Failure while reading or writing a shape file.
@@ -268,16 +373,19 @@ pub enum ShapeError {
         "the shape was written to {}, but the {} sidecar at {} could not be removed ({message}); \
          until it is deleted every reader will refuse this checkpoint as ambiguous",
         .written.display(),
-        .stale_encoding,
+        .stale_kind,
         .stale.display(),
     )]
     SweepFailed {
         /// Sidecar this save wrote. Correct and current.
         written: PathBuf,
-        /// Sidecar of the other convention, left behind.
+        /// Sidecar of another kind, left behind. The first that could
+        /// not be removed; the sweep tries every other name before
+        /// returning, so a second survivor is possible and the reader
+        /// meets it as [`ShapeError::AmbiguousSidecar`].
         stale: PathBuf,
         /// Convention the stale file describes.
-        stale_encoding: CondEncoding,
+        stale_kind: ShapeKind,
         /// Underlying IO message.
         message: String,
     },
@@ -334,28 +442,77 @@ pub enum ShapeError {
         /// The tensor the two were compared over.
         tensor: &'static str,
     },
-    /// One checkpoint, two shape files, one per conditioning
-    /// convention.
+    /// The sidecar and the weights disagree about whether the model
+    /// was handed the ids allowed at each position.
+    ///
+    /// [`Self::EncodingContradictsWeights`] on the other axis, with the
+    /// same origin (a sidecar left behind by a copy) and the same
+    /// consequence: [`LEGAL_TABLE_TENSOR`] sits in the file unrequested
+    /// and the readers, which ask a mmapped `VarBuilder` only for the
+    /// names their model wants, never see it.
+    ///
+    /// The two directions differ in how far they get. Weights with the
+    /// table, read as though without it, build a model with no
+    /// `legal_wte` and score it — every number well-formed and every
+    /// one produced without the channel the run trained under. Weights
+    /// without it, read as though with it, ask for a tensor that is not
+    /// there and the weight load refuses — but only after the shape has
+    /// decided what the reader is going to do.
+    #[error(
+        "checkpoint {path}: its sidecar records a legality input of {declared} while its \
+         weights say {implied} — `{tensor}` is present in a checkpoint trained with one and in \
+         no other. One of the two belongs to a different run, a sidecar left behind by a copy \
+         being the usual cause"
+    )]
+    LegalInputContradictsWeights {
+        /// Checkpoint involved.
+        path: String,
+        /// What the sidecar records.
+        declared: bool,
+        /// What the presence or absence of [`LEGAL_TABLE_TENSOR`] says.
+        implied: bool,
+        /// The tensor the two were compared over.
+        tensor: &'static str,
+    },
+    /// The checkpoint was trained with a legality input and the caller
+    /// cannot supply one.
+    ///
+    /// The readers generate the legal moves already — it is how they
+    /// rank what the model produced — but handing them to the forward
+    /// pass means having them for every position of the row, including
+    /// the ones a windowed row no longer carries the history for. Until
+    /// a reader does that, it says so here rather than scoring the
+    /// model with the channel absent from every position.
+    #[error(
+        "checkpoint {path} was trained with the legal ids supplied at every position, and this \
+         reader does not supply them; scoring it anyway would run the model in a state it never \
+         trained in and every number would still look ordinary"
+    )]
+    LegalInputUnsupported {
+        /// Checkpoint involved.
+        path: String,
+    },
+    /// One checkpoint, more than one shape file.
     ///
     /// Only one of them can describe the weights that are actually
-    /// there, and nothing in either says which. Reading one anyway is
-    /// how a per-position checkpoint gets scored as a prefix one, so
+    /// there, and nothing in any of them says which. Reading one anyway
+    /// is how a per-position checkpoint gets scored as a prefix one, so
     /// this is refused instead of resolved by precedence.
     #[error(
-        "checkpoint has two shape files, {first} and {second}, written under different \
-         conditioning conventions; only one can describe these weights and nothing here says \
-         which, so delete the one that does not belong to this run"
+        "checkpoint has {} shape files ({}), written under different conventions; only one can \
+         describe these weights and nothing here says which, so delete the ones that do not \
+         belong to this run",
+        .found.len(),
+        .found.join(", "),
     )]
     AmbiguousSidecar {
-        /// Prefix-convention sidecar.
-        first: String,
-        /// Per-position sidecar.
-        second: String,
+        /// Every sidecar found beside the checkpoint.
+        found: Vec<String>,
     },
 }
 
-/// Which convention the weights on disk were built under, read from the
-/// tensor names rather than from anything written beside them.
+/// Which conventions the weights on disk were built under, read from
+/// the tensor names rather than from anything written beside them.
 ///
 /// The safetensors header is a name-to-descriptor map at the front of
 /// the file, so this reads the header and nothing else: no tensor is
@@ -366,7 +523,7 @@ pub enum ShapeError {
 /// see a tensor nobody asked for — and an unrequested
 /// [`COND_TABLE_TENSOR`] is exactly the state a stale prefix sidecar
 /// leaves behind.
-fn encoding_of_weights(ckpt: &Path) -> Result<CondEncoding, ShapeError> {
+fn axes_of_weights(ckpt: &Path) -> Result<ShapeKind, ShapeError> {
     // SAFETY: the same discipline every other safetensors load in this
     // crate follows — the file must not be truncated while the mapping
     // is alive. It is created and dropped inside this call, and the
@@ -378,9 +535,12 @@ fn encoding_of_weights(ckpt: &Path) -> Result<CondEncoding, ShapeError> {
                 message: e.to_string(),
             }
         })?;
-    Ok(match weights.get(COND_TABLE_TENSOR).is_ok() {
-        true => CondEncoding::EveryPosition,
-        false => CondEncoding::Prefix,
+    Ok(ShapeKind {
+        encoding: match weights.get(COND_TABLE_TENSOR).is_ok() {
+            true => CondEncoding::EveryPosition,
+            false => CondEncoding::Prefix,
+        },
+        legal_input: weights.get(LEGAL_TABLE_TENSOR).is_ok(),
     })
 }
 
@@ -395,6 +555,15 @@ impl ModelShape {
             vocab,
             bands,
             encoding: CondEncoding::default(),
+            legal_input: false,
+        }
+    }
+
+    /// The pair of axes this shape's sidecar name is built from.
+    pub fn kind(&self) -> ShapeKind {
+        ShapeKind {
+            encoding: self.encoding,
+            legal_input: self.legal_input,
         }
     }
 
@@ -445,12 +614,21 @@ impl ModelShape {
     ///
     /// Under [`CondEncoding::EveryPosition`] the config asks for a
     /// conditioning table with one row per band, which is what
-    /// `Gpt2Model::forward_conditioned` indexes into.
+    /// `Gpt2Model::forward_conditioned` indexes into; under
+    /// [`Self::legal_input`] it asks for the legality table
+    /// `Gpt2Model::forward_legal` reads. A shape asking for both
+    /// describes a model `Gpt2Custom::validate` refuses to build, and
+    /// the refusal is left there rather than repeated here — this
+    /// function has no way to report one.
     pub fn config(&self, device: Device, dtype: DType) -> Gpt2Config {
-        let custom = match self.encoding {
-            CondEncoding::Prefix => None,
-            CondEncoding::EveryPosition => Some(Gpt2Custom {
-                cond_slots: Some(self.bands.len()),
+        let custom = match (self.encoding, self.legal_input) {
+            (CondEncoding::Prefix, false) => None,
+            (encoding, legal_input) => Some(Gpt2Custom {
+                cond_slots: match encoding {
+                    CondEncoding::Prefix => None,
+                    CondEncoding::EveryPosition => Some(self.bands.len()),
+                },
+                legal_input,
                 ..Default::default()
             }),
         };
@@ -476,29 +654,30 @@ impl ModelShape {
         ckpt.with_extension("shape.json")
     }
 
-    /// The path a checkpoint's shape file sits at under a given
-    /// conditioning convention.
+    /// The path a checkpoint's shape file sits at, for a given pair of
+    /// axes.
     ///
-    /// Anything other than [`CondEncoding::Prefix`] is written to a
-    /// name older builds do not look for. That is deliberate and it is
-    /// the only protection available in that direction: `serde` ignores
-    /// nothing here any more, but a build that predates the `encoding`
-    /// field would read a per-position sidecar, see fields it knows,
-    /// and score the checkpoint as prefix-conditioned. Writing
-    /// somewhere else turns that into "no shape file", which every
-    /// reader in this crate already refuses.
-    pub fn path_for_encoding(ckpt: &Path, encoding: CondEncoding) -> PathBuf {
-        match encoding {
-            CondEncoding::Prefix => Self::path_for(ckpt),
-            CondEncoding::EveryPosition => ckpt.with_extension("shape2.json"),
-        }
+    /// Every kind except "prefix-conditioned, no legality input" is
+    /// written to a name older builds do not look for. That is
+    /// deliberate and it is the only protection available in that
+    /// direction: `serde` ignores nothing here any more, but a build
+    /// that predates a field would read the sidecar, see the fields it
+    /// knows, and score the checkpoint as whatever those fields say.
+    /// Writing somewhere else turns that into "no shape file", which
+    /// every reader in this crate already refuses.
+    ///
+    /// So a name per combination rather than per axis. `shape3.json`
+    /// would have done as well and says less; the legality names carry
+    /// the word.
+    pub fn path_for_kind(ckpt: &Path, kind: ShapeKind) -> PathBuf {
+        ckpt.with_extension(kind.suffix())
     }
 
     /// Write the shape beside a checkpoint.
     ///
-    /// The other convention's name is removed afterwards. A checkpoint
-    /// is written under one convention at a time, so a sidecar at the
-    /// other name is an earlier run's, describing weights that are no
+    /// Every other kind's name is removed afterwards. A checkpoint is
+    /// written under one set of conventions at a time, so a sidecar at
+    /// another name is an earlier run's, describing weights that are no
     /// longer there — and two sidecars beside one checkpoint is a state
     /// [`Self::load_any`] refuses outright, since nothing in either
     /// file says which of them the weights belong to.
@@ -513,7 +692,8 @@ impl ModelShape {
     /// and a caller cleaning up after this has to be able to tell them
     /// apart — this one has already written a correct sidecar.
     pub fn save(&self, ckpt: &Path) -> Result<PathBuf, ShapeError> {
-        let path = Self::path_for_encoding(ckpt, self.encoding);
+        let kind = self.kind();
+        let path = Self::path_for_kind(ckpt, kind);
         let body = serde_json::to_string_pretty(self).map_err(|e| ShapeError::Parse {
             path: path.display().to_string(),
             message: e.to_string(),
@@ -522,40 +702,50 @@ impl ModelShape {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        let stale = Self::path_for_encoding(ckpt, self.encoding.other());
-        match std::fs::remove_file(&stale) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(ShapeError::SweepFailed {
-                    written: path,
-                    stale,
-                    stale_encoding: self.encoding.other(),
-                    message: e.to_string(),
-                })
+        // Every other name is swept, and a failure on one does not stop
+        // the rest: leaving a second stale sidecar behind because the
+        // first could not be removed would turn a fixable mispairing
+        // into a longer one, and the error can only name one of them.
+        let mut failed: Option<ShapeError> = None;
+        for stale_kind in kind.others() {
+            let stale = Self::path_for_kind(ckpt, stale_kind);
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    failed.get_or_insert_with(|| ShapeError::SweepFailed {
+                        written: path.clone(),
+                        stale,
+                        stale_kind,
+                        message: e.to_string(),
+                    });
+                }
             }
         }
-        Ok(path)
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(path),
+        }
     }
 
     /// Read the shape written beside a checkpoint, whichever
     /// conditioning convention it was written under.
     ///
     /// Named for what it does rather than for being the default, so
-    /// that [`Self::load_as`] is the shorter thing to reach for. Three
-    /// callers want it, and all three can genuinely handle either
+    /// that [`Self::load_as`] is the shorter thing to reach for. Two
+    /// callers want it, and both can genuinely handle either
     /// convention:
     ///
     /// - `chess_bake`'s resume check, which has to read a checkpoint of
-    ///   either convention in order to compare it against the run's own;
-    /// - `chess_cond`, which scores both — the row it builds is the same
-    ///   `[BOS, band] + moves` under each, and the encoding decides only
-    ///   whether the band is *also* passed to the forward pass as an
-    ///   index into `cond_wte`;
-    /// - `chess_play`, which plays both, and is the interesting one: its
-    ///   branch lives in [`crate::chess::batch::BandBatch`] rather than
-    ///   at the call site, so the encoding is consulted once for the two
-    ///   forwards that file needs.
+    ///   either convention in order to compare it against the run's own,
+    ///   and which is not a reader — it goes on to train, so the
+    ///   legality gate in [`crate::chess::open_reader_shape`] would be
+    ///   wrong for it;
+    /// - [`crate::chess::open_reader_shape`], which the readers that
+    ///   branch on the encoding come through: `chess_cond`, whose row is
+    ///   the same `[BOS, band] + moves` under each convention, and
+    ///   `chess_play`, whose branch lives in
+    ///   [`crate::chess::batch::BandBatch`] rather than at the call site.
     ///
     /// It is not a loophole around [`Self::load_as`]. A caller that
     /// supports one convention has to say which, because the failure it
@@ -569,21 +759,24 @@ impl ModelShape {
     /// to these weights, and a single sidecar cannot say so. A stale
     /// `*.shape.json` beside per-position weights is not ambiguous and
     /// not a mismatch — it reads as prefix and a prefix reader agrees
-    /// with it. So the recorded encoding is checked against the weights
-    /// themselves: [`COND_TABLE_TENSOR`] is present exactly for
-    /// [`CondEncoding::EveryPosition`], and any other pairing is
-    /// [`ShapeError::EncodingContradictsWeights`].
+    /// with it. So the recorded conventions are checked against the
+    /// weights themselves: [`COND_TABLE_TENSOR`] is present exactly for
+    /// [`CondEncoding::EveryPosition`] and [`LEGAL_TABLE_TENSOR`]
+    /// exactly for [`Self::legal_input`], and either disagreement is
+    /// [`ShapeError::EncodingContradictsWeights`] or
+    /// [`ShapeError::LegalInputContradictsWeights`].
     ///
     /// It sits here rather than in a verification function each reader
-    /// calls because this is already the single funnel — [`Self::load_as`]
-    /// goes through it, so every reader in the workspace is covered by
-    /// one call site rather than by five that each have to remember.
+    /// calls because this is already the single funnel —
+    /// [`Self::load_as`] and [`crate::chess::open_reader_shape`] both go
+    /// through it, so every reader in the workspace is covered by one
+    /// call site rather than by five that each have to remember.
     ///
     /// That is a narrowed surface, not an impossibility, and the
     /// difference is worth stating because an earlier version of this
     /// paragraph claimed the stronger thing. `ModelShape` is `pub` and
     /// derives `Deserialize`, and [`Self::path_for`] and
-    /// [`Self::path_for_encoding`] are `pub`, so a reader that reaches
+    /// [`Self::path_for_kind`] are `pub`, so a reader that reaches
     /// for `serde_json::from_str` on a sidecar path never arrives here
     /// and is checked by nothing. Closing that would mean the shape can
     /// only be built by a constructor that has seen the weights —
@@ -603,33 +796,39 @@ impl ModelShape {
     ///
     /// # Errors
     ///
-    /// Both sidecars are present, neither is readable as a shape, the
-    /// weights cannot be opened, or the weights say the checkpoint was
-    /// conditioned the other way.
+    /// More than one of the four sidecar names is present, the one that
+    /// is there is not readable as a shape, the weights cannot be
+    /// opened, or the weights disagree with the sidecar on either axis.
     pub fn load_any(ckpt: &Path) -> Result<Self, ShapeError> {
-        let prefix_path = Self::path_for_encoding(ckpt, CondEncoding::Prefix);
-        let other_path = Self::path_for_encoding(ckpt, CondEncoding::EveryPosition);
-        // Both present is refused rather than resolved. Preferring
-        // either one would answer "which convention is this checkpoint"
-        // from a file that may have been written for different weights,
-        // and the prefix-preferring version of this was worse than the
-        // single-name scheme it replaced: it returned a stale prefix
-        // shape for a per-position checkpoint, so `require_encoding`
-        // compared the caller against the wrong file and agreed with
-        // it. Nothing downstream catches that either — the readers go
-        // through a mmapped `VarBuilder`, which asks for the names the
-        // model wants and never notices `cond_wte.weight` sitting in
-        // the file unrequested, which is why the cross-check below has
-        // to look at the name list itself.
-        let path = match (prefix_path.is_file(), other_path.is_file()) {
-            (true, true) => {
+        // More than one present is refused rather than resolved.
+        // Preferring any of them would answer "which conventions is
+        // this checkpoint" from a file that may have been written for
+        // different weights, and the prefix-preferring version of this
+        // was worse than the single-name scheme it replaced: it
+        // returned a stale prefix shape for a per-position checkpoint,
+        // so `require_encoding` compared the caller against the wrong
+        // file and agreed with it. Nothing downstream catches that
+        // either — the readers go through a mmapped `VarBuilder`, which
+        // asks for the names the model wants and never notices
+        // `cond_wte.weight` sitting in the file unrequested, which is
+        // why the cross-check below has to look at the name list
+        // itself.
+        let present: Vec<PathBuf> = ShapeKind::ALL
+            .iter()
+            .map(|kind| Self::path_for_kind(ckpt, *kind))
+            .filter(|path| path.is_file())
+            .collect();
+        let path = match present.as_slice() {
+            // None found. The bare name is the one to name in the
+            // error: it is what a reader expects and what an operator
+            // will look for.
+            [] => Self::path_for(ckpt),
+            [only] => only.clone(),
+            many => {
                 return Err(ShapeError::AmbiguousSidecar {
-                    first: prefix_path.display().to_string(),
-                    second: other_path.display().to_string(),
+                    found: many.iter().map(|p| p.display().to_string()).collect(),
                 })
             }
-            (true, false) => prefix_path,
-            (false, _) => other_path,
         };
         let body = std::fs::read_to_string(&path).map_err(|e| ShapeError::Io {
             path: path.display().to_string(),
@@ -639,13 +838,21 @@ impl ModelShape {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
-        let implied = encoding_of_weights(ckpt)?;
-        if implied != shape.encoding {
+        let implied = axes_of_weights(ckpt)?;
+        if implied.encoding != shape.encoding {
             return Err(ShapeError::EncodingContradictsWeights {
                 path: ckpt.display().to_string(),
                 declared: shape.encoding,
-                implied,
+                implied: implied.encoding,
                 tensor: COND_TABLE_TENSOR,
+            });
+        }
+        if implied.legal_input != shape.legal_input {
+            return Err(ShapeError::LegalInputContradictsWeights {
+                path: ckpt.display().to_string(),
+                declared: shape.legal_input,
+                implied: implied.legal_input,
+                tensor: LEGAL_TABLE_TENSOR,
             });
         }
         Ok(shape)
@@ -654,9 +861,12 @@ impl ModelShape {
     /// Read the shape and refuse it unless it was conditioned the way
     /// the caller can read.
     ///
-    /// This is the entry point for a reader. It cannot be called
-    /// without naming what the caller supports, which is the property
-    /// [`Self::load_any`] gives up.
+    /// It cannot be called without naming what the caller supports,
+    /// which is the property [`Self::load_any`] gives up. It says
+    /// nothing about the legality axis, so a reader wants
+    /// [`crate::chess::open_reader_shape_as`], which is this plus that
+    /// gate; what is left here is the encoding check on its own, for
+    /// the tests that exercise it and for a caller that is not a reader.
     pub fn load_as(ckpt: &Path, want: CondEncoding) -> Result<Self, ShapeError> {
         let shape = Self::load_any(ckpt)?;
         shape.require_encoding(ckpt, want)?;
@@ -674,6 +884,82 @@ impl ModelShape {
             found: self.encoding,
         })
     }
+
+    /// Fail if this checkpoint expects the legal ids at every position
+    /// and the caller has no way to supply them.
+    ///
+    /// The sibling of [`Self::require_encoding`] on the other axis, in
+    /// the one direction that has a caller: a reader with no legality
+    /// input to give. There is no `require_legal_input` to pair with
+    /// it because nothing here asserts the opposite — a reader that can
+    /// supply the sets branches on [`Self::legal_input`] and gives them
+    /// to the forward pass that takes them, and handing them to a model
+    /// with no table is refused by that forward pass rather than here.
+    ///
+    /// Readers reach this through [`crate::chess::open_reader_shape`]
+    /// rather than calling it themselves, so that the refusal is part
+    /// of opening a checkpoint rather than a second line beside it.
+    pub fn require_no_legal_input(&self, ckpt: &Path) -> Result<(), ShapeError> {
+        if self.legal_input {
+            return Err(ShapeError::LegalInputUnsupported {
+                path: ckpt.display().to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Open the shape beside a checkpoint a **reader** is about to score or
+/// play, refusing the kinds no reader in this workspace can handle.
+///
+/// The gate this adds is [`ModelShape::require_no_legal_input`]. A
+/// checkpoint trained with the legal ids at every position has to be
+/// scored with them supplied, and no reader here supplies a set for
+/// every position of a row — the sets they have are for the position in
+/// front of them, and a windowed row no longer carries the history the
+/// rest would be recovered from. Until one of them can do that, such a
+/// checkpoint is turned away.
+///
+/// # Why this exists rather than two calls at each reader
+///
+/// The refusal was four call sites, one per reader, each a line the
+/// author had to remember to write after loading the shape — and
+/// deleting any one of them left the workspace compiling and every test
+/// passing. The totality is the point of the refusal, so it belongs on
+/// the way in rather than beside it: a reader that gets its shape here
+/// cannot skip the gate, because there is no second call to omit.
+///
+/// It is a narrowing rather than a closure, and the distinction matters
+/// the same way it does on [`ModelShape::load_any`]. That function
+/// stays `pub`, because `chess_bake`'s resume path is not a reader and
+/// legitimately handles either kind, so a fifth reader **can** be
+/// written against it. What it cannot do is go through here and forget.
+///
+/// # Errors
+///
+/// As [`ModelShape::load_any`], plus
+/// [`ShapeError::LegalInputUnsupported`].
+pub fn open_reader_shape(ckpt: &Path) -> Result<ModelShape, ShapeError> {
+    let shape = ModelShape::load_any(ckpt)?;
+    shape.require_no_legal_input(ckpt)?;
+    Ok(shape)
+}
+
+/// [`open_reader_shape`], for a reader that handles one conditioning
+/// convention rather than branching on both.
+///
+/// The legality gate runs first, so a checkpoint that is wrong on both
+/// axes reports the legality refusal. Either message names a checkpoint
+/// this reader must not score, and the legality one is the axis with no
+/// reader at all.
+///
+/// # Errors
+///
+/// As [`open_reader_shape`], plus [`ShapeError::EncodingMismatch`].
+pub fn open_reader_shape_as(ckpt: &Path, want: CondEncoding) -> Result<ModelShape, ShapeError> {
+    let shape = open_reader_shape(ckpt)?;
+    shape.require_encoding(ckpt, want)?;
+    Ok(shape)
 }
 
 #[cfg(test)]
@@ -709,14 +995,28 @@ mod tests {
     /// per-position file carries [`COND_TABLE_TENSOR`] and the prefix
     /// one does not, which is the whole of the difference on disk.
     fn write_weights(ckpt: &Path, encoding: CondEncoding) {
+        write_weights_of(
+            ckpt,
+            ShapeKind {
+                encoding,
+                legal_input: false,
+            },
+        );
+    }
+
+    /// The same, for a checkpoint of any kind.
+    fn write_weights_of(ckpt: &Path, kind: ShapeKind) {
         use candle_core::Tensor;
         use std::collections::HashMap;
 
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         let zeros = |rows: usize| Tensor::zeros((rows, 4), DType::F32, &Device::Cpu).unwrap();
         tensors.insert("wte.weight".into(), zeros(8));
-        if encoding == CondEncoding::EveryPosition {
+        if kind.encoding == CondEncoding::EveryPosition {
             tensors.insert(COND_TABLE_TENSOR.into(), zeros(2));
+        }
+        if kind.legal_input {
+            tensors.insert(LEGAL_TABLE_TENSOR.into(), zeros(8));
         }
         candle_core::safetensors::save(&tensors, ckpt).expect("weights on disk");
     }
@@ -756,7 +1056,13 @@ mod tests {
         let written = a_shape(CondEncoding::EveryPosition).save(&ckpt).unwrap();
         assert_eq!(
             written,
-            ModelShape::path_for_encoding(&ckpt, CondEncoding::EveryPosition)
+            ModelShape::path_for_kind(
+                &ckpt,
+                ShapeKind {
+                    encoding: CondEncoding::EveryPosition,
+                    legal_input: false,
+                }
+            )
         );
         assert!(!ModelShape::path_for(&ckpt).exists());
     }
@@ -800,7 +1106,13 @@ mod tests {
         let perpos = serde_json::to_string(&a_shape(CondEncoding::EveryPosition)).unwrap();
         std::fs::write(ModelShape::path_for(&ckpt), prefix).unwrap();
         std::fs::write(
-            ModelShape::path_for_encoding(&ckpt, CondEncoding::EveryPosition),
+            ModelShape::path_for_kind(
+                &ckpt,
+                ShapeKind {
+                    encoding: CondEncoding::EveryPosition,
+                    legal_input: false,
+                },
+            ),
             perpos,
         )
         .unwrap();
@@ -977,7 +1289,13 @@ mod tests {
         write_weights(&ckpt, CondEncoding::Prefix);
         let body = serde_json::to_string(&a_shape(CondEncoding::EveryPosition)).unwrap();
         std::fs::write(
-            ModelShape::path_for_encoding(&ckpt, CondEncoding::EveryPosition),
+            ModelShape::path_for_kind(
+                &ckpt,
+                ShapeKind {
+                    encoding: CondEncoding::EveryPosition,
+                    legal_input: false,
+                },
+            ),
             body,
         )
         .unwrap();
@@ -1007,6 +1325,186 @@ mod tests {
         assert!(
             matches!(err, ShapeError::WeightsUnreadable { .. }),
             "{err:?}"
+        );
+    }
+
+    /// A legality-input shape rides the same round trip, at a name of
+    /// its own.
+    #[test]
+    fn a_legality_input_checkpoint_records_and_reloads_it() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        let kind = ShapeKind {
+            encoding: CondEncoding::Prefix,
+            legal_input: true,
+        };
+        write_weights_of(&ckpt, kind);
+        let mut shape = a_shape(CondEncoding::Prefix);
+        shape.legal_input = true;
+        let written = shape.save(&ckpt).unwrap();
+
+        assert_eq!(written.file_name().unwrap(), "run.shape-legal.json");
+        assert!(
+            !ModelShape::path_for(&ckpt).exists(),
+            "a build that predates this axis looks at the bare name, and must find nothing"
+        );
+        let back = ModelShape::load_any(&ckpt).unwrap();
+        assert!(back.legal_input);
+        assert_eq!(back.encoding, CondEncoding::Prefix);
+    }
+
+    /// An ordinary checkpoint's sidecar is written exactly as it was
+    /// before the axis existed, so nothing already on disk is stranded
+    /// and nothing new is refused by a build that predates it.
+    #[test]
+    fn the_legality_field_is_absent_from_an_ordinary_sidecar() {
+        let json = serde_json::to_value(a_shape(CondEncoding::Prefix)).unwrap();
+        assert!(json.get("legal_input").is_none(), "got {json}");
+
+        let mut legal = a_shape(CondEncoding::Prefix);
+        legal.legal_input = true;
+        let json = serde_json::to_value(legal).unwrap();
+        assert_eq!(json.get("legal_input"), Some(&serde_json::json!(true)));
+    }
+
+    /// The route the sidecar naming cannot cover on its own, on this
+    /// axis: weights carrying the legality table beside a sidecar that
+    /// does not mention it.
+    ///
+    /// Nothing else refuses it. There is one sidecar, so it is not
+    /// ambiguous; it says nothing about legality, so a reader with no
+    /// legality input agrees with it; and the weight load asks only for
+    /// the tensors its model wants, so `legal_wte.weight` sits there
+    /// unrequested.
+    #[test]
+    fn a_sidecar_that_omits_the_legality_input_beside_weights_that_have_it_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        write_weights_of(
+            &ckpt,
+            ShapeKind {
+                encoding: CondEncoding::Prefix,
+                legal_input: true,
+            },
+        );
+        let body = serde_json::to_string(&a_shape(CondEncoding::Prefix)).unwrap();
+        std::fs::write(ModelShape::path_for(&ckpt), body).unwrap();
+
+        let err = ModelShape::load_any(&ckpt).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShapeError::LegalInputContradictsWeights {
+                    declared: false,
+                    implied: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// And the other direction, which is what a copy that took the
+    /// legality sidecar and the wrong checkpoint leaves.
+    #[test]
+    fn a_legality_sidecar_beside_weights_without_the_table_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        write_weights(&ckpt, CondEncoding::Prefix);
+        let mut shape = a_shape(CondEncoding::Prefix);
+        shape.legal_input = true;
+        let body = serde_json::to_string(&shape).unwrap();
+        std::fs::write(ModelShape::path_for_kind(&ckpt, shape.kind()), body.clone()).unwrap();
+
+        let err = ModelShape::load_any(&ckpt).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShapeError::LegalInputContradictsWeights {
+                    declared: true,
+                    implied: false,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A reader with no legality input refuses such a checkpoint rather
+    /// than scoring the model with that channel absent everywhere.
+    #[test]
+    fn a_reader_without_a_legality_input_refuses_a_checkpoint_that_wants_one() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        let mut shape = a_shape(CondEncoding::Prefix);
+        shape.legal_input = true;
+        let err = shape.require_no_legal_input(&ckpt).unwrap_err();
+        assert!(
+            matches!(err, ShapeError::LegalInputUnsupported { .. }),
+            "{err:?}"
+        );
+        // And an ordinary checkpoint passes the same gate.
+        a_shape(CondEncoding::Prefix)
+            .require_no_legal_input(&ckpt)
+            .expect("a checkpoint that wants no legality input is readable");
+    }
+
+    /// A second bake under the other objective lands on the same
+    /// checkpoint name, and the sweep is what keeps the first bake's
+    /// sidecar from describing the second bake's weights.
+    #[test]
+    fn a_bake_with_a_legality_input_sweeps_the_ordinary_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("run.safetensors");
+        write_weights(&ckpt, CondEncoding::Prefix);
+        a_shape(CondEncoding::Prefix).save(&ckpt).unwrap();
+        assert!(ModelShape::path_for(&ckpt).is_file());
+
+        let kind = ShapeKind {
+            encoding: CondEncoding::Prefix,
+            legal_input: true,
+        };
+        write_weights_of(&ckpt, kind);
+        let mut legal = a_shape(CondEncoding::Prefix);
+        legal.legal_input = true;
+        legal.save(&ckpt).unwrap();
+
+        assert!(
+            !ModelShape::path_for(&ckpt).exists(),
+            "the ordinary sidecar describes weights that are no longer there"
+        );
+        assert!(ModelShape::load_any(&ckpt).unwrap().legal_input);
+    }
+
+    /// The table only exists under the axis that reads it, and the two
+    /// axes do not describe a model together — `Gpt2Custom::validate`
+    /// refuses the pair, which is asserted here through the config this
+    /// shape hands it.
+    #[test]
+    fn the_config_carries_a_legality_table_only_when_the_shape_says_so() {
+        use candle_core::{DType, Device};
+        let plain = a_shape(CondEncoding::Prefix).config(Device::Cpu, DType::F32);
+        assert!(plain.custom.is_none());
+
+        let mut shape = a_shape(CondEncoding::Prefix);
+        shape.legal_input = true;
+        let custom = shape
+            .config(Device::Cpu, DType::F32)
+            .custom
+            .expect("a legality input needs a custom spec");
+        assert!(custom.legal_input);
+        assert_eq!(custom.cond_slots, None);
+        custom.validate().expect("legality alone is buildable");
+
+        let mut both = a_shape(CondEncoding::EveryPosition);
+        both.legal_input = true;
+        let custom = both
+            .config(Device::Cpu, DType::F32)
+            .custom
+            .expect("both axes need a custom spec");
+        assert!(
+            custom.validate().is_err(),
+            "no forward pass reads both channels, so the model must not build"
         );
     }
 

@@ -38,6 +38,10 @@
 //!   position `i` attends to `(i - w, i]` (Mistral 2023).
 //! - **untied head** — an independent `lm_head.weight` Var instead of
 //!   reusing `wte`.
+//! - **legality input** — a `legal_wte` table (`[vocab, dim]`) whose
+//!   mean over the ids allowed at a position is added to the residual
+//!   stream there, so a model over a constrained action space is told
+//!   what is available instead of having to infer it from the sequence.
 //! - **Post-LN** — norm after the sublayer + residual add (Xiong et
 //!   al. 2020, arXiv:2002.04745) instead of the Pre-LN reference. Its
 //!   known training instability is a probe subject, not a defect.
@@ -211,6 +215,33 @@ pub struct Gpt2Custom {
     /// so nothing pulls against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cond_slots: Option<usize>,
+    /// `true` = the model is handed the set of ids it may pick from at
+    /// each position. The mean of `legal_wte` (`[vocab, dim]`) over that
+    /// set is added to the residual stream there, next to where the
+    /// positional embedding is added
+    /// ([`super::gpt2::Gpt2Model::forward_legal`]). `false` (reference)
+    /// = no such table and no entry point that takes one.
+    ///
+    /// # Why a table of its own
+    ///
+    /// The same argument [`Self::cond_slots`] records, with more force.
+    /// The LM head is tied to `wte` on the reference topology
+    /// (`untied_head: false`), so a `wte` row added to the stream raises
+    /// that token's logit at the position it is added — and here the set
+    /// being added **contains the target**, at every position. Sharing
+    /// the table would therefore give this input a direct path to the
+    /// logit it is meant to inform, and leave any measurement of what
+    /// it did partly a measurement of the tie. The blocks could learn
+    /// to work around that; a table nothing else reads means they do
+    /// not have to, and that the question is not raised.
+    ///
+    /// # Why a bool rather than a size
+    ///
+    /// The entries are vocabulary ids, so the table's height follows
+    /// from [`super::gpt2::Gpt2Config::vocab`] and there is nothing for
+    /// a caller to choose.
+    #[serde(default)]
+    pub legal_input: bool,
 }
 
 impl Gpt2Custom {
@@ -246,6 +277,20 @@ impl Gpt2Custom {
                 "gpt2 custom: cond_slots must be ≥ 1 (use None for an unconditioned model)".into(),
             ));
         }
+        if self.cond_slots.is_some() && self.legal_input {
+            // Refused at build time rather than at the first forward
+            // pass, which on a real corpus is minutes of PGN reading
+            // later. `forward_conditioned` and `forward_legal` each
+            // deliver one channel and neither delivers the other, so a
+            // model carrying both tables has no entry point that reads
+            // both — and the one it would go through would drop a
+            // channel the caller paid for, silently.
+            return Err(candle_core::Error::Msg(
+                "gpt2 custom: `cond_slots` and `legal_input` have no combined forward pass in \
+                 this build; pick one channel"
+                    .into(),
+            ));
+        }
         if self.placement == NormPlacement::PostLn && self.residual == ResidualKind::Parallel {
             return Err(candle_core::Error::Msg(
                 "gpt2 custom: Post-LN with the parallel residual topology has no \
@@ -274,6 +319,7 @@ mod tests {
         assert_eq!(c.kv_heads, None);
         assert_eq!(c.window, None);
         assert!(!c.untied_head);
+        assert!(!c.legal_input);
         c.validate().expect("default spec is valid");
     }
 
@@ -289,6 +335,32 @@ mod tests {
             ..Default::default()
         };
         assert!(w0.validate().unwrap_err().to_string().contains("window"));
+    }
+
+    /// The two channels have no combined forward pass, so a spec asking
+    /// for both is refused where a caller still has the spec in hand.
+    #[test]
+    fn validate_rejects_conditioning_together_with_a_legality_input() {
+        let c = Gpt2Custom {
+            cond_slots: Some(2),
+            legal_input: true,
+            ..Default::default()
+        };
+        let msg = c.validate().unwrap_err().to_string();
+        assert!(msg.contains("combined forward"), "unexpected error: {msg}");
+        // Either alone is fine.
+        Gpt2Custom {
+            cond_slots: Some(2),
+            ..Default::default()
+        }
+        .validate()
+        .expect("conditioning alone");
+        Gpt2Custom {
+            legal_input: true,
+            ..Default::default()
+        }
+        .validate()
+        .expect("a legality input alone");
     }
 
     #[test]
@@ -364,6 +436,7 @@ mod tests {
             window: Some(4),
             untied_head: true,
             cond_slots: Some(3),
+            legal_input: false,
         };
         let json = serde_json::to_value(&spec).expect("serialize");
         let back: Gpt2Custom = serde_json::from_value(json.clone()).expect("deserialize");
@@ -374,6 +447,21 @@ mod tests {
         assert_eq!(back.window, Some(4));
         assert!(back.untied_head);
         assert_eq!(back.cond_slots, Some(3));
+        assert!(!back.legal_input);
+
+        // The legality axis rides the same round trip. It is spelled
+        // separately because it does not compose with `cond_slots`
+        // above — a Card carrying both is refused at build time, so a
+        // fixture carrying both would describe a model that cannot
+        // exist.
+        let legal = Gpt2Custom {
+            legal_input: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&legal).expect("serialize");
+        assert_eq!(json.get("legal_input"), Some(&serde_json::json!(true)));
+        let back: Gpt2Custom = serde_json::from_value(json).expect("deserialize");
+        assert!(back.legal_input);
     }
 
     /// An empty table deserializes to the reference spec, and absent
@@ -385,6 +473,7 @@ mod tests {
         assert_eq!(spec.pos, PosKind::Learned);
         assert_eq!(spec.kv_heads, None);
         assert_eq!(spec.window, None);
+        assert!(!spec.legal_input);
 
         let json = serde_json::to_value(&spec).expect("serialize");
         assert!(json.get("kv_heads").is_none(), "got: {json}");

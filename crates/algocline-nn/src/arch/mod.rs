@@ -45,7 +45,7 @@ pub(crate) fn softmax_last_dim_slow(
 }
 
 pub use custom::{Activation, Gpt2Custom, NormKind, NormPlacement, PosKind, ResidualKind};
-pub use gpt2::{CondIndex, Gpt2Config, Gpt2Model};
+pub use gpt2::{CondIndex, Gpt2Config, Gpt2Model, LegalSets};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear, LoraWrappable};
 pub use moe::MoeConfig;
 pub use tinyllama::{TinyLlamaConfig, TinyLlamaModel};

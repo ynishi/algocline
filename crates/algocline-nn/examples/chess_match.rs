@@ -60,7 +60,7 @@ use algocline_nn::arch::Gpt2Model;
 use algocline_nn::chess::guide::{guide_logits, mean_logits};
 use algocline_nn::chess::pgn::uci_standard;
 use algocline_nn::chess::vocab::{MoveVocab, BOS};
-use algocline_nn::chess::{CondEncoding, ModelShape};
+use algocline_nn::chess::{open_reader_shape_as, CondEncoding, ModelShape};
 
 /// A seat: either a band of the model, or uniform random legal play.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -444,7 +444,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // it is left because the head-to-head arm was already retired on
     // its own evidence (86-88% of games ended in repetition) and no
     // conclusion in the current plan rests on this program.
-    let shape = ModelShape::load_as(&ckpt, CondEncoding::Prefix)?;
+    //
+    // The reader entry point rather than `ModelShape::load_as`, so that
+    // the legality refusal — this program supplies no legal ids, and
+    // would otherwise play the model with that channel absent from
+    // every position — arrives with the shape instead of as a second
+    // line somebody has to remember to write.
+    let shape = open_reader_shape_as(&ckpt, CondEncoding::Prefix)?;
     if shape.bands.len() < 2 {
         return Err("this checkpoint carries fewer than two bands".into());
     }

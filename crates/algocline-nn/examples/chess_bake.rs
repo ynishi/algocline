@@ -36,6 +36,27 @@
 //! by a single small tensor otherwise, so a reader that guessed would
 //! get a full set of plausible numbers rather than an error.
 //!
+//! # Handing the model its legality
+//!
+//! `CHESS_LEGAL_MASK=1` restricts the loss to the moves that were legal
+//! in the position, so the model is scored on choosing among them
+//! rather than on knowing which ones exist — measured here, the second
+//! question was taking 1.59 of 4.52 nats, and decoding discards all of
+//! that work because it walks the ranking against the legal set
+//! regardless.
+//!
+//! `CHESS_LEGAL_INPUT=1` goes further and hands the same sets to the
+//! model as *input*: at each position the mean of a table of its own,
+//! `legal_wte`, over the ids available there is added to the residual
+//! stream. It requires the mask flag, because the sets arrive through
+//! the dataset that flag selects. The two arms this serves are the mask
+//! alone and the mask with the input.
+//!
+//! It does not compose with `CHESS_COND_EVERY`: one delivers the band
+//! at every position and the other the legal moves, and no forward pass
+//! in this build reads both. Asked for together, the run stops before
+//! reading the corpus.
+//!
 //! One run is meant to finish in tens of seconds on a laptop CPU.
 //! `steps * batch` is what decides that, and the corpus needs at least
 //! that many rows, so raising either raises the wall clock directly.
@@ -66,11 +87,23 @@
 //! tensor the model does not want, which `restore_into` accepts and
 //! reports as unused. In that second direction the shape file is the
 //! only thing standing between the operator and a resume from weights
-//! trained under another rule. So it is compared field by field first,
-//! heads, band list and conditioning included, and a disagreement
-//! stops the run before training. Resuming a `1600-1799` model as
-//! `1100-1299` is therefore an error, not a run whose embedding row 2
-//! quietly means something else than it did yesterday.
+//! trained under another rule.
+//!
+//! `CHESS_LEGAL_INPUT` is the same shape of problem on its own tensor,
+//! `legal_wte`, and it is the one an operator is likelier to meet. The
+//! two arms this dial defines — the mask alone and the mask with the
+//! input — are meant to be run over the same corpus at the same dials,
+//! so reaching for one as the other's starting point is a natural
+//! thing to do, and it would leave a checkpoint labelled as the arm it
+//! did not start from. A legality checkpoint restored into an ordinary
+//! run is accepted, its table listed in `unused_from_file`, and every
+//! number afterwards well-formed.
+//!
+//! So the shape is compared field by field first — every field of it,
+//! heads, band list, conditioning and legality included — and a
+//! disagreement stops the run before training. Resuming a `1600-1799`
+//! model as `1100-1299` is therefore an error, not a run whose
+//! embedding row 2 quietly means something else than it did yesterday.
 //!
 //! Every checkpoint carries its own shape file, written as it lands,
 //! so the pairing survives an interrupted run and cannot be rewritten
@@ -115,11 +148,11 @@ use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::train::{cond_table, row_conditions};
 use algocline_nn::chess::vocab::MoveVocab;
-use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError};
+use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError, ShapeKind};
 use algocline_nn::train::{
-    allowed_logit_mask, restore_into, run_conditioned_ft, run_full_ft, CkptControl, CkptHook,
-    CkptInfo, CrossEntropyLoss, Dataset, DatasetOpts, FullFtConfig, Loss, ScheduleKind,
-    TeacherCardDataset, TrainingLease,
+    allowed_logit_mask, legal_input_sets, restore_into, run_conditioned_ft, run_full_ft,
+    run_legal_ft, CkptControl, CkptHook, CkptInfo, CrossEntropyLoss, Dataset, DatasetOpts,
+    FullFtConfig, Loss, ScheduleKind, TeacherCardDataset, TrainingLease,
 };
 
 /// Read a `usize` from the environment, falling back to `default`.
@@ -139,6 +172,38 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Read a `0` / `1` switch from the environment.
+///
+/// Every arm is spelled out, which is the point of having this rather
+/// than a comparison against `"1"`:
+///
+/// - an unreadable value is an **error**. `CHESS_LEGAL_MASK=true` under
+///   the old comparison meant "off", and a run that was asked for one
+///   objective and trained under the other reports nothing about it;
+/// - `NotUnicode` — a variable that *is* set, to something this program
+///   cannot read — is an error too, rather than being folded in with
+///   "not set at all";
+/// - empty means "not asked for", because that is how a shell blanks a
+///   variable it has already exported. Said out loud, since an operator
+///   who meant to pass a value should see that none arrived.
+fn env_switch(key: &str) -> Result<bool, String> {
+    match env::var(key) {
+        Ok(v) => match v.as_str() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            "" => {
+                eprintln!("[bake] {key} is set but empty; treating it as 0");
+                Ok(false)
+            }
+            other => Err(format!("unknown {key} {other:?}; pass 0 or 1")),
+        },
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(e @ env::VarError::NotUnicode(_)) => Err(format!(
+            "{key} is set to something this program cannot read ({e}); pass 0 or 1"
+        )),
+    }
 }
 
 /// Deterministic xorshift, used only to order rows.
@@ -187,10 +252,20 @@ fn shuffle<T>(rows: &mut [T], rng: &mut Rng) {
 /// plain forward would run it in a state it never trained in — with the
 /// condition vector absent from every position — and report the result
 /// as a validation loss.
+///
+/// `legal_input` says the same thing about the other channel: a model
+/// trained with the legal moves supplied at every position has to be
+/// scored with them supplied too. It is a separate argument rather than
+/// read off the batch because every batch here carries the sets — that
+/// is what makes the legal-restricted number above comparable across
+/// runs — and only the run knows whether the model was also handed
+/// them.
+#[allow(clippy::too_many_arguments)]
 fn eval_loss(
     model: &Gpt2Model,
     rows: &[TeacherRow],
     conds: Option<&[CondIndex]>,
+    legal_input: bool,
     vocab: &MoveVocab,
     ctx: usize,
     batch: usize,
@@ -231,10 +306,18 @@ fn eval_loss(
         let targets = full.narrow(1, 1, width - 1)?.contiguous()?;
         let m = full_mask.narrow(1, 1, width - 1)?.contiguous()?;
         // The same entry point the run trained through, so the model is
-        // scored in the state it was trained in.
-        let logits = match b.conds.as_deref() {
-            Some(conds) => model.forward_conditioned(&inputs, conds)?,
-            None => model.forward(&inputs)?,
+        // scored in the state it was trained in. `legal_input` decides
+        // it rather than the batch, because the batch carries its sets
+        // under both objectives — they are the loss mask's business on
+        // one and the model's input as well on the other.
+        let logits = match (legal_input, b.conds.as_deref()) {
+            (true, _) => {
+                let sets = legal_input_sets(&b, width, device)?
+                    .ok_or("a legality-input run needs a dataset that carries the legal sets")?;
+                model.forward_legal(&inputs, &sets)?
+            }
+            (false, Some(conds)) => model.forward_conditioned(&inputs, conds)?,
+            (false, None) => model.forward(&inputs)?,
         };
         let logits = match allowed_logit_mask(&b, width, logits.dim(2)?, device)? {
             Some(am) => logits.broadcast_add(&am)?,
@@ -298,6 +381,14 @@ fn describe_bands(bands: &[ConditionBand]) -> String {
         .join(", ")
 }
 
+/// How a shape's legality axis reads in a message.
+fn describe_legal_input(on: bool) -> &'static str {
+    match on {
+        true => "supplied at every position",
+        false => "absent",
+    }
+}
+
 /// Every field on which a checkpoint's recorded shape differs from the
 /// one this run is configured for.
 ///
@@ -305,33 +396,68 @@ fn describe_bands(bands: &[ConditionBand]) -> String {
 /// what moved. An operator who resumed with the wrong `CHESS_DIM`
 /// wants to read "dim is 128 in the checkpoint and 256 here", not that
 /// two structs differed.
+///
+/// "Every field" is a claim about all eight of [`ModelShape`]'s, and it
+/// is held by the destructuring below rather than by this sentence: a
+/// ninth field stops this function compiling, which is the moment to
+/// decide whether resuming across it is safe. An earlier version of
+/// this doc made the same claim over seven of eight — `legal_input` was
+/// not compared, and that is the axis where the asymmetry described in
+/// the module header bites hardest.
 fn shape_disagreements(want: &ModelShape, found: &ModelShape) -> Vec<String> {
+    // Named rather than reached through `found.` so that adding a field
+    // to `ModelShape` is a compile error here.
+    let ModelShape {
+        layers,
+        heads,
+        dim,
+        ctx,
+        vocab,
+        bands,
+        encoding,
+        legal_input,
+    } = found;
     let mut out = Vec::new();
     for (label, w, f) in [
-        ("layers", want.layers, found.layers),
-        ("heads", want.heads, found.heads),
-        ("dim", want.dim, found.dim),
-        ("ctx", want.ctx, found.ctx),
-        ("vocab", want.vocab, found.vocab),
+        ("layers", want.layers, *layers),
+        ("heads", want.heads, *heads),
+        ("dim", want.dim, *dim),
+        ("ctx", want.ctx, *ctx),
+        ("vocab", want.vocab, *vocab),
     ] {
         if w != f {
             out.push(format!("{label} is {f} in the checkpoint and {w} here"));
         }
     }
-    if want.bands != found.bands {
+    if want.bands != *bands {
         out.push(format!(
             "bands are [{}] in the checkpoint and [{}] here",
-            describe_bands(&found.bands),
+            describe_bands(bands),
             describe_bands(&want.bands)
         ));
     }
     // Nothing in the weights records this, and the two conventions
     // train different models out of the same tensors, so resuming
     // across it would continue one run's model under the other's rule.
-    if want.encoding != found.encoding {
+    if want.encoding != *encoding {
         out.push(format!(
             "conditioning is {} in the checkpoint and {} here",
-            found.encoding, want.encoding
+            encoding, want.encoding
+        ));
+    }
+    // The same asymmetry as `encoding`, on the other axis, and the same
+    // remedy. A legality checkpoint restored into an ordinary run
+    // carries `legal_wte.weight`, which the model does not ask for:
+    // `restore_into` accepts the restore, lists the tensor as unused,
+    // and the run trains a model that never reads the channel its
+    // starting weights were shaped by. The reverse direction — an
+    // ordinary checkpoint into a legality run — is caught by the
+    // restore, because the table would be missing.
+    if want.legal_input != *legal_input {
+        out.push(format!(
+            "the legality input is {} in the checkpoint and {} here",
+            describe_legal_input(*legal_input),
+            describe_legal_input(want.legal_input)
         ));
     }
     out
@@ -463,41 +589,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     shape.heads = env_usize("CHESS_HEADS", shape.heads);
     shape.dim = env_usize("CHESS_DIM", shape.dim);
     shape.ctx = env_usize("CHESS_CTX", shape.ctx);
-    // Which conditioning convention this run trains under. It goes into
-    // the shape file because that is where a reader can act on it
-    // before loading anything.
-    //
-    // Every arm is spelled out. `Err(_) => Prefix` would fold
-    // `NotUnicode` — a variable that *is* set, to something this
-    // program cannot read — in with "not set at all", and the run would
-    // then train prefix-conditioned and label itself prefix-
-    // conditioned with nothing anywhere recording that the operator
-    // asked for something else.
-    shape.encoding = match env::var("CHESS_COND_EVERY") {
-        Ok(v) => match v.as_str() {
-            "1" => CondEncoding::EveryPosition,
-            "0" => CondEncoding::Prefix,
-            // A shell blanks an exported variable by setting it empty,
-            // so this means "not asked for" — said out loud for the
-            // same reason `resume_from` says it about CHESS_INIT_FROM.
-            "" => {
-                eprintln!("[bake] CHESS_COND_EVERY is set but empty; conditioning by prefix token");
-                CondEncoding::Prefix
-            }
-            other => return Err(format!("unknown CHESS_COND_EVERY {other:?}; pass 0 or 1").into()),
-        },
-        Err(env::VarError::NotPresent) => CondEncoding::Prefix,
-        Err(e @ env::VarError::NotUnicode(_)) => {
-            return Err(format!(
-                "CHESS_COND_EVERY is set to something this program cannot read ({e}); pass 0 or 1"
-            )
-            .into())
-        }
+    // Which conditioning convention this run trains under, and whether
+    // it hands the model the legal moves. Both go into the shape file,
+    // because that is where a reader can act on them before loading
+    // anything, and both are read here so a bad value costs seconds
+    // rather than a corpus read. `env_switch` has the arms.
+    shape.encoding = if env_switch("CHESS_COND_EVERY")? {
+        CondEncoding::EveryPosition
+    } else {
+        CondEncoding::Prefix
     };
+    // Restricting the loss to the legal moves is opt-in so the two
+    // objectives can be compared on the same corpus and the same seed.
+    let legal_mask = env_switch("CHESS_LEGAL_MASK")?;
+    // And handing the same sets to the model as *input*, which is a
+    // second question about the same list: the mask stops charging for
+    // moves that were never available, this stops the model having to
+    // work out which ones those were.
+    shape.legal_input = env_switch("CHESS_LEGAL_INPUT")?;
     // Whether every row's band is passed to the forward pass. Read once
     // here so the rest of the run asks this rather than the shape, and
     // so the two cannot drift apart within one run.
     let per_position = shape.encoding == CondEncoding::EveryPosition;
+
+    if shape.legal_input && !legal_mask {
+        // The legal sets reach the trainer through the dataset, and the
+        // dataset that produces them is the one `CHESS_LEGAL_MASK`
+        // selects. Refused rather than turned on quietly, because
+        // switching the dataset would also switch the objective — the
+        // shared loop masks the logits of every batch that carries
+        // sets — and a run comparing objectives cannot have one of them
+        // arrive as a side effect.
+        return Err(
+            "CHESS_LEGAL_INPUT=1 needs CHESS_LEGAL_MASK=1: the legal sets reach the model \
+             through the legal-masked dataset, and turning that on by itself would change \
+             the objective as well as the input"
+                .into(),
+        );
+    }
+    if shape.legal_input && per_position {
+        // `Gpt2Custom::validate` refuses the pair when the model is
+        // built; this says so first, with the two dials named, before
+        // the corpus is read.
+        return Err(
+            "CHESS_COND_EVERY=1 and CHESS_LEGAL_INPUT=1 together have no forward pass in this \
+             build: one delivers the band at every position and the other the legal moves, and \
+             nothing reads both. Pick one"
+                .into(),
+        );
+    }
     let batch = env_usize("CHESS_BATCH", 32);
     let lr = env_f64("CHESS_LR", 3e-3);
     // More than one pass over the rows is what lets a run continue past
@@ -511,10 +651,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // validation curve run under it always flattens — whether or not
     // the model converged. `constant` removes that confound: under a
     // fixed rate, a flat tail is the model, not the schedule.
-    let schedule = match env::var("CHESS_SCHEDULE").as_deref() {
-        Ok("constant") | Ok("const") => ScheduleKind::Constant,
-        Ok("cosine") | Ok("cosine_with_warmup") | Err(_) => ScheduleKind::CosineWithWarmup,
-        Ok(other) => return Err(format!("unknown CHESS_SCHEDULE {other:?}").into()),
+    //
+    // Spelled out arm by arm for the reason `env_switch` is: a variable
+    // that is set to something this program cannot read is an error
+    // rather than a run that silently took the default, and a run that
+    // was asked for one schedule and trained under the other reports
+    // nothing about it.
+    let schedule = match env::var("CHESS_SCHEDULE") {
+        Ok(v) => match v.as_str() {
+            "constant" | "const" => ScheduleKind::Constant,
+            "cosine" | "cosine_with_warmup" => ScheduleKind::CosineWithWarmup,
+            "" => {
+                eprintln!("[bake] CHESS_SCHEDULE is set but empty; using the cosine schedule");
+                ScheduleKind::CosineWithWarmup
+            }
+            other => {
+                return Err(
+                    format!("unknown CHESS_SCHEDULE {other:?}; pass constant or cosine").into(),
+                )
+            }
+        },
+        Err(env::VarError::NotPresent) => ScheduleKind::CosineWithWarmup,
+        Err(e @ env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "CHESS_SCHEDULE is set to something this program cannot read ({e}); \
+                 pass constant or cosine"
+            )
+            .into())
+        }
     };
 
     // Resolved here, before the corpus read, so a bad path or a
@@ -620,14 +784,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // Restricting the loss to the legal moves is opt-in so the two
-    // objectives can be compared on the same corpus and the same seed.
-    let legal_mask = env::var("CHESS_LEGAL_MASK").as_deref() == Ok("1");
     let mut dataset: Box<dyn Dataset + Send> = if legal_mask {
         eprintln!(
             "[bake] loss restricted to legal moves (measured: 1.59 of 4.52 nats \
              otherwise goes on suppressing illegal ones, which decoding gives free)"
         );
+        if shape.legal_input {
+            eprintln!(
+                "[bake] and the same sets are handed to the model at every position, so it is \
+                 told what is available rather than having to infer it"
+            );
+        }
         let ds = LegalMaskedDataset::new(
             TeacherRow::into_pairs(rows),
             MoveVocab::new(&tokens)?,
@@ -800,15 +967,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 let swept = match &e {
                     ShapeError::SweepFailed { stale, .. } => sweep_one(stale),
-                    _ => {
-                        let mine =
-                            ModelShape::path_for_encoding(&info.ckpt_path, shape_for_ckpt.encoding);
-                        let theirs = ModelShape::path_for_encoding(
-                            &info.ckpt_path,
-                            shape_for_ckpt.encoding.other(),
-                        );
-                        format!("{}{}", sweep_one(&mine), sweep_one(&theirs))
-                    }
+                    _ => ShapeKind::ALL
+                        .iter()
+                        .map(|kind| sweep_one(&ModelShape::path_for_kind(&info.ckpt_path, *kind)))
+                        .collect::<Vec<_>>()
+                        .join(""),
                 };
                 // The weights are on disk and cost whatever the run has
                 // cost so far. The abort skips the retrieval hint at
@@ -837,7 +1000,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // training unconditioned under a checkpoint labelled otherwise.
     let loss_fn = CrossEntropyLoss::new();
     let lease = Arc::new(TrainingLease::new());
-    let ckpt = if per_position {
+    let ckpt = if shape.legal_input {
+        // The third entry point, and the same discipline: it refuses a
+        // batch that carries no legal sets rather than running the
+        // plain forward, which on this model would fail at the forward
+        // anyway — the table is there and unread.
+        run_legal_ft(
+            &model,
+            &vm,
+            dataset.as_mut(),
+            &ft_cfg,
+            &loss_fn,
+            &ckpt_dir,
+            &prefix,
+            lease,
+            Some(on_ckpt),
+        )?
+    } else if per_position {
         run_conditioned_ft(
             &model,
             &vm,
@@ -904,6 +1083,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &model,
             val,
             val_conds,
+            shape.legal_input,
             &vocab,
             shape.ctx,
             batch,
@@ -918,7 +1098,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let m = Gpt2Model::from_safetensors_file(&cfg, &p)?;
                     curve.push((
                         step,
-                        eval_loss(&m, val, val_conds, &vocab, shape.ctx, batch, &cfg.device)?,
+                        eval_loss(
+                            &m,
+                            val,
+                            val_conds,
+                            shape.legal_input,
+                            &vocab,
+                            shape.ctx,
+                            batch,
+                            &cfg.device,
+                        )?,
                     ));
                 }
                 step += eval_every;

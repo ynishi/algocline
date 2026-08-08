@@ -12,6 +12,9 @@
 //! - `wpe` — learned positional embedding (`ctx × dim`)
 //! - `cond_wte` — optional conditioning table (`cond_slots × dim`),
 //!   added at every position by [`Gpt2Model::forward_conditioned`]
+//! - `legal_wte` — optional legality table (`vocab × dim`), whose mean
+//!   over the ids allowed at a position is added there by
+//!   [`Gpt2Model::forward_legal`]
 //! - `h.<i>.ln_1` / `ln_2` — pre-LayerNorm (dim)
 //! - `h.<i>.attn.c_attn` — fused Q/K/V projection (`dim → 3·dim`)
 //! - `h.<i>.attn.c_proj` — attention output projection (`dim → dim`)
@@ -751,6 +754,214 @@ impl CondIndex {
     }
 }
 
+/// The ids a model may pick from at each position of a batch, in the
+/// form [`Gpt2Model::forward_legal`] reads them.
+///
+/// # What the indices mean
+///
+/// `sets[r][p]` is the set the model's prediction **for input position
+/// `p` of row `r`** is drawn from — the moves available once it has
+/// consumed input position `p`, not the ones that were available when
+/// position `p` itself was played. Under the usual next-token shift
+/// that is the same set the loss mask uses for target `p`
+/// ([`crate::train::allowed_logit_mask`]), which is why
+/// [`crate::train::legal_input_sets`] builds both from one list at one
+/// offset: given as input on one side, used to strike out the
+/// alternatives on the other.
+///
+/// Getting that offset wrong shifts every set by one position and
+/// leaves every shape agreeing, so the in-crate producer is the
+/// training-side helper rather than this constructor. A reader that
+/// builds its own — the players, which generate the legal set from the
+/// board they are standing on — passes it here.
+///
+/// # Layout
+///
+/// The lists are padded to the longest set **in this batch** rather
+/// than to any constant: a constant would have to be a bound on the
+/// number of moves a position can offer, and one chosen slightly too
+/// small truncates a legal set with nothing to say so. The padding
+/// carries no weight, so the width it reaches changes the arithmetic
+/// nowhere.
+///
+/// The cost is paid in the forward pass rather than here: the ids are
+/// `rows × width × k` u32 (7 MB at 64 × 128 × 218), but the gather they
+/// drive materialises `rows × width × k × dim` floats before the mean
+/// collapses it.
+#[derive(Debug, Clone)]
+pub struct LegalSets {
+    /// `[rows, width, k]` u32 — each position's ids, padded with `0`.
+    ids: Tensor,
+    /// `[rows, width, k]` f32 — `1 / count` on a real entry and `0` on
+    /// padding, so the mean is a weighted sum and the division by a
+    /// count that could be zero never happens.
+    weights: Tensor,
+    /// Largest id in `ids`, kept from construction so the range check
+    /// in the forward pass costs no device round trip. `0` when every
+    /// id present is `0`, which is in range for every vocabulary this
+    /// builds a model over.
+    max_id: u32,
+}
+
+impl LegalSets {
+    /// Build from one set per position of every row.
+    ///
+    /// Every row must be the same length, which is the model's input
+    /// width. See the type's documentation for what `sets[r][p]` has to
+    /// be.
+    ///
+    /// # Errors
+    ///
+    /// No rows, no positions, or rows of differing lengths.
+    pub fn new(sets: &[Vec<Vec<u32>>], device: &Device) -> CandleResult<Self> {
+        let width = sets.first().map(Vec::len).unwrap_or(0);
+        Self::window(sets, 0, width, device)
+    }
+
+    /// Build from a window of each row's sets: position `p` of the
+    /// result reads `sets[r][from + p]`.
+    ///
+    /// # The empty set, per position and per batch
+    ///
+    /// A **position** past the end of its row gets the empty set, and
+    /// that is a legitimate thing for a producer to say: it is the
+    /// padding past the end of a game, and the forward pass reads it as
+    /// the zero vector rather than dividing by a count of nothing.
+    ///
+    /// A **batch** in which every position of every row is empty is a
+    /// different statement and is refused here. Such an input would add
+    /// the zero vector everywhere, so the model handed it would answer
+    /// exactly as the same model with the legality term deleted — a
+    /// checkpoint trained with this channel, scored as though it had
+    /// none, every number well-formed.
+    ///
+    /// Nothing else in the workspace catches that. The sidecar axis and
+    /// the readers' refusals act on what a checkpoint *declares*, and
+    /// this is a property of the input handed to it; the guard in
+    /// [`Gpt2Model::forward_legal`] tests that a `LegalSets` was
+    /// supplied rather than that it carries ids, so it lets this
+    /// through and returns numbers a caller cannot tell from a correct
+    /// run.
+    ///
+    /// The two producers differ on whether they can build one.
+    /// [`crate::train::legal_input_sets`] windows a batch's own
+    /// `allowed_ids`, and the batches the chess dataset builds fill
+    /// theirs from a board replay that stops at the first token the
+    /// position cannot play — so the empty positions are a tail and the
+    /// batch carries ids, which
+    /// `tests/chess_legal_input_bake.rs` asserts on a real corpus. A
+    /// reader recovering sets by replaying history has the empty set
+    /// available as a fallback for the positions a window dropped the
+    /// history for, and taking it at every position is exactly the case
+    /// above. So the refusal lives here, where both producers pass,
+    /// rather than in an assertion the second would have to remember.
+    ///
+    /// # Errors
+    ///
+    /// `sets` is empty, `width` is zero, a row is shorter than the rest
+    /// **before** the window is applied (rows of differing lengths mean
+    /// the batch and its legal sets were built from different row
+    /// lists, which no windowing makes safe), or no position in the
+    /// window holds an id.
+    pub fn window(
+        sets: &[Vec<Vec<u32>>],
+        from: usize,
+        width: usize,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        let rows = sets.len();
+        if rows == 0 {
+            return Err(candle_core::Error::Msg(
+                "legal sets: no rows, so there is nothing to say is legal".into(),
+            ));
+        }
+        if width == 0 {
+            return Err(candle_core::Error::Msg(
+                "legal sets: zero positions per row".into(),
+            ));
+        }
+        let full = sets[0].len();
+        for (r, row) in sets.iter().enumerate() {
+            if row.len() != full {
+                return Err(candle_core::Error::Msg(format!(
+                    "legal sets: row {r} holds {} position(s) and row 0 holds {full}",
+                    row.len()
+                )));
+            }
+        }
+
+        // The longest set in the window. Zero means no position of any
+        // row holds an id, which is refused rather than built: every
+        // weight would be zero, the channel would contribute the
+        // additive identity everywhere, and the model would answer
+        // exactly as the same model with no legality table — the one
+        // outcome nothing further along can tell from a correct run.
+        // See this function's documentation for which caller can
+        // produce it.
+        let k = sets
+            .iter()
+            .flat_map(|row| row.iter().skip(from).take(width))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if k == 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "legal sets: no position of any row holds an id ({rows} row(s), {width} \
+                 position(s) from {from}), so this input would add nothing anywhere and the \
+                 model would answer as though it had no legality channel at all; a producer \
+                 with nothing to say about a batch cannot say it here"
+            )));
+        }
+
+        let mut ids = vec![0u32; rows * width * k];
+        let mut weights = vec![0f32; rows * width * k];
+        let mut max_id = 0u32;
+        for (r, row) in sets.iter().enumerate() {
+            for p in 0..width {
+                let Some(set) = row.get(from + p) else {
+                    continue;
+                };
+                if set.is_empty() {
+                    continue;
+                }
+                let base = (r * width + p) * k;
+                // Every real entry carries the same share, so the
+                // weighted sum below is the mean over the true count
+                // and the padding — weight zero — is not counted.
+                let share = 1.0 / set.len() as f32;
+                for (j, id) in set.iter().enumerate() {
+                    ids[base + j] = *id;
+                    weights[base + j] = share;
+                    max_id = max_id.max(*id);
+                }
+            }
+        }
+
+        Ok(Self {
+            ids: Tensor::from_vec(ids, (rows, width, k), device)?,
+            weights: Tensor::from_vec(weights, (rows, width, k), device)?,
+            max_id,
+        })
+    }
+
+    /// Rows this covers.
+    pub fn rows(&self) -> usize {
+        self.ids.dims()[0]
+    }
+
+    /// Positions per row.
+    pub fn width(&self) -> usize {
+        self.ids.dims()[1]
+    }
+
+    /// Entries the padded lists were widened to — the longest set in
+    /// the batch, and never zero, since a batch holding no ids at all
+    /// is refused by [`Self::window`].
+    pub fn widest(&self) -> usize {
+        self.ids.dims()[2]
+    }
+}
+
 /// GPT-2 forward-only model.
 ///
 /// Constructed via [`Gpt2Model::new`] (random init from a [`VarBuilder`])
@@ -785,6 +996,10 @@ pub struct Gpt2Model {
     /// `cond_wte.weight`), present iff [`Gpt2Custom::cond_slots`] is
     /// set. Read only by [`Self::forward_conditioned`].
     cond_wte: Option<Embedding>,
+    /// Legality table (`[vocab, dim]`, VarMap name
+    /// `legal_wte.weight`), present iff [`Gpt2Custom::legal_input`].
+    /// Read only by [`Self::forward_legal`].
+    legal_wte: Option<Embedding>,
     cfg: Gpt2Config,
 }
 
@@ -888,6 +1103,15 @@ impl Gpt2Model {
             Some(slots) => Some(gpt2_embedding(slots, cfg.dim, vs.pp("cond_wte"))?),
             None => None,
         };
+        // Legality table. One row per vocabulary entry, because its
+        // entries are ids — and separate from `wte` for the reason
+        // `Gpt2Custom::legal_input` records: the set added here holds
+        // the token that is about to be the target.
+        let legal_wte = if custom.legal_input {
+            Some(gpt2_embedding(cfg.vocab, cfg.dim, vs.pp("legal_wte"))?)
+        } else {
+            None
+        };
         let causal_mask = build_causal_mask(cfg.ctx, custom.window, &cfg.device, cfg.dtype)?;
         Ok(Self {
             wte,
@@ -899,6 +1123,7 @@ impl Gpt2Model {
             alibi,
             lm_head,
             cond_wte,
+            legal_wte,
             cfg: cfg.clone(),
         })
     }
@@ -1037,8 +1262,81 @@ impl Gpt2Model {
     /// Forward pass. Input `xs` is `[batch, seq]` of `u32` token ids;
     /// output is `[batch, seq, vocab]` — the raw logits (softmax is left
     /// to the training loss / sampling caller).
+    ///
+    /// # Errors
+    ///
+    /// `seq > ctx`, and — since a model built with
+    /// [`Gpt2Custom::legal_input`] reads a legality input at every
+    /// position — a model carrying `legal_wte` handed none. See
+    /// [`Self::forward_legal`] for why that is refused rather than run
+    /// with the channel absent.
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        self.forward_inner(xs, None, None).map(|(logits, _)| logits)
+        self.forward_inner(xs, None, None, None)
+            .map(|(logits, _)| logits)
+    }
+
+    /// Forward pass with the ids allowed at each position added to the
+    /// residual stream there.
+    ///
+    /// `legal` holds one set per position of every row; the mean of
+    /// `legal_wte` over that set is added where the positional
+    /// embedding is added. Output shape is unchanged. Requires
+    /// [`Gpt2Custom::legal_input`] to have been set when the model was
+    /// built.
+    ///
+    /// # What this is for
+    ///
+    /// A model trained on sequences alone has to infer the rules of the
+    /// action space from them, and on chess that inference is most of
+    /// the objective: 1.59 of 4.52 nats measured here went on keeping
+    /// mass off moves that did not exist in the position, and the
+    /// decoder discards all of it, because it walks the ranking against
+    /// the legal set regardless of what the model believed. Handing the
+    /// set over spends that share on the question that survives to
+    /// inference — which of the available moves to play.
+    ///
+    /// # The mean, and the empty set
+    ///
+    /// A set is summarised by the mean of its rows rather than the sum,
+    /// so a position offering forty moves and one offering four arrive
+    /// at the same scale. Exactly so in `F32`, which is what the chess
+    /// runs use. In a lower-precision dtype it is approximate: the
+    /// shares are cast to the model's dtype here rather than held in
+    /// it, and `BF16` carries 8 significand bits, so `1/count` need not
+    /// be representable — it is for a count that is a power of two, and
+    /// rounds by up to about `2^-8` otherwise — and neither the shares
+    /// nor the sum they drive is exact. Nothing here corrects for that;
+    /// a run that cares would have to.
+    ///
+    /// A set with **no** ids contributes the zero vector: the mean over
+    /// zero elements is undefined, and rather than clamp a count the
+    /// weights are simply zero and the sum is empty, so the undefined
+    /// division never happens. That case is not hypothetical — it is
+    /// every padded position past the end of a row, and a NaN there
+    /// would take the whole batch with it. This much is exact in every
+    /// dtype: zero times anything is zero.
+    ///
+    /// The zero vector is the additive identity of the thing being
+    /// added, so such a position sees this channel contribute nothing,
+    /// which is the closest available reading of "nothing is known to
+    /// be legal here". It is not distinguishable from a set whose rows
+    /// happen to average to zero; nothing here relies on telling those
+    /// two apart.
+    ///
+    /// A whole input of such positions is a different matter, and
+    /// [`LegalSets::window`] refuses to build one: it would leave this
+    /// call returning what the same model with no table returns, which
+    /// is the failure the surrounding machinery exists to catch.
+    ///
+    /// # Errors
+    ///
+    /// - The model was built without a legality table.
+    /// - `legal` does not cover exactly `[batch, seq]`.
+    /// - Any id is outside the vocabulary.
+    /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
+    pub fn forward_legal(&self, xs: &Tensor, legal: &LegalSets) -> CandleResult<Tensor> {
+        self.forward_inner(xs, None, Some(legal), None)
+            .map(|(logits, _)| logits)
     }
 
     /// Forward pass with a condition embedding added at **every**
@@ -1100,7 +1398,7 @@ impl Gpt2Model {
     ///   has rows, which is a crossed pair rather than a typo.
     /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
     pub fn forward_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
-        self.forward_inner(xs, Some(conds), None)
+        self.forward_inner(xs, Some(conds), None, None)
             .map(|(logits, _)| logits)
     }
 
@@ -1109,7 +1407,7 @@ impl Gpt2Model {
     /// composing the total loss). `None` on a dense (non-MoE) model,
     /// so existing callers of [`Self::forward`] see no change.
     pub fn forward_with_aux(&self, xs: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
-        self.forward_inner(xs, None, None)
+        self.forward_inner(xs, None, None, None)
     }
 
     /// Probe variant of [`Self::forward_with_aux`] that additionally
@@ -1122,7 +1420,7 @@ impl Gpt2Model {
         xs: &Tensor,
     ) -> CandleResult<(Tensor, Option<Tensor>, Vec<Tensor>)> {
         let mut probs = Vec::new();
-        let (logits, aux) = self.forward_inner(xs, None, Some(&mut probs))?;
+        let (logits, aux) = self.forward_inner(xs, None, None, Some(&mut probs))?;
         Ok((logits, aux, probs))
     }
 
@@ -1130,6 +1428,7 @@ impl Gpt2Model {
         &self,
         xs: &Tensor,
         conds: Option<&[CondIndex]>,
+        legal: Option<&LegalSets>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
         let (b, t) = xs.dims2()?;
@@ -1157,6 +1456,39 @@ impl Gpt2Model {
         if let Some(conds) = conds {
             let cond_emb = self.condition_embedding(conds, b)?; // [B, 1, D]
             h = h.broadcast_add(&cond_emb)?;
+        }
+        // The legality input, beside the condition and for the same
+        // reason: it belongs at every position, because every position
+        // is a different set of available moves.
+        //
+        // Both disagreements are refused. A model that carries the
+        // table was trained with this channel at every position, so
+        // running it without one runs a model in a state it never
+        // trained in — and its moves would look no different, which is
+        // the same silence `run_conditioned_ft` refuses from the other
+        // side. The mirror, sets handed to a model with no table, is a
+        // caller that believes it is doing something it is not.
+        match (&self.legal_wte, legal) {
+            (Some(table), Some(sets)) => {
+                let legal_emb = self.legality_embedding(table, sets, b, t)?; // [B, T, D]
+                h = (h + legal_emb)?;
+            }
+            (Some(_), None) => {
+                return Err(candle_core::Error::Msg(
+                    "gpt2 forward: this model was built with a legality table and reads one at \
+                     every position; running it without one drops that channel entirely — pass \
+                     the legal ids to forward_legal"
+                        .into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(candle_core::Error::Msg(
+                    "gpt2 forward: legal ids were supplied to a model with no legality table; \
+                     build it with `custom.legal_input = true` to use forward_legal"
+                        .into(),
+                ))
+            }
+            (None, None) => {}
         }
         // ALiBi score bias for the active prefix: [H, t, t] =
         // -slopes ⊙ (i - j). Constant tensors — no gradient tracking.
@@ -1235,6 +1567,52 @@ impl Gpt2Model {
         let rows: Vec<u32> = conds.iter().map(|i| i.row()).collect();
         let ids = Tensor::from_vec(rows, (batch,), &self.cfg.device)?;
         table.forward(&ids)?.unsqueeze(1) // [B, 1, D]
+    }
+
+    /// The per-position legality vectors, shaped `[batch, seq, dim]`.
+    ///
+    /// The mean over each position's ids, computed as a weighted sum so
+    /// that padding (weight zero) costs nothing and an empty set — the
+    /// padding past the end of a row — yields the zero vector without a
+    /// division ever being attempted. See [`Self::forward_legal`].
+    ///
+    /// The gather is the expensive step: `[batch, seq, k, dim]` floats
+    /// exist between the lookup and the sum, where `k` is the longest
+    /// set in the batch. That is what pays for not fixing a maximum.
+    ///
+    /// Range is checked here for the reason
+    /// [`Self::condition_embedding`] checks it: candle's CPU backend
+    /// refuses an out-of-range `index_select`, and leaving it to the
+    /// backend would let the accelerator builds decide whether a bad id
+    /// is an error or a quietly different vector.
+    fn legality_embedding(
+        &self,
+        table: &Embedding,
+        legal: &LegalSets,
+        batch: usize,
+        seq: usize,
+    ) -> CandleResult<Tensor> {
+        if legal.rows() != batch || legal.width() != seq {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: legal ids cover {}x{} (rows x positions) for an input of \
+                 {batch}x{seq}; one set per position of every row",
+                legal.rows(),
+                legal.width()
+            )));
+        }
+        if legal.max_id as usize >= self.cfg.vocab {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: legal id {} is outside the {}-entry vocabulary",
+                legal.max_id, self.cfg.vocab
+            )));
+        }
+        let k = legal.widest();
+        let rows = table.forward(&legal.ids)?; // [B, T, K, D]
+        let shares = legal
+            .weights
+            .to_dtype(self.cfg.dtype)?
+            .reshape((batch, seq, k, 1))?;
+        rows.broadcast_mul(&shares)?.sum(2) // [B, T, D]
     }
 
     /// Wrap the model's per-block linear projections with LoRA
@@ -1331,6 +1709,19 @@ impl crate::train::DeviceView for Gpt2Model {
 impl crate::train::ConditionedForward for Gpt2Model {
     fn forward_conditioned_rows(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
         Gpt2Model::forward_conditioned(self, xs, conds)
+    }
+}
+
+/// Delegate to the inherent [`Gpt2Model::forward_legal`] so the
+/// legality-input training entry ([`crate::train::run_legal_ft`]) can
+/// drive this model without naming it.
+///
+/// Spelled differently from the inherent method for the reason
+/// [`crate::train::ConditionedForward`] gives: a shared name leaves the
+/// delegation one edit away from recursing into itself.
+impl crate::train::LegalForward for Gpt2Model {
+    fn forward_legal_rows(&self, xs: &Tensor, legal: &LegalSets) -> CandleResult<Tensor> {
+        Gpt2Model::forward_legal(self, xs, legal)
     }
 }
 
@@ -1895,6 +2286,319 @@ mod tests {
         let last = row.len() - 1;
         let gap = max_abs_diff_f32(&out.i((0, last)).unwrap(), &out.i((1, last)).unwrap()).unwrap();
         assert!(gap > 1e-4, "both rows were conditioned the same way");
+    }
+
+    /// A model carrying the legality table, at a size small enough that
+    /// a set can cover a visible share of the vocabulary.
+    fn legality_cfg() -> Gpt2Config {
+        Gpt2Config {
+            layers: 1,
+            heads: 2,
+            dim: 16,
+            ctx: 32,
+            vocab: 24,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(Gpt2Custom {
+                legal_input: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn legality_model(cfg: &Gpt2Config) -> (VarMap, Gpt2Model) {
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(cfg, vs).unwrap();
+        fill_deterministic(&varmap, 0x0807_2026).unwrap();
+        (varmap, model)
+    }
+
+    /// One row of `width` sets, all the same.
+    fn sets_of(width: usize, ids: &[u32]) -> Vec<Vec<Vec<u32>>> {
+        vec![vec![ids.to_vec(); width]]
+    }
+
+    /// The table is a parameter of its own, sized to the vocabulary,
+    /// and absent from a model that was not asked for one.
+    #[test]
+    fn the_legality_table_is_a_parameter_of_its_own() {
+        let cfg = legality_cfg();
+        let (varmap, _model) = legality_model(&cfg);
+        let data = varmap.data().lock().unwrap();
+        let table = data
+            .get("legal_wte.weight")
+            .expect("a legality-input model registers legal_wte.weight");
+        assert_eq!(table.shape().dims(), &[cfg.vocab, cfg.dim]);
+        // Not the same tensor as `wte`, whose values the same fill
+        // produced under a different name. Sharing them is what the
+        // separate table exists to avoid, and the shapes are equal, so
+        // nothing else here would notice.
+        let wte: Vec<f32> = data["wte.weight"]
+            .as_tensor()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let legal: Vec<f32> = table.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
+        assert_ne!(wte, legal, "legal_wte must not be an alias of wte");
+
+        let plain = VarMap::new();
+        let vs = VarBuilder::from_varmap(&plain, cfg.dtype, &cfg.device);
+        let mut without = cfg.clone();
+        without.custom = None;
+        let _ = Gpt2Model::new(&without, vs).unwrap();
+        assert!(!plain
+            .data()
+            .lock()
+            .unwrap()
+            .contains_key("legal_wte.weight"));
+    }
+
+    /// What the input does at all: the same tokens under two different
+    /// legal sets come out differently, at every position rather than
+    /// at one.
+    #[test]
+    fn the_legal_set_changes_what_the_model_says() {
+        let cfg = legality_cfg();
+        let (_vm, model) = legality_model(&cfg);
+        let row: Vec<u32> = (0..20u32).map(|i| 2 + i % 18).collect();
+        let ids = Tensor::from_slice(&row, (1, row.len()), &cfg.device).unwrap();
+
+        let a = LegalSets::new(&sets_of(row.len(), &[3, 4, 5]), &cfg.device).unwrap();
+        let b = LegalSets::new(&sets_of(row.len(), &[9, 10]), &cfg.device).unwrap();
+        let out_a = model.forward_legal(&ids, &a).unwrap();
+        let out_b = model.forward_legal(&ids, &b).unwrap();
+
+        for pos in [0usize, 1, row.len() / 2, row.len() - 1] {
+            let gap =
+                max_abs_diff_f32(&out_a.i((0, pos)).unwrap(), &out_b.i((0, pos)).unwrap()).unwrap();
+            assert!(
+                gap > 1e-5,
+                "position {pos} said the same thing under two different legal sets (gap {gap})"
+            );
+        }
+    }
+
+    /// The summary is the mean over the true count, not the sum: the
+    /// same id repeated is the same vector, where a sum would double
+    /// it.
+    ///
+    /// This is what makes a position offering forty moves and one
+    /// offering four arrive at the same scale, and it is the property
+    /// the padding has to leave alone.
+    #[test]
+    fn a_set_is_summarised_by_its_mean() {
+        let cfg = legality_cfg();
+        let (_vm, model) = legality_model(&cfg);
+        let row = vec![2u32, 3, 4, 5];
+        let ids = Tensor::from_slice(&row, (1, row.len()), &cfg.device).unwrap();
+
+        let once = LegalSets::new(&sets_of(row.len(), &[7]), &cfg.device).unwrap();
+        let twice = LegalSets::new(&sets_of(row.len(), &[7, 7]), &cfg.device).unwrap();
+        assert_eq!(once.widest(), 1);
+        assert_eq!(twice.widest(), 2);
+
+        let a = model.forward_legal(&ids, &once).unwrap();
+        let b = model.forward_legal(&ids, &twice).unwrap();
+        let gap = max_abs_diff_f32(&a, &b).unwrap();
+        assert!(
+            gap < 1e-5,
+            "the same id listed twice moved the output by {gap}, so the set is being summed \
+             rather than averaged"
+        );
+    }
+
+    /// Padding to the longest set in the batch changes nothing for the
+    /// shorter rows.
+    ///
+    /// The property that lets the width follow the batch instead of a
+    /// constant: a row scored beside a row with a much larger set has
+    /// to come out exactly as it does alone.
+    #[test]
+    fn padding_to_the_longest_set_leaves_the_shorter_rows_alone() {
+        let cfg = legality_cfg();
+        let (_vm, model) = legality_model(&cfg);
+        let row: Vec<u32> = vec![2, 3, 4, 5];
+        let both: Vec<u32> = row.iter().chain(row.iter()).copied().collect();
+
+        // Row 0 offers two ids at every position; row 1 offers seven,
+        // so the batch pads row 0's lists out to seven.
+        let wide: Vec<u32> = (6..13).collect();
+        let mixed = LegalSets::new(
+            &[vec![vec![7u32, 8]; row.len()], vec![wide; row.len()]],
+            &cfg.device,
+        )
+        .unwrap();
+        assert_eq!(mixed.widest(), 7);
+        let ids = Tensor::from_slice(&both, (2, row.len()), &cfg.device).unwrap();
+        let padded = model.forward_legal(&ids, &mixed).unwrap();
+
+        // The same row on its own, where nothing is padded.
+        let alone = LegalSets::new(&sets_of(row.len(), &[7, 8]), &cfg.device).unwrap();
+        assert_eq!(alone.widest(), 2);
+        let ids_alone = Tensor::from_slice(&row, (1, row.len()), &cfg.device).unwrap();
+        let unpadded = model.forward_legal(&ids_alone, &alone).unwrap();
+
+        let gap = max_abs_diff_f32(
+            &padded.i(0).unwrap().contiguous().unwrap(),
+            &unpadded.i(0).unwrap().contiguous().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            gap < 1e-5,
+            "padding a row's lists out to a wider neighbour moved its output by {gap}"
+        );
+    }
+
+    /// An empty position contributes the zero vector, and a batch that
+    /// holds one stays finite.
+    ///
+    /// The case is not hypothetical: it is every padded position past
+    /// the end of a row. A mean over zero elements would be NaN and
+    /// would take the batch with it.
+    ///
+    /// The equality is asserted against the plain forward of a model
+    /// built **from the same `VarMap`** without the table, so every
+    /// shared tensor is the same tensor and the only difference between
+    /// the two runs is the legality term. Attention is causal, so
+    /// position 0 depends on position 0 alone: where the set there is
+    /// empty, the two have to agree bit for bit.
+    #[test]
+    fn an_empty_position_contributes_nothing_rather_than_a_nan() {
+        let cfg = legality_cfg();
+        let (vm, model) = legality_model(&cfg);
+        let row = vec![2u32, 3, 4, 5];
+        let ids = Tensor::from_slice(&row, (1, row.len()), &cfg.device).unwrap();
+
+        // Empty at every position but one — the shape of every batch
+        // whose rows end before the window does.
+        let sets =
+            LegalSets::new(&[vec![vec![], vec![6u32], vec![], vec![]]], &cfg.device).unwrap();
+        let out = model.forward_legal(&ids, &sets).unwrap();
+        let values: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(values.iter().all(|v| v.is_finite()), "got {values:?}");
+
+        let mut plain_cfg = cfg.clone();
+        plain_cfg.custom = None;
+        let plain = Gpt2Model::new(
+            &plain_cfg,
+            VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device),
+        )
+        .unwrap();
+        let bare = plain.forward(&ids).unwrap();
+        let at = |t: &Tensor, p: usize| t.i((0, p)).unwrap();
+
+        let gap = max_abs_diff_f32(&at(&out, 0), &at(&bare, 0)).unwrap();
+        assert!(
+            gap == 0.0,
+            "an empty set at position 0 did not contribute the zero vector (gap {gap})"
+        );
+        // And position 1, which does carry an id, has to differ —
+        // otherwise the equality above would hold for a channel that
+        // does nothing at all.
+        let gap = max_abs_diff_f32(&at(&out, 1), &at(&bare, 1)).unwrap();
+        assert!(
+            gap > 1e-5,
+            "an id at position 1 changed nothing (gap {gap})"
+        );
+    }
+
+    /// A batch with no ids anywhere is refused at construction.
+    ///
+    /// It is the one input that would leave [`Gpt2Model::forward_legal`]
+    /// returning what the plain forward returns, so a checkpoint
+    /// trained with this channel could be scored without it and every
+    /// number would be well-formed. The sidecar axis and the readers'
+    /// refusals do not cover it: they act on what the checkpoint says,
+    /// and this is a property of the input handed to it.
+    #[test]
+    fn a_batch_with_no_ids_anywhere_is_refused() {
+        let msg = match LegalSets::new(&sets_of(4, &[]), &Device::Cpu) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an all-empty batch must not build"),
+        };
+        assert!(msg.contains("no position of any row holds an id"), "{msg}");
+
+        // And through the windowing constructor, which is the one the
+        // training path calls.
+        let rows = vec![vec![vec![], vec![], vec![]], vec![vec![], vec![], vec![]]];
+        assert!(LegalSets::window(&rows, 1, 2, &Device::Cpu).is_err());
+
+        // A single id anywhere in the window is enough: the refusal is
+        // about the batch, not about a position.
+        let rows = vec![
+            vec![vec![], vec![], vec![]],
+            vec![vec![], vec![], vec![9u32]],
+        ];
+        let sets = LegalSets::window(&rows, 1, 2, &Device::Cpu).expect("one id is enough");
+        assert_eq!(sets.widest(), 1);
+    }
+
+    /// A model built with the table refuses to run without the input,
+    /// and a model built without one refuses the input. Both
+    /// directions, because either would be a run in a state the model
+    /// was not trained in and neither would look wrong afterwards.
+    #[test]
+    fn the_legality_channel_refuses_both_mismatches() {
+        let cfg = legality_cfg();
+        let (_vm, model) = legality_model(&cfg);
+        let row = vec![2u32, 3, 4];
+        let ids = Tensor::from_slice(&row, (1, row.len()), &cfg.device).unwrap();
+
+        let msg = match model.forward(&ids) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a model with a legality table must not run without one"),
+        };
+        assert!(msg.contains("legality table"), "{msg}");
+
+        let mut plain_cfg = cfg.clone();
+        plain_cfg.custom = None;
+        let (_vm, plain) = legality_model(&plain_cfg);
+        let sets = LegalSets::new(&sets_of(row.len(), &[5]), &cfg.device).unwrap();
+        let msg = match plain.forward_legal(&ids, &sets) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a model with no legality table must not accept sets"),
+        };
+        assert!(msg.contains("no legality table"), "{msg}");
+    }
+
+    /// Sets that do not cover the input, and ids the vocabulary does
+    /// not hold, are refused by name rather than left to the backend.
+    #[test]
+    fn the_legality_input_has_to_describe_this_batch() {
+        let cfg = legality_cfg();
+        let (_vm, model) = legality_model(&cfg);
+        let row = vec![2u32, 3, 4, 5];
+        let ids = Tensor::from_slice(&row, (1, row.len()), &cfg.device).unwrap();
+
+        let short = LegalSets::new(&sets_of(row.len() - 1, &[5]), &cfg.device).unwrap();
+        let msg = match model.forward_legal(&ids, &short) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a coverage error"),
+        };
+        assert!(msg.contains("one set per position"), "{msg}");
+
+        let outside =
+            LegalSets::new(&sets_of(row.len(), &[cfg.vocab as u32]), &cfg.device).unwrap();
+        let msg = match model.forward_legal(&ids, &outside) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a vocabulary error"),
+        };
+        assert!(msg.contains("outside the"), "{msg}");
+    }
+
+    /// Rows of differing lengths mean the batch and its legal sets came
+    /// from different row lists, which no windowing makes safe.
+    #[test]
+    fn legal_sets_refuse_rows_of_differing_lengths() {
+        let msg = match LegalSets::new(&[vec![vec![1u32]; 3], vec![vec![1u32]; 2]], &Device::Cpu) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a row-length error"),
+        };
+        assert!(msg.contains("position(s)"), "{msg}");
     }
 
     #[test]

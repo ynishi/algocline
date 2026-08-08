@@ -30,7 +30,7 @@ use algocline_nn::chess::corpus::{
 use algocline_nn::chess::pgn::PgnReader;
 use algocline_nn::chess::train::{cond_table, row_conditions};
 use algocline_nn::chess::vocab::MoveVocab;
-use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError};
+use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError, ShapeKind};
 use algocline_nn::train::{
     restore_into, run_conditioned_ft, run_full_ft, Checkpoint, CrossEntropyLoss, DatasetOpts,
     FullFtConfig, ScheduleKind, TeacherCardDataset, TrainingLease,
@@ -245,9 +245,15 @@ fn a_per_position_bake_lands_a_checkpoint_that_says_every_position() {
     // The sidecar is at the per-position name, which is not the one an
     // older build looks in.
     assert_eq!(
-        ModelShape::path_for_encoding(&ckpt_path, CondEncoding::EveryPosition)
-            .file_name()
-            .unwrap(),
+        ModelShape::path_for_kind(
+            &ckpt_path,
+            ShapeKind {
+                encoding: CondEncoding::EveryPosition,
+                legal_input: false,
+            }
+        )
+        .file_name()
+        .unwrap(),
         "perpos.shape2.json"
     );
     assert!(!ModelShape::path_for(&ckpt_path).exists());

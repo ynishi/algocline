@@ -117,6 +117,34 @@ pub trait ConditionedForward {
     ) -> candle_core::Result<candle_core::Tensor>;
 }
 
+/// A model that can be told, at every position, which ids the answer
+/// there may take.
+///
+/// Sibling of [`ConditionedForward`], and a separate trait for the same
+/// reason: most architectures model no constrained action space and
+/// would have to answer for a concept they do not carry. The compiler
+/// keeps them out of [`fullft::run_legal_ft`].
+///
+/// The argument is a [`crate::arch::LegalSets`] rather than nested
+/// `Vec`s because the padding and the per-position counts have to agree
+/// with each other, and that agreement is the constructor's business
+/// rather than every caller's.
+pub trait LegalForward {
+    /// Forward `xs` (`[batch, seq]` token ids) with one set of allowed
+    /// ids per position, returning `[batch, seq, vocab]` logits.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined, but sets that do not cover exactly
+    /// `[batch, seq]`, and ids outside the vocabulary, are expected to
+    /// be refused rather than absorbed.
+    fn forward_legal_rows(
+        &self,
+        xs: &candle_core::Tensor,
+        legal: &crate::arch::LegalSets,
+    ) -> candle_core::Result<candle_core::Tensor>;
+}
+
 pub use ckpt::{
     checkpoint_from_path, restore_into, restore_into_partial, ApplyStage, CheckpointStore,
     RestoreError, RestoreReport, TensorMismatch,
@@ -126,9 +154,9 @@ pub use data::{
     TokenizedDataset,
 };
 pub use fullft::{
-    allowed_logit_mask, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, CkptControl,
-    CkptHook, CkptInfo, DistillLossKind, DistillSpec, FullFtConfig, TrainError, TrainingLease,
-    TrainingLeaseGuard,
+    allowed_logit_mask, legal_input_sets, run_conditioned_ft, run_distill, run_full_ft,
+    run_legal_ft, run_lora_ft, CkptControl, CkptHook, CkptInfo, DistillLossKind, DistillSpec,
+    FullFtConfig, TrainError, TrainingLease, TrainingLeaseGuard,
 };
 pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};
 pub use mixed::MixedAdamW;

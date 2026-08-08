@@ -103,6 +103,13 @@ fn kitchen_sink_a_backward_reaches_every_base_var() {
             // Var no gradient reaches — which is what the coverage
             // assertion at the end of this test exists to catch.
             cond_slots: None,
+            // Off for the same reason: `legal_wte` is only read by
+            // `forward_legal`, so a model built with one and driven
+            // through the plain forward would register a Var no
+            // gradient reaches. (It would not get that far — the plain
+            // forward refuses a model carrying the table — but the
+            // reason to leave it off is the coverage assertion.)
+            legal_input: false,
         },
     );
     let (vm, grads) = masked_backward(&cfg);

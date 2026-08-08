@@ -24,14 +24,14 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{CondIndex, LoraConfig, LoraWrappable};
+use crate::arch::{CondIndex, LegalSets, LoraConfig, LoraWrappable};
 use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
 use crate::train::mixed::MixedAdamW;
 use crate::train::scheduler::{ScheduleKind, Scheduler};
 use crate::train::Checkpoint;
-use crate::train::{ConditionedForward, DeviceView};
+use crate::train::{ConditionedForward, DeviceView, LegalForward};
 
 /// Optimizer flavour selected by the parameter dtype (design §7.1).
 ///
@@ -292,6 +292,35 @@ pub enum TrainError {
         /// diagnosis.
         conds: usize,
     },
+    /// A run that hands the model its legality met a batch carrying
+    /// none.
+    ///
+    /// The counterpart of [`Self::MissingConditions`], and refused for
+    /// the same reason: the fallback would train a model that never saw
+    /// the channel its checkpoint records.
+    ///
+    /// # Why there is no mirror of this one
+    ///
+    /// [`Self::UnexpectedConditions`] exists because a batch carrying
+    /// conditions can only have been built by a caller who meant them
+    /// to be used. [`Batch::allowed_ids`] carries no such implication:
+    /// the same field feeds [`allowed_logit_mask`], so a legal-masked
+    /// run under [`run_full_ft`] carries the sets legitimately and
+    /// ignoring them as *input* is exactly right there.
+    ///
+    /// The distinction the batch cannot make, the model can — it either
+    /// carries a legality table or it does not — so that refusal lives
+    /// where it is decidable: `Gpt2Model::forward` errors on a model
+    /// built with one and handed no sets. This arm and that error are
+    /// the pair.
+    #[error(
+        "legality-input training: a batch of {rows} row(s) arrived with no legal id sets; \
+         the dataset has to carry one per position (`LegalMaskedDataset`)"
+    )]
+    MissingLegalSets {
+        /// Rows in the offending batch.
+        rows: usize,
+    },
     /// An `on_ckpt` hook returned an error. The trainer writes the
     /// terminal `<prefix>.safetensors` before propagating so callers
     /// still have last-good weights on disk, but the returned
@@ -497,6 +526,65 @@ where
     )
 }
 
+/// Run Full FT training with the ids allowed at every position handed
+/// to the model as input.
+///
+/// The same loop as [`run_full_ft`] — same optimizer, schedule,
+/// checkpoint rotation and hook — differing only in how a batch reaches
+/// the model: through [`LegalForward::forward_legal_rows`] with the
+/// sets built from the batch's own [`Batch::allowed_ids`], rather than
+/// through `Module::forward`.
+///
+/// # What the sets do at each end
+///
+/// The same list serves twice and the two uses are opposite. As
+/// **input** (here) the model is told what is available before it
+/// answers; as a **mask** ([`allowed_logit_mask`], which the shared
+/// loop applies to every run whose batches carry the sets) the ids that
+/// were never available stop being charged for. A run can have either
+/// or both: this entry point adds the first to whichever the dataset
+/// already provides.
+///
+/// # Errors
+///
+/// As [`run_full_ft`], plus [`TrainError::MissingLegalSets`] when a
+/// batch arrives without them — refused rather than falling back to the
+/// plain forward, which on a model built with the table would fail at
+/// the forward anyway, several steps further from the cause.
+#[allow(clippy::too_many_arguments)]
+pub fn run_legal_ft<M>(
+    model: &M,
+    varmap: &VarMap,
+    dataset: &mut dyn Dataset,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    ckpt_dir: &Path,
+    ckpt_prefix: &str,
+    lease: Arc<TrainingLease>,
+    hook: Option<CkptHook>,
+) -> Result<Checkpoint, TrainError>
+where
+    M: LegalForward + DeviceView,
+{
+    run_ft_core(
+        model.device(),
+        ForwardPass::Legal(&mut |xs, legal| {
+            model
+                .forward_legal_rows(xs, legal)
+                .map_err(TrainError::from)
+        }),
+        varmap,
+        varmap,
+        dataset,
+        cfg,
+        loss_fn,
+        ckpt_dir,
+        ckpt_prefix,
+        lease,
+        hook,
+    )
+}
+
 /// How one micro-batch reaches the model, and what the caller expects
 /// of the batch.
 ///
@@ -521,6 +609,12 @@ enum ForwardPass<'a> {
     /// row. A batch carrying none is
     /// [`TrainError::MissingConditions`].
     PerRow(&'a mut PerRowForward<'a>),
+    /// [`LegalForward::forward_legal_rows`] — the ids plus, at every
+    /// position, the set the answer there may be drawn from. A batch
+    /// carrying none is [`TrainError::MissingLegalSets`]; one carrying
+    /// conditions is [`TrainError::UnexpectedConditions`], since this
+    /// entry point has nowhere to put them either.
+    Legal(&'a mut LegalForwardPass<'a>),
 }
 
 /// The ids of one micro-batch to its logits.
@@ -533,6 +627,9 @@ type PlainForward<'a> = dyn FnMut(&Tensor) -> Result<Tensor, TrainError> + 'a;
 
 /// The same, with the condition each row of the batch carries.
 type PerRowForward<'a> = dyn FnMut(&Tensor, &[CondIndex]) -> Result<Tensor, TrainError> + 'a;
+
+/// The same, with the ids allowed at each position of the batch.
+type LegalForwardPass<'a> = dyn FnMut(&Tensor, &LegalSets) -> Result<Tensor, TrainError> + 'a;
 
 /// Shared inner training loop.
 ///
@@ -640,6 +737,16 @@ fn run_ft_core(
             })?;
 
             let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
+            // The legality input, built only for the entry point that
+            // takes one: every other run would pay for a tensor it
+            // cannot read. The sets are shifted to line up with the
+            // model's inputs — see `legal_input_sets`.
+            let legal = match &forward {
+                ForwardPass::Legal(_) => {
+                    legal_input_sets(&batch, batch.input_ids[0].len(), &device)?
+                }
+                _ => None,
+            };
             // The batch's own conditions against the caller's declared
             // intent. Both disagreements are refused: a conditioned run
             // over a conditionless batch would train unconditioned
@@ -648,16 +755,26 @@ fn run_ft_core(
             // condition the caller attached per row. `inputs` is the
             // batch after the target shift, so its first dimension is
             // still the row count.
-            let logits = match (&mut forward, batch.conds.as_deref()) {
-                (ForwardPass::Plain(plain), None) => plain(&inputs)?,
-                (ForwardPass::PerRow(per_row), Some(conds)) => per_row(&inputs, conds)?,
-                (ForwardPass::Plain(_), Some(conds)) => {
+            let logits = match (&mut forward, batch.conds.as_deref(), legal.as_ref()) {
+                (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
+                (ForwardPass::PerRow(per_row), Some(conds), _) => per_row(&inputs, conds)?,
+                (ForwardPass::Legal(legal_forward), None, Some(sets)) => {
+                    legal_forward(&inputs, sets)?
+                }
+                (ForwardPass::Legal(_), None, None) => {
+                    return Err(TrainError::MissingLegalSets {
+                        rows: inputs.dim(0)?,
+                    })
+                }
+                // Neither of these two takes a condition, so a batch
+                // carrying one is the same mistake at both.
+                (ForwardPass::Plain(_) | ForwardPass::Legal(_), Some(conds), _) => {
                     return Err(TrainError::UnexpectedConditions {
                         rows: inputs.dim(0)?,
                         conds: conds.len(),
                     })
                 }
-                (ForwardPass::PerRow(_), None) => {
+                (ForwardPass::PerRow(_), None, _) => {
                     return Err(TrainError::MissingConditions {
                         rows: inputs.dim(0)?,
                     })
@@ -1160,6 +1277,64 @@ pub fn allowed_logit_mask(
         }
     }
     Ok(Some(Tensor::from_vec(flat, (rows, width, vocab), device)?))
+}
+
+/// The batch's legal sets as a model input, aligned with the positions
+/// the model actually consumes.
+///
+/// Returns `None` for a batch that carries none, which is how a dataset
+/// that models no constrained action space passes through here.
+///
+/// # The alignment
+///
+/// Entry `k` of the result is the set the model's answer at input
+/// position `k` is drawn from, so it reads `allowed_ids[row][k + 1]` —
+/// the same entry [`allowed_logit_mask`] uses for target `k`, and for
+/// the same reason: having consumed input `k`, the model is standing
+/// where token `k + 1` gets played, and that position's legal moves are
+/// both what it may answer and what the loss should score it among.
+///
+/// The two are built one after the other here rather than in separate
+/// files precisely so the `+ 1` is written once in each and can be read
+/// side by side. Off by one, every set describes the position before
+/// the one it is attached to, and every shape still agrees.
+///
+/// # Errors
+///
+/// The sets do not have one row per row of the batch, the batch is too
+/// short to shift, or the window holds no ids at all — see
+/// [`LegalSets::window`], which refuses that rather than handing the
+/// model an input equivalent to having no legality channel.
+///
+/// The last of those is not something an ordinary chess batch reaches.
+/// The window starts at position 1 and a row's first move sits at the
+/// prefix length, so as long as `seq` leaves room for one move past the
+/// prefix and one row of the batch begins with a move the board can
+/// play, the window covers a position the opening offers moves at. Both
+/// conditions can be violated by a caller — a `ctx` of 2 under a
+/// two-token prefix covers nothing but the prefix — which is why the
+/// refusal is a check rather than a comment.
+pub fn legal_input_sets(
+    batch: &Batch,
+    seq: usize,
+    device: &Device,
+) -> CandleResult<Option<LegalSets>> {
+    let Some(allowed) = batch.allowed_ids.as_ref() else {
+        return Ok(None);
+    };
+    let rows = batch.input_ids.len();
+    if allowed.len() != rows {
+        return Err(candle_core::Error::Msg(format!(
+            "allowed_ids row count {} != batch size {rows}",
+            allowed.len()
+        )));
+    }
+    if seq < 2 {
+        return Err(candle_core::Error::Msg(format!(
+            "legal_input_sets: seq={seq} is too short (need >= 2)"
+        )));
+    }
+    LegalSets::window(allowed, 1, seq - 1, device).map(Some)
 }
 
 #[cfg(test)]
@@ -2483,5 +2658,370 @@ mod conditioned_tests {
             std::iter::repeat_n(vec![1u32, 2, 3, 4, 5, 6], 400).collect(),
             opts_for(1),
         )
+    }
+}
+
+/// The legality-input entry point: which position's set a row is
+/// answered under, and what happens when the batch and the entry point
+/// disagree.
+///
+/// The arithmetic of the input itself is pinned in `arch::gpt2` (the
+/// mean, the padding, the empty set) and the same entry point is walked
+/// over a real corpus by `tests/chess_legal_input_bake.rs`. What is
+/// held here and nowhere else is the offset: the path from a dataset's
+/// `allowed_ids` to the model's argument, which is positional the whole
+/// way and therefore silent when it slips.
+#[cfg(test)]
+mod legal_input_tests {
+    use super::*;
+    use crate::arch::gpt2::Gpt2Config;
+    use crate::arch::{max_abs_diff_f32, Gpt2Custom, Gpt2Model};
+    use crate::train::data::DatasetError;
+    use crate::train::loss::CrossEntropyLoss;
+    use candle_nn::VarBuilder;
+    use tempfile::TempDir;
+
+    const CTX: usize = 6;
+    const VOCAB: usize = 16;
+
+    /// A tiny model that reads a legality input at every position.
+    fn legal_model() -> (VarMap, Gpt2Model) {
+        model_with(Some(Gpt2Custom {
+            legal_input: true,
+            ..Default::default()
+        }))
+    }
+
+    fn model_with(custom: Option<Gpt2Custom>) -> (VarMap, Gpt2Model) {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: CTX,
+            vocab: VOCAB,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom,
+        };
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vb).unwrap();
+        (vm, model)
+    }
+
+    /// The row every batch below repeats.
+    fn row() -> Vec<u32> {
+        vec![1, 2, 3, 4, 5, 6]
+    }
+
+    /// The set at each position: the token that was played there and
+    /// one decoy, so the answer is a choice between two rather than
+    /// over the whole vocabulary — and so the loss mask, which reads
+    /// the same list, always contains its target.
+    fn allowed() -> Vec<Vec<u32>> {
+        row().iter().map(|id| vec![*id, id + 8]).collect()
+    }
+
+    /// One row repeated, carrying whichever channels the test is about.
+    struct RepeatedRows {
+        allowed: Option<Vec<Vec<u32>>>,
+        conds: Option<Vec<CondIndex>>,
+        batch: usize,
+        left: usize,
+    }
+
+    impl RepeatedRows {
+        fn new(batch: usize, steps: usize) -> Self {
+            Self {
+                allowed: Some(allowed()),
+                conds: None,
+                batch,
+                left: steps + 1,
+            }
+        }
+
+        fn without_sets(mut self) -> Self {
+            self.allowed = None;
+            self
+        }
+
+        fn with_conditions(mut self) -> Self {
+            self.conds = Some(vec![CondIndex::from_table_row(0); self.batch]);
+            self
+        }
+    }
+
+    impl Dataset for RepeatedRows {
+        fn next_batch(&mut self) -> Result<Option<Batch>, DatasetError> {
+            if self.left == 0 {
+                return Ok(None);
+            }
+            self.left -= 1;
+            Ok(Some(Batch {
+                input_ids: vec![row(); self.batch],
+                loss_mask: None,
+                is_last: self.left == 0,
+                allowed_ids: self
+                    .allowed
+                    .as_ref()
+                    .map(|sets| vec![sets.clone(); self.batch]),
+                conds: self.conds.clone(),
+            }))
+        }
+
+        fn len_hint(&self) -> Option<usize> {
+            Some(self.batch * self.left)
+        }
+    }
+
+    fn cfg_for(steps: usize, batch: usize, lr: f64) -> FullFtConfig {
+        FullFtConfig {
+            lr,
+            batch_size: batch,
+            grad_accum: 1,
+            steps,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 0,
+            ckpt_keep: 1,
+        }
+    }
+
+    /// Every value of the legality table, flattened.
+    fn legal_wte_values(vm: &VarMap) -> Vec<f32> {
+        let data = vm.data().lock().expect("varmap lock");
+        data.get("legal_wte.weight")
+            .expect("a legality-input model registers legal_wte.weight")
+            .as_tensor()
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("to_vec1")
+    }
+
+    /// The offset, which is the whole of what this file adds.
+    ///
+    /// `allowed_ids[p]` is the set the token at position `p` was drawn
+    /// from, and the model at input position `k` is standing where
+    /// token `k + 1` gets played — so the input it is handed has to be
+    /// `allowed_ids[k + 1]`, the same entry the loss mask uses for
+    /// target `k`. Read one position earlier, every set describes the
+    /// move before the one it belongs to and every shape still agrees,
+    /// which is why this is asserted against the two candidates rather
+    /// than against a shape.
+    #[test]
+    fn the_input_carries_the_set_the_answer_is_drawn_from() {
+        let batch = Batch {
+            input_ids: vec![vec![1, 2, 3, 4]],
+            loss_mask: None,
+            is_last: true,
+            allowed_ids: Some(vec![vec![vec![], vec![5], vec![6], vec![7]]]),
+            conds: None,
+        };
+        let from_batch = legal_input_sets(&batch, 4, &Device::Cpu)
+            .unwrap()
+            .expect("a batch carrying sets gets an input");
+        assert_eq!(from_batch.rows(), 1);
+        assert_eq!(from_batch.width(), 3, "one per input position");
+
+        let shifted = LegalSets::new(&[vec![vec![5u32], vec![6], vec![7]]], &Device::Cpu).unwrap();
+        let unshifted = LegalSets::new(&[vec![vec![], vec![5u32], vec![6]]], &Device::Cpu).unwrap();
+
+        let (_vm, model) = legal_model();
+        let inputs = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &Device::Cpu).unwrap();
+        let built = model.forward_legal(&inputs, &from_batch).unwrap();
+        let want = model.forward_legal(&inputs, &shifted).unwrap();
+        let off_by_one = model.forward_legal(&inputs, &unshifted).unwrap();
+
+        assert_eq!(
+            max_abs_diff_f32(&built, &want).unwrap(),
+            0.0,
+            "the batch's sets are not the ones the answer is drawn from"
+        );
+        let gap = max_abs_diff_f32(&built, &off_by_one).unwrap();
+        assert!(
+            gap > 1e-5,
+            "reading one position earlier produced the same output, so this test cannot \
+             tell the two apart (gap {gap})"
+        );
+    }
+
+    /// A batch that models no constrained action space passes through
+    /// with no input to build.
+    #[test]
+    fn a_batch_without_sets_has_no_legality_input() {
+        let batch = Batch {
+            input_ids: vec![vec![1, 2, 3]],
+            loss_mask: None,
+            is_last: true,
+            allowed_ids: None,
+            conds: None,
+        };
+        assert!(legal_input_sets(&batch, 3, &Device::Cpu).unwrap().is_none());
+    }
+
+    /// The run trains, and the table it trains is the one this channel
+    /// adds — a channel that took no gradient could not have carried
+    /// anything.
+    #[test]
+    fn a_legality_input_run_reduces_loss_and_moves_the_table() {
+        let (vm, model) = legal_model();
+        let before = legal_wte_values(&vm);
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+
+        // The loss the untrained model starts at, scored through the
+        // same entry point and under the same allowed-id mask the loop
+        // applies, so the threshold below compares like with like.
+        let mut probe = RepeatedRows::new(2, 1);
+        let batch = probe.next_batch().unwrap().expect("a batch");
+        let (inputs, targets, _) = batch_to_input_target(&batch, &Device::Cpu).unwrap();
+        let sets = legal_input_sets(&batch, row().len(), &Device::Cpu)
+            .unwrap()
+            .expect("sets");
+        let logits = model.forward_legal(&inputs, &sets).unwrap();
+        let masked = allowed_logit_mask(&batch, row().len(), VOCAB, &Device::Cpu)
+            .unwrap()
+            .expect("a mask");
+        let baseline = loss
+            .compute(&logits.broadcast_add(&masked).unwrap(), &targets, None)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+
+        let mut ds = RepeatedRows::new(2, 80);
+        let ckpt = run_legal_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(80, 2, 8e-3),
+            &loss,
+            tmp.path(),
+            "legal_train",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("a legality-input run over sets-carrying batches must complete");
+
+        let min_loss = *ckpt.metrics.get("min_train_loss").expect("min_train_loss");
+        assert!(
+            min_loss < baseline * 0.7,
+            "expected min_train_loss ({min_loss}) < 0.7 * baseline ({baseline})"
+        );
+        assert!(ckpt.train_loss.is_finite(), "got {}", ckpt.train_loss);
+        assert_ne!(
+            before,
+            legal_wte_values(&vm),
+            "legal_wte never moved, so the legality channel took no gradient"
+        );
+    }
+
+    /// A legality run over a dataset that carries none is refused
+    /// rather than falling through to the plain forward — which on this
+    /// model would fail anyway, several steps further from the cause.
+    #[test]
+    fn a_legality_run_refuses_a_batch_without_sets() {
+        let (vm, model) = legal_model();
+        let mut ds = RepeatedRows::new(2, 4).without_sets();
+        let tmp = TempDir::new().unwrap();
+        let err = run_legal_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(1, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "no_sets",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::MissingLegalSets { rows: 2 }),
+            "{err:?}"
+        );
+    }
+
+    /// And a batch carrying conditions, which this entry point has
+    /// nowhere to put either.
+    #[test]
+    fn a_legality_run_refuses_a_batch_that_carries_conditions() {
+        let (vm, model) = legal_model();
+        let mut ds = RepeatedRows::new(2, 4).with_conditions();
+        let tmp = TempDir::new().unwrap();
+        let err = run_legal_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(1, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "conds_too",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::UnexpectedConditions { rows: 2, conds: 2 }),
+            "{err:?}"
+        );
+    }
+
+    /// The refusal that pairs with [`TrainError::MissingLegalSets`].
+    ///
+    /// There is no `UnexpectedLegalSets` to mirror it, because
+    /// `allowed_ids` on a batch says nothing about how the caller meant
+    /// them to be used: the same field feeds the loss mask, and a
+    /// legal-masked run under `run_full_ft` carries them legitimately.
+    /// What does carry the distinction is the model, and this is where
+    /// it refuses: driven through the plain forward, a model built with
+    /// the table stops rather than training without the channel its
+    /// checkpoint will record.
+    #[test]
+    fn an_unconditioned_run_over_a_legality_model_stops_at_the_forward() {
+        let (vm, model) = legal_model();
+        let mut ds = RepeatedRows::new(2, 4);
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(1, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "plain_over_legal",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            TrainError::Candle(msg) => assert!(msg.contains("legality table"), "{msg}"),
+            other => panic!("expected the forward to refuse, got {other:?}"),
+        }
+    }
+
+    /// And the ordinary run is untouched: a model without the table
+    /// trains over sets-carrying batches exactly as before, using them
+    /// for the loss mask and not as input.
+    #[test]
+    fn a_model_without_the_table_still_trains_over_sets_carrying_batches() {
+        let (vm, model) = model_with(None);
+        let mut ds = RepeatedRows::new(2, 4);
+        let tmp = TempDir::new().unwrap();
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg_for(3, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "mask_only",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("the legal sets are the loss mask's business on this path");
     }
 }

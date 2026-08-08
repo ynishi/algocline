@@ -439,6 +439,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without the margin would read sharpness as steerability. `None` means
   the line was written at version 1, not that the margin was undefined.
 
+- Legality as a model input. `Gpt2Custom::legal_input` builds a
+  `legal_wte` table of `[vocab, dim]`, and `Gpt2Model::forward_legal`
+  adds, at each position, the mean of `legal_wte[id]` over the ids that
+  position's target may take. `train::run_legal_ft` is the entry point;
+  `chess_bake` takes `CHESS_LEGAL_INPUT`.
+
+  The ids were already there. `Batch::allowed_ids` is
+  `[row][position] -> Vec<u32>`, supplied by `LegalMaskedDataset` and
+  read until now only by the loss. Every engine this project surveyed
+  takes legality from the environment and zeroes the illegal moves;
+  learning it from move sequences is how the OthelloGPT family
+  *diagnoses* an emergent world model, and it costs 20M games and 512
+  dimensions on 8x8 Othello. Measured here, 76% of the distribution sits
+  on moves that do not exist, and the decoder discards all of it,
+  because it ranks only what the board generates. That mass costs
+  nothing in play and a third of the objective in training.
+
+  `legal_wte` is **not** tied to `wte`: sharing would give the input a
+  direct path to the logit it informs, and the legal set contains the
+  target.
+
+  **Refused rather than supported**, each with a reason:
+
+  - a model carrying both `cond_wte` and `legal_wte`
+    (`Gpt2Custom::validate`), because no forward pass in this build
+    reads both — refused at build time rather than minutes of corpus
+    reading later
+  - `CHESS_LEGAL_INPUT` without `CHESS_LEGAL_MASK`, since the sets
+    arrive through the dataset that flag selects
+  - a `LegalSets` holding no ids anywhere. It would add the zero vector
+    at every position and the model would answer as though it had no
+    legality channel — bit-identical to one built without the table.
+    The forward refuses a missing `LegalSets`, but a present and empty
+    one is numbers, not an error, so the constructor is where it is
+    caught
+
+  `ShapeError::LegalInputUnsupported`: `chess_cond`, `chess_play`,
+  `chess_eval` and `chess_match` all refuse these checkpoints. They
+  generate legal moves for the position in front of them, not for every
+  position of a windowed row, and recovering the rest needs a replay
+  this change does not do. All four now open through
+  `chess::open_reader_shape`, so the refusal is one tested line rather
+  than four untested ones — though `load_any` stays public for
+  `chess_bake`'s resume, so a reader written against it is checked by
+  nothing.
+
+### Changed — **BREAKING**: `ModelShape::path_for_encoding` → `path_for_kind`
+
+The sidecar name is a product of two axes now, not one. `ShapeKind`
+carries `encoding` and `legal_input`, and the four names are
+`shape.json` / `shape2.json` / `shape-legal.json` / `shape2-legal.json`.
+`save` sweeps the other three and `load_any` refuses more than one, so
+`ShapeError::AmbiguousSidecar` reports `found: Vec<String>` rather than
+a pair, and `SweepFailed` carries the `ShapeKind` it failed to remove.
+
+`legal_input` is omitted from the file when false, so an ordinary
+sidecar is byte-identical to one written before this change, and a
+build predating the field meets the key only on checkpoints it must not
+read.
+
+Before:
+
+```rust
+let path = ModelShape::path_for_encoding(&ckpt, CondEncoding::Prefix);
+```
+
+After:
+
+```rust
+let path = ModelShape::path_for_kind(&ckpt, ShapeKind {
+    encoding: CondEncoding::Prefix,
+    legal_input: false,
+});
+```
+
+`CondEncoding::other()` is removed with it: the sweep and the ambiguity
+check both enumerate `ShapeKind::ALL` now, and nothing else called it.
+
+`chess_bake`'s resume compares the new axis too. It destructures
+`ModelShape` without a rest pattern, so a ninth field is a compile error
+there rather than a field silently left uncompared — which is what the
+eighth was until this change.
+
+`CHESS_LEGAL_MASK` and `CHESS_SCHEDULE` now refuse unknown values
+instead of reading them as off. `CHESS_LEGAL_MASK=true` meant *off*.
+
 - `metric::bootstrap::cluster_bootstrap` — resampling over clusters
   rather than over rows. Positions from one game are not independent,
   so an interval computed per position is too narrow. Takes a

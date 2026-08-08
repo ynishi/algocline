@@ -166,6 +166,27 @@ pub struct NnCustomBranch {
     /// Architecture customization spec (activation / norm kind +
     /// placement / residual topology / MLP ratio / position / GQA /
     /// sliding window / untied head).
+    ///
+    /// # An axis this branch records and does not check
+    ///
+    /// `spec.legal_input` and `spec.cond_slots` each decide whether the
+    /// bundle carries a table of its own (`legal_wte.weight`,
+    /// `cond_wte.weight`), and nothing here compares the recorded value
+    /// against the tensor names in the bundle. The chess sidecar does —
+    /// [`crate::chess::ModelShape::load_any`] refuses a shape whose axes
+    /// disagree with the weights beside it — because there the failure
+    /// is silent in one direction: a table sitting in the file
+    /// unrequested is a channel the run trained with and the reader
+    /// drops, with every number afterwards well-formed.
+    ///
+    /// The same silence is available here in principle. No shipped path
+    /// produces the pairing today: the chess bakes write safetensors
+    /// plus a sidecar and never build a Card, and the Lua spec that
+    /// drives this branch (`alc.nn.card.load_ckpt`) names neither axis,
+    /// so nothing on that route can set them either. A Rust caller can
+    /// build the branch directly — the tests in this file do — which is
+    /// why this reads as unguarded rather than unreachable. A Card path
+    /// for those checkpoints would need the cross-check `load_any` has.
     #[serde(default)]
     pub spec: Gpt2Custom,
 
@@ -873,6 +894,10 @@ mod tests {
                 window: Some(4),
                 untied_head: true,
                 cond_slots: Some(3),
+                // Off beside `cond_slots`, which is the pairing
+                // `Gpt2Custom::validate` refuses: this fixture is meant
+                // to describe a model that could be built.
+                legal_input: false,
             },
             moe: Some(NnMoeBranch {
                 n_experts: 4,

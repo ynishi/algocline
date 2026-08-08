@@ -100,7 +100,7 @@ use algocline_nn::chess::records::{
 };
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::window::{play_row, COND_PREFIX_LEN};
-use algocline_nn::chess::ModelShape;
+use algocline_nn::chess::{open_reader_shape, ModelShape};
 use algocline_nn::metric::{self, MetricError};
 
 /// Jensen-Shannon divergence in bits, via [`algocline_nn::metric::js`].
@@ -242,7 +242,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // with the same row lengths. What differs is one extra channel — the
     // band also arrives as an argument to the forward pass, indexing a
     // conditioning table of its own.
-    let shape = ModelShape::load_any(&ckpt)?;
+    //
+    // Not the legality axis, though. A checkpoint trained with the legal
+    // moves supplied at every position has to be scored with them
+    // supplied, and this walk builds its legal set for the position it
+    // is standing on rather than for every position of the row. That
+    // refusal is inside the entry point below rather than beside it.
+    let shape = open_reader_shape(&ckpt)?;
     if shape.bands.len() < 2 {
         return Err(format!(
             "this checkpoint carries {} band(s); comparing conditions needs at least 2",

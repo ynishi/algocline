@@ -570,6 +570,48 @@ eighth was until this change.
 `CHESS_LEGAL_MASK` and `CHESS_SCHEDULE` now refuse unknown values
 instead of reading them as off. `CHESS_LEGAL_MASK=true` meant *off*.
 
+- `chess::steerability::h22` and `examples/chess_survival` — the third
+  arm set, and the one both earlier experiments left out. Plan 02
+  measured per-position conditioning against prefix with the loss over
+  the whole vocabulary; plan 03 took the loss over the legal moves but
+  made every arm prefix-conditioned, because `Gpt2Custom::validate`
+  refuses a model carrying both the conditioning table and the legality
+  table. That refusal is about legality as an **input**; the loss mask
+  carries no table and was never inside it, so per-position with the
+  mask was buildable throughout and simply never built.
+
+  It matters because on the unmasked objective a model ranks legal
+  moves at about the legal-uniform level, and reordering a nearly flat
+  ranking is cheap — so plan 02's headline flip rates may be an artefact
+  of the objective rather than a property of where the band is attached.
+
+  Two corrections travel with it:
+
+  - the floor is the larger of **both** pairs' seed gaps, where `h14`
+    took the treatment pair's alone. The prefix pair's gap measured
+    0.062 and 0.054, so the borrowed floor was not a small
+    approximation
+  - `gate_top1_survival` measures against the **arm being compared**,
+    not a control. Plan 03's gate used the control and excluded all four
+    treatment arms — for being *better*, by +0.062 to +0.077, against a
+    tolerance of 0.03 sized from the shuffle seed. A band around a
+    baseline on a different objective excludes by construction, and no
+    data can rescue it
+
+  `H22::refuted` documents that it is hard to reach by construction and
+  that the axis failing to survive reads as `undetermined` — recorded on
+  the type so it cannot be presented afterwards as a near miss.
+
+- `gate_top1_legality`'s doc no longer claims that a model handed the
+  legal set puts all its mass there. Measurement says otherwise: 0.0066
+  / 0.0064 without the legality input against 0.0068 / 0.0070 with it, a
+  gap smaller than either pair's seed gap. The gate's exclusion stands
+  for a different reason — under a loss taken over the legal moves
+  nothing trains the full-vocabulary softmax, so legal mass is
+  unconstrained rather than saturated — and the doc now also says the
+  quantity cannot serve as evidence about whether the legality input is
+  read, which is a use it was put to once.
+
 - `chess::steerability` gained the hypotheses for a second experiment,
   and `examples/chess_legality` runs them. `h21` compares two arms that
   share a training objective and differ only in whether the legal set

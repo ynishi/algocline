@@ -137,6 +137,44 @@ pub const LEGALITY_ROLES: [(&str, CondEncoding, bool); 5] = [
     (ARM_AB_B, CondEncoding::Prefix, true),
 ];
 
+/// Survival experiment, arm `P`: per-position conditioning **with** the
+/// loss taken over the legal moves.
+///
+/// The combination plan 02 and plan 03 between them never baked. Plan 02
+/// measured per-position against prefix with the loss over the whole
+/// vocabulary; plan 03 took the loss over the legal moves but made every
+/// arm prefix-conditioned, because [`crate::arch::Gpt2Custom::validate`]
+/// refuses a model carrying both the conditioning table and the legality
+/// table. **That refusal is about legality as an input and says nothing
+/// about the loss**, which carries no table — so this arm was buildable
+/// throughout.
+pub const ARM_P: &str = "P";
+
+/// Second run of [`ARM_P`], differing only in the shuffle seed.
+pub const ARM_P_B: &str = "P-b";
+
+/// The survival experiment's four arms.
+///
+/// Two are new; [`ARM_A`] and [`ARM_A_B`] are plan 03's, reused as the
+/// prefix side because they are the same recipe on the same corpus at
+/// the same step count with the same pair of seeds.
+pub const SURVIVAL_ARMS: [&str; 4] = [ARM_A, ARM_A_B, ARM_P, ARM_P_B];
+
+/// What each of those four checkpoints must have been, on both axes.
+///
+/// Here the **encoding** is what separates the arms, which is the mirror
+/// of [`LEGALITY_ROLES`]: there every arm was prefix and the legality
+/// axis told them apart. The legality axis is `false` throughout —
+/// plan 04 holds it constant rather than varying it, so a legality
+/// checkpoint reaching any slot is a mixed-up arm set rather than a
+/// third condition.
+pub const SURVIVAL_ROLES: [(&str, CondEncoding, bool); 4] = [
+    (ARM_A, CondEncoding::Prefix, false),
+    (ARM_A_B, CondEncoding::Prefix, false),
+    (ARM_P, CondEncoding::EveryPosition, false),
+    (ARM_P_B, CondEncoding::EveryPosition, false),
+];
+
 /// Bootstrap draws.
 ///
 /// Two thousand, from the plan. Fixed here rather than left to the
@@ -168,6 +206,23 @@ pub const LEGAL_MASS_GATE: f64 = 0.20;
 /// did not. Recorded before any arm of the set was baked, and applied
 /// rather than tuned.
 pub const TOP1_GATE_LEGALITY: f64 = 0.03;
+
+/// How far [`ARM_P`]'s mean top-1 match may sit from [`ARM_A`]'s.
+///
+/// **The reference is the arm being compared, not a control.** Plan 03
+/// set its admission against the control and every treatment arm fell
+/// outside it — for being *better*, by +0.062 to +0.077, which is the
+/// loss mask's intended effect against a tolerance sized from the
+/// shuffle seed. A band around a baseline on a different objective
+/// excludes by construction, and no data can rescue it.
+///
+/// Here both sides carry the same objective, and the treatment's
+/// intended effect on top-1 is about zero: plan 02 measured
+/// per-position against prefix at +0.006 / +0.004 with intervals
+/// spanning zero. Against a tolerance of 0.03 and a same-recipe seed
+/// gap measured at 0.0123 / 0.0112 on this very arm pair, both passing
+/// and failing are reachable — which is the check plan 03 did not make.
+pub const TOP1_GATE_SURVIVAL: f64 = 0.03;
 
 /// Oldest record format that carries `ce` and `top2_margin`.
 ///
@@ -519,6 +574,26 @@ fn require_roles(
 /// does not fit ([`StatError::WrongLegalInputForRole`]).
 pub fn check_legality_roles(arms: &AlignedArms) -> Result<(), StatError> {
     require_kinds(arms, &LEGALITY_ROLES)
+}
+
+/// The survival experiment's four arms fit [`SURVIVAL_ROLES`], on both
+/// axes.
+///
+/// The encoding axis is the one that separates the arms here, so a
+/// swapped pair is caught by the first check rather than the third —
+/// the reverse of [`check_legality_roles`], where every arm is prefix
+/// and only the legality axis tells them apart.
+///
+/// The legality axis is nonetheless checked, and against `false` for all
+/// four: plan 04 holds legality-as-input out of the experiment after
+/// plan 03 measured it, so a legality checkpoint reaching any slot would
+/// be a third condition nobody registered rather than a mislabelled arm.
+///
+/// # Errors
+///
+/// As [`check_legality_roles`], over four arms rather than five.
+pub fn check_survival_roles(arms: &AlignedArms) -> Result<(), StatError> {
+    require_kinds(arms, &SURVIVAL_ROLES)
 }
 
 /// Both axes of a checkpoint's kind, per arm.
@@ -891,9 +966,20 @@ pub fn gate_top1(
 /// the control. It must not reappear under another name, which is why
 /// this doc says so rather than leaving the gate merely missing.
 ///
-/// **Legal mass.** With legality as an input the model can put all its
-/// mass on legal moves trivially, so the quantity stops discriminating
-/// (`§4.1`). [`gate_legal_mass`] is not part of this set's admission.
+/// **Legal mass.** [`gate_legal_mass`] is not part of this set's
+/// admission. The reason recorded when this was written — that a model
+/// handed the legal set can put all its mass there trivially, so the
+/// quantity stops discriminating — **is not what happened**: at γ=1 the
+/// arms measured 0.0066 / 0.0064 without the legality input and
+/// 0.0068 / 0.0070 with it, a gap smaller than either pair's seed gap
+/// [実測: `rec-plan03`, both months]. The conclusion stands for a
+/// different reason. Under a loss taken over the legal moves nothing
+/// trains the full-vocabulary softmax, so no gradient pushes mass onto
+/// the legal set and none pushes it off; the quantity is unconstrained
+/// rather than saturated. It therefore also **cannot** serve as evidence
+/// that the legality input is or is not being read, which is a use it
+/// was put to once and should not be again — an ablation at inference
+/// is the measurement that answers that.
 ///
 /// The baseline is guarded as in [`gate_top1`], on both axes: the
 /// control has to be prefix-conditioned **and** to have had no legality
@@ -922,6 +1008,52 @@ pub fn gate_top1_legality(
     Ok(Gate {
         interval,
         tolerance: TOP1_GATE_LEGALITY,
+    })
+}
+
+/// The survival experiment's admission gate: mean top-1 match, as a
+/// difference against [`ARM_A`] — the arm being compared, not a control.
+///
+/// `plan 04 §3`, at [`TOP1_GATE_SURVIVAL`]. A third function rather than
+/// a tolerance parameter, for the reason [`gate_top1_legality`] gives:
+/// a tolerance a caller passes in is one that can be raised after the
+/// difference is known.
+///
+/// # Why the reference moved
+///
+/// Plan 03's gate measured every arm against the control and excluded
+/// all four, because the control trains a different objective and the
+/// treatment's intended effect on top-1 is larger than the tolerance.
+/// Both sides here carry the same objective and differ only in where the
+/// band is attached, so the difference this bootstraps is one the
+/// treatment is not designed to move.
+///
+/// The baseline is guarded on both axes, as [`gate_top1_legality`]'s is:
+/// [`ARM_A`] has to be prefix-conditioned and to have had no legality
+/// input. The subject is not guarded here for the same reason as there —
+/// `arm` is a free string, and [`check_survival_roles`] is where the
+/// whole set is known.
+///
+/// # Errors
+///
+/// As [`gate_top1_legality`], with [`ARM_A`] as the baseline.
+pub fn gate_top1_survival(
+    arms: &AlignedArms,
+    arm: &str,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<Gate, StatError> {
+    require_kinds(arms, &[(ARM_A, CondEncoding::Prefix, false)])?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let subject = tally(arms, arm, gamma_ix, top1_mean)?;
+    let baseline = tally(arms, ARM_A, gamma_ix, top1_mean)?;
+    let interval = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        Some(subject.mean_over(draw)? - baseline.mean_over(draw)?)
+    })?;
+    Ok(Gate {
+        interval,
+        tolerance: TOP1_GATE_SURVIVAL,
     })
 }
 
@@ -1504,6 +1636,149 @@ pub fn h21(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H2
         confirm,
         refute,
         resolution,
+        positions: arms.positions(),
+        games: arms.games(),
+    })
+}
+
+/// Plan 04's only judged hypothesis: does the conditioning advantage
+/// survive the loss mask?
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct H22 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// Flip rate of [`ARM_P`], on the sample as walked.
+    pub flip_p: f64,
+    /// Flip rate of [`ARM_P_B`], the replicate of `P`.
+    pub flip_p_b: f64,
+    /// Flip rate of [`ARM_A`].
+    pub flip_a: f64,
+    /// Flip rate of [`ARM_A_B`], the replicate of `A`.
+    pub flip_a_b: f64,
+    /// `M = flip(P) - flip(A)`, on the sample as walked.
+    pub margin: f64,
+    /// `F`, the larger of the two same-recipe seed gaps.
+    pub floor: f64,
+    /// Interval on `M - F`. Confirmed when it excludes zero from above.
+    pub confirm: Interval,
+    /// Interval on `M + F`. Refuted when it excludes zero from below.
+    pub refute: Interval,
+    /// Positions the arms share.
+    pub positions: usize,
+    /// Games those positions came from — the clusters resampled.
+    pub games: usize,
+}
+
+impl H22 {
+    /// Whether the confirm interval clears zero from above.
+    pub fn confirmed(&self) -> bool {
+        self.confirm.excludes_zero_from_above()
+    }
+
+    /// Whether the refute interval clears zero from below.
+    ///
+    /// **Hard to reach by construction, and the plan says so before any
+    /// arm was baked.** `F` is a positive gap between two real
+    /// checkpoints, so `M + F < 0` needs the per-position arm to flip
+    /// *less* than the prefix arm by more than both observed seed gaps
+    /// — not the shape the axis dying would take. What dying looks like
+    /// here is [`Self::verdict`] returning `"undetermined"`, and plan 04
+    /// §3 registers that reading in advance so it cannot be presented
+    /// afterwards as a near miss.
+    pub fn refuted(&self) -> bool {
+        self.refute.excludes_zero_from_below()
+    }
+
+    /// The verdict on one month, in the three-way form the decision
+    /// table partitions outcomes with.
+    ///
+    /// `"undetermined"` is the load-bearing outcome here rather than the
+    /// leftover one — see [`Self::refuted`].
+    pub fn verdict(&self) -> &'static str {
+        match (self.confirmed(), self.refuted()) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H22 from the four survival arms.
+///
+/// [`h14`] with its floor repaired and its arms re-cast. The margin is
+/// the same quantity — per-position's flip rate less prefix's — but
+/// measured where the loss was taken over the legal moves, which is
+/// where plan 02 never measured it.
+///
+/// # Why the floor is a max over both pairs
+///
+/// [`h14`] took `G = |flip(perpos) - flip(perpos-b)|`: the treatment
+/// pair's gap, standing in for the prefix side's as well. Plan 03 §3.4
+/// calls that a borrowed floor and both sides are replicated here, so
+/// `F = max(|flip(P) - flip(P-b)|, |flip(A) - flip(A-b)|)` as [`h21`]'s
+/// is. The prefix pair's gap is not small — 0.062 and 0.054 on plan 03's
+/// records — so borrowing it would have mattered.
+///
+/// Recomputed inside every draw, like every other term: a gap frozen as
+/// a scalar would report a precision one pair of runs does not carry.
+///
+/// # What the floor does *not* shrink with
+///
+/// Positions. `F` is a distance between two checkpoints, so walking more
+/// of the holdout pins it down without making it smaller — which is why
+/// plan 04 §5 spends nothing on a larger walk and why more seeds would
+/// widen it rather than tighten it.
+///
+/// # What a swap within a pair does
+///
+/// Nothing that matters, as in [`h14`] and [`h21`]: `F` is symmetric in
+/// each pair, and `M` becomes the other replicate's margin — another
+/// reading of the same experiment. A swap **across** the pairs reverses
+/// the sign of `M`, and that is what [`check_survival_roles`] refuses,
+/// on the encoding axis rather than the legality one.
+///
+/// # Errors
+///
+/// One of the four arms is missing, an arm's checkpoint does not fit its
+/// role on either axis or its walk is too old to state the second one
+/// ([`LEGALITY_AXIS_VERSION`]), the gamma was not swept, or the
+/// resampling refused.
+pub fn h22(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H22, StatError> {
+    require_kinds(arms, &SURVIVAL_ROLES)?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let p = tally(arms, ARM_P, gamma_ix, flipped)?;
+    let p_b = tally(arms, ARM_P_B, gamma_ix, flipped)?;
+    let a = tally(arms, ARM_A, gamma_ix, flipped)?;
+    let a_b = tally(arms, ARM_A_B, gamma_ix, flipped)?;
+
+    // One draw, every term, as in `h14` and `h21`.
+    let margin_and_floor = |draw: &[usize]| -> Option<(f64, f64)> {
+        let per = p.mean_over(draw)?;
+        let per_b = p_b.mean_over(draw)?;
+        let pre = a.mean_over(draw)?;
+        let pre_b = a_b.mean_over(draw)?;
+        Some((per - pre, (per - per_b).abs().max((pre - pre_b).abs())))
+    };
+
+    let confirm = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        margin_and_floor(draw).map(|(m, f)| m - f)
+    })?;
+    let refute = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        margin_and_floor(draw).map(|(m, f)| m + f)
+    })?;
+
+    let whole: Vec<usize> = (0..arms.games()).collect();
+    let (margin, floor) = margin_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+    Ok(H22 {
+        gamma,
+        flip_p: p.total().mean().unwrap_or(f64::NAN),
+        flip_p_b: p_b.total().mean().unwrap_or(f64::NAN),
+        flip_a: a.total().mean().unwrap_or(f64::NAN),
+        flip_a_b: a_b.total().mean().unwrap_or(f64::NAN),
+        margin,
+        floor,
+        confirm,
+        refute,
         positions: arms.positions(),
         games: arms.games(),
     })
@@ -3023,6 +3298,230 @@ mod tests {
                  intervals rank the same draws: {refute_end} vs {confirm_end}"
             );
         }
+    }
+
+    /// A walk whose flip rate, cost and top-1 share are each a constant
+    /// fixed by arithmetic.
+    ///
+    /// Twelve positions a game, so `flips` of them flipping is a rate of
+    /// `flips / 12` inside every resample — which makes `M` and `F`
+    /// assertable rather than merely bounded.
+    fn survival_walk(flips: usize, cost: f64, top1: usize) -> Walk {
+        let mut walk = legality_walk(
+            8,
+            12,
+            move |_, _| cost,
+            move |_, ix| ix < flips,
+            |ix| MARGINS[ix % MARGINS.len()],
+        );
+        // `legality_walk` writes one top-1 pattern for every record.
+        // Rewrite it per position so an arm's top-1 share is `top1 / 12`
+        // over the first band, and a third of that meaned over three.
+        for (ix, record) in walk.records.iter_mut().enumerate() {
+            let within = ix % 12;
+            for at in &mut record.at {
+                at.top1 = Some(vec![within < top1, false, false]);
+            }
+        }
+        walk
+    }
+
+    /// Label a walk as a survival arm: its own checkpoint, and the
+    /// conditioning its role calls for.
+    ///
+    /// The encoding is what separates these arms, so it is set from the
+    /// role rather than left at the header default — the mirror of
+    /// [`legality_arm`], where every arm is prefix.
+    fn survival_arm(name: &'static str, mut walk: Walk) -> (String, Walk) {
+        walk.header.ckpt = format!("/root/ckpt/{name}/run.safetensors");
+        walk.header.encoding = match name {
+            ARM_P | ARM_P_B => CondEncoding::EveryPosition,
+            _ => CondEncoding::Prefix,
+        };
+        walk.header.legal_input = false;
+        (name.to_string(), walk)
+    }
+
+    fn survival_arms(a: Walk, a_b: Walk, p: Walk, p_b: Walk) -> AlignedArms {
+        AlignedArms::new(vec![
+            survival_arm(ARM_A, a),
+            survival_arm(ARM_A_B, a_b),
+            survival_arm(ARM_P, p),
+            survival_arm(ARM_P_B, p_b),
+        ])
+        .expect("the fixture arms share a position stream")
+    }
+
+    /// `F` is the larger of **both** pairs' gaps, not the treatment
+    /// pair's standing in for both.
+    ///
+    /// The whole point of the correction over [`h14`], so the fixture is
+    /// built with the prefix pair as the noisier one: `P` flips 9/12 and
+    /// `P-b` 8/12 (a gap of 1/12), while `A` flips 3/12 and `A-b` 5/12
+    /// (a gap of 2/12). A floor borrowed from the treatment pair would
+    /// be 0.0833 and the confirm interval would sit at 0.4167; the
+    /// matched floor is 0.1667 and it sits at 0.3333.
+    #[test]
+    fn h22_takes_the_larger_of_both_seed_gaps() {
+        let arms = survival_arms(
+            survival_walk(3, 2.7, 3),
+            survival_walk(5, 2.75, 3),
+            survival_walk(9, 2.8, 3),
+            survival_walk(8, 2.85, 3),
+        );
+        let result = h22(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert!((result.flip_p - 0.75).abs() < 1e-12, "{}", result.flip_p);
+        assert!((result.flip_a - 0.25).abs() < 1e-12, "{}", result.flip_a);
+        assert!((result.margin - 0.5).abs() < 1e-12, "{}", result.margin);
+        assert!(
+            (result.floor - 2.0 / 12.0).abs() < 1e-12,
+            "the prefix pair's gap is the larger one and has to win: {}",
+            result.floor
+        );
+        assert!(
+            (result.confirm.point - (0.5 - 2.0 / 12.0)).abs() < 1e-12,
+            "{}",
+            result.confirm.point
+        );
+        assert!(
+            (result.refute.point - (0.5 + 2.0 / 12.0)).abs() < 1e-12,
+            "{}",
+            result.refute.point
+        );
+        assert!(result.confirmed());
+        assert!(!result.refuted());
+        assert_eq!(result.verdict(), "confirmed");
+    }
+
+    /// The axis that separates these arms is the encoding, so a prefix
+    /// checkpoint in a per-position slot is refused before a figure is
+    /// computed.
+    #[test]
+    fn h22_refuses_a_prefix_checkpoint_in_a_per_position_slot() {
+        let mut swapped = survival_arm(ARM_P, survival_walk(9, 2.8, 3));
+        swapped.1.header.encoding = CondEncoding::Prefix;
+        let arms = AlignedArms::new(vec![
+            survival_arm(ARM_A, survival_walk(3, 2.7, 3)),
+            survival_arm(ARM_A_B, survival_walk(5, 2.75, 3)),
+            swapped,
+            survival_arm(ARM_P_B, survival_walk(8, 2.85, 3)),
+        ])
+        .unwrap();
+        let err = h22(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::WrongEncodingForRole {
+                    arm: ARM_P,
+                    want: CondEncoding::EveryPosition,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Legality-as-input is held out of plan 04 entirely, so a legality
+    /// checkpoint anywhere is an unregistered third condition rather
+    /// than a mislabelled arm.
+    #[test]
+    fn h22_refuses_a_legality_checkpoint_in_any_slot() {
+        let mut legality = survival_arm(ARM_P, survival_walk(9, 2.8, 3));
+        legality.1.header.legal_input = true;
+        let arms = AlignedArms::new(vec![
+            survival_arm(ARM_A, survival_walk(3, 2.7, 3)),
+            survival_arm(ARM_A_B, survival_walk(5, 2.75, 3)),
+            legality,
+            survival_arm(ARM_P_B, survival_walk(8, 2.85, 3)),
+        ])
+        .unwrap();
+        let err = h22(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::WrongLegalInputForRole {
+                    arm: ARM_P,
+                    want: false,
+                    found: true
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Exchanging the two runs of one recipe leaves the floor alone and
+    /// makes the margin the other replicate's — two readings of one
+    /// experiment, which is why nothing tries to tell them apart.
+    #[test]
+    fn swapping_within_a_pair_leaves_h22s_floor_alone() {
+        let straight = survival_arms(
+            survival_walk(3, 2.7, 3),
+            survival_walk(5, 2.75, 3),
+            survival_walk(9, 2.8, 3),
+            survival_walk(8, 2.85, 3),
+        );
+        let swapped = survival_arms(
+            survival_walk(5, 2.75, 3),
+            survival_walk(3, 2.7, 3),
+            survival_walk(9, 2.8, 3),
+            survival_walk(8, 2.85, 3),
+        );
+        let a = h22(&straight, 1.0, DRAWS, SEED).unwrap();
+        let b = h22(&swapped, 1.0, DRAWS, SEED).unwrap();
+
+        assert!(
+            (a.floor - b.floor).abs() < 1e-12,
+            "{} vs {}",
+            a.floor,
+            b.floor
+        );
+        assert!(
+            (b.margin - (0.75 - 5.0 / 12.0)).abs() < 1e-12,
+            "the margin becomes the other replicate's: {}",
+            b.margin
+        );
+    }
+
+    /// The admission gate's reference is `A`, the arm being compared —
+    /// the correction plan 03's gate needed.
+    ///
+    /// Two arms that match each other pass however far both sit from
+    /// anything else, and an arm that differs from `A` by more than the
+    /// tolerance is outside. A gate keyed on some other baseline could
+    /// not produce both of these from one fixture.
+    #[test]
+    fn gate_top1_survival_measures_against_a() {
+        let arms = survival_arms(
+            survival_walk(3, 2.7, 3),
+            survival_walk(5, 2.75, 3),
+            survival_walk(9, 2.8, 3),
+            survival_walk(8, 2.85, 9),
+        );
+        // `P` and `A` share a top-1 share of (3/12)/3, so the gate is
+        // centred on zero however far that is from the control plan 03
+        // used.
+        let matched = gate_top1_survival(&arms, ARM_P, 1.0, DRAWS, SEED).unwrap();
+        assert!(matched.interval.point.abs() < 1e-12, "{}", matched.interval);
+        assert!(matched.passes());
+        assert_eq!(matched.verdict(), "pass");
+
+        // `P-b` is at (9/12)/3, which is 0.1667 away — five times the
+        // tolerance.
+        let apart = gate_top1_survival(&arms, ARM_P_B, 1.0, DRAWS, SEED).unwrap();
+        assert!(
+            (apart.interval.point - (0.75 - 0.25) / 3.0).abs() < 1e-12,
+            "{}",
+            apart.interval
+        );
+        assert!(!apart.passes());
+        assert_eq!(apart.verdict(), "outside");
+        assert_eq!(apart.tolerance, TOP1_GATE_SURVIVAL);
+
+        // And `A` against itself is identically zero, which is the
+        // property that says the baseline is the one named.
+        let self_ref = gate_top1_survival(&arms, ARM_A, 1.0, DRAWS, SEED).unwrap();
+        assert!(self_ref.interval.point.abs() < 1e-12);
     }
 
     #[test]

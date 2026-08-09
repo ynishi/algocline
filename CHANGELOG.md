@@ -602,6 +602,19 @@ instead of reading them as off. `CHESS_LEGAL_MASK=true` meant *off*.
   that the axis failing to survive reads as `undetermined` — recorded on
   the type so it cannot be presented afterwards as a near miss.
 
+- `chess::steerability::h23` — the depth reach under the mask, read by
+  `chess_survival` only when `h22` confirms. `h15`'s quantity (deep
+  divergence over shallow) with a floor, which `h15` has none of: plan
+  02 replicated one side only, so there was no second reading of the
+  prefix arm to measure a gap against. Both sides are replicated here.
+
+  The plan asked for "the same way of drawing the floor as plan 02's
+  H15", which names no rule since that hypothesis draws none. The
+  disambiguation is recorded in the plan, written after `h22`'s verdict
+  and before `h23` was computed — `h22`'s numbers are not inputs to this
+  statistic — and takes the conservative side, since a floor makes
+  confirming harder.
+
 - `gate_top1_legality`'s doc no longer claims that a model handed the
   legal set puts all its mass there. Measurement says otherwise: 0.0066
   / 0.0064 without the legality input against 0.0068 / 0.0070 with it, a

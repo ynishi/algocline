@@ -1784,6 +1784,169 @@ pub fn h22(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H2
     })
 }
 
+/// Plan 04's secondary hypothesis: does the advantage still reach the
+/// deep positions once the loss is masked?
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct H23 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// The opening bucket, shared by every arm.
+    pub shallow: Bucket,
+    /// The deep bucket, shared by every arm.
+    pub deep: Bucket,
+    /// `JS(deep) / JS(shallow)` for [`ARM_P`]. Higher is a shallower
+    /// decay.
+    pub ratio_p: f64,
+    /// The same for [`ARM_P_B`].
+    pub ratio_p_b: f64,
+    /// The same for [`ARM_A`].
+    pub ratio_a: f64,
+    /// The same for [`ARM_A_B`].
+    pub ratio_a_b: f64,
+    /// `R = ratio(P) - ratio(A)`, on the sample as walked.
+    pub margin: f64,
+    /// `F_R`, the larger of the two same-recipe seed gaps in the ratio.
+    pub floor: f64,
+    /// Interval on `R - F_R`. Confirmed when it excludes zero from
+    /// above.
+    pub confirm: Interval,
+    /// Interval on `R + F_R`. Refuted when it excludes zero from below.
+    pub refute: Interval,
+}
+
+impl H23 {
+    /// Whether the confirm interval clears zero from above.
+    pub fn confirmed(&self) -> bool {
+        self.confirm.excludes_zero_from_above()
+    }
+
+    /// Whether the refute interval clears zero from below.
+    pub fn refuted(&self) -> bool {
+        self.refute.excludes_zero_from_below()
+    }
+
+    /// As [`H22::verdict`].
+    pub fn verdict(&self) -> &'static str {
+        match (self.confirmed(), self.refuted()) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H23 from the four survival arms.
+///
+/// [`h15`]'s quantity — the ratio of deep divergence to shallow — with
+/// a floor, which [`h15`] has none of.
+///
+/// # Why a floor here and not there
+///
+/// Plan 02 replicated one side only, so there was no second reading of
+/// the prefix arm to measure a gap against and the difference had to
+/// stand alone. Both sides are replicated here, so the same rule the
+/// rest of plan 04 runs on applies (`§3.4`, the floor is matched rather
+/// than borrowed).
+///
+/// The plan's own text said "the same way of drawing the floor as
+/// plan 02's H15", which does not name a rule since that hypothesis
+/// draws none. The disambiguation is recorded in plan 04 §2, written
+/// after H22's verdict and **before this was computed** — H22's numbers
+/// are not inputs to this statistic, so fixing the reading between them
+/// is not a criterion moved to fit a result. The conservative side was
+/// taken: a floor makes confirming harder.
+///
+/// # Errors
+///
+/// One of the four arms is missing, an arm's checkpoint does not fit
+/// its role, the gamma was not swept, a bucket caught no positions, or
+/// the resampling refused.
+pub fn h23(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H23, StatError> {
+    require_kinds(arms, &SURVIVAL_ROLES)?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let shallow_range = SHALLOW_BUCKET;
+    let deep_range = deep_bucket(arms.ctx());
+
+    let bucketed =
+        |arm: &str, range: (usize, usize)| tally_in_bucket(arms, arm, gamma_ix, range, widest_js);
+    let p_shallow = bucketed(ARM_P, shallow_range)?;
+    let p_deep = bucketed(ARM_P, deep_range)?;
+    let p_b_shallow = bucketed(ARM_P_B, shallow_range)?;
+    let p_b_deep = bucketed(ARM_P_B, deep_range)?;
+    let a_shallow = bucketed(ARM_A, shallow_range)?;
+    let a_deep = bucketed(ARM_A, deep_range)?;
+    let a_b_shallow = bucketed(ARM_A_B, shallow_range)?;
+    let a_b_deep = bucketed(ARM_A_B, deep_range)?;
+
+    if p_shallow.total().n == 0 {
+        return Err(StatError::EmptyBucket {
+            low: shallow_range.0,
+            high: shallow_range.1.saturating_sub(1),
+            role: "denominator",
+        });
+    }
+    if p_deep.total().n == 0 {
+        return Err(StatError::EmptyBucket {
+            low: deep_range.0,
+            high: deep_range.1.saturating_sub(1),
+            role: "numerator",
+        });
+    }
+
+    // Divergence is non-negative, so a shallow mean of exactly zero
+    // means the bands agreed everywhere in the opening — at which point
+    // the decay has nothing to decay from, as in `h15`.
+    let ratio = |deep: &ClusterTally, shallow: &ClusterTally, draw: &[usize]| -> Option<f64> {
+        let denominator = shallow.mean_over(draw)?;
+        if denominator <= 0.0 {
+            return None;
+        }
+        Some(deep.mean_over(draw)? / denominator)
+    };
+
+    // One draw, every term.
+    let margin_and_floor = |draw: &[usize]| -> Option<(f64, f64)> {
+        let p = ratio(&p_deep, &p_shallow, draw)?;
+        let p_b = ratio(&p_b_deep, &p_b_shallow, draw)?;
+        let a = ratio(&a_deep, &a_shallow, draw)?;
+        let a_b = ratio(&a_b_deep, &a_b_shallow, draw)?;
+        Some((p - a, (p - p_b).abs().max((a - a_b).abs())))
+    };
+
+    let confirm = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        margin_and_floor(draw).map(|(r, f)| r - f)
+    })?;
+    let refute = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        margin_and_floor(draw).map(|(r, f)| r + f)
+    })?;
+
+    let whole: Vec<usize> = (0..arms.games()).collect();
+    let (margin, floor) = margin_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+    Ok(H23 {
+        gamma,
+        shallow: Bucket {
+            low: shallow_range.0,
+            high: shallow_range.1.saturating_sub(1),
+            positions: p_shallow.total().n,
+            games: p_shallow.clusters_present(),
+        },
+        deep: Bucket {
+            low: deep_range.0,
+            high: deep_range.1.saturating_sub(1),
+            positions: p_deep.total().n,
+            games: p_deep.clusters_present(),
+        },
+        ratio_p: ratio(&p_deep, &p_shallow, &whole).unwrap_or(f64::NAN),
+        ratio_p_b: ratio(&p_b_deep, &p_b_shallow, &whole).unwrap_or(f64::NAN),
+        ratio_a: ratio(&a_deep, &a_shallow, &whole).unwrap_or(f64::NAN),
+        ratio_a_b: ratio(&a_b_deep, &a_b_shallow, &whole).unwrap_or(f64::NAN),
+        margin,
+        floor,
+        confirm,
+        refute,
+    })
+}
+
 /// One band of contestability, and what the two arms did inside it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stratum {
@@ -3480,6 +3643,104 @@ mod tests {
             (b.margin - (0.75 - 5.0 / 12.0)).abs() < 1e-12,
             "the margin becomes the other replicate's: {}",
             b.margin
+        );
+    }
+
+    /// A walk whose divergence is one constant in the opening and
+    /// another deep, so the depth ratio is fixed by arithmetic.
+    ///
+    /// Twelve positions a game: the first six at ply 0, 2, 4, 6, 8, 10
+    /// and the rest at 40, 42, ... 50, which puts five in the shallow
+    /// bucket (`ply < 10`), six in the deep one (`40 <= ply <= 125`),
+    /// and one in neither.
+    fn depth_walk(shallow_js: f64, deep_js: f64) -> Walk {
+        let mut records = Vec::new();
+        for game in 0..8 {
+            for ix in 0..12usize {
+                let (ply, js) = if ix < 6 {
+                    (ix * 2, shallow_js)
+                } else {
+                    (40 + (ix - 6) * 2, deep_js)
+                };
+                records.push(PositionRecord {
+                    game,
+                    ply,
+                    n_legal: Some(30),
+                    at: vec![GammaRecord {
+                        flipped: ix % 3 == 0,
+                        widest_js: js,
+                        legal_mass: 0.9,
+                        top1: Some(vec![true, false, false]),
+                        ce: Some(vec![2.7; 3]),
+                        top2_margin: Some(MARGINS[ix % MARGINS.len()]),
+                    }],
+                });
+            }
+        }
+        Walk {
+            header: header(records.len(), 8),
+            records,
+        }
+    }
+
+    /// `F_R` is the larger of both pairs' gaps in the ratio, which is
+    /// what `h15` has none of and what the plan's ambiguous wording had
+    /// to be resolved into.
+    ///
+    /// The fixture puts the noisier pair on the prefix side again:
+    /// `P` and `P-b` sit at ratios 0.5 and 0.4 (a gap of 0.1) while `A`
+    /// and `A-b` sit at 0.2 and 0.35 (a gap of 0.15). Borrowing the
+    /// treatment pair's gap would leave the confirm interval at 0.2;
+    /// the matched floor puts it at 0.15.
+    #[test]
+    fn h23_takes_the_larger_of_both_seed_gaps_in_the_ratio() {
+        let arms = survival_arms(
+            depth_walk(0.1, 0.02),
+            depth_walk(0.1, 0.035),
+            depth_walk(0.1, 0.05),
+            depth_walk(0.1, 0.04),
+        );
+        let result = h23(&arms, 1.0, DRAWS, SEED).unwrap();
+
+        assert_eq!(result.shallow.positions, 8 * 5);
+        assert_eq!(result.deep.positions, 8 * 6);
+        assert!((result.ratio_p - 0.5).abs() < 1e-12, "{}", result.ratio_p);
+        assert!((result.ratio_a - 0.2).abs() < 1e-12, "{}", result.ratio_a);
+        assert!((result.margin - 0.3).abs() < 1e-12, "{}", result.margin);
+        assert!(
+            (result.floor - 0.15).abs() < 1e-12,
+            "the prefix pair's gap is the larger one and has to win: {}",
+            result.floor
+        );
+        assert!(
+            (result.confirm.point - 0.15).abs() < 1e-12,
+            "{}",
+            result.confirm.point
+        );
+        assert!((result.refute.point - 0.45).abs() < 1e-12);
+        assert!(result.confirmed());
+        assert!(!result.refuted());
+        assert_eq!(result.verdict(), "confirmed");
+    }
+
+    /// An opening in which the bands never disagree leaves the ratio
+    /// undefined rather than infinite, as `h15`'s does.
+    #[test]
+    fn h23_refuses_a_ratio_with_no_opening_divergence() {
+        let arms = survival_arms(
+            depth_walk(0.0, 0.02),
+            depth_walk(0.0, 0.035),
+            depth_walk(0.0, 0.05),
+            depth_walk(0.0, 0.04),
+        );
+        let err = h23(&arms, 1.0, DRAWS, SEED).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatError::Bootstrap(BootstrapError::EveryDrawUndefined { .. })
+                    | StatError::Bootstrap(BootstrapError::UndefinedOnWholeSample)
+            ),
+            "{err:?}"
         );
     }
 

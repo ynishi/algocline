@@ -53,14 +53,19 @@
 //! **undetermined**. That is written down so it cannot be presented
 //! afterwards as a near miss.
 //!
-//! # What this program does not compute
+//! # H23 is read only when H22 confirms
 //!
-//! **H23**, the depth reach. Plan 04 registers it and says it is read
-//! only if H22 confirms, so its judge is not built yet — building a
-//! reader for a figure that may never be read is how `chess_stats`,
-//! `chess_legality` and this program came to hold three hardcoded arm
-//! sets between them. If H22 confirms, `h23` goes in against these same
-//! records, with no new walk.
+//! Plan 04 registers the depth reach as secondary and gates it on the
+//! primary, so this prints it only in that case and says so otherwise.
+//! Printing it either way would make "registered but not read" look the
+//! same as "read and unremarkable".
+//!
+//! Its floor is plan 04's rather than plan 02's. `h15` draws none,
+//! because only one side of that comparison was replicated; both sides
+//! are replicated here. The plan's own text asked for "the same way of
+//! drawing the floor as plan 02's H15", which names no rule — plan 04
+//! §2 records the disambiguation, written after H22's verdict and
+//! before H23 was computed, on the conservative side.
 
 use std::env;
 use std::path::PathBuf;
@@ -273,6 +278,52 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
          the axis failing to survive reads as `undetermined`."
     );
 
+    // Read only when H22 confirms, which the plan fixed before any arm
+    // was baked. Printing it either way would make "registered but not
+    // read" indistinguishable from "read and unremarkable".
+    if h22.confirmed() {
+        println!();
+        println!("H23 — does the advantage still reach the deep positions?");
+        let h23 = steerability::h23(&arms, gamma, draws, seed)?;
+        println!(
+            "  buckets                               ply {}-{} ({} position(s), {} game(s)) over \
+             ply {}-{} ({} position(s), {} game(s))",
+            h23.deep.low,
+            h23.deep.high,
+            h23.deep.positions,
+            h23.deep.games,
+            h23.shallow.low,
+            h23.shallow.high,
+            h23.shallow.positions,
+            h23.shallow.games
+        );
+        println!(
+            "  R = ratio(P) - ratio(A)               {:+.6}   ({:.6} - {:.6})",
+            h23.margin, h23.ratio_p, h23.ratio_a
+        );
+        println!(
+            "  F_R = max of the two seed gaps        {:+.6}   (|{:.6} - {:.6}|, |{:.6} - {:.6}|)",
+            h23.floor, h23.ratio_p, h23.ratio_p_b, h23.ratio_a, h23.ratio_a_b
+        );
+        println!("  confirm on R - F_R above zero         {}", h23.confirm);
+        println!("  refute  on R + F_R below zero         {}", h23.refute);
+        report_dropped_draws("H23 confirm", &h23.confirm);
+        report_dropped_draws("H23 refute", &h23.refute);
+        println!("  verdict on this month                 {}", h23.verdict());
+        println!(
+            "  The floor is plan 04's, not plan 02's: `h15` draws none because only one side of \
+             that comparison was replicated. The plan's text did not name a rule, and §2 records \
+             the disambiguation — written after H22's verdict and before this was computed, on \
+             the conservative side."
+        );
+    } else {
+        println!();
+        println!(
+            "H23 is registered and is read only if H22 confirms. It did not, so it was not \
+             computed."
+        );
+    }
+
     if !admitted.contains(&ARM_P) {
         println!();
         println!(
@@ -284,7 +335,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!(
         "Judged on two held-out months and only when the two agree. H23 (depth reach) is \
-         registered and is read only if H22 confirms; its judge is not built."
+         registered and read only when H22 confirms."
     );
 
     println!();

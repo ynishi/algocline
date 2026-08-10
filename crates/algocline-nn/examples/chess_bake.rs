@@ -346,12 +346,26 @@ fn eval_loss(
 /// reason at once.
 fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     let mut out = Vec::new();
+    let (mut any_eco, mut any_rating) = (false, false);
     for part in spec.split(',') {
         let part = part.trim();
         if let Some(prefix) = part.strip_prefix("eco:") {
-            if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Err(format!("band {part:?} is not an ECO prefix"));
+            // What can match an ECO code, not merely what looks tidy:
+            // a capital A-E, then up to two digits. `eco:c` and
+            // `eco:B2X` are one keystroke from a band that collects
+            // zero games, and the zero-row refusal downstream should
+            // be the second line of defence rather than the first.
+            let mut chars = prefix.chars();
+            let well_formed = matches!(chars.next(), Some('A'..='E'))
+                && prefix.len() <= 3
+                && chars.all(|c| c.is_ascii_digit());
+            if !well_formed {
+                return Err(format!(
+                    "band {part:?} is not an ECO prefix (a capital letter A-E, then up to two \
+                     digits)"
+                ));
             }
+            any_eco = true;
             out.push(ConditionBand::tag_prefix(
                 "ECO",
                 prefix,
@@ -359,6 +373,7 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
             ));
             continue;
         }
+        any_rating = true;
         let (lo, hi) = part
             .split_once('-')
             .ok_or_else(|| format!("band {part:?} is not a min-max range"))?;
@@ -381,6 +396,20 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     }
     if out.is_empty() {
         return Err("no bands given".into());
+    }
+    if any_eco && any_rating {
+        // The two derivations disagree about what the complement of a
+        // band is. `band_for` tests in order, so an ECO game inside the
+        // rating range is claimed by whichever band comes first and the
+        // rating band's rows mean "in the range and not that family" —
+        // while `narrow`, walking that band later, re-admits the
+        // family's games. One corpus, two readings of the same token.
+        return Err(
+            "bands mix ECO families and rating ranges; the corpus derivation (first match wins) \
+             and the walk-side filter would disagree about what each band's games are. Condition \
+             on one axis and narrow the population on the other (CHESS_FILTER_ELO)"
+                .into(),
+        );
     }
     Ok(out)
 }
@@ -725,11 +754,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // a game outside every band is rejected when its token is resolved,
     // which is one code path instead of keeping a filter and a band
     // list in agreement.
+    //
+    // `CHESS_FILTER_ELO=min-max` narrows the population on the axis the
+    // bands stopped occupying: when the bands are opening families, the
+    // condition no longer says anything about who was playing, and a
+    // corpus of "everyone who ever opened 1. e4" spans 400 to 3100. One
+    // contiguous range (both players inside it), because the filter's
+    // predicates conjoin — it cannot say "one of these three disjoint
+    // bands", and nothing in the plan this serves needs it to.
+    let mut filter = GameFilter::accept_all()
+        .decided_on_the_board()
+        .with_min_base_seconds(180)
+        .with_ply_bounds(10, None);
+    if let Ok(range) = env::var("CHESS_FILTER_ELO") {
+        let (lo, hi) = range
+            .split_once('-')
+            .ok_or_else(|| format!("CHESS_FILTER_ELO {range:?} is not a min-max range"))?;
+        let min: i64 = lo
+            .trim()
+            .parse()
+            .map_err(|_| format!("CHESS_FILTER_ELO {range:?} has an unreadable minimum"))?;
+        let max: i64 = hi
+            .trim()
+            .parse()
+            .map_err(|_| format!("CHESS_FILTER_ELO {range:?} has an unreadable maximum"))?;
+        if min > max {
+            return Err(format!("CHESS_FILTER_ELO {range:?} is inverted").into());
+        }
+        eprintln!("[bake] population narrowed to both players inside {min}-{max}");
+        filter = filter.with_rating_band(min, max);
+    }
     let opts = CorpusOptions {
-        filter: GameFilter::accept_all()
-            .decided_on_the_board()
-            .with_min_base_seconds(180)
-            .with_ply_bounds(10, None),
+        filter,
         max_rows,
         max_len: Some(shape.ctx),
         condition: Some(spec.clone()),
@@ -748,6 +804,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         t0.elapsed(),
         corpus.stats.tokens
     );
+    // Per band, and a refusal on zero. The aggregate above cannot show
+    // one band collecting nothing — a typo'd band (`eco:c` for `eco:C`,
+    // `9000-9999`) folds its games into `rejected_by_condition` and the
+    // run proceeds to write a sidecar listing a token whose condition
+    // row no gradient ever reached. Downstream accepts that token and
+    // sweeps an untrained embedding, every figure well-formed.
+    if let Some(row_bands) = &corpus.bands {
+        let mut counts = vec![0usize; bands.len()];
+        for b in row_bands {
+            if let Some(slot) = counts.get_mut(*b) {
+                *slot += 1;
+            }
+        }
+        for (band, n) in bands.iter().zip(&counts) {
+            eprintln!("[bake] band {}: {} row(s)", band.token, n);
+        }
+        if let Some((empty, _)) = bands.iter().zip(&counts).find(|(_, n)| **n == 0) {
+            return Err(format!(
+                "band {} collected zero rows, so its condition row would ship untrained while \
+                 the sidecar still lists it; check the band against the archive's tags",
+                empty.token
+            )
+            .into());
+        }
+    }
 
     // Shuffle, then lay down one shuffled copy per epoch. The dataset
     // walks its rows once in order, so repetition has to be materialised

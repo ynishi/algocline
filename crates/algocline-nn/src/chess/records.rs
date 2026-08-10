@@ -208,9 +208,14 @@ pub struct WalkHeader {
     /// absence and a new file's "no filter" are two different facts
     /// and both occur, which is the [`GammaRecord::ce`] situation
     /// rather than the `legal_input` one. A reader whose question
-    /// needs the filter refuses `None` on the **version**, the same
-    /// move [`crate::chess::steerability::check_legality_roles`]
-    /// makes for the legality axis.
+    /// needs the filter refuses on **both**: the version first (a
+    /// pre-5 file cannot state the filter at all, the move
+    /// [`crate::chess::steerability::check_legality_roles`] makes for
+    /// the legality axis), and then the value — because this struct is
+    /// `pub` with public fields, a header carrying version 5 and
+    /// `None` here is constructible and round-trips, so the version
+    /// alone does not imply the statement was made.
+    /// [`crate::chess::steerability::check_jouseki_roles`] does both.
     #[serde(default)]
     pub games_of: Option<Vec<String>>,
 }

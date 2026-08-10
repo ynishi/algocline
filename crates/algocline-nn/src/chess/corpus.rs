@@ -224,29 +224,48 @@ impl ConditionBand {
 /// The on-disk forms of [`ConditionBand`], for the compatibility
 /// argument that type documents.
 ///
-/// `untagged`, with the legacy form first: a legacy object has `min`
-/// and `max` where a matched one has `matcher`, so the two never both
-/// parse and the order only decides which is tried first.
+/// `untagged`, and each variant denies unknown fields — without that,
+/// an object carrying `min`, `max` **and** `matcher` (a hand-edited
+/// sidecar, half-converted) would parse as `Legacy` and silently drop
+/// the matcher, with the variant order deciding which half of the
+/// edit won. Denied, the hybrid matches neither variant and the file
+/// is refused, which is the only reading that does not guess.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum BandRepr {
     /// The shape every sidecar carried before matchers existed.
-    Legacy { min: i64, max: i64, token: String },
+    Legacy(LegacyBandRepr),
     /// The general shape.
-    Matched {
-        matcher: ConditionMatcher,
-        token: String,
-    },
+    Matched(MatchedBandRepr),
+}
+
+/// `deny_unknown_fields` is a container attribute, so each form is a
+/// struct of its own rather than a struct variant.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyBandRepr {
+    min: i64,
+    max: i64,
+    token: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatchedBandRepr {
+    matcher: ConditionMatcher,
+    token: String,
 }
 
 impl From<BandRepr> for ConditionBand {
     fn from(repr: BandRepr) -> Self {
         match repr {
-            BandRepr::Legacy { min, max, token } => ConditionBand {
+            BandRepr::Legacy(LegacyBandRepr { min, max, token }) => ConditionBand {
                 matcher: ConditionMatcher::IntRange { min, max },
                 token,
             },
-            BandRepr::Matched { matcher, token } => ConditionBand { matcher, token },
+            BandRepr::Matched(MatchedBandRepr { matcher, token }) => {
+                ConditionBand { matcher, token }
+            }
         }
     }
 }
@@ -254,15 +273,15 @@ impl From<BandRepr> for ConditionBand {
 impl From<ConditionBand> for BandRepr {
     fn from(band: ConditionBand) -> Self {
         match band.matcher {
-            ConditionMatcher::IntRange { min, max } => BandRepr::Legacy {
+            ConditionMatcher::IntRange { min, max } => BandRepr::Legacy(LegacyBandRepr {
                 min,
                 max,
                 token: band.token,
-            },
-            matcher @ ConditionMatcher::TagPrefix { .. } => BandRepr::Matched {
+            }),
+            matcher @ ConditionMatcher::TagPrefix { .. } => BandRepr::Matched(MatchedBandRepr {
                 matcher,
                 token: band.token,
-            },
+            }),
         }
     }
 }
@@ -1265,6 +1284,18 @@ mod tests {
         assert!(written.get("matcher").is_some());
         let back: ConditionBand = serde_json::from_value(written).unwrap();
         assert_eq!(back, prefix);
+    }
+
+    /// A hand-edited sidecar carrying both the legacy fields and a
+    /// matcher is refused rather than read as whichever half the
+    /// variant order favours.
+    #[test]
+    fn a_hybrid_band_object_is_refused_not_guessed() {
+        let hybrid = serde_json::json!({
+            "min": 0, "max": 1599, "token": "<elo:low>",
+            "matcher": {"TagPrefix": {"key": "ECO", "prefix": "B"}}
+        });
+        assert!(serde_json::from_value::<ConditionBand>(hybrid).is_err());
     }
 
     /// The walk-side reading: a rating band requires both players

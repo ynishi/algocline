@@ -258,6 +258,66 @@ pub const SCOREABLE_VERSION: u32 = 3;
 /// comparison.
 pub const LEGALITY_AXIS_VERSION: u32 = 4;
 
+/// Jouseki experiment (plan 06), primary seed arm.
+///
+/// One recipe, two seeds: the comparison H29 makes is **within** the
+/// model — the correct opening-family token against the wrong one —
+/// so there is no treatment arm and no control, and the second seed
+/// exists only to price the floor.
+pub const ARM_J: &str = "J";
+
+/// Second run of [`ARM_J`], differing only in the shuffle seed.
+pub const ARM_J_B: &str = "J-b";
+
+/// The jouseki experiment's two arms.
+pub const JOUSEKI_ARMS: [&str; 2] = [ARM_J, ARM_J_B];
+
+/// What both checkpoints must have been, on both axes.
+///
+/// Per-position conditioning with no legality input — plan 04's
+/// adopted operating point, held constant rather than varied. Unlike
+/// [`SURVIVAL_ROLES`] the two arms here agree on every axis a header
+/// states about the **checkpoint**; what separates a jouseki walk from
+/// another is which games it walked, and that axis is checked against
+/// [`crate::chess::records::WalkHeader::games_of`] by
+/// [`check_jouseki_roles`] rather than here.
+pub const JOUSEKI_ROLES: [(&str, CondEncoding, bool); 2] = [
+    (ARM_J, CondEncoding::EveryPosition, false),
+    (ARM_J_B, CondEncoding::EveryPosition, false),
+];
+
+/// Oldest record format whose header states which games were walked.
+///
+/// [`crate::chess::records::WalkHeader::games_of`] arrived at version
+/// 5. Before it a walk over one family's games and a walk over
+/// another's produced headers that could not be told apart, and H29's
+/// cost — read per band against the walk's own family — would have its
+/// sign silently reversed by feeding it the other file. The same move
+/// [`LEGALITY_AXIS_VERSION`] makes for the legality axis: refuse on
+/// the version, where the field's absence and its default cannot be
+/// confused.
+pub const WALK_FILTER_VERSION: u32 = 5;
+
+/// How far [`ARM_J_B`]'s mean top-1 match may sit from [`ARM_J`]'s.
+///
+/// The reference is the seed replicate — there is no other arm. The
+/// two runs differ in nothing but the shuffle seed, so the only thing
+/// this can catch is a run defect (a wrong corpus, a wrong step count,
+/// a stale checkpoint in one slot); the treatment axis H29 reads runs
+/// **within** each model and no admission band can sit across it. The
+/// tolerance is [`TOP1_GATE_SURVIVAL`]'s, carried rather than re-derived:
+/// same recipe, same objective, and the same-recipe seed gap it was
+/// sized against (0.0123 / 0.0112) is the quantity being bounded here.
+pub const TOP1_GATE_JOUSEKI: f64 = 0.03;
+
+/// The shallow stratum H29 prints descriptively: ply 0 through 19.
+///
+/// Plan 06 §3 registers the main judgment over the whole walk and the
+/// ply strata as description only — an opening family is a property of
+/// the early plies, so the cost fading with depth is expected rather
+/// than disqualifying, and a stratum is not given a verdict.
+pub const JOUSEKI_SHALLOW: (usize, usize) = (0, 20);
+
 /// Games the floor `§5.3` measured is quoted at, and the anchor of the
 /// curve [`Resolution::at`] reads.
 ///
@@ -421,6 +481,86 @@ pub enum StatError {
         found: u32,
         /// Oldest version that carries the field.
         needed: u32,
+    },
+
+    /// An arm's walk predates the header field that states which games
+    /// were walked.
+    ///
+    /// [`StatError::RecordsPredateLegalityAxis`]'s counterpart for the
+    /// walk-filter axis: before [`WALK_FILTER_VERSION`] the header
+    /// could not say whose games these are, and H29's per-band cost
+    /// read against the wrong family reverses sign with every figure
+    /// well-formed. Same remedy as there — walk again with a current
+    /// binary — rather than trusting a default.
+    #[error(
+        "arm {arm:?} was walked at record format version {found}, and checking which games it \
+         walked needs {needed} or later; before that the header could not state the filter at \
+         all, and a walk of the wrong family's games reverses the sign of the per-band cost \
+         with every number well-formed"
+    )]
+    RecordsPredateWalkFilter {
+        /// Arm whose walk is too old to state the filter.
+        arm: &'static str,
+        /// Version its header declares.
+        found: u32,
+        /// Oldest version that carries the field.
+        needed: u32,
+    },
+
+    /// An arm's walk was over different games than its slot calls for.
+    ///
+    /// The jouseki arms differ from each other on no checkpoint axis —
+    /// same recipe, both per-position, both maskless on the input side
+    /// — so which **games** were walked is the only axis a swap could
+    /// show up on, and this is what refuses it. The header states it
+    /// ([`crate::chess::records::WalkHeader::games_of`]) since format
+    /// version 5, and [`StatError::RecordsPredateWalkFilter`] keeps an
+    /// older walk from arriving here dressed as an unfiltered one.
+    #[error(
+        "arm {arm:?} was walked over games of {found}, and this slot reads them as games of \
+         {want:?}; the per-band cost read against the wrong family reverses sign with every \
+         number well-formed"
+    )]
+    WrongWalkedGamesForRole {
+        /// Arm whose walked games do not fit the slot.
+        arm: &'static str,
+        /// The family token the slot is being read as.
+        want: String,
+        /// What the walk's header records, rendered for the message.
+        found: String,
+    },
+
+    /// The family token a slot is being read as is not one of the
+    /// walk's bands.
+    ///
+    /// The cost is an index into the per-band columns, so a token the
+    /// band list does not carry has no column — and the near-miss this
+    /// refuses is a checkpoint of another band vocabulary reaching the
+    /// judge with every file self-consistent.
+    #[error(
+        "family token {token:?} is not among the walk's bands {bands:?}, so it names no per-band \
+         column to read a cost from"
+    )]
+    FamilyTokenNotABand {
+        /// The token the caller asked to read.
+        token: String,
+        /// The bands the walk carries.
+        bands: Vec<String>,
+    },
+
+    /// The jouseki judge needs exactly two bands.
+    ///
+    /// Plan 06 registers a two-family design: one correct column, one
+    /// wrong one. A third band would make "the wrong token" a choice,
+    /// and a choice made after the walk is a knob; the plan has none,
+    /// so the judge refuses rather than picking.
+    #[error(
+        "the jouseki walk carries {found} band(s) and the registered design has exactly two — \
+         with more, which token counts as the wrong one becomes a post-hoc choice"
+    )]
+    JousekiNeedsTwoBands {
+        /// Bands the walk carries.
+        found: usize,
     },
 
     /// An arm's records predate the fields a statistic reads.
@@ -1944,6 +2084,278 @@ pub fn h23(arms: &AlignedArms, gamma: f32, draws: usize, seed: u64) -> Result<H2
         floor,
         confirm,
         refute,
+    })
+}
+
+/// The jouseki arms fit [`JOUSEKI_ROLES`] and this pair of walks is the
+/// family it claims to be. Returns the (correct, wrong) band columns.
+///
+/// Three refusals, in the order a reader would want them: the
+/// checkpoint axes ([`require_kinds`], as every judge here), the walk
+/// filter's *statability* ([`WALK_FILTER_VERSION`] — a pre-5 walk
+/// cannot say whose games it walked, in either direction), and the
+/// walk filter's *value* — `games_of` must be exactly the one family
+/// token this pair of walks is being read as. The band list must carry
+/// exactly two tokens ([`StatError::JousekiNeedsTwoBands`]), and the
+/// family must be one of them; the other is the wrong column.
+///
+/// What a swap does: feed the C-games walks where the B-games walks
+/// belong and the cost is read against the wrong family — sign
+/// reversed, every figure well-formed. That is the swap the `games_of`
+/// comparison refuses, and the reason the field exists at all.
+pub fn check_jouseki_roles(arms: &AlignedArms, family: &str) -> Result<(usize, usize), StatError> {
+    require_kinds(arms, &JOUSEKI_ROLES)?;
+    for arm in JOUSEKI_ARMS {
+        let header = &arms.walk(arm)?.header;
+        if header.version < WALK_FILTER_VERSION {
+            return Err(StatError::RecordsPredateWalkFilter {
+                arm,
+                found: header.version,
+                needed: WALK_FILTER_VERSION,
+            });
+        }
+        if header.games_of.as_deref() != Some(std::slice::from_ref(&family.to_string())) {
+            return Err(StatError::WrongWalkedGamesForRole {
+                arm,
+                want: family.to_string(),
+                found: match &header.games_of {
+                    Some(tokens) => format!("{tokens:?}"),
+                    None => "(unstated)".to_string(),
+                },
+            });
+        }
+    }
+    let bands = &arms.walk(ARM_J)?.header.bands;
+    if bands.len() != 2 {
+        return Err(StatError::JousekiNeedsTwoBands { found: bands.len() });
+    }
+    let correct =
+        bands
+            .iter()
+            .position(|b| b == family)
+            .ok_or_else(|| StatError::FamilyTokenNotABand {
+                token: family.to_string(),
+                bands: bands.clone(),
+            })?;
+    Ok((correct, 1 - correct))
+}
+
+/// One family's half of H29: the mis-conditioning cost of the walk's
+/// own family, floored by the pair's seed gap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct H29Family {
+    /// The family token the walked games belong to.
+    pub family: String,
+    /// `cost = top1(correct token) - top1(wrong token)` for [`ARM_J`],
+    /// on the sample as walked.
+    pub cost_j: f64,
+    /// The same quantity for [`ARM_J_B`], the seed replicate.
+    pub cost_j_b: f64,
+    /// `F = |cost(J) - cost(J-b)|`, the pair's seed gap.
+    ///
+    /// One pair rather than [`h22`]'s two, and not a borrowed floor:
+    /// borrowing is standing one recipe's gap in for another's, and
+    /// H29 has one recipe — the comparison runs within each model,
+    /// between its own two condition columns.
+    pub floor: f64,
+    /// Interval on `cost(J) - F`. This family confirms when it
+    /// excludes zero from above.
+    pub confirm: Interval,
+    /// Interval on `cost(J) + F`. This family refutes when it excludes
+    /// zero from below.
+    pub refute: Interval,
+    /// `cost(J)` over ply 0-19 only — description, no verdict. `None`
+    /// when the stratum caught no scoreable position.
+    pub shallow_cost_j: Option<f64>,
+    /// `cost(J)` over ply 20 and deeper — description, no verdict.
+    pub deep_cost_j: Option<f64>,
+    /// Positions the two arms share.
+    pub positions: usize,
+    /// Games those positions came from — the clusters resampled.
+    pub games: usize,
+}
+
+impl H29Family {
+    /// Whether the confirm interval clears zero from above.
+    pub fn confirmed(&self) -> bool {
+        self.confirm.excludes_zero_from_above()
+    }
+
+    /// Whether the refute interval clears zero from below.
+    pub fn refuted(&self) -> bool {
+        self.refute.excludes_zero_from_below()
+    }
+}
+
+/// One family's cost, floor and intervals.
+///
+/// The cost is per position `top1[correct] - top1[wrong]` — `+1` where
+/// only the walk's own family token ranks the played move first, `-1`
+/// where only the wrong token does, `0` where they agree — meaned over
+/// the positions, so the family-level figure is the familiar
+/// difference of top-1 rates. `None` positions (a played move outside
+/// the vocabulary) drop from both columns at once, since both are read
+/// off the same record.
+///
+/// Floor and margin are recomputed inside every draw, as [`h22`]'s
+/// are, and for the same reason: a gap frozen as a scalar would report
+/// a precision one pair of runs does not carry.
+///
+/// # Errors
+///
+/// Whatever [`check_jouseki_roles`] refuses, a gamma that was not
+/// swept, or the resampling refusing.
+pub fn h29_family(
+    arms: &AlignedArms,
+    family: &str,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29Family, StatError> {
+    let (correct, wrong) = check_jouseki_roles(arms, family)?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let cost = move |at: &GammaRecord| -> Option<f64> {
+        let per_band = at.top1.as_ref()?;
+        let c = *per_band.get(correct)?;
+        let w = *per_band.get(wrong)?;
+        Some((c as i64 - w as i64) as f64)
+    };
+    let j = tally(arms, ARM_J, gamma_ix, cost)?;
+    let j_b = tally(arms, ARM_J_B, gamma_ix, cost)?;
+
+    // One draw, every term, as in `h22`.
+    let margin_and_floor = |draw: &[usize]| -> Option<(f64, f64)> {
+        let a = j.mean_over(draw)?;
+        let b = j_b.mean_over(draw)?;
+        Some((a, (a - b).abs()))
+    };
+    let confirm = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        margin_and_floor(draw).map(|(m, f)| m - f)
+    })?;
+    let refute = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        margin_and_floor(draw).map(|(m, f)| m + f)
+    })?;
+    let whole: Vec<usize> = (0..arms.games()).collect();
+    let (cost_j, floor) = margin_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+
+    let deep_range = (JOUSEKI_SHALLOW.1, usize::MAX);
+    let shallow = tally_in_bucket(arms, ARM_J, gamma_ix, JOUSEKI_SHALLOW, cost)?;
+    let deep = tally_in_bucket(arms, ARM_J, gamma_ix, deep_range, cost)?;
+
+    Ok(H29Family {
+        family: family.to_string(),
+        cost_j,
+        cost_j_b: j_b.total().mean().unwrap_or(f64::NAN),
+        floor,
+        confirm,
+        refute,
+        shallow_cost_j: shallow.total().mean(),
+        deep_cost_j: deep.total().mean(),
+        positions: arms.positions(),
+        games: arms.games(),
+    })
+}
+
+/// Plan 06's primary hypothesis: does a jouseki token steer toward its
+/// own family's games?
+#[derive(Debug, Clone, PartialEq)]
+pub struct H29 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// The two families, each judged on its own walks.
+    pub families: [H29Family; 2],
+}
+
+impl H29 {
+    /// The verdict on one month.
+    ///
+    /// Confirmed only when **both** families confirm — plan 06 §3's
+    /// min-logic, taken at the verdict layer because the two families'
+    /// walks are different position streams with different clusters,
+    /// so a single interval on the min would need a joint resample the
+    /// registered statistic does not define. A result where only one
+    /// family's token steers is exactly what the min exists to keep
+    /// out of a confirmation. Refuted when either family refutes;
+    /// everything else is undetermined.
+    pub fn verdict(&self) -> &'static str {
+        let all_confirmed = self.families.iter().all(H29Family::confirmed);
+        let any_refuted = self.families.iter().any(H29Family::refuted);
+        match (all_confirmed, any_refuted) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H29 from the two families' arm pairs.
+///
+/// Two [`AlignedArms`] rather than one because the families' walks are
+/// different games — there is no shared position stream for one
+/// alignment to hold, and each family's bootstrap resamples its own
+/// clusters.
+///
+/// # Errors
+///
+/// As [`h29_family`], for either family; or the two pairs disagree on
+/// the band list, which would mean two different checkpoints' walks
+/// were mixed — [`StatError::FamilyTokenNotABand`] would catch most
+/// such mixes late and confusingly, so the lists are compared first.
+pub fn h29(
+    arms_by_family: [(&AlignedArms, &str); 2],
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29, StatError> {
+    let [(arms_a, family_a), (arms_b, family_b)] = arms_by_family;
+    let bands_a = &arms_a.walk(ARM_J)?.header.bands;
+    let bands_b = &arms_b.walk(ARM_J)?.header.bands;
+    if bands_a != bands_b {
+        return Err(StatError::FamilyTokenNotABand {
+            token: family_b.to_string(),
+            bands: bands_a.clone(),
+        });
+    }
+    Ok(H29 {
+        gamma,
+        families: [
+            h29_family(arms_a, family_a, gamma, draws, seed)?,
+            h29_family(arms_b, family_b, gamma, draws, seed)?,
+        ],
+    })
+}
+
+/// The jouseki admission gate: [`ARM_J_B`]'s mean top-1 match as a
+/// difference against [`ARM_J`]'s, at [`TOP1_GATE_JOUSEKI`].
+///
+/// The reference is the seed replicate because there is nothing else:
+/// no control, no treatment arm. The two runs differ in the shuffle
+/// seed alone, so a difference outside the band is a run defect — a
+/// wrong corpus or step count in one slot — rather than an effect,
+/// and both passing and failing are reachable (the same-recipe seed
+/// gap was measured at 0.0123 / 0.0112 against a 0.03 tolerance).
+///
+/// # Errors
+///
+/// As [`check_jouseki_roles`], plus a gamma that was not swept or the
+/// resampling refusing.
+pub fn gate_top1_jouseki(
+    arms: &AlignedArms,
+    family: &str,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<Gate, StatError> {
+    check_jouseki_roles(arms, family)?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let subject = tally(arms, ARM_J_B, gamma_ix, top1_mean)?;
+    let baseline = tally(arms, ARM_J, gamma_ix, top1_mean)?;
+    let interval = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        Some(subject.mean_over(draw)? - baseline.mean_over(draw)?)
+    })?;
+    Ok(Gate {
+        interval,
+        tolerance: TOP1_GATE_JOUSEKI,
     })
 }
 
@@ -4581,5 +4993,192 @@ mod tests {
         let c = h14(&build(), 1.0, 500, SEED + 1).unwrap();
         assert_eq!(a, b);
         assert_ne!(a.confirm, c.confirm);
+    }
+
+    const ECO_B: &str = "<eco:B>";
+    const ECO_C: &str = "<eco:C>";
+
+    /// A jouseki walk: per-position conditioning, two family bands,
+    /// and a header that states whose games these are. `hit(band, game,
+    /// ix)` decides each band's top-1 column; `js` marks the arm so
+    /// two otherwise-identical fixtures are not refused as one file
+    /// read twice (nothing the jouseki statistics read consumes it).
+    fn jouseki_walk(
+        games: usize,
+        per_game: usize,
+        family: &str,
+        js: f64,
+        hit: impl Fn(usize, usize, usize) -> bool,
+    ) -> Walk {
+        let mut records = Vec::new();
+        for game in 0..games {
+            for ix in 0..per_game {
+                records.push(PositionRecord {
+                    game,
+                    ply: ix * 2,
+                    n_legal: None,
+                    at: vec![GammaRecord {
+                        flipped: false,
+                        widest_js: js,
+                        legal_mass: 0.9,
+                        top1: Some(vec![hit(0, game, ix), hit(1, game, ix)]),
+                        ce: None,
+                        top2_margin: None,
+                    }],
+                });
+            }
+        }
+        let mut header = header(records.len(), games);
+        header.encoding = CondEncoding::EveryPosition;
+        header.bands = vec![ECO_B.into(), ECO_C.into()];
+        header.gammas = GAMMAS.to_vec();
+        header.games_of = Some(vec![family.into()]);
+        Walk { header, records }
+    }
+
+    fn jouseki_arms(mut j: Walk, mut j_b: Walk) -> AlignedArms {
+        j.header.ckpt = "/root/ckpt/J/run.safetensors".into();
+        j_b.header.ckpt = "/root/ckpt/J-b/run.safetensors".into();
+        AlignedArms::new(vec![(ARM_J.to_string(), j), (ARM_J_B.to_string(), j_b)])
+            .expect("the fixture arms share a position stream")
+    }
+
+    /// A walk too old to state whose games it walked is refused on the
+    /// version, not read on a default.
+    #[test]
+    fn a_pre_v5_jouseki_walk_is_refused() {
+        let mut j = jouseki_walk(4, 6, ECO_B, 0.0, |band, _, _| band == 0);
+        j.header.version = 4;
+        j.header.games_of = None;
+        let mut j_b = jouseki_walk(4, 6, ECO_B, 0.001, |band, _, _| band == 0);
+        j_b.header.version = 4;
+        j_b.header.games_of = None;
+        let arms = jouseki_arms(j, j_b);
+        assert!(matches!(
+            check_jouseki_roles(&arms, ECO_B),
+            Err(StatError::RecordsPredateWalkFilter { needed: 5, .. })
+        ));
+    }
+
+    /// The swap the field exists to refuse: the other family's walks in
+    /// this family's slot. The cost would reverse sign with every
+    /// figure well-formed, so the mismatch has to be an error.
+    #[test]
+    fn a_walk_of_the_other_familys_games_is_refused() {
+        let arms = jouseki_arms(
+            jouseki_walk(4, 6, ECO_C, 0.0, |band, _, _| band == 0),
+            jouseki_walk(4, 6, ECO_C, 0.001, |band, _, _| band == 0),
+        );
+        assert!(matches!(
+            check_jouseki_roles(&arms, ECO_B),
+            Err(StatError::WrongWalkedGamesForRole { .. })
+        ));
+        // And read as its own family it passes, naming B's column as
+        // correct is index 0 only when the family is B.
+        let arms = jouseki_arms(
+            jouseki_walk(4, 6, ECO_C, 0.0, |band, _, _| band == 0),
+            jouseki_walk(4, 6, ECO_C, 0.001, |band, _, _| band == 0),
+        );
+        assert_eq!(check_jouseki_roles(&arms, ECO_C).unwrap(), (1, 0));
+    }
+
+    /// A version 5 walk that states "deliberately unfiltered" is still
+    /// not a family's walk — `Some(vec![])` is a statement, and it is
+    /// the wrong one for a slot that reads games of one family.
+    #[test]
+    fn a_deliberately_unfiltered_walk_is_not_a_familys_walk() {
+        let mut j = jouseki_walk(4, 6, ECO_B, 0.0, |band, _, _| band == 0);
+        j.header.games_of = Some(vec![]);
+        let mut j_b = jouseki_walk(4, 6, ECO_B, 0.001, |band, _, _| band == 0);
+        j_b.header.games_of = Some(vec![]);
+        let arms = jouseki_arms(j, j_b);
+        assert!(matches!(
+            check_jouseki_roles(&arms, ECO_B),
+            Err(StatError::WrongWalkedGamesForRole { .. })
+        ));
+    }
+
+    /// A third band would make "the wrong token" a post-hoc choice, so
+    /// the registered two-family design is enforced.
+    #[test]
+    fn a_third_band_is_refused() {
+        let mut j = jouseki_walk(4, 6, ECO_B, 0.0, |band, _, _| band == 0);
+        j.header.bands.push("<eco:A>".into());
+        let mut j_b = jouseki_walk(4, 6, ECO_B, 0.001, |band, _, _| band == 0);
+        j_b.header.bands.push("<eco:A>".into());
+        let arms = jouseki_arms(j, j_b);
+        assert!(matches!(
+            check_jouseki_roles(&arms, ECO_B),
+            Err(StatError::JousekiNeedsTwoBands { found: 3 })
+        ));
+    }
+
+    /// The cost on a fixture fixed by construction: the correct column
+    /// hits everywhere, the wrong one nowhere, both seeds agree — cost
+    /// 1, floor 0, confirmed. And the deliberate near-miss: a model
+    /// whose columns agree everywhere prices the cost at exactly zero,
+    /// which confirms nothing.
+    #[test]
+    fn h29_family_prices_the_cost_against_the_walks_own_family() {
+        let strong = |band: usize, _: usize, _: usize| band == 0;
+        let arms = jouseki_arms(
+            jouseki_walk(6, 8, ECO_B, 0.0, strong),
+            jouseki_walk(6, 8, ECO_B, 0.001, strong),
+        );
+        let family = h29_family(&arms, ECO_B, 1.0, 200, SEED).unwrap();
+        assert_eq!(family.cost_j, 1.0);
+        assert_eq!(family.floor, 0.0);
+        assert!(family.confirmed());
+        assert_eq!(family.shallow_cost_j, Some(1.0));
+
+        let flat = |_: usize, _: usize, _: usize| true;
+        let arms = jouseki_arms(
+            jouseki_walk(6, 8, ECO_B, 0.0, flat),
+            jouseki_walk(6, 8, ECO_B, 0.001, flat),
+        );
+        let family = h29_family(&arms, ECO_B, 1.0, 200, SEED).unwrap();
+        assert_eq!(family.cost_j, 0.0);
+        assert!(!family.confirmed());
+        assert!(!family.refuted());
+    }
+
+    /// Plan 06 §3's min-logic at the verdict layer: one steering family
+    /// is not a confirmation of the month.
+    #[test]
+    fn the_month_confirms_only_when_both_families_do() {
+        let steer_b = |band: usize, _: usize, _: usize| band == 0;
+        let steer_c = |band: usize, _: usize, _: usize| band == 1;
+        let flat = |_: usize, _: usize, _: usize| true;
+
+        let b_arms = jouseki_arms(
+            jouseki_walk(6, 8, ECO_B, 0.0, steer_b),
+            jouseki_walk(6, 8, ECO_B, 0.001, steer_b),
+        );
+        let c_flat = jouseki_arms(
+            jouseki_walk(6, 8, ECO_C, 0.0, flat),
+            jouseki_walk(6, 8, ECO_C, 0.001, flat),
+        );
+        let one_sided = h29([(&b_arms, ECO_B), (&c_flat, ECO_C)], 1.0, 200, SEED).unwrap();
+        assert_eq!(one_sided.verdict(), "undetermined");
+
+        let c_arms = jouseki_arms(
+            jouseki_walk(6, 8, ECO_C, 0.0, steer_c),
+            jouseki_walk(6, 8, ECO_C, 0.001, steer_c),
+        );
+        let both = h29([(&b_arms, ECO_B), (&c_arms, ECO_C)], 1.0, 200, SEED).unwrap();
+        assert_eq!(both.verdict(), "confirmed");
+    }
+
+    /// Two identical runs sit at zero distance, and the gate passes.
+    #[test]
+    fn identical_jouseki_seeds_pass_the_admission_gate() {
+        let hit = |band: usize, g: usize, ix: usize| band == 0 && (g + ix).is_multiple_of(2);
+        let arms = jouseki_arms(
+            jouseki_walk(6, 8, ECO_B, 0.0, hit),
+            jouseki_walk(6, 8, ECO_B, 0.001, hit),
+        );
+        let gate = gate_top1_jouseki(&arms, ECO_B, 1.0, DRAWS, SEED).unwrap();
+        assert_eq!(gate.interval.point, 0.0);
+        assert!(gate.passes());
     }
 }

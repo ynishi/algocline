@@ -65,7 +65,8 @@ use crate::chess::CondEncoding;
 ///
 /// Version 2 added [`GammaRecord::top2_margin`]. Version 3 added
 /// [`GammaRecord::ce`] and [`PositionRecord::n_legal`]. Version 4 added
-/// [`WalkHeader::legal_input`]. No bump has changed a field that
+/// [`WalkHeader::legal_input`]. Version 5 added
+/// [`WalkHeader::games_of`]. No bump has changed a field that
 /// already existed. A reader accepts [`MIN_READABLE_VERSION`] through
 /// this and refuses anything outside that range rather than
 /// interpreting unfamiliar fields as absent, which is the same stance
@@ -78,8 +79,10 @@ use crate::chess::CondEncoding;
 /// the version is where the format question is answered. See
 /// [`GammaRecord::ce`]. Version 4's addition is to the *header* and is
 /// a plain `bool`, for a reason that field documents: there the default
-/// is not a stand-in for an unanswered question.
-pub const FORMAT_VERSION: u32 = 4;
+/// is not a stand-in for an unanswered question. Version 5's is a
+/// header `Option`, because for it the two absences are different
+/// facts again — [`WalkHeader::games_of`] has the arithmetic.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Oldest version this build still reads.
 ///
@@ -181,6 +184,35 @@ pub struct WalkHeader {
     /// position. [`AlignedArms::games`] reports the clustering figure,
     /// which counts only games that did contribute.
     pub games: usize,
+    /// Condition tokens of the filter that selected the walk's games,
+    /// or `None` on a file written before version 5.
+    ///
+    /// The last axis of a walk's identity the header did not state.
+    /// [`Self::encoding`] and [`Self::legal_input`] record how the
+    /// **checkpoint** was trained; this records which games the
+    /// **walk** scored. Before it, a walk over one band's games and a
+    /// walk over another's produced headers that could not be told
+    /// apart, and any per-band comparison that depends on which games
+    /// were walked — "does the correct band predict its own games
+    /// best" is one — could have its sign silently reversed by feeding
+    /// it the other file. Plan 04 had to establish the walked band
+    /// from run logs and from [`AlignedArms`]' position-stream match
+    /// instead of from the file itself.
+    ///
+    /// A list rather than a single token because a walk may be
+    /// narrowed on more than one axis at once (an opening family and
+    /// a rating band), and `Some(vec![])` is itself a statement: the
+    /// walk was deliberately unfiltered. That is why this is an
+    /// `Option` where [`Self::legal_input`] is a plain `bool` — there
+    /// `false` is what every pre-4 walk meant, here an old file's
+    /// absence and a new file's "no filter" are two different facts
+    /// and both occur, which is the [`GammaRecord::ce`] situation
+    /// rather than the `legal_input` one. A reader whose question
+    /// needs the filter refuses `None` on the **version**, the same
+    /// move [`crate::chess::steerability::check_legality_roles`]
+    /// makes for the legality axis.
+    #[serde(default)]
+    pub games_of: Option<Vec<String>>,
 }
 
 /// One position, under every guidance strength the walk swept.
@@ -1185,6 +1217,7 @@ mod tests {
             gammas: vec![1.0, 4.0],
             positions,
             games,
+            games_of: Some(vec!["<elo:1100-1299>".into()]),
         }
     }
 
@@ -1369,6 +1402,34 @@ mod tests {
         let walk = Walk::read_jsonl(&path).expect("a version 3 walk is still readable");
         assert_eq!(walk.header.version, 3);
         assert!(!walk.header.legal_input);
+        // The version 5 field reads back as the absence it is on a
+        // pre-5 file, not as an empty filter — the two are different
+        // facts, and `games_of`'s doc leans on this distinction.
+        assert_eq!(walk.header.games_of, None);
+    }
+
+    /// The two statements a version 5 header can make about its games
+    /// — narrowed to these tokens, or deliberately left open — both
+    /// survive the file, and neither collapses into the pre-5 `None`.
+    #[test]
+    fn the_walked_games_statement_round_trips_including_deliberately_open() {
+        let tmp = TempDir::new().unwrap();
+        for games_of in [
+            Some(vec!["<eco:B>".to_string(), "<elo:1100-1299>".to_string()]),
+            Some(vec![]),
+        ] {
+            let path = tmp.path().join("walk.jsonl");
+            let mut h = header(0, 0);
+            h.games_of = games_of.clone();
+            Walk {
+                header: h,
+                records: vec![],
+            }
+            .write_jsonl(&path)
+            .unwrap();
+            let back = Walk::read_jsonl(&path).unwrap();
+            assert_eq!(back.header.games_of, games_of);
+        }
     }
 
     /// And a record written now carries the margin through the file and

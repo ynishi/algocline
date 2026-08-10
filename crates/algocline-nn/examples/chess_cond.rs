@@ -873,6 +873,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 gammas: gammas.clone(),
                 positions: records.len(),
                 games,
+                // The tokens the walk's games were narrowed to, or an
+                // empty list when the walk was deliberately left open
+                // — stated either way, so a reader does not have to
+                // recover which games these were from a run log.
+                games_of: Some(walk_token.iter().cloned().collect()),
             },
             records,
         };

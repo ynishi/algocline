@@ -2428,6 +2428,7 @@ mod tests {
             gammas: GAMMAS.to_vec(),
             positions,
             games,
+            games_of: Some(vec!["<lo>".into()]),
         }
     }
 

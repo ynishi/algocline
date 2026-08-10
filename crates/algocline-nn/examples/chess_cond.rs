@@ -312,7 +312,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(arg) => {
             let token = resolve_band(&shape, arg)?;
             let band = shape.band(&token).expect("resolved");
-            filter = filter.with_rating_band(band.min, band.max);
+            filter = band.narrow(filter);
             Some(token)
         }
         None => None,

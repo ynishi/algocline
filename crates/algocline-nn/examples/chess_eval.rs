@@ -137,7 +137,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_ply_bounds(10, None);
     if let Some(token) = &measure {
         let band = shape.band(token).ok_or("measure band missing")?;
-        filter = filter.with_rating_band(band.min, band.max);
+        filter = band.narrow(filter);
     }
 
     let mut reader = PgnReader::new(BufReader::new(File::open(&pgn)?));

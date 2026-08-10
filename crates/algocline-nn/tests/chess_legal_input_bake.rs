@@ -65,11 +65,7 @@ const CTX: usize = 16;
 const BATCH: usize = 2;
 
 fn bands() -> Vec<ConditionBand> {
-    vec![ConditionBand {
-        min: 1100,
-        max: 2099,
-        token: "<elo:1100-2099>".into(),
-    }]
+    vec![ConditionBand::rating(1100, 2099, "<elo:1100-2099>")]
 }
 
 /// Six games, each four plies long, all inside the one band.

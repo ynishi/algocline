@@ -993,16 +993,8 @@ mod tests {
         let mut shape = ModelShape::compact(
             2048,
             vec![
-                ConditionBand {
-                    min: 1100,
-                    max: 1299,
-                    token: "<elo:1100-1299>".into(),
-                },
-                ConditionBand {
-                    min: 1900,
-                    max: 2099,
-                    token: "<elo:1900-2099>".into(),
-                },
+                ConditionBand::rating(1100, 1299, "<elo:1100-1299>"),
+                ConditionBand::rating(1900, 2099, "<elo:1900-2099>"),
             ],
         );
         shape.encoding = encoding;

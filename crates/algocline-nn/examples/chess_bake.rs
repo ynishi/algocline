@@ -9,9 +9,10 @@
 //! cargo run --release --example chess_bake -- <path.pgn> <bands> <max_rows> <steps> <side> [ckpt_dir]
 //! ```
 //!
-//! `bands` is one or more rating ranges: `1600-1799`, or
+//! `bands` is one or more rating ranges (`1600-1799`, or
 //! `1100-1299,1900-2099` to train one model that can be asked for
-//! either. Each band gets a condition token prefixed to its games, and
+//! either) or ECO opening families (`eco:B,eco:C`). Each band gets a
+//! condition token prefixed to its games, and
 //! a game outside every band is dropped.
 //!
 //! # Where the condition reaches the model
@@ -141,8 +142,8 @@ use candle_nn::{VarBuilder, VarMap};
 
 use algocline_nn::arch::{CondIndex, Gpt2Model};
 use algocline_nn::chess::corpus::{
-    build_rows, ConditionBand, ConditionSpec, CorpusOptions, LegalMaskedDataset, ScoredSide,
-    TeacherRow,
+    build_rows, ConditionBand, ConditionMatcher, ConditionSpec, CorpusOptions, LegalMaskedDataset,
+    ScoredSide, TeacherRow,
 };
 use algocline_nn::chess::filter::GameFilter;
 use algocline_nn::chess::pgn::PgnReader;
@@ -335,7 +336,8 @@ fn eval_loss(
     Ok((total / counted as f64) as f32)
 }
 
-/// Parse `1100-1299,1900-2099` into condition bands.
+/// Parse `1100-1299,1900-2099` (rating ranges) or `eco:B,eco:C`
+/// (opening families) into condition bands.
 ///
 /// Several bands in one corpus is the interesting case: the model sees
 /// which band it is playing as, so one checkpoint can be asked for
@@ -346,6 +348,17 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     let mut out = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
+        if let Some(prefix) = part.strip_prefix("eco:") {
+            if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Err(format!("band {part:?} is not an ECO prefix"));
+            }
+            out.push(ConditionBand::tag_prefix(
+                "ECO",
+                prefix,
+                format!("<eco:{prefix}>"),
+            ));
+            continue;
+        }
         let (lo, hi) = part
             .split_once('-')
             .ok_or_else(|| format!("band {part:?} is not a min-max range"))?;
@@ -360,11 +373,11 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
         if min > max {
             return Err(format!("band {part:?} is inverted"));
         }
-        out.push(ConditionBand {
+        out.push(ConditionBand::rating(
             min,
             max,
-            token: format!("<elo:{min}-{max}>"),
-        });
+            format!("<elo:{min}-{max}>"),
+        ));
     }
     if out.is_empty() {
         return Err("no bands given".into());
@@ -372,11 +385,19 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     Ok(out)
 }
 
+/// Render one band's matcher for a message or a label.
+fn describe_matcher(band: &ConditionBand) -> String {
+    match &band.matcher {
+        ConditionMatcher::IntRange { min, max } => format!("{min}-{max}"),
+        ConditionMatcher::TagPrefix { key, prefix } => format!("{key}:{prefix}"),
+    }
+}
+
 /// Render a band list for an error message.
 fn describe_bands(bands: &[ConditionBand]) -> String {
     bands
         .iter()
-        .map(|b| format!("{}-{} as {}", b.min, b.max, b.token))
+        .map(|b| format!("{} as {}", describe_matcher(b), b.token))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -567,7 +588,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let path = args.next().ok_or(
         "usage: chess_bake <path.pgn> <bands> [max_rows] [steps] [side] [ckpt_dir]\n\
-         bands is comma-separated ranges, e.g. 1600-1799 or 1100-1299,1900-2099",
+         bands is comma-separated ranges or ECO families, e.g. 1600-1799 or \
+         1100-1299,1900-2099 or eco:B,eco:C",
     )?;
     let bands = parse_bands(&args.next().unwrap_or_else(|| "1600-1799".into()))?;
     let max_rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4000);
@@ -897,9 +919,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let band_label = bands
         .iter()
-        .map(|b| format!("{}-{}", b.min, b.max))
+        .map(describe_matcher)
         .collect::<Vec<_>>()
-        .join("_");
+        .join("_")
+        .replace(':', "");
     let prefix = format!("chess-{band_label}-{side:?}").to_lowercase();
 
     // The shape rides with every checkpoint, written the moment the

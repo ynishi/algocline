@@ -100,7 +100,39 @@ impl ScoredSide {
     }
 }
 
-/// A range of an integer tag mapped to a condition token.
+/// How a game is matched to a condition band.
+///
+/// Two kinds because the two attributes conditioned on so far read
+/// their tags differently: a rating is an integer inside a range, an
+/// ECO family is the leading letter of a code. A closed enum rather
+/// than a predicate so the matcher can be written into a shape sidecar
+/// and compared across checkpoints, which a function cannot be.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ConditionMatcher {
+    /// The tag named by [`ConditionSpec::key`] parses as an integer
+    /// inside this inclusive range.
+    IntRange {
+        /// Inclusive lower bound.
+        min: i64,
+        /// Inclusive upper bound.
+        max: i64,
+    },
+    /// The named tag's value starts with this string.
+    ///
+    /// Carries its own tag name where [`ConditionMatcher::IntRange`]
+    /// reads [`ConditionSpec::key`], because the two axes it serves
+    /// are different tags on the same game — a corpus conditioned on
+    /// ECO families still derives its integer bands, if any, from a
+    /// rating tag.
+    TagPrefix {
+        /// PGN tag to read, e.g. `ECO`.
+        key: String,
+        /// The value's required leading characters, e.g. `B`.
+        prefix: String,
+    },
+}
+
+/// A tag condition mapped to a condition token.
 ///
 /// Comparable because the band list is the part of a model's identity
 /// that its tensors do not carry: the tokens occupy ids `2..2+n`
@@ -108,15 +140,131 @@ impl ScoredSide {
 /// power of two for any plausible number of them. A resume that wants
 /// to know whether a checkpoint was trained on the bands it is being
 /// asked for has to compare the bands themselves.
+///
+/// # Sidecar compatibility
+///
+/// A shape written before [`ConditionMatcher`] existed carries a band
+/// as `{"min", "max", "token"}`, and those files are evidence for
+/// settled results, so they keep parsing (into
+/// [`ConditionMatcher::IntRange`]). A band that *is* an integer range
+/// is still **written** in that legacy form, so conditioning on
+/// ratings produces sidecars an older build reads. A
+/// [`ConditionMatcher::TagPrefix`] band has no legacy form; it is
+/// written as `{"matcher", "token"}`, which an older build refuses
+/// with a parse error — loudly, rather than by scoring a checkpoint
+/// whose condition axis it cannot represent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "BandRepr", into = "BandRepr")]
 pub struct ConditionBand {
-    /// Inclusive lower bound.
-    pub min: i64,
-    /// Inclusive upper bound.
-    pub max: i64,
-    /// Token emitted for values in the range. Must exist in the
+    /// How a game is matched to this band.
+    pub matcher: ConditionMatcher,
+    /// Token emitted for games the matcher accepts. Must exist in the
     /// vocabulary's condition block.
     pub token: String,
+}
+
+impl ConditionBand {
+    /// A band matching an integer tag range — the rating form.
+    pub fn rating(min: i64, max: i64, token: impl Into<String>) -> Self {
+        Self {
+            matcher: ConditionMatcher::IntRange { min, max },
+            token: token.into(),
+        }
+    }
+
+    /// A band matching a tag's leading characters — the ECO form.
+    pub fn tag_prefix(
+        key: impl Into<String>,
+        prefix: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self {
+            matcher: ConditionMatcher::TagPrefix {
+                key: key.into(),
+                prefix: prefix.into(),
+            },
+            token: token.into(),
+        }
+    }
+
+    /// Narrow a game filter to this band — the walk-side reading.
+    ///
+    /// Walks filter their games by the band they are scoring so the
+    /// fidelity columns mean something, and before this method each
+    /// walk derived the predicate itself, which only ever knew the
+    /// rating form. One place, next to the matcher, so a band kind
+    /// added here is added to every walk at once.
+    ///
+    /// For an integer range this requires **both** players inside the
+    /// range, which is what every walk has asked since
+    /// `match-design.md` — a game is only evidence about a band if
+    /// both sides were playing at it. That is deliberately stricter
+    /// than [`ConditionSpec::band_for`], which reads the one tag named
+    /// by the spec: the corpus question is "which token does this row
+    /// carry", the walk question is "which games are this band's".
+    pub fn narrow(
+        &self,
+        filter: crate::chess::filter::GameFilter,
+    ) -> crate::chess::filter::GameFilter {
+        use crate::chess::filter::{TagPredicate, TagRule};
+        match &self.matcher {
+            ConditionMatcher::IntRange { min, max } => filter.with_rating_band(*min, *max),
+            ConditionMatcher::TagPrefix { key, prefix } => {
+                let mut filter = filter;
+                filter.tags.push(TagPredicate::new(
+                    key.clone(),
+                    TagRule::StartsWith(prefix.clone()),
+                ));
+                filter
+            }
+        }
+    }
+}
+
+/// The on-disk forms of [`ConditionBand`], for the compatibility
+/// argument that type documents.
+///
+/// `untagged`, with the legacy form first: a legacy object has `min`
+/// and `max` where a matched one has `matcher`, so the two never both
+/// parse and the order only decides which is tried first.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum BandRepr {
+    /// The shape every sidecar carried before matchers existed.
+    Legacy { min: i64, max: i64, token: String },
+    /// The general shape.
+    Matched {
+        matcher: ConditionMatcher,
+        token: String,
+    },
+}
+
+impl From<BandRepr> for ConditionBand {
+    fn from(repr: BandRepr) -> Self {
+        match repr {
+            BandRepr::Legacy { min, max, token } => ConditionBand {
+                matcher: ConditionMatcher::IntRange { min, max },
+                token,
+            },
+            BandRepr::Matched { matcher, token } => ConditionBand { matcher, token },
+        }
+    }
+}
+
+impl From<ConditionBand> for BandRepr {
+    fn from(band: ConditionBand) -> Self {
+        match band.matcher {
+            ConditionMatcher::IntRange { min, max } => BandRepr::Legacy {
+                min,
+                max,
+                token: band.token,
+            },
+            matcher @ ConditionMatcher::TagPrefix { .. } => BandRepr::Matched {
+                matcher,
+                token: band.token,
+            },
+        }
+    }
 }
 
 /// How a game's condition token is derived from its tags.
@@ -126,7 +274,9 @@ pub struct ConditionBand {
 /// is the mapping from a tag value to that token.
 #[derive(Debug, Clone)]
 pub struct ConditionSpec {
-    /// Tag to read, e.g. `WhiteElo`.
+    /// Tag the [`ConditionMatcher::IntRange`] bands read, e.g.
+    /// `WhiteElo`. A [`ConditionMatcher::TagPrefix`] band names its
+    /// own tag and does not consult this.
     pub key: String,
     /// Bands, tested in order.
     pub bands: Vec<ConditionBand>,
@@ -134,8 +284,9 @@ pub struct ConditionSpec {
 
 impl ConditionSpec {
     /// Find the band a game falls in, as a position in [`Self::bands`],
-    /// or `None` when the tag is absent, unparsable, or outside every
-    /// band.
+    /// or `None` when no band's matcher accepts the game — the tag
+    /// absent, unparsable, and outside-every-range cases all land
+    /// there, since none of them is a band.
     ///
     /// The position rather than the token, because both are wanted: the
     /// token goes into the row, and the position is what a model shape
@@ -143,10 +294,14 @@ impl ConditionSpec {
     /// later would mean searching the band list by string for every
     /// game.
     fn band_for(&self, game: &crate::chess::pgn::PgnGame) -> Option<usize> {
-        let value = game.tag_i64(&self.key)?;
-        self.bands
-            .iter()
-            .position(|b| value >= b.min && value <= b.max)
+        self.bands.iter().position(|b| match &b.matcher {
+            ConditionMatcher::IntRange { min, max } => game
+                .tag_i64(&self.key)
+                .is_some_and(|value| value >= *min && value <= *max),
+            ConditionMatcher::TagPrefix { key, prefix } => game
+                .tag(key)
+                .is_some_and(|value| value.starts_with(prefix.as_str())),
+        })
     }
 }
 
@@ -783,11 +938,7 @@ mod tests {
         let vocab = vocab_with_bands();
         let spec = ConditionSpec {
             key: "WhiteElo".to_string(),
-            bands: vec![ConditionBand {
-                min: 0,
-                max: 1599,
-                token: "<elo:low>".to_string(),
-            }],
+            bands: vec![ConditionBand::rating(0, 1599, "<elo:low>")],
         };
         let c = build(
             pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
@@ -839,11 +990,7 @@ mod tests {
                 scored_side: ScoredSide::White,
                 condition: Some(ConditionSpec {
                     key: "WhiteElo".to_string(),
-                    bands: vec![ConditionBand {
-                        min: 0,
-                        max: 1599,
-                        token: "<elo:low>".to_string(),
-                    }],
+                    bands: vec![ConditionBand::rating(0, 1599, "<elo:low>")],
                 }),
                 ..Default::default()
             },
@@ -965,16 +1112,8 @@ mod tests {
         let spec = ConditionSpec {
             key: "WhiteElo".to_string(),
             bands: vec![
-                ConditionBand {
-                    min: 0,
-                    max: 1599,
-                    token: "<elo:low>".to_string(),
-                },
-                ConditionBand {
-                    min: 1600,
-                    max: 4000,
-                    token: "<elo:high>".to_string(),
-                },
+                ConditionBand::rating(0, 1599, "<elo:low>"),
+                ConditionBand::rating(1600, 4000, "<elo:high>"),
             ],
         };
         let c = build(
@@ -1049,16 +1188,8 @@ mod tests {
                 condition: Some(ConditionSpec {
                     key: "WhiteElo".to_string(),
                     bands: vec![
-                        ConditionBand {
-                            min: 0,
-                            max: 1599,
-                            token: "<elo:low>".to_string(),
-                        },
-                        ConditionBand {
-                            min: 1600,
-                            max: 4000,
-                            token: "<elo:high>".to_string(),
-                        },
+                        ConditionBand::rating(0, 1599, "<elo:low>"),
+                        ConditionBand::rating(1600, 4000, "<elo:high>"),
                     ],
                 }),
                 ..Default::default()
@@ -1078,17 +1209,80 @@ mod tests {
             &CorpusOptions {
                 condition: Some(ConditionSpec {
                     key: "WhiteElo".to_string(),
-                    bands: vec![ConditionBand {
-                        min: 0,
-                        max: 1599,
-                        token: "<elo:low>".to_string(),
-                    }],
+                    bands: vec![ConditionBand::rating(0, 1599, "<elo:low>")],
                 }),
                 ..Default::default()
             },
         );
         assert!(c.rows.is_empty());
         assert_eq!(c.stats.rejected_by_condition, 1);
+    }
+
+    /// A prefix band reads the tag its own matcher names, not the
+    /// spec's key: the spec here says `WhiteElo` and the bands are
+    /// derived from `ECO` anyway.
+    #[test]
+    fn a_prefix_band_reads_the_tag_its_matcher_names() {
+        let vocab = MoveVocab::new(&["<eco:B>".to_string(), "<eco:C>".to_string()]).unwrap();
+        let text = "[WhiteElo \"1500\"]\n[ECO \"B20\"]\n\n1. e4 e5 1-0\n\n\
+                    [WhiteElo \"1500\"]\n[ECO \"C50\"]\n\n1. d4 d5 1-0\n\n\
+                    [WhiteElo \"1500\"]\n[ECO \"A00\"]\n\n1. c4 c5 1-0\n\n"
+            .to_string();
+        let c = build(
+            text,
+            &vocab,
+            &CorpusOptions {
+                condition: Some(ConditionSpec {
+                    key: "WhiteElo".to_string(),
+                    bands: vec![
+                        ConditionBand::tag_prefix("ECO", "B", "<eco:B>"),
+                        ConditionBand::tag_prefix("ECO", "C", "<eco:C>"),
+                    ],
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(c.bands.as_deref(), Some([0usize, 1].as_slice()));
+        assert_eq!(c.stats.rejected_by_condition, 1);
+    }
+
+    /// The sidecar compatibility split the type documents: a legacy
+    /// `{min, max, token}` object parses into a rating band, a rating
+    /// band writes back exactly those keys, and a prefix band writes
+    /// the `matcher` form without them — which the pre-matcher
+    /// `ConditionBand`, whose `min` and `max` carried no default,
+    /// could not have parsed into anything.
+    #[test]
+    fn sidecar_bands_keep_the_legacy_form_exactly_for_ratings_and_only_for_ratings() {
+        let legacy = serde_json::json!({"min": 0, "max": 1599, "token": "<elo:low>"});
+        let parsed: ConditionBand = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(parsed, ConditionBand::rating(0, 1599, "<elo:low>"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+
+        let prefix = ConditionBand::tag_prefix("ECO", "B", "<eco:B>");
+        let written = serde_json::to_value(&prefix).unwrap();
+        assert!(written.get("min").is_none() && written.get("max").is_none());
+        assert!(written.get("matcher").is_some());
+        let back: ConditionBand = serde_json::from_value(written).unwrap();
+        assert_eq!(back, prefix);
+    }
+
+    /// The walk-side reading: a rating band requires both players
+    /// inside the range, a prefix band requires the named tag.
+    #[test]
+    fn narrow_is_the_walk_side_reading_of_a_band() {
+        let mut reader = PgnReader::new(Cursor::new(
+            "[WhiteElo \"1650\"]\n[BlackElo \"1900\"]\n[ECO \"B20\"]\n\n1. e4 e5 1-0\n\n",
+        ));
+        let game = reader.next_game().unwrap().unwrap();
+
+        let rating = ConditionBand::rating(1600, 1799, "<elo:mid>");
+        assert!(!rating.narrow(GameFilter::accept_all()).accepts_tags(&game));
+
+        let eco = ConditionBand::tag_prefix("ECO", "B", "<eco:B>");
+        assert!(eco.narrow(GameFilter::accept_all()).accepts_tags(&game));
+        let other = ConditionBand::tag_prefix("ECO", "C", "<eco:C>");
+        assert!(!other.narrow(GameFilter::accept_all()).accepts_tags(&game));
     }
 
     #[test]
@@ -1099,11 +1293,7 @@ mod tests {
         let opts = CorpusOptions {
             condition: Some(ConditionSpec {
                 key: "WhiteElo".to_string(),
-                bands: vec![ConditionBand {
-                    min: 0,
-                    max: 4000,
-                    token: "<elo:low>".to_string(),
-                }],
+                bands: vec![ConditionBand::rating(0, 4000, "<elo:low>")],
             }),
             ..Default::default()
         };

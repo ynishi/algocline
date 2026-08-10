@@ -44,16 +44,8 @@ const BATCH: usize = 2;
 
 fn bands() -> Vec<ConditionBand> {
     vec![
-        ConditionBand {
-            min: 1100,
-            max: 1299,
-            token: "<elo:1100-1299>".into(),
-        },
-        ConditionBand {
-            min: 1900,
-            max: 2099,
-            token: "<elo:1900-2099>".into(),
-        },
+        ConditionBand::rating(1100, 1299, "<elo:1100-1299>"),
+        ConditionBand::rating(1900, 2099, "<elo:1900-2099>"),
     ]
 }
 
@@ -373,16 +365,8 @@ fn a_corpus_banded_for_another_model_is_refused() {
     .expect("vocabulary");
     let mut other = shape_for(&vocab, CondEncoding::EveryPosition);
     other.bands = vec![
-        ConditionBand {
-            min: 1500,
-            max: 1699,
-            token: "<elo:1500-1699>".into(),
-        },
-        ConditionBand {
-            min: 1900,
-            max: 2099,
-            token: "<elo:1900-2099>".into(),
-        },
+        ConditionBand::rating(1500, 1699, "<elo:1500-1699>"),
+        ConditionBand::rating(1900, 2099, "<elo:1900-2099>"),
     ];
     let err = cond_table(&other, &spec()).unwrap_err();
     assert!(

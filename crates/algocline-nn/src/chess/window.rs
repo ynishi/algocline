@@ -845,11 +845,7 @@ mod tests {
             vocab.model_vocab_size(),
             BANDS
                 .iter()
-                .map(|token| ConditionBand {
-                    min: 0,
-                    max: 0,
-                    token: (*token).to_string(),
-                })
+                .map(|token| ConditionBand::rating(0, 0, *token))
                 .collect(),
         );
         shape.encoding = CondEncoding::EveryPosition;

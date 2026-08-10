@@ -72,11 +72,7 @@ fn main() -> ExitCode {
         max_len: Some(MAX_LEN),
         condition: Some(ConditionSpec {
             key: "WhiteElo".to_string(),
-            bands: vec![ConditionBand {
-                min: min_elo,
-                max: max_elo,
-                token: band_token.clone(),
-            }],
+            bands: vec![ConditionBand::rating(min_elo, max_elo, band_token.clone())],
         }),
         scored_side,
         ..Default::default()

@@ -64,6 +64,16 @@ pub enum TagRule {
     /// rather than by the position, which is the usual reason to set
     /// this.
     BaseSecondsAtLeast(i64),
+    /// The tag's value starts with this string.
+    ///
+    /// Here for tags whose leading characters are a classification of
+    /// their own: an ECO code is a letter and two digits, and the
+    /// letter alone names the opening family. [`TagRule::OneOf`] could
+    /// express "family B" as the hundred codes `B00`..`B99`, but that
+    /// states the encoding of the family rather than the family, and a
+    /// reader of the filter would have to count the list to learn what
+    /// it means.
+    StartsWith(String),
 }
 
 impl TagRule {
@@ -80,6 +90,7 @@ impl TagRule {
                 let base = value.split('+').next().unwrap_or("");
                 base.parse::<i64>().map(|n| n >= *min).unwrap_or(false)
             }
+            TagRule::StartsWith(prefix) => value.starts_with(prefix.as_str()),
         }
     }
 }
@@ -185,6 +196,19 @@ impl GameFilter {
         self
     }
 
+    /// Keep only games whose ECO code starts with this prefix.
+    ///
+    /// A one-letter prefix selects an opening family (`"B"` is the
+    /// Sicilian-to-Caro-Kann range), a longer one narrows it (`"B2"`,
+    /// `"B27"`). Lichess writes the tag on every game in the slices
+    /// measured, but this predicate does not assume that: a game
+    /// without the tag fails the predicate like any other absent tag.
+    pub fn with_eco_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.tags
+            .push(TagPredicate::new("ECO", TagRule::StartsWith(prefix.into())));
+        self
+    }
+
     /// Set the accepted ply range.
     pub fn with_ply_bounds(mut self, min: usize, max: Option<usize>) -> Self {
         self.min_plies = min;
@@ -244,6 +268,24 @@ mod tests {
         let f = GameFilter::accept_all().decided_on_the_board();
         assert!(f.accepts_tags(&game(&[("Termination", "Normal")])));
         assert!(!f.accepts_tags(&game(&[("Termination", "Time forfeit")])));
+    }
+
+    #[test]
+    fn an_eco_prefix_selects_a_family_and_narrows_with_length() {
+        let family = GameFilter::accept_all().with_eco_prefix("B");
+        assert!(family.accepts_tags(&game(&[("ECO", "B20")])));
+        assert!(family.accepts_tags(&game(&[("ECO", "B99")])));
+        assert!(!family.accepts_tags(&game(&[("ECO", "C20")])));
+
+        let narrowed = GameFilter::accept_all().with_eco_prefix("B2");
+        assert!(narrowed.accepts_tags(&game(&[("ECO", "B27")])));
+        assert!(!narrowed.accepts_tags(&game(&[("ECO", "B30")])));
+    }
+
+    #[test]
+    fn a_game_without_an_eco_tag_fails_the_eco_predicate() {
+        let f = GameFilter::accept_all().with_eco_prefix("B");
+        assert!(!f.accepts_tags(&game(&[("WhiteElo", "1650")])));
     }
 
     #[test]

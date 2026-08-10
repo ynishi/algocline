@@ -42,6 +42,7 @@
 pub mod batch;
 pub mod corpus;
 pub mod filter;
+pub mod freebie;
 pub mod guide;
 pub mod pgn;
 pub mod records;

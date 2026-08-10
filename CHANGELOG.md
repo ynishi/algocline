@@ -602,6 +602,25 @@ instead of reading them as off. `CHESS_LEGAL_MASK=true` meant *off*.
   that the axis failing to survive reads as `undetermined` — recorded on
   the type so it cannot be presented afterwards as a near miss.
 
+- `chess::freebie` and `examples/chess_freebie` — does the model take a
+  piece handed to it for nothing? A capture counts as free when **no
+  legal move in the resulting position lands on the captured square**,
+  which asks recapture as a question about legality rather than about
+  attack maps: a pinned defender does not make a capture unfree, and a
+  king does not defend a square it may not legally move to. Both fall
+  out of the move generator instead of needing a case.
+
+  Narrow on purpose. Not static exchange evaluation, not "winning" — a
+  free capture by this definition can still lose to a bigger reply. It
+  is decidable from the board with no evaluation function, which is what
+  lets it be a rate over a held-out month rather than an anecdote from a
+  game somebody chose the positions in.
+
+  `chess_freebie` scores any number of checkpoints on one position set
+  and reports each one's take rate beside `chance` — what a uniform pick
+  among the legal moves would take, computed from the same positions. A
+  take rate means nothing without it.
+
 - `chess::steerability::h23` — the depth reach under the mask, read by
   `chess_survival` only when `h22` confirms. `h15`'s quantity (deep
   divergence over shallow) with a floor, which `h15` has none of: plan

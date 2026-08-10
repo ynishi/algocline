@@ -1398,7 +1398,56 @@ impl Gpt2Model {
     ///   has rows, which is a crossed pair rather than a typo.
     /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
     pub fn forward_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
-        self.forward_inner(xs, Some(conds), None, None)
+        self.forward_inner(xs, Some((conds, 1)), None, None)
+            .map(|(logits, _)| logits)
+    }
+
+    /// [`Self::forward_conditioned`] with `per_row` conditions per row,
+    /// whose table rows are **summed** before the addition.
+    ///
+    /// `conds` holds `batch * per_row` indices, row-major: row `i`'s
+    /// conditions are `conds[i*per_row .. (i+1)*per_row]`. With
+    /// `per_row == 1` this is exactly [`Self::forward_conditioned`].
+    ///
+    /// # Why a sum
+    ///
+    /// The composition being tested is additive: each slot contributes
+    /// its own vector to the residual stream at every position, next to
+    /// where a single condition's vector already goes, and nothing
+    /// downstream distinguishes "one vector that is a sum" from "two
+    /// additions". That makes the operation permutation-invariant in
+    /// the slots — `[a, b]` and `[b, a]` are the same forward — which
+    /// is a property of the mechanism and not a claim that the *model*
+    /// treats the slots symmetrically: what each row's vector comes to
+    /// mean is the training corpus's business.
+    ///
+    /// What this is **not**: a per-slot table. Every index still points
+    /// into the one `cond_wte`, so the caller owns the convention of
+    /// which rows belong to which slot (a shape records it as its group
+    /// sizes). Two indices of the same slot are not refused here — the
+    /// forward cannot know the grouping — and a caller that wants that
+    /// refusal puts it where the grouping is known.
+    ///
+    /// # Errors
+    ///
+    /// - `per_row` is zero (pass [`Self::forward`] for an
+    ///   unconditioned batch instead of an empty condition list).
+    /// - `conds.len()` is not `batch * per_row`.
+    /// - Anything [`Self::forward_conditioned`] refuses.
+    pub fn forward_conditioned_groups(
+        &self,
+        xs: &Tensor,
+        conds: &[CondIndex],
+        per_row: usize,
+    ) -> CandleResult<Tensor> {
+        if per_row == 0 {
+            return Err(candle_core::Error::Msg(
+                "gpt2 forward: per_row must be ≥ 1; an unconditioned batch goes through \
+                 `forward` rather than through an empty condition list"
+                    .into(),
+            ));
+        }
+        self.forward_inner(xs, Some((conds, per_row)), None, None)
             .map(|(logits, _)| logits)
     }
 
@@ -1427,7 +1476,7 @@ impl Gpt2Model {
     fn forward_inner(
         &self,
         xs: &Tensor,
-        conds: Option<&[CondIndex]>,
+        conds: Option<(&[CondIndex], usize)>,
         legal: Option<&LegalSets>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
@@ -1453,8 +1502,8 @@ impl Gpt2Model {
         // The condition, if the caller passed one. Added here, beside
         // the positional embedding, so it is present at every position
         // instead of decaying with distance from a token at the front.
-        if let Some(conds) = conds {
-            let cond_emb = self.condition_embedding(conds, b)?; // [B, 1, D]
+        if let Some((conds, per_row)) = conds {
+            let cond_emb = self.condition_embedding(conds, b, per_row)?; // [B, 1, D]
             h = h.broadcast_add(&cond_emb)?;
         }
         // The legality input, beside the condition and for the same
@@ -1536,7 +1585,12 @@ impl Gpt2Model {
     /// `index_select`, but leaving it to the backend would mean the
     /// accelerator builds decide whether a bad index is an error or a
     /// silently conditioned run.
-    fn condition_embedding(&self, conds: &[CondIndex], batch: usize) -> CandleResult<Tensor> {
+    fn condition_embedding(
+        &self,
+        conds: &[CondIndex],
+        batch: usize,
+        per_row: usize,
+    ) -> CandleResult<Tensor> {
         let table = self.cond_wte.as_ref().ok_or_else(|| {
             candle_core::Error::Msg(
                 "gpt2 forward: this model has no conditioning table; build it with \
@@ -1544,11 +1598,12 @@ impl Gpt2Model {
                     .into(),
             )
         })?;
-        if conds.len() != batch {
+        if conds.len() != batch * per_row {
             return Err(candle_core::Error::Msg(format!(
-                "gpt2 forward: {} condition index/indices for a batch of {batch}; \
-                 pass one per row",
-                conds.len()
+                "gpt2 forward: {} condition index/indices for a batch of {batch} at {per_row} \
+                 per row; pass exactly {}",
+                conds.len(),
+                batch * per_row
             )));
         }
         let slots = self
@@ -1565,8 +1620,10 @@ impl Gpt2Model {
             )));
         }
         let rows: Vec<u32> = conds.iter().map(|i| i.row()).collect();
-        let ids = Tensor::from_vec(rows, (batch,), &self.cfg.device)?;
-        table.forward(&ids)?.unsqueeze(1) // [B, 1, D]
+        let ids = Tensor::from_vec(rows, (batch, per_row), &self.cfg.device)?;
+        // [B, k, D] summed over k — one addition per slot, an identity
+        // when k is 1.
+        table.forward(&ids)?.sum(1)?.unsqueeze(1) // [B, 1, D]
     }
 
     /// The per-position legality vectors, shaped `[batch, seq, dim]`.
@@ -2209,7 +2266,74 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("expected an error"),
         };
-        assert!(msg.contains("one per row"), "{msg}");
+        assert!(msg.contains("per row"), "{msg}");
+    }
+
+    /// With one condition per row the grouped entry point is exactly
+    /// the single-condition one — the sum over one row is that row.
+    #[test]
+    fn a_group_of_one_is_the_single_condition_forward() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (2, 3), &cfg.device).unwrap();
+        let conds = [CondIndex::from_table_row(0), CondIndex::from_table_row(2)];
+        let single = model.forward_conditioned(&ids, &conds).unwrap();
+        let grouped = model.forward_conditioned_groups(&ids, &conds, 1).unwrap();
+        let gap = max_abs_diff_f32(&single, &grouped).unwrap();
+        assert!(gap < 1e-6, "the two entry points diverged by {gap}");
+    }
+
+    /// The sum makes the slots order-free, and makes the pair a third
+    /// condition rather than either alone.
+    #[test]
+    fn grouped_conditions_are_order_free_and_not_either_alone() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let a = CondIndex::from_table_row(0);
+        let b = CondIndex::from_table_row(1);
+        let ab = model.forward_conditioned_groups(&ids, &[a, b], 2).unwrap();
+        let ba = model.forward_conditioned_groups(&ids, &[b, a], 2).unwrap();
+        assert!(max_abs_diff_f32(&ab, &ba).unwrap() < 1e-6);
+
+        let alone = model.forward_conditioned(&ids, &[a]).unwrap();
+        assert!(
+            max_abs_diff_f32(&ab, &alone).unwrap() > 1e-4,
+            "the pair read as one of its halves"
+        );
+    }
+
+    /// Zero conditions per row is a different request — the plain
+    /// forward — and is refused rather than read as an empty sum.
+    #[test]
+    fn grouped_conditions_reject_a_zero_group() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned_groups(&ids, &[], 0) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("per_row"), "{msg}");
+    }
+
+    /// A count that is not `batch * per_row` cannot be attributed to
+    /// rows, and is refused with the expected count named.
+    #[test]
+    fn grouped_conditions_reject_a_count_mismatch() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = conditioning_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (2, 3), &cfg.device).unwrap();
+        let three = [
+            CondIndex::from_table_row(0),
+            CondIndex::from_table_row(1),
+            CondIndex::from_table_row(2),
+        ];
+        let msg = match model.forward_conditioned_groups(&ids, &three, 2) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("pass exactly 4"), "{msg}");
     }
 
     /// An index past the end of the table is a caller mistake that no

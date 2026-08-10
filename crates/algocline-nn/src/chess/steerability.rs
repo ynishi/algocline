@@ -2212,6 +2212,44 @@ pub fn h29_family(
     draws: usize,
     seed: u64,
 ) -> Result<H29Family, StatError> {
+    jouseki_family_in(arms, family, None, gamma, draws, seed)
+}
+
+/// [`h29_family`]'s statistic restricted to the shallow stratum —
+/// H31's per-family half.
+///
+/// The domain is a parameter of the computation and not of the type:
+/// what comes back is still "a cost, its floor, and the intervals on
+/// both sides", read over ply 0 through 19 only. The two descriptive
+/// stratum fields keep their meaning (the shallow one now restates the
+/// judged quantity; the deep one shows what was excluded).
+///
+/// Registered by plan 07 because plan 06's stratum description showed
+/// the cost concentrating where an opening lives, and the all-ply mean
+/// dilutes it by roughly the share of plies past 19 — but that
+/// observation was made on months 2026-05 and 2026-04, so those months
+/// are design input here and the verdict is taken on months the
+/// criterion never saw.
+pub fn h31_family(
+    arms: &AlignedArms,
+    family: &str,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29Family, StatError> {
+    jouseki_family_in(arms, family, Some(JOUSEKI_SHALLOW), gamma, draws, seed)
+}
+
+/// The shared computation: cost, floor and intervals over the whole
+/// walk (`bucket: None`) or one ply range.
+fn jouseki_family_in(
+    arms: &AlignedArms,
+    family: &str,
+    bucket: Option<(usize, usize)>,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29Family, StatError> {
     let (correct, wrong) = check_jouseki_roles(arms, family)?;
     let gamma_ix = arms.gamma_index(gamma)?;
     let cost = move |at: &GammaRecord| -> Option<f64> {
@@ -2220,8 +2258,16 @@ pub fn h29_family(
         let w = *per_band.get(wrong)?;
         Some((c as i64 - w as i64) as f64)
     };
-    let j = tally(arms, ARM_J, gamma_ix, cost)?;
-    let j_b = tally(arms, ARM_J_B, gamma_ix, cost)?;
+    let judged = bucket.unwrap_or((0, usize::MAX));
+    let j = tally_in_bucket(arms, ARM_J, gamma_ix, judged, cost)?;
+    let j_b = tally_in_bucket(arms, ARM_J_B, gamma_ix, judged, cost)?;
+    if j.total().n == 0 {
+        return Err(StatError::EmptyBucket {
+            low: judged.0,
+            high: judged.1.saturating_sub(1),
+            role: "cost",
+        });
+    }
 
     // One draw, every term, as in `h22`.
     let margin_and_floor = |draw: &[usize]| -> Option<(f64, f64)> {
@@ -2251,8 +2297,8 @@ pub fn h29_family(
         refute,
         shallow_cost_j: shallow.total().mean(),
         deep_cost_j: deep.total().mean(),
-        positions: arms.positions(),
-        games: arms.games(),
+        positions: j.total().n,
+        games: j.clusters_present(),
     })
 }
 
@@ -2307,6 +2353,28 @@ pub fn h29(
     draws: usize,
     seed: u64,
 ) -> Result<H29, StatError> {
+    jouseki_in(arms_by_family, None, gamma, draws, seed)
+}
+
+/// Plan 07's primary hypothesis: [`h29`]'s statistic over ply 0-19
+/// only, with the same admission, floor construction and verdict-layer
+/// min-logic. See [`h31_family`] for what moves and what does not.
+pub fn h31(
+    arms_by_family: [(&AlignedArms, &str); 2],
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29, StatError> {
+    jouseki_in(arms_by_family, Some(JOUSEKI_SHALLOW), gamma, draws, seed)
+}
+
+fn jouseki_in(
+    arms_by_family: [(&AlignedArms, &str); 2],
+    bucket: Option<(usize, usize)>,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29, StatError> {
     let [(arms_a, family_a), (arms_b, family_b)] = arms_by_family;
     let bands_a = &arms_a.walk(ARM_J)?.header.bands;
     let bands_b = &arms_b.walk(ARM_J)?.header.bands;
@@ -2319,8 +2387,8 @@ pub fn h29(
     Ok(H29 {
         gamma,
         families: [
-            h29_family(arms_a, family_a, gamma, draws, seed)?,
-            h29_family(arms_b, family_b, gamma, draws, seed)?,
+            jouseki_family_in(arms_a, family_a, bucket, gamma, draws, seed)?,
+            jouseki_family_in(arms_b, family_b, bucket, gamma, draws, seed)?,
         ],
     })
 }
@@ -5167,6 +5235,26 @@ mod tests {
         );
         let both = h29([(&b_arms, ECO_B), (&c_arms, ECO_C)], 1.0, 200, SEED).unwrap();
         assert_eq!(both.verdict(), "confirmed");
+    }
+
+    /// H31 judges inside ply 0-19 and nothing past it: a fixture that
+    /// steers only in the opening prices at exactly 1 there, while the
+    /// all-ply reading is diluted by the deep positions.
+    #[test]
+    fn h31_reads_the_shallow_stratum_and_only_it() {
+        let opening_only = |band: usize, _: usize, ix: usize| band == 0 && ix < 10;
+        let arms = jouseki_arms(
+            jouseki_walk(6, 15, ECO_B, 0.0, opening_only),
+            jouseki_walk(6, 15, ECO_B, 0.001, opening_only),
+        );
+        let shallow = h31_family(&arms, ECO_B, 1.0, 200, SEED).unwrap();
+        assert_eq!(shallow.cost_j, 1.0);
+        assert_eq!(shallow.positions, 6 * 10);
+        assert!(shallow.confirmed());
+
+        let all_ply = h29_family(&arms, ECO_B, 1.0, 200, SEED).unwrap();
+        assert!(all_ply.cost_j < 1.0);
+        assert_eq!(all_ply.positions, 6 * 15);
     }
 
     /// Two identical runs sit at zero distance, and the gate passes.

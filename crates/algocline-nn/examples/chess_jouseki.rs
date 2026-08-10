@@ -82,6 +82,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(text) => text.trim().parse()?,
         None => DRAWS,
     };
+    // `shallow` switches the judged statistic to H31 — the same cost
+    // restricted to ply 0-19 (plan 07). Everything else (admission,
+    // floor, verdict-layer min-logic) is unchanged.
+    let shallow = match args.next().as_deref() {
+        Some("shallow") => true,
+        None => false,
+        Some(other) => {
+            return Err(format!("unknown domain {other:?}; pass `shallow` or omit").into())
+        }
+    };
 
     let t0 = Instant::now();
     let mut pairs = Vec::new();
@@ -157,15 +167,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("H29 — does a family token steer toward its own family's games?");
+    let label = if shallow {
+        "H31 (ply 0-19 only)"
+    } else {
+        "H29"
+    };
+    println!("{label} — does a family token steer toward its own family's games?");
     let (arms_a, family_a, _) = &pairs[0];
     let (arms_b, family_b, _) = &pairs[1];
-    let h29 = steerability::h29(
-        [(arms_a, family_a.as_str()), (arms_b, family_b.as_str())],
-        gamma,
-        draws,
-        seed,
-    )?;
+    let by_family = [(arms_a, family_a.as_str()), (arms_b, family_b.as_str())];
+    let h29 = if shallow {
+        steerability::h31(by_family, gamma, draws, seed)?
+    } else {
+        steerability::h29(by_family, gamma, draws, seed)?
+    };
     for family in &h29.families {
         println!("  family {}", family.family);
         println!(

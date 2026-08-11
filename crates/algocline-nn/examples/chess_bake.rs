@@ -266,6 +266,8 @@ fn eval_loss(
     model: &Gpt2Model,
     rows: &[TeacherRow],
     conds: Option<&[CondIndex]>,
+    conds_per_row: usize,
+    prefix_len: usize,
     legal_input: bool,
     vocab: &MoveVocab,
     ctx: usize,
@@ -276,7 +278,7 @@ fn eval_loss(
     let ds = LegalMaskedDataset::new(
         TeacherRow::into_pairs(rows.to_vec()),
         vocab.clone(),
-        2,
+        prefix_len,
         DatasetOpts {
             batch_size: batch,
             ctx_len: ctx,
@@ -286,7 +288,7 @@ fn eval_loss(
         },
     );
     let mut ds = match conds {
-        Some(conds) => ds.with_conditions(conds.to_vec())?,
+        Some(conds) => ds.with_condition_groups(conds.to_vec(), conds_per_row)?,
         None => ds,
     };
     let mut total = 0f64;
@@ -317,7 +319,9 @@ fn eval_loss(
                     .ok_or("a legality-input run needs a dataset that carries the legal sets")?;
                 model.forward_legal(&inputs, &sets)?
             }
-            (false, Some(conds)) => model.forward_conditioned(&inputs, conds)?,
+            (false, Some(conds)) => {
+                model.forward_conditioned_groups(&inputs, conds, b.conds_per_row)?
+            }
             (false, None) => model.forward(&inputs)?,
         };
         let logits = match allowed_logit_mask(&b, width, logits.dim(2)?, device)? {
@@ -344,6 +348,39 @@ fn eval_loss(
 /// either. Baking a model per band answers a different and weaker
 /// question, since two separately trained models differ for every
 /// reason at once.
+/// Parse a `;`-separated list of band groups, each a [`parse_bands`]
+/// spec — one group per condition slot.
+///
+/// Two or more groups make a multi-slot model: the corpus keeps the
+/// condition tokens out of its rows, every forward receives one table
+/// row per group, and the shape records the partition
+/// ([`ModelShape::cond_groups`]). Each group is single-axis on its own
+/// (the mixed-axis refusal below is per group); the axes may differ
+/// **across** groups, which is the point of having them.
+fn parse_band_groups(spec: &str) -> Result<Vec<Vec<ConditionBand>>, String> {
+    let groups = spec
+        .split(';')
+        .map(|group| {
+            let group = group.trim();
+            if group.is_empty() {
+                return Err(format!("band spec {spec:?} has an empty slot"));
+            }
+            parse_bands(group)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = std::collections::HashSet::new();
+    for band in groups.iter().flatten() {
+        if !seen.insert(band.token.as_str()) {
+            return Err(format!(
+                "band {} appears in more than one slot; a token can occupy one \
+                 conditioning-table row only",
+                band.token
+            ));
+        }
+    }
+    Ok(groups)
+}
+
 fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     let mut out = Vec::new();
     let (mut any_eco, mut any_rating) = (false, false);
@@ -628,9 +665,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = args.next().ok_or(
         "usage: chess_bake <path.pgn> <bands> [max_rows] [steps] [side] [ckpt_dir]\n\
          bands is comma-separated ranges or ECO families, e.g. 1600-1799 or \
-         1100-1299,1900-2099 or eco:B,eco:C",
+         1100-1299,1900-2099 or eco:B,eco:C; a `;` separates condition slots, \
+         e.g. 'eco:B,eco:C;1100-1599,1600-2099' for a two-slot model",
     )?;
-    let bands = parse_bands(&args.next().unwrap_or_else(|| "1600-1799".into()))?;
+    let groups = parse_band_groups(&args.next().unwrap_or_else(|| "1600-1799".into()))?;
+    let group_sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+    let multi_slot = groups.len() > 1;
+    let bands: Vec<ConditionBand> = groups.iter().flatten().cloned().collect();
     let max_rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4000);
     let steps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(100);
     let side = match args.next().as_deref() {
@@ -672,6 +713,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // here so the rest of the run asks this rather than the shape, and
     // so the two cannot drift apart within one run.
     let per_position = shape.encoding == CondEncoding::EveryPosition;
+
+    if multi_slot {
+        // A multi-slot corpus carries no condition token in its rows,
+        // so a prefix-encoded run would have nowhere to read the
+        // condition from at all — refused here, before the corpus.
+        if !per_position {
+            return Err(
+                "a multi-slot band spec conditions through forward arguments only (its rows \
+                 carry no condition token); pass CHESS_COND_EVERY=1"
+                    .into(),
+            );
+        }
+        shape.cond_groups = group_sizes.clone();
+    }
+    // How many non-move tokens open every row: `BOS` plus, under a
+    // single slot, the condition token. A multi-slot row carries none.
+    let prefix_len = if multi_slot { 1 } else { 2 };
 
     if shape.legal_input && !legal_mask {
         // The legal sets reach the trainer through the dataset, and the
@@ -750,15 +808,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[bake] resuming from {}", p.display());
     }
 
-    // One `ConditionSpec` value for the whole run. Every row's band is
-    // an ordinal into *this* list, and `cond_table` below turns those
-    // ordinals into conditioning-table rows against the same value —
-    // so the two ends cannot be different lists that happen to be the
-    // same length.
-    let spec = ConditionSpec {
-        key: "WhiteElo".to_string(),
-        bands: bands.clone(),
-    };
+    // One `ConditionSpec` value per slot for the whole run. Every
+    // row's ordinals index into *these* lists, and `cond_table` below
+    // turns those ordinals into conditioning-table rows against the
+    // same values — so the two ends cannot be different lists that
+    // happen to be the same lengths.
+    let specs: Vec<ConditionSpec> = groups
+        .iter()
+        .map(|group| ConditionSpec {
+            key: "WhiteElo".to_string(),
+            bands: group.clone(),
+        })
+        .collect();
 
     // The band is selected by the condition rather than by the filter:
     // a game outside every band is rejected when its token is resolved,
@@ -798,7 +859,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         filter,
         max_rows,
         max_len: Some(shape.ctx),
-        conditions: vec![spec.clone()],
+        conditions: specs.clone(),
         scored_side: side,
         ..Default::default()
     };
@@ -822,11 +883,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // sweeps an untrained embedding, every figure well-formed.
     if let Some(row_bands) = &corpus.bands {
         let mut counts = vec![0usize; bands.len()];
-        // This run builds a single-slot corpus, so each row carries one
-        // ordinal into the one band list.
+        // One ordinal per slot per row; the offsets rebuild the flat
+        // band list's numbering, group by group.
+        let offsets: Vec<usize> = group_sizes
+            .iter()
+            .scan(0usize, |acc, size| {
+                let here = *acc;
+                *acc += size;
+                Some(here)
+            })
+            .collect();
         for bs in row_bands {
-            if let Some(slot) = bs.first().and_then(|b| counts.get_mut(*b)) {
-                *slot += 1;
+            for (g, ordinal) in bs.iter().enumerate() {
+                if let Some(slot) = counts.get_mut(offsets[g] + ordinal) {
+                    *slot += 1;
+                }
             }
         }
         for (band, n) in bands.iter().zip(&counts) {
@@ -889,13 +960,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Built here, from `rows` as they now stand, so the shuffle and the
     // epoch replication above are already accounted for: a row and the
     // band it trains under cannot be one apart.
-    let table = if per_position {
-        Some(cond_table(&shape, &spec)?)
+    let tables = if per_position {
+        Some(
+            specs
+                .iter()
+                .map(|spec| cond_table(&shape, spec))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
     } else {
         None
     };
-    let train_conds = match &table {
-        Some(table) => Some(row_conditions(&rows, std::slice::from_ref(table))?),
+    let train_conds = match &tables {
+        Some(tables) => Some(row_conditions(&rows, tables)?),
         None => None,
     };
 
@@ -913,18 +989,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let ds = LegalMaskedDataset::new(
             TeacherRow::into_pairs(rows),
             MoveVocab::new(&tokens)?,
-            // [BOS, band, moves..] — two tokens before the first move.
-            2,
+            // [BOS, band, moves..] under one slot — two tokens before
+            // the first move; a multi-slot row is [BOS, moves..].
+            prefix_len,
             ds_opts,
         );
         match train_conds {
-            Some(conds) => Box::new(ds.with_conditions(conds)?),
+            Some(conds) => Box::new(ds.with_condition_groups(conds, specs.len())?),
             None => Box::new(ds),
         }
     } else {
         let ds = TeacherCardDataset::from_rows(TeacherRow::into_pairs(rows), ds_opts)?;
         match train_conds {
-            Some(conds) => Box::new(ds.with_conditions(conds)?),
+            Some(conds) => Box::new(ds.with_condition_groups(conds, specs.len())?),
             None => Box::new(ds),
         }
     };
@@ -988,9 +1065,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     // Held-out rows are conditioned the same way the training rows
-    // were, through the same table.
-    let val_conds = match (&table, &val_rows) {
-        (Some(table), Some(val)) => Some(row_conditions(val, std::slice::from_ref(table))?),
+    // were, through the same tables.
+    let val_conds = match (&tables, &val_rows) {
+        (Some(tables), Some(val)) => Some(row_conditions(val, tables)?),
         _ => None,
     };
 
@@ -1199,6 +1276,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &model,
             val,
             val_conds,
+            specs.len(),
+            prefix_len,
             shape.legal_input,
             &vocab,
             shape.ctx,
@@ -1218,6 +1297,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             &m,
                             val,
                             val_conds,
+                            specs.len(),
+                            prefix_len,
                             shape.legal_input,
                             &vocab,
                             shape.ctx,

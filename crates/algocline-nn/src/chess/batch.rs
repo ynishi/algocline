@@ -69,6 +69,33 @@ pub enum BatchError {
     #[error(transparent)]
     Window(#[from] WindowError),
 
+    /// [`BandBatch::over_combos`] was asked for a checkpoint that does
+    /// not partition its bands into several groups.
+    ///
+    /// One group is [`BandBatch::over_bands`]'s case; answering it here
+    /// would quietly run the same comparison through a second path.
+    #[error(
+        "this checkpoint carries {groups} condition group(s); combination rows need at least \
+         two — a single group's comparison is `over_bands`"
+    )]
+    NotMultiSlot {
+        /// Groups the shape partitions its bands into.
+        groups: usize,
+    },
+
+    /// A multi-slot walk of a prefix-encoded checkpoint was asked for.
+    ///
+    /// No such checkpoint exists to walk: a prefix cannot carry two
+    /// slots without inventing an order for them, which is why a
+    /// multi-slot corpus keeps its conditions out of the rows entirely.
+    /// Reaching this means a shape whose `cond_groups` and `encoding`
+    /// contradict each other.
+    #[error(
+        "a multi-slot walk conditions through forward arguments, and this checkpoint is \
+         prefix-encoded; its cond_groups and encoding contradict each other"
+    )]
+    MultiSlotNeedsEveryPosition,
+
     /// The forward pass failed.
     #[error(transparent)]
     Candle(#[from] candle_core::Error),
@@ -203,7 +230,33 @@ pub enum BatchError {
 pub struct BandBatch {
     rows: Vec<Vec<u32>>,
     conds: Option<Vec<CondIndex>>,
+    conds_per_row: usize,
     legal: Option<Vec<Vec<Vec<u32>>>>,
+}
+
+/// Every combination of one global table row per group, earlier groups
+/// varying slower.
+///
+/// Global rows rather than within-group ordinals, so a consumer indexes
+/// the flat band list and the conditioning table without re-deriving
+/// the offsets — the two mistakes that arithmetic invites (an ordinal
+/// used as a row, an offset applied twice) never leave this function.
+fn combo_indices(groups: &[usize]) -> Vec<Vec<u32>> {
+    let mut out: Vec<Vec<u32>> = vec![Vec::new()];
+    let mut offset = 0u32;
+    for size in groups {
+        let mut next = Vec::with_capacity(out.len() * size);
+        for prefix in &out {
+            for member in 0..*size as u32 {
+                let mut combo = prefix.clone();
+                combo.push(offset + member);
+                next.push(combo);
+            }
+        }
+        out = next;
+        offset += *size as u32;
+    }
+    out
 }
 
 /// The conditioning row a band token occupies, when the checkpoint asks
@@ -306,6 +359,7 @@ impl BandBatch {
         Ok(Self {
             rows: vec![window.tokens().to_vec()],
             conds: cond.map(|cond| vec![cond]),
+            conds_per_row: 1,
             legal: sets.map(|sets| vec![sets]),
         })
     }
@@ -363,7 +417,79 @@ impl BandBatch {
         // indices are pushed in lockstep above: two rows cannot come to
         // describe two different games.
         let legal = row_legal.map(|sets| vec![sets; rows.len()]);
-        Ok(Self { rows, conds, legal })
+        Ok(Self {
+            rows,
+            conds,
+            conds_per_row: 1,
+            legal,
+        })
+    }
+
+    /// One row per **combination** of the checkpoint's condition
+    /// groups — the multi-slot counterpart of [`Self::over_bands`].
+    ///
+    /// The rows are identical copies of the window: a multi-slot corpus
+    /// carries no condition token in its rows, so nothing is written
+    /// into them and the combinations differ only in the indices each
+    /// row's forward receives. Combinations iterate with the earlier
+    /// group varying **slower** — for groups `[B, C] × [low, high]`
+    /// that is `B+low, B+high, C+low, C+high` — and
+    /// [`Self::combo_labels`] renders the same order, which is what
+    /// ties a row of logits to the name a reader prints for it.
+    ///
+    /// # Errors
+    ///
+    /// The shape is not multi-slot (one group is [`Self::over_bands`]'s
+    /// case, and answering it here would quietly duplicate that path),
+    /// or it is prefix-encoded — a prefix cannot carry two slots
+    /// without inventing an order for them, so no such checkpoint
+    /// exists to walk — or the legal sets and the checkpoint disagree
+    /// as in [`Self::single`].
+    pub fn over_combos(
+        window: &Window,
+        shape: &ModelShape,
+        legal: Option<&[Vec<u32>]>,
+    ) -> Result<Self, BatchError> {
+        let row_legal = legal_for(shape, window, legal)?;
+        let groups = shape.effective_cond_groups();
+        if groups.len() < 2 {
+            return Err(BatchError::NotMultiSlot {
+                groups: groups.len(),
+            });
+        }
+        if shape.encoding != CondEncoding::EveryPosition {
+            return Err(BatchError::MultiSlotNeedsEveryPosition);
+        }
+        let combos = combo_indices(&groups);
+        let per_row = groups.len();
+        let rows = vec![window.tokens().to_vec(); combos.len()];
+        let conds: Vec<CondIndex> = combos
+            .iter()
+            .flat_map(|combo| combo.iter().map(|row| CondIndex::from_table_row(*row)))
+            .collect();
+        let legal = row_legal.map(|sets| vec![sets; rows.len()]);
+        Ok(Self {
+            rows,
+            conds: Some(conds),
+            conds_per_row: per_row,
+            legal,
+        })
+    }
+
+    /// The name of each combination row [`Self::over_combos`] builds,
+    /// in the same order, each a `+`-join of one band token per group.
+    pub fn combo_labels(shape: &ModelShape) -> Vec<String> {
+        let groups = shape.effective_cond_groups();
+        combo_indices(&groups)
+            .iter()
+            .map(|combo| {
+                combo
+                    .iter()
+                    .map(|row| shape.bands[*row as usize].token.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .collect()
     }
 
     /// How many rows this batch holds.
@@ -432,7 +558,9 @@ impl BandBatch {
         let n = self.rows.len();
         let input = Tensor::from_vec(self.rows.concat(), (n, width), device)?;
         let out = match (&self.conds, &self.legal) {
-            (Some(conds), None) => model.forward_conditioned(&input, conds)?,
+            (Some(conds), None) => {
+                model.forward_conditioned_groups(&input, conds, self.conds_per_row)?
+            }
             (None, Some(sets)) => {
                 let legal = LegalSets::window(sets, 1, width, device)?;
                 model.forward_legal(&input, &legal)?
@@ -521,6 +649,82 @@ mod tests {
 
     /// A toy model at the shape's own size, seeded so thresholds are a
     /// property of these weights rather than of the initialiser's draw.
+    /// A 2×2 multi-slot shape: two opening families and two rating
+    /// bands, per-position encoded, groups `[2, 2]`.
+    fn combo_shape(vocab: &MoveVocab) -> ModelShape {
+        let mut shape = ModelShape::compact(
+            vocab.model_vocab_size(),
+            vec![
+                ConditionBand::tag_prefix("ECO", "B", "<eco:B>"),
+                ConditionBand::tag_prefix("ECO", "C", "<eco:C>"),
+                ConditionBand::rating(0, 1599, "<lo>"),
+                ConditionBand::rating(1600, 4000, "<hi>"),
+            ],
+        );
+        shape.encoding = CondEncoding::EveryPosition;
+        shape.cond_groups = vec![2, 2];
+        shape
+    }
+
+    /// The combination order is the contract a reader's labels rest on:
+    /// earlier groups vary slower, and the labels render the same walk.
+    #[test]
+    fn combo_rows_pair_each_label_with_its_own_index_pair() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let shape = combo_shape(&vocab);
+        assert_eq!(
+            BandBatch::combo_labels(&shape),
+            [
+                "<eco:B>+<lo>",
+                "<eco:B>+<hi>",
+                "<eco:C>+<lo>",
+                "<eco:C>+<hi>"
+            ]
+        );
+
+        let moves = knight_shuffle(6, &vocab);
+        let window = play_row(None, &moves, CTX).unwrap();
+        let batch = BandBatch::over_combos(&window, &shape, None).unwrap();
+        assert_eq!(batch.len(), 4);
+        // Identical rows: nothing is written into a multi-slot row.
+        assert!(batch.rows().iter().all(|r| r == &batch.rows()[0]));
+
+        let (model, device) = model_for(&shape);
+        let logits = batch.logits(&model, &device).unwrap();
+        assert_eq!(logits.len(), 4);
+        // The combinations are distinct conditions: the two rows that
+        // share no group member must differ.
+        let gap = logits[0]
+            .iter()
+            .zip(&logits[3])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(gap > 1e-5, "B+lo and C+hi produced the same logits");
+    }
+
+    /// The two shapes `over_combos` refuses, by name: a single group
+    /// (that comparison is `over_bands`) and a prefix encoding (no such
+    /// checkpoint exists to walk).
+    #[test]
+    fn combos_refuse_a_single_group_and_a_prefix_encoding() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let moves = knight_shuffle(6, &vocab);
+        let window = play_row(None, &moves, CTX).unwrap();
+
+        let single = shape(CondEncoding::EveryPosition, &vocab);
+        assert!(matches!(
+            BandBatch::over_combos(&window, &single, None),
+            Err(BatchError::NotMultiSlot { groups: 1 })
+        ));
+
+        let mut prefix = combo_shape(&vocab);
+        prefix.encoding = CondEncoding::Prefix;
+        assert!(matches!(
+            BandBatch::over_combos(&window, &prefix, None),
+            Err(BatchError::MultiSlotNeedsEveryPosition)
+        ));
+    }
+
     fn model_for(shape: &ModelShape) -> (Gpt2Model, Device) {
         let cfg = shape.config(Device::Cpu, DType::F32);
         let varmap = VarMap::new();
@@ -651,6 +855,7 @@ mod tests {
         let unconditioned = BandBatch {
             rows: batch.rows().to_vec(),
             conds: None,
+            conds_per_row: 1,
             legal: None,
         };
         let plain = unconditioned.logits(&model, &device).unwrap();
@@ -742,6 +947,7 @@ mod tests {
         let naive = BandBatch {
             rows: tail_rows,
             conds: None,
+            conds_per_row: 1,
             legal: None,
         };
         let naive_logits = naive.logits(&model, &device).unwrap();

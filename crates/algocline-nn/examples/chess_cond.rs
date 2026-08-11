@@ -281,6 +281,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    // A multi-slot checkpoint is walked over the **combinations** of
+    // its groups: each combination is one condition, its rows carry no
+    // condition token, and everything below that says "band" reads one
+    // combination per entry. The labels are the batch's own, so a row
+    // of logits and the name printed for it cannot come from two
+    // different orderings.
+    let multi = shape.effective_cond_groups().len() > 1;
+    let report_bands: Vec<String> = if multi {
+        BandBatch::combo_labels(&shape)
+    } else {
+        shape.band_tokens()
+    };
     let vocab = MoveVocab::new(&shape.band_tokens())?;
     let band_ids: Vec<u32> = shape
         .bands
@@ -291,7 +303,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or_else(|| format!("band {} missing", b.token))
         })
         .collect::<Result<_, _>>()?;
-    let n_bands = band_ids.len();
+    let n_bands = report_bands.len();
     // Whether this walk has to recover the legal sets for every position
     // of every row. Read once, and every piece of that work is behind
     // it, so a checkpoint without the axis does none of it.
@@ -308,15 +320,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .decided_on_the_board()
         .with_min_base_seconds(180)
         .with_ply_bounds(10, None);
-    let walk_token = match &walk_band {
-        Some(arg) => {
-            let token = resolve_band(&shape, arg)?;
-            let band = shape.band(&token).expect("resolved");
-            filter = band.narrow(filter);
-            Some(token)
-        }
-        None => None,
+    // One token narrows one axis; a comma separates several (the
+    // multi-slot walk's cell, e.g. `<eco:B>,<elo:1100-1599>`), and
+    // every one of them lands in `games_of` so the records say exactly
+    // what was walked.
+    let walk_tokens: Vec<String> = match &walk_band {
+        Some(arg) => arg
+            .split(',')
+            .map(|part| resolve_band(&shape, part.trim()))
+            .collect::<Result<_, _>>()?,
+        None => Vec::new(),
     };
+    for token in &walk_tokens {
+        let band = shape.band(token).expect("resolved");
+        filter = band.narrow(filter);
+    }
 
     let mut reader = PgnReader::new(BufReader::new(File::open(&pgn)?));
     let t0 = Instant::now();
@@ -488,7 +506,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // read the same way on both arms, and the sweep
                     // still rides on these forwards rather than adding
                     // any.
-                    let window = play_row(Some(band_ids[0]), &moves_so_far, shape.ctx)?;
+                    // A multi-slot row carries no condition token, so
+                    // its window is built without one and the batch
+                    // below delivers every combination as forward
+                    // arguments instead.
+                    let window = match multi {
+                        true => play_row(None, &moves_so_far, shape.ctx)?,
+                        false => play_row(Some(band_ids[0]), &moves_so_far, shape.ctx)?,
+                    };
                     // One list for the row, shared by every band's copy
                     // of it: the rows differ only at the band token,
                     // which holds no move. `legal_sets` is what knows
@@ -510,7 +535,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         true => Some(window.legal_sets(&at_ply, moves_so_far.len())?),
                         false => None,
                     };
-                    let batch = BandBatch::over_bands(&window, &shape, &vocab, sets.as_deref())?;
+                    let batch = match multi {
+                        true => BandBatch::over_combos(&window, &shape, sets.as_deref())?,
+                        false => BandBatch::over_bands(&window, &shape, &vocab, sets.as_deref())?,
+                    };
                     let band_logits = batch.logits(&model, &cfg.device)?;
                     let reference = mean_logits(&band_logits);
 
@@ -747,10 +775,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "walk       {positions} positions from {scoring_games} scoring game(s) \
          ({games} accepted by the filter), side {side:?}{}",
-        walk_token
-            .as_ref()
-            .map(|t| format!(", games of {t}"))
-            .unwrap_or_default()
+        match walk_tokens.is_empty() {
+            true => String::new(),
+            false => format!(", games of {}", walk_tokens.join(",")),
+        }
     );
     println!("elapsed    {:.1?}", t0.elapsed());
 
@@ -822,7 +850,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for b in 0..n_bands {
         println!(
             "    {}  full vocab {:.4}   renormalised over legal {:.4}",
-            shape.bands[b].token,
+            report_bands[b],
             ce_full[b].value().unwrap_or(f64::NAN),
             ce_legal[b].value().unwrap_or(f64::NAN)
         );
@@ -832,7 +860,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (b, m) in uniform_js.iter().enumerate() {
         println!(
             "    {} vs uniform   {:.4}",
-            shape.bands[b].token,
+            report_bands[b],
             m.value().unwrap_or(f64::NAN)
         );
     }
@@ -869,7 +897,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // the sidecar recorded rather than against a file name.
                 legal_input: shape.legal_input,
                 ctx: shape.ctx,
-                bands: shape.band_tokens(),
+                bands: report_bands.clone(),
                 gammas: gammas.clone(),
                 positions: records.len(),
                 games,
@@ -877,7 +905,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // empty list when the walk was deliberately left open
                 // — stated either way, so a reader does not have to
                 // recover which games these were from a run log.
-                games_of: Some(walk_token.iter().cloned().collect()),
+                games_of: Some(walk_tokens.clone()),
             },
             records,
         };

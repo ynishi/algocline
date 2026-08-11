@@ -548,6 +548,45 @@ pub enum StatError {
         bands: Vec<String>,
     },
 
+    /// The duo judge needs exactly four two-part combination columns.
+    ///
+    /// A 2×2 design is what makes "the combination that falsifies one
+    /// slot" unique; with any other grid that phrase names zero or
+    /// several columns and the judge would be choosing.
+    #[error(
+        "the duo walk carries {found} band column(s) and the registered design has exactly \
+         four two-part combinations — outside a 2×2 grid, `the combination that falsifies \
+         one slot` names zero or several columns"
+    )]
+    DuoNeedsFourCombos {
+        /// Band columns the walk carries.
+        found: usize,
+    },
+
+    /// The cell a duo walk claims matches none of its combination
+    /// columns, or has no single-slot falsification among them.
+    #[error(
+        "the walked cell {games_of:?} does not resolve against the combination columns \
+         {bands:?}; either it is not one of them or a single-slot falsification of it is \
+         missing"
+    )]
+    CellNotACombo {
+        /// The cell the walk's header claims.
+        games_of: Vec<String>,
+        /// The combination columns it carries.
+        bands: Vec<String>,
+    },
+
+    /// Two arm pairs handed to the duo judge claim the same cell.
+    ///
+    /// The same walk fed twice would count one cell's evidence as two,
+    /// with the verdict's "every cell" quantifier quietly weakened.
+    #[error("two arm pairs claim the cell {label}; each cell's evidence enters once")]
+    DuplicateCell {
+        /// The duplicated cell's label.
+        label: String,
+    },
+
     /// The jouseki judge needs exactly two bands.
     ///
     /// Plan 06 registers a two-family design: one correct column, one
@@ -2251,6 +2290,32 @@ fn jouseki_family_in(
     seed: u64,
 ) -> Result<H29Family, StatError> {
     let (correct, wrong) = check_jouseki_roles(arms, family)?;
+    cost_family_between(
+        arms, ARM_J, ARM_J_B, family, correct, wrong, bucket, gamma, draws, seed,
+    )
+}
+
+/// The cost-with-floor computation both the jouseki and the duo judges
+/// share: `top1[correct] - top1[wrong]` for `arm_a`, floored by its gap
+/// to `arm_b`, over the whole walk or one ply range.
+///
+/// A free function over indices rather than a method over roles,
+/// because the two judges resolve their indices differently (a family
+/// token against two bands; a cell against four combinations) and the
+/// arithmetic below is identical once they have.
+#[allow(clippy::too_many_arguments)]
+fn cost_family_between(
+    arms: &AlignedArms,
+    arm_a: &'static str,
+    arm_b: &'static str,
+    label: &str,
+    correct: usize,
+    wrong: usize,
+    bucket: Option<(usize, usize)>,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H29Family, StatError> {
     let gamma_ix = arms.gamma_index(gamma)?;
     let cost = move |at: &GammaRecord| -> Option<f64> {
         let per_band = at.top1.as_ref()?;
@@ -2259,8 +2324,8 @@ fn jouseki_family_in(
         Some((c as i64 - w as i64) as f64)
     };
     let judged = bucket.unwrap_or((0, usize::MAX));
-    let j = tally_in_bucket(arms, ARM_J, gamma_ix, judged, cost)?;
-    let j_b = tally_in_bucket(arms, ARM_J_B, gamma_ix, judged, cost)?;
+    let j = tally_in_bucket(arms, arm_a, gamma_ix, judged, cost)?;
+    let j_b = tally_in_bucket(arms, arm_b, gamma_ix, judged, cost)?;
     if j.total().n == 0 {
         return Err(StatError::EmptyBucket {
             low: judged.0,
@@ -2285,11 +2350,11 @@ fn jouseki_family_in(
     let (cost_j, floor) = margin_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
 
     let deep_range = (JOUSEKI_SHALLOW.1, usize::MAX);
-    let shallow = tally_in_bucket(arms, ARM_J, gamma_ix, JOUSEKI_SHALLOW, cost)?;
-    let deep = tally_in_bucket(arms, ARM_J, gamma_ix, deep_range, cost)?;
+    let shallow = tally_in_bucket(arms, arm_a, gamma_ix, JOUSEKI_SHALLOW, cost)?;
+    let deep = tally_in_bucket(arms, arm_a, gamma_ix, deep_range, cost)?;
 
     Ok(H29Family {
-        family: family.to_string(),
+        family: label.to_string(),
         cost_j,
         cost_j_b: j_b.total().mean().unwrap_or(f64::NAN),
         floor,
@@ -2418,6 +2483,266 @@ pub fn gate_top1_jouseki(
     let gamma_ix = arms.gamma_index(gamma)?;
     let subject = tally(arms, ARM_J_B, gamma_ix, top1_mean)?;
     let baseline = tally(arms, ARM_J, gamma_ix, top1_mean)?;
+    let interval = cluster_bootstrap(arms.games(), draws, seed, |draw| {
+        Some(subject.mean_over(draw)? - baseline.mean_over(draw)?)
+    })?;
+    Ok(Gate {
+        interval,
+        tolerance: TOP1_GATE_JOUSEKI,
+    })
+}
+
+/// Duo experiment (plan 08), primary seed arm.
+pub const ARM_K: &str = "K";
+
+/// Second run of [`ARM_K`], differing only in the shuffle seed.
+pub const ARM_K_B: &str = "K-b";
+
+/// The duo experiment's two arms.
+pub const DUO_ARMS: [&str; 2] = [ARM_K, ARM_K_B];
+
+/// What both checkpoints must have been, on both axes — the
+/// [`JOUSEKI_ROLES`] stance with the duo's arm names. Which **cell**
+/// was walked is the axis a swap could show up on, and that is checked
+/// against the records' own `games_of` by [`check_duo_roles`].
+pub const DUO_ROLES: [(&str, CondEncoding, bool); 2] = [
+    (ARM_K, CondEncoding::EveryPosition, false),
+    (ARM_K_B, CondEncoding::EveryPosition, false),
+];
+
+/// The cell a pair of duo walks claims, resolved against the four
+/// combination columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuoCell {
+    /// The correct combination's label — the cell itself.
+    pub label: String,
+    /// Column of the correct combination.
+    pub correct: usize,
+    /// Per slot, in the label's order: the label and column of the
+    /// combination that falsifies **that slot only**.
+    pub wrong: [(String, usize); 2],
+}
+
+/// The duo arms fit [`DUO_ROLES`] and this pair of walks is the cell it
+/// claims to be. Returns the resolved [`DuoCell`].
+///
+/// The walk's `bands` are combination labels — one band token per slot
+/// joined with `+`, written by the walk in the order its batch ran them
+/// — and its `games_of` carries the two tokens the cell's games were
+/// narrowed to. The correct column is the label whose parts are exactly
+/// those two tokens (compared as a set, since the walk's argument order
+/// is the caller's); each wrong column shares one part with it and
+/// differs in the other. A 2×2 design makes both unique, and anything
+/// else — three combinations, a label of one part, a `games_of` no
+/// label matches — is refused by name rather than resolved.
+pub fn check_duo_roles(arms: &AlignedArms) -> Result<DuoCell, StatError> {
+    require_kinds(arms, &DUO_ROLES)?;
+    let header = &arms.walk(ARM_K)?.header;
+    for arm in DUO_ARMS {
+        let header = &arms.walk(arm)?.header;
+        if header.version < WALK_FILTER_VERSION {
+            return Err(StatError::RecordsPredateWalkFilter {
+                arm,
+                found: header.version,
+                needed: WALK_FILTER_VERSION,
+            });
+        }
+    }
+    let cell_tokens = match &header.games_of {
+        Some(tokens) if tokens.len() == 2 => tokens.clone(),
+        other => {
+            return Err(StatError::WrongWalkedGamesForRole {
+                arm: ARM_K,
+                want: "two cell tokens".to_string(),
+                found: match other {
+                    Some(tokens) => format!("{tokens:?}"),
+                    None => "(unstated)".to_string(),
+                },
+            })
+        }
+    };
+    // Both walks must claim the same cell; the alignment does not
+    // compare this field, so it is compared here.
+    let replicate = &arms.walk(ARM_K_B)?.header.games_of;
+    if replicate.as_ref() != Some(&cell_tokens) {
+        return Err(StatError::WrongWalkedGamesForRole {
+            arm: ARM_K_B,
+            want: format!("{cell_tokens:?}"),
+            found: format!("{replicate:?}"),
+        });
+    }
+    let bands = &header.bands;
+    if bands.len() != 4 {
+        return Err(StatError::DuoNeedsFourCombos { found: bands.len() });
+    }
+    let parts: Vec<Vec<&str>> = bands
+        .iter()
+        .map(|label| label.split('+').collect::<Vec<_>>())
+        .collect();
+    if parts.iter().any(|p| p.len() != 2) {
+        return Err(StatError::DuoNeedsFourCombos { found: bands.len() });
+    }
+    let matches_cell = |p: &[&str]| {
+        (p[0] == cell_tokens[0] && p[1] == cell_tokens[1])
+            || (p[0] == cell_tokens[1] && p[1] == cell_tokens[0])
+    };
+    let correct =
+        parts
+            .iter()
+            .position(|p| matches_cell(p))
+            .ok_or_else(|| StatError::CellNotACombo {
+                games_of: cell_tokens.clone(),
+                bands: bands.clone(),
+            })?;
+    let correct_parts = &parts[correct];
+    let mut wrong: Vec<(String, usize)> = Vec::with_capacity(2);
+    for slot in 0..2 {
+        let other = slot ^ 1;
+        let found = parts.iter().enumerate().find(|(ix, p)| {
+            *ix != correct && p[other] == correct_parts[other] && p[slot] != correct_parts[slot]
+        });
+        match found {
+            Some((ix, _)) => wrong.push((bands[ix].clone(), ix)),
+            None => {
+                return Err(StatError::CellNotACombo {
+                    games_of: cell_tokens.clone(),
+                    bands: bands.clone(),
+                })
+            }
+        }
+    }
+    let wrong: [(String, usize); 2] = wrong.try_into().expect("two slots pushed two entries");
+    Ok(DuoCell {
+        label: bands[correct].clone(),
+        correct,
+        wrong,
+    })
+}
+
+/// One cell's half of H30: the cost of falsifying each slot alone,
+/// judged over ply 0-19.
+///
+/// Returns one [`H29Family`]-shaped result per slot, labelled
+/// `"<cell> vs <wrong label>"` so the printed row says which
+/// combination stood in for the mistake. The domain is the shallow
+/// stratum unconditionally — plan 08 registers no all-ply variant.
+///
+/// # Errors
+///
+/// Whatever [`check_duo_roles`] refuses, a gamma that was not swept,
+/// an empty judged bucket, or the resampling refusing.
+pub fn h30_cell(
+    arms: &AlignedArms,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<[H29Family; 2], StatError> {
+    let cell = check_duo_roles(arms)?;
+    let mut out = Vec::with_capacity(2);
+    for (wrong_label, wrong_ix) in &cell.wrong {
+        out.push(cost_family_between(
+            arms,
+            ARM_K,
+            ARM_K_B,
+            &format!("{} vs {}", cell.label, wrong_label),
+            cell.correct,
+            *wrong_ix,
+            Some(JOUSEKI_SHALLOW),
+            gamma,
+            draws,
+            seed,
+        )?);
+    }
+    Ok(out.try_into().expect("two wrongs produced two results"))
+}
+
+/// Plan 08's primary hypothesis: are both slots read, each in its own
+/// attribute's direction?
+#[derive(Debug, Clone, PartialEq)]
+pub struct H30 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// Per cell: its label and the two per-slot judgments.
+    pub cells: Vec<(String, [H29Family; 2])>,
+}
+
+impl H30 {
+    /// The verdict on one month: confirmed only when **every**
+    /// (cell, slot) confirms — the min-logic of [`H29::verdict`],
+    /// widened to the grid, because a slot that only works in some
+    /// cells and a cell where only one slot works are both exactly
+    /// what the min exists to keep out of a confirmation. Refuted when
+    /// any (cell, slot) refutes; everything else undetermined.
+    ///
+    /// The verdict is over the cells the caller fed — which cells
+    /// those must be is the plan's registration, not this function's;
+    /// it refuses none and reports all.
+    pub fn verdict(&self) -> &'static str {
+        let all = self
+            .cells
+            .iter()
+            .flat_map(|(_, slots)| slots.iter())
+            .all(H29Family::confirmed);
+        let any_refuted = self
+            .cells
+            .iter()
+            .flat_map(|(_, slots)| slots.iter())
+            .any(H29Family::refuted);
+        match (all, any_refuted) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H30 from one arm pair per cell.
+///
+/// Separate [`AlignedArms`] per cell for the reason [`h29`] takes two:
+/// the cells' walks are different games and each bootstrap resamples
+/// its own clusters. Two cells claiming the same label are refused —
+/// the same walk fed twice would count one cell's evidence as two.
+///
+/// # Errors
+///
+/// As [`h30_cell`] for any cell, or a duplicated cell label.
+pub fn h30(
+    arms_by_cell: &[&AlignedArms],
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H30, StatError> {
+    let mut cells = Vec::with_capacity(arms_by_cell.len());
+    for arms in arms_by_cell {
+        let cell = check_duo_roles(arms)?;
+        if cells.iter().any(|(label, _)| *label == cell.label) {
+            return Err(StatError::DuplicateCell { label: cell.label });
+        }
+        cells.push((cell.label.clone(), h30_cell(arms, gamma, draws, seed)?));
+    }
+    Ok(H30 { gamma, cells })
+}
+
+/// The duo admission gate: the seed replicate's mean top-1 against the
+/// primary's, at [`TOP1_GATE_JOUSEKI`] — the same reference and the
+/// same tolerance as [`gate_top1_jouseki`], for the same reason: the
+/// pair differ in the shuffle seed alone, so this catches a run defect
+/// and nothing else can sit between them.
+///
+/// # Errors
+///
+/// As [`check_duo_roles`], plus a gamma that was not swept or the
+/// resampling refusing.
+pub fn gate_top1_duo(
+    arms: &AlignedArms,
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<Gate, StatError> {
+    check_duo_roles(arms)?;
+    let gamma_ix = arms.gamma_index(gamma)?;
+    let subject = tally(arms, ARM_K_B, gamma_ix, top1_mean)?;
+    let baseline = tally(arms, ARM_K, gamma_ix, top1_mean)?;
     let interval = cluster_bootstrap(arms.games(), draws, seed, |draw| {
         Some(subject.mean_over(draw)? - baseline.mean_over(draw)?)
     })?;
@@ -5255,6 +5580,146 @@ mod tests {
         let all_ply = h29_family(&arms, ECO_B, 1.0, 200, SEED).unwrap();
         assert!(all_ply.cost_j < 1.0);
         assert_eq!(all_ply.positions, 6 * 15);
+    }
+
+    const ELO_LO: &str = "<elo:1100-1299>";
+    const ELO_HI: &str = "<elo:1900-2099>";
+
+    /// The four combination labels in the batch's own order — eco
+    /// varies slower — as `chess_cond` writes them for a 2×2 model.
+    fn combo_bands() -> Vec<String> {
+        vec![
+            format!("{ECO_B}+{ELO_LO}"),
+            format!("{ECO_B}+{ELO_HI}"),
+            format!("{ECO_C}+{ELO_LO}"),
+            format!("{ECO_C}+{ELO_HI}"),
+        ]
+    }
+
+    /// A duo walk over one cell's games: four combination columns,
+    /// `games_of` naming the two cell tokens, `hit(combo, game, ix)`
+    /// deciding each column's top-1.
+    fn duo_walk(
+        games: usize,
+        per_game: usize,
+        cell: [&str; 2],
+        js: f64,
+        hit: impl Fn(usize, usize, usize) -> bool,
+    ) -> Walk {
+        let mut records = Vec::new();
+        for game in 0..games {
+            for ix in 0..per_game {
+                records.push(PositionRecord {
+                    game,
+                    ply: ix * 2,
+                    n_legal: None,
+                    at: vec![GammaRecord {
+                        flipped: false,
+                        widest_js: js,
+                        legal_mass: 0.9,
+                        top1: Some((0..4).map(|c| hit(c, game, ix)).collect()),
+                        ce: None,
+                        top2_margin: None,
+                    }],
+                });
+            }
+        }
+        let mut header = header(records.len(), games);
+        header.encoding = CondEncoding::EveryPosition;
+        header.bands = combo_bands();
+        header.gammas = GAMMAS.to_vec();
+        header.games_of = Some(cell.iter().map(|t| t.to_string()).collect());
+        Walk { header, records }
+    }
+
+    fn duo_arms(k: Walk, k_b: Walk) -> AlignedArms {
+        let mut k = k;
+        let mut k_b = k_b;
+        k.header.ckpt = "/root/ckpt/K/run.safetensors".into();
+        k_b.header.ckpt = "/root/ckpt/K-b/run.safetensors".into();
+        AlignedArms::new(vec![(ARM_K.to_string(), k), (ARM_K_B.to_string(), k_b)])
+            .expect("the fixture arms share a position stream")
+    }
+
+    /// The cell resolves to its own column and each wrong column
+    /// falsifies exactly one slot — including when the walk's
+    /// `games_of` lists the tokens in the other order.
+    #[test]
+    fn a_duo_cell_resolves_its_column_and_both_single_slot_wrongs() {
+        for cell in [[ECO_B, ELO_HI], [ELO_HI, ECO_B]] {
+            let arms = duo_arms(
+                duo_walk(4, 6, cell, 0.0, |c, _, _| c == 1),
+                duo_walk(4, 6, cell, 0.001, |c, _, _| c == 1),
+            );
+            let resolved = check_duo_roles(&arms).unwrap();
+            assert_eq!(resolved.label, format!("{ECO_B}+{ELO_HI}"));
+            assert_eq!(resolved.correct, 1);
+            // Wrong slot 0 (the eco part) is C+hi; wrong slot 1 (the
+            // elo part) is B+lo.
+            assert_eq!(resolved.wrong[0], (format!("{ECO_C}+{ELO_HI}"), 3));
+            assert_eq!(resolved.wrong[1], (format!("{ECO_B}+{ELO_LO}"), 0));
+        }
+    }
+
+    /// A cell no column matches is refused, as is a walk claiming one
+    /// token where a cell is two.
+    #[test]
+    fn a_duo_walk_of_no_known_cell_is_refused() {
+        let arms = duo_arms(
+            duo_walk(4, 6, [ECO_B, "<elo:other>"], 0.0, |c, _, _| c == 0),
+            duo_walk(4, 6, [ECO_B, "<elo:other>"], 0.001, |c, _, _| c == 0),
+        );
+        assert!(matches!(
+            check_duo_roles(&arms),
+            Err(StatError::CellNotACombo { .. })
+        ));
+
+        let mut k = duo_walk(4, 6, [ECO_B, ELO_LO], 0.0, |c, _, _| c == 0);
+        k.header.games_of = Some(vec![ECO_B.into()]);
+        let mut k_b = duo_walk(4, 6, [ECO_B, ELO_LO], 0.001, |c, _, _| c == 0);
+        k_b.header.games_of = Some(vec![ECO_B.into()]);
+        let arms = duo_arms(k, k_b);
+        assert!(matches!(
+            check_duo_roles(&arms),
+            Err(StatError::WrongWalkedGamesForRole { .. })
+        ));
+    }
+
+    /// The grid min-logic: a model that ignores one slot confirms that
+    /// slot's cost at zero, and the month cannot confirm through it.
+    #[test]
+    fn a_slot_the_model_ignores_keeps_the_month_from_confirming() {
+        // Column top-1 depends only on the eco half: 0/1 share fate,
+        // 2/3 share fate. Falsifying eco costs 1; falsifying elo
+        // costs 0.
+        let eco_only = |c: usize, _: usize, _: usize| c < 2;
+        let arms = duo_arms(
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.0, eco_only),
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.001, eco_only),
+        );
+        let [eco_axis, elo_axis] = h30_cell(&arms, 1.0, 200, SEED).unwrap();
+        assert_eq!(eco_axis.cost_j, 1.0);
+        assert!(eco_axis.confirmed());
+        assert_eq!(elo_axis.cost_j, 0.0);
+        assert!(!elo_axis.confirmed());
+
+        let month = h30(&[&arms], 1.0, 200, SEED).unwrap();
+        assert_eq!(month.verdict(), "undetermined");
+
+        // Both slots read: every falsification costs.
+        let both = |c: usize, _: usize, _: usize| c == 0;
+        let arms = duo_arms(
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.0, both),
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.001, both),
+        );
+        let month = h30(&[&arms], 1.0, 200, SEED).unwrap();
+        assert_eq!(month.verdict(), "confirmed");
+
+        // And the same pair fed twice is not two cells.
+        assert!(matches!(
+            h30(&[&arms, &arms], 1.0, 200, SEED),
+            Err(StatError::DuplicateCell { .. })
+        ));
     }
 
     /// Two identical runs sit at zero distance, and the gate passes.

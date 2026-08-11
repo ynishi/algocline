@@ -60,12 +60,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut gamma: f32 = 1.0;
     let mut seed: u64 = DEFAULT_SEED;
     let mut draws: usize = DRAWS;
+    let mut pool = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--gamma" => gamma = args.next().ok_or(USAGE)?.trim().parse()?,
             "--seed" => seed = args.next().ok_or(USAGE)?.trim().parse()?,
             "--draws" => draws = args.next().ok_or(USAGE)?.trim().parse()?,
+            // Plan 09's judged statistic: the per-axis pooled cost
+            // (H32) instead of the per-(cell, slot) grid (H30).
+            "--pool" => pool = true,
             _ => paths.push(arg.into()),
         }
     }
@@ -119,9 +123,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         admitted &= gate.passes();
     }
 
+    let arms_refs: Vec<&AlignedArms> = pairs.iter().map(|(arms, _, _)| arms).collect();
+
+    if pool {
+        println!();
+        println!("H32 — pooled over the cells, is each slot read in its own direction?");
+        let h32 = steerability::h32(&arms_refs, gamma, draws, seed)?;
+        for axis in &h32.axes {
+            println!("  slot {}", axis.slot);
+            println!(
+                "    D_pool {:+.6} (replicate {:+.6})   F_pool {:+.6}",
+                axis.d_pool_k, axis.d_pool_k_b, axis.floor
+            );
+            println!("    confirm on D - F above zero       {}", axis.confirm);
+            println!("    refute  on D + F below zero       {}", axis.refute);
+            report_dropped_draws(&format!("slot {} confirm", axis.slot), &axis.confirm);
+            report_dropped_draws(&format!("slot {} refute", axis.slot), &axis.refute);
+            println!(
+                "    ({} position(s), {} game(s) pooled in the judged stratum)",
+                axis.positions, axis.games
+            );
+            println!("    per cell (description, no verdict):");
+            for (label, k, k_b) in &axis.per_cell {
+                println!("      {label}  D(K) {k:+.6}  D(K-b) {k_b:+.6}");
+            }
+        }
+        println!();
+        println!(
+            "  verdict on this month over {} cell(s)   {}   (confirmed only when both \
+             axes confirm; per-cell survival is description — plan 09's registered \
+             weakening of plan 08's grid)",
+            h32.axes[0].per_cell.len(),
+            h32.verdict()
+        );
+        if !admitted {
+            println!();
+            println!(
+                "NOTE: an admission gate did not pass, so the verdict above is descriptive \
+                 and not adopted."
+            );
+        }
+        println!();
+        println!("Judged on two held-out months and only when the two agree.");
+        println!(
+            "elapsed    {:.1?} total, of which {:.1?} reading the records",
+            t0.elapsed(),
+            read_elapsed
+        );
+        return Ok(());
+    }
+
     println!();
     println!("H30 — are both slots read, each in its own attribute's direction?");
-    let arms_refs: Vec<&AlignedArms> = pairs.iter().map(|(arms, _, _)| arms).collect();
     let h30 = steerability::h30(&arms_refs, gamma, draws, seed)?;
     for (label, slots) in &h30.cells {
         println!("  cell {label}");

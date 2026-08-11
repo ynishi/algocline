@@ -416,6 +416,77 @@ pub fn cluster_bootstrap(
     })
 }
 
+/// [`cluster_bootstrap`] over several independent strata, resampled
+/// together.
+///
+/// `strata` holds one cluster count per stratum, and every draw
+/// resamples **each stratum from its own clusters** — `stat` receives
+/// one index list per stratum, in order. This is what a statistic
+/// pooled across separate position streams needs: the streams share no
+/// games, so a single pooled cluster space would let a draw omit a
+/// stratum entirely and would treat clusters from different
+/// populations as exchangeable, and both misstate the sampling the
+/// interval claims to describe.
+///
+/// The point estimate is `stat` on every stratum's whole sample. The
+/// percentile machinery, the seed discipline and the undefined-draw
+/// accounting are [`cluster_bootstrap`]'s; [`Interval::clusters`]
+/// reports the total across strata.
+///
+/// # Errors
+///
+/// - `strata` is empty, any stratum has zero clusters, or `draws` is
+///   zero.
+/// - `stat` is undefined on the whole sample, or on every draw of it.
+pub fn stratified_cluster_bootstrap(
+    strata: &[usize],
+    draws: usize,
+    seed: u64,
+    stat: impl Fn(&[Vec<usize>]) -> Option<f64>,
+) -> Result<Interval, BootstrapError> {
+    if strata.is_empty() || strata.contains(&0) {
+        return Err(BootstrapError::NoClusters);
+    }
+    if draws == 0 {
+        return Err(BootstrapError::NoDraws);
+    }
+
+    let whole: Vec<Vec<usize>> = strata.iter().map(|n| (0..*n).collect()).collect();
+    let point = stat(&whole)
+        .filter(|v| v.is_finite())
+        .ok_or(BootstrapError::UndefinedOnWholeSample)?;
+
+    let mut resampler = Resampler::new(seed);
+    let mut draw: Vec<Vec<usize>> = strata.iter().map(|n| vec![0usize; *n]).collect();
+    let mut values: Vec<f64> = Vec::with_capacity(draws);
+    let mut undefined_draws = 0usize;
+    for _ in 0..draws {
+        for (stratum, clusters) in draw.iter_mut().zip(strata) {
+            if !resampler.draw_into(*clusters, stratum) {
+                // Only reachable with zero clusters, refused above.
+                return Err(BootstrapError::NoClusters);
+            }
+        }
+        match stat(&draw).filter(|v| v.is_finite()) {
+            Some(value) => values.push(value),
+            None => undefined_draws += 1,
+        }
+    }
+    if values.is_empty() {
+        return Err(BootstrapError::EveryDrawUndefined { draws });
+    }
+    let (low, high) = percentile_interval(&mut values);
+    Ok(Interval {
+        point,
+        low,
+        high,
+        draws: values.len(),
+        undefined_draws,
+        clusters: strata.iter().sum(),
+        seed,
+    })
+}
+
 /// An interval and the one-sided levels the same draws also carry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignedInterval {

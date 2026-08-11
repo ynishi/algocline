@@ -74,7 +74,8 @@ use crate::chess::records::{AlignError, AlignedArms, GammaRecord};
 use crate::chess::window::COND_PREFIX_LEN;
 use crate::chess::CondEncoding;
 use crate::metric::bootstrap::{
-    cluster_bootstrap, cluster_bootstrap_signed, BootstrapError, ClusterTally, Interval, CONFIDENCE,
+    cluster_bootstrap, cluster_bootstrap_signed, stratified_cluster_bootstrap, BootstrapError,
+    ClusterTally, Interval, CONFIDENCE,
 };
 
 /// Arm trained with the band conditioning every position.
@@ -2721,6 +2722,197 @@ pub fn h30(
         cells.push((cell.label.clone(), h30_cell(arms, gamma, draws, seed)?));
     }
     Ok(H30 { gamma, cells })
+}
+
+/// One slot axis of H32: the pooled mis-conditioning cost of
+/// falsifying that slot alone, over every cell at once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct H32Axis {
+    /// Which slot, as the position in the combination labels (slot 0
+    /// is the label's first part).
+    pub slot: usize,
+    /// `D_pool = Σ_cells Σ_positions cost / Σ_cells positions` for
+    /// [`ARM_K`], judged over ply 0-19.
+    pub d_pool_k: f64,
+    /// The same for [`ARM_K_B`].
+    pub d_pool_k_b: f64,
+    /// `F_pool = |D_pool(K) - D_pool(K-b)|` on the sample as walked.
+    pub floor: f64,
+    /// Interval on `D_pool(K) - F_pool`, floor recomputed inside every
+    /// stratified draw. Confirms when it excludes zero from above.
+    pub confirm: Interval,
+    /// Interval on `D_pool(K) + F_pool`. Refutes when it excludes zero
+    /// from below.
+    pub refute: Interval,
+    /// Per cell, descriptively: label, `D(K)`, `D(K-b)` — the grid
+    /// plan 08 judged, kept visible without carrying a verdict.
+    pub per_cell: Vec<(String, f64, f64)>,
+    /// Positions pooled in the judged stratum, across cells.
+    pub positions: usize,
+    /// Games those came from, across cells — the clusters resampled.
+    pub games: usize,
+}
+
+impl H32Axis {
+    /// Whether the confirm interval clears zero from above.
+    pub fn confirmed(&self) -> bool {
+        self.confirm.excludes_zero_from_above()
+    }
+
+    /// Whether the refute interval clears zero from below.
+    pub fn refuted(&self) -> bool {
+        self.refute.excludes_zero_from_below()
+    }
+}
+
+/// Plan 09's primary hypothesis: pooled over the cells, is each slot
+/// read in its own attribute's direction?
+#[derive(Debug, Clone, PartialEq)]
+pub struct H32 {
+    /// Guidance strength it was read at.
+    pub gamma: f32,
+    /// The two slot axes.
+    pub axes: [H32Axis; 2],
+}
+
+impl H32 {
+    /// The verdict on one month: confirmed when **both** axes confirm,
+    /// refuted when either refutes, undetermined otherwise. Per-cell
+    /// survival carries no verdict here — plan 09 demotes it to the
+    /// description [`H32Axis::per_cell`] keeps visible — which is the
+    /// deliberate weakening plan 08's floor resolution forced, stated
+    /// rather than smuggled.
+    pub fn verdict(&self) -> &'static str {
+        let all = self.axes.iter().all(H32Axis::confirmed);
+        let any_refuted = self.axes.iter().any(H32Axis::refuted);
+        match (all, any_refuted) {
+            (true, false) => "confirmed",
+            (false, true) => "refuted",
+            _ => "undetermined",
+        }
+    }
+}
+
+/// Assemble H32 from one arm pair per cell.
+///
+/// The pooled mean is position-weighted across cells, and the
+/// bootstrap is **stratified**: each cell's games resample from their
+/// own cluster space
+/// ([`crate::metric::bootstrap::stratified_cluster_bootstrap`]),
+/// because the cells share no games and a pooled cluster space would
+/// treat them as exchangeable. The floor is recomputed inside every
+/// draw, as every judge here does.
+///
+/// # Errors
+///
+/// As [`check_duo_roles`] for any cell, a duplicated cell, a gamma
+/// that was not swept, an empty judged stratum, or the resampling
+/// refusing.
+pub fn h32(
+    arms_by_cell: &[&AlignedArms],
+    gamma: f32,
+    draws: usize,
+    seed: u64,
+) -> Result<H32, StatError> {
+    // Per cell, per arm, per axis: a ClusterTally of the judged
+    // stratum's per-position costs.
+    let mut labels: Vec<String> = Vec::with_capacity(arms_by_cell.len());
+    let mut tallies: Vec<[[ClusterTally; 2]; 2]> = Vec::with_capacity(arms_by_cell.len());
+    for arms in arms_by_cell {
+        let cell = check_duo_roles(arms)?;
+        if labels.contains(&cell.label) {
+            return Err(StatError::DuplicateCell { label: cell.label });
+        }
+        let gamma_ix = arms.gamma_index(gamma)?;
+        let mut per_arm: Vec<[ClusterTally; 2]> = Vec::with_capacity(2);
+        for arm in DUO_ARMS {
+            let mut per_axis: Vec<ClusterTally> = Vec::with_capacity(2);
+            for (_, wrong_ix) in &cell.wrong {
+                let correct = cell.correct;
+                let wrong = *wrong_ix;
+                let cost = move |at: &GammaRecord| -> Option<f64> {
+                    let per_band = at.top1.as_ref()?;
+                    let c = *per_band.get(correct)?;
+                    let w = *per_band.get(wrong)?;
+                    Some((c as i64 - w as i64) as f64)
+                };
+                let tally = tally_in_bucket(arms, arm, gamma_ix, JOUSEKI_SHALLOW, cost)?;
+                if tally.total().n == 0 {
+                    return Err(StatError::EmptyBucket {
+                        low: JOUSEKI_SHALLOW.0,
+                        high: JOUSEKI_SHALLOW.1.saturating_sub(1),
+                        role: "cost",
+                    });
+                }
+                per_axis.push(tally);
+            }
+            per_arm.push(per_axis.try_into().expect("two axes"));
+        }
+        labels.push(cell.label);
+        tallies.push(per_arm.try_into().expect("two arms"));
+    }
+
+    let strata: Vec<usize> = arms_by_cell.iter().map(|arms| arms.games()).collect();
+    let pool = |axis: usize, arm: usize, draw: &[Vec<usize>]| -> Option<f64> {
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for (cell, stratum) in tallies.iter().zip(draw) {
+            let t = cell[arm][axis].over(stratum)?;
+            sum += t.sum;
+            n += t.n;
+        }
+        (n > 0).then(|| sum / n as f64)
+    };
+
+    let mut axes: Vec<H32Axis> = Vec::with_capacity(2);
+    for axis in 0..2 {
+        let margin_and_floor = |draw: &[Vec<usize>]| -> Option<(f64, f64)> {
+            let k = pool(axis, 0, draw)?;
+            let k_b = pool(axis, 1, draw)?;
+            Some((k, (k - k_b).abs()))
+        };
+        let confirm = stratified_cluster_bootstrap(&strata, draws, seed, |draw| {
+            margin_and_floor(draw).map(|(m, f)| m - f)
+        })?;
+        let refute = stratified_cluster_bootstrap(&strata, draws, seed, |draw| {
+            margin_and_floor(draw).map(|(m, f)| m + f)
+        })?;
+        let whole: Vec<Vec<usize>> = strata.iter().map(|n| (0..*n).collect()).collect();
+        let (d_pool_k, floor) =
+            margin_and_floor(&whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+        let d_pool_k_b = pool(axis, 1, &whole).ok_or(BootstrapError::UndefinedOnWholeSample)?;
+        let per_cell: Vec<(String, f64, f64)> = labels
+            .iter()
+            .zip(&tallies)
+            .map(|(label, cell)| {
+                (
+                    label.clone(),
+                    cell[0][axis].total().mean().unwrap_or(f64::NAN),
+                    cell[1][axis].total().mean().unwrap_or(f64::NAN),
+                )
+            })
+            .collect();
+        let positions: usize = tallies.iter().map(|cell| cell[0][axis].total().n).sum();
+        let games: usize = tallies
+            .iter()
+            .map(|cell| cell[0][axis].clusters_present())
+            .sum();
+        axes.push(H32Axis {
+            slot: axis,
+            d_pool_k,
+            d_pool_k_b,
+            floor,
+            confirm,
+            refute,
+            per_cell,
+            positions,
+            games,
+        });
+    }
+    Ok(H32 {
+        gamma,
+        axes: axes.try_into().expect("two axes"),
+    })
 }
 
 /// The duo admission gate: the seed replicate's mean top-1 against the
@@ -5720,6 +5912,41 @@ mod tests {
             h30(&[&arms, &arms], 1.0, 200, SEED),
             Err(StatError::DuplicateCell { .. })
         ));
+    }
+
+    /// H32 pools the cells per axis: with one slot ignored everywhere,
+    /// the pooled axis prices at zero and the month cannot confirm;
+    /// with both slots read in both cells, it does. The per-cell grid
+    /// stays visible as description.
+    #[test]
+    fn h32_pools_the_cells_and_still_requires_both_axes() {
+        let eco_only = |c: usize, _: usize, _: usize| c < 2;
+        let cell_b = duo_arms(
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.0, eco_only),
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.001, eco_only),
+        );
+        let cell_c = duo_arms(
+            duo_walk(6, 8, [ECO_C, ELO_HI], 0.0, |c, _, _| c >= 2),
+            duo_walk(6, 8, [ECO_C, ELO_HI], 0.001, |c, _, _| c >= 2),
+        );
+        let month = h32(&[&cell_b, &cell_c], 1.0, 200, SEED).unwrap();
+        assert_eq!(month.axes[0].d_pool_k, 1.0);
+        assert_eq!(month.axes[1].d_pool_k, 0.0);
+        assert!(month.axes[0].confirmed());
+        assert!(!month.axes[1].confirmed());
+        assert_eq!(month.verdict(), "undetermined");
+        assert_eq!(month.axes[0].per_cell.len(), 2);
+
+        let both_b = duo_arms(
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.0, |c, _, _| c == 0),
+            duo_walk(6, 8, [ECO_B, ELO_LO], 0.001, |c, _, _| c == 0),
+        );
+        let both_c = duo_arms(
+            duo_walk(6, 8, [ECO_C, ELO_HI], 0.0, |c, _, _| c == 3),
+            duo_walk(6, 8, [ECO_C, ELO_HI], 0.001, |c, _, _| c == 3),
+        );
+        let month = h32(&[&both_b, &both_c], 1.0, 200, SEED).unwrap();
+        assert_eq!(month.verdict(), "confirmed");
     }
 
     /// Two identical runs sit at zero distance, and the gate passes.

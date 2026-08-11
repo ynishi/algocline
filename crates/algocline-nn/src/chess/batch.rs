@@ -83,6 +83,23 @@ pub enum BatchError {
         groups: usize,
     },
 
+    /// A cell does not name exactly one band per condition group.
+    ///
+    /// Two of one group and none of another would condition a row on
+    /// one attribute twice while leaving the other unstated, and every
+    /// number downstream would still be well-formed.
+    #[error(
+        "the cell {cell:?} does not name exactly one band per condition group of {bands:?}; \
+         a row conditioned twice on one attribute and not at all on another reads like any \
+         other row"
+    )]
+    CellNotOnePerGroup {
+        /// The tokens the caller asked for.
+        cell: Vec<String>,
+        /// The checkpoint's band tokens, in group order.
+        bands: Vec<String>,
+    },
+
     /// A multi-slot walk of a prefix-encoded checkpoint was asked for.
     ///
     /// No such checkpoint exists to walk: a prefix cannot carry two
@@ -476,6 +493,82 @@ impl BandBatch {
         })
     }
 
+    /// One row under one **cell** — one band token per group, in any
+    /// order — for a multi-slot checkpoint.
+    ///
+    /// [`Self::single`]'s multi-slot counterpart, and what a player
+    /// needs: [`Self::over_combos`] runs every combination to compare
+    /// them, while playing a position asks for one. The row is the
+    /// window unchanged (a multi-slot row carries no condition token)
+    /// and the conditions travel as forward arguments.
+    ///
+    /// `cell` names one token per group; they are matched to groups by
+    /// membership rather than by position, so the caller's order is
+    /// its own. Exactly one token per group is required — two of one
+    /// group and none of another is the mistake that would otherwise
+    /// condition a row on one attribute twice.
+    ///
+    /// # Errors
+    ///
+    /// The shape is not multi-slot, is prefix-encoded, `cell` does not
+    /// name exactly one band per group, or the legal sets and the
+    /// checkpoint disagree as in [`Self::single`].
+    pub fn single_combo(
+        window: &Window,
+        shape: &ModelShape,
+        cell: &[String],
+        legal: Option<&[Vec<u32>]>,
+    ) -> Result<Self, BatchError> {
+        let row_legal = legal_for(shape, window, legal)?;
+        let groups = shape.effective_cond_groups();
+        if groups.len() < 2 {
+            return Err(BatchError::NotMultiSlot {
+                groups: groups.len(),
+            });
+        }
+        if shape.encoding != CondEncoding::EveryPosition {
+            return Err(BatchError::MultiSlotNeedsEveryPosition);
+        }
+        // Global rows per group, so a token is matched against the
+        // group it actually belongs to and the answer indexes the
+        // conditioning table directly.
+        let mut offset = 0usize;
+        let mut conds: Vec<CondIndex> = Vec::with_capacity(groups.len());
+        for size in &groups {
+            let members = &shape.bands[offset..offset + size];
+            let mut found = cell.iter().filter_map(|token| {
+                members
+                    .iter()
+                    .position(|b| b.token == *token)
+                    .map(|ix| offset + ix)
+            });
+            let row = found.next().ok_or_else(|| BatchError::CellNotOnePerGroup {
+                cell: cell.to_vec(),
+                bands: shape.band_tokens(),
+            })?;
+            if found.next().is_some() {
+                return Err(BatchError::CellNotOnePerGroup {
+                    cell: cell.to_vec(),
+                    bands: shape.band_tokens(),
+                });
+            }
+            conds.push(CondIndex::from_table_row(row as u32));
+            offset += size;
+        }
+        if cell.len() != groups.len() {
+            return Err(BatchError::CellNotOnePerGroup {
+                cell: cell.to_vec(),
+                bands: shape.band_tokens(),
+            });
+        }
+        Ok(Self {
+            rows: vec![window.tokens().to_vec()],
+            conds: Some(conds),
+            conds_per_row: groups.len(),
+            legal: row_legal.map(|sets| vec![sets]),
+        })
+    }
+
     /// The name of each combination row [`Self::over_combos`] builds,
     /// in the same order, each a `+`-join of one band token per group.
     pub fn combo_labels(shape: &ModelShape) -> Vec<String> {
@@ -700,6 +793,68 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(gap > 1e-5, "B+lo and C+hi produced the same logits");
+    }
+
+    /// A cell picks the one combination row it names, whatever order
+    /// its tokens came in, and matching `over_combos`' row for it.
+    #[test]
+    fn a_cell_picks_its_own_combination_row() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let shape = combo_shape(&vocab);
+        let moves = knight_shuffle(6, &vocab);
+        let window = play_row(None, &moves, CTX).unwrap();
+        let (model, device) = model_for(&shape);
+        // `<eco:C>+<hi>` is combination row 3.
+        let want = BandBatch::over_combos(&window, &shape, None)
+            .unwrap()
+            .logits(&model, &device)
+            .unwrap()[3]
+            .clone();
+
+        for cell in [
+            vec!["<eco:C>".to_string(), "<hi>".to_string()],
+            vec!["<hi>".to_string(), "<eco:C>".to_string()],
+        ] {
+            let batch = BandBatch::single_combo(&window, &shape, &cell, None).unwrap();
+            assert_eq!(batch.len(), 1);
+            let got = batch.logits(&model, &device).unwrap();
+            let gap = max_abs_diff_f32(
+                &Tensor::from_slice(&got[0], (got[0].len(),), &device).unwrap(),
+                &Tensor::from_slice(&want, (want.len(),), &device).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                gap < 1e-6,
+                "the cell did not select its own row (gap {gap})"
+            );
+        }
+    }
+
+    /// A cell naming two bands of one group and none of the other is
+    /// refused — the row would be conditioned twice on one attribute.
+    #[test]
+    fn a_cell_that_misses_a_group_is_refused() {
+        let vocab = MoveVocab::new(&[]).unwrap();
+        let shape = combo_shape(&vocab);
+        let moves = knight_shuffle(6, &vocab);
+        let window = play_row(None, &moves, CTX).unwrap();
+        for cell in [
+            vec!["<eco:B>".to_string(), "<eco:C>".to_string()],
+            vec!["<eco:B>".to_string()],
+            vec![
+                "<eco:B>".to_string(),
+                "<lo>".to_string(),
+                "<hi>".to_string(),
+            ],
+        ] {
+            assert!(
+                matches!(
+                    BandBatch::single_combo(&window, &shape, &cell, None),
+                    Err(BatchError::CellNotOnePerGroup { .. })
+                ),
+                "{cell:?} was accepted"
+            );
+        }
     }
 
     /// The two shapes `over_combos` refuses, by name: a single group

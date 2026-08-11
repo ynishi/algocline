@@ -3,8 +3,16 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --example chess_play -- <ckpt.safetensors> <band|-> [moves...]
+//! cargo run --release --example chess_play -- <ckpt.safetensors> <band|cell|-> [moves...]
 //! ```
+//!
+//! A multi-slot checkpoint is played under a **cell** — one band token
+//! per condition group, comma-separated (`'<eco:B>,<elo:1100-1299>'`).
+//! Its rows carry no condition token, so the conditions travel as
+//! forward arguments and the printed header names every slot's table
+//! row: playing two cells by hand is the observation plan 09's result
+//! calls for, and it is worth nothing if the two runs silently played
+//! the same conditions.
 //!
 //! Moves may be UCI (`e2e4`) or SAN (`Nf3`); both are resolved against
 //! the position, so a game can be typed the way it reads. With no
@@ -88,6 +96,18 @@ fn resolve_band(shape: &ModelShape, arg: &str) -> Result<Option<String>, String>
             ))
         };
     }
+    if shape.effective_cond_groups().len() > 1 {
+        // A multi-slot checkpoint is played under a cell — one token
+        // per group — and this resolver answers about one band. Refused
+        // rather than answered for the first group, which would play
+        // the other attribute on whatever row happened to be zero.
+        return Err(format!(
+            "this checkpoint conditions in {} slots; name one band per slot, \
+             comma-separated (e.g. '<eco:B>,<elo:1100-1299>'), from {:?}",
+            shape.effective_cond_groups().len(),
+            shape.band_tokens()
+        ));
+    }
     // Accept either the token or the bare range.
     let token = if arg.starts_with('<') {
         arg.to_string()
@@ -117,7 +137,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let ckpt: PathBuf = args
         .next()
-        .ok_or("usage: chess_play <ckpt.safetensors> <band|-> [moves...]")?
+        .ok_or(
+            "usage: chess_play <ckpt.safetensors> <band|cell|-> [moves...]\n\
+             a multi-slot checkpoint takes a cell: '<eco:B>,<elo:1100-1299>'",
+        )?
         .into();
     // Either conditioning convention. This used to be
     // `load_as(.., Prefix)`, which refused a per-position checkpoint —
@@ -147,7 +170,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // whatever the caller happened to type.
     let tokens = shape.band_tokens();
     let vocab = MoveVocab::new(&tokens)?;
-    let band_token = resolve_band(&shape, &band_arg)?;
+    // A multi-slot checkpoint is played under a cell: one band token
+    // per condition group, comma-separated. Its rows carry no condition
+    // token, so nothing below writes one into the window and the
+    // conditions travel as forward arguments.
+    let multi = shape.effective_cond_groups().len() > 1;
+    let cell: Vec<String> = if multi {
+        let cell: Vec<String> = band_arg
+            .split(',')
+            .map(|part| part.trim().to_string())
+            .collect();
+        for token in &cell {
+            if shape.band(token).is_none() {
+                return Err(format!(
+                    "checkpoint has no band {token}; it carries {:?}",
+                    shape.band_tokens()
+                )
+                .into());
+            }
+        }
+        cell
+    } else {
+        Vec::new()
+    };
+    let band_token = if multi {
+        None
+    } else {
+        resolve_band(&shape, &band_arg)?
+    };
 
     // Replay what has been played so far, accepting either notation.
     let mut board = Board::default();
@@ -229,7 +279,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         false => None,
     };
     let guided_band = band_token.as_ref().filter(|_| gamma != 1.0);
-    let logits: Vec<f32> = if let Some(asked) = guided_band {
+    let logits: Vec<f32> = if multi {
+        // Guidance is not defined for a cell here: its reference is the
+        // mean over the band rows, and with two slots that mean is over
+        // combinations rather than bands. Playing a cell is what plan
+        // 09 asks for, and inventing a reference for it would be a
+        // measurement nobody registered — so gamma is refused rather
+        // than silently ignored.
+        if gamma != 1.0 {
+            return Err(
+                "guidance is not defined for a multi-slot cell; run at gamma 1 (CHESS_GAMMA=1)"
+                    .into(),
+            );
+        }
+        BandBatch::single_combo(&window, &shape, &cell, sets.as_deref())?
+            .logits(&model, &cfg.device)?
+            .into_iter()
+            .next()
+            .ok_or("the single-row batch came back empty")?
+    } else if let Some(asked) = guided_band {
         // Guidance needs the other bands to build the reference it
         // extrapolates away from, so every band is run at this position
         // and the requested one is pushed away from their mean.
@@ -313,11 +381,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // as the same band.
     println!(
         "band       {}  ({} conditioning{})",
-        band_token.as_deref().unwrap_or("(none)"),
+        match multi {
+            true => cell.join("+"),
+            false => band_token.as_deref().unwrap_or("(none)").to_string(),
+        },
         shape.encoding,
-        match shape.encoding {
-            CondEncoding::Prefix => String::new(),
-            CondEncoding::EveryPosition => format!(
+        match (multi, shape.encoding) {
+            // Every slot's row, so a person playing two cells by hand
+            // can see that both attributes reached the model and which
+            // rows they took.
+            (true, _) => format!(
+                ", table rows {}",
+                cell.iter()
+                    .filter_map(|t| shape.band_index(t))
+                    .map(|c| c.row().to_string())
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ),
+            (false, CondEncoding::Prefix) => String::new(),
+            (false, CondEncoding::EveryPosition) => format!(
                 ", table row {}",
                 band_token
                     .as_deref()

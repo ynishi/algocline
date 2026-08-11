@@ -82,14 +82,16 @@ pub enum DatasetError {
     /// conditioned on another row's band, and the batch shapes would
     /// still line up.
     #[error(
-        "{conds} condition(s) for {rows} row(s) — the pairing is positional, \
-         so it takes exactly one per row"
+        "{conds} condition(s) for {rows} row(s) at {per_row} per row — the pairing is \
+         positional, so it takes exactly rows × per-row"
     )]
     ConditionCountMismatch {
         /// Conditions handed over.
         conds: usize,
         /// Rows the dataset holds.
         rows: usize,
+        /// Conditions each row carries.
+        per_row: usize,
     },
 }
 
@@ -193,6 +195,15 @@ pub struct Batch {
     /// mapping, which for the chess models is
     /// [`crate::chess::ModelShape::band_index`].
     pub conds: Option<Vec<CondIndex>>,
+    /// How many of [`Self::conds`]'s entries belong to each row —
+    /// `conds` is row-major, `conds_per_row` entries per row of
+    /// `input_ids`, the layout
+    /// [`crate::arch::Gpt2Model::forward_conditioned_groups`] reads.
+    ///
+    /// `1` wherever `conds` is `None` or one-per-row, so every dataset
+    /// that predates condition groups keeps its meaning without
+    /// stating anything.
+    pub conds_per_row: usize,
 }
 
 /// Streaming batch iterator.
@@ -255,6 +266,7 @@ impl TokenizedDataset {
             is_last: end == self.rows.len(),
             allowed_ids: None,
             conds: None,
+            conds_per_row: 1,
         })
     }
 }
@@ -408,6 +420,7 @@ impl Dataset for JsonlDataset {
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
                 conds: None,
+                conds_per_row: 1,
             }));
         }
 
@@ -429,6 +442,7 @@ impl Dataset for JsonlDataset {
             is_last: short_batch,
             allowed_ids: None,
             conds: None,
+            conds_per_row: 1,
         }))
     }
 
@@ -650,6 +664,7 @@ impl Dataset for ParquetDataset {
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
                 conds: None,
+                conds_per_row: 1,
             }));
         }
 
@@ -671,6 +686,7 @@ impl Dataset for ParquetDataset {
             is_last: short_batch,
             allowed_ids: None,
             conds: None,
+            conds_per_row: 1,
         }))
     }
 
@@ -729,9 +745,12 @@ fn pad_or_truncate_mask(mask: &[f32], ctx: usize) -> Vec<f32> {
 pub struct TeacherCardDataset {
     rows: Vec<Vec<u32>>,
     masks: Vec<Vec<f32>>,
-    /// One condition per row, or `None` for an unconditioned dataset.
-    /// See [`TeacherCardDataset::with_conditions`].
+    /// Conditions row-major at [`Self::conds_per_row`] per row, or
+    /// `None` for an unconditioned dataset. See
+    /// [`TeacherCardDataset::with_conditions`] and
+    /// [`TeacherCardDataset::with_condition_groups`].
     conds: Option<Vec<CondIndex>>,
+    conds_per_row: usize,
     opts: DatasetOpts,
     cursor: usize,
 }
@@ -793,6 +812,7 @@ impl TeacherCardDataset {
             rows: ids,
             masks,
             conds: None,
+            conds_per_row: 1,
             opts,
             cursor: 0,
         })
@@ -816,14 +836,38 @@ impl TeacherCardDataset {
     ///
     /// [`DatasetError::ConditionCountMismatch`] when the list is not
     /// exactly one entry per row.
-    pub fn with_conditions(mut self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
-        if conds.len() != self.rows.len() {
+    pub fn with_conditions(self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
+        self.with_condition_groups(conds, 1)
+    }
+
+    /// [`Self::with_conditions`] with `per_row` conditions per row,
+    /// row-major — the layout
+    /// [`crate::chess::train::row_conditions`] emits for a multi-slot
+    /// corpus and
+    /// [`crate::arch::Gpt2Model::forward_conditioned_groups`] reads.
+    ///
+    /// Explicit rather than inferred from the list's length: a count
+    /// that happens to divide evenly is exactly the mistake an
+    /// inference would wave through.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::ConditionCountMismatch`] when the list is not
+    /// exactly `per_row` entries per row, `per_row` of zero included.
+    pub fn with_condition_groups(
+        mut self,
+        conds: Vec<CondIndex>,
+        per_row: usize,
+    ) -> Result<Self, DatasetError> {
+        if per_row == 0 || conds.len() != self.rows.len() * per_row {
             return Err(DatasetError::ConditionCountMismatch {
                 conds: conds.len(),
                 rows: self.rows.len(),
+                per_row,
             });
         }
         self.conds = Some(conds);
+        self.conds_per_row = per_row;
         Ok(self)
     }
 
@@ -856,9 +900,14 @@ impl Dataset for TeacherCardDataset {
             loss_mask: Some(loss_mask),
             is_last: end == self.rows.len(),
             allowed_ids: None,
-            // The same `start..end` the rows were taken with, so a row
-            // and its condition cannot come apart here.
-            conds: self.conds.as_ref().map(|c| c[start..end].to_vec()),
+            // The same `start..end` the rows were taken with, scaled by
+            // the per-row count, so a row and its conditions cannot
+            // come apart here.
+            conds: self
+                .conds
+                .as_ref()
+                .map(|c| c[start * self.conds_per_row..end * self.conds_per_row].to_vec()),
+            conds_per_row: self.conds_per_row,
         }))
     }
 

@@ -340,9 +340,23 @@ pub struct CorpusOptions {
     pub max_len: Option<usize>,
     /// What to do when a row exceeds `max_len`.
     pub overlong: Overlong,
-    /// Condition token derivation, or `None` for an unconditional
+    /// Condition derivations, one per slot. Empty for an unconditional
     /// corpus.
-    pub condition: Option<ConditionSpec>,
+    ///
+    /// With **one** spec the corpus is what it always was: the band's
+    /// token sits in the row after `BOS`, so a prefix-encoded model
+    /// reads it there and a per-position one keeps it for row-shape
+    /// comparability with prefix arms (see the [`ScoredSide`] doc).
+    ///
+    /// With **two or more**, no condition token enters the row at all
+    /// — the rows are `BOS` then moves, and the conditions reach the
+    /// model only as forward arguments
+    /// ([`crate::arch::Gpt2Model::forward_conditioned_groups`]). There
+    /// is no prefix arm to stay comparable with (a prefix cannot carry
+    /// two slots without inventing an order for them), and keeping the
+    /// tokens out of the rows is what keeps the multi-slot corpus out
+    /// of the prefix-length arithmetic every windowed reader does.
+    pub conditions: Vec<ConditionSpec>,
     /// Whose moves the loss is scored on.
     pub scored_side: ScoredSide,
 }
@@ -354,7 +368,7 @@ impl Default for CorpusOptions {
             max_rows: 20_000,
             max_len: None,
             overlong: Overlong::default(),
-            condition: None,
+            conditions: Vec::new(),
             scored_side: ScoredSide::default(),
         }
     }
@@ -481,20 +495,23 @@ pub struct Corpus {
     ///
     /// [`rows`]: Corpus::rows
     pub masks: Vec<Vec<f32>>,
-    /// Which band each row fell in, as a position in
-    /// [`ConditionSpec::bands`], aligned row for row with [`rows`].
+    /// Which band each row fell in — one ordinal per condition slot,
+    /// each a position in its own [`ConditionSpec::bands`] — aligned
+    /// row for row with [`rows`].
     ///
-    /// `None` for an unconditional corpus.
+    /// `None` for an unconditional corpus. The inner length is the
+    /// number of specs the corpus was built with, the same for every
+    /// row.
     ///
     /// Recorded here because here is where it is known for certain: the
-    /// band is what the build resolved from the game's own tags in
-    /// order to prefix the row with it. Any later reader has to recover
-    /// it from a position in the row instead, and that position is not
-    /// dependable — a row longer than the context window is cut, and
-    /// the tail slice moves an ordinary move into it.
+    /// bands are what the build resolved from the game's own tags. Any
+    /// later reader has to recover them from a position in the row
+    /// instead, and that position is not dependable — a row longer than
+    /// the context window is cut, and the tail slice moves an ordinary
+    /// move into it; a multi-slot row does not carry them at all.
     ///
     /// [`rows`]: Corpus::rows
-    pub bands: Option<Vec<usize>>,
+    pub bands: Option<Vec<Vec<usize>>>,
     /// What happened to every game read.
     pub stats: CorpusStats,
 }
@@ -512,17 +529,17 @@ pub struct TeacherRow {
     pub ids: Vec<u32>,
     /// Per-position loss mask, the same length as [`Self::ids`].
     pub mask: Vec<f32>,
-    /// Position of this row's band in [`ConditionSpec::bands`], or
-    /// `None` for an unconditional corpus.
+    /// This row's band per condition slot — each a position in its own
+    /// [`ConditionSpec::bands`] — or empty for an unconditional corpus.
     ///
-    /// An ordinal into the band list, not a token id and not a
-    /// conditioning-table row. A token id would select the wrong table
+    /// Ordinals into band lists, not token ids and not
+    /// conditioning-table rows. A token id would select the wrong table
     /// row if it were ever handed over as one (band tokens start at
     /// vocabulary id 2, table rows at 0), and the table row belongs to
     /// the model's [`crate::chess::ModelShape`], which the corpus does
     /// not have. [`crate::chess::train::cond_table`] does that
     /// conversion, in one place.
-    pub band: Option<usize>,
+    pub bands: Vec<usize>,
 }
 
 impl Corpus {
@@ -568,7 +585,7 @@ impl Corpus {
                 Ok(TeacherRow {
                     ids,
                     mask,
-                    band: bands.next(),
+                    bands: bands.next().unwrap_or_default(),
                 })
             })
             .collect()
@@ -594,7 +611,7 @@ pub fn build_rows<R: BufRead>(
 ) -> Result<Corpus, CorpusError> {
     let mut rows: Vec<Vec<u32>> = Vec::new();
     let mut masks: Vec<Vec<f32>> = Vec::new();
-    let mut bands: Vec<usize> = Vec::new();
+    let mut bands: Vec<Vec<usize>> = Vec::new();
     let mut stats = CorpusStats::default();
 
     while rows.len() < opts.max_rows {
@@ -608,11 +625,19 @@ pub fn build_rows<R: BufRead>(
             continue;
         }
 
-        // Resolve the condition before replaying: a game with no band
-        // cannot enter a conditional corpus, and finding that out
-        // costs one tag lookup instead of a full replay.
-        let condition = match &opts.condition {
-            Some(spec) => match spec.band_for(&game) {
+        // Resolve every slot's condition before replaying: a game
+        // outside any slot's bands cannot enter a conditional corpus,
+        // and finding that out costs tag lookups instead of a full
+        // replay. The vocabulary check runs for every slot even though
+        // only a single-slot corpus writes a token into the row — the
+        // token is the band's identity everywhere downstream (the
+        // shape, the walks, the judges), and a vocabulary that cannot
+        // name it would surface as a confusing failure much later.
+        let mut ordinals: Vec<usize> = Vec::with_capacity(opts.conditions.len());
+        let mut single_slot_id: Option<u32> = None;
+        let mut rejected = false;
+        for spec in &opts.conditions {
+            match spec.band_for(&game) {
                 Some(band) => {
                     let token = spec.bands[band].token.as_str();
                     let id = vocab
@@ -621,15 +646,21 @@ pub fn build_rows<R: BufRead>(
                             kind: "condition",
                             token: token.to_string(),
                         })?;
-                    Some((band, id))
+                    if opts.conditions.len() == 1 {
+                        single_slot_id = Some(id);
+                    }
+                    ordinals.push(band);
                 }
                 None => {
-                    stats.rejected_by_condition += 1;
-                    continue;
+                    rejected = true;
+                    break;
                 }
-            },
-            None => None,
-        };
+            }
+        }
+        if rejected {
+            stats.rejected_by_condition += 1;
+            continue;
+        }
 
         let moves = match game_to_uci(&game.movetext) {
             Ok(moves) => moves,
@@ -652,7 +683,10 @@ pub fn build_rows<R: BufRead>(
         let mut mask = Vec::with_capacity(moves.len() + 2);
         row.push(BOS);
         mask.push(0.0f32);
-        if let Some((_, id)) = condition {
+        // Set only by a single-slot corpus; a multi-slot one keeps its
+        // conditions out of the row entirely (see
+        // [`CorpusOptions::conditions`]).
+        if let Some(id) = single_slot_id {
             row.push(id);
             // The condition token is given, not predicted: scoring it
             // would train the model to guess which band it is playing
@@ -707,13 +741,13 @@ pub fn build_rows<R: BufRead>(
         // Pushed only here, after every rejection above, so the band
         // list stays index-for-index with the rows rather than with the
         // games read.
-        if let Some((band, _)) = condition {
-            bands.push(band);
+        if !opts.conditions.is_empty() {
+            bands.push(ordinals);
         }
     }
 
     stats.rows = rows.len();
-    let bands = opts.condition.as_ref().map(|_| bands);
+    let bands = (!opts.conditions.is_empty()).then_some(bands);
     Ok(Corpus {
         rows,
         masks,
@@ -750,9 +784,12 @@ pub struct LegalMaskedDataset {
     vocab: MoveVocab,
     /// Tokens that are not moves and can never be a legal answer.
     prefix_len: usize,
-    /// One condition per row, or `None` for an unconditioned dataset.
-    /// See [`LegalMaskedDataset::with_conditions`].
+    /// Conditions row-major at `conds_per_row` per row, or `None` for
+    /// an unconditioned dataset. See
+    /// [`LegalMaskedDataset::with_conditions`] and
+    /// [`LegalMaskedDataset::with_condition_groups`].
     conds: Option<Vec<CondIndex>>,
+    conds_per_row: usize,
     opts: DatasetOpts,
     cursor: usize,
 }
@@ -774,6 +811,7 @@ impl LegalMaskedDataset {
             vocab,
             prefix_len,
             conds: None,
+            conds_per_row: 1,
             opts,
             cursor: 0,
         }
@@ -790,14 +828,34 @@ impl LegalMaskedDataset {
     ///
     /// [`DatasetError::ConditionCountMismatch`] when the list is not
     /// exactly one entry per row.
-    pub fn with_conditions(mut self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
-        if conds.len() != self.rows.len() {
+    pub fn with_conditions(self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
+        self.with_condition_groups(conds, 1)
+    }
+
+    /// [`Self::with_conditions`] with `per_row` conditions per row,
+    /// row-major — the counterpart of
+    /// [`crate::train::TeacherCardDataset::with_condition_groups`],
+    /// explicit for the same reason: a count that happens to divide
+    /// evenly is exactly the mistake an inference would wave through.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::ConditionCountMismatch`] when the list is not
+    /// exactly `per_row` entries per row, `per_row` of zero included.
+    pub fn with_condition_groups(
+        mut self,
+        conds: Vec<CondIndex>,
+        per_row: usize,
+    ) -> Result<Self, DatasetError> {
+        if per_row == 0 || conds.len() != self.rows.len() * per_row {
             return Err(DatasetError::ConditionCountMismatch {
                 conds: conds.len(),
                 rows: self.rows.len(),
+                per_row,
             });
         }
         self.conds = Some(conds);
+        self.conds_per_row = per_row;
         Ok(self)
     }
 
@@ -887,9 +945,14 @@ impl Dataset for LegalMaskedDataset {
             loss_mask: Some(loss_mask),
             is_last: end == self.rows.len(),
             allowed_ids: Some(allowed),
-            // Sliced with the same `start..end` as the rows, so a row
-            // and its condition cannot come apart here.
-            conds: self.conds.as_ref().map(|c| c[start..end].to_vec()),
+            // Sliced with the same `start..end` as the rows, scaled by
+            // the per-row count, so a row and its conditions cannot
+            // come apart here.
+            conds: self
+                .conds
+                .as_ref()
+                .map(|c| c[start * self.conds_per_row..end * self.conds_per_row].to_vec()),
+            conds_per_row: self.conds_per_row,
         }))
     }
 
@@ -964,7 +1027,7 @@ mod tests {
             &vocab,
             &CorpusOptions {
                 scored_side: ScoredSide::Both,
-                condition: Some(spec),
+                conditions: vec![spec],
                 ..Default::default()
             },
         );
@@ -1007,10 +1070,10 @@ mod tests {
             &vocab,
             &CorpusOptions {
                 scored_side: ScoredSide::White,
-                condition: Some(ConditionSpec {
+                conditions: vec![ConditionSpec {
                     key: "WhiteElo".to_string(),
                     bands: vec![ConditionBand::rating(0, 1599, "<elo:low>")],
-                }),
+                }],
                 ..Default::default()
             },
         );
@@ -1051,7 +1114,7 @@ mod tests {
         assert_eq!(paired.len(), 1);
         assert_eq!(paired[0].ids.len(), paired[0].mask.len());
         // An unconditional corpus has no band to carry.
-        assert_eq!(paired[0].band, None);
+        assert!(paired[0].bands.is_empty());
 
         // `Both` scores every move and neither prefix token.
         let c = build(
@@ -1146,19 +1209,24 @@ mod tests {
             ]),
             &vocab,
             &CorpusOptions {
-                condition: Some(spec),
+                conditions: vec![spec],
                 ..Default::default()
             },
         );
         assert_eq!(c.stats.replay_failures, 1);
-        assert_eq!(c.bands.as_deref(), Some([1usize, 0, 1].as_slice()));
+        assert_eq!(
+            c.bands.as_deref(),
+            Some([vec![1usize], vec![0], vec![1]].as_slice())
+        );
 
         // And the ordinal names the band whose token the row carries.
         let rows = c.into_teacher_rows().expect("the lists agree");
         let tokens = ["<elo:low>", "<elo:high>"];
         for row in &rows {
-            let band = row.band.expect("a conditional corpus bands every row");
-            assert_eq!(row.ids[1], vocab.id_of(tokens[band]).unwrap());
+            let [band] = row.bands.as_slice() else {
+                panic!("a single-slot corpus bands every row once");
+            };
+            assert_eq!(row.ids[1], vocab.id_of(tokens[*band]).unwrap());
         }
     }
 
@@ -1204,13 +1272,13 @@ mod tests {
             pgn(&[("1500", "Normal", "1. e4 e5 1-0")]),
             &vocab,
             &CorpusOptions {
-                condition: Some(ConditionSpec {
+                conditions: vec![ConditionSpec {
                     key: "WhiteElo".to_string(),
                     bands: vec![
                         ConditionBand::rating(0, 1599, "<elo:low>"),
                         ConditionBand::rating(1600, 4000, "<elo:high>"),
                     ],
-                }),
+                }],
                 ..Default::default()
             },
         );
@@ -1226,10 +1294,10 @@ mod tests {
             pgn(&[("2500", "Normal", "1. e4 e5 1-0")]),
             &vocab,
             &CorpusOptions {
-                condition: Some(ConditionSpec {
+                conditions: vec![ConditionSpec {
                     key: "WhiteElo".to_string(),
                     bands: vec![ConditionBand::rating(0, 1599, "<elo:low>")],
-                }),
+                }],
                 ..Default::default()
             },
         );
@@ -1251,18 +1319,69 @@ mod tests {
             text,
             &vocab,
             &CorpusOptions {
-                condition: Some(ConditionSpec {
+                conditions: vec![ConditionSpec {
                     key: "WhiteElo".to_string(),
                     bands: vec![
                         ConditionBand::tag_prefix("ECO", "B", "<eco:B>"),
                         ConditionBand::tag_prefix("ECO", "C", "<eco:C>"),
                     ],
-                }),
+                }],
                 ..Default::default()
             },
         );
-        assert_eq!(c.bands.as_deref(), Some([0usize, 1].as_slice()));
+        assert_eq!(c.bands.as_deref(), Some([vec![0usize], vec![1]].as_slice()));
         assert_eq!(c.stats.rejected_by_condition, 1);
+    }
+
+    /// A two-slot corpus keeps its conditions out of the rows — `BOS`
+    /// then moves — and records one ordinal per slot instead, each
+    /// against its own spec. A game either slot cannot band is
+    /// rejected once.
+    #[test]
+    fn a_multi_slot_corpus_bands_rows_without_tokens_in_them() {
+        let vocab = MoveVocab::new(&[
+            "<eco:B>".to_string(),
+            "<eco:C>".to_string(),
+            "<elo:low>".to_string(),
+            "<elo:high>".to_string(),
+        ])
+        .unwrap();
+        let eco = ConditionSpec {
+            key: "WhiteElo".to_string(),
+            bands: vec![
+                ConditionBand::tag_prefix("ECO", "B", "<eco:B>"),
+                ConditionBand::tag_prefix("ECO", "C", "<eco:C>"),
+            ],
+        };
+        let elo = ConditionSpec {
+            key: "WhiteElo".to_string(),
+            bands: vec![
+                ConditionBand::rating(0, 1599, "<elo:low>"),
+                ConditionBand::rating(1600, 4000, "<elo:high>"),
+            ],
+        };
+        let text = "[WhiteElo \"1800\"]\n[ECO \"C50\"]\n\n1. e4 e5 1-0\n\n\
+                    [WhiteElo \"1500\"]\n[ECO \"B20\"]\n\n1. d4 d5 1-0\n\n\
+                    [WhiteElo \"1500\"]\n[ECO \"A00\"]\n\n1. c4 c5 1-0\n\n"
+            .to_string();
+        let c = build(
+            text,
+            &vocab,
+            &CorpusOptions {
+                conditions: vec![eco, elo],
+                ..Default::default()
+            },
+        );
+        // The A00 game bands in the elo slot but not the eco one.
+        assert_eq!(c.stats.rejected_by_condition, 1);
+        assert_eq!(
+            c.bands.as_deref(),
+            Some([vec![1usize, 1], vec![0, 0]].as_slice())
+        );
+        // No condition token after BOS: the first id past it is a move.
+        assert_eq!(c.rows[0][0], BOS);
+        assert_eq!(c.rows[0][1], vocab.id_of("e2e4").unwrap());
+        assert_eq!(c.masks[0], vec![0.0, 1.0, 1.0]);
     }
 
     /// The sidecar compatibility split the type documents: a legacy
@@ -1322,10 +1441,10 @@ mod tests {
         let mut reader = PgnReader::new(Cursor::new(text));
         let vocab = MoveVocab::new(&[]).unwrap();
         let opts = CorpusOptions {
-            condition: Some(ConditionSpec {
+            conditions: vec![ConditionSpec {
                 key: "WhiteElo".to_string(),
                 bands: vec![ConditionBand::rating(0, 4000, "<elo:low>")],
-            }),
+            }],
             ..Default::default()
         };
         let err = build_rows(&mut reader, &vocab, &opts).unwrap_err();

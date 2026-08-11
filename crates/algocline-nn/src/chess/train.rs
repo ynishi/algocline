@@ -68,30 +68,39 @@ pub enum ConditionError {
         /// The model's band tokens, for the message.
         model_bands: String,
     },
-    /// A row carries no band in a corpus being trained as conditioned.
+    /// A row carries a different number of band ordinals than the run
+    /// has condition slots.
     ///
-    /// A corpus is conditional or it is not, so a row without a band in
-    /// one that has them means the two came apart somewhere between the
-    /// build and here.
+    /// A corpus is built with some number of specs and every row
+    /// carries one ordinal per spec, so a mismatch here means the rows
+    /// and the tables were built against different spec lists — the
+    /// zero-for-some case (an unconditional corpus reaching a
+    /// conditioned run) included.
     #[error(
-        "row {index} carries no band, but this run conditions every row; \
-         the corpus and its band list have come apart"
+        "row {index} carries {found} band ordinal(s) where this run conditions {expected} \
+         slot(s) per row; the corpus and its condition specs have come apart"
     )]
-    RowWithoutBand {
+    RowSlotsMismatch {
         /// 0-based row index.
         index: usize,
+        /// Ordinals the row carries.
+        found: usize,
+        /// Slots the run conditions.
+        expected: usize,
     },
     /// A row names a band the list it was built against does not hold.
     ///
-    /// Same origin as [`Self::RowWithoutBand`] and the same reading: a
-    /// row and its band list that no longer describe each other.
+    /// Same origin as [`Self::RowSlotsMismatch`] and the same reading:
+    /// a row and its band lists that no longer describe each other.
     #[error(
-        "row {index} names band {ordinal} of a list holding {len}; \
-         the corpus and its band list have come apart"
+        "row {index} names band {ordinal} of slot {group}'s list holding {len}; \
+         the corpus and its band lists have come apart"
     )]
     BandOutOfRange {
         /// 0-based row index.
         index: usize,
+        /// Which condition slot, counting from zero.
+        group: usize,
         /// Ordinal the row carries.
         ordinal: usize,
         /// Length of the band list it was resolved against.
@@ -104,7 +113,7 @@ pub enum ConditionError {
 ///
 /// A named type rather than a bare `Vec<CondIndex>` because its indices
 /// are only meaningful against the spec it was built from.
-/// [`TeacherRow::band`] is an ordinal into the spec a corpus was
+/// [`TeacherRow::bands`] holds ordinals into the specs a corpus was
 /// **built** with; a table built from some other list would answer
 /// every lookup, with every length still agreeing, and mean another
 /// band. Requiring this type at [`row_conditions`] is what stops a
@@ -174,37 +183,51 @@ pub fn cond_table(shape: &ModelShape, spec: &ConditionSpec) -> Result<CondTable,
     Ok(CondTable { rows })
 }
 
-/// One [`CondIndex`] per row, in row order.
+/// One [`CondIndex`] per row per slot, row-major.
 ///
-/// The result is positional against `rows`, which is what the datasets'
-/// `with_conditions` takes. Built from the rows as they stand, so a
-/// caller that shuffled or replicated them for several epochs gets the
-/// conditions of the rows it is actually about to train on.
+/// The result is flat — row `i`'s conditions are the `tables.len()`
+/// entries starting at `i * tables.len()` — which is the layout the
+/// datasets' condition setters and
+/// [`crate::arch::Gpt2Model::forward_conditioned_groups`] share. Built
+/// from the rows as they stand, so a caller that shuffled or
+/// replicated them for several epochs gets the conditions of the rows
+/// it is actually about to train on. One table per slot, in the slot
+/// order the corpus was built with.
 ///
 /// # Errors
 ///
-/// [`ConditionError::RowWithoutBand`] or
-/// [`ConditionError::BandOutOfRange`] when a row and the band list have
-/// come apart. Both are refused rather than skipped: dropping a row's
-/// condition here would leave the remaining ones shifted by one, and
-/// every row after it conditioned on its neighbour's band.
+/// [`ConditionError::RowSlotsMismatch`] or
+/// [`ConditionError::BandOutOfRange`] when a row and the band lists
+/// have come apart. Both are refused rather than skipped: dropping a
+/// row's condition here would leave the remaining ones shifted, and
+/// every row after it conditioned on its neighbour's bands.
 pub fn row_conditions(
     rows: &[TeacherRow],
-    table: &CondTable,
+    tables: &[CondTable],
 ) -> Result<Vec<CondIndex>, ConditionError> {
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let ordinal = row.band.ok_or(ConditionError::RowWithoutBand { index })?;
-            table
-                .row_for(ordinal)
-                .ok_or(ConditionError::BandOutOfRange {
-                    index,
-                    ordinal,
-                    len: table.len(),
-                })
-        })
-        .collect()
+    let mut out = Vec::with_capacity(rows.len() * tables.len());
+    for (index, row) in rows.iter().enumerate() {
+        if row.bands.len() != tables.len() {
+            return Err(ConditionError::RowSlotsMismatch {
+                index,
+                found: row.bands.len(),
+                expected: tables.len(),
+            });
+        }
+        for (group, (ordinal, table)) in row.bands.iter().zip(tables).enumerate() {
+            out.push(
+                table
+                    .row_for(*ordinal)
+                    .ok_or(ConditionError::BandOutOfRange {
+                        index,
+                        group,
+                        ordinal: *ordinal,
+                        len: table.len(),
+                    })?,
+            );
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -238,11 +261,11 @@ mod tests {
         shape
     }
 
-    fn row(band: Option<usize>) -> TeacherRow {
+    fn row(bands: Vec<usize>) -> TeacherRow {
         TeacherRow {
             ids: vec![1, 2, 100],
             mask: vec![0.0, 0.0, 1.0],
-            band,
+            bands,
         }
     }
 
@@ -326,26 +349,55 @@ mod tests {
     #[test]
     fn every_row_gets_the_condition_of_its_own_band() {
         let table = cond_table(&shape(), &spec()).expect("table");
-        let rows = vec![row(Some(1)), row(Some(0)), row(Some(1))];
-        let conds = row_conditions(&rows, &table).expect("every row has a band");
+        let rows = vec![row(vec![1]), row(vec![0]), row(vec![1])];
+        let conds =
+            row_conditions(&rows, std::slice::from_ref(&table)).expect("every row has a band");
         assert_eq!(conds.iter().map(|c| c.row()).collect::<Vec<_>>(), [1, 0, 1]);
+    }
+
+    /// Two slots interleave row-major — the layout
+    /// `forward_conditioned_groups` reads — and each slot resolves
+    /// against its own table.
+    #[test]
+    fn two_slots_resolve_row_major_against_their_own_tables() {
+        let table = cond_table(&shape(), &spec()).expect("table");
+        let mut reversed_bands = bands();
+        reversed_bands.reverse();
+        let reversed = cond_table(&shape(), &spec_of(reversed_bands)).expect("table");
+        let rows = vec![row(vec![0, 0]), row(vec![1, 1])];
+        let conds = row_conditions(&rows, &[table, reversed]).expect("every row banded twice");
+        // Slot 0 maps ordinals straight through; slot 1's list is
+        // reversed, so its ordinal 0 is the model's row 1.
+        assert_eq!(
+            conds.iter().map(|c| c.row()).collect::<Vec<_>>(),
+            [0, 1, 1, 0]
+        );
     }
 
     #[test]
     fn a_row_without_a_band_is_refused() {
         let table = cond_table(&shape(), &spec()).expect("table");
-        let err = row_conditions(&[row(Some(0)), row(None)], &table).unwrap_err();
-        assert_eq!(err, ConditionError::RowWithoutBand { index: 1 });
+        let err =
+            row_conditions(&[row(vec![0]), row(vec![])], std::slice::from_ref(&table)).unwrap_err();
+        assert_eq!(
+            err,
+            ConditionError::RowSlotsMismatch {
+                index: 1,
+                found: 0,
+                expected: 1,
+            }
+        );
     }
 
     #[test]
     fn a_row_naming_a_band_outside_the_list_is_refused() {
         let table = cond_table(&shape(), &spec()).expect("table");
-        let err = row_conditions(&[row(Some(7))], &table).unwrap_err();
+        let err = row_conditions(&[row(vec![7])], std::slice::from_ref(&table)).unwrap_err();
         assert_eq!(
             err,
             ConditionError::BandOutOfRange {
                 index: 0,
+                group: 0,
                 ordinal: 7,
                 len: 2,
             }

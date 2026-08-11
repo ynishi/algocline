@@ -108,7 +108,7 @@ fn corpus_rows(vocab: &MoveVocab) -> Vec<TeacherRow> {
     let opts = CorpusOptions {
         max_rows: 100,
         max_len: Some(CTX),
-        condition: Some(spec()),
+        conditions: vec![spec()],
         ..Default::default()
     };
     let mut reader = PgnReader::new(std::io::Cursor::new(tiny_pgn()));

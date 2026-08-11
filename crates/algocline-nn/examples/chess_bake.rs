@@ -447,9 +447,9 @@ fn describe_legal_input(on: bool) -> &'static str {
 /// wants to read "dim is 128 in the checkpoint and 256 here", not that
 /// two structs differed.
 ///
-/// "Every field" is a claim about all eight of [`ModelShape`]'s, and it
+/// "Every field" is a claim about all nine of [`ModelShape`]'s, and it
 /// is held by the destructuring below rather than by this sentence: a
-/// ninth field stops this function compiling, which is the moment to
+/// tenth field stops this function compiling, which is the moment to
 /// decide whether resuming across it is safe. An earlier version of
 /// this doc made the same claim over seven of eight — `legal_input` was
 /// not compared, and that is the axis where the asymmetry described in
@@ -466,6 +466,7 @@ fn shape_disagreements(want: &ModelShape, found: &ModelShape) -> Vec<String> {
         bands,
         encoding,
         legal_input,
+        cond_groups,
     } = found;
     let mut out = Vec::new();
     for (label, w, f) in [
@@ -508,6 +509,15 @@ fn shape_disagreements(want: &ModelShape, found: &ModelShape) -> Vec<String> {
             "the legality input is {} in the checkpoint and {} here",
             describe_legal_input(*legal_input),
             describe_legal_input(want.legal_input)
+        ));
+    }
+    // Same tensors, different partition: the grouping decides how many
+    // rows a forward sums per batch row, so resuming across it would
+    // continue a run whose every step conditions differently.
+    if want.cond_groups != *cond_groups {
+        out.push(format!(
+            "the condition grouping is {cond_groups:?} in the checkpoint and {:?} here",
+            want.cond_groups
         ));
     }
     out
@@ -788,7 +798,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         filter,
         max_rows,
         max_len: Some(shape.ctx),
-        condition: Some(spec.clone()),
+        conditions: vec![spec.clone()],
         scored_side: side,
         ..Default::default()
     };
@@ -812,8 +822,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // sweeps an untrained embedding, every figure well-formed.
     if let Some(row_bands) = &corpus.bands {
         let mut counts = vec![0usize; bands.len()];
-        for b in row_bands {
-            if let Some(slot) = counts.get_mut(*b) {
+        // This run builds a single-slot corpus, so each row carries one
+        // ordinal into the one band list.
+        for bs in row_bands {
+            if let Some(slot) = bs.first().and_then(|b| counts.get_mut(*b)) {
                 *slot += 1;
             }
         }
@@ -883,7 +895,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let train_conds = match &table {
-        Some(table) => Some(row_conditions(&rows, table)?),
+        Some(table) => Some(row_conditions(&rows, std::slice::from_ref(table))?),
         None => None,
     };
 
@@ -978,7 +990,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Held-out rows are conditioned the same way the training rows
     // were, through the same table.
     let val_conds = match (&table, &val_rows) {
-        (Some(table), Some(val)) => Some(row_conditions(val, table)?),
+        (Some(table), Some(val)) => Some(row_conditions(val, std::slice::from_ref(table))?),
         _ => None,
     };
 

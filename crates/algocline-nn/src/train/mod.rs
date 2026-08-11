@@ -91,13 +91,16 @@ pub trait DeviceView {
 /// conditioned entry point, which is a better place for that fact than
 /// a runtime error raised half-way through a run.
 pub trait ConditionedForward {
-    /// Forward `xs` (`[batch, seq]` token ids) with one condition per
-    /// row, returning `[batch, seq, vocab]` logits.
+    /// Forward `xs` (`[batch, seq]` token ids) with `per_row`
+    /// conditions per row, row-major, returning `[batch, seq, vocab]`
+    /// logits.
     ///
-    /// One index **per row**, because a batch mixes conditions: a
+    /// Indices **per row**, because a batch mixes conditions: a
     /// single index for the whole batch would condition most rows on
     /// some other row's band, and every shape downstream would still
-    /// line up.
+    /// line up. `per_row` is `1` for every single-slot dataset and the
+    /// slot count for a multi-slot one ([`data::Batch::conds_per_row`]
+    /// carries it alongside the list it describes).
     ///
     /// The argument is a [`crate::arch::CondIndex`] rather than a
     /// number because the numbering a caller holds is usually a
@@ -107,13 +110,14 @@ pub trait ConditionedForward {
     ///
     /// # Errors
     ///
-    /// Implementation-defined, but `conds.len() != batch` and an index
-    /// outside the implementation's table are expected to be refused
-    /// rather than absorbed.
+    /// Implementation-defined, but `conds.len() != batch * per_row`,
+    /// `per_row` of zero and an index outside the implementation's
+    /// table are expected to be refused rather than absorbed.
     fn forward_conditioned_rows(
         &self,
         xs: &candle_core::Tensor,
         conds: &[crate::arch::CondIndex],
+        per_row: usize,
     ) -> candle_core::Result<candle_core::Tensor>;
 }
 

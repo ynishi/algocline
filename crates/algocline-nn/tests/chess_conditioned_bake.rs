@@ -97,7 +97,7 @@ fn corpus_rows(vocab: &MoveVocab) -> Vec<TeacherRow> {
     let opts = CorpusOptions {
         max_rows: 100,
         max_len: Some(CTX),
-        condition: Some(spec()),
+        conditions: vec![spec()],
         ..Default::default()
     };
     let mut reader = PgnReader::new(std::io::Cursor::new(tiny_pgn()));
@@ -144,7 +144,7 @@ fn bake(
     let conditioned = shape.encoding == CondEncoding::EveryPosition;
     let conds = conditioned.then(|| {
         let table = cond_table(shape, &spec()).expect("the corpus bands are the model's");
-        row_conditions(&rows, &table).expect("every row carries a band")
+        row_conditions(&rows, std::slice::from_ref(&table)).expect("every row carries a band")
     });
 
     let ds_opts = DatasetOpts {

@@ -509,9 +509,9 @@ where
 {
     run_ft_core(
         model.device(),
-        ForwardPass::PerRow(&mut |xs, conds| {
+        ForwardPass::PerRow(&mut |xs, conds, per_row| {
             model
-                .forward_conditioned_rows(xs, conds)
+                .forward_conditioned_rows(xs, conds, per_row)
                 .map_err(TrainError::from)
         }),
         varmap,
@@ -626,7 +626,7 @@ enum ForwardPass<'a> {
 type PlainForward<'a> = dyn FnMut(&Tensor) -> Result<Tensor, TrainError> + 'a;
 
 /// The same, with the condition each row of the batch carries.
-type PerRowForward<'a> = dyn FnMut(&Tensor, &[CondIndex]) -> Result<Tensor, TrainError> + 'a;
+type PerRowForward<'a> = dyn FnMut(&Tensor, &[CondIndex], usize) -> Result<Tensor, TrainError> + 'a;
 
 /// The same, with the ids allowed at each position of the batch.
 type LegalForwardPass<'a> = dyn FnMut(&Tensor, &LegalSets) -> Result<Tensor, TrainError> + 'a;
@@ -757,7 +757,9 @@ fn run_ft_core(
             // still the row count.
             let logits = match (&mut forward, batch.conds.as_deref(), legal.as_ref()) {
                 (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
-                (ForwardPass::PerRow(per_row), Some(conds), _) => per_row(&inputs, conds)?,
+                (ForwardPass::PerRow(per_row), Some(conds), _) => {
+                    per_row(&inputs, conds, batch.conds_per_row)?
+                }
                 (ForwardPass::Legal(legal_forward), None, Some(sets)) => {
                     legal_forward(&inputs, sets)?
                 }
@@ -1348,6 +1350,7 @@ mod allowed_logit_mask_tests {
             is_last: true,
             allowed_ids: allowed,
             conds: None,
+            conds_per_row: 1,
         }
     }
 
@@ -2305,11 +2308,12 @@ mod conditioned_tests {
             &self,
             xs: &Tensor,
             conds: &[CondIndex],
+            per_row: usize,
         ) -> CandleResult<Tensor> {
             self.seen
                 .borrow_mut()
                 .push(conds.iter().map(|c| c.row()).collect());
-            self.inner.forward_conditioned(xs, conds)
+            self.inner.forward_conditioned_groups(xs, conds, per_row)
         }
     }
 
@@ -2336,6 +2340,7 @@ mod conditioned_tests {
             &self,
             _xs: &Tensor,
             _conds: &[CondIndex],
+            _per_row: usize,
         ) -> CandleResult<Tensor> {
             Err(candle_core::Error::Msg(
                 "the unconditioned entry point reached the conditioning path".into(),
@@ -2378,6 +2383,49 @@ mod conditioned_tests {
             recorder.seen.into_inner(),
             vec![vec![1, 0], vec![0, 1]],
             "each row must arrive under its own band, in row order"
+        );
+    }
+
+    /// Two slots per row survive the loop: the flat row-major list a
+    /// multi-slot dataset carries arrives at the model in the same
+    /// layout, batch by batch, with the per-row count intact.
+    #[test]
+    fn every_row_arrives_under_both_its_slots() {
+        let (vm, model) = conditioned_model();
+        let recorder = Recorder {
+            inner: &model,
+            seen: RefCell::new(Vec::new()),
+        };
+        let (rows, _) = banded_rows(&[0, 1, 1, 0]);
+        // Slot 0 is the band pattern; slot 1 is its complement, so a
+        // transposed or interleaved layout cannot produce these lists.
+        let conds: Vec<CondIndex> = [0u32, 1, 1, 0, 1, 0, 0, 1]
+            .chunks(2)
+            .flat_map(|pair| pair.iter().map(|r| CondIndex::from_table_row(*r)))
+            .collect();
+        let mut ds = TeacherCardDataset::from_rows(rows, opts_for(2))
+            .expect("rows are well formed")
+            .with_condition_groups(conds, 2)
+            .expect("two conditions per row");
+        let tmp = TempDir::new().unwrap();
+
+        run_conditioned_ft(
+            &recorder,
+            &vm,
+            &mut ds,
+            &cfg_for(2, 2, 1e-3),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "both_slots",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("a multi-slot run over multi-slot rows must complete");
+
+        assert_eq!(
+            recorder.seen.into_inner(),
+            vec![vec![0, 1, 1, 0], vec![1, 0, 0, 1]],
+            "each batch must carry its rows' slot pairs row-major"
         );
     }
 
@@ -2645,7 +2693,11 @@ mod conditioned_tests {
         assert!(
             matches!(
                 err,
-                DatasetError::ConditionCountMismatch { conds: 2, rows: 3 }
+                DatasetError::ConditionCountMismatch {
+                    conds: 2,
+                    rows: 3,
+                    per_row: 1
+                }
             ),
             "{err:?}"
         );
@@ -2768,6 +2820,7 @@ mod legal_input_tests {
                     .as_ref()
                     .map(|sets| vec![sets.clone(); self.batch]),
                 conds: self.conds.clone(),
+                conds_per_row: 1,
             }))
         }
 
@@ -2820,6 +2873,7 @@ mod legal_input_tests {
             is_last: true,
             allowed_ids: Some(vec![vec![vec![], vec![5], vec![6], vec![7]]]),
             conds: None,
+            conds_per_row: 1,
         };
         let from_batch = legal_input_sets(&batch, 4, &Device::Cpu)
             .unwrap()
@@ -2859,6 +2913,7 @@ mod legal_input_tests {
             is_last: true,
             allowed_ids: None,
             conds: None,
+            conds_per_row: 1,
         };
         assert!(legal_input_sets(&batch, 3, &Device::Cpu).unwrap().is_none());
     }

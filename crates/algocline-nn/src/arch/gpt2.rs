@@ -1764,8 +1764,13 @@ impl crate::train::DeviceView for Gpt2Model {
 /// here and silently wrong the day an implementor writes the delegation
 /// the other way round and recurses.
 impl crate::train::ConditionedForward for Gpt2Model {
-    fn forward_conditioned_rows(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
-        Gpt2Model::forward_conditioned(self, xs, conds)
+    fn forward_conditioned_rows(
+        &self,
+        xs: &Tensor,
+        conds: &[CondIndex],
+        per_row: usize,
+    ) -> CandleResult<Tensor> {
+        Gpt2Model::forward_conditioned_groups(self, xs, conds, per_row)
     }
 }
 

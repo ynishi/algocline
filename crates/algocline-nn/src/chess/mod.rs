@@ -303,6 +303,28 @@ pub struct ModelShape {
     /// [`Self::path_for_kind`] is what covers the older ones.
     #[serde(default, skip_serializing_if = "is_false")]
     pub legal_input: bool,
+    /// Sizes of the condition groups [`Self::bands`] is partitioned
+    /// into, in band-list order — `[2, 2]` says the first two bands are
+    /// one slot and the next two another, and every forward passes one
+    /// row per group ([`crate::arch::Gpt2Model::forward_conditioned_groups`]).
+    ///
+    /// Empty for a single-slot model, and **omitted from the file**
+    /// then, so every shape written before this field existed and every
+    /// single-slot shape written after are the same bytes — an older
+    /// build keeps reading them. A multi-slot shape writes the field,
+    /// and the same older build refuses it on `deny_unknown_fields`:
+    /// the loud outcome, since scoring a multi-slot checkpoint under
+    /// single-slot conventions would condition every row on one group
+    /// and read the rest as moves. The split
+    /// [`crate::chess::corpus::ConditionBand`]'s sidecar forms make for
+    /// the matcher axis, made here for the grouping axis.
+    ///
+    /// The sizes must sum to `bands.len()`; [`Self::load_any`] refuses
+    /// a file where they do not, because every consumer below it would
+    /// otherwise partition the band list at well-formed but wrong
+    /// boundaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cond_groups: Vec<usize>,
 }
 
 /// `skip_serializing_if` for a plain `bool` field.
@@ -329,6 +351,25 @@ pub enum ShapeError {
         /// Underlying message.
         message: String,
     },
+    /// The shape's group sizes do not sum to its band count.
+    ///
+    /// Refused at load rather than left to consumers, because every
+    /// reader below this would partition the band list at well-formed
+    /// but wrong boundaries — a slot reading its neighbour's bands,
+    /// with every number downstream still printable.
+    #[error(
+        "shape file {path} partitions {bands} band(s) into groups of {groups:?}, which do not \
+         sum to it; a reader following those boundaries would put bands in the wrong slots"
+    )]
+    GroupsContradictBands {
+        /// Sidecar involved.
+        path: String,
+        /// The group sizes it declares.
+        groups: Vec<usize>,
+        /// How many bands it carries.
+        bands: usize,
+    },
+
     /// The checkpoint was conditioned one way and the caller is set up
     /// for the other.
     ///
@@ -561,6 +602,7 @@ impl ModelShape {
             bands,
             encoding: CondEncoding::default(),
             legal_input: false,
+            cond_groups: Vec::new(),
         }
     }
 
@@ -569,6 +611,22 @@ impl ModelShape {
         ShapeKind {
             encoding: self.encoding,
             legal_input: self.legal_input,
+        }
+    }
+
+    /// The effective group sizes: [`Self::cond_groups`] when stated,
+    /// otherwise the whole band list as one group.
+    ///
+    /// One accessor rather than reading the field, so "empty means one
+    /// group" is decided in one place. Empty bands give an empty list —
+    /// an unconditioned model has no groups, not one group of nothing.
+    pub fn effective_cond_groups(&self) -> Vec<usize> {
+        if !self.cond_groups.is_empty() {
+            self.cond_groups.clone()
+        } else if self.bands.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.bands.len()]
         }
     }
 
@@ -847,6 +905,15 @@ impl ModelShape {
             path: path.display().to_string(),
             message: e.to_string(),
         })?;
+        if !shape.cond_groups.is_empty()
+            && shape.cond_groups.iter().sum::<usize>() != shape.bands.len()
+        {
+            return Err(ShapeError::GroupsContradictBands {
+                path: path.display().to_string(),
+                groups: shape.cond_groups.clone(),
+                bands: shape.bands.len(),
+            });
+        }
         let implied = axes_of_weights(ckpt)?;
         if implied.encoding != shape.encoding {
             return Err(ShapeError::EncodingContradictsWeights {

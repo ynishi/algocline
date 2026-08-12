@@ -121,6 +121,23 @@ pub enum MergeError {
         token: String,
     },
 
+    /// A shared base carries a conditioning table of its own.
+    ///
+    /// [`merge_task_arithmetic`] adds each source's difference from the
+    /// base, and the sources' tables are stacked rather than differenced
+    /// — a base with a table would either collide with that stacking or
+    /// silently decide the merged model's conditioning, which is the one
+    /// thing a shared base must not do.
+    #[error(
+        "the base {path} carries a conditioning table; a shared base must not decide the \
+         merged model's conditioning — bake it with prefix conditioning so it carries a body \
+         and nothing else"
+    )]
+    BaseIsConditioned {
+        /// The base involved.
+        path: String,
+    },
+
     /// A tensor a source carries is missing from another, or the two
     /// disagree on its shape.
     #[error("tensor {name}: {message}")]
@@ -302,6 +319,110 @@ pub fn merge_slots(sources: &[&Path], out: &Path) -> Result<ModelShape, MergeErr
     Ok(shape)
 }
 
+/// Merge single-slot checkpoints that share a base, by adding each
+/// one's **difference from the base** rather than averaging them.
+///
+/// `base + Σ(source − base)` on every body tensor; the conditioning
+/// tables are stacked as [`merge_slots`] stacks them (the base carries
+/// none — it is prefix-conditioned, which is what
+/// `chess_bake`'s body init requires of it).
+///
+/// # Why this and not the mean
+///
+/// The mean assumes the sources sit in one basin, and plan 11 measured
+/// them at cosine 0.02 on the body — nearly orthogonal, so the
+/// midpoint is neither of them. Differences from a shared base are the
+/// standard answer: each source is the base plus what its condition
+/// taught it, and if those two lessons are small and about different
+/// things, their sum lands near both. Whether they are is exactly what
+/// plan 12 measures — this function makes the claim expressible, not
+/// true.
+///
+/// # Errors
+///
+/// As [`merge_slots`], plus a base that disagrees with the sources on
+/// a body tensor's shape, or one that carries a conditioning table
+/// (a shared base must not decide the merged model's conditioning).
+pub fn merge_task_arithmetic(
+    base: &Path,
+    sources: &[&Path],
+    out: &Path,
+) -> Result<ModelShape, MergeError> {
+    if sources.len() < 2 {
+        return Err(MergeError::TooFewSources {
+            found: sources.len(),
+        });
+    }
+    let device = Device::Cpu;
+    let base_map = candle_core::safetensors::load(base, &device).map_err(|e| MergeError::Io {
+        path: base.display().to_string(),
+        message: e.to_string(),
+    })?;
+    if base_map.contains_key(COND_TABLE) {
+        return Err(MergeError::BaseIsConditioned {
+            path: base.display().to_string(),
+        });
+    }
+
+    // The stacking, the band bookkeeping and every refusal about the
+    // sources are `merge_slots`'s. Its body mean is then replaced,
+    // tensor by tensor, by the base-plus-differences form — one code
+    // path owns "what a merged checkpoint is", and this owns only how
+    // the bodies combine.
+    let shape = merge_slots(sources, out)?;
+    let mut merged = candle_core::safetensors::load(out, &device).map_err(|e| MergeError::Io {
+        path: out.display().to_string(),
+        message: e.to_string(),
+    })?;
+    let loaded: Vec<HashMap<String, Tensor>> = sources
+        .iter()
+        .map(|path| {
+            candle_core::safetensors::load(path, &device).map_err(|e| MergeError::Io {
+                path: path.display().to_string(),
+                message: e.to_string(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    for (name, base_tensor) in &base_map {
+        let Some(slot) = merged.get_mut(name) else {
+            // A base tensor the merged model does not want. The shapes
+            // were checked against each other by `merge_slots`; this is
+            // a base carrying something extra, which is ignored for the
+            // same reason a restore ignores it.
+            continue;
+        };
+        let mut acc = base_tensor.clone();
+        for source in &loaded {
+            let t = source.get(name).ok_or_else(|| MergeError::Tensor {
+                name: name.clone(),
+                message: "present in the base and not in a source".into(),
+            })?;
+            if t.dims() != base_tensor.dims() {
+                return Err(MergeError::Tensor {
+                    name: name.clone(),
+                    message: format!("base {:?} and source {:?}", base_tensor.dims(), t.dims()),
+                });
+            }
+            let delta = (t - base_tensor).map_err(|e| MergeError::Tensor {
+                name: name.clone(),
+                message: e.to_string(),
+            })?;
+            acc = (&acc + delta).map_err(|e| MergeError::Tensor {
+                name: name.clone(),
+                message: e.to_string(),
+            })?;
+        }
+        *slot = acc;
+    }
+
+    candle_core::safetensors::save(&merged, out).map_err(|e| MergeError::Io {
+        path: out.display().to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +495,64 @@ mod tests {
             [101.0, 102.0, 103.0, 104.0],
             "the tables were not stacked in source order"
         );
+    }
+
+    /// Task arithmetic is base-plus-differences, and the tables still
+    /// stack: with sources at base+1 and base+3, the merged body is
+    /// base+4 where the mean would have been base+2.
+    #[test]
+    fn task_arithmetic_adds_the_differences_to_the_base() {
+        let tmp = TempDir::new().unwrap();
+        // The base carries a body and no conditioning table, which is
+        // what a prefix-conditioned bake produces.
+        let base = tmp.path().join("base.safetensors");
+        let device = Device::Cpu;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert(
+            "wte.weight".into(),
+            Tensor::full(10.0f32, (8, 4), &device).unwrap(),
+        );
+        map.insert(
+            "ln_f.weight".into(),
+            Tensor::full(10.0f32, (4,), &device).unwrap(),
+        );
+        candle_core::safetensors::save(&map, &base).unwrap();
+        let mut base_shape = ModelShape::compact(8, vec![ConditionBand::rating(0, 0, "<all>")]);
+        base_shape.dim = 4;
+        base_shape.ctx = 8;
+        base_shape.save(&base).unwrap();
+
+        let a = write_source(tmp.path(), "a", &["<eco:B>", "<eco:C>"], 11.0);
+        let b = write_source(tmp.path(), "b", &["<lo>", "<hi>"], 13.0);
+        let out = tmp.path().join("ta.safetensors");
+        let shape = merge_task_arithmetic(&base, &[&a, &b], &out).unwrap();
+        assert_eq!(shape.cond_groups, vec![2, 2]);
+
+        let got = candle_core::safetensors::load(&out, &Device::Cpu).unwrap();
+        let wte: Vec<f32> = got["wte.weight"].flatten_all().unwrap().to_vec1().unwrap();
+        // 10 + (11-10) + (13-10) = 14, where the mean would be 12.
+        assert!(
+            wte.iter().all(|v| (*v - 14.0).abs() < 1e-5),
+            "{:?}",
+            &wte[..4]
+        );
+        // And the tables still stack rather than being differenced.
+        assert_eq!(got[COND_TABLE].dims(), &[4, 4]);
+    }
+
+    /// A base with a conditioning table would decide the merged
+    /// model's conditioning, and is refused.
+    #[test]
+    fn task_arithmetic_refuses_a_conditioned_base() {
+        let tmp = TempDir::new().unwrap();
+        let base = write_source(tmp.path(), "base", &["<x>"], 10.0);
+        let a = write_source(tmp.path(), "a", &["<eco:B>", "<eco:C>"], 11.0);
+        let b = write_source(tmp.path(), "b", &["<lo>", "<hi>"], 13.0);
+        let out = tmp.path().join("ta.safetensors");
+        assert!(matches!(
+            merge_task_arithmetic(&base, &[&a, &b], &out),
+            Err(MergeError::BaseIsConditioned { .. })
+        ));
     }
 
     /// The disagreements a merge cannot reconcile, by name.

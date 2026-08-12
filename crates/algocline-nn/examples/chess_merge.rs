@@ -22,7 +22,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use algocline_nn::chess::merge::merge_slots;
+use algocline_nn::chess::merge::{merge_slots, merge_task_arithmetic};
 
 fn main() -> ExitCode {
     match run() {
@@ -34,19 +34,41 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: chess_merge <out.safetensors> <src1> <src2> [src3...]";
+const USAGE: &str = "usage: chess_merge [--base <base.safetensors>] <out.safetensors> \
+                     <src1> <src2> [src3...]\n\
+                     with --base the bodies combine as base + sum(source - base) \
+                     (task arithmetic); without it, as their mean";
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut base: Option<PathBuf> = None;
+    let mut positional: Vec<PathBuf> = Vec::new();
     let mut args = env::args().skip(1);
-    let out: PathBuf = args.next().ok_or(USAGE)?.into();
-    let sources: Vec<PathBuf> = args.map(PathBuf::from).collect();
-    if sources.len() < 2 {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base" => base = Some(args.next().ok_or(USAGE)?.into()),
+            _ => positional.push(arg.into()),
+        }
+    }
+    if positional.len() < 3 {
         return Err(USAGE.into());
     }
+    let out = positional[0].clone();
+    let sources: Vec<PathBuf> = positional[1..].to_vec();
     let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
 
-    let shape = merge_slots(&refs, &out)?;
-    println!("merged     {} source(s) -> {}", refs.len(), out.display());
+    let shape = match &base {
+        Some(base) => merge_task_arithmetic(base, &refs, &out)?,
+        None => merge_slots(&refs, &out)?,
+    };
+    println!(
+        "merged     {} source(s) {} -> {}",
+        refs.len(),
+        match &base {
+            Some(b) => format!("as base + sum(differences) from {}", b.display()),
+            None => "as their mean".to_string(),
+        },
+        out.display()
+    );
     for (slot, size) in shape.cond_groups.iter().enumerate() {
         let start: usize = shape.cond_groups[..slot].iter().sum();
         let tokens: Vec<&str> = shape.bands[start..start + size]

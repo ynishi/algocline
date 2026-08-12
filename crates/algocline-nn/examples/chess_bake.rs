@@ -151,9 +151,9 @@ use algocline_nn::chess::train::{cond_table, row_conditions};
 use algocline_nn::chess::vocab::MoveVocab;
 use algocline_nn::chess::{CondEncoding, ModelShape, ShapeError, ShapeKind};
 use algocline_nn::train::{
-    allowed_logit_mask, legal_input_sets, restore_into, run_conditioned_ft, run_full_ft,
-    run_legal_ft, CkptControl, CkptHook, CkptInfo, CrossEntropyLoss, Dataset, DatasetOpts,
-    FullFtConfig, Loss, ScheduleKind, TeacherCardDataset, TrainingLease,
+    allowed_logit_mask, legal_input_sets, restore_into, restore_into_partial, run_conditioned_ft,
+    run_full_ft, run_legal_ft, CkptControl, CkptHook, CkptInfo, CrossEntropyLoss, Dataset,
+    DatasetOpts, FullFtConfig, Loss, ScheduleKind, TeacherCardDataset, TrainingLease,
 };
 
 /// Read a `usize` from the environment, falling back to `default`.
@@ -576,6 +576,81 @@ fn shape_disagreements(want: &ModelShape, found: &ModelShape) -> Vec<String> {
 /// without the sidecar would restore a `1600-1799` model into a run
 /// configured as `1100-1299` and report a flawless resume, which is the
 /// exact silence this check exists to remove.
+/// The checkpoint a `CHESS_INIT_BODY_FROM` run starts its **body**
+/// from, or `None`.
+///
+/// The sibling of [`resume_from`] for the one case that one refuses on
+/// purpose: starting several differently-conditioned runs from one
+/// shared model. `CHESS_INIT_FROM` requires the band lists to agree,
+/// because resuming across them would continue one run's model under
+/// another's meaning. Here the band lists are *supposed* to differ —
+/// what is shared is everything except the conditioning — so the axes
+/// checked are the ones the body actually depends on (layers, heads,
+/// dim, ctx, vocab) and the band list is not one of them.
+///
+/// The restore is [`restore_into_partial`], so the conditioning table
+/// this run registers and the base does not carry is left at its
+/// random initialisation rather than failing the load. A base that
+/// *does* carry one is refused here: two tables of different heights
+/// are a shape error inside the restore, and one of the same height
+/// would be silently adopted as this run's conditioning, which is the
+/// thing a shared base must not decide.
+///
+/// Why this exists: plan 11 measured two independently-trained
+/// conditioned models at cosine 0.02 on their body weights — nearly
+/// orthogonal, so their mean is neither of them. A shared base is the
+/// structural answer (task arithmetic), and it needs an init that
+/// crosses the band list.
+fn body_init_from(want: &ModelShape) -> Result<Option<PathBuf>, String> {
+    let raw = match env::var_os("CHESS_INIT_BODY_FROM") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if raw.is_empty() {
+        eprintln!(
+            "[bake] CHESS_INIT_BODY_FROM is set but empty; starting from a random initialisation"
+        );
+        return Ok(None);
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_file() {
+        return Err(format!(
+            "CHESS_INIT_BODY_FROM={} is not a readable file",
+            path.display()
+        ));
+    }
+    let found = ModelShape::load_any(&path).map_err(|e| {
+        format!(
+            "CHESS_INIT_BODY_FROM={}: cannot read the shape written beside it. {e}",
+            path.display()
+        )
+    })?;
+    let axes: [(&str, String, String); 5] = [
+        ("layers", want.layers.to_string(), found.layers.to_string()),
+        ("heads", want.heads.to_string(), found.heads.to_string()),
+        ("dim", want.dim.to_string(), found.dim.to_string()),
+        ("ctx", want.ctx.to_string(), found.ctx.to_string()),
+        ("vocab", want.vocab.to_string(), found.vocab.to_string()),
+    ];
+    if let Some((field, w, f)) = axes.into_iter().find(|(_, w, f)| w != f) {
+        return Err(format!(
+            "CHESS_INIT_BODY_FROM={} has {field} {f} where this run has {w}; the body cannot \
+             be carried across that",
+            path.display()
+        ));
+    }
+    if found.encoding == CondEncoding::EveryPosition {
+        return Err(format!(
+            "CHESS_INIT_BODY_FROM={} conditions every position, so it carries a conditioning \
+             table of its own. A shared base must not decide this run's conditioning: bake the \
+             base with prefix conditioning (leave CHESS_COND_EVERY unset) so it carries a body \
+             and nothing else",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
+}
+
 fn resume_from(want: &ModelShape) -> Result<Option<PathBuf>, String> {
     let raw = match env::var_os("CHESS_INIT_FROM") {
         Some(v) => v,
@@ -804,6 +879,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // checkpoint of another shape stops the run in seconds. The restore
     // itself has to wait for the model to exist and stays below.
     let init_from = resume_from(&shape)?;
+    let body_init = body_init_from(&shape)?;
+    if init_from.is_some() && body_init.is_some() {
+        // Two inits would leave which one wins depending on the order
+        // of two restores, and the order is an implementation detail.
+        return Err(
+            "CHESS_INIT_FROM and CHESS_INIT_BODY_FROM are both set; pick one — a resume \
+             continues one model, a body init starts several runs from a shared one"
+                .into(),
+        );
+    }
     if let Some(p) = &init_from {
         eprintln!("[bake] resuming from {}", p.display());
     }
@@ -1054,6 +1139,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  and were ignored: {}",
                 report.unused_from_file.len(),
                 report.unused_from_file.join(", ")
+            );
+        }
+    }
+    // The shared-base init. Partial, so this run's conditioning table —
+    // which the base does not carry, and `body_init_from` has refused a
+    // base that does — stays at its random initialisation. The skipped
+    // names are printed rather than assumed: "the table and nothing
+    // else was skipped" is the claim this init rests on.
+    if let Some(base) = &body_init {
+        let report = restore_into_partial(&vm, base)?;
+        eprintln!(
+            "[bake] body init from {}: {}",
+            base.display(),
+            report.summary()
+        );
+        if !report.absent_from_file.is_empty() {
+            eprintln!(
+                "[bake] body init: {} variable(s) left at their initialisation: {}",
+                report.absent_from_file.len(),
+                report.absent_from_file.join(", ")
             );
         }
     }

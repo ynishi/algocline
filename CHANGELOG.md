@@ -46,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table of its own. `examples/chess_merge` is the CLI, with `--base`
   selecting task arithmetic.
 
+- `chess::merge::merge_task_arithmetic_scaled` — task arithmetic with a
+  coefficient on the differences, `base + s * Σ(source − base)`, and
+  `MergeError::ScaleNotPositive` for a scale that is not positive and
+  finite (zero included: it keeps the sources' conditioning tables
+  while discarding everything their bodies learned, which is the base
+  wearing the sources' labels). One scale for all sources rather than
+  one each — per-source weights turn the operator into a search space,
+  and which point of it was looked at then becomes part of any
+  downstream judgement. `merge_task_arithmetic` delegates here with
+  `1.0`; IEEE 754 multiplication by one is exact, so the two agree bit
+  for bit, and a test pins the output files as byte-equal because the
+  unscaled case is used elsewhere as a reproduction of an earlier
+  measurement — a drift between the paths would read as "the
+  experiment did not reproduce" rather than as a bug in the operator.
+  `chess_merge` takes `--scale`, and refuses it without `--base`
+  instead of ignoring it.
+
 - `chess::batch::BandBatch::over_combos` / `combo_labels` /
   `single_combo` — scoring and playing a multi-slot checkpoint.
   `over_combos` runs one row per combination of the groups (earlier

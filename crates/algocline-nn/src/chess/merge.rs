@@ -91,6 +91,22 @@ pub enum MergeError {
         groups: usize,
     },
 
+    /// The scale on the differences is not a positive finite number.
+    ///
+    /// Zero is refused along with the negatives and the non-finites:
+    /// it keeps the sources' conditioning tables while discarding
+    /// everything their bodies learned, so the result would be a
+    /// checkpoint that names two sources and carries neither's
+    /// adaptation. A caller that wants the base's body has the base.
+    #[error(
+        "the scale on the differences must be positive and finite; {found} given. \
+         A merge at scale s writes base + s*sum(source - base)"
+    )]
+    ScaleNotPositive {
+        /// The scale given.
+        found: f64,
+    },
+
     /// Two sources disagree on something the merge cannot reconcile.
     ///
     /// The body tensors are averaged elementwise, so a difference in
@@ -348,6 +364,54 @@ pub fn merge_task_arithmetic(
     sources: &[&Path],
     out: &Path,
 ) -> Result<ModelShape, MergeError> {
+    merge_task_arithmetic_scaled(base, sources, 1.0, out)
+}
+
+/// [`merge_task_arithmetic`] with a scale on the differences:
+/// `base + scale * Σ(source − base)`.
+///
+/// # Why a scale exists
+///
+/// Plan 12 measured what the unscaled form does at this project's
+/// fine-tune length: each source sat 0.57–0.68 of the base's own
+/// magnitude away from it, so their sum landed 0.95 away — as far from
+/// the base as the base is from nothing — and the merged model scored
+/// worse than a uniform draw over the legal moves. The differences
+/// were near-orthogonal (cosine 0.014), which is what task arithmetic
+/// wants; what it does not want is differences the size of the model.
+/// A scale shortens them without changing their directions.
+///
+/// # One scale, not one per source
+///
+/// A scale per source turns the operator into a search space, and
+/// which point of that space was looked at then becomes part of any
+/// judgement made downstream. Plan 13 registers a single coefficient
+/// for exactly that reason. A caller that genuinely wants per-source
+/// weights can call this repeatedly on pairwise merges and own the
+/// resulting bookkeeping.
+///
+/// # Scale 1.0 is the unscaled merge, exactly
+///
+/// [`merge_task_arithmetic`] delegates here with `1.0`, and IEEE 754
+/// multiplication by one is exact on every finite value, so the two
+/// agree bit for bit rather than nearly. `merge_task_arithmetic_at_one_matches_unscaled`
+/// pins that, because the plan that introduced the scale uses the
+/// unscaled case as its reproduction of plan 12: if the two drifted,
+/// a failure to reproduce would read as a result rather than as a bug.
+///
+/// # Errors
+///
+/// As [`merge_task_arithmetic`], plus [`MergeError::ScaleNotPositive`]
+/// for a scale that is not positive and finite.
+pub fn merge_task_arithmetic_scaled(
+    base: &Path,
+    sources: &[&Path],
+    scale: f64,
+    out: &Path,
+) -> Result<ModelShape, MergeError> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(MergeError::ScaleNotPositive { found: scale });
+    }
     if sources.len() < 2 {
         return Err(MergeError::TooFewSources {
             found: sources.len(),
@@ -408,6 +472,15 @@ pub fn merge_task_arithmetic(
                 name: name.clone(),
                 message: e.to_string(),
             })?;
+            // Scaled before accumulating rather than after, so the
+            // sum is of shortened differences and not a shortening of
+            // their sum. The two agree here because the operation is
+            // linear, and they stop agreeing the moment anything
+            // non-linear is put between them.
+            let delta = (delta * scale).map_err(|e| MergeError::Tensor {
+                name: name.clone(),
+                message: e.to_string(),
+            })?;
             acc = (&acc + delta).map_err(|e| MergeError::Tensor {
                 name: name.clone(),
                 message: e.to_string(),
@@ -428,6 +501,7 @@ mod tests {
     use super::*;
     use crate::chess::corpus::ConditionBand;
     use candle_core::DType;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// A single-slot checkpoint whose every tensor holds `fill`.
@@ -538,6 +612,109 @@ mod tests {
         );
         // And the tables still stack rather than being differenced.
         assert_eq!(got[COND_TABLE].dims(), &[4, 4]);
+    }
+
+    /// Writes a base carrying a body and no conditioning table, which
+    /// is what a prefix-conditioned bake produces and what task
+    /// arithmetic requires.
+    fn write_unconditioned_base(dir: &Path, fill: f32) -> PathBuf {
+        let base = dir.join("base.safetensors");
+        let device = Device::Cpu;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert(
+            "wte.weight".into(),
+            Tensor::full(fill, (8, 4), &device).unwrap(),
+        );
+        map.insert(
+            "ln_f.weight".into(),
+            Tensor::full(fill, (4,), &device).unwrap(),
+        );
+        candle_core::safetensors::save(&map, &base).unwrap();
+        let mut base_shape = ModelShape::compact(8, vec![ConditionBand::rating(0, 0, "<all>")]);
+        base_shape.dim = 4;
+        base_shape.ctx = 8;
+        base_shape.save(&base).unwrap();
+        base
+    }
+
+    /// A scale shortens the differences without turning them.
+    ///
+    /// The unscaled merge lands at `10 + 1 + 3 = 14`; at half that,
+    /// the differences contribute `0.5 * (1 + 3)`, so `12`. What is
+    /// being pinned is that the scale multiplies each difference
+    /// before the sum, which for a linear operation is the same as
+    /// scaling the sum — stated here so that a later non-linear step
+    /// inserted between them fails a test rather than passing quietly.
+    #[test]
+    fn task_arithmetic_scales_the_differences() {
+        let tmp = TempDir::new().unwrap();
+        let base = write_unconditioned_base(tmp.path(), 10.0);
+        let a = write_source(tmp.path(), "a", &["<eco:B>", "<eco:C>"], 11.0);
+        let b = write_source(tmp.path(), "b", &["<lo>", "<hi>"], 13.0);
+        let out = tmp.path().join("half.safetensors");
+
+        merge_task_arithmetic_scaled(&base, &[&a, &b], 0.5, &out).unwrap();
+        let got = candle_core::safetensors::load(&out, &Device::Cpu).unwrap();
+        let wte: Vec<f32> = got["wte.weight"].flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            wte.iter().all(|v| (*v - 12.0).abs() < 1e-5),
+            "{:?}",
+            &wte[..4]
+        );
+        // The tables are stacked whole at any scale: a conditioning
+        // row is what one source learned for one band, and half of it
+        // is not a condition.
+        assert_eq!(got[COND_TABLE].dims(), &[4, 4]);
+    }
+
+    /// Scale 1.0 is the unscaled merge byte for byte.
+    ///
+    /// Plan 13 uses the unscaled case as its reproduction of plan 12's
+    /// failure, so a drift between the two paths would present as
+    /// "the experiment did not reproduce" rather than as a bug in the
+    /// operator. IEEE 754 multiplication by one is exact, so this is
+    /// an equality and not a tolerance.
+    #[test]
+    fn merge_task_arithmetic_at_one_matches_unscaled() {
+        let tmp = TempDir::new().unwrap();
+        let base = write_unconditioned_base(tmp.path(), 10.0);
+        let a = write_source(tmp.path(), "a", &["<eco:B>", "<eco:C>"], 11.0);
+        let b = write_source(tmp.path(), "b", &["<lo>", "<hi>"], 13.0);
+
+        let plain = tmp.path().join("plain.safetensors");
+        let scaled = tmp.path().join("scaled.safetensors");
+        merge_task_arithmetic(&base, &[&a, &b], &plain).unwrap();
+        merge_task_arithmetic_scaled(&base, &[&a, &b], 1.0, &scaled).unwrap();
+
+        assert_eq!(
+            std::fs::read(&plain).unwrap(),
+            std::fs::read(&scaled).unwrap(),
+            "scale 1.0 must be the unscaled merge exactly"
+        );
+    }
+
+    /// A scale that is not a positive finite number is refused.
+    ///
+    /// Zero is in the list: it would keep the sources' conditioning
+    /// tables and discard every bit of body their conditions taught,
+    /// which is the base wearing the sources' labels.
+    #[test]
+    fn task_arithmetic_refuses_a_scale_that_is_not_positive_and_finite() {
+        let tmp = TempDir::new().unwrap();
+        let base = write_unconditioned_base(tmp.path(), 10.0);
+        let a = write_source(tmp.path(), "a", &["<eco:B>", "<eco:C>"], 11.0);
+        let b = write_source(tmp.path(), "b", &["<lo>", "<hi>"], 13.0);
+        let out = tmp.path().join("bad.safetensors");
+
+        for bad in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+            assert!(
+                matches!(
+                    merge_task_arithmetic_scaled(&base, &[&a, &b], bad, &out),
+                    Err(MergeError::ScaleNotPositive { .. })
+                ),
+                "scale {bad} should be refused"
+            );
+        }
     }
 
     /// A base with a conditioning table would decide the merged

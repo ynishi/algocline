@@ -22,7 +22,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use algocline_nn::chess::merge::{merge_slots, merge_task_arithmetic};
+use algocline_nn::chess::merge::{merge_slots, merge_task_arithmetic_scaled};
 
 fn main() -> ExitCode {
     match run() {
@@ -34,20 +34,35 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: chess_merge [--base <base.safetensors>] <out.safetensors> \
-                     <src1> <src2> [src3...]\n\
-                     with --base the bodies combine as base + sum(source - base) \
-                     (task arithmetic); without it, as their mean";
+const USAGE: &str = "usage: chess_merge [--base <base.safetensors>] [--scale <s>] \
+                     <out.safetensors> <src1> <src2> [src3...]\n\
+                     with --base the bodies combine as base + s*sum(source - base) \
+                     (task arithmetic, s defaults to 1); without it, as their mean.\n\
+                     --scale requires --base: the mean has no differences to scale";
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut base: Option<PathBuf> = None;
+    let mut scale: Option<f64> = None;
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--base" => base = Some(args.next().ok_or(USAGE)?.into()),
+            "--scale" => {
+                let raw = args.next().ok_or(USAGE)?;
+                scale = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--scale {raw:?} is not a number"))?,
+                );
+            }
             _ => positional.push(arg.into()),
         }
+    }
+    // Refused rather than ignored: a run that passed --scale and got
+    // the mean would produce a file named for a coefficient that had
+    // no part in making it.
+    if scale.is_some() && base.is_none() {
+        return Err("--scale requires --base; the mean has no differences to scale".into());
     }
     if positional.len() < 3 {
         return Err(USAGE.into());
@@ -56,15 +71,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sources: Vec<PathBuf> = positional[1..].to_vec();
     let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
 
+    let scale = scale.unwrap_or(1.0);
     let shape = match &base {
-        Some(base) => merge_task_arithmetic(base, &refs, &out)?,
+        Some(base) => merge_task_arithmetic_scaled(base, &refs, scale, &out)?,
         None => merge_slots(&refs, &out)?,
     };
     println!(
         "merged     {} source(s) {} -> {}",
         refs.len(),
         match &base {
-            Some(b) => format!("as base + sum(differences) from {}", b.display()),
+            Some(b) => format!("as base + {scale}*sum(differences) from {}", b.display()),
             None => "as their mean".to_string(),
         },
         out.display()

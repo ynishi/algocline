@@ -74,6 +74,18 @@ pub enum TagRule {
     /// reader of the filter would have to count the list to learn what
     /// it means.
     StartsWith(String),
+    /// The tag's value starts with any of these strings.
+    ///
+    /// The predicates of a [`GameFilter`] conjoin, so a disjunction has
+    /// to live inside one of them. Without this, "the games of these
+    /// two opening families" is not a population a filter can state —
+    /// it can only be reached by *conditioning* on the families, which
+    /// makes the population a property of the condition and leaves two
+    /// models conditioned on different attributes looking at different
+    /// games. That is exactly the confound plan 10 shipped, and this is
+    /// what lets plan 11 hold the corpus fixed while the condition
+    /// varies.
+    StartsWithAny(Vec<String>),
 }
 
 impl TagRule {
@@ -91,6 +103,9 @@ impl TagRule {
                 base.parse::<i64>().map(|n| n >= *min).unwrap_or(false)
             }
             TagRule::StartsWith(prefix) => value.starts_with(prefix.as_str()),
+            TagRule::StartsWithAny(prefixes) => {
+                prefixes.iter().any(|p| value.starts_with(p.as_str()))
+            }
         }
     }
 }
@@ -209,6 +224,25 @@ impl GameFilter {
         self
     }
 
+    /// Keep only games whose ECO code starts with one of these
+    /// prefixes.
+    ///
+    /// The population "these opening families" — which
+    /// [`Self::with_eco_prefix`] cannot state for more than one family,
+    /// since the filter's predicates conjoin. An empty list would
+    /// accept nothing and is refused by the caller rather than here;
+    /// this takes what it is given.
+    pub fn with_eco_prefixes<S: Into<String>>(
+        mut self,
+        prefixes: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.tags.push(TagPredicate::new(
+            "ECO",
+            TagRule::StartsWithAny(prefixes.into_iter().map(Into::into).collect()),
+        ));
+        self
+    }
+
     /// Set the accepted ply range.
     pub fn with_ply_bounds(mut self, min: usize, max: Option<usize>) -> Self {
         self.min_plies = min;
@@ -280,6 +314,31 @@ mod tests {
         let narrowed = GameFilter::accept_all().with_eco_prefix("B2");
         assert!(narrowed.accepts_tags(&game(&[("ECO", "B27")])));
         assert!(!narrowed.accepts_tags(&game(&[("ECO", "B30")])));
+    }
+
+    /// The disjunction the conjoining predicate list cannot otherwise
+    /// express: two families as one population.
+    #[test]
+    fn several_eco_prefixes_are_a_disjunction() {
+        let f = GameFilter::accept_all().with_eco_prefixes(["B", "C"]);
+        assert!(f.accepts_tags(&game(&[("ECO", "B20")])));
+        assert!(f.accepts_tags(&game(&[("ECO", "C50")])));
+        assert!(!f.accepts_tags(&game(&[("ECO", "A00")])));
+        assert!(!f.accepts_tags(&game(&[("ECO", "D02")])));
+        // And it conjoins with the rest, as every predicate does.
+        let narrowed = GameFilter::accept_all()
+            .with_eco_prefixes(["B", "C"])
+            .with_rating_band(1100, 2099);
+        assert!(narrowed.accepts_tags(&game(&[
+            ("ECO", "B20"),
+            ("WhiteElo", "1500"),
+            ("BlackElo", "1600")
+        ])));
+        assert!(!narrowed.accepts_tags(&game(&[
+            ("ECO", "B20"),
+            ("WhiteElo", "2500"),
+            ("BlackElo", "1600")
+        ])));
     }
 
     #[test]

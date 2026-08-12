@@ -855,6 +855,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[bake] population narrowed to both players inside {min}-{max}");
         filter = filter.with_rating_band(min, max);
     }
+    // `CHESS_FILTER_ECO=B,C` narrows the population to those opening
+    // families, which is a different statement from conditioning on
+    // them: a condition rejects the games it cannot label, so two
+    // models conditioned on different attributes end up looking at
+    // different games unless the population is stated here. Plan 10
+    // shipped exactly that confound; this is what lets a run hold the
+    // corpus fixed while the condition varies.
+    if let Ok(families) = env::var("CHESS_FILTER_ECO") {
+        let prefixes: Vec<String> = families
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if prefixes.is_empty() {
+            return Err(format!("CHESS_FILTER_ECO {families:?} names no family").into());
+        }
+        eprintln!("[bake] population narrowed to ECO families {prefixes:?}");
+        filter = filter.with_eco_prefixes(prefixes);
+    }
     let opts = CorpusOptions {
         filter,
         max_rows,

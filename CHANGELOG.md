@@ -9,6 +9,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-slot conditioning** — one model conditioned on several
+  attributes at once, each slot's vector summed into the residual
+  stream. `Gpt2Model::forward_conditioned_groups(xs, conds, per_row)`
+  takes `batch * per_row` indices row-major and sums each row's
+  `cond_wte` rows before the one addition the single-condition path
+  already makes: an identity at `per_row == 1`, order-free in the
+  slots, and deliberately **not** a per-slot table — every index still
+  points into the one table, so the grouping is the shape's and the
+  corpus's business rather than the forward's.
+  `ModelShape::cond_groups` records that partition (`[2, 2]` says the
+  first two bands are one slot and the next two another), with
+  `effective_cond_groups()` as the accessor that decides "empty means
+  one group" in one place. The field is omitted from the sidecar for a
+  single-slot model, so those files stay byte-identical and older
+  builds keep reading them, while a multi-slot sidecar carries it and
+  an older build refuses it loudly. Group sizes that do not sum to the
+  band count are refused at load (`ShapeError::GroupsContradictBands`)
+  rather than left to partition the band list at well-formed but wrong
+  boundaries. `TeacherCardDataset::with_condition_groups` and
+  `chess::corpus::LegalMaskedDataset::with_condition_groups` attach the
+  row-major list.
+
+- `chess::merge` — assembling a multi-slot checkpoint out of
+  single-slot ones. `merge_slots` averages every body tensor and stacks
+  the conditioning tables in slot order (each `cond_wte` row was
+  learned by one model for one attribute, so stacking keeps every row
+  intact while the body is the part the runs learned redundantly);
+  `merge_task_arithmetic` composes bodies as `base + Σ(source − base)`
+  against a shared base instead. The merged sidecar goes out through
+  `ModelShape::save`, so the result is indistinguishable from a trained
+  checkpoint to every reader downstream. Refused by name: fewer than
+  two sources, a source that is prefix-encoded or already multi-slot, a
+  band token appearing in two sources, a shape axis the merge cannot
+  reconcile, and (for task arithmetic) a base carrying a conditioning
+  table of its own. `examples/chess_merge` is the CLI, with `--base`
+  selecting task arithmetic.
+
+- `chess::batch::BandBatch::over_combos` / `combo_labels` /
+  `single_combo` — scoring and playing a multi-slot checkpoint.
+  `over_combos` runs one row per combination of the groups (earlier
+  groups varying slower) and `combo_labels` renders the same order, so
+  a row of logits and the name printed for it cannot come from two
+  different orderings; `single_combo` takes one **cell** (one band
+  token per group, matched by membership rather than position) for a
+  reader that plays a position rather than comparing every
+  combination. `chess_play` takes a comma-separated cell and prints
+  every slot's table row.
+
+- `chess::records` format version 5: `WalkHeader::games_of` records the
+  condition tokens of the filter that selected the walk's games, so that
+  two walks differing only in which games were scored can be told apart.
+  Detail in the `chess::records` entry below;
+  `StatError::RecordsPredateWalkFilter` is what a judge returns for a
+  walk that cannot state its cell.
+
+- `chess::steerability` judges for the conditioning experiments:
+  `h29` / `h31` (a family token's mis-conditioning cost, over the whole
+  walk and over the opening stratum), `h30` (per-cell, per-slot
+  falsification on a 2×2 grid) and `h32` (the same pooled per slot
+  axis across cells). Each resolves its arms' roles from the records
+  themselves — `check_jouseki_roles` and `check_duo_roles` read
+  `games_of` and refuse a walk that claims another cell, a pre-v5 walk
+  that cannot claim one at all, a band list that is not the registered
+  shape, and a cell fed twice. `examples/chess_jouseki` and
+  `examples/chess_duo` (the latter with `--pool`) are the CLIs.
+
+- `metric::bootstrap::stratified_cluster_bootstrap` — resampling
+  several independent strata together, one index list per stratum per
+  draw. A statistic pooled across separate position streams cannot use
+  a single cluster space: the streams share no games, a pooled space
+  would let a draw omit a stratum entirely, and clusters from different
+  populations are not exchangeable.
+
+- `chess::filter::TagRule::StartsWith` / `StartsWithAny` with
+  `GameFilter::with_eco_prefix` / `with_eco_prefixes` — a filter can
+  now state "the games of these opening families" as a population. Its
+  predicates conjoin, so a disjunction has to live inside one of them;
+  without that, such a population could only be reached by
+  *conditioning* on the families, which makes the corpus a property of
+  the condition and leaves two differently-conditioned models looking
+  at different games.
+
+- `examples/chess_bake` grows `CHESS_FILTER_ELO` and `CHESS_FILTER_ECO`
+  (state the population in the filter), `;`-separated band groups for a
+  multi-slot model (`eco:B,eco:C;1100-1599,1600-2099`), per-band row
+  counts with a refusal when any band collects zero rows, and
+  `CHESS_INIT_BODY_FROM` — the init `CHESS_INIT_FROM` refuses on
+  purpose, for starting several differently-conditioned runs from one
+  shared body. It checks the axes the body depends on (layers, heads,
+  dim, ctx, vocab) and not the band list, restores partially so this
+  run's conditioning table stays at its initialisation, and refuses a
+  base that carries a table of its own.
+
 - `examples/gameai/gen_guardian_player_styles.lua` — deterministic
   generator for player-style training corpora, driving the duel loop
   directly (scripted boss policies, no Cards, no nn, no RNG). Ships
@@ -443,6 +536,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint was — so the legality arm set requires version 4 outright,
   the axis being merely unstated below it rather than known absent.
 
+  Version 5 adds `WalkHeader::games_of`: the condition tokens of the
+  filter that selected the walk's games. It is the same argument as
+  version 4 one axis over — `encoding` and `legal_input` say how the
+  checkpoint was trained, and nothing said **which games were scored**.
+  Two walks over the same checkpoint, one over one band's games and one
+  over another's, produced headers that could not be told apart, so any
+  comparison that depends on which games were walked could have its sign
+  reversed by feeding it the other file, with every number well-formed.
+
+  An `Option<Vec<String>>` rather than a plain `Vec`, because unlike
+  version 4's `bool` both absences occur here and they differ: `None` is
+  a file written before this field existed and says nothing about its
+  filter, while `Some(vec![])` is a walk **deliberately** left
+  unfiltered. Collapsing them would make a pre-5 walk claim to be an
+  open one, which is exactly the claim a per-cell judge acts on.
+  `MIN_READABLE_VERSION` stays 1.
+
   Version 3 adds `GammaRecord::ce` and `PositionRecord::n_legal`. `ce`
   is the negative log probability of the move actually played, under
   each band's distribution restricted to the legal moves and
@@ -717,15 +827,84 @@ instead of reading them as off. `CHESS_LEGAL_MASK=true` meant *off*.
   metadata, with no checkpoint beside it, now fails where it used to
   return.
 
-### Changed — **BREAKING**: `algocline_nn::train::Batch` gained a `conds` field
+### Changed — **BREAKING**: a corpus takes several condition specs, and a row carries one band per slot
 
-`Batch` carries an optional per-row conditioning index, so a training
-loop can tell the model which condition each row was written under.
+A model can now be conditioned on several attributes at once — an
+opening family *and* a rating band, say — and the corpus side changed
+shape to carry that.
+
+- `chess::corpus::CorpusOptions::condition: Option<ConditionSpec>` is
+  now `conditions: Vec<ConditionSpec>`, one per slot. An empty vector
+  is the unconditional corpus the `None` used to be.
+- `chess::corpus::TeacherRow::band: Option<usize>` is now
+  `bands: Vec<usize>`, one ordinal per slot, empty when unconditional.
+- `chess::corpus::Corpus::bands` is `Option<Vec<Vec<usize>>>` rather
+  than `Option<Vec<usize>>`, for the same reason.
+- `chess::train::row_conditions` takes `&[CondTable]` (one table per
+  slot) rather than `&CondTable`, and returns the flat **row-major**
+  list — row `i`'s conditions are the `tables.len()` entries starting
+  at `i * tables.len()`, which is the layout the datasets'
+  `with_condition_groups` and `Gpt2Model::forward_conditioned_groups`
+  share.
+- `chess::train::ConditionError::RowWithoutBand` is replaced by
+  `RowSlotsMismatch { index, found, expected }`, and `BandOutOfRange`
+  gained a `group` field. Neither enum is `#[non_exhaustive]`.
+- `train::ConditionedForward::forward_conditioned_rows` takes a
+  `per_row: usize` argument. Implementors pass it through to
+  `forward_conditioned_groups`, which is an identity at `1`.
+
+**With one spec nothing about the corpus moved**: the band token still
+sits in the row after `BOS`, so a single-slot run trains on the same
+rows, the same lengths and the same token counts as before. With two
+or more, **no condition token enters the row at all** — the rows are
+`BOS` then moves, and the conditions reach the model only as forward
+arguments. There is no prefix arm for a multi-slot corpus to stay
+row-shape-comparable with (a prefix cannot carry two slots without
+inventing an order for them), and keeping the tokens out is what keeps
+the multi-slot corpus out of the prefix-length arithmetic every
+windowed reader does.
+
+Migrating a single-slot caller is mechanical: `condition: Some(spec)`
+becomes `conditions: vec![spec]`, `row.band` becomes
+`row.bands.first()`, and `row_conditions(&rows, &table)` becomes
+`row_conditions(&rows, std::slice::from_ref(&table))`.
+
+### Changed — **BREAKING**: `chess::corpus::ConditionBand` says how it matches, not only which ratings
+
+`ConditionBand`'s `min` / `max` fields are replaced by a
+`matcher: ConditionMatcher`, which is either `IntRange { min, max }`
+(the rating band it always was, read against `ConditionSpec::key`) or
+`TagPrefix { key, prefix }` (a tag's leading characters — an ECO code's
+letter names the opening family). Construct through
+`ConditionBand::rating(min, max, token)` and
+`ConditionBand::tag_prefix(key, prefix, token)`.
+
+**Sidecar compatibility is deliberately split.** A rating band still
+**writes** the legacy `{"min", "max", "token"}` object, so every
+checkpoint written before this change keeps parsing and every
+rating-conditioned checkpoint written after it stays readable by an
+older build. A `TagPrefix` band has no legacy form and writes
+`{"matcher", "token"}`, which an older build refuses with a parse
+error — loudly, rather than by scoring a checkpoint whose condition
+axis it cannot represent. A hand-edited object carrying both forms is
+refused rather than resolved.
+
+`ConditionBand::narrow(filter)` is the walk-side reading of a band
+(both players inside the range for `IntRange`, the named tag for
+`TagPrefix`), moved out of the readers so that a band kind added once
+is added to every walk.
+
+### Changed — **BREAKING**: `algocline_nn::train::Batch` gained `conds` and `conds_per_row`
+
+`Batch` carries an optional conditioning index list, so a training
+loop can tell the model which condition each row was written under,
+plus the count that says how many of those indices belong to each row.
 The struct has no `#[non_exhaustive]`, so any code that builds a
 `Batch` with a struct literal — a hand-written `Dataset`, most likely —
-stops compiling until the field is named. Field reads are unaffected;
-an exhaustive struct pattern (`let Batch { input_ids, loss_mask,
-is_last, allowed_ids } = batch;`) needs the new field or a `..`.
+stops compiling until both fields are named. Field reads are
+unaffected; an exhaustive struct pattern (`let Batch { input_ids,
+loss_mask, is_last, allowed_ids } = batch;`) needs the new fields or a
+`..`.
 
 Two error enums grew arms in the same change and neither is
 `#[non_exhaustive]`, so a downstream exhaustive `match` breaks the
@@ -756,20 +935,33 @@ Ok(Some(Batch {
     is_last,
     allowed_ids: None,
     conds: None,          // unconditioned; behaviour unchanged
+    conds_per_row: 1,     // conditions per row; 1 wherever conds is None
 }))
 ```
 
 Migrate steps:
 
-1. Add `conds: None` to every `Batch` literal. That is the whole
-   migration for a dataset that does not condition — `None` is what
-   every existing dataset produces and what `run_full_ft` expects.
+1. Add `conds: None` and `conds_per_row: 1` to every `Batch` literal.
+   That is the whole migration for a dataset that does not condition —
+   `None` is what every existing dataset produces and what
+   `run_full_ft` expects, and `1` is what every single-condition
+   dataset means.
 2. To condition, attach one `CondIndex` per row via
    `TeacherCardDataset::with_conditions` (or
    `chess::corpus::LegalMaskedDataset::with_conditions`) and drive the
    run with `run_conditioned_ft`. A `CondIndex` comes only from
    `ModelShape::band_index`; a token id is not one, because table rows
    and vocabulary ids are both `u32` and their ranges overlap.
+3. To condition on several attributes at once, use
+   `with_condition_groups(conds, per_row)` instead: the list is
+   row-major, `per_row` entries per row, and `per_row` is explicit
+   rather than inferred from the length — a count that happens to
+   divide evenly is exactly the mistake an inference would wave
+   through.
+
+`ConditionCountMismatch` reports `per_row` alongside the counts for
+the same reason, so a mismatch says which of the two the caller and
+the dataset disagreed about.
 
 `run_full_ft` and `run_lora_ft` keep their signatures and their
 bounds. Both pairings the entry points cannot serve are errors rather

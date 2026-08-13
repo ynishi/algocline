@@ -383,9 +383,34 @@ fn parse_band_groups(spec: &str) -> Result<Vec<Vec<ConditionBand>>, String> {
 
 fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     let mut out = Vec::new();
-    let (mut any_eco, mut any_rating) = (false, false);
+    let (mut any_tag, mut any_rating) = (false, false);
     for part in spec.split(',') {
         let part = part.trim();
+        // A tag other than ECO, spelled out: `tag:Event=Rated Blitz`.
+        // The ECO shorthand keeps its own arm below because an ECO
+        // code has a shape worth checking; nothing general can be
+        // said about an arbitrary tag's values, so what stands
+        // between a typo and a wasted bake here is the zero-row
+        // refusal downstream — which is why that refusal stops the
+        // run rather than warning.
+        if let Some(rest) = part.strip_prefix("tag:") {
+            let (key, prefix) = rest.split_once('=').ok_or_else(|| {
+                format!("band {part:?} is not tag:<Key>=<prefix> (the '=' is missing)")
+            })?;
+            let (key, prefix) = (key.trim(), prefix.trim());
+            if key.is_empty() || prefix.is_empty() {
+                return Err(format!(
+                    "band {part:?} needs a tag name and a prefix on either side of the '='"
+                ));
+            }
+            any_tag = true;
+            out.push(ConditionBand::tag_prefix(
+                key,
+                prefix,
+                format!("<{key}:{prefix}>"),
+            ));
+            continue;
+        }
         if let Some(prefix) = part.strip_prefix("eco:") {
             // What can match an ECO code, not merely what looks tidy:
             // a capital A-E, then up to two digits. `eco:c` and
@@ -402,7 +427,7 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
                      digits)"
                 ));
             }
-            any_eco = true;
+            any_tag = true;
             out.push(ConditionBand::tag_prefix(
                 "ECO",
                 prefix,
@@ -434,17 +459,23 @@ fn parse_bands(spec: &str) -> Result<Vec<ConditionBand>, String> {
     if out.is_empty() {
         return Err("no bands given".into());
     }
-    if any_eco && any_rating {
+    if any_tag && any_rating {
         // The two derivations disagree about what the complement of a
-        // band is. `band_for` tests in order, so an ECO game inside the
-        // rating range is claimed by whichever band comes first and the
-        // rating band's rows mean "in the range and not that family" —
+        // band is. `band_for` tests in order, so a tagged game inside
+        // the rating range is claimed by whichever band comes first and
+        // the rating band's rows mean "in the range and not that tag" —
         // while `narrow`, walking that band later, re-admits the
-        // family's games. One corpus, two readings of the same token.
+        // tag's games. One corpus, two readings of the same token.
+        //
+        // This is a per-slot rule. A multi-slot spec puts each axis in
+        // its own slot, where the derivation is one-per-group and the
+        // disagreement cannot arise; what is refused here is the two
+        // kinds sharing one slot.
         return Err(
-            "bands mix ECO families and rating ranges; the corpus derivation (first match wins) \
-             and the walk-side filter would disagree about what each band's games are. Condition \
-             on one axis and narrow the population on the other (CHESS_FILTER_ELO)"
+            "a slot mixes tag prefixes and rating ranges; the corpus derivation (first match \
+             wins) and the walk-side filter would disagree about what each band's games are. \
+             Put each axis in its own slot (';'), or narrow the population on one of them \
+             (CHESS_FILTER_ELO / CHESS_FILTER_ECO / CHESS_FILTER_TAG)"
                 .into(),
         );
     }
@@ -959,6 +990,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[bake] population narrowed to ECO families {prefixes:?}");
         filter = filter.with_eco_prefixes(prefixes);
     }
+    // `CHESS_FILTER_TAG=Event:Rated Blitz,Rated Bullet` is the same
+    // statement for a tag that has no shorthand. The separator between
+    // the key and the prefixes is a colon and the prefixes are split on
+    // commas, so a prefix containing a comma cannot be written — the
+    // values this exists for (`"Rated Blitz game"`,
+    // `"Rated Blitz tournament"`, both taken by the prefix
+    // `"Rated Blitz"`) do not contain one, and refusing is better than
+    // an escape syntax nobody will remember.
+    if let Ok(spec) = env::var("CHESS_FILTER_TAG") {
+        let (key, rest) = spec.split_once(':').ok_or_else(|| {
+            format!("CHESS_FILTER_TAG {spec:?} is not <Key>:<prefix>[,<prefix>...]")
+        })?;
+        let key = key.trim();
+        let prefixes: Vec<String> = rest
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if key.is_empty() || prefixes.is_empty() {
+            return Err(format!("CHESS_FILTER_TAG {spec:?} names no tag or no prefix").into());
+        }
+        eprintln!("[bake] population narrowed to {key} starting with {prefixes:?}");
+        filter = filter.with_tag_prefixes(key, prefixes);
+    }
     let opts = CorpusOptions {
         filter,
         max_rows,
@@ -1211,13 +1266,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ckpt_keep: steps.checked_div(eval_every).map_or(1, |n| n + 2),
     };
 
+    // The label goes into a file name, so it keeps only what a shell
+    // can pass around unquoted. A tag prefix may carry spaces
+    // (`Event` reads `"Rated Blitz"`), and a checkpoint whose name has
+    // one is a scp away from being two arguments -- which is the kind
+    // of break that shows up as a missing file at the end of a bake
+    // rather than as an error at the start of one. Anything outside
+    // `[a-z0-9-]` becomes a hyphen, and runs of hyphens collapse so
+    // the result stays readable.
     let band_label = bands
         .iter()
         .map(describe_matcher)
         .collect::<Vec<_>>()
-        .join("_")
-        .replace(':', "");
+        .join("_");
     let prefix = format!("chess-{band_label}-{side:?}").to_lowercase();
+    let mut prefix: String = prefix
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while prefix.contains("--") {
+        prefix = prefix.replace("--", "-");
+    }
 
     // The shape rides with every checkpoint, written the moment the
     // checkpoint itself lands. The weights alone do not say how many

@@ -243,6 +243,32 @@ impl GameFilter {
         self
     }
 
+    /// Keep only games whose `key` tag starts with one of these
+    /// prefixes.
+    ///
+    /// [`Self::with_eco_prefixes`] one axis out. The ECO pair stays
+    /// because opening families are what most of this module's callers
+    /// ask for and `"ECO"` spelled at every call site is a typo
+    /// waiting to happen; this is the same rule for the tags that have
+    /// no such shorthand.
+    ///
+    /// The case it was added for is Lichess's `Event`, whose values
+    /// read `"Rated Blitz game"` and `"Rated Blitz tournament"` — one
+    /// prefix (`"Rated Blitz"`) collects both, which is the property
+    /// that makes a speed band statable as a population rather than
+    /// only as a condition.
+    pub fn with_tag_prefixes<S: Into<String>>(
+        mut self,
+        key: impl Into<String>,
+        prefixes: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.tags.push(TagPredicate::new(
+            key,
+            TagRule::StartsWithAny(prefixes.into_iter().map(Into::into).collect()),
+        ));
+        self
+    }
+
     /// Set the accepted ply range.
     pub fn with_ply_bounds(mut self, min: usize, max: Option<usize>) -> Self {
         self.min_plies = min;

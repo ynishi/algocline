@@ -99,6 +99,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would let a draw omit a stratum entirely, and clusters from different
   populations are not exchangeable.
 
+- `chess::filter::GameFilter::with_tag_prefixes(key, prefixes)` — the
+  ECO pair one axis out, for the tags that have no shorthand. The case
+  it was added for is Lichess's `Event`, whose values read
+  `"Rated Blitz game"` and `"Rated Blitz tournament"`: one prefix
+  collects both, which is what makes a speed band statable as a
+  population rather than only as a condition. `chess_bake` takes
+  `CHESS_FILTER_TAG=Event:Rated Blitz,Rated Rapid` and a band spec
+  gains `tag:<Key>=<prefix>` beside the `eco:` shorthand — the
+  shorthand stays because an ECO code has a shape worth checking,
+  while nothing general can be said about an arbitrary tag's values.
+  A prefix containing a comma cannot be written and is refused rather
+  than escaped.
+
+  The checkpoint name that a band list produces now folds anything
+  outside `[a-z0-9-_]` to a hyphen, because a tag prefix may carry
+  spaces and a checkpoint whose name has one is an `scp` away from
+  being two arguments — a break that surfaces as a missing file after
+  a bake rather than as an error before one. This renames what a
+  *future* run writes for ECO bands (`ecob` becomes `eco-b`); files
+  already on disk are untouched.
+
 - `chess::filter::TagRule::StartsWith` / `StartsWithAny` with
   `GameFilter::with_eco_prefix` / `with_eco_prefixes` — a filter can
   now state "the games of these opening families" as a population. Its

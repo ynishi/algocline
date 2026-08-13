@@ -60,7 +60,9 @@
 //! - [`remove`] — `pkg_remove` (project / global / all scope dispatch).
 
 mod doctor;
-mod install;
+// `install` is crate-visible so `service::pack::restore` can name
+// `InstallSource` when re-fetching declared packages during unpack.
+pub(crate) mod install;
 mod list;
 pub(crate) mod read;
 mod remove;

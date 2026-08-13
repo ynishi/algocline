@@ -8903,3 +8903,259 @@ async fn test_alc_llm_card_context_injects_past_cards_into_system_prompt() {
 
     client.cancel().await.expect("cancel failed");
 }
+
+// ─── alc_pack / alc_unpack ───────────────────────────────────────
+
+/// Seed the harness app dir with one package of each pack classification.
+///
+/// Returns the directory the symlink points at, so a test can delete it and
+/// reproduce the cross-machine case where a link target does not exist.
+fn seed_pack_fixture(home: &std::path::Path) -> std::path::PathBuf {
+    let write = |path: std::path::PathBuf, body: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    };
+
+    // Unregistered on disk: must travel as bytes.
+    write(
+        home.join("packages/e2e_pack_local/init.lua"),
+        "local M = {}\nM.meta = { name = \"e2e_pack_local\", version = \"0.1.0\" }\nreturn M\n",
+    );
+    write(home.join("cards/e2e_card.toml"), "x = 1\n");
+    write(home.join("logs/e2e.log"), "noise\n");
+
+    // A linked package whose target lives outside the app dir.
+    let outside = home.join("outside_checkout/e2e_pack_linked");
+    write(
+        outside.join("init.lua"),
+        "local M = {}\nM.meta = { name = \"e2e_pack_linked\", version = \"0.1.0\" }\nreturn M\n",
+    );
+    std::os::unix::fs::symlink(&outside, home.join("packages/e2e_pack_linked"))
+        .expect("symlink failed");
+
+    outside
+}
+
+#[tokio::test]
+async fn test_alc_pack_then_unpack_dry_run_roundtrip() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let home = harness.home_path().to_path_buf();
+    seed_pack_fixture(&home);
+
+    let out_dir = home.join("snapshot.alcpack");
+    let packed = call_json(
+        client,
+        "alc_pack",
+        json!({ "out_dir": out_dir.to_string_lossy() }),
+    )
+    .await;
+
+    assert_eq!(packed["packages"]["payload"], 1, "packed: {packed}");
+    assert_eq!(packed["packages"]["linked"], 1, "packed: {packed}");
+    assert_eq!(packed["links"]["live"], 1, "packed: {packed}");
+    let sections: Vec<&str> = packed["sections"]
+        .as_array()
+        .expect("sections array")
+        .iter()
+        .map(|s| s.as_str().expect("section string"))
+        .collect();
+    assert!(sections.contains(&"core"));
+    assert!(sections.contains(&"cards"));
+    assert!(
+        !sections.contains(&"logs"),
+        "logs must not travel by default: {packed}"
+    );
+
+    assert!(out_dir.join("profile.toml").exists());
+    assert!(out_dir
+        .join("payload/packages/e2e_pack_local/init.lua")
+        .exists());
+    assert!(!out_dir.join("payload/logs").exists());
+
+    // Reading it back reports what a real run would do, and writes nothing.
+    let planned = call_json(
+        client,
+        "alc_unpack",
+        json!({ "pack_dir": out_dir.to_string_lossy(), "mode": "dry-run" }),
+    )
+    .await;
+
+    assert_eq!(planned["dry_run"], true, "planned: {planned}");
+    assert_eq!(planned["status"], "ok", "planned: {planned}");
+    assert_eq!(
+        planned["unresolved"].as_array().expect("unresolved").len(),
+        0,
+        "the link target still exists here: {planned}"
+    );
+}
+
+#[tokio::test]
+async fn test_alc_unpack_reports_missing_link_target_as_partial() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let home = harness.home_path().to_path_buf();
+    let outside = seed_pack_fixture(&home);
+
+    let out_dir = home.join("moved.alcpack");
+    call_json(
+        client,
+        "alc_pack",
+        json!({ "out_dir": out_dir.to_string_lossy() }),
+    )
+    .await;
+
+    // Stand in for the destination machine: the checkout the link points at
+    // is simply not here.
+    std::fs::remove_dir_all(&outside).expect("remove checkout");
+    std::fs::remove_file(home.join("packages/e2e_pack_linked")).expect("remove link");
+
+    let restored = call_json(
+        client,
+        "alc_unpack",
+        json!({ "pack_dir": out_dir.to_string_lossy(), "mode": "dry-run" }),
+    )
+    .await;
+
+    assert_eq!(
+        restored["status"], "partial",
+        "an unresolvable link degrades status rather than erroring: {restored}"
+    );
+    let unresolved = restored["unresolved"].as_array().expect("unresolved");
+    assert_eq!(unresolved.len(), 1, "restored: {restored}");
+    assert_eq!(unresolved[0]["kind"], "link_target_missing");
+    assert_eq!(unresolved[0]["name"], "e2e_pack_linked");
+    assert!(
+        unresolved[0]["target"]
+            .as_str()
+            .expect("target")
+            .contains("e2e_pack_linked"),
+        "the report names the path to clone: {restored}"
+    );
+}
+
+#[tokio::test]
+async fn test_alc_pack_rejects_existing_destination() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let out_dir = harness.home_path().join("taken.alcpack");
+    std::fs::create_dir_all(&out_dir).expect("mkdir");
+
+    let result = client
+        .call_tool(call_params(
+            "alc_pack",
+            json!({ "out_dir": out_dir.to_string_lossy() }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("already exists"),
+        "expected a refusal to overwrite, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_alc_unpack_rejects_unknown_mode() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+
+    let result = client
+        .call_tool(call_params(
+            "alc_unpack",
+            json!({ "pack_dir": "/tmp/whatever.alcpack", "mode": "force" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("unknown mode") && text.contains("force"),
+        "expected a typed mode error, got: {text}"
+    );
+    assert!(
+        text.contains("dry-run"),
+        "error should list the accepted modes, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_alc_unpack_rejects_missing_pack_dir() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let missing = harness.home_path().join("never-written.alcpack");
+
+    let result = client
+        .call_tool(call_params(
+            "alc_unpack",
+            json!({ "pack_dir": missing.to_string_lossy() }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("profile.toml"),
+        "error should name the file it could not read, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_alc_pack_rejects_non_array_include() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let out_dir = harness.home_path().join("bad-shape.alcpack");
+
+    // `include` is a list of section names; a bare string must not be
+    // silently coerced into a one-element list.
+    let result = client
+        .call_tool(call_params(
+            "alc_pack",
+            json!({ "out_dir": out_dir.to_string_lossy(), "include": "cards" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("invalid type") || text.contains("expected"),
+        "expected a schema rejection, got: {text}"
+    );
+    assert!(
+        !out_dir.exists(),
+        "a rejected call must not leave a partial pack behind"
+    );
+}
+
+#[tokio::test]
+async fn test_alc_pack_include_takes_sections_all_withholds() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let home = harness.home_path().to_path_buf();
+    seed_pack_fixture(&home);
+
+    let out_dir = home.join("everything.alcpack");
+    let packed = call_json(
+        client,
+        "alc_pack",
+        json!({
+            "out_dir": out_dir.to_string_lossy(),
+            "all": true,
+            "include": ["logs"],
+        }),
+    )
+    .await;
+
+    let sections: Vec<&str> = packed["sections"]
+        .as_array()
+        .expect("sections array")
+        .iter()
+        .map(|s| s.as_str().expect("section string"))
+        .collect();
+    assert!(
+        sections.contains(&"logs"),
+        "`all` + `include` compose as a union: {packed}"
+    );
+    assert!(out_dir.join("payload/logs/e2e.log").exists());
+}

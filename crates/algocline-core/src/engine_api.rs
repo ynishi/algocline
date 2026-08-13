@@ -190,6 +190,40 @@ pub trait EngineApi: Send + Sync {
         force: Option<bool>,
     ) -> Result<String, String>;
 
+    /// Write a portable snapshot of the application directory to `out_dir`,
+    /// for moving the setup to another machine.
+    ///
+    /// Sections default to `core` + `cards` + `evals`. `all` adds `nn` and
+    /// `state`; `logs` / `hub_cache` / `types` require an explicit `include`.
+    /// `exclude` is applied last. The two `packages_*` arguments select
+    /// entries inside `packages/` and are a separate axis from sections.
+    ///
+    /// Arguments are primitives rather than an options struct because this
+    /// trait lives below the service crate that owns the typed form.
+    #[allow(clippy::too_many_arguments)]
+    async fn pack(
+        &self,
+        out_dir: String,
+        all: Option<bool>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        packages_only: Option<Vec<String>>,
+        packages_exclude: Option<Vec<String>>,
+    ) -> Result<String, String>;
+
+    /// Restore a pack directory into the application directory.
+    ///
+    /// `mode` is `"merge"` (default), `"overwrite"`, or `"dry-run"`; an
+    /// unrecognised value is an error rather than a silent fallback.
+    /// Unresolvable link targets are reported on the response, not raised.
+    async fn unpack(
+        &self,
+        pack_dir: String,
+        mode: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> Result<String, String>;
+
     /// Remove a symlinked package from `~/.algocline/packages/`.
     ///
     /// Only removes symlinks; for installed (copied) packages, use `pkg_remove`.

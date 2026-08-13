@@ -1144,6 +1144,26 @@ mod tests {
                 ) -> Result<String, String> {
                     Err($err.into())
                 }
+                async fn pack(
+                    &self,
+                    _out_dir: String,
+                    _all: Option<bool>,
+                    _include: Option<Vec<String>>,
+                    _exclude: Option<Vec<String>>,
+                    _packages_only: Option<Vec<String>>,
+                    _packages_exclude: Option<Vec<String>>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
+                async fn unpack(
+                    &self,
+                    _pack_dir: String,
+                    _mode: Option<String>,
+                    _include: Option<Vec<String>>,
+                    _exclude: Option<Vec<String>>,
+                ) -> Result<String, String> {
+                    Err($err.into())
+                }
                 async fn pkg_unlink(&self, _name: String) -> Result<String, String> {
                     Err($err.into())
                 }
@@ -1892,6 +1912,26 @@ mod tests {
         ) -> Result<String, String> {
             Err("noop".into())
         }
+        async fn pack(
+            &self,
+            _: String,
+            _: Option<bool>,
+            _: Option<Vec<String>>,
+            _: Option<Vec<String>>,
+            _: Option<Vec<String>>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
+        async fn unpack(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: Option<Vec<String>>,
+            _: Option<Vec<String>>,
+        ) -> Result<String, String> {
+            Err("noop".into())
+        }
         async fn pkg_unlink(&self, _: String) -> Result<String, String> {
             Err("noop".into())
         }
@@ -2231,6 +2271,26 @@ mod tests {
                 _: String,
                 _: Option<String>,
                 _: Option<bool>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn pack(
+                &self,
+                _: String,
+                _: Option<bool>,
+                _: Option<Vec<String>>,
+                _: Option<Vec<String>>,
+                _: Option<Vec<String>>,
+                _: Option<Vec<String>>,
+            ) -> Result<String, String> {
+                Err("noop".into())
+            }
+            async fn unpack(
+                &self,
+                _: String,
+                _: Option<String>,
+                _: Option<Vec<String>>,
+                _: Option<Vec<String>>,
             ) -> Result<String, String> {
                 Err("noop".into())
             }

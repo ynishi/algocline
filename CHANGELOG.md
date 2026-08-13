@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc_pack` / `alc_unpack`** — moving a `~/.algocline` setup to
+  another machine. A pack is a directory (`profile.toml` +
+  `payload/`), not an archive: compression is the caller's `tar czf`,
+  so the crate takes no archive-format dependency and the result stays
+  inspectable.
+
+  What travels depends on whether it can be reproduced. Packages
+  installed from Git or a bundled collection are recorded as
+  declarations and re-fetched by `alc_unpack`; packages with a
+  local-path origin — and every directory on disk that
+  `installed.json` does not know about — travel as bytes; symlinked
+  packages travel as link definitions. That last split is the reason
+  the pack walks the filesystem rather than reading the manifest:
+  `pkg_link` records nothing in `installed.json`, so a manifest-driven
+  snapshot silently drops every linked and every unregistered package.
+
+  Sections are named after `AppDir` accessors and selected in three
+  tiers: the default is `core` + `cards` + `evals`; `all: true` adds
+  `nn` and `state`; `logs` / `hub_cache` / `types` are reachable only
+  through an explicit `include`. `all` and `include` compose as a
+  union (`all: true, include: ["logs"]` takes everything), `exclude`
+  is applied last, and `core` cannot be excluded. Package-level
+  selection (`packages_only` / `packages_exclude`) is a separate axis
+  with separate names.
+
+  `alc_unpack` runs re-fetch → expand → re-link, with
+  `mode` ∈ `merge` (default, local wins) / `overwrite` / `dry-run`.
+  `installed.json` is grafted entry by entry even under `overwrite`,
+  so packages that exist only on the destination keep their version
+  tracking instead of becoming `unregistered_pkg`. Link targets are
+  absolute paths from the source machine and routinely do not exist on
+  the destination; that is reported as
+  `unresolved[{kind: "link_target_missing", target}]` with
+  `status: "partial"` rather than raised as an error, and `dry-run`
+  probes every link without writing, which is the cheapest way to see
+  what a move would leave dangling.
+
 - `examples/gameai/gen_guardian_player_styles.lua` — deterministic
   generator for player-style training corpora, driving the duel loop
   directly (scripted boss policies, no Cards, no nn, no RNG). Ships

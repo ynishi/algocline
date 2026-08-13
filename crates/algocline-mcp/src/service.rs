@@ -174,6 +174,50 @@ pub struct McpQueryResponse {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PackParams {
+    /// Destination directory for the pack. Must not already exist.
+    pub out_dir: String,
+    /// Take every section except `logs` / `hub_cache` / `types`
+    /// (default `false`, which takes `core` + `cards` + `evals`).
+    #[serde(default)]
+    pub all: Option<bool>,
+    /// Sections to add on top of the default / `all` set. Union, not
+    /// replacement — `all: true, include: ["logs"]` takes everything.
+    /// Values: `cards`, `evals`, `nn`, `state`, `logs`, `hub_cache`, `types`.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Sections to drop. Applied last, so it wins over both the default set
+    /// and `all`. `core` cannot be excluded.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+    /// When non-empty, only these package names are packed (any class).
+    #[serde(default)]
+    pub packages_only: Option<Vec<String>>,
+    /// Package names to leave out entirely.
+    #[serde(default)]
+    pub packages_exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnpackParams {
+    /// Pack directory produced by `alc_pack`.
+    pub pack_dir: String,
+    /// `merge` (default): keep whatever is already here.
+    /// `overwrite`: the pack wins (`installed.json` is still merged per entry).
+    /// `dry-run`: write nothing, but still report what would land and which
+    /// link targets are missing.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Expand only these sections, out of those the pack carries. `core` is
+    /// always expanded.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    /// Sections to leave in the pack.
+    #[serde(default)]
+    pub exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PkgInstallParams {
     /// Git URL or local path of a package collection.
     /// (e.g. "github.com/user/my-pkg", "file:///path/to/local/pkg").
@@ -1366,6 +1410,67 @@ impl AlcService {
                 params.fields,
                 params.verbose,
             )
+            .await
+    }
+
+    /// Write a portable snapshot of `~/.algocline` to `out_dir`, for moving
+    /// the setup to another machine.
+    ///
+    /// The pack is a directory, not an archive — compress it yourself
+    /// (`tar czf pack.tgz <out_dir>`) if you need a single file.
+    ///
+    /// What travels depends on how each package can be reproduced:
+    ///
+    /// - packages installed from Git / a bundled collection are recorded as
+    ///   declarations and re-fetched by `alc_unpack`
+    /// - packages with a local-path origin, and any directory on disk that
+    ///   `installed.json` does not know about, travel as bytes
+    /// - symlinked packages travel as link definitions; whether the target
+    ///   exists on the destination is decided at unpack time
+    ///
+    /// Sections default to `core` + `cards` + `evals`. `all: true` adds `nn`
+    /// and `state`; `logs` / `hub_cache` / `types` are reachable only through
+    /// an explicit `include`.
+    ///
+    /// Returns per-class package counts, link liveness, byte totals, and
+    /// everything skipped. Fails if `out_dir` already exists.
+    #[tool(
+        name = "alc_pack",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn pack(&self, Parameters(params): Parameters<PackParams>) -> Result<String, String> {
+        self.app
+            .pack(
+                params.out_dir,
+                params.all,
+                params.include,
+                params.exclude,
+                params.packages_only,
+                params.packages_exclude,
+            )
+            .await
+    }
+
+    /// Restore a pack written by `alc_pack` into this machine's
+    /// `~/.algocline`.
+    ///
+    /// Runs three phases: re-fetch the declared packages, expand the payload,
+    /// then re-create the symlinks.
+    ///
+    /// Link targets are absolute paths from the source machine, so they
+    /// routinely do not exist here. That is reported under `unresolved`
+    /// (`kind: "link_target_missing"`) with the path to clone — it is not a
+    /// failure, and `status` becomes `"partial"` rather than an error.
+    ///
+    /// `mode="dry-run"` writes nothing while still probing every link, which
+    /// is the cheapest way to see what a real run would leave unresolved.
+    #[tool(
+        name = "alc_unpack",
+        annotations(destructive_hint = true, open_world_hint = true)
+    )]
+    async fn unpack(&self, Parameters(params): Parameters<UnpackParams>) -> Result<String, String> {
+        self.app
+            .unpack(params.pack_dir, params.mode, params.include, params.exclude)
             .await
     }
 

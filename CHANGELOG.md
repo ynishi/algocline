@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.48.0] - 2026-08-13
+
+### Added
+
 - **`alc_pack` / `alc_unpack`** — moving a `~/.algocline` setup to
   another machine. A pack is a directory (`profile.toml` +
   `payload/`), not an archive: compression is the caller's `tar czf`,

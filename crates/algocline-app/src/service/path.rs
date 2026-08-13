@@ -7,7 +7,13 @@ pub(crate) fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        // Use metadata() (follows symlinks) instead of file_type() (does not)
+        // `DirEntry::metadata` does NOT traverse symlinks (it is `lstat`), so
+        // a linked subdirectory is reported as a file here and copied through
+        // the `std::fs::copy` branch below, which does follow the link and
+        // therefore writes the target's bytes. A dangling link fails the copy
+        // and aborts the walk — acceptable for the callers of this helper,
+        // which copy freshly staged trees. The pack/unpack paths need
+        // per-entry tolerance instead and use `service::pack::fs::copy_tree`.
         let meta = entry.metadata()?;
         let dest_path = dst.join(entry.file_name());
         if meta.is_dir() {

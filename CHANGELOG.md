@@ -140,341 +140,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run's conditioning table stays at its initialisation, and refuses a
   base that carries a table of its own.
 
-- `examples/gameai/gen_guardian_player_styles.lua` — deterministic
-  generator for player-style training corpora, driving the duel loop
-  directly (scripted boss policies, no Cards, no nn, no RNG). Ships
-  two new styles as data files: `data/guardian_bruiser_playlog_train
-  .json` (intent-blind aggressor — one rule, heavy into the spiked
-  mode-1 window) and `data/guardian_shield_playlog_train.json`
-  (intent-reactive defender — block what is announced, never press).
-  The script also carries a sentinel-reproduction mode that regrows
-  the shipped sample playlog and verifies it entry for entry against
-  the committed file — a standing sensor for drift in the rules, the
-  canonical Cards or the generation path — and returns its rule maps
-  as data so an attribution analysis can assert its own slot
-  classifier against the corpus (compliance must be exactly 1.0 on
-  rule slots).
-
-- `examples/gameai/fight_boss_sweep.lua` — temperature-grid driver over
-  `fight_matrix`. Takes the fight driver's ctx with `ctx.temperatures`
-  (a non-empty array of positive finite grid points, kept in caller
-  order) in place of a single temperature, runs one fight matrix per
-  grid point under one shared seed, asserts that the boss / player
-  axes and every non-temperature run parameter stayed fixed across
-  the grid (the single-variable-sweep invariant), and writes one JSON
-  (`sweep = [{temperature, matrix}, ...]` + aggregated `meta`). A
-  leftover singular `ctx.temperature` is refused loudly rather than
-  silently outvoted by the grid. Nothing is written when any grid
-  point fails. 47 spec tests.
-
-- `examples/gameai/gameai_metrics/fight_matrix.lua` — Card-vs-Card
-  fight matrix runner: every boss Card of a harvest collection (or an
-  explicit alias list) against every player Card of a pool.
-  `fm.new{collection_path | bosses, players, n_games, seed, style,
-  temperature}` builds the runner; `fight:run()` plays one `level`
-  call per boss row (`seat = "boss"`, the player pool as
-  `opts.opponents`) and reports one cell per pairing — boss-seat
-  `win_rate` with a Wilson CI, `game_length_mean` and
-  `final_hp_margin_mean`. A temperature is mandatory (default `1.0`):
-  the duel engine carries no RNG and its openings do not vary, so the
-  decode draw is the only source of variance a Card-vs-Card fight
-  has, and greedy has no spelling on this runner.
-  `fight:save(path)` writes the report as JSON through the shared
-  auto-mkdir helper. 33 spec tests.
-
-- `examples/gameai/fight_boss_collection.lua` — thin `alc_run` driver
-  around `fight_matrix`. Takes `ctx.collection_path` + `ctx.players`
-  + `ctx.output` (required) and the standard opt fields as
-  passthroughs; logs a one-line header plus one line per cell
-  (`win_rate` / CI / game length / hp margin) after `:save()`.
-
-- `examples/gameai/gameai_metrics/audit_matrix.lua` — post-hoc auditor
-  for a boss harvest manifest. `am.new{collection_path | aliases,
-  n_games, prompt_set_size, seed, style, teacher_alias}` builds an
-  auditor; `audit:run()` restores each Card from its recorded
-  `card_id`, re-measures the per-Card baseline (`level` with a Wilson
-  CI at higher game counts than the harvest hook could afford,
-  `trickiness` on the boss seat, `style_distance` vs the teacher),
-  and fills a symmetric pair-wise `style_distance` matrix between the
-  Cards themselves — the numeric input to the question a
-  teacher-only distance cannot answer, whether a strong Card is a
-  distinct policy or the mid Card carried further along the same
-  teacher-collapse arc. `audit:save(path)` writes the report as JSON
-  through the shared auto-mkdir helper. 26 spec tests.
-
-- `examples/gameai/audit_boss_collection.lua` — thin `alc_run` driver
-  around `audit_matrix`. Takes `ctx.collection_path` +
-  `ctx.output` (required) and the standard opt fields as passthroughs;
-  logs a one-line header, one line per Card, and one line per
-  Card-pair after `:save()`. 17 spec tests drive the required-field
-  loud errors, the default fallbacks, the runner wiring, and the
-  summary emission.
-
-- `examples/gameai/gameai_metrics/_fs.lua` — shared filesystem helper
-  with `shell_squote` (POSIX single-quote wrap that neutralises `$` /
-  `` ` `` / `!` / `"` / whitespace — Lua's `string.format("%q", …)`
-  produces Lua source escapes, not shell escapes) and
-  `ensure_parent_dir(path)`, an `os.execute("mkdir -p …")` wrapper
-  with a loud return-code check so a mid-run manifest write no longer
-  crashes the trainer when the caller has not created the target
-  directory first (the accident class the prior iter's boss-harvest
-  smoke hit). `harvest_collection:save()` now calls it before
-  `io.open`; the auditor `save` calls it too. 15 helper spec tests +
-  2 new manifest-writer tests covering fresh-directory creation.
-
-- `alc.nn.card.save_from_ckpt(path, name, meta) -> card_id` — additive
-  sibling of `alc.nn.card.save`. Copies a raw safetensors file (a
-  mid-run `alc.nn.trainer.run_full_ft` checkpoint, in practice) into
-  the Card store's canonical layout and mints a Card without paying
-  the vars round-trip. Same meta schema, same on-disk layout, so
-  downstream `alc.nn.card.load` / `load_handle` consume the result
-  unchanged. Named-variant only (`gpt2-tiny` etc.); `gpt2-custom`
-  needs `build_nn_meta` to populate the custom branch and is deferred.
-  4 Rust unit tests + 2 Lua bridge round-trip tests.
-
-- `examples/gameai/anymetric` — `judgment.band{view_id, field, lo, hi,
-  label?}` and `judgment.staged{view_id, field, bands}`. Four arms
-  (missing / errored / non-numeric → `continue`, inside a band →
-  `harvest` with `Decision.meta = {label, step, values}`, above
-  topmost `hi` → `break`, below the lowest `lo` → `continue`). Bands
-  are strictly disjoint (`bands[i].hi < bands[i+1].lo`); a shared
-  boundary is rejected because the hit label would be
-  non-deterministic. `Decision` gains an optional `meta` field that
-  the adapter merges into the harvest marker; built-in `harvest` /
-  `reason` fields always win over conflicting meta keys. Stateless —
-  first-writer-wins is caller-side. Existing `threshold` /
-  `never_break` remain byte-invariant (no `meta`). 32 new spec tests.
-
-- `examples/gameai/gameai_metrics/harvest_collection.lua` — Lua-side
-  utility that consumes anymetric harvest markers and writes a JSON
-  manifest (`schema_version = 1`) of `(label, step, ckpt_path,
-  card_id, alias, level_win_rate, level_ci_lower, sd_teacher,
-  trickiness_norm)` tuples. Configurable policy
-  (`first_writer_wins` default / `last_writer_wins`), partial
-  collections allowed (a run that only hits some bands still saves).
-  23 spec tests covering the write-through / merge / policy /
-  round-trip surface.
-
-- `examples/gameai/train_guardian_npc.lua` — `enable_stages = true`
-  arms the staged-harvest path: every checkpoint whose `level.ci_lower`
-  lands in a band is baked immediately via `save_from_ckpt`, pinned
-  to `<stage_alias_prefix>_<label>` (`guardian_duel_npc_weak/mid/
-  strong` by default), and appended to the collection manifest.
-  First-writer-wins per label. `enable_stages` composes with
-  `enable_gate`: staged-side `break` (top-band overshoot) wins over
-  a same-fire gate break; harvest side-effects still run when the
-  gate breaks on the same fire (so the mid-band Card lands even when
-  the gate stops the run on the same checkpoint). `ckpt_keep >= 2` is
-  asserted up front. `enable_stages = false` (the default) is
-  byte-invariant with the prior behaviour. 11 new spec tests.
-
-- `alc.nn.trainer.run_full_ft` now accepts the optional `opts.on_ckpt`
-  checkpoint hook, mirrored from the `alc.nn.trainer.full_ft` sibling
-  through the shared extractor. The Card-writing surface (the one every
-  gameai bake script drives) can now run per-checkpoint evaluation and
-  early-break the training loop. `run_lora_ft` / `run_distill` keep
-  passing no hook. Additionally, supplying `on_ckpt` without a positive
-  `ckpt_every` is now refused with a loud error on **both** `full_ft`
-  and `run_full_ft` (previously the pairing was a silent no-op: the
-  hook could never fire and the run reported clean).
-
-- `alc.nn.card.load_ckpt(path, spec) -> NnHandle` — Cardless loader that
-  rebuilds a handle straight from a raw safetensors file, with the
-  architecture supplied by the caller (`spec.arch`, same vocabulary as
-  `load_handle`; optional `device` / `dtype` defaulting to cpu / f32,
-  plus the custom-shape keys for `arch = "gpt2-custom"`). This is the
-  bridge an `on_ckpt` hook uses to turn the mid-run `info.ckpt_path`
-  (which has no Card yet) into a handle the metric surfaces can
-  consume. The load path never touches an existing handle's mutex, so
-  it is safe to call from inside the hook while the trainer holds the
-  model lock. Checkpoint paths rotate (`ckpt_keep`) — load inside the
-  hook body only. Known limitation (pre-existing, pinned by a test):
-  TinyLlama raw checkpoints use a different tensor layout than
-  `from_safetensors_file` expects and fail loudly; GPT-2 (named and
-  custom) round-trips.
-
-- `examples/gameai/anymetric` — new Lua pkg defining a generic
-  observation domain (no gameai vocabulary) for the Level Sweep
-  learning iter. A *view* (`am.view(view_id, metric_name, config)`)
-  binds a metric registered in `alc.nn.metric.registry` to a fixed
-  config under a first-class `view_id`, so the same metric can be
-  observed under several configs in one run. `am.observe(views,
-  {card, step})` evaluates every view per checkpoint behind a per-view
-  `pcall`: a failing metric becomes an `ErrorRecord {step, view_id,
-  error}` in the run log instead of propagating as `TrainError::Hook`
-  (which would skip the terminal checkpoint save). Judgment is a
-  separate layer — `am.judgment.threshold{view_id, field, op, value}` /
-  `never_break()` return a `Decision {action, reason}` with `action ∈
-  break | continue | harvest`, and `am.to_hook_action` projects it
-  onto the 2-value trainer hook ABI (harvest → continue + a harvest
-  marker record, reserved for the staged-boss iteration). 51 spec
-  tests including structural isolation proofs (a judgment never reads
-  records outside its declared `view_id`/`field`).
-
-- `examples/gameai/gameai_metrics` — boss-seat measurement arm. New
-  shared `boss_seat.lua` (encode + legal-gated distribution over the
-  boss action set; deliberate exception to the per-file duplication
-  convention, since `guardian_duel_npc.decide` is module-local and the
-  NPC pkg's public API should not widen for measurement's sake). All
-  three metrics accept additive `seat` / `style` opts (default
-  `"player"`, prior behaviour unchanged): `level` gains an opponent
-  pool (`opponents` list, per-opponent Wilson CI + pooled aggregate +
-  `win_rate_min`), `style_distance` documents and enforces its
-  same-basis contract (boss prompt sets are boss states; element-type
-  mismatch is a loud error), `trickiness` returns normalised entropy
-  (`H / log |legal|`) on the boss seat where the legal set is
-  state-dependent. `wilson_ci` now clamps the interval to contain the
-  point estimate (float residue at p̂ = 1 could violate
-  `ci_lower <= win_rate <= ci_upper`). 83 spec tests total.
-
-- `examples/gameai/train_guardian_npc.lua` — per-checkpoint
-  observation wiring (additive; `ckpt_every = 0`, the default,
-  restores the previous run untouched). New ctx fields `ckpt_every` /
-  `ckpt_keep` / `gate_games` / `teacher_alias` / `enable_gate` /
-  `target_win_rate_lo`. Each checkpoint is measured on three
-  independent axes (level / style_distance vs the teacher /
-  trickiness) via `anymetric`; only the strength axis may stop the run
-  (`ci_lower >= target_win_rate_lo` achievement gate — a point
-  estimate inside a 0.20 band is narrower than the Wilson CI at
-  feasible game counts, so band-inclusion gating would fire on noise).
-  Personality axes are logged for human judgment only. Records are
-  emitted per fire (human line + JSON) and returned in an
-  `observations` field for transcription. 15 spec tests drive the
-  whole script against a stubbed host.
-
-- `crates/algocline-engine/tests/gameai_ckpt_metric_e2e.rs` — end-to-end
-  smoke wiring the three pieces above together in one training run:
-  `alc.nn.trainer.run_full_ft` fires `on_ckpt` at every `ckpt_every`
-  boundary, the hook turns `info.ckpt_path` into a handle with
-  `alc.nn.card.load_ckpt`, and
-  `alc.nn.metric.registry.evaluate("trickiness", …)` reads a number off
-  that handle — all while the trainer holds the model mutex and the
-  dataset lock. The hook fire count is asserted first (a silent no-op
-  hook would make the rest vacuous) and the metric is bounded by its
-  definition (`[0, ln 4]`) rather than by a training-budget threshold.
-  Added to `just test-nn`.
-
-- `examples/gameai/gameai_metrics` — new Lua pkg composing the metric
-  primitives + Registry into three GameAI-specific metrics for the
-  Level Sweep learning iter. `style_distance(card_a, card_b,
-  prompt_set)` returns mean JS divergence over prompt-set greedy action
-  distributions (composes `alc.nn.metric.js`). `trickiness(card,
-  prompt_set, temperature)` returns mean Shannon entropy of
-  temperature-scaled softmax over legal moves (composes
-  `alc.nn.metric.entropy`). `level(card, opponent, n_games, seed)`
-  returns `{ win_rate, ci_lower, ci_upper }` (Wilson 95% CI) over N
-  autoplay games against `"greedy"` / `"random"` boss (boss-Card seat
-  via `guardian_duel_npc` deferred to the Level Sweep iter). The pkg
-  self-registers into `alc.nn.metric.registry` on `require` so the
-  trainer `on_ckpt` hook can dispatch by name (`registry.evaluate("level",
-  { card = info.ckpt_path, opponent = "greedy", n_games = 32 })`).
-  `prompt_set` is caller-supplied as a Lua array of `player_view`
-  tables — raw playlog load (`data/guardian_sample_playlog_*.json`)
-  stays at the caller layer to keep the metric compose free of file
-  paths. 20 spec tests (6 style / 6 trickiness / 8 level) cover
-  primitive composition, arg validation, and return shape; stylua
-  clean.
-
-- `alc.nn.trainer.full_ft` gains an optional `on_ckpt` callback in
-  `opts` — invoked at every `ckpt_every` boundary right after the
-  weights checkpoint is saved. Signature is
-  `function(info) -> "continue" | "break" | nil`; `nil` is treated as
-  `"continue"`. `info` is a Lua table with `{ step, ckpt_path,
-  train_loss, lr, grad_norm, elapsed_ms, min_train_loss }` — enough
-  context to gate on any metric registered via
-  `alc.nn.metric.registry.evaluate`. Returning `"break"` writes the
-  terminal `<prefix>.safetensors` from the current weights, sets
-  `metrics.early_break = 1.0`, and returns the `Checkpoint` early
-  (the remaining `cfg.steps` are not run). Any other return value
-  (unknown string, wrong type, Lua `error(..)`) aborts the run with
-  `TrainError::Hook` after the terminal ckpt is still written, so the
-  caller keeps last-good weights. `on_ckpt` absent = pre-existing
-  behaviour byte-for-byte. **Rust public API additive change**:
-  `algocline_nn::train::run_full_ft` grows a 9th `hook:
-  Option<CkptHook>` parameter, and `CkptInfo` / `CkptControl` /
-  `CkptHook` are newly exported from `algocline_nn::train`. `FullFtConfig`
-  itself is unchanged (the hook lives out-of-band to keep the
-  struct-literal / derive contract byte-identical). `run_lora_ft` and
-  the distill trainer keep their signatures — internally they pass
-  `None` through `run_ft_core`, so the hook applies to `full_ft` only
-  in this iter (LoRA / distill hook wiring is deferred to a later
-  iter). Industry-standard equivalent: HuggingFace `TrainerCallback`
-  `on_save` + `EarlyStoppingCallback` collapsed into a single
-  ckpt-boundary hook. `grad_norm` is computed via L2 over the
-  `VarMap` grads only when a hook fires, so no-hook runs pay zero
-  overhead.
-- `alc.nn.metric.*` Lua bridge — `alc.nn.metric.{kl, js, tvd, entropy}`
-  wrap the `algocline_nn::metric` primitives added in the previous
-  commit (Lua array table in, Rust `Vec<f32>` cross the FFI, typed
-  `MetricError` surfaces as `LuaError::external` with the `metric:`
-  prefix preserved). `kl` may return `math.huge` when
-  `q[i] == 0 && p[i] > 0` per the KL definition (do **not** treat as
-  error). `js` / `tvd` / `entropy` never emit non-finite values on
-  validated inputs.
-- `alc.nn.metric.registry.{register, get, evaluate, list}` —
-  per-VM Lua-side name → fn registry for the metric infrastructure.
-  Fresh empty on every VM boot; `gameai_metrics` and any other pkg
-  self-register on `require`. `register` / `evaluate` refuse loudly
-  (`error(..)` at `level = 2`) on bad name / missing fn / unknown
-  metric; `get` returns `nil` on miss (query surface); `list` returns
-  a sorted array of registered names. Kept in Lua (no Rust
-  `RegistryKey`) so name → fn dispatch has zero cross-FFI lifetime.
-- `algocline_nn::metric` — new Rust module exposing four distribution /
-  entropy primitives (`kl` / `js` / `tvd` / `entropy`) that back the
-  metric infrastructure for the GameAI SLM Level Sweep learning iter
-  (issue fc070f15). Operates on `&[f32]` slices interpreted as
-  probability distributions with loud validation (empty / non-finite /
-  negative / not-normalized / length-mismatch → typed `MetricError`).
-  `kl` follows the `0·log 0 := 0` convention and returns
-  `f32::INFINITY` when `q[i] == 0 && p[i] > 0` per the KL definition;
-  `js` and `tvd` are symmetric and bounded (`[0, ln 2]` / `[0, 1]`);
-  `entropy` is bounded on `[0, ln(len)]`. Domain-agnostic Rust core —
-  the Lua bridge (`alc.nn.metric.*`) and the `MetricRegistry` follow in
-  a subsequent commit; domain composition (gameai style-distance /
-  trickiness / level) lives in a separate Lua pkg.
-
-- `alc.nn.constraint.allow_list({ id, ... })` — allow-list (legal-mask)
-  logits constraint, backed by the new
-  `algocline_nn::sampling::AllowListConstraint`. Every logit outside the
-  listed token ids is masked to `-inf` at every position, so
-  `sampler.constrained(sampler.temperature(t, seed), constraint.allow_list(ids))`
-  is a one-line legality-guaranteed noisy decode. The mask is
-  prefix-agnostic and never terminal — stopping stays with
-  `stop_tokens` / the generation loop. An empty id list is refused at
-  construction rather than at the draw. Composition still consumes both
-  handles, so the intended usage is to rebuild the chain per decision
-  with the legal set recomputed and the seed derived explicitly (e.g.
-  from a turn number).
-- gameai example: noisy decoding on the guardian player NPC, the first
-  consumer of `alc.nn.constraint.allow_list`.
-  `guardian_player_npc` gains a `decide_noisy` mode
-  (`{ view, seed, temperature? }`, returning
-  `action=<move> legal=true raw_legal=<bool> noisy=true temperature=<t>
-  seed=<n>`) that draws one move from
-  `sampler.constrained(sampler.temperature(t, seed), constraint.allow_list(move_ids))`
-  instead of scanning the ranking — legal by construction rather than
-  by a gate. Its `autoplay` mode takes the same optional `temperature`,
-  which turns a batch of fights from N copies of one greedy fight into
-  N samples; each decision draws under
-  `seed + game * (TURN_LIMIT + 1) + turn`, so a run is still a function
-  of its seed and a single turn can be replayed on its own. `seed` is
-  required on the noisy path (never defaulted) and the sampler chain is
-  rebuilt per decision, following the bridge's move semantics. The
-  greedy `decide` / `determinism` paths are untouched, so the existing
-  eval cases and the generalisation script keep fencing the same
-  behaviour. See README "Drawing instead of scanning".
-- gameai example: reproducible generalisation proof for the guardian
-  player bake. `examples/gameai/data/` ships a sample play log at the
-  tens-of-games scale (36 train / 18 held-out games, played by a fixed
-  conditional style), `eval_guardian_player_generalization.lua` bakes
-  it and scores the Card on held-out positions against explicit fences
-  (style match on rule positions ≥ 0.90, raw decode legality ≥ 0.95,
-  loss below baseline), and `gen_guardian_sample_playlog.lua` replays
-  the deterministic collection to regenerate or verify the data files.
-  Measured: rule positions 58/58 on held-out games including every
-  unseen one, across two runs. See README "Proving the bake
-  generalises".
-
 - `train::ckpt::restore_into` / `restore_into_partial` — start a run
   from weights it already has. Both verify before they write: one pass
   compares every name, shape and dtype against the live `VarMap`,
@@ -1046,6 +711,392 @@ which `LegalMaskedDataset` would otherwise pad or truncate into
 silently unscored positions on the `CHESS_LEGAL_MASK=1` path.
 `CorpusError` is not `#[non_exhaustive]` either, so a downstream
 exhaustive `match` needs both arms or a `_`.
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.48.0] - 2026-08-13
+
+### Added
+
+- **`alc_pack` / `alc_unpack`** — moving a `~/.algocline` setup to
+  another machine. A pack is a directory (`profile.toml` +
+  `payload/`), not an archive: compression is the caller's `tar czf`,
+  so the crate takes no archive-format dependency and the result stays
+  inspectable.
+
+  What travels depends on whether it can be reproduced. Packages
+  installed from Git or a bundled collection are recorded as
+  declarations and re-fetched by `alc_unpack`; packages with a
+  local-path origin — and every directory on disk that
+  `installed.json` does not know about — travel as bytes; symlinked
+  packages travel as link definitions. That last split is the reason
+  the pack walks the filesystem rather than reading the manifest:
+  `pkg_link` records nothing in `installed.json`, so a manifest-driven
+  snapshot silently drops every linked and every unregistered package.
+
+  Sections are named after `AppDir` accessors and selected in three
+  tiers: the default is `core` + `cards` + `evals`; `all: true` adds
+  `nn` and `state`; `logs` / `hub_cache` / `types` are reachable only
+  through an explicit `include`. `all` and `include` compose as a
+  union (`all: true, include: ["logs"]` takes everything), `exclude`
+  is applied last, and `core` cannot be excluded. Package-level
+  selection (`packages_only` / `packages_exclude`) is a separate axis
+  with separate names.
+
+  `alc_unpack` runs re-fetch → expand → re-link, with
+  `mode` ∈ `merge` (default, local wins) / `overwrite` / `dry-run`.
+  `installed.json` is grafted entry by entry even under `overwrite`,
+  so packages that exist only on the destination keep their version
+  tracking instead of becoming `unregistered_pkg`. Link targets are
+  absolute paths from the source machine and routinely do not exist on
+  the destination; that is reported as
+  `unresolved[{kind: "link_target_missing", target}]` with
+  `status: "partial"` rather than raised as an error, and `dry-run`
+  probes every link without writing, which is the cheapest way to see
+  what a move would leave dangling.
+
+- `examples/gameai/gen_guardian_player_styles.lua` — deterministic
+  generator for player-style training corpora, driving the duel loop
+  directly (scripted boss policies, no Cards, no nn, no RNG). Ships
+  two new styles as data files: `data/guardian_bruiser_playlog_train
+  .json` (intent-blind aggressor — one rule, heavy into the spiked
+  mode-1 window) and `data/guardian_shield_playlog_train.json`
+  (intent-reactive defender — block what is announced, never press).
+  The script also carries a sentinel-reproduction mode that regrows
+  the shipped sample playlog and verifies it entry for entry against
+  the committed file — a standing sensor for drift in the rules, the
+  canonical Cards or the generation path — and returns its rule maps
+  as data so an attribution analysis can assert its own slot
+  classifier against the corpus (compliance must be exactly 1.0 on
+  rule slots).
+
+- `examples/gameai/fight_boss_sweep.lua` — temperature-grid driver over
+  `fight_matrix`. Takes the fight driver's ctx with `ctx.temperatures`
+  (a non-empty array of positive finite grid points, kept in caller
+  order) in place of a single temperature, runs one fight matrix per
+  grid point under one shared seed, asserts that the boss / player
+  axes and every non-temperature run parameter stayed fixed across
+  the grid (the single-variable-sweep invariant), and writes one JSON
+  (`sweep = [{temperature, matrix}, ...]` + aggregated `meta`). A
+  leftover singular `ctx.temperature` is refused loudly rather than
+  silently outvoted by the grid. Nothing is written when any grid
+  point fails. 47 spec tests.
+
+- `examples/gameai/gameai_metrics/fight_matrix.lua` — Card-vs-Card
+  fight matrix runner: every boss Card of a harvest collection (or an
+  explicit alias list) against every player Card of a pool.
+  `fm.new{collection_path | bosses, players, n_games, seed, style,
+  temperature}` builds the runner; `fight:run()` plays one `level`
+  call per boss row (`seat = "boss"`, the player pool as
+  `opts.opponents`) and reports one cell per pairing — boss-seat
+  `win_rate` with a Wilson CI, `game_length_mean` and
+  `final_hp_margin_mean`. A temperature is mandatory (default `1.0`):
+  the duel engine carries no RNG and its openings do not vary, so the
+  decode draw is the only source of variance a Card-vs-Card fight
+  has, and greedy has no spelling on this runner.
+  `fight:save(path)` writes the report as JSON through the shared
+  auto-mkdir helper. 33 spec tests.
+
+- `examples/gameai/fight_boss_collection.lua` — thin `alc_run` driver
+  around `fight_matrix`. Takes `ctx.collection_path` + `ctx.players`
+  + `ctx.output` (required) and the standard opt fields as
+  passthroughs; logs a one-line header plus one line per cell
+  (`win_rate` / CI / game length / hp margin) after `:save()`.
+
+- `examples/gameai/gameai_metrics/audit_matrix.lua` — post-hoc auditor
+  for a boss harvest manifest. `am.new{collection_path | aliases,
+  n_games, prompt_set_size, seed, style, teacher_alias}` builds an
+  auditor; `audit:run()` restores each Card from its recorded
+  `card_id`, re-measures the per-Card baseline (`level` with a Wilson
+  CI at higher game counts than the harvest hook could afford,
+  `trickiness` on the boss seat, `style_distance` vs the teacher),
+  and fills a symmetric pair-wise `style_distance` matrix between the
+  Cards themselves — the numeric input to the question a
+  teacher-only distance cannot answer, whether a strong Card is a
+  distinct policy or the mid Card carried further along the same
+  teacher-collapse arc. `audit:save(path)` writes the report as JSON
+  through the shared auto-mkdir helper. 26 spec tests.
+
+- `examples/gameai/audit_boss_collection.lua` — thin `alc_run` driver
+  around `audit_matrix`. Takes `ctx.collection_path` +
+  `ctx.output` (required) and the standard opt fields as passthroughs;
+  logs a one-line header, one line per Card, and one line per
+  Card-pair after `:save()`. 17 spec tests drive the required-field
+  loud errors, the default fallbacks, the runner wiring, and the
+  summary emission.
+
+- `examples/gameai/gameai_metrics/_fs.lua` — shared filesystem helper
+  with `shell_squote` (POSIX single-quote wrap that neutralises `$` /
+  `` ` `` / `!` / `"` / whitespace — Lua's `string.format("%q", …)`
+  produces Lua source escapes, not shell escapes) and
+  `ensure_parent_dir(path)`, an `os.execute("mkdir -p …")` wrapper
+  with a loud return-code check so a mid-run manifest write no longer
+  crashes the trainer when the caller has not created the target
+  directory first (the accident class the prior iter's boss-harvest
+  smoke hit). `harvest_collection:save()` now calls it before
+  `io.open`; the auditor `save` calls it too. 15 helper spec tests +
+  2 new manifest-writer tests covering fresh-directory creation.
+
+- `alc.nn.card.save_from_ckpt(path, name, meta) -> card_id` — additive
+  sibling of `alc.nn.card.save`. Copies a raw safetensors file (a
+  mid-run `alc.nn.trainer.run_full_ft` checkpoint, in practice) into
+  the Card store's canonical layout and mints a Card without paying
+  the vars round-trip. Same meta schema, same on-disk layout, so
+  downstream `alc.nn.card.load` / `load_handle` consume the result
+  unchanged. Named-variant only (`gpt2-tiny` etc.); `gpt2-custom`
+  needs `build_nn_meta` to populate the custom branch and is deferred.
+  4 Rust unit tests + 2 Lua bridge round-trip tests.
+
+- `examples/gameai/anymetric` — `judgment.band{view_id, field, lo, hi,
+  label?}` and `judgment.staged{view_id, field, bands}`. Four arms
+  (missing / errored / non-numeric → `continue`, inside a band →
+  `harvest` with `Decision.meta = {label, step, values}`, above
+  topmost `hi` → `break`, below the lowest `lo` → `continue`). Bands
+  are strictly disjoint (`bands[i].hi < bands[i+1].lo`); a shared
+  boundary is rejected because the hit label would be
+  non-deterministic. `Decision` gains an optional `meta` field that
+  the adapter merges into the harvest marker; built-in `harvest` /
+  `reason` fields always win over conflicting meta keys. Stateless —
+  first-writer-wins is caller-side. Existing `threshold` /
+  `never_break` remain byte-invariant (no `meta`). 32 new spec tests.
+
+- `examples/gameai/gameai_metrics/harvest_collection.lua` — Lua-side
+  utility that consumes anymetric harvest markers and writes a JSON
+  manifest (`schema_version = 1`) of `(label, step, ckpt_path,
+  card_id, alias, level_win_rate, level_ci_lower, sd_teacher,
+  trickiness_norm)` tuples. Configurable policy
+  (`first_writer_wins` default / `last_writer_wins`), partial
+  collections allowed (a run that only hits some bands still saves).
+  23 spec tests covering the write-through / merge / policy /
+  round-trip surface.
+
+- `examples/gameai/train_guardian_npc.lua` — `enable_stages = true`
+  arms the staged-harvest path: every checkpoint whose `level.ci_lower`
+  lands in a band is baked immediately via `save_from_ckpt`, pinned
+  to `<stage_alias_prefix>_<label>` (`guardian_duel_npc_weak/mid/
+  strong` by default), and appended to the collection manifest.
+  First-writer-wins per label. `enable_stages` composes with
+  `enable_gate`: staged-side `break` (top-band overshoot) wins over
+  a same-fire gate break; harvest side-effects still run when the
+  gate breaks on the same fire (so the mid-band Card lands even when
+  the gate stops the run on the same checkpoint). `ckpt_keep >= 2` is
+  asserted up front. `enable_stages = false` (the default) is
+  byte-invariant with the prior behaviour. 11 new spec tests.
+
+- `alc.nn.trainer.run_full_ft` now accepts the optional `opts.on_ckpt`
+  checkpoint hook, mirrored from the `alc.nn.trainer.full_ft` sibling
+  through the shared extractor. The Card-writing surface (the one every
+  gameai bake script drives) can now run per-checkpoint evaluation and
+  early-break the training loop. `run_lora_ft` / `run_distill` keep
+  passing no hook. Additionally, supplying `on_ckpt` without a positive
+  `ckpt_every` is now refused with a loud error on **both** `full_ft`
+  and `run_full_ft` (previously the pairing was a silent no-op: the
+  hook could never fire and the run reported clean).
+
+- `alc.nn.card.load_ckpt(path, spec) -> NnHandle` — Cardless loader that
+  rebuilds a handle straight from a raw safetensors file, with the
+  architecture supplied by the caller (`spec.arch`, same vocabulary as
+  `load_handle`; optional `device` / `dtype` defaulting to cpu / f32,
+  plus the custom-shape keys for `arch = "gpt2-custom"`). This is the
+  bridge an `on_ckpt` hook uses to turn the mid-run `info.ckpt_path`
+  (which has no Card yet) into a handle the metric surfaces can
+  consume. The load path never touches an existing handle's mutex, so
+  it is safe to call from inside the hook while the trainer holds the
+  model lock. Checkpoint paths rotate (`ckpt_keep`) — load inside the
+  hook body only. Known limitation (pre-existing, pinned by a test):
+  TinyLlama raw checkpoints use a different tensor layout than
+  `from_safetensors_file` expects and fail loudly; GPT-2 (named and
+  custom) round-trips.
+
+- `examples/gameai/anymetric` — new Lua pkg defining a generic
+  observation domain (no gameai vocabulary) for the Level Sweep
+  learning iter. A *view* (`am.view(view_id, metric_name, config)`)
+  binds a metric registered in `alc.nn.metric.registry` to a fixed
+  config under a first-class `view_id`, so the same metric can be
+  observed under several configs in one run. `am.observe(views,
+  {card, step})` evaluates every view per checkpoint behind a per-view
+  `pcall`: a failing metric becomes an `ErrorRecord {step, view_id,
+  error}` in the run log instead of propagating as `TrainError::Hook`
+  (which would skip the terminal checkpoint save). Judgment is a
+  separate layer — `am.judgment.threshold{view_id, field, op, value}` /
+  `never_break()` return a `Decision {action, reason}` with `action ∈
+  break | continue | harvest`, and `am.to_hook_action` projects it
+  onto the 2-value trainer hook ABI (harvest → continue + a harvest
+  marker record, reserved for the staged-boss iteration). 51 spec
+  tests including structural isolation proofs (a judgment never reads
+  records outside its declared `view_id`/`field`).
+
+- `examples/gameai/gameai_metrics` — boss-seat measurement arm. New
+  shared `boss_seat.lua` (encode + legal-gated distribution over the
+  boss action set; deliberate exception to the per-file duplication
+  convention, since `guardian_duel_npc.decide` is module-local and the
+  NPC pkg's public API should not widen for measurement's sake). All
+  three metrics accept additive `seat` / `style` opts (default
+  `"player"`, prior behaviour unchanged): `level` gains an opponent
+  pool (`opponents` list, per-opponent Wilson CI + pooled aggregate +
+  `win_rate_min`), `style_distance` documents and enforces its
+  same-basis contract (boss prompt sets are boss states; element-type
+  mismatch is a loud error), `trickiness` returns normalised entropy
+  (`H / log |legal|`) on the boss seat where the legal set is
+  state-dependent. `wilson_ci` now clamps the interval to contain the
+  point estimate (float residue at p̂ = 1 could violate
+  `ci_lower <= win_rate <= ci_upper`). 83 spec tests total.
+
+- `examples/gameai/train_guardian_npc.lua` — per-checkpoint
+  observation wiring (additive; `ckpt_every = 0`, the default,
+  restores the previous run untouched). New ctx fields `ckpt_every` /
+  `ckpt_keep` / `gate_games` / `teacher_alias` / `enable_gate` /
+  `target_win_rate_lo`. Each checkpoint is measured on three
+  independent axes (level / style_distance vs the teacher /
+  trickiness) via `anymetric`; only the strength axis may stop the run
+  (`ci_lower >= target_win_rate_lo` achievement gate — a point
+  estimate inside a 0.20 band is narrower than the Wilson CI at
+  feasible game counts, so band-inclusion gating would fire on noise).
+  Personality axes are logged for human judgment only. Records are
+  emitted per fire (human line + JSON) and returned in an
+  `observations` field for transcription. 15 spec tests drive the
+  whole script against a stubbed host.
+
+- `crates/algocline-engine/tests/gameai_ckpt_metric_e2e.rs` — end-to-end
+  smoke wiring the three pieces above together in one training run:
+  `alc.nn.trainer.run_full_ft` fires `on_ckpt` at every `ckpt_every`
+  boundary, the hook turns `info.ckpt_path` into a handle with
+  `alc.nn.card.load_ckpt`, and
+  `alc.nn.metric.registry.evaluate("trickiness", …)` reads a number off
+  that handle — all while the trainer holds the model mutex and the
+  dataset lock. The hook fire count is asserted first (a silent no-op
+  hook would make the rest vacuous) and the metric is bounded by its
+  definition (`[0, ln 4]`) rather than by a training-budget threshold.
+  Added to `just test-nn`.
+
+- `examples/gameai/gameai_metrics` — new Lua pkg composing the metric
+  primitives + Registry into three GameAI-specific metrics for the
+  Level Sweep learning iter. `style_distance(card_a, card_b,
+  prompt_set)` returns mean JS divergence over prompt-set greedy action
+  distributions (composes `alc.nn.metric.js`). `trickiness(card,
+  prompt_set, temperature)` returns mean Shannon entropy of
+  temperature-scaled softmax over legal moves (composes
+  `alc.nn.metric.entropy`). `level(card, opponent, n_games, seed)`
+  returns `{ win_rate, ci_lower, ci_upper }` (Wilson 95% CI) over N
+  autoplay games against `"greedy"` / `"random"` boss (boss-Card seat
+  via `guardian_duel_npc` deferred to the Level Sweep iter). The pkg
+  self-registers into `alc.nn.metric.registry` on `require` so the
+  trainer `on_ckpt` hook can dispatch by name (`registry.evaluate("level",
+  { card = info.ckpt_path, opponent = "greedy", n_games = 32 })`).
+  `prompt_set` is caller-supplied as a Lua array of `player_view`
+  tables — raw playlog load (`data/guardian_sample_playlog_*.json`)
+  stays at the caller layer to keep the metric compose free of file
+  paths. 20 spec tests (6 style / 6 trickiness / 8 level) cover
+  primitive composition, arg validation, and return shape; stylua
+  clean.
+
+- `alc.nn.trainer.full_ft` gains an optional `on_ckpt` callback in
+  `opts` — invoked at every `ckpt_every` boundary right after the
+  weights checkpoint is saved. Signature is
+  `function(info) -> "continue" | "break" | nil`; `nil` is treated as
+  `"continue"`. `info` is a Lua table with `{ step, ckpt_path,
+  train_loss, lr, grad_norm, elapsed_ms, min_train_loss }` — enough
+  context to gate on any metric registered via
+  `alc.nn.metric.registry.evaluate`. Returning `"break"` writes the
+  terminal `<prefix>.safetensors` from the current weights, sets
+  `metrics.early_break = 1.0`, and returns the `Checkpoint` early
+  (the remaining `cfg.steps` are not run). Any other return value
+  (unknown string, wrong type, Lua `error(..)`) aborts the run with
+  `TrainError::Hook` after the terminal ckpt is still written, so the
+  caller keeps last-good weights. `on_ckpt` absent = pre-existing
+  behaviour byte-for-byte. **Rust public API additive change**:
+  `algocline_nn::train::run_full_ft` grows a 9th `hook:
+  Option<CkptHook>` parameter, and `CkptInfo` / `CkptControl` /
+  `CkptHook` are newly exported from `algocline_nn::train`. `FullFtConfig`
+  itself is unchanged (the hook lives out-of-band to keep the
+  struct-literal / derive contract byte-identical). `run_lora_ft` and
+  the distill trainer keep their signatures — internally they pass
+  `None` through `run_ft_core`, so the hook applies to `full_ft` only
+  in this iter (LoRA / distill hook wiring is deferred to a later
+  iter). Industry-standard equivalent: HuggingFace `TrainerCallback`
+  `on_save` + `EarlyStoppingCallback` collapsed into a single
+  ckpt-boundary hook. `grad_norm` is computed via L2 over the
+  `VarMap` grads only when a hook fires, so no-hook runs pay zero
+  overhead.
+- `alc.nn.metric.*` Lua bridge — `alc.nn.metric.{kl, js, tvd, entropy}`
+  wrap the `algocline_nn::metric` primitives added in the previous
+  commit (Lua array table in, Rust `Vec<f32>` cross the FFI, typed
+  `MetricError` surfaces as `LuaError::external` with the `metric:`
+  prefix preserved). `kl` may return `math.huge` when
+  `q[i] == 0 && p[i] > 0` per the KL definition (do **not** treat as
+  error). `js` / `tvd` / `entropy` never emit non-finite values on
+  validated inputs.
+- `alc.nn.metric.registry.{register, get, evaluate, list}` —
+  per-VM Lua-side name → fn registry for the metric infrastructure.
+  Fresh empty on every VM boot; `gameai_metrics` and any other pkg
+  self-register on `require`. `register` / `evaluate` refuse loudly
+  (`error(..)` at `level = 2`) on bad name / missing fn / unknown
+  metric; `get` returns `nil` on miss (query surface); `list` returns
+  a sorted array of registered names. Kept in Lua (no Rust
+  `RegistryKey`) so name → fn dispatch has zero cross-FFI lifetime.
+- `algocline_nn::metric` — new Rust module exposing four distribution /
+  entropy primitives (`kl` / `js` / `tvd` / `entropy`) that back the
+  metric infrastructure for the GameAI SLM Level Sweep learning iter
+  (issue fc070f15). Operates on `&[f32]` slices interpreted as
+  probability distributions with loud validation (empty / non-finite /
+  negative / not-normalized / length-mismatch → typed `MetricError`).
+  `kl` follows the `0·log 0 := 0` convention and returns
+  `f32::INFINITY` when `q[i] == 0 && p[i] > 0` per the KL definition;
+  `js` and `tvd` are symmetric and bounded (`[0, ln 2]` / `[0, 1]`);
+  `entropy` is bounded on `[0, ln(len)]`. Domain-agnostic Rust core —
+  the Lua bridge (`alc.nn.metric.*`) and the `MetricRegistry` follow in
+  a subsequent commit; domain composition (gameai style-distance /
+  trickiness / level) lives in a separate Lua pkg.
+
+- `alc.nn.constraint.allow_list({ id, ... })` — allow-list (legal-mask)
+  logits constraint, backed by the new
+  `algocline_nn::sampling::AllowListConstraint`. Every logit outside the
+  listed token ids is masked to `-inf` at every position, so
+  `sampler.constrained(sampler.temperature(t, seed), constraint.allow_list(ids))`
+  is a one-line legality-guaranteed noisy decode. The mask is
+  prefix-agnostic and never terminal — stopping stays with
+  `stop_tokens` / the generation loop. An empty id list is refused at
+  construction rather than at the draw. Composition still consumes both
+  handles, so the intended usage is to rebuild the chain per decision
+  with the legal set recomputed and the seed derived explicitly (e.g.
+  from a turn number).
+- gameai example: noisy decoding on the guardian player NPC, the first
+  consumer of `alc.nn.constraint.allow_list`.
+  `guardian_player_npc` gains a `decide_noisy` mode
+  (`{ view, seed, temperature? }`, returning
+  `action=<move> legal=true raw_legal=<bool> noisy=true temperature=<t>
+  seed=<n>`) that draws one move from
+  `sampler.constrained(sampler.temperature(t, seed), constraint.allow_list(move_ids))`
+  instead of scanning the ranking — legal by construction rather than
+  by a gate. Its `autoplay` mode takes the same optional `temperature`,
+  which turns a batch of fights from N copies of one greedy fight into
+  N samples; each decision draws under
+  `seed + game * (TURN_LIMIT + 1) + turn`, so a run is still a function
+  of its seed and a single turn can be replayed on its own. `seed` is
+  required on the noisy path (never defaulted) and the sampler chain is
+  rebuilt per decision, following the bridge's move semantics. The
+  greedy `decide` / `determinism` paths are untouched, so the existing
+  eval cases and the generalisation script keep fencing the same
+  behaviour. See README "Drawing instead of scanning".
+- gameai example: reproducible generalisation proof for the guardian
+  player bake. `examples/gameai/data/` ships a sample play log at the
+  tens-of-games scale (36 train / 18 held-out games, played by a fixed
+  conditional style), `eval_guardian_player_generalization.lua` bakes
+  it and scores the Card on held-out positions against explicit fences
+  (style match on rule positions ≥ 0.90, raw decode legality ≥ 0.95,
+  loss below baseline), and `gen_guardian_sample_playlog.lua` replays
+  the deterministic collection to regenerate or verify the data files.
+  Measured: rule positions 58/58 on held-out games including every
+  unseen one, across two runs. See README "Proving the bake
+  generalises".
 
 ### Changed
 

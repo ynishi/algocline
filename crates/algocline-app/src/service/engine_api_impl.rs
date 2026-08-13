@@ -186,6 +186,55 @@ impl EngineApi for AppService {
         AppService::pkg_install(self, url, name, force).await
     }
 
+    async fn pack(
+        &self,
+        out_dir: String,
+        all: Option<bool>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+        packages_only: Option<Vec<String>>,
+        packages_exclude: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        AppService::pack(
+            self,
+            out_dir,
+            crate::service::PackOptions {
+                all: all.unwrap_or(false),
+                include: include.unwrap_or_default(),
+                exclude: exclude.unwrap_or_default(),
+                packages_only: packages_only.unwrap_or_default(),
+                packages_exclude: packages_exclude.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+
+    async fn unpack(
+        &self,
+        pack_dir: String,
+        mode: Option<String>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        // Parsed here rather than defaulted silently: an unrecognised mode
+        // would otherwise be indistinguishable from `merge` and could write
+        // where the caller expected a dry run.
+        let mode = match mode.as_deref() {
+            Some(raw) => raw.parse::<crate::service::UnpackMode>()?,
+            None => crate::service::UnpackMode::default(),
+        };
+        AppService::unpack(
+            self,
+            pack_dir,
+            crate::service::UnpackOptions {
+                mode,
+                include: include.unwrap_or_default(),
+                exclude: exclude.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+
     async fn pkg_remove(
         &self,
         name: &str,

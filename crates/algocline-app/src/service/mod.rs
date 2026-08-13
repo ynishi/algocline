@@ -22,6 +22,7 @@ pub(crate) mod lockfile;
 mod logging;
 pub(crate) mod manifest;
 mod migrate;
+pub(crate) mod pack;
 pub(crate) mod path;
 mod pkg;
 mod pkg_link;
@@ -52,6 +53,7 @@ use algocline_engine::{Executor, FileCardStore, JsonFileStore, SessionRegistry, 
 
 pub use algocline_core::{EngineApi, TokenUsage};
 pub use config::{AppConfig, LogDirSource};
+pub use pack::{PackOptions, UnpackMode, UnpackOptions};
 pub use resolve::{QueryResponse, SearchPath};
 
 // ─── Application Service ────────────────────────────────────────

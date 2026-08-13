@@ -285,6 +285,61 @@ impl FsInstalledManifestStore {
             }
         })
     }
+
+    /// Fold `incoming` entries into the on-disk manifest, entry by entry.
+    ///
+    /// Used by `alc_unpack` to graft a foreign machine's `installed.json`
+    /// onto this one. Merging per entry (rather than replacing the file)
+    /// keeps packages that exist only on the destination — a wholesale
+    /// overwrite would erase them from version tracking while leaving their
+    /// directories on disk, i.e. manufacture `unregistered_pkg` entries.
+    ///
+    /// With `overwrite = false` an incoming entry whose name already exists
+    /// is left untouched and reported under `kept`.
+    ///
+    /// Deliberately an inherent method rather than an
+    /// [`InstalledManifestStore`] trait method: `unpack` is the only caller,
+    /// and no in-memory store needs to answer it. When the vacant
+    /// `PkgRepository` seat is filled (see the module header) this is a
+    /// natural thing to lift onto the trait.
+    pub(crate) fn merge_entries(
+        &self,
+        incoming: &Manifest,
+        overwrite: bool,
+    ) -> Result<ManifestMergeOutcome, InstalledManifestStoreError> {
+        self.with_lock(|| {
+            let mut manifest = self.load()?;
+            let mut outcome = ManifestMergeOutcome::default();
+
+            for (name, entry) in &incoming.packages {
+                match manifest.packages.get_mut(name) {
+                    None => {
+                        manifest.packages.insert(name.clone(), entry.clone());
+                        outcome.added.push(name.clone());
+                    }
+                    Some(existing) if overwrite => {
+                        *existing = entry.clone();
+                        outcome.updated.push(name.clone());
+                    }
+                    Some(_) => outcome.kept.push(name.clone()),
+                }
+            }
+
+            self.save(&manifest)?;
+            Ok(outcome)
+        })
+    }
+}
+
+/// Per-entry result of [`FsInstalledManifestStore::merge_entries`].
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ManifestMergeOutcome {
+    /// Names that did not exist locally and were inserted.
+    pub added: Vec<String>,
+    /// Names that existed locally and were replaced (`overwrite = true`).
+    pub updated: Vec<String>,
+    /// Names that existed locally and were left alone (`overwrite = false`).
+    pub kept: Vec<String>,
 }
 
 impl InstalledManifestStore for FsInstalledManifestStore {
@@ -543,6 +598,16 @@ pub(crate) fn record_install_batch(
     source: PackageSource,
 ) -> Result<(), InstalledManifestStoreError> {
     FsInstalledManifestStore::new(app_dir.clone()).record_install_batch(names, source)
+}
+
+/// Merge a foreign manifest into the local one (`alc_unpack`). See
+/// [`FsInstalledManifestStore::merge_entries`] for the per-entry semantics.
+pub(crate) fn merge_manifest(
+    app_dir: &AppDir,
+    incoming: &Manifest,
+    overwrite: bool,
+) -> Result<ManifestMergeOutcome, InstalledManifestStoreError> {
+    FsInstalledManifestStore::new(app_dir.clone()).merge_entries(incoming, overwrite)
 }
 
 /// Remove a package from the manifest (`installed.json`). Used by

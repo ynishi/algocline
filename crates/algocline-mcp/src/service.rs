@@ -175,7 +175,9 @@ pub struct McpQueryResponse {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PackParams {
-    /// Destination directory for the pack. Must not already exist.
+    /// Destination path for the pack archive. A path without a `.tgz` /
+    /// `.tar.gz` suffix gets `.tgz`. Must not already exist, and neither may
+    /// its `.sha256` sidecar.
     pub out_dir: String,
     /// Take every section except `logs` / `hub_cache` / `types`
     /// (default `false`, which takes `core` + `cards` + `evals`).
@@ -200,7 +202,9 @@ pub struct PackParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UnpackParams {
-    /// Pack directory produced by `alc_pack`.
+    /// Pack archive produced by `alc_pack` (`.tgz` / `.tar.gz`). Its
+    /// `.sha256` sidecar is checked before anything is expanded. A directory
+    /// is also accepted, for packs written before the archive format.
     pub pack_dir: String,
     /// `merge` (default): keep whatever is already here.
     /// `overwrite`: the pack wins (`installed.json` is still merged per entry).
@@ -1413,11 +1417,14 @@ impl AlcService {
             .await
     }
 
-    /// Write a portable snapshot of `~/.algocline` to `out_dir`, for moving
-    /// the setup to another machine.
+    /// Write a portable snapshot of `~/.algocline`, for moving the setup to
+    /// another machine.
     ///
-    /// The pack is a directory, not an archive — compress it yourself
-    /// (`tar czf pack.tgz <out_dir>`) if you need a single file.
+    /// The pack is one gzip'd tar plus a `.sha256` sidecar. A snapshot has to
+    /// stay the thing it was when it was taken — often the gap between packing
+    /// and restoring is weeks — and a directory cannot say whether anything
+    /// changed inside it. The archive is the atomic unit; the digest makes the
+    /// freeze checkable, and `alc_unpack` verifies before it expands.
     ///
     /// What travels depends on how each package can be reproduced:
     ///
@@ -1432,8 +1439,10 @@ impl AlcService {
     /// and `state`; `logs` / `hub_cache` / `types` are reachable only through
     /// an explicit `include`.
     ///
-    /// Returns per-class package counts, link liveness, byte totals, and
-    /// everything skipped. Fails if `out_dir` already exists.
+    /// Returns the archive path, its SHA-256 and size, per-class package
+    /// counts, link liveness, byte totals, and everything skipped. Fails if
+    /// the archive or its sidecar already exists — a snapshot someone may
+    /// still be relying on is not overwritten.
     #[tool(
         name = "alc_pack",
         annotations(destructive_hint = false, open_world_hint = false)
@@ -1454,8 +1463,14 @@ impl AlcService {
     /// Restore a pack written by `alc_pack` into this machine's
     /// `~/.algocline`.
     ///
-    /// Runs three phases: re-fetch the declared packages, expand the payload,
-    /// then re-create the symlinks.
+    /// The archive is checked against its `.sha256` sidecar first: one that
+    /// changed after it was packed (truncated transfer, edited payload) is
+    /// refused before anything lands, rather than restored halfway. An archive
+    /// carried without its sidecar still restores, and the report says
+    /// `source.verified: false` — "not checked" is not "checked and fine".
+    ///
+    /// Then three phases: re-fetch the declared packages, expand the payload,
+    /// re-create the symlinks.
     ///
     /// Link targets are absolute paths from the source machine, so they
     /// routinely do not exist here. That is reported under `unresolved`

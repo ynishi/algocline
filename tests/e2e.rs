@@ -8967,26 +8967,83 @@ async fn test_alc_pack_then_unpack_dry_run_roundtrip() {
         "logs must not travel by default: {packed}"
     );
 
-    assert!(out_dir.join("profile.toml").exists());
-    assert!(out_dir
-        .join("payload/packages/e2e_pack_local/init.lua")
-        .exists());
-    assert!(!out_dir.join("payload/logs").exists());
+    // One archive plus its digest — not a directory left on disk.
+    let archive = std::path::PathBuf::from(packed["archive"].as_str().expect("archive path"));
+    assert_eq!(archive, home.join("snapshot.alcpack.tgz"));
+    assert!(archive.is_file(), "packed: {packed}");
+    assert!(home.join("snapshot.alcpack.tgz.sha256").is_file());
+    assert!(
+        !out_dir.exists(),
+        "the staging tree must not survive at the destination"
+    );
+    assert_eq!(
+        packed["sha256"].as_str().expect("sha256").len(),
+        64,
+        "packed: {packed}"
+    );
 
-    // Reading it back reports what a real run would do, and writes nothing.
+    // Reading it back verifies the digest, reports what a real run would do,
+    // and writes nothing.
     let planned = call_json(
         client,
         "alc_unpack",
-        json!({ "pack_dir": out_dir.to_string_lossy(), "mode": "dry-run" }),
+        json!({ "pack_dir": archive.to_string_lossy(), "mode": "dry-run" }),
     )
     .await;
 
     assert_eq!(planned["dry_run"], true, "planned: {planned}");
     assert_eq!(planned["status"], "ok", "planned: {planned}");
+    assert_eq!(planned["source"]["kind"], "archive", "planned: {planned}");
+    assert_eq!(planned["source"]["verified"], true, "planned: {planned}");
+    assert_eq!(
+        planned["source"]["sha256"], packed["sha256"],
+        "the digest unpack verified is the one pack recorded"
+    );
     assert_eq!(
         planned["unresolved"].as_array().expect("unresolved").len(),
         0,
         "the link target still exists here: {planned}"
+    );
+}
+
+/// An archive edited after packing is refused before anything lands. This is
+/// the reason a pack is an archive rather than a directory.
+#[tokio::test]
+async fn test_alc_unpack_refuses_an_archive_that_changed() {
+    let harness = TempAlcHome::connect().await;
+    let client = &harness.client;
+    let home = harness.home_path().to_path_buf();
+    seed_pack_fixture(&home);
+
+    let packed = call_json(
+        client,
+        "alc_pack",
+        json!({ "out_dir": home.join("tampered.alcpack").to_string_lossy() }),
+    )
+    .await;
+    let archive = std::path::PathBuf::from(packed["archive"].as_str().expect("archive path"));
+
+    let mut bytes = std::fs::read(&archive).expect("read archive");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&archive, &bytes).expect("write archive");
+
+    let result = client
+        .call_tool(call_params(
+            "alc_unpack",
+            json!({ "pack_dir": archive.to_string_lossy(), "mode": "dry-run" }),
+        ))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+
+    assert!(
+        text.contains("changed after it was packed"),
+        "expected a checksum refusal, got: {text}"
+    );
+    assert!(
+        text.contains("recorded") && text.contains("computed"),
+        "the error should show both digests, got: {text}"
     );
 }
 
@@ -8997,13 +9054,16 @@ async fn test_alc_unpack_reports_missing_link_target_as_partial() {
     let home = harness.home_path().to_path_buf();
     let outside = seed_pack_fixture(&home);
 
-    let out_dir = home.join("moved.alcpack");
-    call_json(
+    let packed = call_json(
         client,
         "alc_pack",
-        json!({ "out_dir": out_dir.to_string_lossy() }),
+        json!({ "out_dir": home.join("moved.alcpack").to_string_lossy() }),
     )
     .await;
+    let archive = packed["archive"]
+        .as_str()
+        .expect("archive path")
+        .to_string();
 
     // Stand in for the destination machine: the checkout the link points at
     // is simply not here.
@@ -9013,7 +9073,7 @@ async fn test_alc_unpack_reports_missing_link_target_as_partial() {
     let restored = call_json(
         client,
         "alc_unpack",
-        json!({ "pack_dir": out_dir.to_string_lossy(), "mode": "dry-run" }),
+        json!({ "pack_dir": archive, "mode": "dry-run" }),
     )
     .await;
 
@@ -9039,7 +9099,8 @@ async fn test_alc_pack_rejects_existing_destination() {
     let harness = TempAlcHome::connect().await;
     let client = &harness.client;
     let out_dir = harness.home_path().join("taken.alcpack");
-    std::fs::create_dir_all(&out_dir).expect("mkdir");
+    let archive = harness.home_path().join("taken.alcpack.tgz");
+    std::fs::write(&archive, "an earlier snapshot").expect("seed archive");
 
     let result = client
         .call_tool(call_params(
@@ -9053,6 +9114,11 @@ async fn test_alc_pack_rejects_existing_destination() {
     assert!(
         text.contains("already exists"),
         "expected a refusal to overwrite, got: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&archive).expect("read archive"),
+        "an earlier snapshot",
+        "a snapshot someone may still rely on must not be overwritten"
     );
 }
 
@@ -9157,5 +9223,18 @@ async fn test_alc_pack_include_takes_sections_all_withholds() {
         sections.contains(&"logs"),
         "`all` + `include` compose as a union: {packed}"
     );
-    assert!(out_dir.join("payload/logs/e2e.log").exists());
+
+    // The bytes are inside the archive; restoring is what surfaces them.
+    let archive = packed["archive"]
+        .as_str()
+        .expect("archive path")
+        .to_string();
+    let restored = call_json(
+        client,
+        "alc_unpack",
+        json!({ "pack_dir": archive, "mode": "overwrite" }),
+    )
+    .await;
+    assert_eq!(restored["source"]["verified"], true, "{restored}");
+    assert!(home.join("logs/e2e.log").exists());
 }

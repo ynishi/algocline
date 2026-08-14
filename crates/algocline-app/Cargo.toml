@@ -29,6 +29,9 @@ libc = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }
 toml_edit = "0.22"
+tar = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
 ureq = "3"
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
 mlua-lspec = "0.3"

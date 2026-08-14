@@ -36,6 +36,14 @@ async-trait = "0.1"
 rand = "0.10"
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 
+# `alc_pack` writes a single archive rather than a directory: a migration
+# artifact has to freeze the state it was taken from, and a directory keeps
+# changing under whoever holds it. tar gives the atomic unit, sha2 makes the
+# freeze checkable after the fact.
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+
 [package]
 name = "algocline"
 version.workspace = true

@@ -15,6 +15,7 @@
 //! See [`profile`] for the reproducible / irreproducible / referential split
 //! that the format is built around.
 
+pub(crate) mod archive;
 pub(crate) mod create;
 pub(crate) mod fs;
 pub(crate) mod profile;

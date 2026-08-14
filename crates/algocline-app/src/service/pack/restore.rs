@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use algocline_core::AppDir;
 use serde::Serialize;
 
+use super::archive::{extract_archive, is_archive_path, verify_archive, ArchiveError};
 use super::fs::{
     copy_file, copy_tree, measure_tree, CopyStats, FsError, OverwritePolicy, SkipRecord,
 };
@@ -147,6 +148,12 @@ pub(crate) enum UnpackError {
     },
 
     #[error(transparent)]
+    Archive {
+        #[from]
+        source: ArchiveError,
+    },
+
+    #[error(transparent)]
     Profile {
         #[from]
         source: PackProfileError,
@@ -183,6 +190,18 @@ pub(crate) struct Unresolved {
     pub detail: Option<String>,
 }
 
+/// Where a restore's contents came from, when they came from an archive.
+///
+/// `verified` is `None` when the archive arrived without its `.sha256`
+/// sidecar. That is reported as unverified rather than silently treated as
+/// checked — "we did not look" and "we looked and it was fine" are different
+/// answers to the only question an old snapshot raises.
+#[derive(Debug, Clone)]
+struct ArchiveOrigin<'a> {
+    path: &'a Path,
+    verified: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct UnpackReport {
     from_source: usize,
@@ -203,15 +222,52 @@ struct UnpackReport {
 // ─── Service ────────────────────────────────────────────────────
 
 impl AppService {
-    /// Restore a pack directory into this machine's application directory.
+    /// Restore a pack into this machine's application directory.
+    ///
+    /// `pack` is the `.tgz` written by `alc_pack`. Its `.sha256` sidecar is
+    /// checked before anything is expanded, so an archive that changed after
+    /// it was packed is refused rather than half-restored. A directory is also
+    /// accepted, for packs written before the archive format.
     ///
     /// Returns a JSON report; `status` is `"partial"` whenever anything landed
     /// in `unresolved`.
-    pub async fn unpack(&self, pack_dir: String, opts: UnpackOptions) -> Result<String, String> {
+    pub async fn unpack(&self, pack: String, opts: UnpackOptions) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
-        Ok(self
-            .unpack_inner(&app_dir, Path::new(&pack_dir), &opts)
-            .await?)
+        Ok(self.unpack_at(&app_dir, Path::new(&pack), &opts).await?)
+    }
+
+    /// Resolve `pack` to a directory — verifying and expanding it first when it
+    /// names an archive — then restore from it.
+    ///
+    /// The expansion goes to a temp dir that lives until this returns: the
+    /// snapshot is never left lying around unarchived, which is what keeps
+    /// "what was in the pack" answerable after the fact.
+    async fn unpack_at(
+        &self,
+        app_dir: &AppDir,
+        pack: &Path,
+        opts: &UnpackOptions,
+    ) -> Result<String, UnpackError> {
+        if !is_archive_path(pack) {
+            return self.unpack_inner(app_dir, pack, opts, None).await;
+        }
+
+        let verified = verify_archive(pack)?;
+        let staging = tempfile::tempdir().map_err(|source| FsError::CreateDir {
+            path: PathBuf::from("<temp>"),
+            source,
+        })?;
+        let dir = extract_archive(pack, staging.path())?;
+        self.unpack_inner(
+            app_dir,
+            &dir,
+            opts,
+            Some(ArchiveOrigin {
+                path: pack,
+                verified,
+            }),
+        )
+        .await
     }
 
     async fn unpack_inner(
@@ -219,6 +275,7 @@ impl AppService {
         app_dir: &AppDir,
         pack_dir: &Path,
         opts: &UnpackOptions,
+        origin: Option<ArchiveOrigin<'_>>,
     ) -> Result<String, UnpackError> {
         let profile = PackProfile::load(pack_dir)?;
         let sections = select_sections(&profile.pack.sections, &opts.include, &opts.exclude)?;
@@ -234,7 +291,7 @@ impl AppService {
         // Phase 3 — re-link.
         relink(app_dir, &profile.links, opts.mode, &mut report)?;
 
-        Ok(report_json(pack_dir, opts.mode, &sections, &report))
+        Ok(report_json(pack_dir, origin, opts.mode, &sections, &report))
     }
 
     /// Install each declared package from its recorded origin.
@@ -539,6 +596,7 @@ fn ensure_parent(path: &Path) -> Result<(), UnpackError> {
 
 fn report_json(
     pack_dir: &Path,
+    origin: Option<ArchiveOrigin<'_>>,
     mode: UnpackMode,
     sections: &BTreeSet<PackSection>,
     report: &UnpackReport,
@@ -551,11 +609,28 @@ fn report_json(
         })
     });
 
+    // An archive restore reports what it verified. `verified: false` means the
+    // `.sha256` was absent, not that the check failed — a failed check does not
+    // reach here at all.
+    let source = match &origin {
+        Some(o) => serde_json::json!({
+            "kind": "archive",
+            "path": o.path.display().to_string(),
+            "verified": o.verified.is_some(),
+            "sha256": o.verified,
+        }),
+        None => serde_json::json!({
+            "kind": "directory",
+            "path": pack_dir.display().to_string(),
+            "verified": false,
+        }),
+    };
+
     serde_json::json!({
         "status": if report.unresolved.is_empty() { "ok" } else { "partial" },
         "mode": mode.as_str(),
         "dry_run": mode.is_dry_run(),
-        "pack_dir": pack_dir.display().to_string(),
+        "source": source,
         "sections": sections.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         "restored": {
             "from_source": report.from_source,
@@ -656,11 +731,106 @@ mod tests {
         let service = AppService::new(executor, config, vec![]);
 
         let app_dir = AppDir::new(home.to_path_buf());
+        // Through `unpack_at`, so archive paths take the verify + expand route
+        // and directories take the legacy one — the same dispatch the MCP tool
+        // hits.
         let json = service
-            .unpack_inner(&app_dir, pack, &opts)
+            .unpack_at(&app_dir, pack, &opts)
             .await
             .expect("unpack");
         serde_json::from_str(&json).unwrap()
+    }
+
+    /// The path a real migration takes: pack writes an archive, unpack
+    /// verifies it against its digest and restores from the expansion.
+    #[tokio::test]
+    async fn restores_from_a_verified_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pack, home) = packed(tmp.path());
+        let archive = tmp.path().join("snap.tgz");
+        let (digest, _) =
+            crate::service::pack::archive::write_archive(&pack, &archive, "snap").unwrap();
+
+        let v = run(&archive, &home, UnpackOptions::default()).await;
+
+        assert_eq!(v["source"]["kind"], "archive");
+        assert_eq!(v["source"]["verified"], true);
+        assert_eq!(v["source"]["sha256"], digest);
+        assert!(home.join("packages/packed_pkg/init.lua").exists());
+        assert!(home.join("cards/c.toml").exists());
+    }
+
+    /// An archive that changed after packing is refused before anything is
+    /// written — a half-restored application directory is worse than none.
+    #[tokio::test]
+    async fn refuses_an_archive_that_changed_after_packing() {
+        use crate::service::AppConfig;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (pack, home) = packed(tmp.path());
+        let archive = tmp.path().join("snap.tgz");
+        crate::service::pack::archive::write_archive(&pack, &archive, "snap").unwrap();
+
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let executor = Arc::new(
+            algocline_engine::Executor::new(vec![home.join("packages")])
+                .await
+                .unwrap(),
+        );
+        let config = AppConfig::default()
+            .with_app_dir(home.to_path_buf())
+            .with_log_disabled();
+        let service = AppService::new(executor, config, vec![]);
+        let app_dir = AppDir::new(home.to_path_buf());
+
+        let err = service
+            .unpack_at(&app_dir, &archive, &UnpackOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("changed after it was packed"),
+            "{err}"
+        );
+        assert!(
+            !home.join("packages/packed_pkg").exists(),
+            "nothing may land from an archive that failed verification"
+        );
+    }
+
+    /// An archive carried without its sidecar restores, but says it was not
+    /// verified. "We did not check" must not read as "we checked and it passed".
+    #[tokio::test]
+    async fn archive_without_a_sidecar_reports_unverified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pack, home) = packed(tmp.path());
+        let archive = tmp.path().join("snap.tgz");
+        crate::service::pack::archive::write_archive(&pack, &archive, "snap").unwrap();
+        std::fs::remove_file(crate::service::pack::archive::checksum_path(&archive)).unwrap();
+
+        let v = run(&archive, &home, UnpackOptions::default()).await;
+
+        assert_eq!(v["source"]["kind"], "archive");
+        assert_eq!(v["source"]["verified"], false);
+        assert!(home.join("packages/packed_pkg/init.lua").exists());
+    }
+
+    /// Packs written before the archive format still restore.
+    #[tokio::test]
+    async fn a_directory_pack_still_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pack, home) = packed(tmp.path());
+
+        let v = run(&pack, &home, UnpackOptions::default()).await;
+
+        assert_eq!(v["source"]["kind"], "directory");
+        assert_eq!(v["source"]["verified"], false);
+        assert!(home.join("packages/packed_pkg/init.lua").exists());
     }
 
     #[tokio::test]

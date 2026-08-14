@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use algocline_core::AppDir;
 
+use super::archive::{checksum_path, with_archive_extension, write_archive, ArchiveError};
 use super::fs::{copy_file, copy_tree, CopyStats, FsError, OverwritePolicy, SkipRecord};
 use super::profile::{
     payload_dir, resolve_sections, LinkStatus, PackMeta, PackProfile, PackProfileError,
@@ -79,6 +80,12 @@ pub(crate) enum PackError {
     },
 
     #[error(transparent)]
+    Archive {
+        #[from]
+        source: ArchiveError,
+    },
+
+    #[error(transparent)]
     Profile {
         #[from]
         source: PackProfileError,
@@ -109,33 +116,63 @@ struct Classified {
 // ─── Service ────────────────────────────────────────────────────
 
 impl AppService {
-    /// Write a pack directory describing (and partially containing) the
-    /// current application directory.
+    /// Write a pack archive holding (and describing) the current application
+    /// directory.
+    ///
+    /// `out` names the archive; a path without a `.tgz` / `.tar.gz` suffix
+    /// gets `.tgz`. A `<archive>.sha256` sidecar is written beside it.
     ///
     /// Returns a JSON summary: section list, per-class package counts, link
-    /// liveness, byte totals, and everything skipped.
-    pub async fn pack(&self, out_dir: String, opts: PackOptions) -> Result<String, String> {
+    /// liveness, byte totals, the archive path, its digest and its size.
+    pub async fn pack(&self, out: String, opts: PackOptions) -> Result<String, String> {
         let app_dir = self.log_config.app_dir();
-        Ok(pack_into(&app_dir, Path::new(&out_dir), &opts)?)
+        Ok(pack_into(&app_dir, Path::new(&out), &opts)?)
     }
 }
 
-fn pack_into(app_dir: &AppDir, out_dir: &Path, opts: &PackOptions) -> Result<String, PackError> {
+fn pack_into(app_dir: &AppDir, out: &Path, opts: &PackOptions) -> Result<String, PackError> {
     let sections = resolve_sections(opts.all, &opts.include, &opts.exclude)?;
 
-    // Refuse to write into an existing directory. Packing is a bulk copy; an
-    // accidental merge into an unrelated tree is not something the caller can
-    // easily undo.
-    if out_dir.exists() {
+    let archive = with_archive_extension(out);
+    // Refuse to overwrite. A pack is a snapshot someone may still be relying
+    // on; silently replacing one is not something the caller can undo.
+    if archive.exists() {
+        return Err(PackError::OutDirExists { path: archive });
+    }
+    if checksum_path(&archive).exists() {
         return Err(PackError::OutDirExists {
-            path: out_dir.to_path_buf(),
+            path: checksum_path(&archive),
         });
     }
-    let payload = payload_dir(out_dir);
+
+    // The tree is staged in a temp dir and then frozen into the archive. It
+    // never exists at the destination as a directory: a pack that spends time
+    // on disk unarchived is a pack whose contents can change between being
+    // written and being read, which is the thing the archive exists to stop.
+    let staging = tempfile::tempdir().map_err(|source| FsError::CreateDir {
+        path: PathBuf::from("<temp>"),
+        source,
+    })?;
+    let root_name = archive
+        .file_name()
+        .map(|n| {
+            n.to_string_lossy()
+                .trim_end_matches(".gz")
+                .trim_end_matches(".tar")
+                .trim_end_matches(".tgz")
+                .trim_end_matches('.')
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "alcpack".to_string());
+    let out_dir = staging.path().join(&root_name);
+
+    let payload = payload_dir(&out_dir);
     std::fs::create_dir_all(&payload).map_err(|source| FsError::CreateDir {
         path: payload.clone(),
         source,
     })?;
+    let out_dir = out_dir.as_path();
 
     let manifest = load_manifest(app_dir)?;
     let mut classified = classify_packages(&packages_dir(app_dir), &manifest, opts)?;
@@ -190,8 +227,14 @@ fn pack_into(app_dir: &AppDir, out_dir: &Path, opts: &PackOptions) -> Result<Str
     };
     profile.save(out_dir)?;
 
+    // Freeze. From here the snapshot is one file with one digest; the staging
+    // tree is dropped with `staging`.
+    let (digest, archive_bytes) = write_archive(out_dir, &archive, &root_name)?;
+
     Ok(summary_json(
-        out_dir,
+        &archive,
+        &digest,
+        archive_bytes,
         &present,
         &classified,
         &stats_by_section,
@@ -377,8 +420,11 @@ fn copy_core(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summary_json(
-    out_dir: &Path,
+    archive: &Path,
+    digest: &str,
+    archive_bytes: u64,
     sections: &[PackSection],
     classified: &Classified,
     stats: &[(PackSection, CopyStats)],
@@ -401,7 +447,10 @@ fn summary_json(
     }
 
     serde_json::json!({
-        "pack_dir": out_dir.display().to_string(),
+        "archive": archive.display().to_string(),
+        "checksum_file": checksum_path(archive).display().to_string(),
+        "sha256": digest,
+        "archive_bytes": archive_bytes,
         "format_version": FORMAT_VERSION,
         "sections": sections.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         "packages": {
@@ -558,6 +607,16 @@ mod tests {
         assert_eq!(c.links.len(), 1);
     }
 
+    /// Expand a written pack so its contents can be asserted on.
+    fn expand(tmp: &Path, archive: &Path) -> PathBuf {
+        let dest = tmp.join(format!(
+            "expanded-{}",
+            archive.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&dest).unwrap();
+        super::super::archive::extract_archive(archive, &dest).unwrap()
+    }
+
     #[test]
     fn default_pack_carries_core_and_cards_but_not_logs() {
         let (tmp, app_dir, _) = fixture();
@@ -575,17 +634,30 @@ mod tests {
         assert_eq!(v["packages"]["linked"], 2);
         assert_eq!(v["links"]["dangling"], 1);
 
-        assert!(out.join("profile.toml").exists());
-        assert!(out.join("payload/core/config.toml").exists());
-        assert!(out.join("payload/scenarios/s.lua").exists());
-        assert!(out.join("payload/cards/c.toml").exists());
+        // The pack is one file plus its digest — not a directory left behind.
+        let archive = PathBuf::from(v["archive"].as_str().unwrap());
+        assert_eq!(archive, tmp.path().join("out.alcpack.tgz"));
+        assert!(archive.is_file());
+        assert!(checksum_path(&archive).is_file());
         assert!(
-            !out.join("payload/logs").exists(),
+            !out.exists(),
+            "the staging tree must not survive at the destination"
+        );
+        assert_eq!(v["sha256"].as_str().unwrap().len(), 64);
+        assert!(v["archive_bytes"].as_u64().unwrap() > 0);
+
+        let root = expand(tmp.path(), &archive);
+        assert!(root.join("profile.toml").exists());
+        assert!(root.join("payload/core/config.toml").exists());
+        assert!(root.join("payload/scenarios/s.lua").exists());
+        assert!(root.join("payload/cards/c.toml").exists());
+        assert!(
+            !root.join("payload/logs").exists(),
             "logs must not travel by default"
         );
         // Payload packages carry bytes; declared ones do not.
-        assert!(out.join("payload/packages/unregistered/init.lua").exists());
-        assert!(!out.join("payload/packages/from_git").exists());
+        assert!(root.join("payload/packages/unregistered/init.lua").exists());
+        assert!(!root.join("payload/packages/from_git").exists());
     }
 
     #[test]
@@ -599,21 +671,59 @@ mod tests {
             include: vec!["logs".to_string()],
             ..Default::default()
         };
-        pack_into(&app_dir, &out, &opts).unwrap();
+        let json = pack_into(&app_dir, &out, &opts).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert!(out.join("payload/logs/l.txt").exists());
+        let root = expand(tmp.path(), Path::new(v["archive"].as_str().unwrap()));
+        assert!(root.join("payload/logs/l.txt").exists());
     }
 
     #[test]
-    fn existing_destination_is_refused() {
+    fn existing_archive_is_refused() {
         let (tmp, app_dir, _) = fixture();
         write(&app_dir.installed_json(), r#"{"packages":{}}"#);
 
         let out = tmp.path().join("taken.alcpack");
-        std::fs::create_dir_all(&out).unwrap();
+        write(&tmp.path().join("taken.alcpack.tgz"), "an earlier snapshot");
 
         let err = pack_into(&app_dir, &out, &PackOptions::default()).unwrap_err();
         assert!(matches!(err, PackError::OutDirExists { .. }));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("taken.alcpack.tgz")).unwrap(),
+            "an earlier snapshot",
+            "a snapshot someone may still rely on must not be overwritten"
+        );
+    }
+
+    /// A stale sidecar without its archive still blocks: writing the archive
+    /// would leave a `.sha256` that describes something else.
+    #[test]
+    fn orphaned_checksum_is_refused() {
+        let (tmp, app_dir, _) = fixture();
+        write(&app_dir.installed_json(), r#"{"packages":{}}"#);
+
+        let out = tmp.path().join("orphan.alcpack");
+        write(
+            &tmp.path().join("orphan.alcpack.tgz.sha256"),
+            "0000000000000000000000000000000000000000000000000000000000000000  orphan.alcpack.tgz\n",
+        );
+
+        let err = pack_into(&app_dir, &out, &PackOptions::default()).unwrap_err();
+        assert!(matches!(err, PackError::OutDirExists { .. }));
+    }
+
+    /// A caller who spells the suffix keeps their spelling.
+    #[test]
+    fn explicit_archive_suffix_is_honoured() {
+        let (tmp, app_dir, _) = fixture();
+        write(&app_dir.installed_json(), r#"{"packages":{}}"#);
+
+        let out = tmp.path().join("named.tar.gz");
+        let json = pack_into(&app_dir, &out, &PackOptions::default()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["archive"].as_str().unwrap(), out.to_string_lossy());
+        assert!(out.is_file());
     }
 
     #[test]

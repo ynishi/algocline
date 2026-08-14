@@ -17,7 +17,7 @@ algocline-core = { workspace = true }
 
 # alc.nn bridge — optional, pulled only by the `nn` feature (default off) so
 # the default MCP build never links candle (keeps it light).
-algocline-nn = { path = "../algocline-nn", version = "0.48.0", optional = true }
+algocline-nn = { path = "../algocline-nn", version = "0.48.1", optional = true }
 
 # Candle re-exports named by bridge/nn_card.rs (DType / Device / VarMap
 # / VarBuilder). Gated on the same `nn` feature so the default MCP

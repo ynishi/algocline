@@ -19,6 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.48.1] - 2026-08-14
+
+### Fixed
+
+- `alc_pack` walked a tree as "directory or regular file", so a unix
+  socket in it aborted the whole pack. `~/.algocline/state/pool/*.sock`
+  is a live listener owned by a pool worker and `std::fs::copy` refuses
+  it with `ENOTSUP` — packing a real application directory with `state`
+  included failed before a single section had been written. Sockets,
+  FIFOs and device nodes are now skipped and reported under `skipped`.
+  Carrying one would be meaningless anyway: the name refers to a
+  listener in a process that does not exist on the destination.
+
+- `alc_unpack --mode=dry-run` counted a symlinked directory as one file
+  where a real run would have walked it, because the measuring pass read
+  `DirEntry::metadata` (which does not traverse links) while the copying
+  pass had moved to `std::fs::metadata`. The two passes now classify
+  entries identically — including which non-regular files they refuse —
+  so the dry run predicts the job it is a dry run of.
+
 ## [0.48.0] - 2026-08-13
 
 ### Added

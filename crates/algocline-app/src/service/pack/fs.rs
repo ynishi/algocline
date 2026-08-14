@@ -154,12 +154,23 @@ pub(crate) fn copy_tree(
 
         if meta.is_dir() {
             stats += copy_tree(&path, &dest, policy, skipped)?;
-        } else {
+        } else if meta.is_file() {
             if policy == OverwritePolicy::KeepExisting && dest.exists() {
                 stats.kept += 1;
                 continue;
             }
             stats += copy_file(&path, &dest)?;
+        } else {
+            // Sockets, FIFOs and device nodes. `std::fs::copy` refuses them
+            // (ENOTSUP), and copying one would be meaningless anyway: the pool
+            // worker's `state/pool/*.sock` names a listener in a process that
+            // does not exist on the destination. Skipping keeps the walk alive
+            // — deciding by `is_file()` rather than "not a directory" is what
+            // stops one socket from aborting a 360 MB pack.
+            skipped.push(SkipRecord {
+                path: path.display().to_string(),
+                reason: "not a regular file (socket / fifo / device)".to_string(),
+            });
         }
     }
 
@@ -190,7 +201,10 @@ pub(crate) fn measure_tree(
         let path = entry.path();
         let dest = dst.join(entry.file_name());
 
-        let meta = match entry.metadata() {
+        // Same traversal rule as `copy_tree`: `std::fs::metadata` follows
+        // links, `DirEntry::metadata` does not. A dry run that classified
+        // entries differently from the real run would predict the wrong work.
+        let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 skipped.push(SkipRecord {
@@ -203,7 +217,7 @@ pub(crate) fn measure_tree(
 
         if meta.is_dir() {
             stats += measure_tree(&path, &dest, policy, skipped)?;
-        } else {
+        } else if meta.is_file() {
             if policy == OverwritePolicy::KeepExisting && dest.exists() {
                 stats.kept += 1;
                 continue;
@@ -213,6 +227,13 @@ pub(crate) fn measure_tree(
                 bytes: meta.len(),
                 kept: 0,
             };
+        } else {
+            // Mirrors `copy_tree`: sockets / FIFOs / device nodes are skipped,
+            // so the dry run reports the same skip set the real run produces.
+            skipped.push(SkipRecord {
+                path: path.display().to_string(),
+                reason: "not a regular file (socket / fifo / device)".to_string(),
+            });
         }
     }
 
@@ -286,6 +307,84 @@ mod tests {
         assert_eq!(stats.files, 1, "the readable file still travels");
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].reason.contains("unreadable"));
+    }
+
+    /// A unix socket in the tree must not abort the walk.
+    ///
+    /// `~/.algocline/state/pool/*.sock` is a live listener owned by a pool
+    /// worker. `std::fs::copy` refuses it with ENOTSUP, and classifying by
+    /// "not a directory" sent it to the copy — one socket aborted a 360 MB
+    /// pack against a real application directory.
+    #[test]
+    fn socket_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        write(&src.join("real.txt"), "payload");
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("worker.sock")).unwrap();
+
+        let mut skipped = Vec::new();
+        let stats = copy_tree(
+            &src,
+            &tmp.path().join("dst"),
+            OverwritePolicy::Replace,
+            &mut skipped,
+        )
+        .unwrap();
+
+        assert_eq!(stats.files, 1, "the regular file still travels");
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].reason.contains("not a regular file"),
+            "{:?}",
+            skipped[0]
+        );
+        assert!(!tmp.path().join("dst/worker.sock").exists());
+    }
+
+    /// A dry run must classify entries exactly as the real run does, including
+    /// the ones it refuses to carry.
+    #[test]
+    fn measure_skips_sockets_like_copy_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        write(&src.join("real.txt"), "payload");
+        let _listener = std::os::unix::net::UnixListener::bind(src.join("worker.sock")).unwrap();
+        let dst = tmp.path().join("dst");
+
+        let mut measured_skips = Vec::new();
+        let measured =
+            measure_tree(&src, &dst, OverwritePolicy::Replace, &mut measured_skips).unwrap();
+        let mut copied_skips = Vec::new();
+        let copied = copy_tree(&src, &dst, OverwritePolicy::Replace, &mut copied_skips).unwrap();
+
+        assert_eq!(measured, copied);
+        assert_eq!(measured_skips, copied_skips);
+    }
+
+    /// `measure_tree` must follow symlinks the same way `copy_tree` does —
+    /// `DirEntry::metadata` does not traverse, so a linked directory would be
+    /// counted as a single file instead of walked.
+    #[test]
+    fn measure_follows_symlinks_like_copy_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        write(&outside.join("a.txt"), "12345");
+        write(&outside.join("b.txt"), "678");
+
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("linked_dir")).unwrap();
+        let dst = tmp.path().join("dst");
+
+        let mut measured_skips = Vec::new();
+        let measured =
+            measure_tree(&src, &dst, OverwritePolicy::Replace, &mut measured_skips).unwrap();
+        let mut copied_skips = Vec::new();
+        let copied = copy_tree(&src, &dst, OverwritePolicy::Replace, &mut copied_skips).unwrap();
+
+        assert_eq!(measured.files, 2, "the link is walked, not counted as one");
+        assert_eq!(measured, copied);
+        assert_eq!(measured_skips, copied_skips);
     }
 
     #[test]

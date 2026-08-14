@@ -19,6 +19,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.48.2] - 2026-08-14
+
+### Fixed
+
+- **`alc_pack` wrote a directory, which cannot hold a snapshot.** A pack
+  is carried across time — the gap between writing one and restoring it
+  is usually weeks — and over that gap the question stops being "did the
+  copy work" and becomes "is this still what I packed". A directory
+  cannot answer it: anything with filesystem access can add, remove or
+  truncate a file inside it, and the result is indistinguishable from
+  one that was never touched. Treating compression as the caller's
+  business (`tar czf`) mistook the reason to reach for an archive.
+
+  `alc_pack` now writes one gzip'd tar plus a `sha256sum`-compatible
+  `.sha256` sidecar. A destination without a `.tgz` / `.tar.gz` suffix
+  gets `.tgz`; an existing archive is never overwritten, nor is a
+  destination whose sidecar is present without it. The response carries
+  `archive`, `sha256` and `archive_bytes`. The staging tree lives in a
+  tempdir and never exists at the destination.
+
+  `alc_unpack` verifies the digest **before** expanding, so an archive
+  that changed after packing — an edited payload, a truncated transfer —
+  is refused with both digests named rather than restored halfway into
+  an application directory. An archive carried without its sidecar still
+  restores and reports `source.verified: false`: "we did not check" and
+  "we checked and it was fine" are different answers. Directories are
+  still accepted, for packs written before this.
+
 ## [0.48.1] - 2026-08-14
 
 ### Fixed

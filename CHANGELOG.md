@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`alc.nn.logits.mix(a, b, beta, opts?)` — two logits rows combined
+  into one.** `beta` is the weight on `a`, and the result is an ordinary
+  logits handle, so `argmax` / `top(n)` / the samplers / a constrained
+  sampler all consume it and a mixture can itself be mixed again.
+  `opts.space` selects what the coefficients act on: `"prob"` (the
+  default) mixes the distributions, `β·softmax(a) + (1-β)·softmax(b)`,
+  storing the log of that mixture so the downstream softmax recovers it;
+  `"log"` mixes the logits, which is a geometric mixture after
+  normalisation. The default is the arithmetic one because it is what a
+  caller blending *behaviours* is asking for — measured over a 200-state
+  β sweep (2026-08-25), the arithmetic mixture moved the share of steps
+  following the first source monotonically with β and left at most 14%
+  of steps following neither source, against 33% following neither at
+  β = 0.5 under the geometric mixture, which concentrates where both
+  sources agree. Rows over different vocabularies, a `beta` that is not
+  a finite number in `[0, 1]`, an unrecognised `opts.space`, a row
+  holding `NaN` or `+inf`, and a row with no finite entry at all are all
+  refused by name, at every `beta` including the endpoints; `-inf` (what
+  a constraint mask writes) is accepted, and in the arithmetic mixture
+  an id stays at zero probability exactly when neither row leaves it
+  any — which a mask on both sides reaches, and so does a pair of
+  scores far enough below their rows' maxima (about 745 nats) to
+  underflow. The geometric mixture lives on the ids both rows allow, so
+  two rows masked to disjoint id sets are refused rather than mixed into
+  a row with nothing left to sample. Per-step mixing is not a
+  claim about whole sequences: what fraction of a generated sequence
+  follows either source is a property of the models and remains
+  something to measure.
+
+- **Fractional conditioning: `opts.cond` accepts a weight per table
+  row.** `handle:generate_session(prompt, { cond = { w0, w1, ... } })`
+  conditions on `Σ wᵢ · cond_wte[i]` instead of on a single row, opening
+  the points between the rows a model was trained on. The integer form
+  (`cond = row`) is unchanged, and a one-hot weighting reproduces it.
+  Weights are used as given rather than normalised — coefficients
+  summing to more or less than one are a deliberate amplification or
+  damping, and nothing here can tell that apart from a mistake. A
+  weight vector that does not cover every row, an entry that is not a
+  number (a numeric string included), an entry that is not finite once
+  narrowed to the model's dtype, and a weighting that is all zero once
+  narrowed are refused; the last because it adds the zero vector, which
+  is the unfed state a conditioned model is already refused for running
+  in. Backed by
+  `Gpt2Model::forward_cond_weighted` in `algocline-nn`. Training still
+  takes discrete rows: what the weights interpolate is the embedding
+  space, and whether behaviour interpolates with it is a question about
+  the trained model.
+
 - **Slot conditioning (`cond_slots`) on the GPT-2 `custom` preset.** A
   model can be built with a conditioning table of `N` rows whose
   selected row is added to the residual stream at every position, so a

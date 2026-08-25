@@ -729,6 +729,28 @@ pub enum CondIndexError {
     NoSlots,
 }
 
+/// How a forward pass names the condition it adds to the residual
+/// stream.
+///
+/// Internal to the forward path: the public entry points
+/// ([`Gpt2Model::forward_conditioned`],
+/// [`Gpt2Model::forward_conditioned_groups`],
+/// [`Gpt2Model::forward_cond_weighted`]) each build one variant, so a
+/// caller never chooses between them by passing a tag.
+enum CondInput<'a> {
+    /// Table rows, `per_row` of them for each row of the batch, summed
+    /// before the addition.
+    Rows {
+        /// `batch * per_row` indices, row-major.
+        conds: &'a [CondIndex],
+        /// How many of them belong to each row of the batch.
+        per_row: usize,
+    },
+    /// One coefficient per table row; the combination they describe is
+    /// added to every row of the batch.
+    Weights(&'a [f32]),
+}
+
 /// A row of a model's conditioning table.
 ///
 /// The point of the wrapper is that the number inside cannot be
@@ -1305,6 +1327,64 @@ impl Gpt2Model {
             .map(|(logits, _)| logits)
     }
 
+    /// Forward pass whose condition is a **weighted combination** of the
+    /// whole conditioning table rather than one of its rows.
+    ///
+    /// `weights` holds one coefficient per row of `cond_wte`; the vector
+    /// `Σ weights[i] · cond_wte[i]` is added at every position, at the
+    /// same point [`Self::forward_conditioned`] adds a single row. One
+    /// combination covers the whole batch — the weights describe *what
+    /// to condition on*, and a batch conditioned row by row is what
+    /// [`Self::forward_conditioned`] already expresses.
+    ///
+    /// A one-hot `weights` reproduces [`Self::forward_conditioned`] on
+    /// the row it selects, so this is a widening of that entry point
+    /// rather than a second convention. The two reach that vector by
+    /// different kernels — the whole table gathered, scaled and reduced,
+    /// against the one row gathered — so they agree to within
+    /// floating-point reassociation rather than bit for bit.
+    ///
+    /// # Why the weights are not normalised
+    ///
+    /// Rescaling them here would silently change what the caller asked
+    /// for. Coefficients summing to more than one are a deliberate use
+    /// of this operation (an amplified condition), coefficients summing
+    /// to less are a damped one, and neither is distinguishable from a
+    /// caller error by anything this function can see. So the numbers
+    /// are used as given and their meaning stays with whoever chose
+    /// them.
+    ///
+    /// The one combination that is refused is all-zero: it adds the zero
+    /// vector, which is exactly what a model carrying this table does
+    /// when nobody feeds it — the state the channel exists to keep the
+    /// model out of. Refusing it here means "condition on nothing" has
+    /// to be said with [`Self::forward`], where it is visible.
+    ///
+    /// # Training
+    ///
+    /// The training entry points take table rows; nothing trains a
+    /// fractional combination. What the weights interpolate is therefore
+    /// the *embedding* space, and whether the model's behaviour
+    /// interpolates with it is a question about the trained model, not a
+    /// property of this call.
+    ///
+    /// # Errors
+    ///
+    /// - The model was built without a conditioning table.
+    /// - `weights.len()` is not the table's row count.
+    /// - Any weight is not finite **once narrowed to the model's
+    ///   dtype**: a NaN or infinity spreads through the sum to every
+    ///   position of the residual stream, and a weight finite as an
+    ///   `f32` can still be an infinity as an `f16`.
+    /// - Every weight is zero once narrowed (see above) — which
+    ///   coefficients far below the model dtype's smallest subnormal
+    ///   also reach.
+    /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
+    pub fn forward_cond_weighted(&self, xs: &Tensor, weights: &[f32]) -> CandleResult<Tensor> {
+        self.forward_inner(xs, Some(CondInput::Weights(weights)), None, None)
+            .map(|(logits, _)| logits)
+    }
+
     /// Forward pass with a condition embedding added at **every**
     /// position rather than carried by a token at the front of the row.
     ///
@@ -1332,7 +1412,7 @@ impl Gpt2Model {
     ///   which is a crossed pair rather than a typo.
     /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
     pub fn forward_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
-        self.forward_inner(xs, Some((conds, 1)), None, None)
+        self.forward_inner(xs, Some(CondInput::Rows { conds, per_row: 1 }), None, None)
             .map(|(logits, _)| logits)
     }
 
@@ -1382,7 +1462,7 @@ impl Gpt2Model {
                     .into(),
             ));
         }
-        self.forward_inner(xs, Some((conds, per_row)), None, None)
+        self.forward_inner(xs, Some(CondInput::Rows { conds, per_row }), None, None)
             .map(|(logits, _)| logits)
     }
 
@@ -1467,7 +1547,7 @@ impl Gpt2Model {
     fn forward_inner(
         &self,
         xs: &Tensor,
-        conds: Option<(&[CondIndex], usize)>,
+        cond: Option<CondInput<'_>>,
         allowed: Option<&AllowedSets>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
@@ -1493,8 +1573,16 @@ impl Gpt2Model {
         // The condition, if the caller passed one. Added here, beside
         // the positional embedding, so it is present at every position
         // instead of decaying with distance from a token at the front.
-        if let Some((conds, per_row)) = conds {
-            let cond_emb = self.condition_embedding(conds, b, per_row)?; // [B, 1, D]
+        if let Some(cond) = cond {
+            // `[B, 1, D]` from a row selection, `[1, 1, D]` from a
+            // weighted combination — both broadcast over the sequence,
+            // and the second over the batch as well.
+            let cond_emb = match cond {
+                CondInput::Rows { conds, per_row } => {
+                    self.condition_embedding(conds, b, per_row)?
+                }
+                CondInput::Weights(weights) => self.weighted_condition_embedding(weights)?,
+            };
             h = h.broadcast_add(&cond_emb)?;
         }
         // The allowed-id input, beside the condition and for the same
@@ -1613,6 +1701,79 @@ impl Gpt2Model {
         // [B, k, D] summed over k — one addition per slot, an identity
         // when k is 1.
         table.forward(&ids)?.sum(1)?.unsqueeze(1) // [B, 1, D]
+    }
+
+    /// The combination `Σ weights[i] · cond_wte[i]`, shaped
+    /// `[1, 1, dim]` so it broadcasts across both the batch and the
+    /// sequence.
+    ///
+    /// The whole table is gathered and scaled rather than only the rows
+    /// with a non-zero weight: which rows those are is data, and a
+    /// gather whose shape depends on the values would make two calls
+    /// with the same arity run different kernels. The table is
+    /// `cond_slots × dim` — the smallest tensor in the model — so the
+    /// scaled-and-summed form costs nothing worth branching for.
+    ///
+    /// Validation is here rather than at the entry point because this is
+    /// where the table is in hand: the row count the weights have to
+    /// match is the table's, and a model built without one has no count
+    /// to check against.
+    fn weighted_condition_embedding(&self, weights: &[f32]) -> CandleResult<Tensor> {
+        let table = self.cond_wte.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "gpt2 forward: this model has no conditioning table; build it with \
+                 `custom.cond_slots = Some(n)` to use forward_cond_weighted"
+                    .into(),
+            )
+        })?;
+        let slots = self
+            .cfg
+            .custom
+            .as_ref()
+            .and_then(|c| c.cond_slots)
+            .unwrap_or(0);
+        if weights.len() != slots {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: {} condition weight(s) for a {slots}-row conditioning table; \
+                 pass exactly one weight per row",
+                weights.len()
+            )));
+        }
+        // The coefficients are checked *after* the cast, because what
+        // multiplies the table is the cast tensor: an `f32` weight of
+        // 1e5 is finite as given and an infinity once narrowed to `f16`,
+        // and one of 1e-8 is non-zero as given and exactly zero once
+        // narrowed — the two states this validation exists to refuse.
+        // The check itself is done in `f32`, which every model dtype
+        // here widens into losslessly.
+        let shares = Tensor::from_slice(weights, (1, slots, 1), &self.cfg.device)?
+            .to_dtype(self.cfg.dtype)?;
+        let narrowed: Vec<f32> = shares.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+        if let Some((i, w)) = narrowed
+            .iter()
+            .enumerate()
+            .find(|(_, w)| !w.is_finite())
+            .map(|(i, w)| (i, *w))
+        {
+            let dtype = self.cfg.dtype;
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: condition weight {i} is {w} as {dtype:?} (given as {given}); a \
+                 non-finite coefficient reaches every position of the residual stream",
+                given = weights[i]
+            )));
+        }
+        if narrowed.iter().all(|w| *w == 0.0) {
+            let dtype = self.cfg.dtype;
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: every condition weight is zero as {dtype:?}, which adds the zero \
+                 vector — the same state a model carrying this table runs in when nobody feeds \
+                 it; an unconditioned run goes through `forward`"
+            )));
+        }
+        let rows: Vec<u32> = (0..slots as u32).collect();
+        let ids = Tensor::from_vec(rows, (1, slots), &self.cfg.device)?;
+        let table_rows = table.forward(&ids)?; // [1, slots, D]
+        table_rows.broadcast_mul(&shares)?.sum(1)?.unsqueeze(1) // [1, 1, D]
     }
 
     /// The per-position allowed-id vectors, shaped `[batch, seq, dim]`.
@@ -2895,6 +3056,205 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(msg.contains("conditioning table"), "{msg}");
+    }
+
+    // ─── Weighted conditions ──────────────────────────────────────
+
+    /// A one-hot combination is the row it selects. The two paths reach
+    /// the same vector by different kernels — a gather of the whole
+    /// table, scaled and reduced, against a gather of the one row — so
+    /// the agreement is asserted within a tolerance rather than
+    /// bit-for-bit.
+    #[test]
+    fn one_hot_weights_are_the_single_row_forward() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+
+        for row in 0..4u32 {
+            let mut weights = [0.0f32; 4];
+            weights[row as usize] = 1.0;
+            let selected = model.forward_conditioned(&ids, &[cond(row, 4)]).unwrap();
+            let weighted = model.forward_cond_weighted(&ids, &weights).unwrap();
+            let gap = crate::arch::max_abs_diff_f32(&selected, &weighted).unwrap();
+            assert!(
+                gap < 1e-6,
+                "one-hot weights on row {row} diverged from the row selection by {gap}"
+            );
+        }
+    }
+
+    /// Equal weights on two rows put the added vector exactly halfway
+    /// between the two rows' own vectors.
+    ///
+    /// The claim is about what is added to the residual stream, so it is
+    /// checked there. The logits are not a linear function of that
+    /// vector, and asserting a midpoint on them would be asserting
+    /// something the model does not promise — the second half of this
+    /// test only pins that the interpolation reaches the forward pass at
+    /// all.
+    #[test]
+    fn equal_weights_land_halfway_between_the_two_rows() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+
+        let first = model
+            .weighted_condition_embedding(&[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let second = model
+            .weighted_condition_embedding(&[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        let middle = model
+            .weighted_condition_embedding(&[0.5, 0.5, 0.0, 0.0])
+            .unwrap();
+        let average = (&first + &second).unwrap().affine(0.5, 0.0).unwrap();
+        let gap = crate::arch::max_abs_diff_f32(&middle, &average).unwrap();
+        assert!(
+            gap < 1e-6,
+            "the half-and-half vector was {gap} off the mean"
+        );
+        // Non-vacuity: if the two rows held the same vector, every
+        // combination of them would agree and the assertion above would
+        // hold for a table that carries no distinction at all.
+        let rows_differ = crate::arch::max_abs_diff_f32(&first, &second).unwrap();
+        assert!(
+            rows_differ > 1e-4,
+            "the two table rows are {rows_differ} apart — too close to tell a midpoint from an \
+             endpoint"
+        );
+
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let out_first = model
+            .forward_cond_weighted(&ids, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let out_middle = model
+            .forward_cond_weighted(&ids, &[0.5, 0.5, 0.0, 0.0])
+            .unwrap();
+        let logit_gap = crate::arch::max_abs_diff_f32(&out_first, &out_middle).unwrap();
+        assert!(
+            logit_gap > 1e-4,
+            "the interpolated condition changed the logits by {logit_gap}; it never reached the \
+             forward pass"
+        );
+    }
+
+    /// The weights are used as given. A scaled combination is a
+    /// different condition, not the same one renormalised.
+    #[test]
+    fn weights_are_not_normalised() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let plain = model
+            .forward_cond_weighted(&ids, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let amplified = model
+            .forward_cond_weighted(&ids, &[2.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let gap = crate::arch::max_abs_diff_f32(&plain, &amplified).unwrap();
+        assert!(
+            gap > 1e-4,
+            "doubling the coefficient changed nothing (gap {gap}); the weights were rescaled \
+             behind the caller's back"
+        );
+    }
+
+    /// One weight per row, or the caller and the table disagree about
+    /// which rows the numbers refer to.
+    #[test]
+    fn weighted_forward_rejects_a_count_that_is_not_one_per_row() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_cond_weighted(&ids, &[1.0, 0.0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("one weight per row"), "{msg}");
+    }
+
+    /// A non-finite coefficient would reach every position, and the
+    /// output would be uniformly unusable with nothing naming the cause.
+    #[test]
+    fn weighted_forward_rejects_a_non_finite_weight() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let msg = match model.forward_cond_weighted(&ids, &[0.5, bad, 0.0, 0.0]) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected an error for {bad}"),
+            };
+            assert!(msg.contains("condition weight 1"), "{msg}");
+        }
+    }
+
+    /// All-zero weights add the zero vector, which is the unfed state
+    /// the channel exists to keep the model out of.
+    #[test]
+    fn weighted_forward_rejects_an_all_zero_combination() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_cond_weighted(&ids, &[0.0, 0.0, 0.0, 0.0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("every condition weight is zero"), "{msg}");
+    }
+
+    /// The two refusals hold in the model's dtype rather than in the
+    /// `f32` the caller wrote, because the cast tensor is what
+    /// multiplies the table. `1e5` is finite as an `f32` and `+inf` as
+    /// an `f16` (which tops out at 65504); `1e-8` is non-zero as an
+    /// `f32` and exactly zero as an `f16` (whose smallest subnormal is
+    /// ≈ 6e-8), which is the zero-vector state the all-zero refusal
+    /// exists for. The `f32` model is run on the same weights as the
+    /// control: it accepts both, so the assertions above are about the
+    /// dtype and not about the numbers.
+    #[test]
+    fn weighted_forward_checks_the_weights_in_the_models_dtype() {
+        let mut half = conditioning_cfg(Some(4));
+        half.dtype = DType::F16;
+        let model = seeded_model(&half);
+
+        let msg = match model.weighted_condition_embedding(&[1.0e5, 0.0, 0.0, 0.0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(
+            msg.contains("condition weight 0") && msg.contains("F16"),
+            "{msg}"
+        );
+
+        let msg = match model.weighted_condition_embedding(&[1e-8; 4]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("every condition weight is zero"), "{msg}");
+
+        let full = seeded_model(&conditioning_cfg(Some(4)));
+        full.weighted_condition_embedding(&[1.0e5, 0.0, 0.0, 0.0])
+            .expect("1e5 is an ordinary f32 coefficient");
+        full.weighted_condition_embedding(&[1e-8; 4])
+            .expect("1e-8 is non-zero as an f32");
+    }
+
+    /// A model built without the table has no rows to combine, and says
+    /// so rather than ignoring the argument.
+    #[test]
+    fn weighted_forward_needs_a_table() {
+        let cfg = conditioning_cfg(None);
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_cond_weighted(&ids, &[1.0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(
+            msg.contains("no conditioning table") && msg.contains("forward_cond_weighted"),
+            "{msg}"
+        );
     }
 
     /// The constructor is where a row from some other numbering stops.

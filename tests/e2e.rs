@@ -9365,3 +9365,136 @@ async fn test_nn_channel_cond_slots_wrong_type_errors() {
         "the error must name the option and the expected type: {text}"
     );
 }
+
+// ─── alc.nn decode-side mixing ────────────────────────────────────
+//
+// Same `nn`-feature gate and the same reason as the channel tests
+// above: without candle linked there is no `alc.nn.preset` for these to
+// drive.
+
+/// Two rows mixed into one over the wire. The mixture is an ordinary
+/// logits handle — it answers `vocab` / `top` / `argmax` — and at
+/// `beta = 1` it ranks the ids the way the row it names does.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_logits_mix_blends_two_rows() {
+    let harness = TempAlcHome::connect().await;
+
+    let code = r#"
+        local handle = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local a = handle:generate_session({ 1, 2, 3 }):next_logits()
+        local b = handle:generate_session({ 10, 11, 12 }):next_logits()
+        local mixed = alc.nn.logits.mix(a, b, 0.5)
+        local geometric = alc.nn.logits.mix(a, b, 0.5, { space = "log" })
+        return {
+            vocab = mixed:vocab(),
+            candidates = #mixed:top(3),
+            a_argmax = a:argmax(),
+            b_argmax = b:argmax(),
+            at_one = alc.nn.logits.mix(a, b, 1.0):argmax(),
+            at_zero = alc.nn.logits.mix(a, b, 0.0):argmax(),
+            log_vocab = geometric:vocab(),
+        }
+    "#;
+
+    let resp = call_json(&harness.client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "completed", "run failed: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["vocab"], 64, "tiny-shaped vocabulary: {result}");
+    assert_eq!(result["log_vocab"], 64, "log-space mixture width: {result}");
+    assert_eq!(result["candidates"], 3, "top(3) over the mixture: {result}");
+    assert_eq!(
+        result["at_one"], result["a_argmax"],
+        "beta = 1 must rank as a does: {result}"
+    );
+    assert_eq!(
+        result["at_zero"], result["b_argmax"],
+        "beta = 0 must rank as b does: {result}"
+    );
+}
+
+/// A decode session conditioned on a combination of table rows rather
+/// than on one of them. The one-hot case is checked against the row
+/// form in the same run, so the widening is pinned to the behaviour it
+/// widens.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_fractional_cond_decode() {
+    let harness = TempAlcHome::connect().await;
+
+    let code = r#"
+        local handle = alc.nn.preset.gpt2("custom", {
+            pretrained = false, cond_slots = 2,
+        })
+        local by_row = handle:generate_session({ 1, 2, 3 }, { cond = 0 }):next_logits()
+        local one_hot = handle:generate_session({ 1, 2, 3 }, { cond = { 1.0, 0.0 } })
+            :next_logits()
+        local session = handle:generate_session({ 1, 2, 3 }, { cond = { 0.5, 0.5 } })
+        local blended = session:next_logits()
+        session:append(blended:argmax())
+        return {
+            vocab = blended:vocab(),
+            position = session:position(),
+            row_argmax = by_row:argmax(),
+            one_hot_argmax = one_hot:argmax(),
+        }
+    "#;
+
+    let resp = call_json(&harness.client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "completed", "run failed: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["vocab"], 64, "tiny-shaped vocabulary: {result}");
+    assert_eq!(
+        result["position"], 4,
+        "three prompt tokens plus the appended one: {result}"
+    );
+    assert_eq!(
+        result["one_hot_argmax"], result["row_argmax"],
+        "a one-hot weighting must decode as the row it selects: {result}"
+    );
+}
+
+/// The two refusals a caller is most likely to hit, over the wire: a
+/// weight vector that does not cover the table, and a mixture of rows
+/// over different vocabularies. Both have to arrive as errors naming
+/// the argument rather than as a plausible-looking generation.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_mixing_refusals_reach_the_wire() {
+    let harness = TempAlcHome::connect().await;
+
+    let weights = r#"
+        local handle = alc.nn.preset.gpt2("custom", {
+            pretrained = false, cond_slots = 2,
+        })
+        return handle:generate_session({ 1, 2, 3 }, { cond = { 1.0, 0.0, 0.0 } })
+    "#;
+    let result = harness
+        .client
+        .call_tool(call_params("alc_run", json!({ "code": weights })))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("3 weight(s)") && text.contains("2-row"),
+        "the error must name both counts: {text}"
+    );
+
+    let vocab = r#"
+        local wide = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local narrow = alc.nn.preset.gpt2("custom", { pretrained = false, vocab = 32 })
+        local a = wide:generate_session({ 1, 2, 3 }):next_logits()
+        local b = narrow:generate_session({ 1, 2, 3 }):next_logits()
+        return alc.nn.logits.mix(a, b, 0.5)
+    "#;
+    let result = harness
+        .client
+        .call_tool(call_params("alc_run", json!({ "code": vocab })))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("64 ids") && text.contains("32"),
+        "the error must name both vocabularies: {text}"
+    );
+}

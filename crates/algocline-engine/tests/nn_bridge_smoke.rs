@@ -1210,6 +1210,146 @@ fn alc_nn_next_logits_without_append_errors() {
     assert!(err.contains("no pending tokens"), "unexpected error: {err}");
 }
 
+/// `alc.nn.logits.mix` from Lua: the result is an ordinary logits
+/// handle, and the endpoints of `beta` rank the ids the way the row
+/// they name does.
+///
+/// Ranking rather than values, because `LogitsHandle` is opaque here —
+/// the value-level claim (the stored row denotes `β·pA + (1-β)·pB`)
+/// lives in `bridge/nn_gen.rs`'s in-crate tests.
+#[test]
+fn alc_nn_logits_mix_runs_from_lua() {
+    let lua = nn_vm();
+    lua.load(
+        r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            local a = h:generate_session({ 1, 2, 3 }):next_logits()
+            local b = h:generate_session({ 10, 11, 12 }):next_logits()
+            assert(a:argmax() ~= b:argmax(),
+                "the two prompts must rank differently for this test to prove anything")
+
+            local mixed = alc.nn.logits.mix(a, b, 0.5)
+            assert(mixed:vocab() == a:vocab(), "the mixture must span the same vocabulary")
+            assert(#mixed:top(3) == 3, "the mixture must answer top(n) like any other row")
+
+            assert(alc.nn.logits.mix(a, b, 1.0):argmax() == a:argmax(),
+                "beta = 1 must rank as a does")
+            assert(alc.nn.logits.mix(a, b, 0.0):argmax() == b:argmax(),
+                "beta = 0 must rank as b does")
+
+            local geometric = alc.nn.logits.mix(a, b, 0.5, { space = "log" })
+            assert(geometric:vocab() == a:vocab(), "the log-space mixture must span the vocabulary")
+            assert(alc.nn.logits.mix(a, b, 1.0, { space = "log" }):argmax() == a:argmax(),
+                "beta = 1 in log space must rank as a does")
+
+            -- A mixture is a row, so it mixes again and samples like one.
+            local twice = alc.nn.logits.mix(mixed, a, 0.25)
+            assert(twice:vocab() == a:vocab(), "a mixture of a mixture is still a row")
+            local s = alc.nn.sampler.greedy()
+            assert(s:sample(twice) == twice:argmax(), "a greedy sampler must accept the mixture")
+        "#,
+    )
+    .exec()
+    .expect("logits mix from Lua");
+}
+
+/// The refusals reach Lua naming the argument that was wrong.
+#[test]
+fn alc_nn_logits_mix_refusals_reach_lua() {
+    let lua = nn_vm();
+    lua.load(
+        r#"
+            local h = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+            local a = h:generate_session({ 1, 2, 3 }):next_logits()
+            local b = h:generate_session({ 4, 5, 6 }):next_logits()
+
+            local function fails(f, needle)
+                local ok, err = pcall(f)
+                assert(not ok, "expected a refusal mentioning " .. needle)
+                assert(tostring(err):find(needle, 1, true),
+                    "unexpected error: " .. tostring(err))
+            end
+
+            fails(function() return alc.nn.logits.mix(a, b, 1.5) end, "outside [0, 1]")
+            fails(function() return alc.nn.logits.mix(a, b, "0.5") end, "beta must be a number")
+            fails(function() return alc.nn.logits.mix(a, b, 0.5, { space = "probs" }) end,
+                "not a mixing space")
+
+            -- Different vocabularies: a narrower model's ids do not
+            -- denote the same tokens.
+            local narrow = alc.nn.preset.gpt2("custom", {
+                pretrained = false, device = "cpu", dtype = "f32", vocab = 32,
+            })
+            local c = narrow:generate_session({ 1, 2, 3 }):next_logits()
+            fails(function() return alc.nn.logits.mix(a, c, 0.5) end, "ids and b over")
+        "#,
+    )
+    .exec()
+    .expect("logits mix refusals from Lua");
+}
+
+/// The array form of `opts.cond` from Lua: a one-hot weighting decodes
+/// as the row it selects, and an interpolation between two rows runs.
+#[test]
+fn alc_nn_gpt2_session_cond_weights_from_lua() {
+    let lua = nn_vm();
+    lua.load(
+        r#"
+            local h = alc.nn.preset.gpt2("custom", {
+                pretrained = false, device = "cpu", dtype = "f32", cond_slots = 2,
+            })
+            local by_row = h:generate_session({ 1, 2, 3 }, { cond = 0 }):next_logits()
+            local by_weights = h:generate_session({ 1, 2, 3 }, { cond = { 1.0, 0.0 } })
+                :next_logits()
+            assert(by_row:argmax() == by_weights:argmax(),
+                "a one-hot weighting must decode as the row it selects")
+
+            local blended = h:generate_session({ 1, 2, 3 }, { cond = { 0.5, 0.5 } }):next_logits()
+            assert(blended:vocab() == h:vocab(), "the interpolated session must answer a full row")
+
+            -- Coefficients are used as given, so a scaled one is a
+            -- different condition rather than the same one renormalised.
+            local scaled = h:generate_session({ 1, 2, 3 }, { cond = { 2.0, 0.0 } }):next_logits()
+            assert(scaled:vocab() == h:vocab(), "an amplified condition must still answer a row")
+        "#,
+    )
+    .exec()
+    .expect("weighted cond session from Lua");
+}
+
+/// Every way the array form can disagree with the model reaches Lua as
+/// an error naming `opts.cond`.
+#[test]
+fn alc_nn_gpt2_session_cond_weights_refusals_reach_lua() {
+    let lua = nn_vm();
+    lua.load(
+        r#"
+            local h = alc.nn.preset.gpt2("custom", {
+                pretrained = false, device = "cpu", dtype = "f32", cond_slots = 2,
+            })
+            local function fails(weights, needle)
+                local ok, err = pcall(function()
+                    return h:generate_session({ 1, 2, 3 }, { cond = weights })
+                end)
+                assert(not ok, "expected a refusal mentioning " .. needle)
+                assert(tostring(err):find(needle, 1, true),
+                    "unexpected error: " .. tostring(err))
+            end
+
+            fails({ 1.0, 0.0, 0.0 }, "3 weight(s)")
+            fails({ 0.0, 0.0 }, "every weight in opts.cond is zero")
+            fails({ "half", 0.0 }, "opts.cond[1]")
+            -- A numeric string is refused too, the way `beta` refuses
+            -- one: Lua would have coerced it, and a weight that arrived
+            -- as text was built by concatenation.
+            fails({ "0.5", 0.0 }, "must be a number")
+            fails({}, "empty table")
+        "#,
+    )
+    .exec()
+    .expect("weighted cond refusals from Lua");
+}
+
 /// An empty prompt has nothing to forward, so the session is refused at
 /// construction rather than failing on the first `next_logits`.
 #[test]

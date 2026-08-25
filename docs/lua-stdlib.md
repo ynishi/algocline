@@ -847,6 +847,102 @@ a state it never trained in and the output looks entirely ordinary.
 every position of every step. The per-position decode form is not in
 this release.
 
+**Fractional conditions** — `cond` also accepts an array of weights,
+one per row of the table, in row order:
+`generate_session(prompt, { cond = { 0.5, 0.5 } })`. The condition
+added at every position is then `Σ wᵢ · cond_wte[i]` — a point between
+the rows rather than one of them. A one-hot weighting is exactly the
+integer form on the row it selects, so this widens `cond` without
+changing it.
+
+The weights are **not normalised**: coefficients summing to more than
+one amplify the condition and less than one damp it, and neither is
+distinguishable from a mistake by anything the bridge can see, so the
+numbers are used as given. Refused: a list that does not cover every
+row, an entry that is not a number (a numeric string is not one — a
+weight that arrived as text was built by concatenation), an entry that
+does not survive as a finite weight in the model's dtype, and a
+weighting that is all zero in that dtype (it adds the zero vector — the
+same unfed state a conditioned model is already refused for).
+
+Training takes discrete rows. What the weights interpolate is the
+embedding space; whether the model's *behaviour* interpolates with it
+is a property of the trained model and something to measure, not
+something this option asserts.
+
+#### `alc.nn.logits.mix(a, b, beta, opts?)`
+
+Combine two logits rows into one, with `beta` the weight on `a`.
+
+**Parameters:**
+
+| name   | type       | required | notes                                            |
+|--------|------------|----------|--------------------------------------------------|
+| a      | LogitsHandle | yes    | from `session:next_logits()` (or an earlier mix) |
+| b      | LogitsHandle | yes    | same vocabulary as `a`                           |
+| beta   | number     | yes      | finite, in `[0, 1]`; the weight on `a`           |
+| opts   | table      | no       | `{ space = "prob" \| "log" }` — default `"prob"` |
+
+**Returns:** a `LogitsHandle`. It is an ordinary row: `vocab()`,
+`top(n)`, `argmax()`, the samplers, and a constrained sampler all take
+it, and it can be mixed again.
+
+- **`space = "prob"` (default)** — mixes the distributions:
+  `β·softmax(a) + (1-β)·softmax(b)`, stored as the log of that mixture
+  so the downstream softmax recovers it.
+- **`space = "log"`** — mixes the logits: `β·a + (1-β)·b`, which after
+  normalisation is a *geometric* mixture of the two distributions.
+
+The default is the arithmetic mixture because it is the operation a
+caller blending two behaviours is asking for. Measured over a 200-state
+β sweep (2026-08-25): under the arithmetic mixture the share of steps
+following the first source moved monotonically with β and at most 14%
+of steps followed neither source; under the geometric mixture 33% of
+steps at β = 0.5 followed neither. That is the geometric mixture
+working as intended — it concentrates where both sources put mass,
+which is a consensus rather than a blend — so `"log"` stays available
+and stays a deliberate choice.
+
+**Errors:** rows over different vocabularies, a `beta` that is not a
+number / not finite / outside `[0, 1]`, an `opts.space` other than
+`"prob"` or `"log"` (a typo is refused rather than defaulted — the two
+produce different distributions), and a row holding `NaN` or `+inf` or
+no finite entry at all. Both rows are read and checked at every `beta`,
+the endpoints included. `-inf` is accepted and carried: that is what a
+constraint mask writes, and it means the same thing in both spaces.
+
+At the endpoints of `space = "log"` the row named by `beta` is returned
+as given rather than recomputed. That is the operation's own shape: the
+geometric mixture lives on the ids *both* rows leave open for every
+`beta` strictly inside `[0, 1]`, and on `a`'s alone at `beta = 1`. For
+the same reason, two rows masked to disjoint id sets have no geometric
+mixture — every id would be masked — and that is refused rather than
+returned; `space = "prob"` mixes over the union instead. In the
+arithmetic mixture an id keeps zero probability exactly when neither
+row leaves it any, which a mask on both sides reaches and so does a
+pair of scores about 745 nats below their rows' maxima (both underflow
+to zero in the f64 softmax).
+
+Mixing per step says nothing about whole sequences. What fraction of a
+generated sequence follows either source depends on the models and the
+states they reach; `beta` weights one step's distribution and the rest
+is measured.
+
+```lua
+local one = model_a:generate_session(prompt)
+local other = model_b:generate_session(prompt)
+local sampler = alc.nn.sampler.greedy()
+
+for _ = 1, steps do
+    local mixed = alc.nn.logits.mix(one:next_logits(), other:next_logits(), 0.7)
+    local id = sampler:sample(mixed)
+    -- both sessions have to be advanced, or they stop describing the
+    -- same prefix and the next mixture is of two different states
+    one:append(id)
+    other:append(id)
+end
+```
+
 ```lua
 local h = alc.nn.preset.gpt2("custom", { pretrained = false, cond_slots = 2 })
 

@@ -13,6 +13,7 @@
 //! logits:vocab()                         -> n
 //! logits:top(n)                          -> { { id = i, value = v }, ... }
 //! logits:argmax()                        -> id
+//! alc.nn.logits.mix(a, b, beta, opts?)   -> LogitsHandle
 //! alc.nn.tokenize(preset, text)          -> { id, ... }
 //! alc.nn.detokenize(preset, ids)         -> string
 //! alc.nn.chat_prompt(preset, messages)   -> string
@@ -54,7 +55,10 @@
 //! (`alc.nn.preset.gpt2("custom", { cond_slots = N })` or
 //! `{ allowed_input = true }`) reads that channel on every forward, so
 //! a session over it takes the channel's value in `opts`:
-//! `{ cond = <row> }` or `{ allowed = { id, ... } }`. Both directions
+//! `{ cond = <row> }` or `{ allowed = { id, ... } }`. `cond` also
+//! accepts `{ w0, w1, ... }` — one weight per row of the table — which
+//! conditions on the combination those weights describe rather than on
+//! a single row. Both directions
 //! of disagreement between the option and the model are refused — see
 //! [`extract_channel`], which also says why the *silent* direction (a
 //! table the caller says nothing about) is the one that matters.
@@ -147,6 +151,15 @@ enum SessionChannel {
     /// A row of the model's conditioning table, added at every
     /// position of every step.
     Cond(CondIndex),
+    /// A weighted combination of *every* row of the model's
+    /// conditioning table, added at every position of every step.
+    ///
+    /// The rows the model trained on are the table's own; a combination
+    /// of them is a point the training never visited, which is the
+    /// point of having it at decode time. Whether the model's behaviour
+    /// varies smoothly between two rows is a question about the trained
+    /// model — this only makes the question askable.
+    CondWeights(Vec<f32>),
     /// The ids the model may pick from. Flat: the same set is handed
     /// to every position of every step.
     ///
@@ -406,6 +419,11 @@ impl GenSession {
                         let conds = [*index];
                         self.full_history_row(|input| guard.forward_conditioned(input, &conds))?
                     }
+                    SessionChannel::CondWeights(weights) => {
+                        // One combination for the whole forward; the
+                        // session is batch-1 either way.
+                        self.full_history_row(|input| guard.forward_cond_weighted(input, weights))?
+                    }
                     SessionChannel::Allowed(ids) => self.full_history_row(|input| {
                         // The same set at every position of the one
                         // row, rebuilt each step because the history
@@ -484,6 +502,12 @@ const GEN_SESSION_ERR_PREFIX: &str = "alc.nn generate_session";
 /// `vocab` bounds the `allowed` ids: an id outside it is refused here
 /// rather than at the embedding lookup, where the message would name
 /// neither the option nor the bound.
+///
+/// `cond` arrives in one of two forms ([`CondOpt`]). The weighted form
+/// is checked against the same declared row count as the row form, and
+/// an all-zero weighting is refused for the reason an unfed table is:
+/// it adds the zero vector, so the model runs in a state it never
+/// trained in and the output looks no different.
 fn extract_channel(
     opts: Option<&LuaTable>,
     declared: DeclaredChannels,
@@ -491,12 +515,7 @@ fn extract_channel(
 ) -> LuaResult<SessionChannel> {
     let (cond, allowed) = match opts {
         Some(t) => (
-            t.get::<Option<u32>>("cond").map_err(|e| {
-                LuaError::external(format!(
-                    "{GEN_SESSION_ERR_PREFIX}: opts.cond must be a conditioning-table row \
-                     (a non-negative integer): {e}"
-                ))
-            })?,
+            extract_cond(t)?,
             t.get::<Option<Vec<u32>>>("allowed").map_err(|e| {
                 LuaError::external(format!(
                     "{GEN_SESSION_ERR_PREFIX}: opts.allowed must be an array of token ids: {e}"
@@ -514,7 +533,7 @@ fn extract_channel(
     }
 
     match (cond, allowed) {
-        (Some(row), None) => {
+        (Some(cond), None) => {
             let slots = declared.cond_slots.ok_or_else(|| {
                 LuaError::external(format!(
                     "{GEN_SESSION_ERR_PREFIX}: opts.cond was given but this model has no \
@@ -522,10 +541,32 @@ fn extract_channel(
                      alc.nn.preset.gpt2('custom', {{ cond_slots = N }})"
                 ))
             })?;
-            let index = CondIndex::new(row, slots).map_err(|e| {
-                LuaError::external(format!("{GEN_SESSION_ERR_PREFIX}: opts.cond: {e}"))
-            })?;
-            Ok(SessionChannel::Cond(index))
+            match cond {
+                CondOpt::Row(row) => {
+                    let index = CondIndex::new(row, slots).map_err(|e| {
+                        LuaError::external(format!("{GEN_SESSION_ERR_PREFIX}: opts.cond: {e}"))
+                    })?;
+                    Ok(SessionChannel::Cond(index))
+                }
+                CondOpt::Weights(weights) => {
+                    if weights.len() != slots {
+                        return Err(LuaError::external(format!(
+                            "{GEN_SESSION_ERR_PREFIX}: opts.cond holds {} weight(s) for a \
+                             {slots}-row conditioning table; as a table it is one weight per \
+                             row, in row order",
+                            weights.len()
+                        )));
+                    }
+                    if weights.iter().all(|w| *w == 0.0) {
+                        return Err(LuaError::external(format!(
+                            "{GEN_SESSION_ERR_PREFIX}: every weight in opts.cond is zero, which \
+                             adds nothing — the same state this model runs in when the channel \
+                             is left unfed, and the reason an unfed one is refused above"
+                        )));
+                    }
+                    Ok(SessionChannel::CondWeights(weights))
+                }
+            }
         }
         (None, Some(ids)) => {
             if !declared.allowed_input {
@@ -567,6 +608,99 @@ fn extract_channel(
         // Refused above.
         (Some(_), Some(_)) => unreachable!("both channels guarded above"),
     }
+}
+
+/// What `opts.cond` said, before it is checked against the model.
+///
+/// Two forms, because there are two things a caller can mean by "the
+/// condition": one of the table's rows, or a combination of all of
+/// them. They are distinguished by Lua type rather than by a second
+/// key — a number is a row and a table is a weight vector — so neither
+/// form can be written in a way the other would accept.
+enum CondOpt {
+    /// A row index, the form that has always been accepted.
+    Row(u32),
+    /// One weight per row of the table, in row order.
+    Weights(Vec<f32>),
+}
+
+/// Read `opts.cond` in either of its forms.
+///
+/// The number path re-reads the key through mlua's own conversion so
+/// that what an integer `cond` accepts is exactly what it accepted
+/// before this second form existed — including the integral-float case
+/// (`cond = 1.0`), which arithmetic on a row index produces.
+fn extract_cond(opts: &LuaTable) -> LuaResult<Option<CondOpt>> {
+    let raw: LuaValue = opts
+        .get("cond")
+        .map_err(|e| LuaError::external(format!("{GEN_SESSION_ERR_PREFIX}: opts.cond: {e}")))?;
+    match raw {
+        LuaValue::Nil => Ok(None),
+        LuaValue::Table(weights) => extract_cond_weights(&weights).map(Some),
+        _ => opts
+            .get::<u32>("cond")
+            .map(|row| Some(CondOpt::Row(row)))
+            .map_err(|e| {
+                LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.cond must be a conditioning-table row \
+                     (a non-negative integer) or an array of one weight per row: {e}"
+                ))
+            }),
+    }
+}
+
+/// Read the array form of `opts.cond`.
+///
+/// Every element is required to be a number that survives the trip to
+/// `f32` finite: a weight that arrived as `1e300` would become an
+/// infinity before the model ever saw it, and the caller who wrote it
+/// would have no way to see where it turned. What the *model's* dtype
+/// makes of a weight is checked where the dtype is known, in
+/// `Gpt2Model::forward_cond_weighted`.
+///
+/// Each element is taken as a [`LuaValue`] and matched, for the reason
+/// [`mix_beta`] is: mlua's own conversion would also accept a numeric
+/// *string*, and a weight that arrived as text is a caller who built it
+/// by concatenation, which is a different bug than a weight out of
+/// range.
+///
+/// The length is not checked here — the number of rows belongs to the
+/// model, and [`extract_channel`] is where the two meet.
+fn extract_cond_weights(weights: &LuaTable) -> LuaResult<CondOpt> {
+    let len = weights.raw_len();
+    if len == 0 {
+        return Err(LuaError::external(format!(
+            "{GEN_SESSION_ERR_PREFIX}: opts.cond is an empty table; as a table it names one \
+             weight per conditioning row, and no weights name no condition"
+        )));
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 1..=len {
+        let raw: LuaValue = weights.get(i).map_err(|e| {
+            LuaError::external(format!(
+                "{GEN_SESSION_ERR_PREFIX}: opts.cond[{i}] must be a number: {e}"
+            ))
+        })?;
+        let value = match raw {
+            LuaValue::Integer(v) => v as f64,
+            LuaValue::Number(v) => v,
+            other => {
+                return Err(LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.cond[{i}] must be a number, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let weight = value as f32;
+        if !weight.is_finite() {
+            return Err(LuaError::external(format!(
+                "{GEN_SESSION_ERR_PREFIX}: opts.cond[{i}] = {value} is not a finite weight as an \
+                 f32; it would reach every position of every step"
+            )));
+        }
+        out.push(weight);
+    }
+    Ok(CondOpt::Weights(out))
 }
 
 /// Validate one caller-supplied token id against the model's vocabulary.
@@ -704,6 +838,268 @@ impl mlua::UserData for LogitsHandle {
     }
 }
 
+/// Error prefix for the `alc.nn.logits.mix` surface.
+const LOGITS_MIX_ERR_PREFIX: &str = "alc.nn.logits.mix";
+
+/// The space a mixture's coefficients act in.
+///
+/// The two are different operations on the same pair of rows, and which
+/// one a caller wants depends on what they are mixing *for* — see
+/// [`mix_impl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixSpace {
+    /// Mix the distributions: `β·softmax(a) + (1-β)·softmax(b)`.
+    Prob,
+    /// Mix the logits: `β·a + (1-β)·b`.
+    Log,
+}
+
+impl MixSpace {
+    /// Resolve the `opts.space` string.
+    ///
+    /// An unrecognised name is refused rather than falling back to the
+    /// default: the two spaces produce different distributions, and a
+    /// typo'd `"probs"` silently taking the arithmetic path would be a
+    /// caller who believes they measured one operation and measured the
+    /// other.
+    fn parse(name: &str) -> LuaResult<Self> {
+        match name {
+            "prob" => Ok(Self::Prob),
+            "log" => Ok(Self::Log),
+            other => Err(LuaError::external(format!(
+                "{LOGITS_MIX_ERR_PREFIX}: opts.space = '{other}' is not a mixing space \
+                 (expected 'prob' or 'log')"
+            ))),
+        }
+    }
+}
+
+/// Read a `[vocab]` f32 row off a handle and refuse the values that
+/// have no image under either mixture.
+///
+/// `-inf` is accepted: it is what a constraint mask writes into a row,
+/// and it means the same thing in both spaces (an id with no
+/// probability). `NaN` and `+inf` are refused — the softmax of a row
+/// containing `+inf` is `0/0` at every other entry, and a `NaN` reaching
+/// [`LogitsHandle::top`] would sort to one end of `total_cmp`'s order
+/// (above `+inf` or below `-inf`, by its sign bit) rather than being
+/// ignored, and that order is the ranking a sampler acts on.
+fn mix_row(handle: &LogitsHandle, side: &str) -> LuaResult<Vec<f32>> {
+    let row: Vec<f32> = handle
+        .tensor()
+        .to_vec1()
+        .map_err(|e| LuaError::external(format!("{LOGITS_MIX_ERR_PREFIX}: reading {side}: {e}")))?;
+    if let Some((index, value)) = row
+        .iter()
+        .enumerate()
+        .find(|(_, v)| v.is_nan() || **v == f32::INFINITY)
+    {
+        return Err(LuaError::external(format!(
+            "{LOGITS_MIX_ERR_PREFIX}: {side}[{index}] is {value}; a mixture of it is undefined \
+             (-inf is accepted — that is what a constraint mask writes)"
+        )));
+    }
+    Ok(row)
+}
+
+/// The row's largest entry, refusing a row that has no finite one.
+///
+/// A row of nothing but `-inf` (or an empty row) denotes no
+/// distribution: every id has been struck out, so there is nothing left
+/// to weight. Both mixing spaces need that refused — [`softmax_f64`]
+/// because the shift below needs a finite maximum, and the log space
+/// because `β·-inf + (1-β)·-inf` would carry the dead row through.
+fn finite_max(row: &[f32], side: &str) -> LuaResult<f32> {
+    let max = row.iter().fold(f32::NEG_INFINITY, |acc, v| acc.max(*v));
+    if !max.is_finite() {
+        return Err(LuaError::external(format!(
+            "{LOGITS_MIX_ERR_PREFIX}: {side} has no finite entry, so it denotes no \
+             distribution to mix"
+        )));
+    }
+    Ok(max)
+}
+
+/// The distribution a row denotes, in f64.
+///
+/// Shifted by the row's maximum before exponentiating, so the largest
+/// term is `exp(0) = 1` and the denominator is at least 1 — the division
+/// below cannot be by zero.
+fn softmax_f64(row: &[f32], side: &str) -> LuaResult<Vec<f64>> {
+    let max = f64::from(finite_max(row, side)?);
+    let mut weights: Vec<f64> = row.iter().map(|v| (f64::from(*v) - max).exp()).collect();
+    let total: f64 = weights.iter().sum();
+    for w in &mut weights {
+        *w /= total;
+    }
+    Ok(weights)
+}
+
+/// `alc.nn.logits.mix(a, b, beta, opts?) -> logits`
+///
+/// Combine two rows into one, with `beta` the weight on `a`.
+///
+/// ```text
+/// local mixed = alc.nn.logits.mix(from_one, from_other, 0.7)
+/// local id = mixed:argmax()          -- or hand it to a sampler
+/// ```
+///
+/// The result is an ordinary logits handle, so everything that consumes
+/// one — `argmax`, `top`, the samplers, a constrained sampler — consumes
+/// this too.
+///
+/// # The two spaces
+///
+/// `opts.space = "prob"` (the default) mixes the *distributions*:
+/// `softmax(a)` and `softmax(b)` are combined as
+/// `β·pA + (1-β)·pB`, and the result is stored as the log of that
+/// mixture so the downstream softmax recovers it. `"log"` mixes the
+/// logits themselves, `β·a + (1-β)·b`, which is a geometric mixture of
+/// the two distributions after normalisation.
+///
+/// The default is `"prob"` because the two answer different questions
+/// and the arithmetic one is the question a caller mixing *behaviours*
+/// is asking. Measured on a 200-state sweep of β (2026-08-25): under the
+/// arithmetic mixture the share of steps agreeing with the first source
+/// moved monotonically with β and at most 14% of steps agreed with
+/// neither source, while under the geometric mixture 33% of steps at
+/// β = 0.5 agreed with neither. That is the geometric mixture behaving
+/// as it is supposed to — it concentrates where both sources put mass,
+/// which is a consensus, not a blend — so `"log"` stays available and
+/// stays a deliberate choice.
+///
+/// # What this does not claim
+///
+/// Mixing per step is not the same as mixing over whole sequences. What
+/// fraction of a *generated sequence* follows either source is a
+/// property of the models and the states they reach, not of β, and
+/// nothing here establishes a relation between the two. β is the weight
+/// on one step's distribution; anything beyond that is measured, not
+/// assumed.
+///
+/// # Errors
+///
+/// - The rows are over different vocabularies.
+/// - `beta` is not a number, is not finite, or is outside `[0, 1]`.
+/// - `opts.space` is a string other than `"prob"` or `"log"`.
+/// - Either row holds a `NaN` or a `+inf`, or has no finite entry at
+///   all (see [`mix_row`] and [`finite_max`]). Both rows are checked at
+///   every `beta`, the endpoints included.
+/// - The geometric mixture masks every id, which happens when the two
+///   rows leave no id unmasked in common: the result would denote no
+///   distribution, and the arithmetic space is where a union is meant.
+fn mix_impl(a: &LogitsHandle, b: &LogitsHandle, beta: f64, space: MixSpace) -> LuaResult<Tensor> {
+    let vocab_a = a
+        .tensor()
+        .dims1()
+        .map_err(|e| LuaError::external(format!("{LOGITS_MIX_ERR_PREFIX}: a: {e}")))?;
+    let vocab_b = b
+        .tensor()
+        .dims1()
+        .map_err(|e| LuaError::external(format!("{LOGITS_MIX_ERR_PREFIX}: b: {e}")))?;
+    if vocab_a != vocab_b {
+        return Err(LuaError::external(format!(
+            "{LOGITS_MIX_ERR_PREFIX}: a is over {vocab_a} ids and b over {vocab_b}; mixing them \
+             would add together the scores of tokens that do not denote the same thing"
+        )));
+    }
+    if !(0.0..=1.0).contains(&beta) {
+        return Err(LuaError::external(format!(
+            "{LOGITS_MIX_ERR_PREFIX}: beta = {beta} is outside [0, 1]; beta is the weight on a \
+             and (1 - beta) the weight on b"
+        )));
+    }
+
+    // Both rows are read and checked before anything is returned, at
+    // every `beta` including the endpoints. The refusals are a statement
+    // about the arguments — a row carrying a `NaN` or a `+inf`, or one
+    // with nothing left unmasked, is not a distribution — and a
+    // statement that held only for `beta` strictly inside the interval
+    // would be one the caller could not act on.
+    let row_a = mix_row(a, "a")?;
+    let row_b = mix_row(b, "b")?;
+    finite_max(&row_a, "a")?;
+    finite_max(&row_b, "b")?;
+
+    // The endpoints of the log-space mixture are the row they name,
+    // returned rather than computed. That is the convention the
+    // operation carries, not a workaround: the geometric family
+    // `p ∝ pA^β·pB^(1-β)` lives on `supp(pA) ∩ supp(pB)` for every β in
+    // (0, 1) and on `supp(pA)` alone at β = 1 under `x⁰ = 1`, so the
+    // value at an endpoint genuinely differs from the limit approaching
+    // it. Computing it here would also read `0 · -inf`, which is `NaN`.
+    if space == MixSpace::Log {
+        if beta == 1.0 {
+            return Ok(a.tensor().clone());
+        }
+        if beta == 0.0 {
+            return Ok(b.tensor().clone());
+        }
+    }
+
+    let mixed: Vec<f32> = match space {
+        MixSpace::Prob => {
+            let pa = softmax_f64(&row_a, "a")?;
+            let pb = softmax_f64(&row_b, "b")?;
+            pa.iter()
+                .zip(&pb)
+                .map(|(x, y)| (beta * x + (1.0 - beta) * y).ln() as f32)
+                .collect()
+        }
+        MixSpace::Log => row_a
+            .iter()
+            .zip(&row_b)
+            .map(|(x, y)| (beta * f64::from(*x) + (1.0 - beta) * f64::from(*y)) as f32)
+            .collect(),
+    };
+
+    // The same refusal the inputs get, applied to the result, so that
+    // what comes out of a mixture can go back into one. Only the
+    // geometric space can reach it: an arithmetic mixture of two
+    // distributions sums to 1, so some id always keeps mass, while
+    // `β·a + (1-β)·b` is `-inf` wherever either side is — and if the two
+    // rows leave no id unmasked in common, every id is.
+    if !mixed.iter().any(|v| v.is_finite()) {
+        return Err(LuaError::external(format!(
+            "{LOGITS_MIX_ERR_PREFIX}: the mixture masks every id — a and b mask every id the \
+             other keeps, and a geometric mixture lives on the ids both rows allow; \
+             opts.space = 'prob' mixes over the union instead"
+        )));
+    }
+
+    // Built on `a`'s device: the values crossed to the host to be mixed
+    // either way, and one of the two devices has to be picked when they
+    // differ.
+    Tensor::from_vec(mixed, vocab_a, a.tensor().device())
+        .map_err(|e| LuaError::external(format!("{LOGITS_MIX_ERR_PREFIX}: {e}")))
+}
+
+/// Read `beta` off the Lua stack.
+///
+/// Taken as a `LuaValue` rather than as an `f64` so the refusal names
+/// the argument: mlua's own conversion would also accept a numeric
+/// *string*, and a `beta` that arrived as text is a caller who built it
+/// by concatenation and has a different bug than the one a mixing
+/// weight out of range describes.
+fn mix_beta(value: &LuaValue) -> LuaResult<f64> {
+    let beta = match value {
+        LuaValue::Integer(i) => *i as f64,
+        LuaValue::Number(n) => *n,
+        other => {
+            return Err(LuaError::external(format!(
+                "{LOGITS_MIX_ERR_PREFIX}: beta must be a number in [0, 1], got {}",
+                other.type_name()
+            )))
+        }
+    };
+    if !beta.is_finite() {
+        return Err(LuaError::external(format!(
+            "{LOGITS_MIX_ERR_PREFIX}: beta = {beta} is not a finite number"
+        )));
+    }
+    Ok(beta)
+}
+
 /// Register `handle:generate_session(prompt_tokens, opts?)` on the
 /// Llama handle's method table.
 ///
@@ -806,12 +1202,18 @@ where
 const CHAT_ROLES: [&str; 4] = ["system", "user", "assistant", "tool"];
 
 /// Register `alc.nn.tokenize` / `alc.nn.detokenize` /
-/// `alc.nn.chat_prompt`.
+/// `alc.nn.chat_prompt`, plus the `alc.nn.logits.*` namespace.
 ///
-/// All three resolve the tokenizer through [`HfTokenizer::load_cached`]
-/// against `<nn_dir>/tokenizers`, the same cache directory the
-/// `alc.nn.data.*` producers use, so a preset downloaded by either path
-/// is reused by the other.
+/// The first three resolve the tokenizer through
+/// [`HfTokenizer::load_cached`] against `<nn_dir>/tokenizers`, the same
+/// cache directory the `alc.nn.data.*` producers use, so a preset
+/// downloaded by either path is reused by the other.
+///
+/// `alc.nn.logits` holds the operations that take logits rows and
+/// return one — currently [`mix_impl`]. It sits beside `alc.nn.sampler`
+/// (which turns a row into a token) rather than inside it: a mixture is
+/// still a row, and it may be mixed again, masked, or ranked before
+/// anything samples from it.
 pub(super) fn register_gen_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -> LuaResult<()> {
     let tokenize_dir = nn_dir.clone();
     let tokenize = lua.create_function(
@@ -848,6 +1250,34 @@ pub(super) fn register_gen_ns(lua: &Lua, nn_table: &LuaTable, nn_dir: PathBuf) -
         },
     )?;
     nn_table.set("chat_prompt", chat_prompt)?;
+
+    let logits_ns = lua.create_table()?;
+    let mix = lua.create_function(
+        |_,
+         (a, b, beta, opts): (
+            LuaUserDataRef<LogitsHandle>,
+            LuaUserDataRef<LogitsHandle>,
+            LuaValue,
+            Option<LuaTable>,
+        )| {
+            let beta = mix_beta(&beta)?;
+            let space = match opts {
+                Some(t) => match t.get::<Option<String>>("space").map_err(|e| {
+                    LuaError::external(format!(
+                        "{LOGITS_MIX_ERR_PREFIX}: opts.space must be a string \
+                         ('prob' or 'log'): {e}"
+                    ))
+                })? {
+                    Some(name) => MixSpace::parse(&name)?,
+                    None => MixSpace::Prob,
+                },
+                None => MixSpace::Prob,
+            };
+            mix_impl(&a, &b, beta, space).map(LogitsHandle::from_tensor)
+        },
+    )?;
+    logits_ns.set("mix", mix)?;
+    nn_table.set("logits", logits_ns)?;
 
     Ok(())
 }
@@ -1186,5 +1616,379 @@ mod tests {
         let err = extract_channel(Some(&opts), declares_cond(2), 16)
             .expect_err("no model carries both channels");
         assert!(err.to_string().contains("two different"), "message: {err}");
+    }
+
+    // ─── Weighted cond opts ───────────────────────────────────────
+
+    fn weights_opt(lua: &Lua, weights: &[LuaValue]) -> LuaTable {
+        let list = lua.create_table().expect("weights table");
+        for (i, w) in weights.iter().enumerate() {
+            list.set(i + 1, w.clone()).expect("set weight");
+        }
+        channel_opts(lua, &[("cond", LuaValue::Table(list))])
+    }
+
+    /// The array form resolves against the same declared row count the
+    /// integer form does, and reaches the session as a combination
+    /// rather than as a row.
+    #[test]
+    fn cond_as_an_array_becomes_a_weighted_channel() {
+        let lua = Lua::new();
+        let opts = weights_opt(
+            &lua,
+            &[LuaValue::Number(0.25), LuaValue::Number(0.75), lua_zero()],
+        );
+        let channel = extract_channel(Some(&opts), declares_cond(3), 64).expect("three weights");
+        match channel {
+            SessionChannel::CondWeights(weights) => assert_eq!(weights, vec![0.25, 0.75, 0.0]),
+            other => panic!("expected a weighted session, got {other:?}"),
+        }
+    }
+
+    /// An integer `cond` still means a row after the array form was
+    /// added — including the integral-float spelling that arithmetic on
+    /// a row index produces.
+    #[test]
+    fn the_integer_form_is_unchanged_by_the_array_form() {
+        let lua = Lua::new();
+        for value in [LuaValue::Integer(1), LuaValue::Number(1.0)] {
+            let opts = channel_opts(&lua, &[("cond", value.clone())]);
+            match extract_channel(Some(&opts), declares_cond(3), 64).expect("row 1 of 3") {
+                SessionChannel::Cond(index) => assert_eq!(index.row(), 1),
+                other => panic!("expected a row selection for {value:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The weights and the table have to agree on how many rows there
+    /// are; a short list would otherwise silently name a prefix.
+    #[test]
+    fn cond_weights_must_cover_every_row() {
+        let lua = Lua::new();
+        let opts = weights_opt(&lua, &[LuaValue::Number(1.0), lua_zero()]);
+        let err = extract_channel(Some(&opts), declares_cond(3), 64)
+            .expect_err("two weights for three rows");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 weight(s)") && msg.contains("3-row"),
+            "message must name both counts: {msg}"
+        );
+    }
+
+    /// All-zero weights add the zero vector — the unfed state the
+    /// channel exists to refuse.
+    #[test]
+    fn all_zero_cond_weights_are_refused() {
+        let lua = Lua::new();
+        let opts = weights_opt(&lua, &[lua_zero(), lua_zero()]);
+        let err = extract_channel(Some(&opts), declares_cond(2), 64)
+            .expect_err("nothing to condition on");
+        assert!(
+            err.to_string()
+                .contains("every weight in opts.cond is zero"),
+            "message: {err}"
+        );
+    }
+
+    /// A weight that is not a number, and one that no `f32` can hold.
+    #[test]
+    fn cond_weights_must_be_finite_numbers() {
+        let lua = Lua::new();
+        let text = lua.create_string("half").expect("string");
+        let opts = weights_opt(&lua, &[LuaValue::String(text), lua_zero()]);
+        let err = extract_channel(Some(&opts), declares_cond(2), 64).expect_err("a non-number");
+        assert!(
+            err.to_string().contains("opts.cond[1]"),
+            "message must name the entry: {err}"
+        );
+
+        let opts = weights_opt(&lua, &[lua_zero(), LuaValue::Number(1e300)]);
+        let err = extract_channel(Some(&opts), declares_cond(2), 64).expect_err("an overflow");
+        assert!(
+            err.to_string().contains("opts.cond[2]"),
+            "message must name the entry: {err}"
+        );
+    }
+
+    /// A numeric string is refused, the way `beta` refuses one: mlua's
+    /// own conversion would have taken it, and a weight that arrived as
+    /// text is a caller who built it by concatenation.
+    #[test]
+    fn cond_weights_refuse_a_numeric_string() {
+        let lua = Lua::new();
+        let text = lua.create_string("0.5").expect("string");
+        let opts = weights_opt(&lua, &[LuaValue::String(text), lua_zero()]);
+        let err = extract_channel(Some(&opts), declares_cond(2), 64).expect_err("a numeric string");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("opts.cond[1]") && msg.contains("must be a number"),
+            "message must name the entry and what it is not: {msg}"
+        );
+
+        // The integer form of a weight is still a weight.
+        let opts = weights_opt(&lua, &[LuaValue::Integer(1), lua_zero()]);
+        match extract_channel(Some(&opts), declares_cond(2), 64).expect("integer weights") {
+            SessionChannel::CondWeights(weights) => assert_eq!(weights, vec![1.0, 0.0]),
+            other => panic!("expected a weighted session, got {other:?}"),
+        }
+    }
+
+    /// An empty table is neither a row nor a combination.
+    #[test]
+    fn an_empty_cond_table_is_refused() {
+        let lua = Lua::new();
+        let opts = weights_opt(&lua, &[]);
+        let err = extract_channel(Some(&opts), declares_cond(2), 64).expect_err("no weights");
+        assert!(err.to_string().contains("empty table"), "message: {err}");
+    }
+
+    /// Lua numeric literal `0.0`, spelled once.
+    fn lua_zero() -> LuaValue {
+        LuaValue::Number(0.0)
+    }
+
+    // ─── alc.nn.logits.mix ────────────────────────────────────────
+
+    fn logits_of(values: &[f32]) -> LogitsHandle {
+        LogitsHandle::from_tensor(
+            Tensor::from_slice(values, values.len(), &Device::Cpu).expect("logits row"),
+        )
+    }
+
+    fn mixed_row(a: &[f32], b: &[f32], beta: f64, space: MixSpace) -> Vec<f32> {
+        mix_impl(&logits_of(a), &logits_of(b), beta, space)
+            .expect("mix")
+            .to_vec1()
+            .expect("row")
+    }
+
+    fn distribution(row: &[f32]) -> Vec<f64> {
+        softmax_f64(row, "row").expect("a distribution")
+    }
+
+    fn worst_gap(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .fold(0.0f64, |acc, (x, y)| acc.max((x - y).abs()))
+    }
+
+    /// In probability space the result *denotes* the arithmetic mixture:
+    /// the stored row is its log, so the softmax a sampler applies
+    /// recovers `β·pA + (1-β)·pB` exactly. The endpoints are the two
+    /// input distributions, which is the claim `β` is worth having.
+    #[test]
+    fn prob_space_denotes_the_arithmetic_mixture() {
+        let a = [2.0f32, 0.0, -1.0, 0.5];
+        let b = [-1.0f32, 3.0, 0.25, 0.0];
+        let (pa, pb) = (distribution(&a), distribution(&b));
+
+        for beta in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let mixed = distribution(&mixed_row(&a, &b, beta, MixSpace::Prob));
+            let expected: Vec<f64> = pa
+                .iter()
+                .zip(&pb)
+                .map(|(x, y)| beta * x + (1.0 - beta) * y)
+                .collect();
+            let gap = worst_gap(&mixed, &expected);
+            assert!(
+                gap < 1e-6,
+                "beta {beta} was {gap} off the arithmetic mixture"
+            );
+        }
+    }
+
+    /// In log space the result *is* the arithmetic mixture of the two
+    /// rows, and the endpoints are the rows themselves — returned
+    /// unchanged rather than computed, because `0 · -inf` is `NaN`.
+    #[test]
+    fn log_space_mixes_the_rows_and_returns_the_endpoints_intact() {
+        let a = [2.0f32, f32::NEG_INFINITY, -1.0];
+        let b = [-1.0f32, 3.0, 0.25];
+
+        assert_eq!(mixed_row(&a, &b, 1.0, MixSpace::Log), a.to_vec());
+        assert_eq!(mixed_row(&a, &b, 0.0, MixSpace::Log), b.to_vec());
+
+        let mixed = mixed_row(&a, &b, 0.25, MixSpace::Log);
+        let expected = |x: f64, y: f64| 0.25 * x + 0.75 * y;
+        assert!((f64::from(mixed[0]) - expected(2.0, -1.0)).abs() < 1e-6);
+        // A masked entry stays masked at every interior weight: the
+        // sampler must not be handed a candidate the constraint struck
+        // out.
+        assert_eq!(mixed[1], f32::NEG_INFINITY);
+        assert!((f64::from(mixed[2]) - expected(-1.0, 0.25)).abs() < 1e-6);
+    }
+
+    /// Two rows masked to disjoint id sets have no geometric mixture:
+    /// every entry of `β·a + (1-β)·b` is `-inf`, and such a row denotes
+    /// no distribution. It is refused rather than handed on — an
+    /// `argmax` over it would return candle's tie-break index, a
+    /// plausible-looking token drawn from nothing.
+    #[test]
+    fn log_space_refuses_a_mixture_of_disjoint_supports() {
+        let neg = f32::NEG_INFINITY;
+        let a = [0.0f32, 1.0, neg, neg];
+        let b = [neg, neg, 0.5, 2.0];
+        for beta in [0.25, 0.5, 0.75] {
+            let err = mix_impl(&logits_of(&a), &logits_of(&b), beta, MixSpace::Log)
+                .expect_err("nothing left unmasked in common");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("masks every id") && msg.contains("'prob'"),
+                "message must name the cause and the space that mixes over the union: {msg}"
+            );
+        }
+
+        // Non-vacuity: one shared unmasked id and the same rows mix.
+        let b_shared = [0.0f32, neg, 0.5, 2.0];
+        let mixed = mixed_row(&a, &b_shared, 0.5, MixSpace::Log);
+        assert!(
+            mixed[0].is_finite(),
+            "id 0 is open on both sides: {mixed:?}"
+        );
+    }
+
+    /// The endpoints return the row they name, but they read both rows
+    /// first: a row that denotes no distribution is refused at every
+    /// `beta`, in both spaces. A refusal that held only strictly inside
+    /// the interval would be one a caller could not act on.
+    #[test]
+    fn mix_checks_both_rows_at_the_endpoints_too() {
+        let neg = f32::NEG_INFINITY;
+        let good = [0.0f32, 1.0];
+        for space in [MixSpace::Log, MixSpace::Prob] {
+            for beta in [0.0, 1.0] {
+                let err = mix_impl(&logits_of(&good), &logits_of(&[f32::NAN, 1.0]), beta, space)
+                    .expect_err("NaN in b");
+                assert!(err.to_string().contains("b[0]"), "message: {err}");
+
+                let err = mix_impl(&logits_of(&[neg, neg]), &logits_of(&good), beta, space)
+                    .expect_err("a row with nothing left");
+                assert!(
+                    err.to_string().contains("no finite entry"),
+                    "message: {err}"
+                );
+            }
+        }
+    }
+
+    /// A masked id keeps zero probability in the arithmetic mixture
+    /// exactly when the *other* row masks it too — a mask on one side
+    /// only is a candidate the other side still offers, weighted down
+    /// rather than removed.
+    #[test]
+    fn prob_space_keeps_a_mask_only_where_both_sides_agree() {
+        let a = [0.0f32, f32::NEG_INFINITY, 1.0];
+        let b = [0.0f32, f32::NEG_INFINITY, 1.0];
+        assert_eq!(mixed_row(&a, &b, 0.5, MixSpace::Prob)[1], f32::NEG_INFINITY);
+
+        let b_open = [0.0f32, 0.5, 1.0];
+        let mixed = mixed_row(&a, &b_open, 0.5, MixSpace::Prob);
+        assert!(
+            mixed[1].is_finite(),
+            "the unmasked side still offers id 1: {mixed:?}"
+        );
+    }
+
+    /// Two rows over different vocabularies index different things, so
+    /// adding their scores together is refused.
+    #[test]
+    fn mix_refuses_rows_of_different_widths() {
+        let err = mix_impl(
+            &logits_of(&[0.0, 1.0]),
+            &logits_of(&[0.0, 1.0, 2.0]),
+            0.5,
+            MixSpace::Prob,
+        )
+        .expect_err("2 ids against 3");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2 ids") && msg.contains("3"),
+            "message must name both widths: {msg}"
+        );
+    }
+
+    /// `beta` is a weight, and the values that are not one are refused
+    /// rather than clamped: a caller who computed 1.4 has a bug that
+    /// clamping to 1.0 would answer with a plausible-looking row.
+    #[test]
+    fn mix_refuses_a_beta_outside_the_unit_interval() {
+        for beta in [-0.1, 1.4, f64::INFINITY] {
+            let err = mix_impl(
+                &logits_of(&[0.0, 1.0]),
+                &logits_of(&[1.0, 0.0]),
+                beta,
+                MixSpace::Prob,
+            )
+            .expect_err("beta outside [0, 1]");
+            assert!(err.to_string().contains("beta"), "message: {err}");
+        }
+    }
+
+    /// `beta` off the Lua stack: numbers pass, everything else is
+    /// refused by name — including the numeric string mlua's own
+    /// conversion would have accepted.
+    #[test]
+    fn mix_beta_takes_numbers_only() {
+        let lua = Lua::new();
+        assert_eq!(mix_beta(&LuaValue::Number(0.5)).expect("a number"), 0.5);
+        assert_eq!(mix_beta(&LuaValue::Integer(1)).expect("an integer"), 1.0);
+
+        let text = lua.create_string("0.5").expect("string");
+        let err = mix_beta(&LuaValue::String(text)).expect_err("a numeric string");
+        assert!(err.to_string().contains("beta must be a number"), "{err}");
+
+        let err = mix_beta(&LuaValue::Number(f64::NAN)).expect_err("NaN");
+        assert!(err.to_string().contains("finite"), "{err}");
+    }
+
+    /// An unrecognised space is refused rather than defaulted: the two
+    /// produce different distributions, so a typo that fell through to
+    /// the default would be a measurement of the wrong operation.
+    #[test]
+    fn mix_refuses_an_unknown_space() {
+        assert_eq!(MixSpace::parse("prob").expect("prob"), MixSpace::Prob);
+        assert_eq!(MixSpace::parse("log").expect("log"), MixSpace::Log);
+        let err = MixSpace::parse("probs").expect_err("a typo");
+        assert!(
+            err.to_string().contains("not a mixing space"),
+            "message: {err}"
+        );
+    }
+
+    /// A row that denotes no distribution stops here. `NaN` in
+    /// particular would sort above every real candidate in
+    /// [`LogitsHandle::top`], which is the ranking a sampler acts on.
+    #[test]
+    fn mix_refuses_rows_it_cannot_read_as_distributions() {
+        let err = mix_impl(
+            &logits_of(&[f32::NAN, 1.0]),
+            &logits_of(&[0.0, 1.0]),
+            0.5,
+            MixSpace::Prob,
+        )
+        .expect_err("NaN in a");
+        assert!(err.to_string().contains("a[0]"), "message: {err}");
+
+        let err = mix_impl(
+            &logits_of(&[0.0, 1.0]),
+            &logits_of(&[0.0, f32::INFINITY]),
+            0.5,
+            MixSpace::Prob,
+        )
+        .expect_err("+inf in b");
+        assert!(err.to_string().contains("b[1]"), "message: {err}");
+
+        let all_masked = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let err = mix_impl(
+            &logits_of(&all_masked),
+            &logits_of(&[0.0, 1.0]),
+            0.5,
+            MixSpace::Prob,
+        )
+        .expect_err("a row with nothing left");
+        assert!(
+            err.to_string().contains("no finite entry"),
+            "message: {err}"
+        );
     }
 }

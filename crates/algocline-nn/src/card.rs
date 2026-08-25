@@ -13,8 +13,12 @@
 //! sub-struct without breaking foundation serialization
 //! (`skip_serializing_if = "Option::is_none"`).
 
+use std::path::Path;
+
+use candle_core::safetensors::MmapedSafetensors;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use thiserror::Error;
 
 use crate::arch::{Gpt2Config, Gpt2Custom, MoeConfig};
 use crate::train::{Checkpoint, FullFtConfig};
@@ -74,6 +78,115 @@ pub struct NnCardMeta {
     /// `hosted` cards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candle: Option<NnCandleBranch>,
+}
+
+impl NnCardMeta {
+    /// Whether this Card declares `axis`.
+    ///
+    /// A Card with no `candle.custom` branch declares neither: that
+    /// branch is absent exactly when the run used the reference
+    /// architecture, which has no channel tables.
+    pub fn declares_channel(&self, axis: ChannelAxis) -> bool {
+        axis.is_set_by(
+            self.candle
+                .as_ref()
+                .and_then(|candle| candle.custom.as_ref())
+                .map(|custom| &custom.spec),
+        )
+    }
+
+    /// Check every [`ChannelAxis`] this Card declares against
+    /// `tensor_names`, the names actually present in its bundle.
+    ///
+    /// The comparison runs in **both** directions, and the second one
+    /// is the reason this exists. A declared channel whose table is
+    /// missing is caught by the loader soon enough *when the config it
+    /// rebuilds asks for the tensor* — the config that asks for
+    /// nothing is [`Self::verify_channels_consumed`]'s case, not this
+    /// one. A table present in the bundle that
+    /// the Card does not declare is caught by nothing: the load path
+    /// rebuilds the config from the Card, so it never asks for that
+    /// tensor, and the model then runs without an input it was trained
+    /// with. Nothing fails, and every number afterwards looks ordinary.
+    ///
+    /// Axes are inspected in [`ChannelAxis::ALL`] order and the first
+    /// disagreement is returned, so the verdict is deterministic for a
+    /// Card that is wrong about both.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelMismatch::Missing`] or [`ChannelMismatch::Undeclared`]
+    /// for the first axis whose declaration and bundle disagree.
+    pub fn verify_channel_tensors<S: AsRef<str>>(
+        &self,
+        tensor_names: &[S],
+    ) -> Result<(), ChannelMismatch> {
+        for axis in ChannelAxis::ALL {
+            let present = tensor_names
+                .iter()
+                .any(|name| name.as_ref() == axis.tensor());
+            match (self.declares_channel(axis), present) {
+                (true, false) => return Err(ChannelMismatch::Missing { axis }),
+                (false, true) => return Err(ChannelMismatch::Undeclared { axis }),
+                (true, true) | (false, false) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Check every [`ChannelAxis`] this Card declares against
+    /// `consumed`, the customization spec of the config a loader has
+    /// just built for it (`None` for a config that has none, which
+    /// reads no channel at all).
+    ///
+    /// [`Self::verify_channel_tensors`] compares the declaration with
+    /// the bundle; this compares it with the model about to be built,
+    /// and a loader needs both. A config rebuilt for a Card can ignore
+    /// the declaration outright — a named architecture pins its own
+    /// shape and never consults the shape block — and then the table
+    /// sits in the bundle unread, which is the same silence
+    /// [`ChannelMismatch::Undeclared`] is about, reached from the
+    /// config side instead of the Card side.
+    ///
+    /// Only the declared ⊆ consumed direction is checked. A config that
+    /// reads a channel the Card does not declare cannot come from that
+    /// Card's shape block, so it would be the loader's own invention
+    /// rather than a disagreement the Card can be judged on.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelMismatch::NotConsumed`] for the first declared axis the
+    /// built config does not read.
+    pub fn verify_channels_consumed(
+        &self,
+        consumed: Option<&Gpt2Custom>,
+    ) -> Result<(), ChannelMismatch> {
+        for axis in ChannelAxis::ALL {
+            if self.declares_channel(axis) && !axis.is_set_by(consumed) {
+                return Err(ChannelMismatch::NotConsumed { axis });
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::verify_channel_tensors`] against the bundle stored at
+    /// `path`.
+    ///
+    /// This is the load-time entry point: resolve the Card's
+    /// `candle.bundle_ref` to a safetensors path, call this, and only
+    /// then build the model. Only the file header is read, so the cost
+    /// does not scale with the weights.
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::verify_channel_tensors`] verdicts, plus
+    /// [`ChannelMismatch::BundleUnreadable`] when the bundle cannot be
+    /// opened — a check that could not run is reported rather than
+    /// passed.
+    pub fn verify_channel_tensors_in_bundle(&self, path: &Path) -> Result<(), ChannelMismatch> {
+        let names = bundle_tensor_names(path)?;
+        self.verify_channel_tensors(&names)
+    }
 }
 
 /// Content of `[metadata.nn.lineage]`.
@@ -165,7 +278,20 @@ pub struct NnCustomBranch {
 
     /// Architecture customization spec (activation / norm kind +
     /// placement / residual topology / MLP ratio / position / GQA /
-    /// sliding window / untied head).
+    /// sliding window / untied head / slot conditioning / allowed-id
+    /// input).
+    ///
+    /// # The two axes that are also a claim about the bundle
+    ///
+    /// Most axes here only shape how the recorded tensors are *used*.
+    /// [`Gpt2Custom::cond_slots`] and [`Gpt2Custom::allowed_input`] are
+    /// different: each decides whether the bundle carries a table of
+    /// its own ([`crate::arch::COND_TABLE_TENSOR`],
+    /// [`crate::arch::ALLOWED_TABLE_TENSOR`]), so what this branch
+    /// records about them is checkable against the weights — and is
+    /// checked, by [`NnCardMeta::verify_channel_tensors`], which the
+    /// load path is expected to call. See that method for why the
+    /// undeclared direction matters as much as the missing one.
     #[serde(default)]
     pub spec: Gpt2Custom,
 
@@ -202,6 +328,177 @@ impl NnCustomBranch {
             moe: cfg.moe.as_ref().map(NnMoeBranch::from),
         })
     }
+}
+
+/// An optional input channel a custom-architecture run can be trained
+/// with.
+///
+/// Each channel adds a table of its own to the safetensors bundle, so
+/// a Card that declares one is making a claim about the tensors sitting
+/// beside it — which is what makes
+/// [`NnCardMeta::verify_channel_tensors`] possible at all. Axes that
+/// only change how existing tensors are used (activation, norm kind,
+/// residual topology, ...) leave no such trace and are not represented
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelAxis {
+    /// Slot conditioning: [`Gpt2Custom::cond_slots`], stored as
+    /// [`crate::arch::COND_TABLE_TENSOR`].
+    Conditioning,
+    /// Allowed-id input: [`Gpt2Custom::allowed_input`], stored as
+    /// [`crate::arch::ALLOWED_TABLE_TENSOR`].
+    AllowedInput,
+}
+
+impl ChannelAxis {
+    /// Every channel axis, in the order
+    /// [`NnCardMeta::verify_channel_tensors`] inspects them.
+    ///
+    /// Iterating this rather than listing the axes at each call site is
+    /// what makes "a new channel is checked by default" true: a variant
+    /// added here reaches the verifier without the verifier changing.
+    pub const ALL: [ChannelAxis; 2] = [ChannelAxis::Conditioning, ChannelAxis::AllowedInput];
+
+    /// Tensor this channel's table is stored under in the bundle.
+    pub fn tensor(self) -> &'static str {
+        match self {
+            ChannelAxis::Conditioning => crate::arch::COND_TABLE_TENSOR,
+            ChannelAxis::AllowedInput => crate::arch::ALLOWED_TABLE_TENSOR,
+        }
+    }
+
+    /// Whether `spec` turns this channel on.
+    ///
+    /// `None` — a config or a Card with no customization spec at all —
+    /// turns none of them on: the reference architecture has no channel
+    /// tables.
+    pub fn is_set_by(self, spec: Option<&Gpt2Custom>) -> bool {
+        let Some(spec) = spec else {
+            return false;
+        };
+        match self {
+            ChannelAxis::Conditioning => spec.cond_slots.is_some(),
+            ChannelAxis::AllowedInput => spec.allowed_input,
+        }
+    }
+
+    /// Field of `candle.custom.spec` that declares this channel.
+    ///
+    /// Returned as the serialized spelling, so an error message names
+    /// the key a caller would edit rather than a Rust identifier.
+    pub fn spec_field(self) -> &'static str {
+        match self {
+            ChannelAxis::Conditioning => "cond_slots",
+            ChannelAxis::AllowedInput => "allowed_input",
+        }
+    }
+}
+
+impl std::fmt::Display for ChannelAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.spec_field())
+    }
+}
+
+/// A Card's declared channels and the tensors in its bundle disagree.
+///
+/// Carries the axis rather than the Card id or the bundle path: the
+/// caller knows what it was verifying, and both entry points are
+/// per-Card. [`ChannelMismatch::BundleUnreadable`] is the exception —
+/// there the path is the whole content of the failure.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ChannelMismatch {
+    /// The Card declares a channel and the bundle has no table for it.
+    ///
+    /// Loading anyway would build a model with a randomly initialised
+    /// table in place of a trained one, and nothing downstream would
+    /// look unusual.
+    #[error(
+        "card declares `{}` but the bundle carries no `{}`; the channel it claims to have been \
+         trained with is not in these weights",
+        .axis.spec_field(),
+        .axis.tensor(),
+    )]
+    Missing {
+        /// Channel the Card declared.
+        axis: ChannelAxis,
+    },
+
+    /// The bundle carries a channel table the Card does not declare.
+    ///
+    /// This is the direction that fails quietly when it is not checked:
+    /// the load path rebuilds the config from the Card, so an
+    /// undeclared table is simply never asked for. The model then runs
+    /// without an input it was trained with — well-formed output, every
+    /// number afterwards ordinary, and no error anywhere.
+    #[error(
+        "the bundle carries `{}` but the card does not declare `{}`; loading it would drop a \
+         channel the run trained with and every number afterwards would still look ordinary",
+        .axis.tensor(),
+        .axis.spec_field(),
+    )]
+    Undeclared {
+        /// Channel the bundle carries.
+        axis: ChannelAxis,
+    },
+
+    /// The Card declares a channel the config rebuilt for it does not
+    /// read.
+    ///
+    /// Not a claim about the weights: the bundle may well carry the
+    /// table. The model is the problem — the config asks for no such
+    /// input, so the table is never read and the channel is dropped
+    /// exactly as quietly as in [`ChannelMismatch::Undeclared`]. The
+    /// pair that reaches this is a Card whose architecture pins its own
+    /// shape while its shape block declares a channel; no trainer
+    /// writes that combination, so such a Card was hand-edited or
+    /// written by a foreign pipeline.
+    #[error(
+        "card declares `{}` but the architecture it names rebuilds a model that never reads it; \
+         loading it would drop a channel the run trained with and every number afterwards would \
+         still look ordinary",
+        .axis.spec_field(),
+    )]
+    NotConsumed {
+        /// Channel the Card declared.
+        axis: ChannelAxis,
+    },
+
+    /// The bundle could not be opened, so the declared channels could
+    /// not be checked against anything.
+    ///
+    /// Distinct from the two disagreements: nothing is known here, and
+    /// treating "could not look" as "nothing to report" is what the
+    /// check exists to prevent.
+    #[error("bundle {path} could not be read to verify its channel tables: {message}")]
+    BundleUnreadable {
+        /// Bundle that could not be read.
+        path: String,
+        /// Reason reported by the safetensors reader.
+        message: String,
+    },
+}
+
+/// Tensor names in the safetensors bundle at `path`.
+///
+/// Reads the header — a name-to-descriptor map at the front of the file
+/// — and materialises no tensor. Deliberately not the reader models
+/// load through: a `VarBuilder` answers "is the tensor I asked for
+/// here", which by construction cannot see a tensor nobody asked for,
+/// and that is exactly the case
+/// [`ChannelMismatch::Undeclared`] is about.
+fn bundle_tensor_names(path: &Path) -> Result<Vec<String>, ChannelMismatch> {
+    // SAFETY: the mapping is unsound if the file is truncated while it
+    // is alive. It is created and dropped inside this call, and the
+    // bundles this reads are written once and then only read. The same
+    // obligation `train::ckpt::restore_into` states applies to the
+    // caller.
+    let file =
+        unsafe { MmapedSafetensors::new(path) }.map_err(|e| ChannelMismatch::BundleUnreadable {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+    Ok(file.tensors().into_iter().map(|(name, _)| name).collect())
 }
 
 /// Content of `[metadata.nn.candle.custom.moe]` — the projection of
@@ -872,6 +1169,8 @@ mod tests {
                 kv_heads: Some(1),
                 window: Some(4),
                 untied_head: true,
+                cond_slots: None,
+                allowed_input: false,
             },
             moe: Some(NnMoeBranch {
                 n_experts: 4,
@@ -1361,5 +1660,331 @@ mod tests {
         let card = NnModelCard::from_merge(id, "user-name".into(), meta).expect("from_merge");
         assert_eq!(card.meta().name, "user-name");
         assert_eq!(card.meta().training_path, "merged");
+    }
+
+    // ─── channel axes: recorded, and checked against the bundle ──────
+
+    /// A spec that declares `axis` and nothing else.
+    fn spec_declaring(axis: ChannelAxis) -> Gpt2Custom {
+        match axis {
+            ChannelAxis::Conditioning => Gpt2Custom {
+                cond_slots: Some(3),
+                ..Gpt2Custom::default()
+            },
+            ChannelAxis::AllowedInput => Gpt2Custom {
+                allowed_input: true,
+                ..Gpt2Custom::default()
+            },
+        }
+    }
+
+    /// A custom-architecture card carrying `spec`.
+    fn card_meta_with_spec(spec: Gpt2Custom) -> NnCardMeta {
+        NnCardMeta {
+            name: "channels".into(),
+            backend: "candle".into(),
+            task: None,
+            architecture: "gpt2-custom".into(),
+            training_path: "full_ft".into(),
+            lineage: NnLineage::default(),
+            hyperparams: empty_object(),
+            metrics: empty_object(),
+            candle: Some(NnCandleBranch {
+                bundle_ref: "nn/channels".into(),
+                device: None,
+                dtype: None,
+                lora: None,
+                custom: Some(NnCustomBranch {
+                    vocab: 32,
+                    ctx: 8,
+                    layers: 1,
+                    heads: 2,
+                    dim: 16,
+                    spec,
+                    moe: None,
+                }),
+            }),
+        }
+    }
+
+    /// Both axes, in both directions, against a bundle that either
+    /// carries the table or does not: the four quadrants the check is
+    /// defined over.
+    #[test]
+    fn channel_verification_covers_every_quadrant() {
+        for axis in ChannelAxis::ALL {
+            let declared = card_meta_with_spec(spec_declaring(axis));
+            let silent = card_meta_with_spec(Gpt2Custom::default());
+            let with_table = ["wte.weight".to_string(), axis.tensor().to_string()];
+            let without_table = ["wte.weight".to_string()];
+
+            assert!(declared.declares_channel(axis));
+            assert!(!silent.declares_channel(axis));
+
+            // Declared + present: the pairing the run actually had.
+            assert_eq!(declared.verify_channel_tensors(&with_table), Ok(()));
+            // Declared + absent: the table the card claims is not there.
+            assert_eq!(
+                declared.verify_channel_tensors(&without_table),
+                Err(ChannelMismatch::Missing { axis })
+            );
+            // Present + undeclared: the silent direction — a trained
+            // channel the load path would never ask for.
+            assert_eq!(
+                silent.verify_channel_tensors(&with_table),
+                Err(ChannelMismatch::Undeclared { axis })
+            );
+            // Neither: an ordinary card over an ordinary bundle.
+            assert_eq!(silent.verify_channel_tensors(&without_table), Ok(()));
+        }
+    }
+
+    /// The other pair a loader has to compare: the declaration against
+    /// the config it is about to build from. A config that reads none
+    /// of the channels — the reference architecture, or an
+    /// architecture with no customization spec at all — drops every
+    /// channel the Card declares, however complete the bundle is.
+    #[test]
+    fn a_config_that_reads_no_channel_is_refused_for_a_card_that_declares_one() {
+        for axis in ChannelAxis::ALL {
+            let declared = card_meta_with_spec(spec_declaring(axis));
+            let silent = card_meta_with_spec(Gpt2Custom::default());
+
+            // The config the Card was trained with reads it.
+            assert_eq!(
+                declared.verify_channels_consumed(Some(&spec_declaring(axis))),
+                Ok(())
+            );
+            // A config rebuilt without the spec reads nothing.
+            assert_eq!(
+                declared.verify_channels_consumed(None),
+                Err(ChannelMismatch::NotConsumed { axis })
+            );
+            // ... and so does one whose spec leaves the axis off.
+            assert_eq!(
+                declared.verify_channels_consumed(Some(&Gpt2Custom::default())),
+                Err(ChannelMismatch::NotConsumed { axis })
+            );
+            // A Card that declares nothing has nothing to drop.
+            assert_eq!(silent.verify_channels_consumed(None), Ok(()));
+        }
+
+        let message = ChannelMismatch::NotConsumed {
+            axis: ChannelAxis::Conditioning,
+        }
+        .to_string();
+        assert!(message.contains("cond_slots"), "got: {message}");
+    }
+
+    /// The message has to name both the tensor and the spec key, since
+    /// the two ends of the disagreement are edited in different places.
+    #[test]
+    fn mismatch_messages_name_the_tensor_and_the_spec_field() {
+        let missing = ChannelMismatch::Missing {
+            axis: ChannelAxis::Conditioning,
+        }
+        .to_string();
+        assert!(missing.contains("cond_slots"), "got: {missing}");
+        assert!(
+            missing.contains(crate::arch::COND_TABLE_TENSOR),
+            "got: {missing}"
+        );
+
+        let undeclared = ChannelMismatch::Undeclared {
+            axis: ChannelAxis::AllowedInput,
+        }
+        .to_string();
+        assert!(undeclared.contains("allowed_input"), "got: {undeclared}");
+        assert!(
+            undeclared.contains(crate::arch::ALLOWED_TABLE_TENSOR),
+            "got: {undeclared}"
+        );
+    }
+
+    /// A reference-architecture card has no `custom` branch at all, so
+    /// it declares neither channel — and a bundle that carries one is
+    /// the same silence, reached from the other side.
+    #[test]
+    fn a_card_without_a_custom_branch_declares_no_channel() {
+        let meta = NnCardMeta {
+            name: "reference".into(),
+            backend: "candle".into(),
+            task: None,
+            architecture: "gpt2-medium".into(),
+            training_path: "full_ft".into(),
+            lineage: NnLineage::default(),
+            hyperparams: empty_object(),
+            metrics: empty_object(),
+            candle: Some(NnCandleBranch {
+                bundle_ref: "nn/reference".into(),
+                device: None,
+                dtype: None,
+                lora: None,
+                custom: None,
+            }),
+        };
+        assert!(!meta.declares_channel(ChannelAxis::Conditioning));
+        assert!(!meta.declares_channel(ChannelAxis::AllowedInput));
+        assert_eq!(meta.verify_channel_tensors(&["wte.weight"]), Ok(()));
+        assert_eq!(
+            meta.verify_channel_tensors(&["wte.weight", crate::arch::COND_TABLE_TENSOR]),
+            Err(ChannelMismatch::Undeclared {
+                axis: ChannelAxis::Conditioning
+            })
+        );
+    }
+
+    /// A card written before the channel axes existed has neither key
+    /// in its spec table. It must still deserialize — and it reads as
+    /// declaring nothing, which is what such a run was.
+    #[test]
+    fn deserialize_backwards_compat_spec_without_channel_axes() {
+        let legacy = serde_json::json!({
+            "name": "legacy-custom",
+            "backend": "candle",
+            "architecture": "gpt2-custom",
+            "training_path": "full_ft",
+            "candle": {
+                "bundle_ref": "nn/legacy-custom",
+                "custom": {
+                    "vocab": 32,
+                    "ctx": 8,
+                    "layers": 1,
+                    "heads": 2,
+                    "dim": 16,
+                    "spec": { "norm": "rmsnorm" }
+                }
+            }
+        });
+        let meta: NnCardMeta = serde_json::from_value(legacy).expect("legacy card deserialize");
+        let spec = &meta
+            .candle
+            .as_ref()
+            .and_then(|c| c.custom.as_ref())
+            .expect("custom branch")
+            .spec;
+        assert_eq!(spec.cond_slots, None);
+        assert!(!spec.allowed_input);
+        assert_eq!(meta.verify_channel_tensors(&["wte.weight"]), Ok(()));
+    }
+
+    /// The axes serialize under the keys the check reports, so a Card
+    /// on disk can be read (and corrected) by hand.
+    #[test]
+    fn declared_channels_serialize_under_their_spec_keys() {
+        let meta = card_meta_with_spec(spec_declaring(ChannelAxis::Conditioning));
+        let json = serde_json::to_value(&meta).expect("serialize");
+        let spec = json
+            .pointer("/candle/custom/spec")
+            .expect("spec sub-object present");
+        assert_eq!(spec.get("cond_slots"), Some(&serde_json::json!(3)));
+        // `allowed_input` is a plain bool, so it is written either way.
+        assert_eq!(spec.get("allowed_input"), Some(&serde_json::json!(false)));
+
+        let allowed = card_meta_with_spec(spec_declaring(ChannelAxis::AllowedInput));
+        let json = serde_json::to_value(&allowed).expect("serialize");
+        let spec = json
+            .pointer("/candle/custom/spec")
+            .expect("spec sub-object present");
+        assert_eq!(spec.get("allowed_input"), Some(&serde_json::json!(true)));
+        assert!(
+            spec.get("cond_slots").is_none(),
+            "an unset Option is omitted, got: {spec}"
+        );
+    }
+
+    /// The config -> Card projection carries the channel axes through
+    /// without the caller naming them, so a run that built the tables
+    /// produces a card that declares them.
+    #[test]
+    fn training_from_a_channelled_config_records_the_axis() {
+        for axis in ChannelAxis::ALL {
+            let cfg = Gpt2Config {
+                custom: Some(spec_declaring(axis)),
+                ..Gpt2Config::tiny()
+            };
+            let branch = NnCustomBranch::from_gpt2_config(&cfg).expect("custom config projects");
+            let card = NnModelCard::from_training(
+                CardId::mint("channelled"),
+                "channelled",
+                "gpt2-custom".into(),
+                TrainingPath::FullFt,
+                &test_ckpt(),
+                &FullFtConfig::default(),
+                Some(branch),
+                None,
+                None,
+            )
+            .expect("from_training");
+
+            assert!(
+                card.meta().declares_channel(axis),
+                "{axis} must survive the config -> card projection"
+            );
+            assert_eq!(
+                card.meta()
+                    .verify_channel_tensors(&["wte.weight", axis.tensor()]),
+                Ok(())
+            );
+        }
+    }
+
+    /// The load-time entry point reads the tensor names off a real
+    /// bundle header and reaches the same verdicts.
+    #[test]
+    fn verification_against_a_bundle_on_disk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("channelled.safetensors");
+        let device = candle_core::Device::Cpu;
+        let mut tensors: std::collections::HashMap<String, candle_core::Tensor> =
+            std::collections::HashMap::new();
+        tensors.insert(
+            "wte.weight".into(),
+            candle_core::Tensor::zeros((4, 2), candle_core::DType::F32, &device).expect("wte"),
+        );
+        tensors.insert(
+            crate::arch::COND_TABLE_TENSOR.into(),
+            candle_core::Tensor::zeros((3, 2), candle_core::DType::F32, &device).expect("cond"),
+        );
+        candle_core::safetensors::save(&tensors, &path).expect("write bundle");
+
+        let declared = card_meta_with_spec(spec_declaring(ChannelAxis::Conditioning));
+        assert_eq!(declared.verify_channel_tensors_in_bundle(&path), Ok(()));
+
+        let silent = card_meta_with_spec(Gpt2Custom::default());
+        assert_eq!(
+            silent.verify_channel_tensors_in_bundle(&path),
+            Err(ChannelMismatch::Undeclared {
+                axis: ChannelAxis::Conditioning
+            })
+        );
+
+        let allowed = card_meta_with_spec(spec_declaring(ChannelAxis::AllowedInput));
+        assert_eq!(
+            allowed.verify_channel_tensors_in_bundle(&path),
+            Err(ChannelMismatch::Undeclared {
+                axis: ChannelAxis::Conditioning
+            }),
+            "the first disagreeing axis is reported, in ALL order"
+        );
+    }
+
+    /// A bundle that cannot be read is reported as unread, not as
+    /// nothing to report.
+    #[test]
+    fn an_unreadable_bundle_is_refused_rather_than_passed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent.safetensors");
+        let meta = card_meta_with_spec(Gpt2Custom::default());
+        let err = meta
+            .verify_channel_tensors_in_bundle(&missing)
+            .expect_err("a missing bundle cannot be verified");
+        match err {
+            ChannelMismatch::BundleUnreadable { path, message } => {
+                assert!(path.ends_with("absent.safetensors"), "got: {path}");
+                assert!(!message.is_empty(), "the reader's reason must be carried");
+            }
+            other => panic!("expected BundleUnreadable, got {other:?}"),
+        }
     }
 }

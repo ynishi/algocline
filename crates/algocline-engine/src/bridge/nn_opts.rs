@@ -31,6 +31,8 @@
 //! [`super::nn_card::guard_base_dtype_for_training`], which already
 //! serves four trainer entrypoints off a single `fn_name` argument.
 
+use std::path::PathBuf;
+
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::train::{
     CkptControl, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, ScheduleKind, TrainError,
@@ -72,7 +74,7 @@ pub(super) fn extract_full_ft_opts(
     if let Some(v) = t.get::<Option<String>>("schedule")? {
         cfg.schedule = parse_schedule(prefix, &v)?;
     }
-    apply_optional_overrides(&mut cfg, t)?;
+    apply_optional_overrides(prefix, &mut cfg, t)?;
     if cfg.batch_size == 0 {
         return Err(LuaError::external(format!(
             "{prefix}: batch_size must be >= 1"
@@ -277,13 +279,14 @@ pub(super) fn extract_run_train_cfg(prefix: &str, opts: &LuaTable) -> LuaResult<
         schedule,
         ..FullFtConfig::default()
     };
-    apply_optional_overrides(&mut cfg, opts)?;
+    apply_optional_overrides(prefix, &mut cfg, opts)?;
     Ok(cfg)
 }
 
 /// Apply the pass-through [`FullFtConfig`] fields that both surface
 /// families accept verbatim (no surface-specific validation):
-/// `grad_accum` / `weight_decay` / `ckpt_every` / `ckpt_keep`.
+/// `grad_accum` / `weight_decay` / `ckpt_every` / `ckpt_keep` /
+/// `init_from` / `mask_disallowed_logits`.
 ///
 /// Keeping the reads here is what makes each of those keys appear
 /// exactly once in the repo — the pre-consolidation `run_*` surfaces
@@ -292,9 +295,15 @@ pub(super) fn extract_run_train_cfg(prefix: &str, opts: &LuaTable) -> LuaResult<
 /// doc claim that they were "NOT exposed" did not match the code.
 ///
 /// Wrong-type input surfaces as an mlua type-mismatch error (no
-/// prefix rewrite) exactly as it did before, so no `prefix` argument
-/// is threaded through here.
-fn apply_optional_overrides(cfg: &mut FullFtConfig, opts: &LuaTable) -> LuaResult<()> {
+/// prefix rewrite) exactly as it did before. `prefix` is threaded
+/// through for the one field that carries a validation rule of its
+/// own (`init_from`, which refuses an empty path), so that refusal
+/// reads like every other error from the caller's surface.
+fn apply_optional_overrides(
+    prefix: &str,
+    cfg: &mut FullFtConfig,
+    opts: &LuaTable,
+) -> LuaResult<()> {
     if let Some(v) = opts.get::<Option<usize>>("grad_accum")? {
         cfg.grad_accum = v;
     }
@@ -306,6 +315,31 @@ fn apply_optional_overrides(cfg: &mut FullFtConfig, opts: &LuaTable) -> LuaResul
     }
     if let Some(v) = opts.get::<Option<usize>>("ckpt_keep")? {
         cfg.ckpt_keep = v;
+    }
+    // `init_from` names a checkpoint the model's variables are restored
+    // from before the first step. An empty string is refused rather
+    // than read as "no checkpoint": the two spellings for "do not
+    // resume" would then be `nil` and `""`, and a caller whose path
+    // variable came back empty would get a fresh run under a config
+    // that says it resumed. The restore itself is strict — anything
+    // short of a complete one is a `TrainError::Restore` and the run
+    // does not start.
+    if let Some(v) = opts.get::<Option<String>>("init_from")? {
+        if v.is_empty() {
+            return Err(LuaError::external(format!(
+                "{prefix}: opts.init_from must be a non-empty checkpoint path \
+                 (omit the key to train from the handle as built)"
+            )));
+        }
+        cfg.init_from = Some(PathBuf::from(v));
+    }
+    // Whether the loss scores each target among the ids its position
+    // allowed instead of among the whole vocabulary. Independent of
+    // whether the model is *handed* those ids (that is the training
+    // entry point's business), so both switches are readable here and
+    // neither implies the other.
+    if let Some(v) = opts.get::<Option<bool>>("mask_disallowed_logits")? {
+        cfg.mask_disallowed_logits = v;
     }
     Ok(())
 }
@@ -479,6 +513,33 @@ pub(super) fn train_err_to_lua(prefix: &str, e: TrainError) -> LuaError {
         TrainError::Ckpt(inner) => format!("{prefix}: checkpoint: {inner}"),
         TrainError::Candle(inner) => format!("{prefix}: candle: {inner}"),
         TrainError::Hook(inner) => format!("{prefix}: {inner}"),
+        // `opts.init_from` named a checkpoint the variables could not
+        // be restored from. The hint names the option rather than the
+        // Rust field, because that is what the caller edits.
+        TrainError::Restore(inner) => format!(
+            "{prefix}: opts.init_from could not be restored: {inner}; \
+             the run did not start"
+        ),
+        TrainError::InitFromUnsupported => format!(
+            "{prefix}: opts.init_from is not supported by this surface; \
+             restore the base handle before wrapping it"
+        ),
+        // The two channel mismatches. Both are a disagreement between
+        // how the model was built and what the dataset carries, so the
+        // hint points at the pair rather than at either side.
+        TrainError::MissingConditions { rows } => format!(
+            "{prefix}: the model declares a conditioning table but a batch of {rows} row(s) \
+             carried no conditions; attach them when the dataset is built"
+        ),
+        TrainError::UnexpectedConditions { rows, conds } => format!(
+            "{prefix}: a batch of {rows} row(s) carries {conds} condition(s) but the model \
+             was built without a conditioning table; add cond_slots to the preset opts \
+             or drop the conditions from the dataset"
+        ),
+        TrainError::MissingAllowedSets { rows, needed } => format!(
+            "{prefix}: a batch of {rows} row(s) carries no allowed-id sets, which this run \
+             requires ({needed}); attach them when the dataset is built"
+        ),
         other => format!("{prefix}: {other}"),
     };
     LuaError::external(msg)
@@ -563,6 +624,102 @@ mod tests {
         assert!((cfg.weight_decay - 0.5).abs() < 1e-12);
         assert_eq!(cfg.ckpt_every, 7);
         assert_eq!(cfg.ckpt_keep, 1);
+    }
+
+    #[test]
+    fn opts_read_init_from_and_the_loss_mask_switch() {
+        let lua = Lua::new();
+        let path = LuaValue::String(lua.create_string("/tmp/run-step40.safetensors").unwrap());
+        let opts = opts_from(
+            &lua,
+            &[
+                ("init_from", path),
+                ("mask_disallowed_logits", LuaValue::Boolean(true)),
+            ],
+        );
+        let cfg = extract_full_ft_opts("alc.nn.trainer", Some(&opts)).expect("channel opts");
+        assert_eq!(
+            cfg.init_from.as_deref(),
+            Some(std::path::Path::new("/tmp/run-step40.safetensors"))
+        );
+        assert!(cfg.mask_disallowed_logits);
+
+        // Both surfaces read the same field set, so the strict
+        // extractor has to see them too.
+        let strict = opts_from(
+            &lua,
+            &[
+                ("lr", LuaValue::Number(1e-4)),
+                ("batch", LuaValue::Integer(2)),
+                ("steps", LuaValue::Integer(3)),
+                (
+                    "init_from",
+                    LuaValue::String(lua.create_string("/tmp/base.safetensors").unwrap()),
+                ),
+            ],
+        );
+        let cfg = extract_run_train_cfg("alc.nn.trainer.run_full_ft", &strict).expect("strict");
+        assert_eq!(
+            cfg.init_from.as_deref(),
+            Some(std::path::Path::new("/tmp/base.safetensors"))
+        );
+        // Absent keys keep the crate default, which is "no resume" and
+        // "score against the whole vocabulary".
+        let d = FullFtConfig::default();
+        assert!(d.init_from.is_none());
+        assert!(!d.mask_disallowed_logits);
+    }
+
+    #[test]
+    fn opts_refuse_an_empty_init_from_path() {
+        let lua = Lua::new();
+        let opts = opts_from(
+            &lua,
+            &[(
+                "init_from",
+                LuaValue::String(lua.create_string("").unwrap()),
+            )],
+        );
+        let err = extract_full_ft_opts("alc.nn.trainer.full_ft", Some(&opts))
+            .expect_err("an empty init_from must be refused");
+        assert!(
+            err.to_string()
+                .contains("alc.nn.trainer.full_ft: opts.init_from must be a non-empty"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn train_err_to_lua_points_channel_errors_at_the_option() {
+        let err = train_err_to_lua(
+            "alc.nn.trainer.run_full_ft",
+            TrainError::InitFromUnsupported,
+        );
+        assert!(
+            err.to_string().contains("opts.init_from is not supported"),
+            "message: {err}"
+        );
+
+        let err = train_err_to_lua(
+            "alc.nn.trainer.run_full_ft",
+            TrainError::UnexpectedConditions { rows: 2, conds: 2 },
+        );
+        assert!(
+            err.to_string().contains("cond_slots"),
+            "the hint must name the preset option that adds the table: {err}"
+        );
+
+        let err = train_err_to_lua(
+            "alc.nn.trainer.run_full_ft",
+            TrainError::MissingAllowedSets {
+                rows: 2,
+                needed: "the model input",
+            },
+        );
+        assert!(
+            err.to_string().contains("the model input"),
+            "the hint must carry which switch asked for the sets: {err}"
+        );
     }
 
     #[test]

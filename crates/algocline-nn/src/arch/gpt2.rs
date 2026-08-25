@@ -69,6 +69,55 @@ const KNOWN_TARGET_MODULES: [&str; 6] = ["q_proj", "k_proj", "v_proj", "o_proj",
 /// descending. Measured on `examples/init_loss_probe.rs`.
 pub(crate) const INIT_STDEV: f64 = 0.02;
 
+/// Overwrite every registered parameter with values a seed decides, so
+/// a test can assert on the numbers a forward pass actually produces.
+///
+/// candle has no `Device::set_seed` on this version and this crate does
+/// not seed its initialisers, so a model built by [`Gpt2Model::new`] is
+/// different on every run. A test that thresholds the difference
+/// between two such forwards is thresholding a random draw; this makes
+/// the draw the test's own.
+///
+/// Norm weights are held at one and every bias at zero rather than
+/// randomised: a norm scaled by a number near zero would make the model
+/// degenerate in a way no real initialisation is.
+#[cfg(test)]
+pub(crate) fn fill_deterministic(vm: &VarMap, seed: u64) -> CandleResult<()> {
+    let data = vm
+        .data()
+        .lock()
+        .map_err(|_| candle_core::Error::Msg("fill_deterministic: VarMap lock poisoned".into()))?;
+    // `HashMap` iteration order is arbitrary and the generator is
+    // sequential, so the names have to be walked in a fixed order for
+    // the fill to be reproducible.
+    let mut names: Vec<&String> = data.keys().collect();
+    names.sort();
+    let mut state = seed | 1;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // [-0.05, 0.05), the order of magnitude the real initialiser
+        // draws at (INIT_STDEV = 0.02).
+        ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
+    };
+    for name in names {
+        let var = &data[name];
+        let n = var.shape().elem_count();
+        let values: Vec<f32> = if name.ends_with(".bias") {
+            vec![0.0; n]
+        } else if name.contains("ln_") {
+            vec![1.0; n]
+        } else {
+            (0..n).map(|_| next()).collect()
+        };
+        let t =
+            Tensor::from_vec(values, var.shape().clone(), var.device())?.to_dtype(var.dtype())?;
+        var.set(&t)?;
+    }
+    Ok(())
+}
+
 /// Embedding table drawn from `N(0, INIT_STDEV)` instead of candle-nn's
 /// `N(0, 1)` default.
 ///
@@ -661,6 +710,278 @@ impl Block {
     }
 }
 
+/// Why a table row could not be wrapped in a [`CondIndex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CondIndexError {
+    /// The row is outside the table the caller named.
+    #[error(
+        "condition row {row} is outside a {slots}-row conditioning table; \
+         rows are numbered 0..{slots}"
+    )]
+    OutOfRange {
+        /// Row the caller asked for.
+        row: u32,
+        /// Rows the table holds.
+        slots: usize,
+    },
+    /// The caller named a table with no rows, which selects nothing.
+    #[error("a conditioning table of zero rows has no row to select")]
+    NoSlots,
+}
+
+/// A row of a model's conditioning table.
+///
+/// The point of the wrapper is that the number inside cannot be
+/// supplied casually. Rows are `0..cond_slots`, and a condition that
+/// means something to a caller almost always has a *second* numbering —
+/// most obviously a token id, when the condition also appears in the
+/// sequence. The two ranges are different and they overlap, so an id
+/// passed where a row is wanted selects a real but wrong row: every
+/// shape agrees, the forward pass succeeds, and the model is
+/// conditioned on something else with nothing downstream able to report
+/// it.
+///
+/// So the constructor takes the table size as well as the row and
+/// checks one against the other. A caller holding an id from some other
+/// numbering does not have a slot count that makes it valid, and the
+/// mistake stops here rather than at a number that happens to be in
+/// range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CondIndex(u32);
+
+impl CondIndex {
+    /// Wrap `row` after checking it against a table of `slots` rows.
+    ///
+    /// `slots` is [`Gpt2Custom::cond_slots`] of the model the index is
+    /// destined for. Passing it is what makes the check possible, and
+    /// asking for it is what makes a caller state which table they mean.
+    ///
+    /// # Errors
+    ///
+    /// [`CondIndexError::NoSlots`] when `slots` is zero, and
+    /// [`CondIndexError::OutOfRange`] when `row >= slots`.
+    pub fn new(row: u32, slots: usize) -> Result<Self, CondIndexError> {
+        if slots == 0 {
+            return Err(CondIndexError::NoSlots);
+        }
+        if row as usize >= slots {
+            return Err(CondIndexError::OutOfRange { row, slots });
+        }
+        Ok(Self(row))
+    }
+
+    /// The row this index selects.
+    pub fn row(self) -> u32 {
+        self.0
+    }
+}
+
+/// The ids a model may pick from at each position of a batch, in the
+/// form [`Gpt2Model::forward_allowed`] reads them.
+///
+/// # What the indices mean
+///
+/// `sets[r][p]` is the set the model's prediction **for input position
+/// `p` of row `r`** is drawn from — what is available once it has
+/// consumed input position `p`, not what was available when position
+/// `p` itself was produced. Under the usual next-token shift that is
+/// the same set the loss mask uses for target `p`
+/// ([`crate::train::allowed_logit_mask`]), which is why
+/// [`crate::train::allowed_input_sets`] builds both from one list at
+/// one offset: given as input on one side, used to strike out the
+/// alternatives on the other.
+///
+/// Getting that offset wrong shifts every set by one position and
+/// leaves every shape agreeing, so the in-crate producer is the
+/// training-side helper rather than this constructor. A caller that
+/// builds its own — one recovering the sets from the state it is
+/// standing on — passes it here.
+///
+/// # Layout
+///
+/// The lists are padded to the longest set **in this batch** rather
+/// than to any constant: a constant would have to be a bound on how
+/// many ids a position can offer, and one chosen slightly too small
+/// truncates a set with nothing to say so. The padding carries no
+/// weight, so the width it reaches changes the arithmetic nowhere.
+///
+/// The cost is paid in the forward pass rather than here: the ids are
+/// `rows × width × k` u32, but the gather they drive materialises
+/// `rows × width × k × dim` floats before the mean collapses it.
+#[derive(Debug, Clone)]
+pub struct AllowedSets {
+    /// `[rows, width, k]` u32 — each position's ids, padded with `0`.
+    ids: Tensor,
+    /// `[rows, width, k]` f32 — `1 / count` on a real entry and `0` on
+    /// padding, so the mean is a weighted sum and the division by a
+    /// count that could be zero never happens.
+    weights: Tensor,
+    /// Largest id in `ids`, kept from construction so the range check
+    /// in the forward pass costs no device round trip. `0` when every
+    /// id present is `0`, which is in range for every vocabulary this
+    /// builds a model over.
+    max_id: u32,
+}
+
+impl AllowedSets {
+    /// Build from one set per position of every row.
+    ///
+    /// Every row must hold the same number of positions, which is the
+    /// model's input width. See the type's documentation for what
+    /// `sets[r][p]` has to be.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::window`], which this delegates to with the full width.
+    pub fn new(sets: &[Vec<Vec<u32>>], device: &Device) -> CandleResult<Self> {
+        let width = sets.first().map(Vec::len).unwrap_or(0);
+        Self::window(sets, 0, width, device)
+    }
+
+    /// Build from a window of each row's sets: position `p` of the
+    /// result reads `sets[r][from + p]`.
+    ///
+    /// # The empty set, per position and per batch
+    ///
+    /// A **position** past the end of its row gets the empty set, and
+    /// that is a legitimate thing for a producer to say: it is the
+    /// padding past the end of a row, and the forward pass reads it as
+    /// the zero vector rather than dividing by a count of nothing.
+    ///
+    /// A **batch** in which every position of every row is empty is a
+    /// different statement and is refused here. Such an input would add
+    /// the zero vector everywhere, so the model handed it would answer
+    /// exactly as the same model with this channel deleted — a
+    /// checkpoint trained with the channel, scored as though it had
+    /// none, every number well-formed.
+    ///
+    /// The guard in [`Gpt2Model::forward_allowed`] tests that an
+    /// `AllowedSets` was supplied rather than that it carries ids, so
+    /// it would let that through and return numbers a caller cannot
+    /// tell from a correct run. The refusal therefore lives here, where
+    /// every producer passes.
+    ///
+    /// # Errors
+    ///
+    /// `sets` is empty, `width` is zero, a row holds a different number
+    /// of positions than row 0 **before** the window is applied (rows
+    /// of differing lengths mean the batch and its sets were built from
+    /// different row lists, which no windowing makes safe), or no
+    /// position in the window holds an id.
+    pub fn window(
+        sets: &[Vec<Vec<u32>>],
+        from: usize,
+        width: usize,
+        device: &Device,
+    ) -> CandleResult<Self> {
+        let rows = sets.len();
+        if rows == 0 {
+            return Err(candle_core::Error::Msg(
+                "allowed sets: no rows, so there is nothing to say is allowed".into(),
+            ));
+        }
+        if width == 0 {
+            return Err(candle_core::Error::Msg(
+                "allowed sets: zero positions per row".into(),
+            ));
+        }
+        let full = sets[0].len();
+        for (r, row) in sets.iter().enumerate() {
+            if row.len() != full {
+                return Err(candle_core::Error::Msg(format!(
+                    "allowed sets: row {r} holds {} position(s) and row 0 holds {full}",
+                    row.len()
+                )));
+            }
+        }
+
+        // The longest set in the window. Zero means no position of any
+        // row holds an id, which is refused rather than built: every
+        // weight would be zero, the channel would contribute the
+        // additive identity everywhere, and the model would answer
+        // exactly as the same model with no table — the one outcome
+        // nothing further along can tell from a correct run.
+        let k = sets
+            .iter()
+            .flat_map(|row| row.iter().skip(from).take(width))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if k == 0 {
+            return Err(candle_core::Error::Msg(format!(
+                "allowed sets: no position of any row holds an id ({rows} row(s), {width} \
+                 position(s) from {from}), so this input would add nothing anywhere and the \
+                 model would answer as though it had no allowed-id channel at all; a producer \
+                 with nothing to say about a batch cannot say it here"
+            )));
+        }
+
+        let mut ids = vec![0u32; rows * width * k];
+        let mut weights = vec![0f32; rows * width * k];
+        let mut max_id = 0u32;
+        for (r, row) in sets.iter().enumerate() {
+            for p in 0..width {
+                let Some(set) = row.get(from + p) else {
+                    continue;
+                };
+                if set.is_empty() {
+                    continue;
+                }
+                let base = (r * width + p) * k;
+                // Every real entry carries the same share, so the
+                // weighted sum below is the mean over the true count
+                // and the padding — weight zero — is not counted.
+                let share = 1.0 / set.len() as f32;
+                for (j, id) in set.iter().enumerate() {
+                    ids[base + j] = *id;
+                    weights[base + j] = share;
+                    max_id = max_id.max(*id);
+                }
+            }
+        }
+
+        Ok(Self {
+            ids: Tensor::from_vec(ids, (rows, width, k), device)?,
+            weights: Tensor::from_vec(weights, (rows, width, k), device)?,
+            max_id,
+        })
+    }
+
+    /// Rows this covers.
+    pub fn rows(&self) -> usize {
+        self.ids.dims()[0]
+    }
+
+    /// Positions per row.
+    pub fn width(&self) -> usize {
+        self.ids.dims()[1]
+    }
+
+    /// Entries the padded lists were widened to — the longest set in
+    /// the batch, and never zero, since a batch holding no ids at all
+    /// is refused by [`Self::window`].
+    pub fn widest(&self) -> usize {
+        self.ids.dims()[2]
+    }
+
+    /// The padded id table, `[rows, width, widest]`. Test-only: the
+    /// padding convention is part of what the mean arithmetic rests on,
+    /// and asserting on it directly is cheaper than inferring it from a
+    /// forward pass.
+    #[cfg(test)]
+    pub(crate) fn ids(&self) -> &Tensor {
+        &self.ids
+    }
+
+    /// The per-entry weights, `[rows, width, widest]` — `1 / count` on
+    /// a real entry, `0` on padding. Test-only, for the reason
+    /// [`Self::ids`] is.
+    #[cfg(test)]
+    pub(crate) fn weights(&self) -> &Tensor {
+        &self.weights
+    }
+}
+
 /// GPT-2 forward-only model.
 ///
 /// Constructed via [`Gpt2Model::new`] (random init from a [`VarBuilder`])
@@ -691,6 +1012,15 @@ pub struct Gpt2Model {
     /// `lm_head.weight`), present iff `untied_head`. `None` = head
     /// tied to `wte` (reference).
     lm_head: Option<Tensor>,
+    /// Conditioning table (`[cond_slots, dim]`, VarMap name
+    /// `cond_wte.weight`), present iff [`Gpt2Custom::cond_slots`] is
+    /// set. Read only by [`Self::forward_conditioned`] and its grouped
+    /// sibling.
+    cond_wte: Option<Embedding>,
+    /// Allowed-id table (`[vocab, dim]`, VarMap name
+    /// `allowed_wte.weight`), present iff [`Gpt2Custom::allowed_input`].
+    /// Read only by [`Self::forward_allowed`].
+    allowed_wte: Option<Embedding>,
     cfg: Gpt2Config,
 }
 
@@ -787,6 +1117,31 @@ impl Gpt2Model {
         } else {
             None
         };
+        // Conditioning table. Small (`slots × dim`) and read by nothing
+        // but the conditioning addition, which is what keeps it out of
+        // the tug-of-war `wte` would be in — see
+        // [`Gpt2Custom::cond_slots`].
+        let cond_wte = match custom.cond_slots {
+            Some(slots) => Some(gpt2_embedding(
+                slots,
+                cfg.dim,
+                vs.pp(super::custom::COND_TABLE_PREFIX),
+            )?),
+            None => None,
+        };
+        // Allowed-id table. One row per vocabulary entry, because its
+        // entries are ids — and separate from `wte` for the reason
+        // [`Gpt2Custom::allowed_input`] records: the set added here
+        // holds the id that is about to be the target.
+        let allowed_wte = if custom.allowed_input {
+            Some(gpt2_embedding(
+                cfg.vocab,
+                cfg.dim,
+                vs.pp(super::custom::ALLOWED_TABLE_PREFIX),
+            )?)
+        } else {
+            None
+        };
         let causal_mask = build_causal_mask(cfg.ctx, custom.window, &cfg.device, cfg.dtype)?;
         Ok(Self {
             wte,
@@ -797,6 +1152,8 @@ impl Gpt2Model {
             rope,
             alibi,
             lm_head,
+            cond_wte,
+            allowed_wte,
             cfg: cfg.clone(),
         })
     }
@@ -935,8 +1292,154 @@ impl Gpt2Model {
     /// Forward pass. Input `xs` is `[batch, seq]` of `u32` token ids;
     /// output is `[batch, seq, vocab]` — the raw logits (softmax is left
     /// to the training loss / sampling caller).
+    ///
+    /// # Errors
+    ///
+    /// `seq > ctx`, and — since a model built with
+    /// [`Gpt2Custom::allowed_input`] reads an allowed-id set at every
+    /// position — a model carrying `allowed_wte` handed none. See
+    /// [`Self::forward_allowed`] for why that is refused rather than
+    /// run with the channel absent.
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        self.forward_inner(xs, None).map(|(logits, _)| logits)
+        self.forward_inner(xs, None, None, None)
+            .map(|(logits, _)| logits)
+    }
+
+    /// Forward pass with a condition embedding added at **every**
+    /// position rather than carried by a token at the front of the row.
+    ///
+    /// `conds` holds one [`CondIndex`] per row of `xs`;
+    /// `cond_wte[conds[i]]` is added to row `i` at every position, next
+    /// to where the learned positional embedding is added. Output shape
+    /// is unchanged. Requires [`Gpt2Custom::cond_slots`] to have been
+    /// set when the model was built.
+    ///
+    /// # Why the condition is an argument
+    ///
+    /// The alternative — read it out of a fixed position in `xs` — does
+    /// not survive a row longer than `ctx`: whatever windowing the
+    /// caller applies can move an ordinary token into that slot, and
+    /// the model would condition on it with no observable difference
+    /// from a real condition. As an argument there is no position for
+    /// windowing to disturb.
+    ///
+    /// # Errors
+    ///
+    /// - The model was built without a conditioning table.
+    /// - `conds.len()` is not `batch`.
+    /// - Any index is outside `[0, cond_slots)` — reachable when the
+    ///   index was built against a larger table than this model has,
+    ///   which is a crossed pair rather than a typo.
+    /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
+    pub fn forward_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
+        self.forward_inner(xs, Some((conds, 1)), None, None)
+            .map(|(logits, _)| logits)
+    }
+
+    /// [`Self::forward_conditioned`] with `per_row` conditions per row,
+    /// whose table rows are **summed** before the addition.
+    ///
+    /// `conds` holds `batch * per_row` indices, row-major: row `i`'s
+    /// conditions are `conds[i*per_row .. (i+1)*per_row]`. With
+    /// `per_row == 1` this is exactly [`Self::forward_conditioned`].
+    ///
+    /// # Why a sum
+    ///
+    /// The composition being expressed is additive: each slot
+    /// contributes its own vector to the residual stream at every
+    /// position, next to where a single condition's vector already
+    /// goes, and nothing downstream distinguishes "one vector that is a
+    /// sum" from "two additions". That makes the operation
+    /// permutation-invariant in the slots — `[a, b]` and `[b, a]` are
+    /// the same forward — which is a property of the mechanism and not
+    /// a claim that the *model* treats the slots symmetrically: what
+    /// each row's vector comes to mean is the training corpus's
+    /// business.
+    ///
+    /// What this is **not**: a per-slot table. Every index still points
+    /// into the one `cond_wte`, so the caller owns the convention of
+    /// which rows belong to which slot. Two indices of the same slot
+    /// are not refused here — the forward cannot know the grouping —
+    /// and a caller that wants that refusal puts it where the grouping
+    /// is known.
+    ///
+    /// # Errors
+    ///
+    /// - `per_row` is zero (pass [`Self::forward`] for an
+    ///   unconditioned batch instead of an empty condition list).
+    /// - `conds.len()` is not `batch * per_row`.
+    /// - Anything [`Self::forward_conditioned`] refuses.
+    pub fn forward_conditioned_groups(
+        &self,
+        xs: &Tensor,
+        conds: &[CondIndex],
+        per_row: usize,
+    ) -> CandleResult<Tensor> {
+        if per_row == 0 {
+            return Err(candle_core::Error::Msg(
+                "gpt2 forward: per_row must be ≥ 1; an unconditioned batch goes through \
+                 `forward` rather than through an empty condition list"
+                    .into(),
+            ));
+        }
+        self.forward_inner(xs, Some((conds, per_row)), None, None)
+            .map(|(logits, _)| logits)
+    }
+
+    /// Forward pass with the ids allowed at each position added to the
+    /// residual stream there.
+    ///
+    /// `allowed` holds one set per position of every row; the mean of
+    /// `allowed_wte` over that set is added where the positional
+    /// embedding is added. Output shape is unchanged. Requires
+    /// [`Gpt2Custom::allowed_input`] to have been set when the model
+    /// was built.
+    ///
+    /// # What this is for
+    ///
+    /// A model trained on sequences alone has to infer the rules of a
+    /// constrained id space from them, and a decoder that walks its
+    /// ranking against the allowed set discards every bit of that work.
+    /// Handing the set over spends that share of the objective on the
+    /// question that survives to inference — which of the available ids
+    /// to pick.
+    ///
+    /// # The mean, and the empty set
+    ///
+    /// A set is summarised by the mean of its rows rather than the sum,
+    /// so a position offering forty ids and one offering four arrive at
+    /// the same scale. Exactly so in `F32`. In a lower-precision dtype
+    /// it is approximate: the shares are cast to the model's dtype
+    /// here rather than held in it, and `BF16` carries 8 significand
+    /// bits, so `1 / count` need not be representable — it is for a
+    /// count that is a power of two and rounds by up to about `2^-8`
+    /// otherwise. Nothing here corrects for that; a run that cares
+    /// would have to.
+    ///
+    /// A set with **no** ids contributes the zero vector: the mean over
+    /// zero elements is undefined, and rather than clamp a count the
+    /// weights are simply zero and the sum is empty, so the undefined
+    /// division never happens. That case is not hypothetical — it is
+    /// every padded position past the end of a row, and a NaN there
+    /// would take the whole batch with it. This much is exact in every
+    /// dtype: zero times anything is zero.
+    ///
+    /// The zero vector is the additive identity of the thing being
+    /// added, so such a position sees this channel contribute nothing,
+    /// which is the closest available reading of "nothing is known to
+    /// be available here". A whole input of such positions is a
+    /// different matter, and [`AllowedSets::window`] refuses to build
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// - The model was built without an allowed-id table.
+    /// - `allowed` does not cover exactly `[batch, seq]`.
+    /// - Any id is outside the vocabulary.
+    /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
+    pub fn forward_allowed(&self, xs: &Tensor, allowed: &AllowedSets) -> CandleResult<Tensor> {
+        self.forward_inner(xs, None, Some(allowed), None)
+            .map(|(logits, _)| logits)
     }
 
     /// Forward pass that also returns the summed MoE load-balancing
@@ -944,7 +1447,7 @@ impl Gpt2Model {
     /// composing the total loss). `None` on a dense (non-MoE) model,
     /// so existing callers of [`Self::forward`] see no change.
     pub fn forward_with_aux(&self, xs: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
-        self.forward_inner(xs, None)
+        self.forward_inner(xs, None, None, None)
     }
 
     /// Probe variant of [`Self::forward_with_aux`] that additionally
@@ -957,13 +1460,15 @@ impl Gpt2Model {
         xs: &Tensor,
     ) -> CandleResult<(Tensor, Option<Tensor>, Vec<Tensor>)> {
         let mut probs = Vec::new();
-        let (logits, aux) = self.forward_inner(xs, Some(&mut probs))?;
+        let (logits, aux) = self.forward_inner(xs, None, None, Some(&mut probs))?;
         Ok((logits, aux, probs))
     }
 
     fn forward_inner(
         &self,
         xs: &Tensor,
+        conds: Option<(&[CondIndex], usize)>,
+        allowed: Option<&AllowedSets>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
         let (b, t) = xs.dims2()?;
@@ -985,6 +1490,45 @@ impl Gpt2Model {
             // attention; NoPos has none by design.
             None => tok_emb,
         };
+        // The condition, if the caller passed one. Added here, beside
+        // the positional embedding, so it is present at every position
+        // instead of decaying with distance from a token at the front.
+        if let Some((conds, per_row)) = conds {
+            let cond_emb = self.condition_embedding(conds, b, per_row)?; // [B, 1, D]
+            h = h.broadcast_add(&cond_emb)?;
+        }
+        // The allowed-id input, beside the condition and for the same
+        // reason: it belongs at every position, because every position
+        // has its own set of available ids.
+        //
+        // Both disagreements are refused. A model that carries the
+        // table was trained with this channel at every position, so
+        // running it without one runs a model in a state it never
+        // trained in — and its output would look no different. The
+        // mirror, sets handed to a model with no table, is a caller
+        // that believes it is doing something it is not.
+        match (&self.allowed_wte, allowed) {
+            (Some(table), Some(sets)) => {
+                let allowed_emb = self.allowed_embedding(table, sets, b, t)?; // [B, T, D]
+                h = (h + allowed_emb)?;
+            }
+            (Some(_), None) => {
+                return Err(candle_core::Error::Msg(
+                    "gpt2 forward: this model was built with an allowed-id table and reads one \
+                     at every position; running it without one drops that channel entirely — \
+                     pass the allowed ids to forward_allowed"
+                        .into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(candle_core::Error::Msg(
+                    "gpt2 forward: allowed ids were supplied to a model with no allowed-id \
+                     table; build it with `custom.allowed_input = true` to use forward_allowed"
+                        .into(),
+                ))
+            }
+            (None, None) => {}
+        }
         // ALiBi score bias for the active prefix: [H, t, t] =
         // -slopes ⊙ (i - j). Constant tensors — no gradient tracking.
         let alibi_bias = match &self.alibi {
@@ -1019,6 +1563,102 @@ impl Gpt2Model {
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
         Ok((logits, aux_sum))
+    }
+
+    /// The per-row condition vectors, shaped `[batch, 1, dim]` so they
+    /// broadcast across the sequence.
+    ///
+    /// The indices arrive as a host slice rather than as a `Tensor`:
+    /// every caller has them on the host anyway, and it makes the arity
+    /// and range checks free. Range in particular has to be checked
+    /// here — candle's CPU backend rejects an out-of-range
+    /// `index_select`, but leaving it to the backend would mean the
+    /// accelerator builds decide whether a bad index is an error or a
+    /// silently conditioned run.
+    fn condition_embedding(
+        &self,
+        conds: &[CondIndex],
+        batch: usize,
+        per_row: usize,
+    ) -> CandleResult<Tensor> {
+        let table = self.cond_wte.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "gpt2 forward: this model has no conditioning table; build it with \
+                 `custom.cond_slots = Some(n)` to use forward_conditioned"
+                    .into(),
+            )
+        })?;
+        if conds.len() != batch * per_row {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: {} condition index/indices for a batch of {batch} at {per_row} \
+                 per row; pass exactly {}",
+                conds.len(),
+                batch * per_row
+            )));
+        }
+        let slots = self
+            .cfg
+            .custom
+            .as_ref()
+            .and_then(|c| c.cond_slots)
+            .unwrap_or(0);
+        if let Some(bad) = conds.iter().find(|i| i.row() as usize >= slots) {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: condition index {} is outside the {slots}-row conditioning table",
+                bad.row()
+            )));
+        }
+        let rows: Vec<u32> = conds.iter().map(|i| i.row()).collect();
+        let ids = Tensor::from_vec(rows, (batch, per_row), &self.cfg.device)?;
+        // [B, k, D] summed over k — one addition per slot, an identity
+        // when k is 1.
+        table.forward(&ids)?.sum(1)?.unsqueeze(1) // [B, 1, D]
+    }
+
+    /// The per-position allowed-id vectors, shaped `[batch, seq, dim]`.
+    ///
+    /// The mean over each position's ids, computed as a weighted sum so
+    /// that padding (weight zero) costs nothing and an empty set — the
+    /// padding past the end of a row — yields the zero vector without a
+    /// division ever being attempted. See [`Self::forward_allowed`].
+    ///
+    /// The gather is the expensive step: `[batch, seq, k, dim]` floats
+    /// exist between the lookup and the sum, where `k` is the longest
+    /// set in the batch. That is what pays for not fixing a maximum.
+    ///
+    /// Range is checked here for the reason
+    /// [`Self::condition_embedding`] checks it: candle's CPU backend
+    /// refuses an out-of-range `index_select`, and leaving it to the
+    /// backend would let the accelerator builds decide whether a bad id
+    /// is an error or a quietly different vector.
+    fn allowed_embedding(
+        &self,
+        table: &Embedding,
+        allowed: &AllowedSets,
+        batch: usize,
+        seq: usize,
+    ) -> CandleResult<Tensor> {
+        if allowed.rows() != batch || allowed.width() != seq {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: allowed ids cover {}x{} (rows x positions) for an input of \
+                 {batch}x{seq}; one set per position of every row",
+                allowed.rows(),
+                allowed.width()
+            )));
+        }
+        if allowed.max_id as usize >= self.cfg.vocab {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: allowed id {} is outside the {}-entry vocabulary",
+                allowed.max_id, self.cfg.vocab
+            )));
+        }
+        let k = allowed.widest();
+        let rows = table.forward(&allowed.ids)?; // [B, T, K, D]
+        let shares = allowed
+            .weights
+            .to_dtype(self.cfg.dtype)?
+            .reshape((batch, seq, k, 1))?;
+        rows.broadcast_mul(&shares)?.sum(2) // [B, T, D]
     }
 
     /// Wrap the model's per-block linear projections with LoRA
@@ -1094,6 +1734,29 @@ impl Gpt2Model {
 impl Module for Gpt2Model {
     fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         Gpt2Model::forward(self, xs)
+    }
+}
+
+/// Delegate to the inherent [`Gpt2Model::forward_conditioned_groups`],
+/// so the conditioned training entry point can drive this model without
+/// naming it.
+impl crate::train::ConditionedForward for Gpt2Model {
+    fn forward_conditioned_rows(
+        &self,
+        xs: &Tensor,
+        conds: &[CondIndex],
+        per_row: usize,
+    ) -> CandleResult<Tensor> {
+        self.forward_conditioned_groups(xs, conds, per_row)
+    }
+}
+
+/// Delegate to the inherent [`Gpt2Model::forward_allowed`], so the
+/// allowed-id training entry point can drive this model without naming
+/// it.
+impl crate::train::AllowedForward for Gpt2Model {
+    fn forward_allowed_rows(&self, xs: &Tensor, allowed: &AllowedSets) -> CandleResult<Tensor> {
+        self.forward_allowed(xs, allowed)
     }
 }
 
@@ -2021,5 +2684,481 @@ mod tests {
             Ok(_) => panic!("expected an error"),
         };
         assert!(msg.contains("top_k"), "unexpected error: {msg}");
+    }
+
+    // ── Conditioning ────────────────────────────────────────────────
+
+    /// A model wide enough in context that "far from the front of the
+    /// row" means something, carrying `slots` conditioning rows.
+    fn conditioning_cfg(slots: Option<usize>) -> Gpt2Config {
+        Gpt2Config {
+            layers: 1,
+            heads: 2,
+            dim: 16,
+            ctx: 128,
+            vocab: 64,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(Gpt2Custom {
+                cond_slots: slots,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A model whose weights a seed decides, so the assertions below
+    /// are on numbers rather than on a draw.
+    fn seeded_model(cfg: &Gpt2Config) -> Gpt2Model {
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(cfg, vs).unwrap();
+        fill_deterministic(&varmap, 0x0824_2026).unwrap();
+        model
+    }
+
+    fn cond(row: u32, slots: usize) -> CondIndex {
+        CondIndex::new(row, slots).expect("row inside the table")
+    }
+
+    /// The claim is comparative. "The condition changes the output far
+    /// from the front of the row" is true of a token at the front too —
+    /// decayed, but non-zero — so on its own it does not distinguish
+    /// the two mechanisms. What is specific to conditioning at every
+    /// position is that the effect does not fall off with distance.
+    ///
+    /// So the test measures both, on the same model and the same two
+    /// positions: (a) two conditions passed as arguments, and (b) two
+    /// rows differing only in the token at position 1, which is the
+    /// prefix mechanism this replaces. The counterfactual is run rather
+    /// than asserted in a comment, which is what makes the separation a
+    /// measured margin instead of a chosen one.
+    #[test]
+    fn a_condition_does_not_decay_with_distance_the_way_a_prefix_does() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+
+        let seq: Vec<u32> = (0..120u32).map(|i| 8 + i % 40).collect();
+        let far = seq.len() - 1;
+        let near = 1;
+        let ids = Tensor::from_slice(&seq, (1, seq.len()), &cfg.device).unwrap();
+        let at = |out: &Tensor, pos: usize| out.i((0, pos)).unwrap();
+
+        let plain = model.forward(&ids).unwrap();
+        let low = model.forward_conditioned(&ids, &[cond(0, 4)]).unwrap();
+        let high = model.forward_conditioned(&ids, &[cond(1, 4)]).unwrap();
+
+        let plain_vs_low = crate::arch::max_abs_diff_f32(&at(&plain, far), &at(&low, far)).unwrap();
+        assert!(
+            plain_vs_low > 1e-4,
+            "a condition that changes nothing at position {far} is not a condition \
+             (max abs diff {plain_vs_low})"
+        );
+
+        let far_gap = crate::arch::max_abs_diff_f32(&at(&low, far), &at(&high, far)).unwrap();
+        assert!(
+            far_gap > 1e-4,
+            "two conditions produced the same logits at position {far} (gap {far_gap})"
+        );
+        let near_gap = crate::arch::max_abs_diff_f32(&at(&low, near), &at(&high, near)).unwrap();
+        let per_position = far_gap / near_gap;
+
+        // The counterfactual: the same information carried by a token
+        // at position 1.
+        let mut prefix_a = seq.clone();
+        prefix_a[near] = 2;
+        let mut prefix_b = seq.clone();
+        prefix_b[near] = 3;
+        let out_a = model
+            .forward(&Tensor::from_slice(&prefix_a, (1, seq.len()), &cfg.device).unwrap())
+            .unwrap();
+        let out_b = model
+            .forward(&Tensor::from_slice(&prefix_b, (1, seq.len()), &cfg.device).unwrap())
+            .unwrap();
+        let prefix_far = crate::arch::max_abs_diff_f32(&at(&out_a, far), &at(&out_b, far)).unwrap();
+        let prefix_near =
+            crate::arch::max_abs_diff_f32(&at(&out_a, near), &at(&out_b, near)).unwrap();
+        let prefix_ratio = prefix_far / prefix_near;
+
+        // The two mechanisms have to be *separated*, not merely on
+        // opposite sides of a boundary: bounding one below 0.5 and the
+        // other above it passes at 0.499 against 0.501, which is two
+        // indistinguishable mechanisms. So the assertion is on the
+        // ratio between them. The margin belongs to this model — one
+        // layer at dim 16, untrained, where the prefix's far/near is
+        // mostly dilution over the sequence — and the claim being made
+        // is ordinal (an argument does not fade where a prefix does),
+        // not a prediction of the size of the gap.
+        let separation = per_position / prefix_ratio;
+        assert!(
+            separation > 10.0,
+            "the two mechanisms are {separation}x apart: argument {per_position} \
+             (near {near_gap}, far {far_gap}) against prefix {prefix_ratio} \
+             (near {prefix_near}, far {prefix_far}); below a factor of ten they are not \
+             telling us apart from what they replace"
+        );
+    }
+
+    /// With one condition per row the grouped entry point is exactly
+    /// the single-condition one — the sum over one row is that row.
+    #[test]
+    fn a_group_of_one_is_the_single_condition_forward() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (2, 3), &cfg.device).unwrap();
+        let conds = [cond(0, 4), cond(2, 4)];
+        let single = model.forward_conditioned(&ids, &conds).unwrap();
+        let grouped = model.forward_conditioned_groups(&ids, &conds, 1).unwrap();
+        let gap = crate::arch::max_abs_diff_f32(&single, &grouped).unwrap();
+        assert!(gap < 1e-6, "the two entry points diverged by {gap}");
+    }
+
+    /// The sum makes the slots order-free, and makes the pair a third
+    /// condition rather than either of its halves.
+    #[test]
+    fn grouped_conditions_are_order_free_and_not_either_alone() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let (a, b) = (cond(0, 4), cond(1, 4));
+        let ab = model.forward_conditioned_groups(&ids, &[a, b], 2).unwrap();
+        let ba = model.forward_conditioned_groups(&ids, &[b, a], 2).unwrap();
+        assert!(crate::arch::max_abs_diff_f32(&ab, &ba).unwrap() < 1e-6);
+
+        let alone = model.forward_conditioned(&ids, &[a]).unwrap();
+        assert!(
+            crate::arch::max_abs_diff_f32(&ab, &alone).unwrap() > 1e-4,
+            "the pair read as one of its halves"
+        );
+    }
+
+    /// One index per row, or the caller does not know which row it
+    /// meant.
+    #[test]
+    fn conditioned_forward_rejects_a_count_that_is_not_one_per_row() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4, 5, 6], (2, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned(&ids, &[cond(0, 4)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("per row"), "{msg}");
+
+        let three = [cond(0, 4), cond(1, 4), cond(2, 4)];
+        let msg = match model.forward_conditioned_groups(&ids, &three, 2) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("pass exactly 4"), "{msg}");
+    }
+
+    /// Zero conditions per row is a different request — the plain
+    /// forward — and is refused rather than read as an empty sum.
+    #[test]
+    fn grouped_conditions_reject_a_zero_group() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned_groups(&ids, &[], 0) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("per_row"), "{msg}");
+    }
+
+    /// A model built without the table cannot be conditioned, and says
+    /// so rather than ignoring the argument.
+    #[test]
+    fn conditioned_forward_needs_a_table() {
+        let cfg = conditioning_cfg(None);
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let msg = match model.forward_conditioned(&ids, &[cond(0, 4)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("no conditioning table"), "{msg}");
+    }
+
+    /// An index built against a larger table than this model carries is
+    /// a crossed pair, and no downstream reading would reveal it.
+    #[test]
+    fn conditioned_forward_rejects_an_index_outside_this_models_table() {
+        let cfg = conditioning_cfg(Some(2));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        // Valid against a 4-row table, which this model does not have.
+        let msg = match model.forward_conditioned(&ids, &[cond(3, 4)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("conditioning table"), "{msg}");
+    }
+
+    /// The constructor is where a row from some other numbering stops.
+    #[test]
+    fn cond_index_checks_the_row_against_the_table_it_names() {
+        assert_eq!(CondIndex::new(0, 1).unwrap().row(), 0);
+        assert_eq!(CondIndex::new(3, 4).unwrap().row(), 3);
+        assert_eq!(
+            CondIndex::new(4, 4).unwrap_err(),
+            CondIndexError::OutOfRange { row: 4, slots: 4 }
+        );
+        assert_eq!(CondIndex::new(0, 0).unwrap_err(), CondIndexError::NoSlots);
+        assert!(CondIndex::new(4, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("outside a 4-row"));
+    }
+
+    /// The table is a parameter of its own, registered under a name
+    /// nothing else reads. Its absence from an unconditioned model is
+    /// what makes a checkpoint of one convention fail to restore into
+    /// the other.
+    #[test]
+    fn the_conditioning_table_is_a_parameter_of_its_own() {
+        let cfg = conditioning_cfg(Some(3));
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let _ = Gpt2Model::new(&cfg, vs).unwrap();
+        let names: Vec<String> = varmap.data().lock().unwrap().keys().cloned().collect();
+        assert!(
+            names.iter().any(|n| n == "cond_wte.weight"),
+            "got: {names:?}"
+        );
+        let shape = varmap.data().lock().unwrap()["cond_wte.weight"]
+            .shape()
+            .dims()
+            .to_vec();
+        assert_eq!(shape, vec![3, cfg.dim]);
+
+        let plain = conditioning_cfg(None);
+        let plain_vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&plain_vm, plain.dtype, &plain.device);
+        let _ = Gpt2Model::new(&plain, vs).unwrap();
+        assert!(!plain_vm
+            .data()
+            .lock()
+            .unwrap()
+            .contains_key("cond_wte.weight"));
+    }
+
+    // ── Allowed-id input ────────────────────────────────────────────
+
+    fn allowed_cfg() -> Gpt2Config {
+        Gpt2Config {
+            layers: 1,
+            heads: 2,
+            dim: 16,
+            ctx: 16,
+            vocab: 32,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(Gpt2Custom {
+                allowed_input: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The set is summarised by its mean, so a set that names the same
+    /// id twice is the same input as the set that names it once. That
+    /// identity is exact, and it is the arithmetic the channel rests
+    /// on: a position offering many ids and one offering few arrive at
+    /// the same scale.
+    #[test]
+    fn a_repeated_id_averages_back_to_the_single_id() {
+        let cfg = allowed_cfg();
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+
+        let once = AllowedSets::new(&[vec![vec![5u32], vec![5], vec![5]]], &cfg.device).unwrap();
+        let twice =
+            AllowedSets::new(&[vec![vec![5u32, 5], vec![5, 5], vec![5, 5]]], &cfg.device).unwrap();
+        assert_eq!((once.widest(), twice.widest()), (1, 2));
+
+        let a = model.forward_allowed(&ids, &once).unwrap();
+        let b = model.forward_allowed(&ids, &twice).unwrap();
+        let gap = crate::arch::max_abs_diff_f32(&a, &b).unwrap();
+        assert!(gap < 1e-5, "the mean over a repeated id moved by {gap}");
+
+        // A different set is a different input, or the channel does
+        // nothing.
+        let other = AllowedSets::new(&[vec![vec![6u32], vec![6], vec![6]]], &cfg.device).unwrap();
+        let c = model.forward_allowed(&ids, &other).unwrap();
+        assert!(crate::arch::max_abs_diff_f32(&a, &c).unwrap() > 1e-4);
+    }
+
+    /// The weights are `1 / count` on a real entry and zero on padding,
+    /// so an empty position adds the zero vector without a division by
+    /// a count of nothing ever being attempted.
+    #[test]
+    fn an_empty_position_carries_no_weight_at_all() {
+        let device = Device::Cpu;
+        let sets = AllowedSets::new(&[vec![vec![1u32, 2, 3], vec![], vec![7]]], &device).unwrap();
+        assert_eq!((sets.rows(), sets.width(), sets.widest()), (1, 3, 3));
+        let weights: Vec<Vec<f32>> = sets.weights().i(0).unwrap().to_vec2().unwrap();
+        let third = 1.0f32 / 3.0;
+        assert_eq!(weights[0], vec![third, third, third]);
+        assert_eq!(weights[1], vec![0.0, 0.0, 0.0]);
+        assert_eq!(weights[2], vec![1.0, 0.0, 0.0]);
+        let ids: Vec<Vec<u32>> = sets.ids().i(0).unwrap().to_vec2().unwrap();
+        assert_eq!(ids[1], vec![0, 0, 0], "padding is the zero id, weight zero");
+    }
+
+    /// An empty position changes nothing at that position and nothing
+    /// before it, and a non-empty one does — which is how the zero
+    /// vector differs from a set.
+    #[test]
+    fn an_empty_position_leaves_that_position_to_the_sequence_alone() {
+        let cfg = allowed_cfg();
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2], (1, 2), &cfg.device).unwrap();
+        let empty_tail = AllowedSets::new(&[vec![vec![5u32], vec![]]], &cfg.device).unwrap();
+        let filled_tail = AllowedSets::new(&[vec![vec![5u32], vec![9]]], &cfg.device).unwrap();
+
+        let a = model.forward_allowed(&ids, &empty_tail).unwrap();
+        let b = model.forward_allowed(&ids, &filled_tail).unwrap();
+        let at = |out: &Tensor, pos: usize| out.i((0, pos)).unwrap();
+        assert!(
+            crate::arch::max_abs_diff_f32(&at(&a, 0), &at(&b, 0)).unwrap() < 1e-6,
+            "a later position changed an earlier one"
+        );
+        assert!(
+            crate::arch::max_abs_diff_f32(&at(&a, 1), &at(&b, 1)).unwrap() > 1e-4,
+            "an empty set read the same as a set naming an id"
+        );
+    }
+
+    /// A batch in which no position of any row holds an id would add
+    /// the zero vector everywhere, leaving the model answering exactly
+    /// as one built without the table.
+    #[test]
+    fn allowed_sets_refuse_a_batch_with_no_ids_anywhere() {
+        let device = Device::Cpu;
+        let msg = AllowedSets::new(&[vec![vec![], vec![]]], &device)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("no position of any row holds an id"), "{msg}");
+
+        // Zero rows and zero positions are refused by name as well.
+        assert!(AllowedSets::new(&[], &device)
+            .unwrap_err()
+            .to_string()
+            .contains("no rows"));
+        assert!(AllowedSets::window(&[vec![vec![1u32]]], 0, 0, &device)
+            .unwrap_err()
+            .to_string()
+            .contains("zero positions"));
+    }
+
+    /// Rows of differing lengths mean the batch and its sets were built
+    /// from different row lists, which no windowing makes safe.
+    #[test]
+    fn allowed_sets_refuse_rows_of_differing_lengths() {
+        let device = Device::Cpu;
+        let msg = AllowedSets::new(&[vec![vec![1u32], vec![2]], vec![vec![3u32]]], &device)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("row 1 holds 1 position(s)"), "{msg}");
+    }
+
+    /// The window skips the positions it was told to skip, and reaches
+    /// past the end of a row as the empty set rather than as an error.
+    #[test]
+    fn the_window_selects_positions_and_pads_past_the_end() {
+        let device = Device::Cpu;
+        let sets =
+            AllowedSets::window(&[vec![vec![1u32], vec![2, 3], vec![4]]], 1, 3, &device).unwrap();
+        assert_eq!((sets.rows(), sets.width(), sets.widest()), (1, 3, 2));
+        let ids: Vec<Vec<u32>> = sets.ids().i(0).unwrap().to_vec2().unwrap();
+        assert_eq!(ids[0], vec![2, 3]);
+        assert_eq!(ids[1], vec![4, 0]);
+        assert_eq!(ids[2], vec![0, 0], "past the end of the row");
+    }
+
+    /// The two disagreements are refused in both directions: a model
+    /// that reads the channel run without one, and sets handed to a
+    /// model that has no table.
+    #[test]
+    fn the_allowed_channel_refuses_both_disagreements() {
+        let cfg = allowed_cfg();
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2], (1, 2), &cfg.device).unwrap();
+
+        let msg = match model.forward(&ids) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("drops that channel entirely"), "{msg}");
+
+        let plain_cfg = Gpt2Config {
+            custom: None,
+            ..allowed_cfg()
+        };
+        let plain = seeded_model(&plain_cfg);
+        let sets = AllowedSets::new(&[vec![vec![5u32], vec![6]]], &cfg.device).unwrap();
+        let msg = match plain.forward_allowed(&ids, &sets) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("no allowed-id table"), "{msg}");
+    }
+
+    /// Sets that do not cover exactly the input, and ids past the end
+    /// of the vocabulary, are the two mistakes a shape check alone
+    /// would not catch on the device.
+    #[test]
+    fn allowed_forward_checks_the_cover_and_the_vocabulary() {
+        let cfg = allowed_cfg();
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2], (1, 2), &cfg.device).unwrap();
+
+        let short = AllowedSets::new(&[vec![vec![5u32]]], &cfg.device).unwrap();
+        let msg = match model.forward_allowed(&ids, &short) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("1x1 (rows x positions)"), "{msg}");
+
+        let too_big =
+            AllowedSets::new(&[vec![vec![5u32], vec![cfg.vocab as u32]]], &cfg.device).unwrap();
+        let msg = match model.forward_allowed(&ids, &too_big) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("outside the 32-entry vocabulary"), "{msg}");
+    }
+
+    /// The allowed-id table is its own parameter, sized by the
+    /// vocabulary, and absent from a model built without the axis.
+    #[test]
+    fn the_allowed_table_is_a_parameter_of_its_own() {
+        let cfg = allowed_cfg();
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, cfg.dtype, &cfg.device);
+        let _ = Gpt2Model::new(&cfg, vs).unwrap();
+        let shape = varmap.data().lock().unwrap()["allowed_wte.weight"]
+            .shape()
+            .dims()
+            .to_vec();
+        assert_eq!(shape, vec![cfg.vocab, cfg.dim]);
+
+        let plain_cfg = Gpt2Config {
+            custom: None,
+            ..allowed_cfg()
+        };
+        let plain_vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&plain_vm, plain_cfg.dtype, &plain_cfg.device);
+        let _ = Gpt2Model::new(&plain_cfg, vs).unwrap();
+        assert!(!plain_vm
+            .data()
+            .lock()
+            .unwrap()
+            .contains_key("allowed_wte.weight"));
     }
 }

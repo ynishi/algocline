@@ -763,6 +763,8 @@ lands.
 | `kv_heads` | integer | GQA KV-head count (omit for MHA; `heads % kv_heads == 0`) |
 | `window` | integer | sliding-window size `w ≥ 1` (omit for full causal) |
 | `untied_head` | boolean | `true` = independent `lm_head.weight` |
+| `cond_slots` | integer | rows of a conditioning table (omit for none) — see *Optional input channels* below |
+| `allowed_input` | boolean | `true` = the model reads the ids allowed at each position — see below |
 | `moe` | table | `{ n_experts, top_k?, alpha? }` — dense-MoE MLP (defaults: Mixtral top-2, α 0.01) |
 | `layers` / `heads` / `dim` / `ctx` / `vocab` | integer | shape overrides on the tiny base |
 | `device` / `dtype` / `pretrained` | — | same as the stock variants |
@@ -786,6 +788,83 @@ local h = alc.nn.preset.gpt2("custom", {
 })
 -- trains through the existing bindings unchanged:
 local ckpt = alc.nn.trainer.full_ft(h, ds, { lr = 3e-4, steps = 100, ... })
+```
+
+#### Optional input channels (`cond_slots` / `allowed_input`)
+
+Two of the `custom` axes give the model an input beside the tokens.
+Each adds a table of its own to the safetensors bundle, which is what
+lets a Card's declaration be checked against the weights (see
+`alc.nn.card.load_handle` below).
+
+- **`cond_slots = N`** — a table of `N` rows. One row is selected per
+  sequence and added to the residual stream at **every** position, so
+  the condition holds for the whole sequence instead of decaying with
+  distance from a token at the front. The row is supplied as an
+  argument rather than as a position in the input, which leaves nothing
+  for windowing to move.
+- **`allowed_input = true`** — the model is told, at each position,
+  which ids the answer there may be drawn from; the mean of the table
+  over that set is added where the positional embedding is. This is the
+  model's *input*. Restricting what the sampler may **pick** is
+  `alc.nn.constraint.allow_list`, and the two are independent — a model
+  told what is available can still rank an unavailable id first.
+
+The two cannot be combined: no forward pass delivers both, so a model
+carrying both tables would silently drop one, and the preset refuses
+the pair at build time.
+
+**Supplying the channel while training** — rows of
+`alc.nn.data.synthetic` may be written as
+`{ ids = {...}, cond = <row>, allowed = { {ids...}, ... } }` instead of
+a bare id array. `cond` may be a single row or an array of rows for a
+model whose corpus names several slots, and `opts.cond_slots` on the
+dataset states the table size the rows are checked against (a slot
+index and a token id overlap without meaning the same thing, so the
+size has to be stated rather than guessed). `allowed[p]` is the id set
+for position `p` of that row's `ids`. A channel present on some rows
+only is refused: the rest would train without it under a corpus that
+says otherwise. A set that does not hold the token its own position
+carries is refused too — the loss scores that token among the ids the
+set names, so a row contradicting itself would be trained against a
+penalty instead of stopping. Positions past the end of a row hold the
+pad id, so a set covering them has to allow it; an empty set means the
+position is unconstrained and is exempt.
+
+`alc.nn.trainer.run_full_ft` then routes the run through the matching
+training pass automatically — the decision follows the shape the handle
+was built with, so there is no opts key to keep in agreement with it.
+
+**Supplying the channel while generating** —
+`handle:generate_session(prompt_tokens, opts?)` takes `cond = <row>` or
+`allowed = { id, ... }`. Both directions of disagreement are refused: a
+key the model has no table for, and a table the caller says nothing
+about. The second is the one that would otherwise be silent — an unfed
+conditioning table adds nothing at every position, so the model runs in
+a state it never trained in and the output looks entirely ordinary.
+
+`allowed` is flat here: one set for the whole generation, handed to
+every position of every step. The per-position decode form is not in
+this release.
+
+```lua
+local h = alc.nn.preset.gpt2("custom", { pretrained = false, cond_slots = 2 })
+
+local rows = {}
+for i = 1, 8 do
+    rows[i] = { ids = { 1, 2, 3, 4, 5, 6, 7, 8 }, cond = i % 2 }
+end
+local ds = alc.nn.data.synthetic(rows, {
+    batch_size = 1, ctx_len = 8, cond_slots = 2,
+})
+
+local card_id = alc.nn.trainer.run_full_ft(h, ds, {
+    lr = 5e-3, batch = 1, steps = 3, warmup = 0,
+})
+
+local reloaded = alc.nn.card.load_handle(card_id)
+local session = reloaded:generate_session({ 1, 2, 3 }, { cond = 1 })
+local id = session:next_logits():argmax()
 ```
 
 #### `alc.nn.preset.tinyllama(variant, opts?)`
@@ -892,9 +971,28 @@ the bridge's arch registry, mmaps the safetensors bundle at
 `<nn_dir>/<card_id>.safetensors`, and returns an `NnHandle`
 UserData whose variant matches the card's arch.
 
+Before the model is built, the optional input channels the Card
+declares (`cond_slots` / `allowed_input`) are compared against the
+tensors in the bundle — the safetensors header only, so the cost does
+not scale with the weights. Both directions are refused. The second is
+the reason the check exists: the config is rebuilt from the Card, so a
+channel table the Card does not declare is never asked for, and the
+model would then run without an input it was trained with while every
+number afterwards still looked ordinary.
+
+The declaration is also compared against the config the loader rebuilds.
+A Card naming an architecture that pins its own shape (`gpt2-tiny`, or
+any non-GPT-2 family) while declaring a channel is refused: that config
+reads no such input, so the table would be dropped however complete the
+bundle is. `alc.nn.card.load_ckpt` runs the bundle comparison over the
+spec the caller hands it, for the same reasons.
+
 **Errors:**
 
 - `alc.nn.card.load_handle: card '...' not found`.
+- `alc.nn.card.load_handle: card '...': card declares '<axis>' but the bundle carries no '<tensor>'` — a declared channel whose table is missing; loading would put a randomly initialised table where a trained one belongs.
+- `alc.nn.card.load_handle: card '...': the bundle carries '<tensor>' but the card does not declare '<axis>'` — the silent direction above.
+- `alc.nn.card.load_handle: card '...': bundle ... could not be read to verify its channel tables` — a check that could not run is reported rather than passed.
 - `alc.nn.card.load_handle: card '...' has training_path="lora"; ... call `alc.nn.card.load_wrap(card_id, base)` instead` — LoRA cards need a base handle; directed to `load_wrap`.
 - `alc.nn.card.load_handle: card '...' has unknown training_path "..."` — training_path is not one of the accepted values.
 - `alc.nn.card.load_handle: card '...' architecture '...' has no bridge dispatch` — arch family is not registered on the bridge.
@@ -1256,6 +1354,19 @@ Checkpoint before assembling the Card.
     `NnCardMeta.name`; also `sanitize`d and used as a prefix
     to derive `card_id`. Defaults to `"run_full_ft"` when
     absent or empty.
+  - `init_from` (string, optional) — path to a checkpoint the
+    model's variables are restored from before the first step.
+    Strict: anything short of a complete restore is an error
+    and the run does not start, because a resume that quietly
+    kept some parameters at their initial values cannot be
+    told from a real one once training is under way. An empty
+    string is refused rather than read as "no checkpoint".
+  - `mask_disallowed_logits` (boolean, optional, default
+    `false`) — score each target among the ids its position
+    allowed instead of among the whole vocabulary. Requires
+    the dataset to carry allowed-id sets. Independent of
+    whether the model is *handed* those ids, which follows
+    from the handle's own shape.
 
 **Returns:** `card_id` (string). The Card carries
 `training_path="full_ft"` and `candle.bundle_ref="nn/<card_id>"`
@@ -1444,6 +1555,50 @@ as `load_handle` during the deprecation window). The old `load`
 name continues to work as an alias for `load_vars` until the
 deprecation cycle closes; new callers should use `load_vars`
 explicitly.
+
+#### `alc.nn.metric.bootstrap_ci(clusters, opts) -> table`
+
+Put a 95% confidence interval around the mean of a sample whose
+observations arrive in groups that are not independent of each other.
+
+`clusters` is an array of observation arrays: `clusters[i]` holds every
+number belonging to group `i`. The resampling unit is the **group**,
+not the observation — a bootstrap that drew observations would treat
+two readings from one group as two independent facts and return an
+interval narrower than the sample supports. Which readings belong
+together is something only the caller knows, so it is stated rather
+than inferred.
+
+**opts:**
+
+| key | type | notes |
+|-----|------|-------|
+| `seed` | integer | **required** — the same seed over the same sample reproduces the interval exactly |
+| `draws` | integer | resamples, default `2000` |
+
+`seed` has no default on purpose: an interval nothing can reproduce
+looks exactly like one that can.
+
+**Returns** a table with `point` (the statistic on the sample as
+walked, no resampling), `low` / `high` (the percentile bounds), `draws`
+(resamples that produced a usable value), `undefined_draws` (those that
+did not, reported rather than swallowed — dropping draws biases the
+interval), `clusters`, and `seed`.
+
+**Errors** (prefixed `alc.nn.metric.bootstrap_ci:`): an empty cluster
+list, a cluster that is not an array of numbers, a non-finite
+observation, `draws = 0`, a statistic undefined on the whole sample,
+and one that survives the whole sample but no resample of it (which
+means it rests on too few clusters to resample).
+
+```lua
+local ci = alc.nn.metric.bootstrap_ci(
+    { { 1, 0, 1 }, { 0, 0 }, { 1, 1, 1 } },   -- three groups
+    { draws = 2000, seed = 42 })
+if ci.low > 0 then
+    -- the whole interval lies above zero
+end
+```
 
 ---
 

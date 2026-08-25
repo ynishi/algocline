@@ -1,8 +1,14 @@
-//! Distribution distance / entropy primitives.
+//! Distribution distance / entropy primitives, and interval estimates
+//! for statistics built out of them.
 //!
 //! Domain-agnostic scalar metrics computed from probability vectors. All
 //! four primitives ([`kl`], [`js`], [`tvd`], [`entropy`]) operate on
 //! `&[f32]` slices interpreted as discrete probability distributions.
+//!
+//! [`bootstrap`] sits one level up: given observations that arrive in
+//! correlated groups, it puts a confidence interval around a statistic
+//! computed over them (which may well be one of the primitives here,
+//! meaned over a sample).
 //!
 //! # Layer boundary
 //!
@@ -10,8 +16,8 @@
 //! free callables from either Rust or the Lua bridge (added in a later
 //! subtask). Domain-specific composition — collecting an action
 //! distribution from a Card, comparing two Cards over a prompt set — is
-//! the responsibility of the Lua side (`gameai_metrics` pkg) which
-//! chains these primitives together.
+//! the responsibility of the Lua side, which chains these primitives
+//! together.
 //!
 //! # Input contract
 //!
@@ -32,6 +38,8 @@
 //! context for the caller to locate and fix the source.
 
 use thiserror::Error;
+
+pub mod bootstrap;
 
 /// Absolute tolerance used when checking that a distribution sums to
 /// `1.0`.

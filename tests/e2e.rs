@@ -9238,3 +9238,130 @@ async fn test_alc_pack_include_takes_sections_all_withholds() {
     assert_eq!(restored["source"]["verified"], true, "{restored}");
     assert!(home.join("logs/e2e.log").exists());
 }
+
+// ─── alc.nn optional input channels ───────────────────────────────
+//
+// Gated on the `nn` feature because the surface under test does not
+// exist in the binary the default build produces: without candle
+// linked there is no `alc.nn.preset`, so these would fail for a reason
+// unrelated to what they check. Run them with
+// `cargo test --features nn --test e2e nn_channel` — the form
+// `just test-nn` uses.
+//
+// Each drives the MCP `alc_run` tool, so what they cover is the whole
+// path a caller takes: JSON in, Lua VM, bridge, candle, and the error
+// text back out over the wire.
+
+/// The conditioning channel end to end: a corpus whose rows carry a
+/// condition, a model built with the matching table, a training run,
+/// the Card it writes, and a decode session over the reloaded handle.
+///
+/// The reload is the load-bearing step. `alc.nn.card.load_handle`
+/// rebuilds the model from the Card and checks the channel the Card
+/// declares against the tensors in the bundle, so a run that recorded
+/// the axis but wrote no table — or wrote one it did not record —
+/// stops here instead of generating ordinary-looking output.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_channel_bake_then_conditioned_decode() {
+    let harness = TempAlcHome::connect().await;
+
+    // The `custom` variant starts from the tiny shape (2 layers /
+    // dim 32 / ctx 16 / vocab 64), so the whole loop runs on CPU in
+    // about a second.
+    let code = r#"
+        local rows = {}
+        for i = 1, 8 do
+            rows[i] = { ids = { 1, 2, 3, 4, 5, 6, 7, 8 }, cond = i % 2 }
+        end
+        local ds = alc.nn.data.synthetic(rows, {
+            batch_size = 1, ctx_len = 8, cond_slots = 2,
+        })
+        local handle = alc.nn.preset.gpt2("custom", {
+            pretrained = false, cond_slots = 2,
+        })
+        local card_id = alc.nn.trainer.run_full_ft(handle, ds, {
+            lr = 5e-3, batch = 1, steps = 3, warmup = 0,
+        })
+        local reloaded = alc.nn.card.load_handle(card_id)
+        local session = reloaded:generate_session({ 1, 2, 3 }, { cond = 1 })
+        local logits = session:next_logits()
+        local id = logits:argmax()
+        session:append(id)
+        return {
+            vocab = logits:vocab(),
+            position = session:position(),
+            id = id,
+            card_id = card_id,
+        }
+    "#;
+
+    let resp = call_json(&harness.client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "completed", "run failed: {resp}");
+    let result = &resp["result"];
+    assert_eq!(result["vocab"], 64, "tiny-shaped vocabulary: {result}");
+    assert_eq!(
+        result["position"], 4,
+        "three prompt tokens plus the appended one: {result}"
+    );
+    let id = result["id"].as_u64().expect("argmax returns a token id");
+    assert!(
+        id < 64,
+        "the sampled id must be inside the vocabulary: {id}"
+    );
+    assert!(
+        result["card_id"].as_str().map(str::is_empty) == Some(false),
+        "the run must report the Card it wrote: {result}"
+    );
+}
+
+/// A condition against a model with no table to select from. The
+/// refusal has to reach the caller as an error rather than as a
+/// silently unconditioned generation, and it has to name the option
+/// that builds the table.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_channel_cond_on_unconfigured_model_errors() {
+    let harness = TempAlcHome::connect().await;
+
+    let code = r#"
+        local handle = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        return handle:generate_session({ 1, 2, 3 }, { cond = 0 })
+    "#;
+    let result = harness
+        .client
+        .call_tool(call_params("alc_run", json!({ "code": code })))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("no conditioning table") && text.contains("cond_slots"),
+        "the error must name the missing table and how to build one: {text}"
+    );
+}
+
+/// A `cond_slots` the parser cannot read. Refused at the option rather
+/// than absorbed: a value that did not take effect would build an
+/// unconditioned model the caller then trains and labels as
+/// conditioned.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_channel_cond_slots_wrong_type_errors() {
+    let harness = TempAlcHome::connect().await;
+
+    let code = r#"
+        return alc.nn.preset.gpt2("custom", {
+            pretrained = false, cond_slots = "two",
+        })
+    "#;
+    let result = harness
+        .client
+        .call_tool(call_params("alc_run", json!({ "code": code })))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("cond_slots") && text.contains("must be an integer"),
+        "the error must name the option and the expected type: {text}"
+    );
+}

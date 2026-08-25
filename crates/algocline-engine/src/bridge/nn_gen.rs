@@ -5,7 +5,7 @@
 //! and owns everything the token-by-token inference path needs:
 //!
 //! ```text
-//! handle:generate_session(prompt_tokens) -> GenSession
+//! handle:generate_session(prompt_tokens, opts?) -> GenSession
 //! session:next_logits()                  -> LogitsHandle
 //! session:append(token_id)
 //! session:tokens()                       -> { id, ... }
@@ -48,6 +48,24 @@
 //! a loud session-level error rather than a positional-embedding
 //! failure surfacing from candle.
 //!
+//! # Optional input channels
+//!
+//! A GPT-2 model built with one of the optional input channels
+//! (`alc.nn.preset.gpt2("custom", { cond_slots = N })` or
+//! `{ allowed_input = true }`) reads that channel on every forward, so
+//! a session over it takes the channel's value in `opts`:
+//! `{ cond = <row> }` or `{ allowed = { id, ... } }`. Both directions
+//! of disagreement between the option and the model are refused — see
+//! [`extract_channel`], which also says why the *silent* direction (a
+//! table the caller says nothing about) is the one that matters.
+//!
+//! `opts.allowed` is the model's input channel, not a decode
+//! constraint: it is added to the residual stream before the model
+//! answers. Restricting what the sampler may *pick* is
+//! `alc.nn.constraint.allow_list` in `nn_sampler.rs`, and the two are
+//! independent — a model can be told what is available and still rank
+//! an unavailable id first.
+//!
 //! # Why the loop lives in Lua
 //!
 //! The session exposes one forward step (`next_logits`) and one
@@ -71,7 +89,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{InferenceAdapter, LlamaAdapter, LlamaCache};
-use algocline_nn::arch::{Gpt2Model, TinyLlamaModel};
+use algocline_nn::arch::{AllowedSets, CondIndex, Gpt2Model, TinyLlamaModel};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
 use algocline_nn::train::DeviceView;
 use candle_core::{DType, Device, Tensor};
@@ -109,6 +127,72 @@ enum SessionBackend {
     TinyLlama(Arc<Mutex<TinyLlamaModel>>),
 }
 
+/// The optional input channel a session feeds the model on every
+/// forward, alongside the tokens.
+///
+/// Fixed for the session's lifetime. A decode loop that could change
+/// the channel between steps would produce a sequence no single
+/// forward pass explains, and there is no way to read back from the
+/// tokens which step ran under what — so the value is taken once, at
+/// construction, next to the prompt it belongs with.
+///
+/// The variants are mutually exclusive because the model's are: a spec
+/// setting both channels is refused at build time
+/// ([`algocline_nn::arch::Gpt2Custom::validate`]), since no forward
+/// pass delivers both.
+#[derive(Debug)]
+enum SessionChannel {
+    /// No channel — the plain forward.
+    None,
+    /// A row of the model's conditioning table, added at every
+    /// position of every step.
+    Cond(CondIndex),
+    /// The ids the model may pick from. Flat: the same set is handed
+    /// to every position of every step.
+    ///
+    /// # Flat, and what that leaves out
+    ///
+    /// The training-side channel is per position — each position
+    /// carries the set that was available there
+    /// ([`algocline_nn::arch::AllowedSets`]). A decode loop could
+    /// supply the same shape, but it would have to restate the whole
+    /// history's sets on every step, and the sets for the positions
+    /// already forwarded cannot have changed. What a decoder actually
+    /// knows fresh is the set at the position it is about to answer,
+    /// and threading that through without restating the rest needs a
+    /// session-level "advance with this set" call rather than an opts
+    /// key. That is out of scope here: this option covers the case
+    /// where one set holds for the whole generation.
+    Allowed(Vec<u32>),
+}
+
+/// The optional channels a model was built with, read off its config.
+///
+/// Carried as a small value so the session can be constructed from one
+/// lock acquisition: the device, the channels and the spec all come out
+/// of the same config read.
+#[derive(Debug, Clone, Copy, Default)]
+struct DeclaredChannels {
+    /// Rows of the model's conditioning table, or `None` when it has
+    /// none.
+    cond_slots: Option<usize>,
+    /// Whether the model reads an allowed-id set at every position.
+    allowed_input: bool,
+}
+
+impl DeclaredChannels {
+    /// Read the channels a GPT-2 model declares.
+    fn of_gpt2(model: &Gpt2Model) -> Self {
+        let Some(spec) = model.config().custom.as_ref() else {
+            return Self::default();
+        };
+        Self {
+            cond_slots: spec.cond_slots,
+            allowed_input: spec.allowed_input,
+        }
+    }
+}
+
 /// One in-flight generation over a model handle.
 ///
 /// Holds the full token history (prompt included) plus the count of
@@ -117,6 +201,8 @@ enum SessionBackend {
 /// state rather than taking it as an argument.
 pub(super) struct GenSession {
     backend: SessionBackend,
+    /// The input channel every forward of this session carries.
+    channel: SessionChannel,
     /// Device the input tensors must be built on. Captured at
     /// construction — a model's device never changes after load.
     device: Device,
@@ -157,9 +243,16 @@ impl GenSession {
     }
 
     /// Start a session over `prompt` against a Llama adapter.
-    fn new_llama(adapter: Arc<LlamaAdapter>, prompt: &[i64]) -> LuaResult<Self> {
+    fn new_llama(
+        adapter: Arc<LlamaAdapter>,
+        prompt: &[i64],
+        opts: Option<&LuaTable>,
+    ) -> LuaResult<Self> {
         let meta = adapter.meta();
         let tokens = Self::validate_prompt(prompt, meta.vocab)?;
+        // The adapter architectures carry no channel table, so the two
+        // opts keys have nowhere to land here.
+        let channel = extract_channel(opts, DeclaredChannels::default(), meta.vocab)?;
         let cache = adapter
             .new_cache()
             .map_err(|e| LuaError::external(format!("alc.nn generate_session: kv cache: {e}")))?;
@@ -168,6 +261,7 @@ impl GenSession {
                 adapter,
                 cache: Mutex::new(cache),
             },
+            channel,
             device: meta.device,
             vocab: meta.vocab,
             ctx: meta.ctx,
@@ -177,20 +271,29 @@ impl GenSession {
     }
 
     /// Start a session over `prompt` against a trainable GPT-2 model.
+    ///
+    /// `opts` may name the input channel the model was built with —
+    /// `cond` (a row of its conditioning table) or `allowed` (the ids
+    /// it may pick from). Both are checked against what the model
+    /// actually carries; see [`extract_channel`].
     pub(super) fn new_gpt2(
         model: Arc<Mutex<Gpt2Model>>,
         vocab: usize,
         ctx: usize,
         prompt: &[i64],
+        opts: Option<&LuaTable>,
     ) -> LuaResult<Self> {
         let tokens = Self::validate_prompt(prompt, vocab)?;
-        let device = model
-            .lock()
-            .map_err(|e| LuaError::external(format!("alc.nn generate_session: model lock: {e}")))?
-            .device()
-            .clone();
+        let (device, declared) = {
+            let guard = model.lock().map_err(|e| {
+                LuaError::external(format!("alc.nn generate_session: model lock: {e}"))
+            })?;
+            (guard.device().clone(), DeclaredChannels::of_gpt2(&guard))
+        };
+        let channel = extract_channel(opts, declared, vocab)?;
         Ok(Self {
             backend: SessionBackend::Gpt2(model),
+            channel,
             device,
             vocab,
             ctx,
@@ -206,6 +309,7 @@ impl GenSession {
         vocab: usize,
         ctx: usize,
         prompt: &[i64],
+        opts: Option<&LuaTable>,
     ) -> LuaResult<Self> {
         let tokens = Self::validate_prompt(prompt, vocab)?;
         let device = model
@@ -213,8 +317,12 @@ impl GenSession {
             .map_err(|e| LuaError::external(format!("alc.nn generate_session: model lock: {e}")))?
             .device()
             .clone();
+        // TinyLlama has no channel-table axis, so a channel key here is
+        // refused rather than dropped.
+        let channel = extract_channel(opts, DeclaredChannels::default(), vocab)?;
         Ok(Self {
             backend: SessionBackend::TinyLlama(model),
+            channel,
             device,
             vocab,
             ctx,
@@ -290,7 +398,26 @@ impl GenSession {
                         "alc.nn session:next_logits: model lock poisoned: {e}"
                     ))
                 })?;
-                self.full_history_row(|input| guard.forward(input))?
+                match &self.channel {
+                    SessionChannel::None => self.full_history_row(|input| guard.forward(input))?,
+                    SessionChannel::Cond(index) => {
+                        // One row, so one condition. The session is
+                        // batch-1 by construction.
+                        let conds = [*index];
+                        self.full_history_row(|input| guard.forward_conditioned(input, &conds))?
+                    }
+                    SessionChannel::Allowed(ids) => self.full_history_row(|input| {
+                        // The same set at every position of the one
+                        // row, rebuilt each step because the history
+                        // the sets have to cover grows with it. Built
+                        // inside the closure so the context-window
+                        // check runs first.
+                        let positions = input.dims()[1];
+                        let sets = vec![vec![ids.clone(); positions]];
+                        let allowed = AllowedSets::new(&sets, input.device())?;
+                        guard.forward_allowed(input, &allowed)
+                    })?,
+                }
             }
             SessionBackend::TinyLlama(model) => {
                 let guard = model.lock().map_err(|e| {
@@ -330,6 +457,115 @@ impl GenSession {
         let id = check_token(token, self.vocab, "token_id")?;
         self.tokens.push(id);
         Ok(())
+    }
+}
+
+/// Error prefix for the session-construction surface.
+const GEN_SESSION_ERR_PREFIX: &str = "alc.nn generate_session";
+
+/// Resolve the `cond` / `allowed` opts against the channels the model
+/// declares.
+///
+/// Both directions of disagreement are refused, and neither is
+/// cosmetic:
+///
+/// - A key the model has no table for is a caller who believes they
+///   are conditioning a model that has nothing to condition on. Only
+///   the allowed-id side is caught by the forward pass itself; a
+///   `cond` handed to a model without the table would be caught there
+///   too, but the message would name a Rust entry point rather than
+///   the option that was written.
+/// - A table the caller says nothing about is the silent direction. A
+///   conditioning table left unfed adds the zero vector at every
+///   position, so the model runs in a state it never trained in and
+///   the output looks exactly as ordinary as a correct run. That is
+///   the case this refusal exists for.
+///
+/// `vocab` bounds the `allowed` ids: an id outside it is refused here
+/// rather than at the embedding lookup, where the message would name
+/// neither the option nor the bound.
+fn extract_channel(
+    opts: Option<&LuaTable>,
+    declared: DeclaredChannels,
+    vocab: usize,
+) -> LuaResult<SessionChannel> {
+    let (cond, allowed) = match opts {
+        Some(t) => (
+            t.get::<Option<u32>>("cond").map_err(|e| {
+                LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.cond must be a conditioning-table row \
+                     (a non-negative integer): {e}"
+                ))
+            })?,
+            t.get::<Option<Vec<u32>>>("allowed").map_err(|e| {
+                LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.allowed must be an array of token ids: {e}"
+                ))
+            })?,
+        ),
+        None => (None, None),
+    };
+
+    if cond.is_some() && allowed.is_some() {
+        return Err(LuaError::external(format!(
+            "{GEN_SESSION_ERR_PREFIX}: opts.cond and opts.allowed name two different \
+             channels and no model carries both; pass one"
+        )));
+    }
+
+    match (cond, allowed) {
+        (Some(row), None) => {
+            let slots = declared.cond_slots.ok_or_else(|| {
+                LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.cond was given but this model has no \
+                     conditioning table; build it with \
+                     alc.nn.preset.gpt2('custom', {{ cond_slots = N }})"
+                ))
+            })?;
+            let index = CondIndex::new(row, slots).map_err(|e| {
+                LuaError::external(format!("{GEN_SESSION_ERR_PREFIX}: opts.cond: {e}"))
+            })?;
+            Ok(SessionChannel::Cond(index))
+        }
+        (None, Some(ids)) => {
+            if !declared.allowed_input {
+                return Err(LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.allowed was given but this model has no \
+                     allowed-id table; build it with \
+                     alc.nn.preset.gpt2('custom', {{ allowed_input = true }})"
+                )));
+            }
+            if ids.is_empty() {
+                return Err(LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: opts.allowed is empty, which says every id is \
+                     unavailable; the model would answer as though it had no allowed-id \
+                     channel at all"
+                )));
+            }
+            for (i, id) in ids.iter().enumerate() {
+                check_token(i64::from(*id), vocab, &format!("opts.allowed[{}]", i + 1))?;
+            }
+            Ok(SessionChannel::Allowed(ids))
+        }
+        (None, None) => {
+            if declared.cond_slots.is_some() {
+                return Err(LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: this model was built with a conditioning table \
+                     and was trained with a condition at every position; generating without \
+                     one runs it in a state it never trained in and the output would look no \
+                     different — pass opts.cond = <row>"
+                )));
+            }
+            if declared.allowed_input {
+                return Err(LuaError::external(format!(
+                    "{GEN_SESSION_ERR_PREFIX}: this model was built with an allowed-id table \
+                     and reads one at every position; pass opts.allowed = {{ id, ... }}"
+                )));
+            }
+            Ok(SessionChannel::None)
+        }
+        // Refused above.
+        (Some(_), Some(_)) => unreachable!("both channels guarded above"),
     }
 }
 
@@ -468,8 +704,8 @@ impl mlua::UserData for LogitsHandle {
     }
 }
 
-/// Register `handle:generate_session(prompt_tokens)` on the Llama
-/// handle's method table.
+/// Register `handle:generate_session(prompt_tokens, opts?)` on the
+/// Llama handle's method table.
 ///
 /// Lives here rather than in `nn_card.rs` so the whole generation
 /// surface stays in one module; `nn_card.rs` only calls this from its
@@ -478,49 +714,86 @@ pub(super) fn add_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<LlamaHandle>,
 {
-    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| {
-        GenSession::new_llama(this.adapter(), &prompt)
-    });
+    methods.add_method(
+        "generate_session",
+        |_, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            GenSession::new_llama(this.adapter(), &prompt, opts.as_ref())
+        },
+    );
 }
 
-/// Register `handle:generate_session(prompt_tokens)` on the trainable
-/// GPT-2 handle's method table (stateless full-history backend).
+/// Register `handle:generate_session(prompt_tokens, opts?)` on the
+/// trainable GPT-2 handle's method table (stateless full-history
+/// backend).
 pub(super) fn add_gpt2_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<Gpt2Handle>,
 {
-    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| {
-        GenSession::new_gpt2(this.model(), this.vocab(), this.ctx(), &prompt)
-    });
+    methods.add_method(
+        "generate_session",
+        |_, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            GenSession::new_gpt2(
+                this.model(),
+                this.vocab(),
+                this.ctx(),
+                &prompt,
+                opts.as_ref(),
+            )
+        },
+    );
 }
 
-/// Register `handle:generate_session(prompt_tokens)` on the trainable
-/// TinyLlama handle's method table (stateless full-history backend).
+/// Register `handle:generate_session(prompt_tokens, opts?)` on the
+/// trainable TinyLlama handle's method table (stateless full-history
+/// backend).
 pub(super) fn add_tinyllama_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<TinyLlamaHandle>,
 {
-    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| {
-        GenSession::new_tinyllama(this.model(), this.vocab(), this.ctx(), &prompt)
-    });
+    methods.add_method(
+        "generate_session",
+        |_, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            GenSession::new_tinyllama(
+                this.model(),
+                this.vocab(),
+                this.ctx(),
+                &prompt,
+                opts.as_ref(),
+            )
+        },
+    );
 }
 
-/// Register `handle:generate_session(prompt_tokens)` on the arch-neutral
-/// [`NnHandle`] union, fanning out per variant.
+/// Register `handle:generate_session(prompt_tokens, opts?)` on the
+/// arch-neutral [`NnHandle`] union, fanning out per variant.
 ///
 /// This is what closes the "train → save Card → `load_handle` →
 /// generate" loop from Lua: `alc.nn.card.load_handle` returns an
 /// `NnHandle`, so without this registration a reloaded model could not
-/// generate no matter which arch it wraps.
+/// generate no matter which arch it wraps. It is also the path a
+/// channel-carrying model reaches after a reload, which is why the
+/// `opts` table is threaded through every variant rather than only the
+/// GPT-2 one — the two other arms refuse a channel key instead of
+/// dropping it.
 pub(super) fn add_nn_handle_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<NnHandle>,
 {
-    methods.add_method("generate_session", |_, this, prompt: Vec<i64>| match this {
-        NnHandle::Llama(h) => GenSession::new_llama(h.adapter(), &prompt),
-        NnHandle::Gpt2(h) => GenSession::new_gpt2(h.model(), h.vocab(), h.ctx(), &prompt),
-        NnHandle::TinyLlama(h) => GenSession::new_tinyllama(h.model(), h.vocab(), h.ctx(), &prompt),
-    });
+    methods.add_method(
+        "generate_session",
+        |_, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            let opts = opts.as_ref();
+            match this {
+                NnHandle::Llama(h) => GenSession::new_llama(h.adapter(), &prompt, opts),
+                NnHandle::Gpt2(h) => {
+                    GenSession::new_gpt2(h.model(), h.vocab(), h.ctx(), &prompt, opts)
+                }
+                NnHandle::TinyLlama(h) => {
+                    GenSession::new_tinyllama(h.model(), h.vocab(), h.ctx(), &prompt, opts)
+                }
+            }
+        },
+    );
 }
 
 /// Roles a message may carry.
@@ -695,7 +968,7 @@ mod tests {
     }
 
     fn run(adapter: Arc<LlamaAdapter>, prompt: &[i64], steps: usize) -> Vec<(u32, Vec<f32>)> {
-        let mut s = GenSession::new_llama(adapter, prompt).expect("session");
+        let mut s = GenSession::new_llama(adapter, prompt, None).expect("session");
         (0..steps).map(|_| step(&mut s)).collect()
     }
 
@@ -724,8 +997,10 @@ mod tests {
         let solo_a = run(Arc::clone(&adapter), &prompt_a, 4);
         let solo_b = run(Arc::clone(&adapter), &prompt_b, 4);
 
-        let mut a = GenSession::new_llama(Arc::clone(&adapter), &prompt_a).expect("session a");
-        let mut b = GenSession::new_llama(Arc::clone(&adapter), &prompt_b).expect("session b");
+        let mut a =
+            GenSession::new_llama(Arc::clone(&adapter), &prompt_a, None).expect("session a");
+        let mut b =
+            GenSession::new_llama(Arc::clone(&adapter), &prompt_b, None).expect("session b");
         let mut mixed_a = Vec::new();
         let mut mixed_b = Vec::new();
         for _ in 0..4 {
@@ -756,7 +1031,7 @@ mod tests {
     fn logits_row_is_vocab_shaped_f32() {
         let adapter = tiny_adapter();
         let vocab = adapter.vocab();
-        let mut session = GenSession::new_llama(adapter, &[1, 2, 3]).expect("session");
+        let mut session = GenSession::new_llama(adapter, &[1, 2, 3], None).expect("session");
         let logits = session.next_logits().expect("next_logits");
         assert_eq!(logits.tensor().dims(), &[vocab]);
         assert_eq!(logits.tensor().dtype(), DType::F32);
@@ -767,7 +1042,7 @@ mod tests {
     #[test]
     fn position_and_forwarded_track_appends() {
         let adapter = tiny_adapter();
-        let mut session = GenSession::new_llama(adapter, &[1, 2, 3]).expect("session");
+        let mut session = GenSession::new_llama(adapter, &[1, 2, 3], None).expect("session");
         assert_eq!(session.tokens.len(), 3);
         assert_eq!(session.forwarded, 0);
 
@@ -780,5 +1055,136 @@ mod tests {
 
         session.next_logits().expect("incremental forward");
         assert_eq!(session.forwarded, 4);
+    }
+
+    // ─── Channel opts ─────────────────────────────────────────────
+
+    fn channel_opts(lua: &Lua, pairs: &[(&str, LuaValue)]) -> LuaTable {
+        let t = lua.create_table().expect("opts table");
+        for (k, v) in pairs {
+            t.set(*k, v.clone()).expect("set opt");
+        }
+        t
+    }
+
+    fn declares_cond(slots: usize) -> DeclaredChannels {
+        DeclaredChannels {
+            cond_slots: Some(slots),
+            allowed_input: false,
+        }
+    }
+
+    fn declares_allowed() -> DeclaredChannels {
+        DeclaredChannels {
+            cond_slots: None,
+            allowed_input: true,
+        }
+    }
+
+    #[test]
+    fn a_model_with_no_channel_and_no_opts_runs_plain() {
+        let channel =
+            extract_channel(None, DeclaredChannels::default(), 64).expect("no channel anywhere");
+        assert!(matches!(channel, SessionChannel::None));
+    }
+
+    #[test]
+    fn cond_resolves_against_the_declared_table() {
+        let lua = Lua::new();
+        let opts = channel_opts(&lua, &[("cond", LuaValue::Integer(1))]);
+        let channel = extract_channel(Some(&opts), declares_cond(3), 64).expect("row 1 of 3");
+        match channel {
+            SessionChannel::Cond(index) => assert_eq!(index.row(), 1),
+            other => panic!("expected a conditioned session, got {other:?}"),
+        }
+
+        // Outside the table the model actually has: a crossed pair
+        // rather than a typo, and refused as one.
+        let opts = channel_opts(&lua, &[("cond", LuaValue::Integer(7))]);
+        let err =
+            extract_channel(Some(&opts), declares_cond(3), 64).expect_err("row 7 of a 3-row table");
+        assert!(err.to_string().contains("outside"), "message: {err}");
+    }
+
+    #[test]
+    fn cond_against_a_model_without_the_table_is_refused() {
+        let lua = Lua::new();
+        let opts = channel_opts(&lua, &[("cond", LuaValue::Integer(0))]);
+        let err = extract_channel(Some(&opts), DeclaredChannels::default(), 64)
+            .expect_err("no conditioning table to select from");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no conditioning table") && msg.contains("cond_slots"),
+            "message must name the missing table and how to build one: {msg}"
+        );
+    }
+
+    /// The silent direction: the model carries the table and the
+    /// caller says nothing, so the channel contributes nothing and the
+    /// output looks exactly as ordinary as a correct run.
+    #[test]
+    fn a_declared_channel_left_unfed_is_refused() {
+        let err = extract_channel(None, declares_cond(2), 64)
+            .expect_err("a conditioning table left unfed");
+        assert!(
+            err.to_string().contains("opts.cond"),
+            "message must name the option that feeds it: {err}"
+        );
+
+        let err =
+            extract_channel(None, declares_allowed(), 64).expect_err("an allowed table left unfed");
+        assert!(
+            err.to_string().contains("opts.allowed"),
+            "message must name the option that feeds it: {err}"
+        );
+    }
+
+    #[test]
+    fn allowed_ids_are_checked_against_the_vocabulary() {
+        let lua = Lua::new();
+        let ids = lua.create_table().expect("ids table");
+        ids.set(1, 3).expect("set");
+        ids.set(2, 9).expect("set");
+        let opts = channel_opts(&lua, &[("allowed", LuaValue::Table(ids))]);
+        let channel = extract_channel(Some(&opts), declares_allowed(), 16).expect("ids in range");
+        match channel {
+            SessionChannel::Allowed(ids) => assert_eq!(ids, vec![3, 9]),
+            other => panic!("expected an allowed-id session, got {other:?}"),
+        }
+
+        let ids = lua.create_table().expect("ids table");
+        ids.set(1, 99).expect("set");
+        let opts = channel_opts(&lua, &[("allowed", LuaValue::Table(ids))]);
+        let err = extract_channel(Some(&opts), declares_allowed(), 16)
+            .expect_err("an id outside the vocabulary");
+        assert!(
+            err.to_string().contains("opts.allowed[1]"),
+            "message must name the offending entry: {err}"
+        );
+
+        // An empty set says every id is unavailable, which the model
+        // cannot be told apart from having no channel at all.
+        let empty = lua.create_table().expect("ids table");
+        let opts = channel_opts(&lua, &[("allowed", LuaValue::Table(empty))]);
+        let err =
+            extract_channel(Some(&opts), declares_allowed(), 16).expect_err("an empty allowed set");
+        assert!(err.to_string().contains("empty"), "message: {err}");
+    }
+
+    #[test]
+    fn the_two_channels_cannot_be_combined() {
+        let lua = Lua::new();
+        let ids = lua.create_table().expect("ids table");
+        ids.set(1, 1).expect("set");
+        let opts = channel_opts(
+            &lua,
+            &[
+                ("cond", LuaValue::Integer(0)),
+                ("allowed", LuaValue::Table(ids)),
+            ],
+        );
+        let err = extract_channel(Some(&opts), declares_cond(2), 16)
+            .expect_err("no model carries both channels");
+        assert!(err.to_string().contains("two different"), "message: {err}");
     }
 }

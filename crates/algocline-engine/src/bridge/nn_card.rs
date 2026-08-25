@@ -38,8 +38,8 @@ use algocline_nn::arch::adapter::{
     InferenceAdapter, LlamaAdapter, LlamaAdapterConfig, LogitsShape,
 };
 use algocline_nn::arch::{
-    Activation, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig, MoeConfig, NormKind, NormPlacement,
-    PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
+    Activation, CondIndex, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig, MoeConfig, NormKind,
+    NormPlacement, PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
 };
 use algocline_nn::card::{
     bundle_ref_for, sanitize_stem, unique_stem, validate_training_path, CardId, NnCandleBranch,
@@ -487,6 +487,19 @@ fn load_handle_impl(
             "alc.nn.card.load_handle: bundle missing at {path:?} for card '{card_id}'"
         )));
     }
+
+    // Channel axes are compared against the bundle *before* the model
+    // is built, because the build cannot make the comparison itself:
+    // it asks the bundle for the tensors the Card's config names, so a
+    // table the Card does not declare is never asked for and never
+    // missed. The model would then run without an input it was trained
+    // with and every number afterwards would look ordinary. Reads the
+    // safetensors header only, so the cost does not scale with the
+    // weights.
+    meta.verify_channel_tensors_in_bundle(&path).map_err(|e| {
+        LuaError::external(format!("alc.nn.card.load_handle: card '{card_id}': {e}"))
+    })?;
+
     build(&meta, &path)
 }
 
@@ -513,6 +526,8 @@ const LOAD_CKPT_CUSTOM_KEYS: &[&str] = &[
     "kv_heads",
     "window",
     "untied_head",
+    "cond_slots",
+    "allowed_input",
     "moe",
 ];
 
@@ -536,9 +551,10 @@ const LOAD_CKPT_CUSTOM_KEYS: &[&str] = &[
 /// A custom-shape run (`arch = "gpt2-custom"`) additionally passes the
 /// shape keys it built the preset with (`vocab` / `ctx` / `layers` /
 /// `heads` / `dim` / `act` / `norm` / `residual` / `placement` / `pos`
-/// / `mlp_ratio` / `kv_heads` / `window` / `untied_head` / `moe`) —
-/// the architecture string pins nothing for that variant, so the shape
-/// has to come from the caller the same way it does on the build side.
+/// / `mlp_ratio` / `kv_heads` / `window` / `untied_head` /
+/// `cond_slots` / `allowed_input` / `moe`) — the architecture string
+/// pins nothing for that variant, so the shape has to come from the
+/// caller the same way it does on the build side.
 ///
 /// # Checkpoint paths are volatile
 ///
@@ -573,9 +589,11 @@ const LOAD_CKPT_CUSTOM_KEYS: &[&str] = &[
 ///
 /// - This function's own validation — missing / mistyped `spec.arch`,
 ///   a `path` that is not on disk, an architecture with no bridge
-///   dispatch, and inference-only architectures (`llama`) whose
-///   `build_from_safetensors` slot is `None` — carries
-///   `alc.nn.card.load_ckpt:`.
+///   dispatch, inference-only architectures (`llama`) whose
+///   `build_from_safetensors` slot is `None`, and a spec whose optional
+///   input channels disagree with the tables in the checkpoint
+///   ([`NnCardMeta::verify_channel_tensors_in_bundle`], in both
+///   directions) — carries `alc.nn.card.load_ckpt:`.
 /// - Everything raised while reading the bundle (unknown variant,
 ///   custom+MoE refusal, device / dtype parsing, shape mismatch)
 ///   keeps the `alc.nn.card.load:` prefix its shared implementation
@@ -682,6 +700,17 @@ fn load_ckpt_impl(path: &str, spec: &LuaTable) -> LuaResult<NnHandle> {
              inference-only and never produce one)"
         ))
     })?;
+
+    // Same comparison `load_handle_impl` runs, for the same reason —
+    // the build asks the checkpoint for the tensors the spec names, so
+    // a table the spec is silent about is never asked for and never
+    // missed. Here the spec is hand-written by the Lua caller, which
+    // puts a channel key one typo away from being dropped: the model
+    // would then run without an input the run trained with, and the
+    // metrics the hook computes off it would look ordinary.
+    meta.verify_channel_tensors_in_bundle(path)
+        .map_err(|e| LuaError::external(format!("{LOAD_CKPT_ERR_PREFIX}: {e}")))?;
+
     build(&meta, path)
 }
 
@@ -1944,12 +1973,14 @@ fn preset_llama_neutral(
 /// - The architecture is not a known variant and there is no `custom`
 ///   branch to fall back on (an unknown variant, or a custom-variant
 ///   card written before the shape block existed).
+/// - The rebuilt config reads none of the optional input channels the
+///   card declares — see [`refuse_dropped_channels`].
 fn gpt2_config_for_card(meta: &NnCardMeta) -> LuaResult<Gpt2Config> {
     // `Gpt2Config::from_variant` accepts both bare ("medium") and
     // "gpt2-medium" forms — pass the card's architecture string
     // directly.
     if let Some(cfg) = Gpt2Config::from_variant(&meta.architecture) {
-        return Ok(cfg);
+        return refuse_dropped_channels(meta, cfg);
     }
 
     let Some(branch) = meta.candle.as_ref().and_then(|c| c.custom.as_ref()) else {
@@ -1972,7 +2003,7 @@ fn gpt2_config_for_card(meta: &NnCardMeta) -> LuaResult<Gpt2Config> {
         )));
     }
 
-    Ok(Gpt2Config {
+    let cfg = Gpt2Config {
         vocab: branch.vocab,
         ctx: branch.ctx,
         layers: branch.layers,
@@ -1987,7 +2018,42 @@ fn gpt2_config_for_card(meta: &NnCardMeta) -> LuaResult<Gpt2Config> {
         // `build_custom_gpt2_config`). Spreading that base keeps the
         // two sides sharing one epsilon instead of a literal here.
         ..Gpt2Config::tiny()
-    })
+    };
+    // Identical to the declaration by construction on this arm — the
+    // spec above *is* the card's. Stated anyway so the guarantee holds
+    // per load path rather than per branch: a future arm that filtered
+    // or rewrote the spec would have to answer for it here.
+    refuse_dropped_channels(meta, cfg)
+}
+
+/// Refuse a config that reads none of the optional input channels the
+/// card declares.
+///
+/// The verification the load surfaces run before this
+/// ([`NnCardMeta::verify_channel_tensors_in_bundle`]) compares the
+/// card with its bundle. That is the wrong pair on its own: what
+/// decides whether a channel is read is the config the loader builds,
+/// and a named variant rebuilds its shape from the preset and ignores
+/// the shape block entirely. A card naming `"gpt2-tiny"` while its
+/// shape block declares `cond_slots` therefore passes the bundle
+/// comparison (declared, and the table is right there) and then builds
+/// a model that never asks for the tensor — the silence the channel
+/// check exists to remove, reached from the config side.
+///
+/// No trainer writes that pair (`run_full_ft` records the architecture
+/// off the handle that carries the channel, which is `gpt2-custom`), so
+/// a card carrying it was hand-edited or written by a foreign pipeline
+/// — the case `assert_bundle_ref_matches` already refuses rather than
+/// guesses at.
+fn refuse_dropped_channels(meta: &NnCardMeta, cfg: Gpt2Config) -> LuaResult<Gpt2Config> {
+    meta.verify_channels_consumed(cfg.custom.as_ref())
+        .map_err(|e| {
+            LuaError::external(format!(
+                "alc.nn.card.load: card {:?} names architecture {:?}: {e}",
+                meta.name, meta.architecture
+            ))
+        })?;
+    Ok(cfg)
 }
 
 fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
@@ -2029,6 +2095,16 @@ fn tinyllama_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaR
         LuaError::external(format!(
             "alc.nn.card.load: unknown tinyllama variant {:?} on card {:?}",
             meta.architecture, meta.name
+        ))
+    })?;
+    // A tinyllama config has no customization spec, so it reads no
+    // optional input channel whatever its card says. The same
+    // reasoning as `refuse_dropped_channels`: a card that declares one
+    // here would have its table left unread rather than refused.
+    meta.verify_channels_consumed(None).map_err(|e| {
+        LuaError::external(format!(
+            "alc.nn.card.load: card {:?} names architecture {:?}: {e}",
+            meta.name, meta.architecture
         ))
     })?;
     apply_candle_branch_device_dtype("alc.nn.card.load", meta, &mut cfg.device, &mut cfg.dtype)?;
@@ -2673,6 +2749,8 @@ const GPT2_CUSTOM_ONLY_KEYS: &[&str] = &[
     "kv_heads",
     "window",
     "untied_head",
+    "cond_slots",
+    "allowed_input",
     "moe",
     "layers",
     "heads",
@@ -2844,6 +2922,19 @@ fn build_custom_gpt2_config(ctx: &str, opts: Option<&LuaTable>) -> LuaResult<Gpt
     }
     if let Some(b) = custom_opt::<bool>(ctx, t, "untied_head", "a boolean")? {
         spec.untied_head = b;
+    }
+    // Optional input channels. Each adds a table of its own to the
+    // bundle, which is what lets the Card check its declaration against
+    // the tensors beside it
+    // (`algocline_nn::card::NnCardMeta::verify_channel_tensors`). Both
+    // are read here rather than on a channel-specific entry point so a
+    // Card records them through the same `Gpt2Custom` projection every
+    // other axis goes through.
+    if let Some(v) = custom_opt::<usize>(ctx, t, "cond_slots", "an integer")? {
+        spec.cond_slots = Some(v);
+    }
+    if let Some(b) = custom_opt::<bool>(ctx, t, "allowed_input", "a boolean")? {
+        spec.allowed_input = b;
     }
 
     cfg.moe = parse_custom_moe(ctx, t)?;
@@ -3528,40 +3619,16 @@ fn register_data_ns(
     // Lua array of integers in `[0, vocab)` — out-of-range ids
     // surface as an index-select error inside the model forward
     // rather than here (this binding only enforces integer typing).
+    //
+    // A row may instead be `{ ids = { ... }, cond = ..., allowed = ... }`
+    // to carry the optional input channels; see
+    // [`extract_synthetic_rows`].
     let synthetic = lua.create_function(
         move |_lua, (rows_tbl, opts): (LuaTable, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
             let dopts = extract_dataset_opts(opts.as_ref())?;
             let row_count = rows_tbl.raw_len();
-            if row_count == 0 {
-                return Err(LuaError::external(
-                    "alc.nn.data.synthetic: rows must be a non-empty array of token id \
-                     sequences (each row itself an array of u32)"
-                        .to_string(),
-                ));
-            }
-            let mut rows: Vec<Vec<u32>> = Vec::with_capacity(row_count);
-            for i in 1..=row_count {
-                let row: LuaTable = rows_tbl.get(i).map_err(|e| {
-                    LuaError::external(format!("alc.nn.data.synthetic: row {i} not a table: {e}"))
-                })?;
-                let len = row.raw_len();
-                if len == 0 {
-                    return Err(LuaError::external(format!(
-                        "alc.nn.data.synthetic: row {i} is empty (need at least 1 token)"
-                    )));
-                }
-                let mut ids: Vec<u32> = Vec::with_capacity(len);
-                for j in 1..=len {
-                    let id: u32 = row.get(j).map_err(|e| {
-                        LuaError::external(format!(
-                            "alc.nn.data.synthetic: row {i} token {j} not a u32 integer: {e}"
-                        ))
-                    })?;
-                    ids.push(id);
-                }
-                rows.push(ids);
-            }
-            let ds = TokenizedDataset::new(rows, dopts.clone());
+            let parsed = extract_synthetic_rows(&rows_tbl, opts.as_ref())?;
+            let ds = build_synthetic_dataset(parsed, dopts.clone())?;
             Ok(DatasetHandle {
                 inner: Mutex::new(Box::new(ds)),
                 source: format!("synthetic:{row_count}rows"),
@@ -3574,6 +3641,537 @@ fn register_data_ns(
 
     nn_table.set("data", data)?;
     Ok(())
+}
+
+/// Error prefix for the `alc.nn.data.synthetic` surface.
+const SYNTHETIC_ERR_PREFIX: &str = "alc.nn.data.synthetic";
+
+/// A parsed `alc.nn.data.synthetic` corpus: the token rows plus
+/// whichever optional input channels the caller attached to them.
+///
+/// The channels are collected here rather than applied row by row
+/// because [`TokenizedDataset`] takes each as one list covering every
+/// row, and the counts are checked against the row count there.
+#[derive(Debug)]
+struct SyntheticRows {
+    /// Unpadded token ids, one entry per corpus row.
+    ids: Vec<Vec<u32>>,
+    /// Conditions row-major at [`Self::conds_per_row`] per row, or
+    /// `None` when no row carried one.
+    conds: Option<Vec<CondIndex>>,
+    /// Conditions each row carried. `1` when there are none, matching
+    /// [`algocline_nn::train::Batch::conds_per_row`]'s own default.
+    conds_per_row: usize,
+    /// Allowed ids `[row][position]`, or `None` when no row carried
+    /// them.
+    #[allow(clippy::type_complexity)]
+    allowed: Option<Vec<Vec<Vec<u32>>>>,
+}
+
+/// Read a `u32` array off a Lua table, naming `what` in every error.
+fn synthetic_id_array(what: &str, tbl: &LuaTable) -> LuaResult<Vec<u32>> {
+    let len = tbl.raw_len();
+    let mut ids: Vec<u32> = Vec::with_capacity(len);
+    for j in 1..=len {
+        let id: u32 = tbl.get(j).map_err(|e| {
+            LuaError::external(format!(
+                "{SYNTHETIC_ERR_PREFIX}: {what} entry {j} is not a u32 integer: {e}"
+            ))
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Parse the `rows` argument of `alc.nn.data.synthetic`.
+///
+/// A row is either the plain array of token ids this surface has always
+/// taken, or a table naming its ids and the channels it carries:
+///
+/// ```text
+/// { ids = { 1, 2, 3 },          -- required in the second form
+///   cond = 2,                   -- or { 2, 5 } for a multi-slot row
+///   allowed = { {1,2}, {3} } }  -- one id set per position of `ids`
+/// ```
+///
+/// The two forms are told apart by the presence of an `ids` field, so
+/// an array row keeps its meaning unchanged.
+///
+/// # Why `cond` needs `opts.cond_slots`
+///
+/// A condition is a row of the model's conditioning table, and the
+/// numbering a caller holds is usually a different one — a token id
+/// most often, whose range overlaps the table's rows without meaning
+/// the same thing. [`CondIndex`] therefore takes the table size along
+/// with the row and checks one against the other, and the size has to
+/// come from the caller because a dataset knows no model. Stating it
+/// once in `opts` rather than per row keeps a corpus from describing
+/// two different tables.
+///
+/// # Errors
+///
+/// An empty corpus or an empty row, a row that is not a table, a
+/// non-integer id, a `cond` without `opts.cond_slots`, a `cond` outside
+/// that table, rows that disagree about how many conditions they carry,
+/// and a channel that only some rows carry (which would leave the rest
+/// silently unconditioned).
+fn extract_synthetic_rows(
+    rows_tbl: &LuaTable,
+    opts: Option<&LuaTable>,
+) -> LuaResult<SyntheticRows> {
+    let row_count = rows_tbl.raw_len();
+    if row_count == 0 {
+        return Err(LuaError::external(format!(
+            "{SYNTHETIC_ERR_PREFIX}: rows must be a non-empty array of token id \
+             sequences (each row itself an array of u32, or a table with an `ids` field)"
+        )));
+    }
+    let cond_slots: Option<usize> = match opts {
+        Some(t) => t.get("cond_slots").map_err(|e| {
+            LuaError::external(format!(
+                "{SYNTHETIC_ERR_PREFIX}: opts.cond_slots must be an integer: {e}"
+            ))
+        })?,
+        None => None,
+    };
+
+    let mut ids: Vec<Vec<u32>> = Vec::with_capacity(row_count);
+    let mut conds: Vec<CondIndex> = Vec::new();
+    let mut conds_per_row: Option<usize> = None;
+    let mut allowed: Vec<Vec<Vec<u32>>> = Vec::new();
+
+    for i in 1..=row_count {
+        let row: LuaTable = rows_tbl.get(i).map_err(|e| {
+            LuaError::external(format!("{SYNTHETIC_ERR_PREFIX}: row {i} not a table: {e}"))
+        })?;
+        let structured: Option<LuaTable> = row.get("ids").map_err(|e| {
+            LuaError::external(format!(
+                "{SYNTHETIC_ERR_PREFIX}: row {i} field `ids` must be an array of u32: {e}"
+            ))
+        })?;
+        let id_tbl = structured.as_ref().unwrap_or(&row);
+        let row_ids = synthetic_id_array(&format!("row {i}"), id_tbl)?;
+        if row_ids.is_empty() {
+            return Err(LuaError::external(format!(
+                "{SYNTHETIC_ERR_PREFIX}: row {i} is empty (need at least 1 token)"
+            )));
+        }
+
+        // Channels only exist on the structured form, and they hang
+        // off the row rather than off its `ids` array — an array row
+        // carries none by construction.
+        let (row_conds, row_allowed) = if structured.is_some() {
+            (
+                extract_row_cond(i, &row, cond_slots)?,
+                extract_row_allowed(i, &row)?,
+            )
+        } else {
+            (None, None)
+        };
+
+        // A channel present on some rows and not others is refused: the
+        // dataset attaches one list covering every row, so the rows
+        // without would have to be filled with something, and anything
+        // chosen there is a condition the caller never wrote.
+        match (row_conds, conds_per_row) {
+            (Some(list), None) if i == 1 => {
+                conds_per_row = Some(list.len());
+                conds.extend(list);
+            }
+            (Some(_), None) => {
+                return Err(LuaError::external(format!(
+                    "{SYNTHETIC_ERR_PREFIX}: row {i} carries `cond` but row 1 does not; \
+                     a condition on some rows only would leave the rest trained \
+                     unconditioned under a corpus that says otherwise"
+                )));
+            }
+            (Some(list), Some(per_row)) => {
+                if list.len() != per_row {
+                    return Err(LuaError::external(format!(
+                        "{SYNTHETIC_ERR_PREFIX}: row {i} carries {} condition(s) and row 1 \
+                         carries {per_row}; every row of a corpus describes the same slots",
+                        list.len()
+                    )));
+                }
+                conds.extend(list);
+            }
+            (None, Some(_)) => {
+                return Err(LuaError::external(format!(
+                    "{SYNTHETIC_ERR_PREFIX}: row {i} carries no `cond` but row 1 does; \
+                     a condition on some rows only would leave the rest trained \
+                     unconditioned under a corpus that says otherwise"
+                )));
+            }
+            (None, None) => {}
+        }
+
+        match (row_allowed, allowed.is_empty() && i > 1) {
+            (Some(_), true) => {
+                return Err(LuaError::external(format!(
+                    "{SYNTHETIC_ERR_PREFIX}: row {i} carries `allowed` but row 1 does not; \
+                     the sets are attached as one list covering every row"
+                )));
+            }
+            (Some(list), false) => allowed.push(list),
+            (None, _) if !allowed.is_empty() => {
+                return Err(LuaError::external(format!(
+                    "{SYNTHETIC_ERR_PREFIX}: row {i} carries no `allowed` but row 1 does; \
+                     the sets are attached as one list covering every row"
+                )));
+            }
+            (None, _) => {}
+        }
+
+        ids.push(row_ids);
+    }
+
+    Ok(SyntheticRows {
+        ids,
+        conds: (!conds.is_empty()).then_some(conds),
+        conds_per_row: conds_per_row.unwrap_or(1),
+        allowed: (!allowed.is_empty()).then_some(allowed),
+    })
+}
+
+/// Read one row's `cond` field: a single slot index, or an array of
+/// them for a row that names several.
+fn extract_row_cond(
+    row: usize,
+    tbl: &LuaTable,
+    cond_slots: Option<usize>,
+) -> LuaResult<Option<Vec<CondIndex>>> {
+    let raw: LuaValue = tbl.get("cond")?;
+    let rows: Vec<u32> = match raw {
+        LuaValue::Nil => return Ok(None),
+        LuaValue::Table(t) => synthetic_id_array(&format!("row {row} `cond`"), &t)?,
+        other => {
+            let one: u32 = tbl.get("cond").map_err(|e| {
+                LuaError::external(format!(
+                    "{SYNTHETIC_ERR_PREFIX}: row {row} `cond` must be an integer or an \
+                     array of integers (got {}): {e}",
+                    other.type_name()
+                ))
+            })?;
+            vec![one]
+        }
+    };
+    if rows.is_empty() {
+        return Err(LuaError::external(format!(
+            "{SYNTHETIC_ERR_PREFIX}: row {row} `cond` is an empty array; omit the key \
+             for an unconditioned row"
+        )));
+    }
+    let slots = cond_slots.ok_or_else(|| {
+        LuaError::external(format!(
+            "{SYNTHETIC_ERR_PREFIX}: row {row} carries `cond`, so opts.cond_slots must \
+             state how many rows the model's conditioning table has (the same value \
+             passed to alc.nn.preset.gpt2('custom', {{ cond_slots = N }}))"
+        ))
+    })?;
+    rows.into_iter()
+        .map(|r| {
+            CondIndex::new(r, slots).map_err(|e| {
+                LuaError::external(format!("{SYNTHETIC_ERR_PREFIX}: row {row} `cond`: {e}"))
+            })
+        })
+        .collect::<LuaResult<Vec<_>>>()
+        .map(Some)
+}
+
+/// Read one row's `allowed` field: an array holding one id set per
+/// position of that row's `ids`.
+///
+/// Positions the list does not reach are read downstream as "nothing is
+/// known to be available here" rather than as an error, which is what
+/// the padding past the end of a row needs
+/// ([`algocline_nn::arch::AllowedSets::window`]).
+#[allow(clippy::type_complexity)]
+fn extract_row_allowed(row: usize, tbl: &LuaTable) -> LuaResult<Option<Vec<Vec<u32>>>> {
+    let Some(list): Option<LuaTable> = tbl.get("allowed").map_err(|e| {
+        LuaError::external(format!(
+            "{SYNTHETIC_ERR_PREFIX}: row {row} `allowed` must be an array of id arrays: {e}"
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+    let positions = list.raw_len();
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(positions);
+    for p in 1..=positions {
+        let set: LuaTable = list.get(p).map_err(|e| {
+            LuaError::external(format!(
+                "{SYNTHETIC_ERR_PREFIX}: row {row} `allowed` position {p} is not an array: {e}"
+            ))
+        })?;
+        out.push(synthetic_id_array(
+            &format!("row {row} `allowed` position {p}"),
+            &set,
+        )?);
+    }
+    Ok(Some(out))
+}
+
+/// Build the [`TokenizedDataset`] a parsed corpus describes, attaching
+/// whichever channels it carries.
+///
+/// The attachment errors ([`algocline_nn::train::DatasetError`]) reach
+/// Lua verbatim under this surface's prefix — notably the refusal to
+/// attach a positional channel to a shuffled dataset, where the pairing
+/// the caller means no longer holds.
+fn build_synthetic_dataset(rows: SyntheticRows, opts: DatasetOpts) -> LuaResult<TokenizedDataset> {
+    let mut ds = TokenizedDataset::new(rows.ids, opts);
+    if let Some(conds) = rows.conds {
+        ds = ds
+            .with_condition_groups(conds, rows.conds_per_row)
+            .map_err(|e| LuaError::external(format!("{SYNTHETIC_ERR_PREFIX}: {e}")))?;
+    }
+    if let Some(allowed) = rows.allowed {
+        ds = ds
+            .with_allowed_ids(allowed)
+            .map_err(|e| LuaError::external(format!("{SYNTHETIC_ERR_PREFIX}: {e}")))?;
+    }
+    Ok(ds)
+}
+
+#[cfg(test)]
+mod synthetic_rows_tests {
+    //! Corpus parsing for `alc.nn.data.synthetic`.
+    //!
+    //! The channels are positional — a condition belongs to the row it
+    //! was written on — so the failures worth pinning are the ones that
+    //! leave every shape agreeing: a channel that only some rows carry,
+    //! and a slot index checked against no table at all.
+    use super::*;
+    use mlua::Lua;
+
+    /// `rows` as a Lua array of arrays (the form this surface has
+    /// always taken).
+    fn array_rows(lua: &Lua, rows: &[&[u32]]) -> LuaTable {
+        let out = lua.create_table().expect("rows table");
+        for (i, row) in rows.iter().enumerate() {
+            let t = lua.create_table().expect("row table");
+            for (j, id) in row.iter().enumerate() {
+                t.set(j + 1, *id).expect("set id");
+            }
+            out.set(i + 1, t).expect("set row");
+        }
+        out
+    }
+
+    /// One structured row: `{ ids = {...}, ... }`, with `extra`
+    /// applied on top.
+    fn structured_row(lua: &Lua, ids: &[u32], extra: &[(&str, LuaValue)]) -> LuaTable {
+        let row = lua.create_table().expect("row table");
+        let id_tbl = lua.create_table().expect("ids table");
+        for (j, id) in ids.iter().enumerate() {
+            id_tbl.set(j + 1, *id).expect("set id");
+        }
+        row.set("ids", id_tbl).expect("set ids");
+        for (k, v) in extra {
+            row.set(*k, v.clone()).expect("set field");
+        }
+        row
+    }
+
+    fn rows_of(lua: &Lua, rows: Vec<LuaTable>) -> LuaTable {
+        let out = lua.create_table().expect("rows table");
+        for (i, row) in rows.into_iter().enumerate() {
+            out.set(i + 1, row).expect("set row");
+        }
+        out
+    }
+
+    fn cond_slots_opts(lua: &Lua, slots: usize) -> LuaTable {
+        let t = lua.create_table().expect("opts table");
+        t.set("cond_slots", slots).expect("set cond_slots");
+        t
+    }
+
+    #[test]
+    fn array_rows_carry_no_channels() {
+        let lua = Lua::new();
+        let rows = array_rows(&lua, &[&[1, 2, 3], &[4, 5, 6]]);
+        let parsed = extract_synthetic_rows(&rows, None).expect("array rows must parse");
+        assert_eq!(parsed.ids, vec![vec![1, 2, 3], vec![4, 5, 6]]);
+        assert!(parsed.conds.is_none());
+        assert_eq!(parsed.conds_per_row, 1);
+        assert!(parsed.allowed.is_none());
+    }
+
+    #[test]
+    fn structured_rows_carry_one_condition_each() {
+        let lua = Lua::new();
+        let rows = rows_of(
+            &lua,
+            vec![
+                structured_row(&lua, &[1, 2], &[("cond", LuaValue::Integer(0))]),
+                structured_row(&lua, &[3, 4], &[("cond", LuaValue::Integer(1))]),
+            ],
+        );
+        let opts = cond_slots_opts(&lua, 2);
+        let parsed = extract_synthetic_rows(&rows, Some(&opts)).expect("conditioned rows");
+        let conds = parsed.conds.expect("conditions attached");
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0].row(), 0);
+        assert_eq!(conds[1].row(), 1);
+        assert_eq!(parsed.conds_per_row, 1);
+    }
+
+    #[test]
+    fn a_row_may_name_several_slots() {
+        let lua = Lua::new();
+        let pair = |a: i64, b: i64| {
+            let t = lua.create_table().expect("cond table");
+            t.set(1, a).expect("set");
+            t.set(2, b).expect("set");
+            LuaValue::Table(t)
+        };
+        let rows = rows_of(
+            &lua,
+            vec![
+                structured_row(&lua, &[1, 2], &[("cond", pair(0, 2))]),
+                structured_row(&lua, &[3, 4], &[("cond", pair(1, 2))]),
+            ],
+        );
+        let opts = cond_slots_opts(&lua, 3);
+        let parsed = extract_synthetic_rows(&rows, Some(&opts)).expect("grouped conditions");
+        assert_eq!(parsed.conds_per_row, 2);
+        assert_eq!(parsed.conds.expect("conditions").len(), 4);
+    }
+
+    #[test]
+    fn a_condition_without_a_table_size_is_refused() {
+        let lua = Lua::new();
+        let rows = rows_of(
+            &lua,
+            vec![structured_row(
+                &lua,
+                &[1, 2],
+                &[("cond", LuaValue::Integer(0))],
+            )],
+        );
+        let err = extract_synthetic_rows(&rows, None)
+            .expect_err("a slot index checked against nothing must be refused");
+        assert!(
+            err.to_string().contains("opts.cond_slots"),
+            "message must name the option that supplies the table size: {err}"
+        );
+    }
+
+    #[test]
+    fn a_condition_outside_the_table_is_refused() {
+        let lua = Lua::new();
+        let rows = rows_of(
+            &lua,
+            vec![structured_row(
+                &lua,
+                &[1, 2],
+                &[("cond", LuaValue::Integer(5))],
+            )],
+        );
+        let opts = cond_slots_opts(&lua, 2);
+        let err = extract_synthetic_rows(&rows, Some(&opts)).expect_err("row 5 of a 2-row table");
+        assert!(err.to_string().contains("outside"), "message: {err}");
+    }
+
+    #[test]
+    fn a_channel_on_some_rows_only_is_refused() {
+        let lua = Lua::new();
+        let opts = cond_slots_opts(&lua, 2);
+
+        let missing_later = rows_of(
+            &lua,
+            vec![
+                structured_row(&lua, &[1, 2], &[("cond", LuaValue::Integer(0))]),
+                structured_row(&lua, &[3, 4], &[]),
+            ],
+        );
+        let err = extract_synthetic_rows(&missing_later, Some(&opts))
+            .expect_err("row 2 without a condition");
+        assert!(
+            err.to_string().contains("row 2 carries no `cond`"),
+            "message: {err}"
+        );
+
+        let missing_first = rows_of(
+            &lua,
+            vec![
+                structured_row(&lua, &[1, 2], &[]),
+                structured_row(&lua, &[3, 4], &[("cond", LuaValue::Integer(1))]),
+            ],
+        );
+        let err = extract_synthetic_rows(&missing_first, Some(&opts))
+            .expect_err("row 1 without a condition");
+        assert!(
+            err.to_string().contains("row 2 carries `cond`"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn allowed_sets_are_collected_per_position() {
+        let lua = Lua::new();
+        let sets = |a: &[i64], b: &[i64]| {
+            let outer = lua.create_table().expect("allowed table");
+            for (p, set) in [a, b].iter().enumerate() {
+                let inner = lua.create_table().expect("set table");
+                for (j, id) in set.iter().enumerate() {
+                    inner.set(j + 1, *id).expect("set id");
+                }
+                outer.set(p + 1, inner).expect("set position");
+            }
+            LuaValue::Table(outer)
+        };
+        let rows = rows_of(
+            &lua,
+            vec![
+                structured_row(&lua, &[1, 2], &[("allowed", sets(&[1, 2], &[3]))]),
+                structured_row(&lua, &[3, 4], &[("allowed", sets(&[4], &[5, 6]))]),
+            ],
+        );
+        let parsed = extract_synthetic_rows(&rows, None).expect("allowed rows");
+        let allowed = parsed.allowed.expect("sets attached");
+        assert_eq!(allowed.len(), 2);
+        assert_eq!(allowed[0], vec![vec![1, 2], vec![3]]);
+        assert_eq!(allowed[1], vec![vec![4], vec![5, 6]]);
+    }
+
+    #[test]
+    fn a_positional_channel_is_refused_on_a_shuffled_dataset() {
+        // `shuffle` re-orders the rows at construction, so the pairing
+        // the caller wrote between a row and its condition no longer
+        // holds. The dataset refuses the attachment; this asserts the
+        // refusal reaches Lua under this surface's prefix rather than
+        // being absorbed.
+        let lua = Lua::new();
+        let rows = rows_of(
+            &lua,
+            vec![
+                structured_row(&lua, &[1, 2], &[("cond", LuaValue::Integer(0))]),
+                structured_row(&lua, &[3, 4], &[("cond", LuaValue::Integer(1))]),
+            ],
+        );
+        let opts = cond_slots_opts(&lua, 2);
+        let parsed = extract_synthetic_rows(&rows, Some(&opts)).expect("conditioned rows");
+        let dopts = DatasetOpts {
+            shuffle: true,
+            ..DatasetOpts::default()
+        };
+        let err =
+            build_synthetic_dataset(parsed, dopts).expect_err("a shuffled corpus keeps no pairing");
+        assert!(
+            err.to_string().contains(SYNTHETIC_ERR_PREFIX),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_corpus_is_refused() {
+        let lua = Lua::new();
+        let rows = lua.create_table().expect("rows table");
+        let err = extract_synthetic_rows(&rows, None).expect_err("an empty corpus");
+        assert!(err.to_string().contains("non-empty"), "message: {err}");
+    }
 }
 
 fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
@@ -4333,6 +4931,84 @@ mod custom_spec_vocabulary_tests {
                 );
             }
         }
+    }
+
+    /// The two channel axes are not strings, so the walk above cannot
+    /// carry them — but they are the axes a Card's declaration is
+    /// *checked* against
+    /// (`algocline_nn::card::NnCardMeta::verify_channel_tensors`), so a
+    /// Lua spelling that did not reach the spec would leave the check
+    /// comparing a silent declaration against a bundle that carries the
+    /// table. Both directions are pinned here.
+    #[test]
+    fn channel_axes_reach_the_spec_and_the_card_from_lua() {
+        let lua = Lua::new();
+        let opts = lua.create_table().expect("opts table");
+        opts.set("cond_slots", 3).expect("set cond_slots");
+        let spec = build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, Some(&opts))
+            .expect("cond_slots must parse")
+            .custom
+            .expect("custom spec");
+        assert_eq!(spec.cond_slots, Some(3));
+        assert!(!spec.allowed_input, "cond_slots must not imply the other");
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        assert_eq!(json.get("cond_slots"), Some(&serde_json::json!(3)));
+
+        let opts = lua.create_table().expect("opts table");
+        opts.set("allowed_input", true).expect("set allowed_input");
+        let spec = build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, Some(&opts))
+            .expect("allowed_input must parse")
+            .custom
+            .expect("custom spec");
+        assert!(spec.allowed_input);
+        assert_eq!(spec.cond_slots, None, "allowed_input must not imply cond");
+        let json = serde_json::to_value(&spec).expect("serialize spec");
+        assert_eq!(json.get("allowed_input"), Some(&serde_json::json!(true)));
+
+        // Neither key set: the reference architecture declares no
+        // channel, which is what makes an absent Card branch readable
+        // as "no channel tables" rather than "unknown".
+        let empty = lua.create_table().expect("opts table");
+        let spec = build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, Some(&empty))
+            .expect("empty opts must parse")
+            .custom
+            .expect("custom spec");
+        assert_eq!(spec.cond_slots, None);
+        assert!(!spec.allowed_input);
+    }
+
+    /// A `cond_slots` that could not be read is refused rather than
+    /// ignored: one that did not take effect would build an
+    /// unconditioned model the caller then trains and labels as
+    /// conditioned.
+    ///
+    /// `allowed_input` is a boolean and is deliberately not tested for
+    /// the same thing: mlua reads any non-`nil` value as `true` (Lua's
+    /// own truthiness), so there is no wrong type to refuse. That is
+    /// the behaviour every sibling boolean axis on this table already
+    /// has — `untied_head` included — and this test pins the
+    /// asymmetry rather than papering over it.
+    #[test]
+    fn a_mistyped_cond_slots_is_refused() {
+        let lua = Lua::new();
+        let opts = lua.create_table().expect("opts table");
+        opts.set("cond_slots", "two").expect("set cond_slots");
+        let err = build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, Some(&opts))
+            .expect_err("a non-numeric cond_slots must be refused");
+        assert!(
+            err.to_string().contains("option 'cond_slots' must be"),
+            "message: {err}"
+        );
+
+        // The documented boolean behaviour, asserted so a future mlua
+        // change is visible here rather than in a caller's model.
+        let opts = lua.create_table().expect("opts table");
+        opts.set("allowed_input", 1).expect("set allowed_input");
+        let spec = build_custom_gpt2_config(GPT2_CUSTOM_PRESET_ERR_PREFIX, Some(&opts))
+            .expect("a truthy allowed_input reads as true")
+            .custom
+            .expect("custom spec");
+        assert!(spec.allowed_input);
     }
 }
 
@@ -5348,14 +6024,28 @@ mod load_dispatch_tests {
 
     // ── gpt2-custom shape restore (issue 467e6630) ───────────
 
-    /// Seed an empty bundle at the path `load_handle_impl` resolves so
-    /// the pre-flight existence check passes. The two refusals below
-    /// fire while rebuilding the config, before any safetensors byte
-    /// is read, so the file's contents do not matter — but its absence
-    /// would mask the error under test.
+    /// Seed a tensor-less but *readable* bundle at the path
+    /// `load_handle_impl` resolves.
+    ///
+    /// Two pre-flight steps stand between the card and the config
+    /// rebuild the refusals below are about: the existence check, and
+    /// the channel-axis comparison, which reads the safetensors header.
+    /// An empty file passes the first and fails the second with
+    /// `ChannelMismatch::BundleUnreadable`, which would mask the error
+    /// under test — so the seed is a real header carrying no tensors.
+    /// That is also the truthful input for these cards: they declare no
+    /// channel, and a bundle with no channel table agrees with them.
+    ///
+    /// The layout is safetensors' own: an 8-byte little-endian header
+    /// length followed by that many bytes of JSON. The header is padded
+    /// with spaces to a multiple of 8 so the tensor region that would
+    /// follow starts aligned.
     fn touch_bundle(nn_dir: &std::path::Path, card_id: &str) {
         std::fs::create_dir_all(nn_dir).expect("create nn dir");
-        std::fs::write(nn_dir.join(format!("{card_id}.safetensors")), b"")
+        let header = b"{}      ";
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        std::fs::write(nn_dir.join(format!("{card_id}.safetensors")), bytes)
             .expect("seed placeholder bundle");
     }
 
@@ -5429,6 +6119,126 @@ mod load_dispatch_tests {
         assert!(
             msg.contains("custom+MoE") && msg.contains("not supported yet"),
             "error must name the unsupported combination: {msg}"
+        );
+    }
+
+    // ── channel-axis verification on the load path ───────────
+
+    /// Seed a bundle carrying exactly the named tensors, each a
+    /// one-element `f32`. The channel check reads names only, so the
+    /// values are irrelevant — the point is which names are in the
+    /// header.
+    fn seed_bundle_with(nn_dir: &std::path::Path, card_id: &str, names: &[&str]) {
+        std::fs::create_dir_all(nn_dir).expect("create nn dir");
+        let mut tensors: std::collections::HashMap<String, candle_core::Tensor> =
+            std::collections::HashMap::new();
+        for name in names {
+            let t = candle_core::Tensor::from_slice(&[0f32], (1,), &candle_core::Device::Cpu)
+                .expect("build placeholder tensor");
+            tensors.insert((*name).to_string(), t);
+        }
+        candle_core::safetensors::save(&tensors, nn_dir.join(format!("{card_id}.safetensors")))
+            .expect("write placeholder bundle");
+    }
+
+    /// Card metadata for a `gpt2-custom` full-FT card whose spec is
+    /// `spec`.
+    fn custom_card_meta(name: &str, spec: serde_json::Value) -> serde_json::Value {
+        json!({
+            "name": name,
+            "backend": "candle",
+            "architecture": "gpt2-custom",
+            "training_path": "full_ft",
+            "candle": {
+                "bundle_ref": "nn/placeholder",
+                "custom": {
+                    "vocab": 64, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+                    "spec": spec
+                }
+            }
+        })
+    }
+
+    /// A card that declares a conditioning table whose bundle has none
+    /// must be refused. Loading anyway would build the table from a
+    /// random initialisation and call it trained.
+    #[test]
+    fn load_handle_refuses_declared_channel_missing_from_the_bundle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            custom_card_meta("declares-cond", json!({ "cond_slots": 3 })),
+        );
+        seed_bundle_with(&nn_dir, &card_id, &["wte.weight"]);
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("a declared channel with no table must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_handle")
+                && msg.contains("cond_slots")
+                && msg.contains(algocline_nn::arch::COND_TABLE_TENSOR),
+            "error must name the surface, the declaration and the tensor: {msg}"
+        );
+    }
+
+    /// The direction the check exists for: the bundle carries a table
+    /// the card is silent about. The config is rebuilt from the card,
+    /// so nothing downstream ever asks for that tensor — the model
+    /// would simply run without an input it was trained with.
+    #[test]
+    fn load_handle_refuses_undeclared_channel_present_in_the_bundle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            custom_card_meta("silent-about-allowed", json!({ "norm": "rmsnorm" })),
+        );
+        seed_bundle_with(
+            &nn_dir,
+            &card_id,
+            &["wte.weight", algocline_nn::arch::ALLOWED_TABLE_TENSOR],
+        );
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("an undeclared channel table must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_handle")
+                && msg.contains(algocline_nn::arch::ALLOWED_TABLE_TENSOR)
+                && msg.contains("allowed_input"),
+            "error must name the surface, the tensor and the missing declaration: {msg}"
+        );
+    }
+
+    /// A card and a bundle that agree get past the check. The build
+    /// that follows fails for its own reason here (the seeded bundle
+    /// carries no real weights), which is what shows the check itself
+    /// let the pair through.
+    #[test]
+    fn load_handle_passes_the_channel_check_when_card_and_bundle_agree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            custom_card_meta("declares-cond", json!({ "cond_slots": 3 })),
+        );
+        seed_bundle_with(
+            &nn_dir,
+            &card_id,
+            &["wte.weight", algocline_nn::arch::COND_TABLE_TENSOR],
+        );
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("the placeholder bundle cannot build a model"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !msg.contains("cond_slots"),
+            "the channel check must not fire when the two agree: {msg}"
         );
     }
 
@@ -5507,6 +6317,122 @@ mod load_dispatch_tests {
         assert_eq!(cfg.vocab, Gpt2Config::tiny().vocab);
         assert_eq!(cfg.layers, Gpt2Config::tiny().layers);
         assert!(cfg.custom.is_none(), "named variant is the reference shape");
+    }
+
+    /// The contradiction the bundle comparison cannot see: a named
+    /// variant rebuilds its shape from the preset, so a channel
+    /// declared in the shape block is read by nothing. The Card and the
+    /// bundle agree with each other and the model still drops the
+    /// channel, which is why the config is compared against the
+    /// declaration as well.
+    #[test]
+    fn gpt2_config_for_card_refuses_a_named_variant_that_declares_a_channel() {
+        for (spec, key) in [
+            (json!({ "cond_slots": 2 }), "cond_slots"),
+            (json!({ "allowed_input": true }), "allowed_input"),
+        ] {
+            let meta: NnCardMeta = serde_json::from_value(json!({
+                "name": "gpt2-tiny-run",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "full_ft",
+                "candle": {
+                    "bundle_ref": "nn/gpt2-tiny-run",
+                    "custom": {
+                        "vocab": 64, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+                        "spec": spec
+                    }
+                }
+            }))
+            .expect("meta deserialize");
+
+            let msg = match gpt2_config_for_card(&meta) {
+                Ok(_) => panic!("a named variant cannot read {key}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains(key) && msg.contains("gpt2-tiny"),
+                "error must name the declaration and the architecture that ignores it: {msg}"
+            );
+        }
+    }
+
+    /// The same card on the whole load path, with a bundle that carries
+    /// the declared table. The bundle comparison passes — declared and
+    /// present — and the refusal comes from the config instead.
+    #[test]
+    fn load_handle_refuses_a_named_variant_card_that_declares_a_channel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "named-but-conditioned",
+                "backend": "candle",
+                "architecture": "gpt2-tiny",
+                "training_path": "full_ft",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "custom": {
+                        "vocab": 64, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+                        "spec": { "cond_slots": 3 }
+                    }
+                }
+            }),
+        );
+        seed_bundle_with(
+            &nn_dir,
+            &card_id,
+            &["wte.weight", algocline_nn::arch::COND_TABLE_TENSOR],
+        );
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("a card whose config drops its channel must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("cond_slots") && msg.contains("never reads it"),
+            "error must say the rebuilt model would not read the channel: {msg}"
+        );
+    }
+
+    /// An architecture with no customization spec at all reads no
+    /// channel either, so the same refusal has to hold there — the
+    /// guarantee is per load path, not per architecture.
+    #[test]
+    fn load_handle_refuses_a_tinyllama_card_that_declares_a_channel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let card_id = write_test_card(
+            &store,
+            json!({
+                "name": "tinyllama-but-allowed",
+                "backend": "candle",
+                "architecture": "tinyllama-tiny",
+                "training_path": "full_ft",
+                "candle": {
+                    "bundle_ref": "nn/placeholder",
+                    "custom": {
+                        "vocab": 64, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+                        "spec": { "allowed_input": true }
+                    }
+                }
+            }),
+        );
+        seed_bundle_with(
+            &nn_dir,
+            &card_id,
+            &["wte.weight", algocline_nn::arch::ALLOWED_TABLE_TENSOR],
+        );
+        let msg = match load_handle_impl(&store, &card_id, &nn_dir) {
+            Ok(_) => panic!("a tinyllama card cannot read an allowed-id channel"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("allowed_input") && msg.contains("never reads it"),
+            "error must say the rebuilt model would not read the channel: {msg}"
+        );
     }
 
     // ── load_wrap_impl directional errors + arch match ───────
@@ -6070,6 +6996,106 @@ mod load_ckpt_tests {
         assert_eq!(gpt2.vocab, 48);
         assert_eq!(gpt2.ctx, 16);
         assert_eq!(gpt2.layers, 2);
+        assert_eq!(gpt2.dim, 32);
+    }
+
+    // ── channel axes on the Cardless path ────────────────────────
+
+    /// Write a `gpt2-custom` checkpoint under `dir` and return its path
+    /// together with the spec keys describing the shape it was built
+    /// with. The conditioning axis is deliberately *not* included in the
+    /// returned spec: each test below adds it back on the side it wants
+    /// it on, which is what makes the two directions of the
+    /// disagreement expressible.
+    fn custom_ckpt_and_spec(
+        lua: &Lua,
+        dir: &std::path::Path,
+        conditioned: bool,
+    ) -> (std::path::PathBuf, serde_json::Value) {
+        let shape = json!({
+            "vocab": 48, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+        });
+        let mut build_opts = shape.clone();
+        build_opts["pretrained"] = json!(false);
+        if conditioned {
+            build_opts["cond_slots"] = json!(2);
+        }
+        let base = build_gpt2_handle(
+            "custom",
+            Some(&opts_table(lua, build_opts)),
+            &dir.join("nn"),
+        )
+        .expect("custom gpt2 base");
+        let path = dir.join("run.safetensors");
+        base.varmap()
+            .expect("from-scratch handle carries a VarMap")
+            .save(&path)
+            .expect("write checkpoint");
+        let mut spec = shape;
+        spec["arch"] = json!("gpt2-custom");
+        (path, spec)
+    }
+
+    /// The direction that is otherwise silent, on the path that had no
+    /// check at all: the checkpoint carries a conditioning table and the
+    /// spec says nothing about it. The spec is hand-written by the hook,
+    /// so this is one dropped key away — and the model would then run
+    /// unconditioned while every metric computed off it looked ordinary.
+    #[test]
+    fn load_ckpt_refuses_a_channel_the_spec_omits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let (path, spec) = custom_ckpt_and_spec(&lua, tmp.path(), true);
+
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &opts_table(&lua, spec))
+        {
+            Ok(_) => panic!("a checkpoint channel the spec omits must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:")
+                && msg.contains(algocline_nn::arch::COND_TABLE_TENSOR)
+                && msg.contains("does not declare"),
+            "error must name the surface, the tensor and the missing declaration: {msg}"
+        );
+    }
+
+    /// The mirror direction: the spec declares a channel the checkpoint
+    /// has no table for. The build would fail on its own here, but with
+    /// a shape error rather than one naming the channel.
+    #[test]
+    fn load_ckpt_refuses_a_declared_channel_the_checkpoint_lacks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let (path, mut spec) = custom_ckpt_and_spec(&lua, tmp.path(), false);
+        spec["cond_slots"] = json!(2);
+
+        let msg = match load_ckpt_impl(path.to_str().expect("utf-8 path"), &opts_table(&lua, spec))
+        {
+            Ok(_) => panic!("a declared channel with no table must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("alc.nn.card.load_ckpt:")
+                && msg.contains("cond_slots")
+                && msg.contains("carries no"),
+            "error must name the surface, the declaration and what is absent: {msg}"
+        );
+    }
+
+    /// The pair that agrees goes through, so the check costs the
+    /// conditioned hook nothing.
+    #[test]
+    fn load_ckpt_accepts_a_spec_that_names_the_checkpoint_channel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let (path, mut spec) = custom_ckpt_and_spec(&lua, tmp.path(), true);
+        spec["cond_slots"] = json!(2);
+
+        let handle = load_ckpt_impl(path.to_str().expect("utf-8 path"), &opts_table(&lua, spec))
+            .expect("a spec that matches the checkpoint loads");
+        let gpt2 = handle.as_gpt2().expect("gpt2 handle");
+        assert_eq!(gpt2.vocab, 48);
         assert_eq!(gpt2.dim, 32);
     }
 

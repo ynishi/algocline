@@ -117,6 +117,8 @@ fn distill_run_reduces_masked_loss_on_teacher_corpus() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     });
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());

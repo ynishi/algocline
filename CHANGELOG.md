@@ -9,6 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Slot conditioning (`cond_slots`) on the GPT-2 `custom` preset.** A
+  model can be built with a conditioning table of `N` rows whose
+  selected row is added to the residual stream at every position, so a
+  condition holds for a whole sequence instead of decaying with
+  distance from a token at the front. The row is an argument rather
+  than a position in the input, which leaves nothing for windowing to
+  disturb. Reached from Lua as
+  `alc.nn.preset.gpt2("custom", { cond_slots = N })`, with the row per
+  corpus row (`alc.nn.data.synthetic`) and per decode session
+  (`handle:generate_session(prompt, { cond = row })`). The row is
+  checked against the table size at every boundary: a number from some
+  other numbering — a token id, most often — overlaps the table's rows
+  without meaning the same thing.
+
+- **Allowed-id input channel (`allowed_input`) on the GPT-2 `custom`
+  preset.** A model can be told, at each position, which ids the answer
+  there may be drawn from; the mean of a dedicated table over that set
+  is added where the positional embedding is. Built with
+  `alc.nn.preset.gpt2("custom", { allowed_input = true })`, fed per row
+  and position through `alc.nn.data.synthetic`, and per session through
+  `generate_session(prompt, { allowed = { id, ... } })` (flat: one set
+  for the whole generation; the per-position decode form is not in this
+  release). This is the model's *input*, not a decode constraint —
+  `alc.nn.constraint.allow_list` still governs what the sampler may
+  pick, and the two are independent. A corpus whose set at a position
+  does not hold the token that position carries is refused when the
+  sets are attached: the loss scores that token among the ids the set
+  names, so the contradiction would train against a penalty rather than
+  stop.
+
+- **Channel-aware training entry points.** `alc.nn.trainer.run_full_ft`
+  routes a handle carrying one of the channels through the matching
+  training pass. The decision follows the shape the handle was built
+  with rather than an opts key: a model holding a channel table has no
+  forward pass that ignores it, so a key would only offer a way to
+  disagree with the model. A conditioned model over a corpus carrying
+  no conditions is refused rather than trained unconditioned under a
+  checkpoint labelled otherwise.
+
+- **`opts.init_from` and `opts.mask_disallowed_logits` on the trainer
+  surfaces.** `init_from` restores a checkpoint into the model's
+  variables before the first step; anything short of a complete restore
+  is an error and the run does not start, because a resume that quietly
+  kept some parameters at their initial values is indistinguishable
+  from a real one once training is under way.
+  `mask_disallowed_logits` scores each target among the ids its
+  position allowed instead of among the whole vocabulary. The two
+  switches are independent of each other and of the model's input
+  channel.
+
+- **Card channel-axis validation on the load path.**
+  `alc.nn.card.load_handle` now compares the channels a Card declares
+  against the tensors in its bundle before building the model, reading
+  the safetensors header only. Both directions are refused. The second
+  is the reason it exists: the load path rebuilds the config from the
+  Card, so a channel table the Card does not declare is never asked
+  for, and the model then runs without an input it was trained with
+  with every number afterwards looking ordinary.
+  `alc.nn.card.load_ckpt` runs the same comparison against the spec its
+  caller writes by hand. The declaration is additionally compared with
+  the config the loader rebuilds, so a Card naming an architecture that
+  pins its own shape while declaring a channel is refused rather than
+  loaded into a model that never reads the table.
+
+- **`alc.nn.metric.bootstrap_ci(clusters, opts)`.** A cluster
+  bootstrap: observations are grouped by the caller, the resampling
+  unit is the group, and the result carries the point estimate, the 95%
+  percentile bounds, the usable and undefined draw counts, the cluster
+  count and the seed. `opts.seed` is required — an interval nothing can
+  reproduce looks exactly like one that can. Resampling observations
+  rather than clusters would treat two readings from one group as two
+  independent facts and return an interval narrower than the sample
+  supports.
+
+- **`just check-invariants` refuses named games under
+  `crates/algocline-nn`.** The crate holds general machine-learning
+  machinery and a run's subject belongs to the caller; comments and doc
+  comments count, since a doc example naming one game is how the next
+  reader learns the crate is "for" it.
+
 ### Changed
 
 ### Deprecated

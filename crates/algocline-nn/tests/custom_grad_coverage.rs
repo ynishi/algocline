@@ -97,6 +97,8 @@ fn kitchen_sink_a_backward_reaches_every_base_var() {
             kv_heads: Some(1), // MQA — c_attn out = 16 + 2·8 = 32
             window: Some(4),
             untied_head: true,
+            cond_slots: None,
+            allowed_input: false,
         },
     );
     let (vm, grads) = masked_backward(&cfg);

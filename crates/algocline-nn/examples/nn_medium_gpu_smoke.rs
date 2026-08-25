@@ -151,6 +151,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
 
     let ckpt_dir = ckpt_path

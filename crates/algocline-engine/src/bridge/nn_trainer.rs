@@ -98,10 +98,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use algocline_nn::card::{bundle_ref_for, CardId, NnLoraBranch, NnModelCard, TrainingPath};
+use algocline_nn::card::{
+    bundle_ref_for, CardId, NnCustomBranch, NnLoraBranch, NnModelCard, TrainingPath,
+};
 use algocline_nn::train::{
-    run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss, DistillLossKind, DistillSpec,
-    TrainingLease,
+    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss,
+    DistillLossKind, DistillSpec, TrainingLease,
 };
 use mlua::prelude::*;
 
@@ -456,6 +458,14 @@ fn run_lora_ft_impl(
 //   (`RUN_FULL_FT_ERR_PREFIX`), threaded into the shared
 //   `super::nn_opts` extractor / error converter so the loud-error
 //   contract (one prefix per surface) holds off one implementation.
+// - Channel routing — a GPT-2 handle built with an optional input
+//   channel (`cond_slots` / `allowed_input` on the `custom` preset)
+//   goes through `run_conditioned_ft` / `run_allowed_ft` instead of
+//   `run_full_ft`. The decision reads the shape the handle carries
+//   rather than an opts key ([`trained_channel`]): a model holding a
+//   channel table has no forward pass that ignores it, so a key would
+//   only give the caller a way to disagree with the model. TinyLlama
+//   models carry no such table and keep the plain entry point.
 // - `opts.on_ckpt` — the checkpoint hook, mirrored from the Layer 5b
 //   sibling `alc.nn.trainer.full_ft` (`super::nn_card`) through the
 //   shared [`super::nn_opts::extract_on_ckpt_hook`]. Full-fine-tune is
@@ -463,6 +473,48 @@ fn run_lora_ft_impl(
 //   passing `None` (Layer 5b design decision, revisited only if a
 //   caller needs it). Requires `ckpt_every > 0`, otherwise the hook
 //   could never fire and the extractor refuses the pair.
+
+/// Which optional input channel a model was built with, and therefore
+/// which training entry point it has to go through.
+///
+/// The three are mutually exclusive by construction: a spec setting
+/// both channels is refused at build time
+/// (`algocline_nn::arch::Gpt2Custom::validate`) because no forward pass
+/// delivers both, so the model that carried both would silently lose
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrainedChannel {
+    /// No channel table — the plain `Module::forward` path.
+    None,
+    /// A conditioning table, fed one condition per row.
+    Conditioning,
+    /// An allowed-id table, fed one id set per position.
+    Allowed,
+}
+
+/// Read the channel off the Card branch projected from the handle's
+/// live config.
+///
+/// The branch is the same value the Card records, which is what keeps
+/// the routing decision and the written declaration from disagreeing:
+/// a model routed through the conditioned entry point is exactly the
+/// one whose Card says `cond_slots`, and the load path checks that
+/// declaration against the bundle
+/// (`algocline_nn::card::NnCardMeta::verify_channel_tensors`).
+///
+/// `None` for a reference-architecture run, which has no branch.
+fn trained_channel(custom: Option<&NnCustomBranch>) -> TrainedChannel {
+    let Some(spec) = custom.map(|branch| &branch.spec) else {
+        return TrainedChannel::None;
+    };
+    if spec.cond_slots.is_some() {
+        TrainedChannel::Conditioning
+    } else if spec.allowed_input {
+        TrainedChannel::Allowed
+    } else {
+        TrainedChannel::None
+    }
+}
 
 /// L5c S1 core. Mirrors [`run_lora_ft_impl`] structurally; see the
 /// section header above for the design divergence.
@@ -577,6 +629,11 @@ fn run_full_ft_impl(
     //    `custom_branch_of_gpt2`).
     let architecture = handle.arch_family_variant();
     let custom = custom_branch_of_gpt2(RUN_FULL_FT_ERR_PREFIX, &handle)?;
+    // Which entry point the run takes follows from the shape the
+    // handle was built with, not from an opts key. A model carrying a
+    // channel table has no forward pass that ignores it, so a key
+    // would only offer the caller a way to disagree with the model.
+    let channel = trained_channel(custom.as_ref());
     let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
 
     // 9. Fresh per-call TrainingLease (design §0, matches
@@ -606,21 +663,45 @@ fn run_full_ft_impl(
                 LuaError::external(format!("alc.nn.trainer.run_full_ft: model lock: {e}"))
             })?;
 
-            let result = run_full_ft(
-                &*model,
-                &vm_arc,
-                ds_lock.as_mut(),
-                &train_cfg,
-                &loss_fn,
-                nn_dir,
-                card_id.as_str(),
-                Arc::clone(&lease),
-                // Optional `on_ckpt` hook (step 6.5). `None` when the
-                // caller omitted the key, which keeps the pre-hook
-                // behaviour bit-identical. `CkptHook` is not `Clone`,
-                // but the match arms are exclusive so the move is fine.
-                hook,
-            );
+            // Optional `on_ckpt` hook (step 6.5). `None` when the
+            // caller omitted the key, which keeps the pre-hook
+            // behaviour bit-identical. `CkptHook` is not `Clone`, but
+            // the arms below are exclusive so the move is fine.
+            let result = match channel {
+                TrainedChannel::None => run_full_ft(
+                    &*model,
+                    &vm_arc,
+                    ds_lock.as_mut(),
+                    &train_cfg,
+                    &loss_fn,
+                    nn_dir,
+                    card_id.as_str(),
+                    Arc::clone(&lease),
+                    hook,
+                ),
+                TrainedChannel::Conditioning => run_conditioned_ft(
+                    &*model,
+                    &vm_arc,
+                    ds_lock.as_mut(),
+                    &train_cfg,
+                    &loss_fn,
+                    nn_dir,
+                    card_id.as_str(),
+                    Arc::clone(&lease),
+                    hook,
+                ),
+                TrainedChannel::Allowed => run_allowed_ft(
+                    &*model,
+                    &vm_arc,
+                    ds_lock.as_mut(),
+                    &train_cfg,
+                    &loss_fn,
+                    nn_dir,
+                    card_id.as_str(),
+                    Arc::clone(&lease),
+                    hook,
+                ),
+            };
             drop(model);
             drop(ds_lock);
             drop(ds_handle);
@@ -1437,6 +1518,152 @@ mod run_ft_bridge_tests {
         assert!(
             lora.is_none() || lora.unwrap().is_null(),
             "full-ft Card must not carry a LoRA branch; got: {lora:?}"
+        );
+    }
+
+    // ─── Channel routing ──────────────────────────────────────────
+
+    /// Build a custom `gpt2` handle carrying `cond_slots` rows of a
+    /// conditioning table, on the same tiny shape the scaffolds use.
+    fn setup_conditioned_gpt2_scaffold(
+        cond_slots: usize,
+    ) -> (tempfile::TempDir, FileCardStore, PathBuf, Gpt2Handle, Lua) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let nn_dir = tmp.path().join("nn");
+        let lua = Lua::new();
+        let base_opts = opts_table(
+            &lua,
+            json!({ "pretrained": false, "cond_slots": cond_slots }),
+        );
+        let base = build_gpt2_handle("custom", Some(&base_opts), &nn_dir)
+            .expect("build conditioned gpt2 custom base");
+        (tmp, store, nn_dir, base, lua)
+    }
+
+    /// A dataset whose rows each carry one condition, cycling through
+    /// `cond_slots` so no single row's condition explains the corpus.
+    fn make_conditioned_dataset_handle(
+        lua: &Lua,
+        row: Vec<u32>,
+        n: usize,
+        cond_slots: usize,
+    ) -> LuaAnyUserData {
+        let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| row.clone()).take(n).collect();
+        let conds: Vec<algocline_nn::arch::CondIndex> = (0..n)
+            .map(|i| {
+                algocline_nn::arch::CondIndex::new((i % cond_slots) as u32, cond_slots)
+                    .expect("slot index inside the table")
+            })
+            .collect();
+        let dopts = DatasetOpts {
+            batch_size: 1,
+            ctx_len: 16,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        };
+        let ds = TokenizedDataset::new(rows, dopts)
+            .with_conditions(conds)
+            .expect("attach conditions");
+        let handle = DatasetHandle::for_test(Box::new(ds), "test-conditioned".into(), 1, 16);
+        lua.create_userdata(handle).expect("dataset userdata")
+    }
+
+    /// A model built with a conditioning table has no forward pass
+    /// that ignores it, so `run_full_ft` has to take the conditioned
+    /// entry point. The bundle carrying `cond_wte.weight` is what
+    /// shows it did: the plain entry point would have refused the
+    /// batch outright, and a model built without the table would have
+    /// written a bundle without one.
+    #[test]
+    fn run_full_ft_routes_a_conditioned_model_through_the_conditioned_entry() {
+        let (_tmp, store, nn_dir, base, lua) = setup_conditioned_gpt2_scaffold(2);
+        let ds_ud = make_conditioned_dataset_handle(&lua, overfit_row(), 20, 2);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let card_id = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft over a conditioned model");
+
+        let ckpt_path = nn_dir.join(format!("{card_id}.safetensors"));
+        assert!(ckpt_path.exists(), "bundle must exist at {ckpt_path:?}");
+
+        // The Card declares the channel, and the bundle carries its
+        // table — the pair the load path checks against each other.
+        let card = store.get(&card_id).unwrap().unwrap();
+        let nn = card.get("metadata").and_then(|m| m.get("nn")).unwrap();
+        let spec = nn
+            .get("candle")
+            .and_then(|c| c.get("custom"))
+            .and_then(|c| c.get("spec"))
+            .expect("custom spec on the card");
+        assert_eq!(spec.get("cond_slots").unwrap().as_u64().unwrap(), 2);
+
+        let meta: algocline_nn::card::NnCardMeta =
+            serde_json::from_value(nn.clone()).expect("card metadata");
+        meta.verify_channel_tensors_in_bundle(&ckpt_path)
+            .expect("the written bundle must agree with the written declaration");
+    }
+
+    /// The same model against a corpus that carries no conditions.
+    /// Refused rather than trained unconditioned, which would write a
+    /// checkpoint labelled as conditioned.
+    #[test]
+    fn run_full_ft_refuses_a_conditioned_model_over_an_unconditioned_corpus() {
+        let (_tmp, store, nn_dir, base, lua) = setup_conditioned_gpt2_scaffold(2);
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let err = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect_err("a conditioned model over an unconditioned corpus");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(RUN_FULL_FT_ERR_PREFIX) && msg.contains("carried no conditions"),
+            "message must name the surface and the disagreement: {msg}"
+        );
+    }
+
+    /// The routing decision reads the same branch the Card records, so
+    /// the two cannot disagree. A reference-architecture run has no
+    /// branch at all and keeps the plain entry point.
+    #[test]
+    fn trained_channel_reads_the_recorded_branch() {
+        assert_eq!(trained_channel(None), TrainedChannel::None);
+
+        let branch = |spec: serde_json::Value| -> NnCustomBranch {
+            serde_json::from_value(json!({
+                "vocab": 64, "ctx": 16, "layers": 2, "heads": 2, "dim": 32,
+                "spec": spec
+            }))
+            .expect("custom branch")
+        };
+        assert_eq!(
+            trained_channel(Some(&branch(json!({})))),
+            TrainedChannel::None
+        );
+        assert_eq!(
+            trained_channel(Some(&branch(json!({ "cond_slots": 3 })))),
+            TrainedChannel::Conditioning
+        );
+        assert_eq!(
+            trained_channel(Some(&branch(json!({ "allowed_input": true })))),
+            TrainedChannel::Allowed
         );
     }
 

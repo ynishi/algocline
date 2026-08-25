@@ -292,6 +292,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
 
     let lora_cfg = LoraConfig::with_targets(lora_rank, lora_alpha, targets.iter().cloned());

@@ -77,6 +77,7 @@ test-nn:
     cargo test -p algocline-engine --features nn --test nn_distill_teacher_card_e2e
     cargo test -p algocline-engine --features nn --test gameai_smoke_test
     cargo test -p algocline-engine --features nn --test gameai_ckpt_metric_e2e
+    cargo test --features nn --test e2e nn_channel
 
 # Clippy for the nn-feature layer. `just clippy` runs the default (nn off)
 # workspace clippy; this recipe closes the gap for the `--features nn` code
@@ -133,6 +134,10 @@ ready:
 #          calls live outside `service/manifest.rs` (the `FsInstalledManifestStore`
 #          impl block is the single source). Added in Subtask 3b together
 #          with the `InstalledManifestStore` trait extraction (Subtask 3a).
+#   Inv-5: `crates/algocline-nn` names no specific game. The crate holds
+#          general machine-learning machinery; a run's subject belongs to the
+#          caller. Comments and doc comments count — a doc example naming one
+#          game is how the next reader learns the crate is "for" it.
 [group('allow-agent')]
 check-invariants:
     #!/usr/bin/env bash
@@ -197,6 +202,23 @@ check-invariants:
             crates/algocline-app/src/service/ --include='*.rs' \
             | grep -v -E '^crates/algocline-app/src/service/manifest\.rs:'; then
         echo "Inv-4 FAILED: installed.json filesystem access outside service/manifest.rs" >&2
+        fail=1
+    fi
+    # Inv-5: no specific game is named anywhere under crates/algocline-nn.
+    #
+    # The list is of *named games*, not of the word "game": general prose
+    # like "a game or tool" describes the kind of caller the crate serves
+    # and is exactly what this invariant wants the crate to say instead.
+    # Matching is case-insensitive so a type name (`ChessBoard`) is caught
+    # alongside a comment.
+    #
+    # Limitation: this is a word list, so a game not on it passes. The list
+    # grows when a new one shows up; the check is a tripwire on the failure
+    # that has actually happened (an experiment's subject leaking into the
+    # library it was run with), not a proof of neutrality.
+    if grep -rniE '(chess|othello|reversi|shogi|guardian|card_duel)' \
+            crates/algocline-nn/; then
+        echo "Inv-5 FAILED: crates/algocline-nn names a specific game (see the file:line above)" >&2
         fail=1
     fi
     if [ "$fail" -ne 0 ]; then

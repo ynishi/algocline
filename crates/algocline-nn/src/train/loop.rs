@@ -24,13 +24,15 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{LoraConfig, LoraWrappable};
-use crate::train::ckpt::{checkpoint_from_path, CheckpointStore};
+use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
+use crate::train::ckpt::{checkpoint_from_path, restore_into, CheckpointStore, RestoreError};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::loss::Loss;
 use crate::train::mixed::MixedAdamW;
 use crate::train::scheduler::{ScheduleKind, Scheduler};
+use crate::train::AllowedForward;
 use crate::train::Checkpoint;
+use crate::train::ConditionedForward;
 use crate::train::DeviceView;
 
 /// Optimizer flavour selected by the parameter dtype (design §7.1).
@@ -129,6 +131,35 @@ pub struct FullFtConfig {
     /// Number of rotating checkpoints kept (clamped to at least 1
     /// inside [`CheckpointStore`]).
     pub ckpt_keep: usize,
+    /// Checkpoint the model's variables are restored from before the
+    /// first step, or `None` (default) to train from whatever the
+    /// caller built.
+    ///
+    /// Restored through [`restore_into`], so anything short of a
+    /// complete restore is a [`TrainError::Restore`] and the run does
+    /// not start: a resume that quietly kept some parameters at their
+    /// initial values is the failure that costs a run, and it is
+    /// indistinguishable from a real one once training is under way.
+    ///
+    /// Not supported on [`run_lora_ft`], which never sees the base
+    /// map — see [`TrainError::InitFromUnsupported`].
+    pub init_from: Option<PathBuf>,
+    /// Whether the loss scores each target among the ids that position
+    /// allowed, rather than among the whole vocabulary.
+    ///
+    /// When `true`, [`allowed_logit_mask`] is added to the logits
+    /// before the loss, so the ids a target could not have taken stop
+    /// being charged for. Requires the dataset to carry
+    /// [`Batch::allowed_ids`]; a batch without them is
+    /// [`TrainError::MissingAllowedSets`] rather than an unmasked step
+    /// under a config that says otherwise.
+    ///
+    /// `false` (default) leaves the loss over the full vocabulary even
+    /// for a dataset that carries the sets — the sets are then either
+    /// unused or serving only as model input through
+    /// [`run_allowed_ft`], which is what the two independent switches
+    /// are for.
+    pub mask_disallowed_logits: bool,
 }
 
 impl Default for FullFtConfig {
@@ -143,6 +174,8 @@ impl Default for FullFtConfig {
             weight_decay: 0.1,
             ckpt_every: 0,
             ckpt_keep: 3,
+            init_from: None,
+            mask_disallowed_logits: false,
         }
     }
 }
@@ -255,6 +288,66 @@ pub enum TrainError {
     /// error is discoverable from the bundle side too.
     #[error("on_ckpt hook: {0}")]
     Hook(String),
+    /// [`FullFtConfig::init_from`] named a checkpoint the model's
+    /// variables could not be restored from. The run does not start.
+    #[error("init_from: {0}")]
+    Restore(#[from] RestoreError),
+    /// [`FullFtConfig::init_from`] was set on an entry point that never
+    /// sees the base `VarMap`.
+    ///
+    /// [`run_lora_ft`] is handed the model and builds its own
+    /// LoRA-only map; the base variables belong to a map the caller
+    /// holds. Restoring the LoRA map from a base checkpoint would
+    /// restore nothing it recognises, so the request is refused here
+    /// rather than answered with a checkpoint that went somewhere else.
+    /// Restore the base map yourself (
+    /// [`crate::train::restore_into`]) before wrapping.
+    #[error(
+        "init_from is not supported by this entry point: it never sees the base VarMap, so the \
+         checkpoint would have nowhere to land; restore the base map before wrapping it"
+    )]
+    InitFromUnsupported,
+    /// A conditioned run was handed a batch carrying no conditions.
+    ///
+    /// Refused rather than falling back to the plain forward, because a
+    /// run that quietly trained unconditioned would still write a
+    /// checkpoint labelled as conditioned.
+    #[error(
+        "a conditioned run received a batch of {rows} row(s) carrying no conditions; the run \
+         would have trained unconditioned under a checkpoint labelled otherwise"
+    )]
+    MissingConditions {
+        /// Rows in the batch that arrived without conditions.
+        rows: usize,
+    },
+    /// An entry point with nowhere to put a condition was handed a
+    /// batch carrying one. The mirror of
+    /// [`TrainError::MissingConditions`]: dropping it would discard a
+    /// channel the caller attached per row.
+    #[error(
+        "a batch of {rows} row(s) carries {conds} condition(s), but this entry point has \
+         nowhere to put them; use run_conditioned_ft"
+    )]
+    UnexpectedConditions {
+        /// Rows in the batch.
+        rows: usize,
+        /// Conditions the batch carried.
+        conds: usize,
+    },
+    /// Allowed-id sets were required — as model input by
+    /// [`run_allowed_ft`], or by the loss under
+    /// [`FullFtConfig::mask_disallowed_logits`] — and the batch carried
+    /// none.
+    #[error(
+        "a batch of {rows} row(s) carries no allowed-id sets, which this run requires ({needed})"
+    )]
+    MissingAllowedSets {
+        /// Rows in the batch that arrived without sets.
+        rows: usize,
+        /// What needed them, so the caller knows which switch to look
+        /// at: the model input or the loss mask.
+        needed: &'static str,
+    },
 }
 
 /// Information handed to the [`CkptHook`] at every `ckpt_every` boundary.
@@ -369,8 +462,10 @@ where
     // step/save loop with `run_lora_ft` via `run_ft_core`; the only
     // difference is which VarMap the optimizer holds and which VarMap
     // the checkpoint store saves.
+    apply_init_from(cfg, varmap)?;
     run_ft_core(
-        model,
+        model.device(),
+        ForwardPass::Plain(&mut |xs| model.forward(xs).map_err(TrainError::from)),
         varmap,
         varmap,
         dataset,
@@ -383,8 +478,200 @@ where
     )
 }
 
+/// Run Full FT training with a condition supplied per row of every
+/// batch.
+///
+/// The same loop as [`run_full_ft`] — same optimizer, schedule,
+/// checkpoint rotation and hook — differing only in how a batch reaches
+/// the model: through [`ConditionedForward::forward_conditioned_rows`]
+/// with the batch's own [`Batch::conds`], rather than through
+/// `Module::forward`.
+///
+/// # Why a second entry point rather than a flag
+///
+/// The two paths need different things of the model. `run_full_ft`'s
+/// bound is `Module + DeviceView`, which every architecture here
+/// satisfies; conditioning needs a table most of them do not have.
+/// Widening the single entry point would have made every model answer
+/// for a concept it does not carry, and the answer would have been a
+/// runtime error raised after the corpus was read. Two entries put the
+/// same refusal in the type checker.
+///
+/// # Errors
+///
+/// As [`run_full_ft`], plus [`TrainError::MissingConditions`] when a
+/// batch arrives without them.
+#[allow(clippy::too_many_arguments)]
+pub fn run_conditioned_ft<M>(
+    model: &M,
+    varmap: &VarMap,
+    dataset: &mut dyn Dataset,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    ckpt_dir: &Path,
+    ckpt_prefix: &str,
+    lease: Arc<TrainingLease>,
+    hook: Option<CkptHook>,
+) -> Result<Checkpoint, TrainError>
+where
+    M: ConditionedForward + DeviceView,
+{
+    apply_init_from(cfg, varmap)?;
+    run_ft_core(
+        model.device(),
+        ForwardPass::PerRow(&mut |xs, conds, per_row| {
+            model
+                .forward_conditioned_rows(xs, conds, per_row)
+                .map_err(TrainError::from)
+        }),
+        varmap,
+        varmap,
+        dataset,
+        cfg,
+        loss_fn,
+        ckpt_dir,
+        ckpt_prefix,
+        lease,
+        hook,
+    )
+}
+
+/// Run Full FT training with the ids allowed at every position handed
+/// to the model as input.
+///
+/// The same loop as [`run_full_ft`] — same optimizer, schedule,
+/// checkpoint rotation and hook — differing only in how a batch reaches
+/// the model: through [`AllowedForward::forward_allowed_rows`] with the
+/// sets built from the batch's own [`Batch::allowed_ids`], rather than
+/// through `Module::forward`.
+///
+/// # What the sets do at each end
+///
+/// The same list serves twice and the two uses are opposite. As
+/// **input** (here) the model is told what is available before it
+/// answers; as a **mask** ([`allowed_logit_mask`], switched on by
+/// [`FullFtConfig::mask_disallowed_logits`]) the ids that were never
+/// available stop being charged for. A run can have either or both:
+/// this entry point adds the first to whichever the config asked for.
+///
+/// # Errors
+///
+/// As [`run_full_ft`], plus [`TrainError::MissingAllowedSets`] when a
+/// batch arrives without them — refused rather than falling back to the
+/// plain forward, which on a model built with the table would fail at
+/// the forward anyway, several steps further from the cause.
+#[allow(clippy::too_many_arguments)]
+pub fn run_allowed_ft<M>(
+    model: &M,
+    varmap: &VarMap,
+    dataset: &mut dyn Dataset,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    ckpt_dir: &Path,
+    ckpt_prefix: &str,
+    lease: Arc<TrainingLease>,
+    hook: Option<CkptHook>,
+) -> Result<Checkpoint, TrainError>
+where
+    M: AllowedForward + DeviceView,
+{
+    apply_init_from(cfg, varmap)?;
+    run_ft_core(
+        model.device(),
+        ForwardPass::Allowed(&mut |xs, allowed| {
+            model
+                .forward_allowed_rows(xs, allowed)
+                .map_err(TrainError::from)
+        }),
+        varmap,
+        varmap,
+        dataset,
+        cfg,
+        loss_fn,
+        ckpt_dir,
+        ckpt_prefix,
+        lease,
+        hook,
+    )
+}
+
+/// Restore [`FullFtConfig::init_from`] into `varmap`, if one was named.
+///
+/// Strict: [`restore_into`] refuses anything short of a complete
+/// restore, and the error propagates rather than degrading into a run
+/// that started from a mixture of the checkpoint and a random
+/// initialisation. The report is logged rather than returned — the
+/// caller asked for a resume, and what it needs to know is that the
+/// resume happened and from where.
+fn apply_init_from(cfg: &FullFtConfig, varmap: &VarMap) -> Result<(), TrainError> {
+    let Some(path) = cfg.init_from.as_ref() else {
+        return Ok(());
+    };
+    let report = restore_into(varmap, path)?;
+    tracing::info!(
+        target: "algocline_nn::train",
+        summary = %report.summary(),
+        "init_from restored"
+    );
+    Ok(())
+}
+
+/// How one micro-batch reaches the model, and what the caller expects
+/// of the batch.
+///
+/// The loop holds this rather than the model itself, so the entry
+/// points can require different things of it — `Module` on one side,
+/// [`ConditionedForward`] or [`AllowedForward`] on the others — without
+/// any of those bounds leaking into the shared loop or into another
+/// entry's callers.
+///
+/// It is an enum rather than one callback taking `Option`s, because the
+/// variant is also the caller's **declared intent**, and that is what
+/// lets the loop refuse both mismatches rather than only the one the
+/// model happens to notice. A callback that quietly ignored an
+/// unexpected condition would put the loop back where
+/// [`TrainError::UnexpectedConditions`] came from.
+enum ForwardPass<'a> {
+    /// `Module::forward` — the ids alone. A batch carrying conditions
+    /// is [`TrainError::UnexpectedConditions`].
+    Plain(&'a mut PlainForward<'a>),
+    /// [`ConditionedForward::forward_conditioned_rows`] — the ids plus
+    /// the conditions each row carries. A batch carrying none is
+    /// [`TrainError::MissingConditions`].
+    PerRow(&'a mut PerRowForward<'a>),
+    /// [`AllowedForward::forward_allowed_rows`] — the ids plus, at
+    /// every position, the set the answer there may be drawn from. A
+    /// batch carrying none is [`TrainError::MissingAllowedSets`]; one
+    /// carrying conditions is [`TrainError::UnexpectedConditions`],
+    /// since this entry point has nowhere to put them either.
+    Allowed(&'a mut AllowedForwardPass<'a>),
+}
+
+/// The ids of one micro-batch to its logits.
+///
+/// The lifetime is the closure's own: it borrows the model, so it does
+/// not outlive the call that built it. Naming it is what keeps the
+/// alias from defaulting the trait object to `'static`, which no entry
+/// point here could satisfy.
+type PlainForward<'a> = dyn FnMut(&Tensor) -> Result<Tensor, TrainError> + 'a;
+
+/// The same, with the conditions each row of the batch carries.
+type PerRowForward<'a> = dyn FnMut(&Tensor, &[CondIndex], usize) -> Result<Tensor, TrainError> + 'a;
+
+/// The same, with the ids allowed at each position of the batch.
+type AllowedForwardPass<'a> = dyn FnMut(&Tensor, &AllowedSets) -> Result<Tensor, TrainError> + 'a;
+
 /// Shared inner training loop.
 ///
+/// - `device` — where the batch tensors are built. The model's own, so
+///   the caller reads it off the model rather than being trusted to
+///   pick one.
+/// - `forward` — how a micro-batch reaches the model, and what the
+///   caller expects of it. See [`ForwardPass`]: the loop is written
+///   against the callback so the entry points can differ in what they
+///   demand of the model without this function knowing about any of
+///   them, and it checks each batch against the variant rather than
+///   letting a disagreement pass as a silent ignore.
 /// - `opt_vm` — VarMap whose variables get optimizer updates. In a
 ///   Full FT run this is the same map as the model was constructed
 ///   against; in a LoRA run it is the fresh LoRA-only map returned by
@@ -395,8 +682,9 @@ where
 ///   parameter so a future full-vs-delta save-side split can flip
 ///   independently.
 #[allow(clippy::too_many_arguments)]
-fn run_ft_core<M>(
-    model: &M,
+fn run_ft_core(
+    device: &Device,
+    mut forward: ForwardPass<'_>,
     opt_vm: &VarMap,
     save_vm: &VarMap,
     dataset: &mut dyn Dataset,
@@ -406,10 +694,7 @@ fn run_ft_core<M>(
     ckpt_prefix: &str,
     lease: Arc<TrainingLease>,
     mut hook: Option<CkptHook>,
-) -> Result<Checkpoint, TrainError>
-where
-    M: Module + DeviceView,
-{
+) -> Result<Checkpoint, TrainError> {
     if cfg.steps == 0 {
         return Err(TrainError::ZeroSteps);
     }
@@ -453,7 +738,7 @@ where
     let ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
 
-    let device = model.device().clone();
+    let device = device.clone();
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
 
@@ -482,7 +767,52 @@ where
             })?;
 
             let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
-            let logits = model.forward(&inputs)?;
+            // The allowed-id input, built only for the entry point that
+            // takes one: every other run would pay for a tensor it
+            // cannot read. The sets are shifted to line up with the
+            // model's inputs — see `allowed_input_sets`.
+            let allowed = match &forward {
+                ForwardPass::Allowed(_) => {
+                    allowed_input_sets(&batch, batch.input_ids[0].len(), &device)?
+                }
+                _ => None,
+            };
+            // The batch's own side channels against the caller's
+            // declared intent. Both disagreements are refused: a
+            // conditioned run over a conditionless batch would train
+            // unconditioned under a checkpoint labelled otherwise, and
+            // an unconditioned run over a conditioned batch would drop
+            // a condition the caller attached per row. `inputs` is the
+            // batch after the target shift, so its first dimension is
+            // still the row count.
+            let logits = match (&mut forward, batch.conds.as_deref(), allowed.as_ref()) {
+                (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
+                (ForwardPass::PerRow(per_row), Some(conds), _) => {
+                    per_row(&inputs, conds, batch.conds_per_row)?
+                }
+                (ForwardPass::Allowed(allowed_forward), None, Some(sets)) => {
+                    allowed_forward(&inputs, sets)?
+                }
+                (ForwardPass::Allowed(_), None, None) => {
+                    return Err(TrainError::MissingAllowedSets {
+                        rows: inputs.dim(0)?,
+                        needed: "the model reads them at every position",
+                    })
+                }
+                // Neither of these two takes a condition, so a batch
+                // carrying one is the same mistake at both.
+                (ForwardPass::Plain(_) | ForwardPass::Allowed(_), Some(conds), _) => {
+                    return Err(TrainError::UnexpectedConditions {
+                        rows: inputs.dim(0)?,
+                        conds: conds.len(),
+                    })
+                }
+                (ForwardPass::PerRow(_), None, _) => {
+                    return Err(TrainError::MissingConditions {
+                        rows: inputs.dim(0)?,
+                    })
+                }
+            };
             // Mixed precision: the loss (log_softmax + NLL reduction)
             // is always scored in F32 — BF16's 8 mantissa bits are too
             // coarse for a mean over thousands of log-probs.
@@ -493,6 +823,26 @@ where
                 logits
             } else {
                 logits.to_dtype(DType::F32)?
+            };
+            // Remove the ids this target could not have taken, so the
+            // loss scores the choice among the ones it could. Applied
+            // after the F32 cast: a large negative penalty in BF16
+            // would not survive the conversion cleanly. Opt-in, and a
+            // batch that cannot honour the opt-in is refused rather
+            // than trained unmasked.
+            let logits = if cfg.mask_disallowed_logits {
+                match allowed_logit_mask(&batch, batch.input_ids[0].len(), logits.dim(2)?, &device)?
+                {
+                    Some(m) => logits.broadcast_add(&m)?,
+                    None => {
+                        return Err(TrainError::MissingAllowedSets {
+                            rows: inputs.dim(0)?,
+                            needed: "cfg.mask_disallowed_logits asks the loss to use them",
+                        })
+                    }
+                }
+            } else {
+                logits
             };
             let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
 
@@ -621,7 +971,7 @@ where
 fn grad_l2_norm(opt_vm: &VarMap, grads: &GradStore) -> CandleResult<f32> {
     let data = opt_vm.data().lock().unwrap();
     let mut sum_sq: f32 = 0.0;
-    for (_name, var) in data.iter() {
+    for var in data.values() {
         if let Some(g) = grads.get(var.as_tensor()) {
             let g_f32 = if g.dtype() == DType::F32 {
                 g.clone()
@@ -678,6 +1028,12 @@ where
     if ckpt_stem.is_empty() {
         return Err(TrainError::Candle("run_lora_ft: ckpt_stem is empty".into()));
     }
+    // The base map belongs to the caller and never reaches here, so a
+    // checkpoint named on the config would have nowhere to land. See
+    // `TrainError::InitFromUnsupported`.
+    if train_cfg.init_from.is_some() {
+        return Err(TrainError::InitFromUnsupported);
+    }
 
     // Wrap first so we surface `LoraConfig` validation errors (unknown
     // target module, oversized rank) before the lease is acquired.
@@ -703,8 +1059,10 @@ where
     // (add ~14.5 MB from the 4× MLP widening). The previous
     // "< 20 MB" figure only held for the attention-only variant and
     // has been corrected to reflect both cases.
+    let base = &*base;
     run_ft_core(
-        base,
+        base.device(),
+        ForwardPass::Plain(&mut |xs| base.forward(xs).map_err(TrainError::from)),
         &lora_vm,
         &lora_vm,
         dataset,
@@ -900,6 +1258,142 @@ fn batch_to_input_target(
     Ok((inputs, targets, mask))
 }
 
+/// Magnitude of the penalty applied to a disallowed id.
+///
+/// Large enough that `exp` of it underflows to zero in f32, so the
+/// softmax behaves as if the id were absent — and finite, which
+/// negative infinity is not. An infinite log-probability multiplied by
+/// a zero loss weight is NaN rather than zero, so a single disallowed
+/// target at a position the loss ignores would otherwise poison the
+/// whole batch, and the padding past the end of a row is exactly such
+/// a position.
+const DISALLOWED_LOGIT: f32 = -1e9;
+
+/// Additive logit mask that removes every id a target may not take.
+///
+/// Returns `[batch, seq - 1, vocab]` of `0.0` on allowed ids and
+/// a large finite negative penalty elsewhere (finite so that a
+/// disallowed target at a position the loss ignores stays zero rather
+/// than turning into NaN), aligned with the targets: entry `k`
+/// governs the prediction of `input_ids[k + 1]`, so it reads
+/// `allowed_ids[row][k + 1]`.
+///
+/// Added to the logits before the softmax, this makes the loss score
+/// the choice among the allowed ids rather than the choice among all of
+/// them. A position with no allowed ids is left unmasked, which is how
+/// a producer says "this position is not constrained".
+///
+/// `None` for a batch that carries no sets — the caller decides whether
+/// that is acceptable (the training loop refuses it when
+/// [`FullFtConfig::mask_disallowed_logits`] asked for the mask).
+///
+/// Nothing here checks that a target is inside its own position's set:
+/// a batch whose sets contradict its tokens is scored with the target
+/// penalised as a disallowed id, which is a number rather than a
+/// refusal. The check belongs where the two are attached to each other
+/// and the producer can still fix it —
+/// [`crate::train::data::TokenizedDataset::with_allowed_ids`] refuses
+/// that pairing.
+///
+/// # Errors
+///
+/// The sets do not have one row per row of the batch, or an id is
+/// outside `vocab`.
+pub fn allowed_logit_mask(
+    batch: &Batch,
+    seq: usize,
+    vocab: usize,
+    device: &Device,
+) -> CandleResult<Option<Tensor>> {
+    let Some(allowed) = batch.allowed_ids.as_ref() else {
+        return Ok(None);
+    };
+    let rows = batch.input_ids.len();
+    if allowed.len() != rows {
+        return Err(candle_core::Error::Msg(format!(
+            "allowed_ids row count {} != batch size {rows}",
+            allowed.len()
+        )));
+    }
+    if seq < 2 {
+        return Err(candle_core::Error::Msg(format!(
+            "allowed_logit_mask: seq={seq} is too short (need >= 2)"
+        )));
+    }
+    let width = seq - 1;
+    let mut flat = vec![DISALLOWED_LOGIT; rows * width * vocab];
+    for (r, row) in allowed.iter().enumerate() {
+        for k in 0..width {
+            let base = (r * width + k) * vocab;
+            match row.get(k + 1) {
+                Some(ids) if !ids.is_empty() => {
+                    for id in ids {
+                        let i = *id as usize;
+                        if i >= vocab {
+                            return Err(candle_core::Error::Msg(format!(
+                                "allowed id {i} is outside vocab {vocab}"
+                            )));
+                        }
+                        flat[base + i] = 0.0;
+                    }
+                }
+                // No set for this position: leave every id available.
+                _ => flat[base..base + vocab].fill(0.0),
+            }
+        }
+    }
+    Ok(Some(Tensor::from_vec(flat, (rows, width, vocab), device)?))
+}
+
+/// The batch's allowed-id sets as a model input, aligned with the
+/// positions the model actually consumes.
+///
+/// Returns `None` for a batch that carries none, which is how a dataset
+/// that models no constrained id space passes through here.
+///
+/// # The alignment
+///
+/// Entry `k` of the result is the set the model's answer at input
+/// position `k` is drawn from, so it reads `allowed_ids[row][k + 1]` —
+/// the same entry [`allowed_logit_mask`] uses for target `k`, and for
+/// the same reason: having consumed input `k`, the model is standing
+/// where token `k + 1` is produced, and that position's available ids
+/// are both what it may answer and what the loss should score it among.
+///
+/// The two are built one after the other in this file precisely so the
+/// `+ 1` is written once in each and can be read side by side. Off by
+/// one, every set describes the position before the one it is attached
+/// to, and every shape still agrees.
+///
+/// # Errors
+///
+/// The sets do not have one row per row of the batch, the batch is too
+/// short to shift, or the window holds no ids at all — see
+/// [`AllowedSets::window`], which refuses that rather than handing the
+/// model an input equivalent to having no allowed-id channel.
+pub fn allowed_input_sets(
+    batch: &Batch,
+    seq: usize,
+    device: &Device,
+) -> CandleResult<Option<AllowedSets>> {
+    let Some(allowed) = batch.allowed_ids.as_ref() else {
+        return Ok(None);
+    };
+    let rows = batch.input_ids.len();
+    if allowed.len() != rows {
+        return Err(candle_core::Error::Msg(format!(
+            "allowed_ids row count {} != batch size {rows}",
+            allowed.len()
+        )));
+    }
+    if seq < 2 {
+        return Err(candle_core::Error::Msg(format!(
+            "allowed_input_sets: seq={seq} is too short (need >= 2)"
+        )));
+    }
+    AllowedSets::window(allowed, 1, seq - 1, device).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,6 +1526,8 @@ mod tests {
             weight_decay: 0.0,
             ckpt_every: 0,
             ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1113,6 +1609,8 @@ mod tests {
             weight_decay: 0.0,
             ckpt_every: 2,
             ckpt_keep: 3,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1164,6 +1662,8 @@ mod tests {
             weight_decay: 0.0,
             ckpt_every: 2,
             ckpt_keep: 5,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1261,6 +1761,8 @@ mod tests {
             weight_decay: 0.0,
             ckpt_every: 4,
             ckpt_keep: 3,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1329,6 +1831,8 @@ mod tests {
             weight_decay: 0.0,
             ckpt_every: 2,
             ckpt_keep: 3,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1376,6 +1880,8 @@ mod tests {
             weight_decay: 0.0,
             ckpt_every: 0,
             ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
 
         // Run A: baseline (no hook).
@@ -1546,5 +2052,512 @@ mod tests {
             2 * 7 * 2,
             "TinyLlama wrap_lora via LoraWrappable must register 2 layers × 7 targets × 2 = 28 vars"
         );
+    }
+
+    // ── Side-channel entry points ───────────────────────────────────
+
+    use crate::arch::Gpt2Custom;
+    use candle_core::IndexOp;
+
+    /// The tiny model above, plus whichever side-channel table the
+    /// caller names.
+    fn side_channel_model(custom: Gpt2Custom) -> (Gpt2Config, VarMap, Gpt2Model) {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: 8,
+            vocab: 32,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(custom),
+        };
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vb).unwrap();
+        (cfg, vm, model)
+    }
+
+    fn short_run(steps: usize) -> FullFtConfig {
+        FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            steps,
+            warmup: 0,
+            ..FullFtConfig::default()
+        }
+    }
+
+    /// `rows` copies of one sequence, so a run over them is cheap and
+    /// deterministic in shape.
+    fn repeated_rows(rows: usize) -> Vec<Vec<u32>> {
+        std::iter::repeat_with(|| vec![1u32, 2, 3, 4, 5, 6, 7, 8])
+            .take(rows)
+            .collect()
+    }
+
+    fn one_row_batch_opts() -> DatasetOpts {
+        DatasetOpts {
+            batch_size: 1,
+            ctx_len: 8,
+            shuffle: false,
+            pad_id: 0,
+            text_field: "text".into(),
+        }
+    }
+
+    /// The conditioned entry point drives a model that has the table,
+    /// over a dataset that carries the conditions, and reaches the end.
+    #[test]
+    fn conditioned_run_completes_over_a_conditioned_dataset() {
+        let (_, vm, model) = side_channel_model(Gpt2Custom {
+            cond_slots: Some(2),
+            ..Default::default()
+        });
+        let conds: Vec<CondIndex> = (0..8u32)
+            .map(|i| CondIndex::new(i % 2, 2).unwrap())
+            .collect();
+        let mut ds = TokenizedDataset::new(repeated_rows(8), one_row_batch_opts())
+            .with_conditions(conds)
+            .expect("one condition per row");
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &short_run(4),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "cond",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("conditioned run");
+        assert_eq!(ckpt.step, 4);
+        assert!(tmp.path().join("cond.safetensors").exists());
+    }
+
+    /// A conditioned run over a conditionless batch would train
+    /// unconditioned under a checkpoint labelled otherwise.
+    #[test]
+    fn conditioned_run_refuses_a_batch_without_conditions() {
+        let (_, vm, model) = side_channel_model(Gpt2Custom {
+            cond_slots: Some(2),
+            ..Default::default()
+        });
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        let tmp = TempDir::new().unwrap();
+        let err = run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &short_run(1),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "cond",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::MissingConditions { rows: 1 }),
+            "{err:?}"
+        );
+    }
+
+    /// The mirror: an entry point with nowhere to put a condition says
+    /// so rather than dropping it.
+    #[test]
+    fn plain_run_refuses_a_batch_carrying_conditions() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let conds: Vec<CondIndex> = (0..4).map(|_| CondIndex::new(0, 2).unwrap()).collect();
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts())
+            .with_conditions(conds)
+            .expect("one condition per row");
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &short_run(1),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "plain",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            TrainError::UnexpectedConditions { rows, conds } => {
+                assert_eq!((rows, conds), (1, 1));
+            }
+            other => panic!("expected UnexpectedConditions, got {other:?}"),
+        }
+    }
+
+    /// The allowed-id entry point drives a model built with the table
+    /// over a dataset that carries the sets, and reaches the end.
+    #[test]
+    fn allowed_run_completes_over_a_dataset_carrying_the_sets() {
+        let (_, vm, model) = side_channel_model(Gpt2Custom {
+            allowed_input: true,
+            ..Default::default()
+        });
+        let allowed: Vec<Vec<Vec<u32>>> = (0..8)
+            .map(|_| (0..8).map(|p| vec![p as u32 + 1, 9]).collect())
+            .collect();
+        let mut ds = TokenizedDataset::new(repeated_rows(8), one_row_batch_opts())
+            .with_allowed_ids(allowed)
+            .expect("one set list per row");
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_allowed_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &short_run(4),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "allowed",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("allowed run");
+        assert_eq!(ckpt.step, 4);
+    }
+
+    /// The model reads the sets at every position, so a batch without
+    /// them is refused where the cause is still visible.
+    #[test]
+    fn allowed_run_refuses_a_batch_without_the_sets() {
+        let (_, vm, model) = side_channel_model(Gpt2Custom {
+            allowed_input: true,
+            ..Default::default()
+        });
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        let tmp = TempDir::new().unwrap();
+        let err = run_allowed_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &short_run(1),
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "allowed",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            TrainError::MissingAllowedSets { rows, needed } => {
+                assert_eq!(rows, 1);
+                assert!(needed.contains("every position"), "{needed}");
+            }
+            other => panic!("expected MissingAllowedSets, got {other:?}"),
+        }
+    }
+
+    /// Asking the loss to score among the allowed ids, over a dataset
+    /// that carries none, is refused rather than run unmasked under a
+    /// config that says otherwise.
+    #[test]
+    fn masked_loss_refuses_a_batch_without_the_sets() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        let cfg = FullFtConfig {
+            mask_disallowed_logits: true,
+            ..short_run(1)
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "masked",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            TrainError::MissingAllowedSets { needed, .. } => {
+                assert!(needed.contains("mask_disallowed_logits"), "{needed}");
+            }
+            other => panic!("expected MissingAllowedSets, got {other:?}"),
+        }
+    }
+
+    /// A plain run over a dataset that does carry the sets accepts the
+    /// mask and completes — the switch is what turns it on.
+    #[test]
+    fn masked_loss_completes_when_the_batch_carries_the_sets() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let allowed: Vec<Vec<Vec<u32>>> = (0..4)
+            .map(|_| (0..8).map(|p| vec![p as u32 + 1, 9]).collect())
+            .collect();
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts())
+            .with_allowed_ids(allowed)
+            .expect("one set list per row");
+        let cfg = FullFtConfig {
+            mask_disallowed_logits: true,
+            ..short_run(3)
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "masked",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("masked run");
+        assert_eq!(ckpt.step, 3);
+    }
+
+    fn batch_with_allowed(allowed: Vec<Vec<Vec<u32>>>, rows: usize, seq: usize) -> Batch {
+        Batch {
+            input_ids: (0..rows).map(|_| vec![1u32; seq]).collect(),
+            loss_mask: None,
+            is_last: true,
+            allowed_ids: Some(allowed),
+            conds: None,
+            conds_per_row: 1,
+        }
+    }
+
+    /// The mask reads one position later than the entry it governs, and
+    /// an empty set means "not constrained here" rather than "nothing
+    /// is allowed here" — which would zero the whole row.
+    #[test]
+    fn allowed_logit_mask_reads_the_position_after_the_input() {
+        // Row of 3 positions: sets at 0 / 1 / 2, mask width 2.
+        let allowed = vec![vec![vec![0u32], vec![1], vec![]]];
+        let batch = batch_with_allowed(allowed, 1, 3);
+        let mask = allowed_logit_mask(&batch, 3, 4, &Device::Cpu)
+            .unwrap()
+            .expect("the batch carries sets");
+        assert_eq!(mask.dims(), &[1, 2, 4]);
+        let values: Vec<Vec<f32>> = mask.i(0).unwrap().to_vec2().unwrap();
+        // Entry 0 governs target `input_ids[1]`, so it reads the set at
+        // position 1 — `{1}` — and not the one at position 0.
+        assert_eq!(
+            values[0],
+            vec![DISALLOWED_LOGIT, 0.0, DISALLOWED_LOGIT, DISALLOWED_LOGIT]
+        );
+        // Entry 1 reads position 2, whose set is empty: unconstrained.
+        assert_eq!(values[1], vec![0.0; 4]);
+    }
+
+    /// An id past the end of the vocabulary is a producer mistake that
+    /// no shape would reveal.
+    #[test]
+    fn allowed_logit_mask_refuses_an_id_outside_the_vocabulary() {
+        let batch = batch_with_allowed(vec![vec![vec![0u32], vec![9]]], 1, 2);
+        let msg = allowed_logit_mask(&batch, 2, 4, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("outside vocab 4"), "{msg}");
+    }
+
+    /// The input side reads the same entry as the mask, one position
+    /// after the input it is attached to. Off by one here and every
+    /// shape would still agree.
+    #[test]
+    fn allowed_input_sets_read_the_same_entry_as_the_mask() {
+        // Position 0 offers a set the window must skip; the two the
+        // window keeps have different widths, so the padding shows.
+        let allowed = vec![vec![vec![3u32], vec![1, 2], vec![0]]];
+        let batch = batch_with_allowed(allowed, 1, 3);
+        let sets = allowed_input_sets(&batch, 3, &Device::Cpu)
+            .unwrap()
+            .expect("the batch carries sets");
+        assert_eq!((sets.rows(), sets.width(), sets.widest()), (1, 2, 2));
+        let ids: Vec<Vec<u32>> = sets.ids().i(0).unwrap().to_vec2().unwrap();
+        // Position 0 of the window is the set at index 1 — `{1, 2}` —
+        // not `{3}`, which belongs to the input the model already read.
+        assert_eq!(ids[0], vec![1, 2]);
+        assert_eq!(ids[1], vec![0, 0]); // `{0}` plus one padding entry
+        let weights: Vec<Vec<f32>> = sets.weights().i(0).unwrap().to_vec2().unwrap();
+        assert_eq!(weights[0], vec![0.5, 0.5]);
+        assert_eq!(weights[1], vec![1.0, 0.0]);
+    }
+
+    /// A batch carrying no sets passes through both helpers, which is
+    /// how an unconstrained dataset reaches the plain loop.
+    #[test]
+    fn the_allowed_helpers_pass_a_batch_that_carries_no_sets() {
+        let batch = Batch {
+            input_ids: vec![vec![1u32, 2, 3]],
+            loss_mask: None,
+            is_last: true,
+            allowed_ids: None,
+            conds: None,
+            conds_per_row: 1,
+        };
+        assert!(allowed_logit_mask(&batch, 3, 8, &Device::Cpu)
+            .unwrap()
+            .is_none());
+        assert!(allowed_input_sets(&batch, 3, &Device::Cpu)
+            .unwrap()
+            .is_none());
+    }
+
+    /// `init_from` puts the checkpoint's weights in place before the
+    /// first step. Run at `lr = 0` with no weight decay so what the
+    /// map holds afterwards is the checkpoint and nothing else.
+    #[test]
+    fn init_from_restores_the_checkpoint_before_training() {
+        let tmp = TempDir::new().unwrap();
+        let (_, source_vm, _source) = tiny_cfg_and_model();
+        let source_path = tmp.path().join("source.safetensors");
+        source_vm.save(&source_path).unwrap();
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let before: Vec<f32> = vm.data().lock().unwrap()["wte.weight"]
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let from_file: Vec<f32> = source_vm.data().lock().unwrap()["wte.weight"]
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_ne!(before, from_file, "two random inits collided");
+
+        let cfg = FullFtConfig {
+            lr: 0.0,
+            weight_decay: 0.0,
+            init_from: Some(source_path),
+            ..short_run(1)
+        };
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "resumed",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("resumed run");
+
+        let after: Vec<f32> = vm.data().lock().unwrap()["wte.weight"]
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(after, from_file);
+    }
+
+    /// A checkpoint that cannot be read stops the run before it starts,
+    /// rather than training from the random initialisation under a
+    /// config that says it resumed.
+    #[test]
+    fn init_from_propagates_a_failed_restore_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let cfg = FullFtConfig {
+            init_from: Some(tmp.path().join("nowhere.safetensors")),
+            ..short_run(1)
+        };
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "resumed",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match &err {
+            TrainError::Restore(RestoreError::Open { .. }) => {}
+            other => panic!("expected Restore(Open), got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("init_from:"), "{err}");
+        assert!(
+            !tmp.path().join("resumed.safetensors").exists(),
+            "a run that never started must not write a terminal checkpoint"
+        );
+    }
+
+    /// A shape disagreement is the same refusal one level down: the
+    /// checkpoint is not this model's.
+    #[test]
+    fn init_from_refuses_a_checkpoint_of_another_shape() {
+        let tmp = TempDir::new().unwrap();
+        let other = VarMap::new();
+        let vb = VarBuilder::from_varmap(&other, DType::F32, &Device::Cpu);
+        let _ = vb.get((3, 3), "wte.weight").unwrap();
+        let path = tmp.path().join("other.safetensors");
+        other.save(&path).unwrap();
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let cfg = FullFtConfig {
+            init_from: Some(path),
+            ..short_run(1)
+        };
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "resumed",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        // Every other variable of the model is absent from that file,
+        // so the strict entry point stops on the gap first.
+        match &err {
+            TrainError::Restore(RestoreError::Incomplete { .. })
+            | TrainError::Restore(RestoreError::Mismatch { .. }) => {}
+            other => panic!("expected Restore(Incomplete|Mismatch), got {other:?}"),
+        }
+    }
+
+    /// The LoRA entry point never sees the base map, so a checkpoint
+    /// named on the config would have nowhere to land.
+    #[test]
+    fn init_from_is_refused_by_the_lora_entry_point() {
+        let tmp = TempDir::new().unwrap();
+        let (_, vm, mut model) = tiny_cfg_and_model();
+        let path = tmp.path().join("base.safetensors");
+        vm.save(&path).unwrap();
+
+        let cfg = FullFtConfig {
+            init_from: Some(path),
+            ..short_run(1)
+        };
+        let mut ds = TokenizedDataset::new(repeated_rows(4), one_row_batch_opts());
+        let err = run_lora_ft(
+            &mut model,
+            &mut ds,
+            &LoraConfig::new(2, 4.0),
+            &cfg,
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "lora",
+            Arc::new(TrainingLease::new()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TrainError::InitFromUnsupported), "{err:?}");
     }
 }

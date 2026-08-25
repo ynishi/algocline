@@ -26,6 +26,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use crate::arch::CondIndex;
 use crate::tokenizer::{HfTokenizer, TokenizerError};
 
 /// Errors surfaced by dataset iterators.
@@ -72,6 +73,95 @@ pub enum DatasetError {
         ctx_len: usize,
         /// Untruncated mask length of the offending row.
         row_len: usize,
+    },
+    /// A per-row conditioning list was attached to a dataset holding a
+    /// different number of rows.
+    ///
+    /// Refused rather than zipped to the shorter of the two: the
+    /// pairing is positional, so a length disagreement means some row
+    /// would be conditioned on another row's condition, and the batch
+    /// shapes would still line up.
+    #[error(
+        "{conds} condition(s) for {rows} row(s) at {per_row} per row — the pairing is \
+         positional, so it takes exactly rows × per-row"
+    )]
+    ConditionCountMismatch {
+        /// Conditions handed over.
+        conds: usize,
+        /// Rows the dataset holds.
+        rows: usize,
+        /// Conditions each row carries.
+        per_row: usize,
+    },
+    /// An allowed-id list was attached to a dataset holding a different
+    /// number of rows. Positional for the same reason
+    /// [`Self::ConditionCountMismatch`] is.
+    #[error("allowed-id sets for {allowed} row(s) attached to a dataset of {rows} row(s)")]
+    AllowedRowCountMismatch {
+        /// Rows the attached sets cover.
+        allowed: usize,
+        /// Rows the dataset holds.
+        rows: usize,
+    },
+    /// The attached allowed-id rows do not all describe the same number
+    /// of positions.
+    ///
+    /// Refused here rather than at the forward pass: the sets are read
+    /// by position, so rows of differing lengths mean the batch and its
+    /// sets were built from different row lists, and no later windowing
+    /// makes that safe.
+    #[error(
+        "allowed-id row {row} describes {positions} position(s) and row 0 describes {expected}"
+    )]
+    AllowedRaggedRows {
+        /// 0-based row index within the attached sets.
+        row: usize,
+        /// Positions that row describes.
+        positions: usize,
+        /// Positions row 0 describes.
+        expected: usize,
+    },
+    /// A position's allowed-id set does not hold the token that
+    /// position of the row actually carries.
+    ///
+    /// The two then say contradictory things about one position, and
+    /// the training loop answers with a number rather than a refusal:
+    /// [`crate::train::allowed_logit_mask`] scores the target among the
+    /// ids its set names, so a target its own set excludes is scored as
+    /// a disallowed id and contributes the penalty — roughly `1e9`,
+    /// which nothing gates here (a [`TokenizedDataset`] batch carries
+    /// no `loss_mask`). Refused where the caller can still fix it, for
+    /// the same reason [`Self::AllowedRaggedRows`] is.
+    #[error(
+        "allowed-id row {row} position {position} excludes token {token}, which is the token \
+         that position holds — the loss would score the observed target as disallowed"
+    )]
+    AllowedExcludesTarget {
+        /// 0-based row index within the attached sets.
+        row: usize,
+        /// 0-based position within that row.
+        position: usize,
+        /// Token that position holds (the row's pad id past the end of
+        /// a row shorter than `ctx_len`).
+        token: u32,
+    },
+    /// A per-row side channel was attached to a dataset that had
+    /// already re-ordered its rows.
+    ///
+    /// The pairing is positional and the caller's list is in the order
+    /// the caller handed the rows over, which is no longer the order
+    /// the dataset walks them in. Every shape would still agree, so
+    /// this is refused rather than honoured: build the dataset with
+    /// [`DatasetOpts::shuffle`] off and re-order the rows together with
+    /// their side channel before either reaches here.
+    #[error(
+        "a per-row {channel} cannot be attached to a dataset built with shuffle on: the rows \
+         were re-ordered at construction, so a positional pairing would attach each entry to \
+         some other row"
+    )]
+    SideChannelAfterReorder {
+        /// Which channel the caller was attaching.
+        channel: String,
     },
 }
 
@@ -128,6 +218,47 @@ pub struct Batch {
     /// `true` when this is the final batch of the source and the
     /// caller may want to skip a gradient step (or scale the loss).
     pub is_last: bool,
+    /// Which ids each position of each row was allowed to take,
+    /// `[row][position]`, or `None` for a dataset that models no
+    /// constrained id space.
+    ///
+    /// The same list serves two opposite purposes and the training loop
+    /// builds both from it at one offset: as **input**
+    /// ([`crate::train::allowed_input_sets`]) the model is told what is
+    /// available before it answers, and as a **mask**
+    /// ([`crate::train::allowed_logit_mask`]) the ids that were never
+    /// available stop being charged for. A run can use either or both.
+    ///
+    /// This matters wherever decoding already enforces the constraint:
+    /// whatever share of the objective went on keeping mass off ids
+    /// that did not exist at a position is work the decoder discards,
+    /// because it walks its ranking against the allowed set no matter
+    /// what the model believed.
+    #[allow(clippy::type_complexity)]
+    pub allowed_ids: Option<Vec<Vec<Vec<u32>>>>,
+    /// Which condition each row of this batch was recorded under,
+    /// row-major at [`Self::conds_per_row`] entries per row of
+    /// `input_ids`.
+    ///
+    /// `None` for every dataset that models no condition, which leaves
+    /// the training loop driving the model through `Module::forward`
+    /// exactly as before. `Some` is what
+    /// [`crate::train::run_conditioned_ft`] hands to the model.
+    ///
+    /// The entries are [`CondIndex`] rather than numbers because the
+    /// numbering a producer holds is usually a different one — a token
+    /// id, most often, whose range overlaps the conditioning table's
+    /// rows without meaning the same thing. See [`CondIndex`].
+    pub conds: Option<Vec<CondIndex>>,
+    /// How many of [`Self::conds`]'s entries belong to each row —
+    /// `conds` is row-major, `conds_per_row` entries per row of
+    /// `input_ids`, the layout
+    /// [`crate::arch::Gpt2Model::forward_conditioned_groups`] reads.
+    ///
+    /// `1` wherever `conds` is `None` or one-per-row, so every dataset
+    /// that predates condition groups keeps its meaning without stating
+    /// anything.
+    pub conds_per_row: usize,
 }
 
 /// Streaming batch iterator.
@@ -150,8 +281,18 @@ pub trait Dataset {
 /// Used by the bridge's `from_card` path (invariant #5) and by tests
 /// that want to feed deterministic token sequences without a JSONL
 /// / Parquet fixture on disk.
+#[derive(Debug)]
 pub struct TokenizedDataset {
     rows: Vec<Vec<u32>>,
+    /// Conditions row-major at [`Self::conds_per_row`] per row, or
+    /// `None` for an unconditioned dataset. See
+    /// [`TokenizedDataset::with_conditions`].
+    conds: Option<Vec<CondIndex>>,
+    conds_per_row: usize,
+    /// Allowed ids per row per position, or `None`. See
+    /// [`TokenizedDataset::with_allowed_ids`].
+    #[allow(clippy::type_complexity)]
+    allowed_ids: Option<Vec<Vec<Vec<u32>>>>,
     opts: DatasetOpts,
     cursor: usize,
 }
@@ -162,6 +303,9 @@ impl TokenizedDataset {
     pub fn new(rows: Vec<Vec<u32>>, opts: DatasetOpts) -> Self {
         let mut this = Self {
             rows,
+            conds: None,
+            conds_per_row: 1,
+            allowed_ids: None,
             opts,
             cursor: 0,
         };
@@ -169,6 +313,154 @@ impl TokenizedDataset {
             this.rows.reverse(); // deterministic re-order for now; a later stage wires an RNG
         }
         this
+    }
+
+    /// Attach the condition each row was recorded under, in row order.
+    ///
+    /// Every batch then carries the slice belonging to its own rows,
+    /// which is what [`crate::train::run_conditioned_ft`] passes to the
+    /// model.
+    ///
+    /// Applied to the built dataset rather than taken by [`Self::new`]
+    /// so the unconditioned constructor keeps its signature — most
+    /// callers have no condition to give.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::ConditionCountMismatch`] when the list is not
+    /// exactly one entry per row, and
+    /// [`DatasetError::SideChannelAfterReorder`] when the dataset was
+    /// built with [`DatasetOpts::shuffle`] on, since the positional
+    /// pairing the caller means no longer holds.
+    pub fn with_conditions(self, conds: Vec<CondIndex>) -> Result<Self, DatasetError> {
+        self.with_condition_groups(conds, 1)
+    }
+
+    /// [`Self::with_conditions`] with `per_row` conditions per row,
+    /// row-major — the layout
+    /// [`crate::arch::Gpt2Model::forward_conditioned_groups`] reads.
+    ///
+    /// Explicit rather than inferred from the list's length: a count
+    /// that happens to divide evenly is exactly the mistake an
+    /// inference would wave through.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::ConditionCountMismatch`] when the list is not
+    /// exactly `per_row` entries per row, `per_row` of zero included,
+    /// and [`DatasetError::SideChannelAfterReorder`] as
+    /// [`Self::with_conditions`].
+    pub fn with_condition_groups(
+        mut self,
+        conds: Vec<CondIndex>,
+        per_row: usize,
+    ) -> Result<Self, DatasetError> {
+        self.refuse_after_reorder("conditioning list")?;
+        if per_row == 0 || conds.len() != self.rows.len() * per_row {
+            return Err(DatasetError::ConditionCountMismatch {
+                conds: conds.len(),
+                rows: self.rows.len(),
+                per_row,
+            });
+        }
+        self.conds = Some(conds);
+        self.conds_per_row = per_row;
+        Ok(self)
+    }
+
+    /// Attach the ids each position of each row was allowed to take, in
+    /// row order.
+    ///
+    /// `allowed[r][p]` describes position `p` of row `r` of the rows
+    /// this dataset was built from — the same indexing as `input_ids`,
+    /// before the training loop's input/target shift. The loop applies
+    /// that shift once, in [`crate::train::allowed_input_sets`] and
+    /// [`crate::train::allowed_logit_mask`], so a producer here does
+    /// not apply it too.
+    ///
+    /// # The token at a position must be in that position's set
+    ///
+    /// A set that excludes the token its own position holds is a
+    /// producer contradicting itself, and the loop cannot answer it
+    /// with anything but a number (see
+    /// [`DatasetError::AllowedExcludesTarget`]), so it is refused here
+    /// instead. Checked over the positions the loop actually reads —
+    /// from position 1, since the shift leaves position 0 governing no
+    /// target, up to [`DatasetOpts::ctx_len`], past which the batch is
+    /// truncated. A row shorter than the context is padded with
+    /// [`DatasetOpts::pad_id`], so those positions are checked against
+    /// the pad id: a set covering them has to say the padding is
+    /// allowed there. An empty set is exempt — that is how a producer
+    /// says the position is unconstrained, and
+    /// [`crate::train::allowed_logit_mask`] leaves it unmasked.
+    ///
+    /// # Errors
+    ///
+    /// [`DatasetError::AllowedRowCountMismatch`] when the list is not
+    /// one entry per row, [`DatasetError::AllowedRaggedRows`] when the
+    /// rows describe differing numbers of positions,
+    /// [`DatasetError::AllowedExcludesTarget`] when a set excludes its
+    /// own position's token, and
+    /// [`DatasetError::SideChannelAfterReorder`] as
+    /// [`Self::with_conditions`].
+    pub fn with_allowed_ids(mut self, allowed: Vec<Vec<Vec<u32>>>) -> Result<Self, DatasetError> {
+        self.refuse_after_reorder("allowed-id list")?;
+        if allowed.len() != self.rows.len() {
+            return Err(DatasetError::AllowedRowCountMismatch {
+                allowed: allowed.len(),
+                rows: self.rows.len(),
+            });
+        }
+        let expected = allowed.first().map(Vec::len).unwrap_or(0);
+        for (row, positions) in allowed.iter().enumerate() {
+            if positions.len() != expected {
+                return Err(DatasetError::AllowedRaggedRows {
+                    row,
+                    positions: positions.len(),
+                    expected,
+                });
+            }
+            // Position 0 governs no target (the loop shifts inputs
+            // against targets once) and everything from `ctx_len` on is
+            // truncated away, so those are the positions no reader
+            // pairs a token with.
+            let read_positions = positions.len().min(self.opts.ctx_len);
+            for (position, ids) in positions.iter().enumerate().take(read_positions).skip(1) {
+                if ids.is_empty() {
+                    continue;
+                }
+                let token = self.rows[row]
+                    .get(position)
+                    .copied()
+                    .unwrap_or(self.opts.pad_id);
+                if !ids.contains(&token) {
+                    return Err(DatasetError::AllowedExcludesTarget {
+                        row,
+                        position,
+                        token,
+                    });
+                }
+            }
+        }
+        self.allowed_ids = Some(allowed);
+        Ok(self)
+    }
+
+    /// Rows currently held by this dataset.
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Refuse a positional side channel on a dataset whose rows were
+    /// re-ordered at construction. See
+    /// [`DatasetError::SideChannelAfterReorder`].
+    fn refuse_after_reorder(&self, channel: &str) -> Result<(), DatasetError> {
+        if self.opts.shuffle {
+            return Err(DatasetError::SideChannelAfterReorder {
+                channel: channel.to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn take_next_batch(&mut self) -> Option<Batch> {
@@ -184,10 +476,25 @@ impl TokenizedDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        // The side channels follow their rows. `conds` is row-major at
+        // `conds_per_row` per row, so the row range scales; the counts
+        // were checked against the row count when they were attached.
+        let per_row = self.conds_per_row;
+        let conds = self
+            .conds
+            .as_ref()
+            .map(|all| all[start * per_row..end * per_row].to_vec());
+        let allowed_ids = self
+            .allowed_ids
+            .as_ref()
+            .map(|all| all[start..end].to_vec());
         Some(Batch {
             input_ids,
             loss_mask: None,
             is_last: end == self.rows.len(),
+            allowed_ids,
+            conds,
+            conds_per_row: per_row,
         })
     }
 }
@@ -339,6 +646,9 @@ impl Dataset for JsonlDataset {
                 input_ids,
                 loss_mask: None,
                 is_last: end == self.buffer.len(),
+                allowed_ids: None,
+                conds: None,
+                conds_per_row: 1,
             }));
         }
 
@@ -358,6 +668,9 @@ impl Dataset for JsonlDataset {
             input_ids,
             loss_mask: None,
             is_last: short_batch,
+            allowed_ids: None,
+            conds: None,
+            conds_per_row: 1,
         }))
     }
 
@@ -577,6 +890,9 @@ impl Dataset for ParquetDataset {
                 input_ids,
                 loss_mask: None,
                 is_last: end == self.buffer.len(),
+                allowed_ids: None,
+                conds: None,
+                conds_per_row: 1,
             }));
         }
 
@@ -596,6 +912,9 @@ impl Dataset for ParquetDataset {
             input_ids,
             loss_mask: None,
             is_last: short_batch,
+            allowed_ids: None,
+            conds: None,
+            conds_per_row: 1,
         }))
     }
 
@@ -747,6 +1066,9 @@ impl Dataset for TeacherCardDataset {
             input_ids,
             loss_mask: Some(loss_mask),
             is_last: end == self.rows.len(),
+            allowed_ids: None,
+            conds: None,
+            conds_per_row: 1,
         }))
     }
 
@@ -796,6 +1118,251 @@ mod tests {
         let mut ds = TokenizedDataset::new(rows, opts);
         let b = ds.next_batch().unwrap().unwrap();
         assert_eq!(b.input_ids[0], vec![1, 2, 3]);
+    }
+
+    /// Every batch carries the slice of the conditions belonging to its
+    /// own rows, in the order the rows were handed over. The pairing is
+    /// positional and nothing else checks it.
+    #[test]
+    fn conditions_follow_their_rows_into_each_batch() {
+        let rows = vec![vec![1u32, 2], vec![3, 4], vec![5, 6]];
+        let opts = DatasetOpts {
+            batch_size: 2,
+            ctx_len: 2,
+            ..DatasetOpts::default()
+        };
+        let conds: Vec<CondIndex> = (0..3u32).map(|i| CondIndex::new(i, 3).unwrap()).collect();
+        let mut ds = TokenizedDataset::new(rows, opts)
+            .with_conditions(conds)
+            .expect("one condition per row");
+        assert_eq!(ds.row_count(), 3);
+
+        let b1 = ds.next_batch().unwrap().unwrap();
+        assert_eq!(b1.conds_per_row, 1);
+        let rows: Vec<u32> = b1.conds.unwrap().iter().map(|c| c.row()).collect();
+        assert_eq!(rows, vec![0, 1]);
+
+        let b2 = ds.next_batch().unwrap().unwrap();
+        let rows: Vec<u32> = b2.conds.unwrap().iter().map(|c| c.row()).collect();
+        assert_eq!(rows, vec![2]);
+    }
+
+    /// Groups are row-major, so a batch takes `per_row` entries for
+    /// each of its rows rather than one.
+    #[test]
+    fn condition_groups_slice_by_row_not_by_entry() {
+        let rows = vec![vec![1u32, 2], vec![3, 4], vec![5, 6]];
+        let opts = DatasetOpts {
+            batch_size: 2,
+            ctx_len: 2,
+            ..DatasetOpts::default()
+        };
+        let conds: Vec<CondIndex> = (0..6u32)
+            .map(|i| CondIndex::new(i % 3, 3).unwrap())
+            .collect();
+        let mut ds = TokenizedDataset::new(rows, opts)
+            .with_condition_groups(conds, 2)
+            .expect("two conditions per row");
+        let b1 = ds.next_batch().unwrap().unwrap();
+        assert_eq!(b1.conds_per_row, 2);
+        let rows: Vec<u32> = b1.conds.unwrap().iter().map(|c| c.row()).collect();
+        assert_eq!(rows, vec![0, 1, 2, 0]);
+    }
+
+    /// A list that is not exactly `rows × per_row` cannot be attributed
+    /// to rows, and `per_row` of zero conditions nothing.
+    #[test]
+    fn condition_counts_that_do_not_divide_by_row_are_refused() {
+        let rows = vec![vec![1u32, 2], vec![3, 4]];
+        let one = vec![CondIndex::new(0, 2).unwrap()];
+        let err = TokenizedDataset::new(rows.clone(), DatasetOpts::default())
+            .with_conditions(one)
+            .unwrap_err();
+        match err {
+            DatasetError::ConditionCountMismatch {
+                conds,
+                rows,
+                per_row,
+            } => assert_eq!((conds, rows, per_row), (1, 2, 1)),
+            other => panic!("expected ConditionCountMismatch, got {other:?}"),
+        }
+
+        let two = vec![CondIndex::new(0, 2).unwrap(), CondIndex::new(1, 2).unwrap()];
+        let err = TokenizedDataset::new(rows, DatasetOpts::default())
+            .with_condition_groups(two, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, DatasetError::ConditionCountMismatch { per_row: 0, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// The allowed-id sets follow their rows the same way, and the
+    /// per-row shape is checked where the caller can still fix it.
+    #[test]
+    fn allowed_sets_follow_their_rows_and_must_be_rectangular() {
+        let rows = vec![vec![1u32, 2], vec![3, 4]];
+        let opts = DatasetOpts {
+            batch_size: 1,
+            ctx_len: 2,
+            ..DatasetOpts::default()
+        };
+        let allowed = vec![vec![vec![1u32], vec![2]], vec![vec![3u32], vec![4]]];
+        let mut ds = TokenizedDataset::new(rows.clone(), opts.clone())
+            .with_allowed_ids(allowed)
+            .expect("one set list per row");
+        let b1 = ds.next_batch().unwrap().unwrap();
+        assert_eq!(b1.allowed_ids.unwrap(), vec![vec![vec![1u32], vec![2]]]);
+
+        let ragged = vec![vec![vec![1u32], vec![2]], vec![vec![3u32]]];
+        let err = TokenizedDataset::new(rows.clone(), opts.clone())
+            .with_allowed_ids(ragged)
+            .unwrap_err();
+        match err {
+            DatasetError::AllowedRaggedRows {
+                row,
+                positions,
+                expected,
+            } => assert_eq!((row, positions, expected), (1, 1, 2)),
+            other => panic!("expected AllowedRaggedRows, got {other:?}"),
+        }
+
+        let short = vec![vec![vec![1u32], vec![2]]];
+        let err = TokenizedDataset::new(rows, opts)
+            .with_allowed_ids(short)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DatasetError::AllowedRowCountMismatch {
+                    allowed: 1,
+                    rows: 2
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A set that excludes the token its own position holds is a
+    /// producer contradicting itself, and the training loop answers
+    /// that with a ~1e9 loss term rather than an error — so it is
+    /// refused here. The boundary the check must not overshoot: a
+    /// target sitting at either edge of its set is inside it.
+    #[test]
+    fn an_allowed_set_must_hold_the_token_its_own_position_carries() {
+        let rows = vec![vec![1u32, 2, 3]];
+        let opts = DatasetOpts {
+            batch_size: 1,
+            ctx_len: 3,
+            ..DatasetOpts::default()
+        };
+
+        // Position 1 holds token 2; its set names 5 and 6.
+        let contradicting = vec![vec![vec![1u32], vec![5, 6], vec![3]]];
+        let err = TokenizedDataset::new(rows.clone(), opts.clone())
+            .with_allowed_ids(contradicting)
+            .unwrap_err();
+        match err {
+            DatasetError::AllowedExcludesTarget {
+                row,
+                position,
+                token,
+            } => assert_eq!((row, position, token), (0, 1, 2)),
+            other => panic!("expected AllowedExcludesTarget, got {other:?}"),
+        }
+
+        // The target at the first member of one set and the last of the
+        // next. Position 0 governs no target, so its set is not paired
+        // with anything and is left alone.
+        let at_the_edges = vec![vec![vec![9u32], vec![2, 7], vec![8, 3]]];
+        TokenizedDataset::new(rows.clone(), opts.clone())
+            .with_allowed_ids(at_the_edges)
+            .expect("a target at either edge of its set is inside it");
+
+        // An empty set is how a producer says the position is
+        // unconstrained, so there is nothing for it to contradict.
+        let unconstrained = vec![vec![vec![9u32], vec![], vec![]]];
+        TokenizedDataset::new(rows, opts)
+            .with_allowed_ids(unconstrained)
+            .expect("an empty set constrains nothing");
+    }
+
+    /// The producer this check is really for: one that pads its set
+    /// list out to `ctx_len`. The tokens over that tail are the pad id,
+    /// so a set describing those positions has to say the padding is
+    /// allowed there.
+    #[test]
+    fn sets_covering_the_padded_tail_must_allow_the_pad_id() {
+        let rows = vec![vec![1u32, 2]];
+        let opts = DatasetOpts {
+            batch_size: 1,
+            ctx_len: 4,
+            pad_id: 0,
+            ..DatasetOpts::default()
+        };
+
+        let excludes_the_pad = vec![vec![vec![1u32], vec![2], vec![5], vec![5]]];
+        let err = TokenizedDataset::new(rows.clone(), opts.clone())
+            .with_allowed_ids(excludes_the_pad)
+            .unwrap_err();
+        match err {
+            DatasetError::AllowedExcludesTarget {
+                row,
+                position,
+                token,
+            } => assert_eq!((row, position, token), (0, 2, 0)),
+            other => panic!("expected AllowedExcludesTarget, got {other:?}"),
+        }
+
+        let allows_the_pad = vec![vec![vec![1u32], vec![2], vec![5, 0], vec![0]]];
+        TokenizedDataset::new(rows, opts)
+            .with_allowed_ids(allows_the_pad)
+            .expect("a tail whose sets admit the padding is consistent");
+    }
+
+    /// A dataset that re-ordered its rows at construction cannot take a
+    /// positional side channel: every shape would still agree while
+    /// each entry described some other row.
+    #[test]
+    fn a_side_channel_is_refused_after_the_rows_were_reordered() {
+        let rows = vec![vec![1u32, 2], vec![3, 4]];
+        let opts = DatasetOpts {
+            batch_size: 1,
+            ctx_len: 2,
+            shuffle: true,
+            ..DatasetOpts::default()
+        };
+        let conds = vec![CondIndex::new(0, 2).unwrap(), CondIndex::new(1, 2).unwrap()];
+        let err = TokenizedDataset::new(rows.clone(), opts.clone())
+            .with_conditions(conds)
+            .unwrap_err();
+        match &err {
+            DatasetError::SideChannelAfterReorder { channel } => {
+                assert!(channel.contains("conditioning"), "{channel}");
+            }
+            other => panic!("expected SideChannelAfterReorder, got {other:?}"),
+        }
+        assert!(err.to_string().contains("shuffle on"), "{err}");
+
+        let allowed = vec![vec![vec![1u32], vec![2]], vec![vec![3u32], vec![4]]];
+        let err = TokenizedDataset::new(rows, opts)
+            .with_allowed_ids(allowed)
+            .unwrap_err();
+        assert!(
+            matches!(err, DatasetError::SideChannelAfterReorder { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A dataset with no side channel says so on every batch, which is
+    /// what keeps the plain training path unchanged.
+    #[test]
+    fn a_plain_dataset_carries_no_side_channel() {
+        let mut ds = TokenizedDataset::new(vec![vec![1u32, 2]], DatasetOpts::default());
+        let b = ds.next_batch().unwrap().unwrap();
+        assert!(b.conds.is_none());
+        assert!(b.allowed_ids.is_none());
+        assert_eq!(b.conds_per_row, 1);
     }
 
     // ParquetDataset coverage lives in `tests/dataset_iter.rs`, which

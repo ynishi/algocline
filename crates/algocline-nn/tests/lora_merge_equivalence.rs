@@ -180,6 +180,8 @@ fn run_lora_ft_leaves_base_weights_bit_identical() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let lora_cfg = LoraConfig::new(4, 8.0);
     let tmp = TempDir::new().unwrap();
@@ -316,6 +318,8 @@ fn run_lora_ft_reduces_loss_on_overfit_corpus() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
@@ -424,6 +428,8 @@ fn run_lora_ft_updates_lora_weights() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());

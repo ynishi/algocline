@@ -132,6 +132,8 @@ fn synthetic_run_reduces_loss_and_saves_final_bundle() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
@@ -244,6 +246,8 @@ fn bf16_synthetic_run_reduces_loss_through_mixed_adamw() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
@@ -450,6 +454,8 @@ fn grad_accum_matches_equivalent_batch() {
             weight_decay: 0.0,
             ckpt_every: 0,
             ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -490,6 +496,8 @@ fn grad_accum_matches_equivalent_batch() {
             weight_decay: 0.0,
             ckpt_every: 0,
             ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -542,6 +550,8 @@ fn grad_accum_gt_one_reduces_loss() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
@@ -606,6 +616,8 @@ fn bf16_grad_accum_synthetic_run_reduces_loss_through_mixed_adamw() {
         weight_decay: 0.0,
         ckpt_every: 0,
         ckpt_keep: 1,
+        init_from: None,
+        mask_disallowed_logits: false,
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());

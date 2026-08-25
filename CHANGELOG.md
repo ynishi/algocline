@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Corpus files are a platform concept: `algocline_nn::train::corpus`
+  + `alc.nn.data.corpus(paths, opts?)`.** A corpus file is JSON —
+  `{"meta": {"ctx_len": N, "vocab_size": V}, "rows": [[id, …]]}` — of
+  rows a producer has already tokenized, which is the case no existing
+  dataset adapter covered (JSONL and Parquet both tokenize text, and
+  `synthetic` takes its rows through the Lua VM). The module's rustdoc
+  is the format's specification; unknown `meta` fields are ignored, so a
+  producer records more than a trainer reads and a file from a later
+  writer still loads — unless the writer listed the field in
+  `meta.requires`, the format's forward-compatibility list, which is how
+  a producer marks a field the rows' *meaning* depends on so an older
+  reader refuses the file rather than training on a reading it did not
+  intend. `CorpusFile::load` validates on the way in — both dimensions
+  non-zero, at least one row, no empty row, no row longer than the
+  declared `ctx_len`, and every id inside the declared `vocab_size` —
+  with the file, row and position named in each refusal, because the fix
+  belongs to the program that wrote the file. `interleave` merges several corpora round-robin rather
+  than concatenating them: concatenation makes "which corpus" a function
+  of how far a run has got, which a conditioned run cannot separate from
+  the condition it is binding; files disagreeing about `ctx_len` /
+  `vocab_size` are refused naming both. The Lua entry returns the same
+  dataset handle as its siblings, takes `cond` (one conditioning-table
+  row per corpus, checked positionally against `paths`) with the
+  `cond_slots` that states the table those rows are checked against, and
+  `epochs` to repeat the merged list for a one-pass dataset that a run
+  would otherwise exhaust. `ctx_len` and the id space are *not* options
+  here — they come from the corpus `meta`, and passing them, or
+  `text_field` / `shuffle`, is refused rather than ignored, as is every
+  other key the entry does not read. Replaces the
+  hand-written `io.open` + `alc.json_decode` + manual interleave +
+  manual repeat each caller was writing, where the rows and their
+  conditions could fall out of step with every shape still agreeing.
 - **`alc.nn.logits.mix(a, b, beta, opts?)` — two logits rows combined
   into one.** `beta` is the weight on `a`, and the result is an ordinary
   logits handle, so `argmax` / `top(n)` / the samplers / a constrained

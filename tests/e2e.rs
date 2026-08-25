@@ -9366,6 +9366,126 @@ async fn test_nn_channel_cond_slots_wrong_type_errors() {
     );
 }
 
+// ─── alc.nn.data.corpus ───────────────────────────────────────────
+//
+// Same `nn`-feature gate and the same reason as the channel tests
+// above. What these two add is the filesystem edge: a corpus file is
+// written by a producer that is not this process, so the path under
+// test starts at bytes on disk rather than at a Lua table.
+
+/// Write a corpus file under `home` and return its path as a Lua string
+/// literal body.
+#[cfg(feature = "nn")]
+fn write_corpus(home: &std::path::Path, name: &str, rows: &str) -> String {
+    let path = home.join(name);
+    std::fs::write(
+        &path,
+        format!(r#"{{ "meta": {{ "ctx_len": 8, "vocab_size": 64 }}, "rows": {rows} }}"#),
+    )
+    .expect("write corpus fixture");
+    path.to_string_lossy().into_owned()
+}
+
+/// The whole surface end to end: two corpus files on disk, merged and
+/// repeated by one call, trained under the condition each file was
+/// labelled with, and decoded through the Card the run wrote.
+///
+/// This is the call the format exists for — before it, the same run
+/// took a hand-written `io.open` + `alc.json_decode` + manual
+/// interleave + manual repeat in Lua, and each of those steps was a
+/// place for the rows and their conditions to fall out of step with no
+/// shape disagreeing about it.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_corpus_bake_then_decode() {
+    let harness = TempAlcHome::connect().await;
+    let home = harness.home_path().to_path_buf();
+    let first = write_corpus(&home, "corpus-a.json", "[[1, 2, 3], [4, 5, 6], [7, 8, 9]]");
+    let second = write_corpus(&home, "corpus-b.json", "[[11, 12], [13, 14], [15, 16]]");
+
+    let code = format!(
+        r#"
+        local ds = alc.nn.data.corpus({{ "{first}", "{second}" }}, {{
+            batch_size = 1, epochs = 2, cond = {{ 0, 1 }}, cond_slots = 2,
+        }})
+        local handle = alc.nn.preset.gpt2("custom", {{
+            pretrained = false, cond_slots = 2,
+        }})
+        local card_id = alc.nn.trainer.run_full_ft(handle, ds, {{
+            lr = 5e-3, batch = 1, steps = 3, warmup = 0,
+        }})
+        local reloaded = alc.nn.card.load_handle(card_id)
+        local session = reloaded:generate_session({{ 1, 2, 3 }}, {{ cond = 1 }})
+        local logits = session:next_logits()
+        local id = logits:argmax()
+        session:append(id)
+        return {{
+            source = ds:source(),
+            ctx_len = ds:ctx_len(),
+            rows = ds:len_hint(),
+            vocab = logits:vocab(),
+            position = session:position(),
+            card_id = card_id,
+        }}
+    "#
+    );
+
+    let resp = call_json(&harness.client, "alc_run", json!({ "code": code })).await;
+    assert_eq!(resp["status"], "completed", "run failed: {resp}");
+    let result = &resp["result"];
+    assert_eq!(
+        result["ctx_len"], 8,
+        "the width comes from the corpus meta, not from opts: {result}"
+    );
+    assert_eq!(
+        result["rows"], 12,
+        "six merged rows repeated for two epochs: {result}"
+    );
+    assert_eq!(result["vocab"], 64, "tiny-shaped vocabulary: {result}");
+    assert_eq!(
+        result["position"], 4,
+        "three prompt tokens plus the appended one: {result}"
+    );
+    assert!(
+        result["source"]
+            .as_str()
+            .map(|s| s.starts_with("corpus:") && s.contains("corpus-b.json"))
+            == Some(true),
+        "the handle names the files it was built from: {result}"
+    );
+    assert!(
+        result["card_id"].as_str().map(str::is_empty) == Some(false),
+        "the run must report the Card it wrote: {result}"
+    );
+}
+
+/// A corpus whose rows disagree with its own `meta`. The refusal has to
+/// reach the caller naming the file and the position, because the fix
+/// is in the program that wrote the file rather than in the Lua that
+/// read it — and because an id past the vocabulary would otherwise
+/// surface much later as an out-of-range embedding lookup.
+#[cfg(feature = "nn")]
+#[tokio::test]
+async fn test_nn_corpus_token_outside_declared_vocab_errors() {
+    let harness = TempAlcHome::connect().await;
+    let home = harness.home_path().to_path_buf();
+    let path = write_corpus(&home, "corpus-wide.json", "[[1, 2], [3, 400]]");
+
+    let code = format!(r#"return alc.nn.data.corpus({{ "{path}" }})"#);
+    let result = harness
+        .client
+        .call_tool(call_params("alc_run", json!({ "code": code })))
+        .await
+        .expect("call_tool failed");
+    let text = extract_text(&result);
+    assert!(
+        text.contains("corpus-wide.json")
+            && text.contains("row 1 position 1")
+            && text.contains("meta.vocab_size 64"),
+        "the error must name the file, the position and the declared id space: {text}"
+    );
+}
+
 // ─── alc.nn decode-side mixing ────────────────────────────────────
 //
 // Same `nn`-feature gate and the same reason as the channel tests

@@ -4,6 +4,10 @@
 //!
 //! - [`data`] — streaming batch abstraction (`Dataset` trait + JSONL /
 //!   Parquet / in-memory implementations).
+//! - [`corpus`] — the pre-tokenized corpus file format (its module
+//!   documentation is the spec) plus the loader and the round-robin
+//!   merge that turn a set of such files into rows a
+//!   [`data::TokenizedDataset`] takes.
 //! - [`loss`] — [`loss::Loss`] trait + [`loss::CrossEntropyLoss`], the
 //!   default used by Full FT. A distillation follow-up plugs in the
 //!   same trait.
@@ -18,12 +22,14 @@
 //!   that hand the model a side channel per batch
 //!   ([`fullft::run_conditioned_ft`] / [`fullft::run_allowed_ft`]).
 //!
-//! The Lua bridge only reaches for the top-level re-exports; internal
-//! callers can still pull individual submodule items when needed.
+//! The Lua bridge mostly reaches for the top-level re-exports; internal
+//! callers can still pull individual submodule items when needed, as
+//! the bridge does for [`corpus::interleave`].
 
 use std::collections::HashMap;
 
 pub mod ckpt;
+pub mod corpus;
 pub mod data;
 pub mod loss;
 pub mod mixed;
@@ -153,6 +159,11 @@ pub use ckpt::{
     checkpoint_from_path, restore_into, restore_into_partial, ApplyStage, CheckpointStore,
     RestoreError, RestoreReport, TensorMismatch,
 };
+// The types carry their noun and are re-exported; `interleave` /
+// `interleave_labelled` do not, and `train::interleave` would read as
+// "interleave datasets" rather than "interleave corpora", so they stay
+// at `train::corpus::`.
+pub use corpus::{CorpusError, CorpusFile, InterleavedRow};
 pub use data::{
     Batch, Dataset, DatasetError, DatasetOpts, JsonlDataset, ParquetDataset, TeacherCardDataset,
     TokenizedDataset,

@@ -47,9 +47,11 @@ use algocline_nn::card::{
 };
 use algocline_nn::merged::{export_merged, MergeError, MergedProvenance};
 use algocline_nn::tokenizer::HfTokenizer;
+use algocline_nn::train::corpus::{interleave, interleave_labelled};
 use algocline_nn::train::{
-    run_distill, run_full_ft, run_lora_ft, Batch, CrossEntropyLoss, Dataset, DatasetOpts,
-    DistillSpec, JsonlDataset, ParquetDataset, TeacherCardDataset, TokenizedDataset, TrainingLease,
+    run_distill, run_full_ft, run_lora_ft, Batch, CorpusFile, CrossEntropyLoss, Dataset,
+    DatasetOpts, DistillSpec, JsonlDataset, ParquetDataset, TeacherCardDataset, TokenizedDataset,
+    TrainingLease,
 };
 use candle_core::{DType, Device};
 use candle_nn::VarMap;
@@ -3639,6 +3641,20 @@ fn register_data_ns(
     )?;
     data.set("synthetic", synthetic)?;
 
+    // corpus(paths, opts) — load one or more pre-tokenized corpus files
+    // (`algocline_nn::train::corpus`, whose module documentation is the
+    // format's specification), merge them round-robin, and build the
+    // same `TokenizedDataset` handle the siblings return. No tokenizer
+    // is involved: the rows are already token ids.
+    let corpus = lua.create_function(
+        move |_lua, (paths, opts): (LuaValue, Option<LuaTable>)| -> LuaResult<DatasetHandle> {
+            let paths = extract_corpus_paths(&paths)?;
+            let copts = extract_corpus_opts(opts.as_ref(), paths.len())?;
+            build_corpus_dataset(&paths, &copts)
+        },
+    )?;
+    data.set("corpus", corpus)?;
+
     nn_table.set("data", data)?;
     Ok(())
 }
@@ -4204,6 +4220,857 @@ fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
         ));
     }
     Ok(d)
+}
+
+// ─── alc.nn.data.corpus ───────────────────────────────────────────
+
+/// Error prefix for the `alc.nn.data.corpus` surface.
+const CORPUS_ERR_PREFIX: &str = "alc.nn.data.corpus";
+
+/// Ceiling on `opts.epochs`.
+///
+/// The merged rows are materialised once per epoch, so an unbounded
+/// count is an allocation request the caller cannot see the size of: a
+/// typo'd extra digit would reach the allocator rather than an error
+/// message. The value is high enough that no run over a corpus large
+/// enough to train on can want more passes, and low enough that the
+/// refusal arrives at the option that named it.
+const MAX_CORPUS_EPOCHS: usize = 10_000;
+
+/// `alc.nn.data.corpus`'s options, after checking.
+///
+/// `ctx_len` is absent on purpose: it comes from the corpus files
+/// themselves, which is what separates this surface from its siblings.
+#[derive(Debug)]
+struct CorpusOpts {
+    /// Rows per batch.
+    batch_size: usize,
+    /// Pad id used to fill rows short of the corpus `ctx_len`.
+    pad_id: u32,
+    /// One conditioning-table row per corpus path, or `None` for an
+    /// unconditioned run.
+    cond: Option<Vec<u32>>,
+    /// Rows of the model's conditioning table. `Some` exactly when
+    /// [`Self::cond`] is.
+    cond_slots: Option<usize>,
+    /// How many times the merged row list is repeated.
+    epochs: usize,
+}
+
+/// Read the `paths` argument: an array of corpus file paths.
+///
+/// Taken as a [`LuaValue`] rather than a `LuaTable` so a caller who
+/// passed a bare path string is told what the argument takes instead of
+/// meeting mlua's conversion error.
+fn extract_corpus_paths(paths: &LuaValue) -> LuaResult<Vec<String>> {
+    let LuaValue::Table(list) = paths else {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: paths must be an array of corpus file paths (got {}); \
+             a single file is written as {{ \"/path/to/corpus.json\" }}",
+            paths.type_name()
+        )));
+    };
+    let count = list.raw_len();
+    if count == 0 {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: paths is empty; a call naming no corpus has nothing to \
+             train on"
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 1..=count {
+        let path: String = list.get(i).map_err(|e| {
+            LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: paths[{i}] must be a file path string: {e}"
+            ))
+        })?;
+        if path.trim().is_empty() {
+            return Err(LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: paths[{i}] is an empty string"
+            )));
+        }
+        out.push(path);
+    }
+    Ok(out)
+}
+
+/// The options this surface reads. Every other key in the table is
+/// refused — see [`refuse_unread_opts`].
+const CORPUS_OPT_KEYS: [&str; 5] = ["batch_size", "pad_id", "cond", "cond_slots", "epochs"];
+
+/// Where the value a near-miss key names actually comes from, for the
+/// keys a caller is most likely to reach for here because a sibling
+/// entry reads them.
+fn corpus_opt_not_read_why(key: &str) -> Option<&'static str> {
+    match key {
+        "ctx_len" => Some(
+            "the context length comes from the corpus meta, which every file of one call \
+             states and has to agree on",
+        ),
+        "vocab_size" => Some(
+            "the id space comes from the corpus meta, and the loader checks every row against it",
+        ),
+        "vocab" => Some(
+            "the id space comes from the corpus meta.vocab_size, and the loader checks every \
+             row against it",
+        ),
+        "text_field" => Some(
+            "corpus rows are already token ids, so no tokenizer runs and no text column is read",
+        ),
+        "shuffle" => Some(
+            "the corpora are merged in a deliberate rotation and re-ordering would undo it; a \
+             conditioned dataset also refuses a positional channel once its rows have moved",
+        ),
+        _ => None,
+    }
+}
+
+/// Refuse every key this surface does not read, naming it.
+///
+/// A key that silently did not take effect is the failure this guards:
+/// `ctx_len` handed here and ignored would train at a width the corpus
+/// was not written for, and every shape downstream would still agree.
+/// The check is over the whole table rather than a list of known
+/// mistakes, so a typo of a key this entry *does* read (`padid`,
+/// `batchsize`) is refused on the same terms as a key that belongs to a
+/// sibling entry.
+fn refuse_unread_opts(opts: &LuaTable) -> LuaResult<()> {
+    for pair in opts.pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let LuaValue::String(name) = &key else {
+            return Err(LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: opts takes named options, and a {} key names none of \
+                 them ({})",
+                key.type_name(),
+                CORPUS_OPT_KEYS.join(" / ")
+            )));
+        };
+        let name = name.to_str()?;
+        if CORPUS_OPT_KEYS.contains(&&*name) {
+            continue;
+        }
+        return Err(LuaError::external(match corpus_opt_not_read_why(&name) {
+            Some(why) => format!("{CORPUS_ERR_PREFIX}: opts.{name} is not read here — {why}"),
+            None => format!(
+                "{CORPUS_ERR_PREFIX}: opts.{name} is not read here — this entry takes {}",
+                CORPUS_OPT_KEYS.join(" / ")
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// Read a Lua value as a whole non-negative number, naming `what` in
+/// every refusal.
+///
+/// Lua has one number type, so a count that arithmetic produced arrives
+/// as `2.0` and is accepted. `1.5` is refused rather than truncated:
+/// mlua's own integer conversion takes the floor, which would run one
+/// epoch for a caller who wrote one and a half and report nothing.
+///
+/// Both carriers share one ceiling, `u32::MAX`. It is a token id /
+/// count bound rather than `usize::MAX` because past it the float
+/// branch's `as` cast saturates silently, which is the behaviour this
+/// function exists to avoid — and applying it to the integer branch
+/// too is what keeps the bound visible: which carrier Lua chose for a
+/// literal is not something the caller wrote.
+fn corpus_whole_number(value: &LuaValue, what: &str) -> LuaResult<usize> {
+    let refuse = |got: String| {
+        LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: {what} must be a whole non-negative number no greater than \
+             {} (got {got})",
+            u32::MAX
+        ))
+    };
+    let ceiling = u32::MAX as usize;
+    match value {
+        LuaValue::Integer(i) => {
+            let n = usize::try_from(*i).map_err(|_| refuse(i.to_string()))?;
+            if n > ceiling {
+                return Err(refuse(i.to_string()));
+            }
+            Ok(n)
+        }
+        LuaValue::Number(f) => {
+            let f = *f;
+            if !f.is_finite() || f.fract() != 0.0 || !(0.0..=f64::from(u32::MAX)).contains(&f) {
+                return Err(refuse(f.to_string()));
+            }
+            Ok(f as usize)
+        }
+        other => Err(refuse(other.type_name().to_string())),
+    }
+}
+
+/// Read one optional whole-number option off the opts table.
+fn corpus_number_opt(opts: &LuaTable, key: &str) -> LuaResult<Option<usize>> {
+    let raw: LuaValue = opts
+        .get(key)
+        .map_err(|e| LuaError::external(format!("{CORPUS_ERR_PREFIX}: opts.{key}: {e}")))?;
+    if raw == LuaValue::Nil {
+        return Ok(None);
+    }
+    corpus_whole_number(&raw, &format!("opts.{key}")).map(Some)
+}
+
+/// Read `opts.cond` in either of its forms: one slot id per corpus, or
+/// a single slot id for a call naming one corpus.
+fn extract_corpus_cond(opts: &LuaTable) -> LuaResult<Option<Vec<u32>>> {
+    let raw: LuaValue = opts
+        .get("cond")
+        .map_err(|e| LuaError::external(format!("{CORPUS_ERR_PREFIX}: opts.cond: {e}")))?;
+    let read_slot = |value: &LuaValue, what: &str| -> LuaResult<u32> {
+        let row = corpus_whole_number(value, what)?;
+        u32::try_from(row).map_err(|_| {
+            LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: {what} = {row} is wider than a conditioning-table row \
+                 index"
+            ))
+        })
+    };
+    let slots: Vec<u32> = match &raw {
+        LuaValue::Nil => return Ok(None),
+        LuaValue::Table(list) => {
+            let count = list.raw_len();
+            let mut out = Vec::with_capacity(count);
+            for i in 1..=count {
+                let entry: LuaValue = list.get(i).map_err(|e| {
+                    LuaError::external(format!("{CORPUS_ERR_PREFIX}: opts.cond[{i}]: {e}"))
+                })?;
+                out.push(read_slot(&entry, &format!("opts.cond[{i}]"))?);
+            }
+            out
+        }
+        // A single corpus may name its condition without wrapping it in
+        // a one-element array; the arity check below still applies.
+        other => vec![read_slot(other, "opts.cond")?],
+    };
+    if slots.is_empty() {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: opts.cond is an empty array; omit the key for an \
+             unconditioned run"
+        )));
+    }
+    Ok(Some(slots))
+}
+
+/// Read and check `alc.nn.data.corpus`'s options against `path_count`
+/// corpus paths.
+///
+/// # Errors
+///
+/// Any key this surface does not read (see [`refuse_unread_opts`]), a
+/// `batch_size` / `epochs` that is not a positive integer, an `epochs`
+/// past [`MAX_CORPUS_EPOCHS`], a `cond` naming a different number of
+/// conditions than there are corpora, and either of `cond` /
+/// `cond_slots` without the other.
+fn extract_corpus_opts(opts: Option<&LuaTable>, path_count: usize) -> LuaResult<CorpusOpts> {
+    let defaults = DatasetOpts::default();
+    let Some(t) = opts else {
+        return Ok(CorpusOpts {
+            batch_size: defaults.batch_size,
+            pad_id: defaults.pad_id,
+            cond: None,
+            cond_slots: None,
+            epochs: 1,
+        });
+    };
+
+    refuse_unread_opts(t)?;
+
+    let batch_size = corpus_number_opt(t, "batch_size")?.unwrap_or(defaults.batch_size);
+    if batch_size == 0 {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: opts.batch_size = 0 leaves every step without rows"
+        )));
+    }
+    let pad_id = match corpus_number_opt(t, "pad_id")? {
+        None => defaults.pad_id,
+        Some(id) => u32::try_from(id).map_err(|_| {
+            LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: opts.pad_id = {id} is wider than a token id"
+            ))
+        })?,
+    };
+    let epochs = corpus_number_opt(t, "epochs")?.unwrap_or(1);
+    if epochs == 0 {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: opts.epochs = 0 builds a dataset holding no rows"
+        )));
+    }
+    if epochs > MAX_CORPUS_EPOCHS {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: opts.epochs = {epochs} is past the {MAX_CORPUS_EPOCHS} this \
+             entry takes — the merged rows are held in memory once per epoch, so a count this \
+             size is an extra digit rather than a run"
+        )));
+    }
+
+    let cond = extract_corpus_cond(t)?;
+    let cond_slots = corpus_number_opt(t, "cond_slots")?;
+    match (&cond, cond_slots) {
+        (Some(list), _) if list.len() != path_count => {
+            return Err(LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: opts.cond names {} condition(s) for the {path_count} \
+                 corpus path(s) in `paths` — the pairing is positional, so it takes exactly \
+                 one per corpus",
+                list.len()
+            )));
+        }
+        // The table size has to be stated rather than read off the
+        // conditions: a slot index and a token id overlap without
+        // meaning the same thing, and the largest slot a corpus happens
+        // to use is not the size of the model's table.
+        (Some(_), None) => {
+            return Err(LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: opts.cond was given, so opts.cond_slots must state how \
+                 many rows the model's conditioning table has (the same value passed to \
+                 alc.nn.preset.gpt2('custom', {{ cond_slots = N }}))"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: opts.cond_slots was given without opts.cond — a table \
+                 size with nothing selecting a row from it conditions nothing"
+            )));
+        }
+        _ => {}
+    }
+
+    Ok(CorpusOpts {
+        batch_size,
+        pad_id,
+        cond,
+        cond_slots,
+        epochs,
+    })
+}
+
+/// Load the named corpora, merge them, and build the dataset handle.
+///
+/// The merge is
+/// [`algocline_nn::train::corpus::interleave`]'s rotation, and `epochs`
+/// repeats that merged list rather than each file in turn — a dataset
+/// is one-pass, so a run consuming more rows than the corpora hold
+/// needs them repeated, and repeating the *merged* order is what keeps
+/// the rotation intact across the repeats.
+///
+/// # Memory
+///
+/// The whole dataset is materialised, and peak use is roughly
+/// `(2 + epochs) ×` the corpora's rows: the loaded [`CorpusFile`]s stay
+/// alive for the length of this call, the merge clones every row into
+/// one list, and that list is cloned once per epoch. `epochs` therefore
+/// multiplies the footprint rather than re-reading the rows, which is
+/// why it is bounded by [`MAX_CORPUS_EPOCHS`]; a run wanting many
+/// passes over a large corpus wants a cycling dataset instead.
+fn build_corpus_dataset(paths: &[String], opts: &CorpusOpts) -> LuaResult<DatasetHandle> {
+    let corpus_err = |e: algocline_nn::train::CorpusError| {
+        LuaError::external(format!("{CORPUS_ERR_PREFIX}: {e}"))
+    };
+    // `epochs` is bounded and a row list is not, so the product is
+    // checked rather than trusted: an unchecked multiply here panics in
+    // a debug build and asks the allocator for a wrapped capacity in a
+    // release one, neither of which is a refusal the caller can read.
+    let repeated_rows = |merged: usize| -> LuaResult<usize> {
+        merged.checked_mul(opts.epochs).ok_or_else(|| {
+            LuaError::external(format!(
+                "{CORPUS_ERR_PREFIX}: opts.epochs = {} over {merged} merged row(s) is more \
+                 rows than this machine can hold",
+                opts.epochs
+            ))
+        })
+    };
+
+    let corpora = paths
+        .iter()
+        .map(|p| CorpusFile::load(std::path::Path::new(p)).map_err(corpus_err))
+        .collect::<LuaResult<Vec<_>>>()?;
+    let sources: Vec<&CorpusFile> = corpora.iter().collect();
+
+    // Conditions are resolved before any row is built so a slot outside
+    // the declared table is refused at the option that named it.
+    let per_source: Option<Vec<CondIndex>> = match (&opts.cond, opts.cond_slots) {
+        (Some(cond), Some(slots)) => Some(
+            cond.iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    CondIndex::new(*row, slots).map_err(|e| {
+                        LuaError::external(format!(
+                            "{CORPUS_ERR_PREFIX}: opts.cond[{}]: {e}",
+                            i + 1
+                        ))
+                    })
+                })
+                .collect::<LuaResult<Vec<_>>>()?,
+        ),
+        _ => None,
+    };
+
+    let (rows, conds) = match &per_source {
+        Some(per_source) => {
+            let merged = interleave_labelled(&sources).map_err(corpus_err)?;
+            let total = repeated_rows(merged.len())?;
+            let mut rows = Vec::with_capacity(total);
+            let mut conds = Vec::with_capacity(total);
+            for _ in 0..opts.epochs {
+                for row in &merged {
+                    rows.push(row.ids.clone());
+                    conds.push(per_source[row.source]);
+                }
+            }
+            (rows, Some(conds))
+        }
+        None => {
+            let merged = interleave(&sources).map_err(corpus_err)?;
+            let mut rows = Vec::with_capacity(repeated_rows(merged.len())?);
+            for _ in 0..opts.epochs {
+                rows.extend(merged.iter().cloned());
+            }
+            (rows, None)
+        }
+    };
+
+    // Every file agreed on the shape — `interleave` refused the call
+    // otherwise — so the first one speaks for all of them.
+    let ctx_len = sources[0].ctx_len();
+    // The pad id is the one id that reaches training without coming out
+    // of a corpus, and it reaches almost every row: rows are stored
+    // unpadded, so everything short of `ctx_len` is filled with it. Left
+    // unchecked, a pad id inside the model's vocabulary but outside the
+    // corpus's trains the model to emit an id the corpus declares does
+    // not exist, with every shape downstream still agreeing.
+    let vocab_size = sources[0].vocab_size();
+    if opts.pad_id as usize >= vocab_size {
+        return Err(LuaError::external(format!(
+            "{CORPUS_ERR_PREFIX}: opts.pad_id = {} is at or past the meta.vocab_size \
+             {vocab_size} the corpora declare — the pad id fills every row short of ctx_len, \
+             so it is trained on",
+            opts.pad_id
+        )));
+    }
+    let dopts = DatasetOpts {
+        batch_size: opts.batch_size,
+        ctx_len,
+        pad_id: opts.pad_id,
+        // Off: the rows are in the rotation the merge put them in, and
+        // a positional condition list cannot survive a re-order.
+        shuffle: false,
+        ..DatasetOpts::default()
+    };
+    let mut ds = TokenizedDataset::new(rows, dopts);
+    if let Some(conds) = conds {
+        ds = ds
+            .with_conditions(conds)
+            .map_err(|e| LuaError::external(format!("{CORPUS_ERR_PREFIX}: {e}")))?;
+    }
+    Ok(DatasetHandle {
+        inner: Mutex::new(Box::new(ds)),
+        source: format!("corpus:{}", paths.join(",")),
+        batch_size: opts.batch_size,
+        ctx_len,
+    })
+}
+
+#[cfg(test)]
+mod corpus_bridge_tests {
+    //! Option checking for `alc.nn.data.corpus`.
+    //!
+    //! The failures worth pinning are the ones that would otherwise
+    //! leave every shape agreeing: a condition list that does not cover
+    //! the corpora it was written for, an option this surface ignores,
+    //! and a repeat count that silently empties the dataset.
+
+    use super::*;
+    use mlua::Lua;
+    use tempfile::TempDir;
+
+    /// Write a corpus file holding `rows` and return its path.
+    fn corpus_file(dir: &TempDir, name: &str, rows: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(r#"{{ "meta": {{ "ctx_len": 4, "vocab_size": 16 }}, "rows": {rows} }}"#),
+        )
+        .expect("write corpus fixture");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn opts_of(lua: &Lua, pairs: &[(&str, LuaValue)]) -> LuaTable {
+        let t = lua.create_table().expect("opts table");
+        for (k, v) in pairs {
+            t.set(*k, v.clone()).expect("set opt");
+        }
+        t
+    }
+
+    fn int_array(lua: &Lua, values: &[i64]) -> LuaValue {
+        let t = lua.create_table().expect("array table");
+        for (i, v) in values.iter().enumerate() {
+            t.set(i + 1, *v).expect("set entry");
+        }
+        LuaValue::Table(t)
+    }
+
+    fn paths_value(lua: &Lua, paths: &[&str]) -> LuaValue {
+        let t = lua.create_table().expect("paths table");
+        for (i, p) in paths.iter().enumerate() {
+            t.set(i + 1, *p).expect("set path");
+        }
+        LuaValue::Table(t)
+    }
+
+    #[test]
+    fn paths_must_be_an_array_and_a_bare_string_says_so() {
+        let lua = Lua::new();
+        let err = extract_corpus_paths(&LuaValue::String(
+            lua.create_string("/tmp/a.json").expect("string"),
+        ))
+        .expect_err("a bare path string");
+        assert!(
+            err.to_string()
+                .contains("must be an array of corpus file paths"),
+            "message: {err}"
+        );
+
+        let empty = lua.create_table().expect("paths table");
+        let err = extract_corpus_paths(&LuaValue::Table(empty)).expect_err("no paths");
+        assert!(err.to_string().contains("paths is empty"), "message: {err}");
+    }
+
+    #[test]
+    fn options_this_surface_does_not_read_are_refused_by_name() {
+        let lua = Lua::new();
+        for key in ["ctx_len", "vocab_size", "vocab", "text_field", "shuffle"] {
+            let opts = opts_of(&lua, &[(key, LuaValue::Integer(8))]);
+            let err = extract_corpus_opts(Some(&opts), 1)
+                .err()
+                .unwrap_or_else(|| panic!("opts.{key} must be refused rather than ignored"));
+            assert!(
+                err.to_string()
+                    .contains(&format!("opts.{key} is not read here")),
+                "message: {err}"
+            );
+        }
+
+        // The refusal also says where the value does come from, since
+        // that is the caller's next question.
+        let opts = opts_of(&lua, &[("ctx_len", LuaValue::Integer(8))]);
+        let err = extract_corpus_opts(Some(&opts), 1).expect_err("ctx_len is not read here");
+        assert!(err.to_string().contains("corpus meta"), "{err}");
+    }
+
+    /// The check is over the whole table rather than a list of known
+    /// mistakes: a typo of a key this entry does read would otherwise
+    /// leave the default in place with nothing said, which is the same
+    /// failure the named refusals above exist for.
+    #[test]
+    fn a_key_this_surface_never_heard_of_is_refused_by_name_too() {
+        let lua = Lua::new();
+        for key in [
+            "padid",
+            "batchsize",
+            "epoch",
+            "lr",
+            "definitely_not_an_option",
+        ] {
+            let opts = opts_of(&lua, &[(key, LuaValue::Integer(8))]);
+            let err = extract_corpus_opts(Some(&opts), 1)
+                .err()
+                .unwrap_or_else(|| panic!("opts.{key} must be refused rather than ignored"));
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!("opts.{key} is not read here")),
+                "{text}"
+            );
+            assert!(
+                text.contains("batch_size / pad_id / cond / cond_slots / epochs"),
+                "the refusal must say what the entry does take: {text}"
+            );
+        }
+
+        // Every key this entry reads passes the same gate.
+        let opts = opts_of(
+            &lua,
+            &[
+                ("batch_size", LuaValue::Integer(2)),
+                ("pad_id", LuaValue::Integer(1)),
+                ("cond", LuaValue::Integer(0)),
+                ("cond_slots", LuaValue::Integer(2)),
+                ("epochs", LuaValue::Integer(3)),
+            ],
+        );
+        let parsed = extract_corpus_opts(Some(&opts), 1).expect("the options this entry reads");
+        assert_eq!(parsed.epochs, 3);
+        assert_eq!(parsed.pad_id, 1);
+    }
+
+    #[test]
+    fn a_condition_list_must_cover_exactly_the_corpora_it_was_written_for() {
+        let lua = Lua::new();
+        let opts = opts_of(
+            &lua,
+            &[
+                ("cond", int_array(&lua, &[0, 1])),
+                ("cond_slots", LuaValue::Integer(2)),
+            ],
+        );
+        let err = extract_corpus_opts(Some(&opts), 3).expect_err("two conditions for three paths");
+        let text = err.to_string();
+        assert!(text.contains("opts.cond names 2 condition(s)"), "{text}");
+        assert!(text.contains("3 corpus path(s)"), "{text}");
+
+        // A single corpus may name its condition as a bare integer.
+        let opts = opts_of(
+            &lua,
+            &[
+                ("cond", LuaValue::Integer(1)),
+                ("cond_slots", LuaValue::Integer(2)),
+            ],
+        );
+        let parsed = extract_corpus_opts(Some(&opts), 1).expect("one condition for one path");
+        assert_eq!(parsed.cond, Some(vec![1]));
+        assert_eq!(parsed.cond_slots, Some(2));
+    }
+
+    #[test]
+    fn a_condition_without_a_table_size_and_a_table_size_without_a_condition_are_both_refused() {
+        let lua = Lua::new();
+        let opts = opts_of(&lua, &[("cond", LuaValue::Integer(0))]);
+        let err = extract_corpus_opts(Some(&opts), 1).expect_err("no cond_slots");
+        assert!(
+            err.to_string().contains("opts.cond_slots must state"),
+            "{err}"
+        );
+
+        let opts = opts_of(&lua, &[("cond_slots", LuaValue::Integer(2))]);
+        let err = extract_corpus_opts(Some(&opts), 1).expect_err("no cond");
+        assert!(
+            err.to_string().contains("without opts.cond"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn epochs_defaults_to_one_pass_and_zero_is_refused() {
+        let lua = Lua::new();
+        let parsed = extract_corpus_opts(None, 1).expect("no opts at all");
+        assert_eq!(parsed.epochs, 1);
+        assert_eq!(parsed.batch_size, DatasetOpts::default().batch_size);
+
+        let opts = opts_of(&lua, &[("epochs", LuaValue::Integer(0))]);
+        let err = extract_corpus_opts(Some(&opts), 1).expect_err("zero epochs");
+        assert!(err.to_string().contains("opts.epochs = 0"), "{err}");
+
+        // Lua has one number type, so `2.0` is how arithmetic produces
+        // a count and is taken; `1.5` is refused rather than floored to
+        // the one-pass run the caller did not ask for.
+        let opts = opts_of(&lua, &[("epochs", LuaValue::Number(2.0))]);
+        let parsed = extract_corpus_opts(Some(&opts), 1).expect("a whole float count");
+        assert_eq!(parsed.epochs, 2);
+
+        let opts = opts_of(&lua, &[("epochs", LuaValue::Number(1.5))]);
+        let err = extract_corpus_opts(Some(&opts), 1).expect_err("a fractional epoch count");
+        let text = err.to_string();
+        assert!(text.contains("opts.epochs"), "{text}");
+        assert!(text.contains("whole non-negative number"), "{text}");
+    }
+
+    /// A count large enough to be a typo is refused at the option that
+    /// named it rather than at the allocator: the merged rows are held
+    /// once per epoch. The two carriers Lua has for the same literal
+    /// share the ceiling, so which one it picked is not something the
+    /// caller has to know.
+    #[test]
+    fn an_epoch_count_past_the_ceiling_is_refused_whichever_carrier_it_arrives_in() {
+        let lua = Lua::new();
+
+        let opts = opts_of(
+            &lua,
+            &[("epochs", LuaValue::Integer(MAX_CORPUS_EPOCHS as i64 + 1))],
+        );
+        let err = extract_corpus_opts(Some(&opts), 1).expect_err("one past the ceiling");
+        let text = err.to_string();
+        assert!(text.contains("opts.epochs"), "{text}");
+        assert!(text.contains(&MAX_CORPUS_EPOCHS.to_string()), "{text}");
+
+        let opts = opts_of(
+            &lua,
+            &[("epochs", LuaValue::Integer(MAX_CORPUS_EPOCHS as i64))],
+        );
+        let parsed = extract_corpus_opts(Some(&opts), 1).expect("the ceiling itself");
+        assert_eq!(parsed.epochs, MAX_CORPUS_EPOCHS);
+
+        // 2^40 is exact in both of Lua's number carriers, and the
+        // caller cannot see which one carried it.
+        let huge = 1_i64 << 40;
+        let as_integer = opts_of(&lua, &[("epochs", LuaValue::Integer(huge))]);
+        let integer_err = extract_corpus_opts(Some(&as_integer), 1).expect_err("2^40 epochs");
+        let as_number = opts_of(&lua, &[("epochs", LuaValue::Number(huge as f64))]);
+        let number_err = extract_corpus_opts(Some(&as_number), 1).expect_err("2^40 epochs");
+        assert_eq!(
+            integer_err.to_string(),
+            number_err.to_string(),
+            "the same literal must be refused on the same terms in either carrier"
+        );
+    }
+
+    /// The whole point of the surface: several files become one dataset
+    /// whose rows alternate between them, repeated `epochs` times, with
+    /// each row carrying the condition its own corpus was labelled
+    /// with.
+    #[test]
+    fn corpora_are_merged_in_rotation_and_repeated_per_epoch() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let a = corpus_file(&dir, "a.json", "[[1, 2], [3, 4]]");
+        let b = corpus_file(&dir, "b.json", "[[5, 6]]");
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&a, &b])).expect("two paths");
+        let opts = opts_of(
+            &lua,
+            &[
+                ("batch_size", LuaValue::Integer(1)),
+                ("epochs", LuaValue::Integer(2)),
+                ("cond", int_array(&lua, &[0, 1])),
+                ("cond_slots", LuaValue::Integer(2)),
+            ],
+        );
+        let copts = extract_corpus_opts(Some(&opts), 2).expect("two conditions for two paths");
+        let handle = build_corpus_dataset(&paths, &copts).expect("a conditioned corpus dataset");
+
+        assert_eq!(handle.ctx_len, 4, "the width comes from the corpus meta");
+        assert!(handle.source.contains("a.json"), "{}", handle.source);
+
+        // 3 rows merged (a0, b0, a1), twice.
+        let mut ds = handle.inner_lock().expect("dataset lock");
+        let mut ids: Vec<Vec<u32>> = Vec::new();
+        let mut conds: Vec<u32> = Vec::new();
+        while let Some(batch) = ds.next_batch().expect("batch") {
+            ids.extend(batch.input_ids);
+            conds.extend(
+                batch
+                    .conds
+                    .expect("a conditioned dataset labels every batch")
+                    .iter()
+                    .map(|c| c.row()),
+            );
+        }
+        assert_eq!(
+            ids,
+            vec![
+                vec![1, 2, 0, 0],
+                vec![5, 6, 0, 0],
+                vec![3, 4, 0, 0],
+                vec![1, 2, 0, 0],
+                vec![5, 6, 0, 0],
+                vec![3, 4, 0, 0],
+            ],
+            "rotation first, then the repeat, padded to the corpus ctx_len"
+        );
+        assert_eq!(conds, vec![0, 1, 0, 0, 1, 0]);
+    }
+
+    /// Files that disagree about their shape reach Lua as a refusal
+    /// naming both of them rather than as a dataset built on one of the
+    /// two.
+    #[test]
+    fn corpora_that_disagree_about_their_shape_reach_lua_as_a_refusal() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let a = corpus_file(&dir, "a.json", "[[1, 2]]");
+        let narrow = dir.path().join("narrow.json");
+        std::fs::write(
+            &narrow,
+            r#"{ "meta": { "ctx_len": 4, "vocab_size": 8 }, "rows": [[1]] }"#,
+        )
+        .expect("write corpus fixture");
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&a, &narrow.to_string_lossy()]))
+            .expect("two paths");
+        let copts = extract_corpus_opts(None, 2).expect("no opts");
+        // `DatasetHandle` carries no `Debug` (it holds a boxed
+        // `Dataset`), so the success arm is named rather than unwrapped.
+        let Err(err) = build_corpus_dataset(&paths, &copts) else {
+            panic!("corpora disagreeing about their id space must be refused");
+        };
+        let text = err.to_string();
+        assert!(text.contains(CORPUS_ERR_PREFIX), "{text}");
+        assert!(
+            text.contains("a.json") && text.contains("narrow.json"),
+            "{text}"
+        );
+    }
+
+    /// A load failure keeps the file's own message — the row and
+    /// position are what a producer needs to find the line that wrote
+    /// them.
+    #[test]
+    fn a_token_outside_the_declared_id_space_reaches_lua_with_its_position() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let path = corpus_file(&dir, "wide.json", "[[1, 99]]");
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&path])).expect("one path");
+        let copts = extract_corpus_opts(None, 1).expect("no opts");
+        let Err(err) = build_corpus_dataset(&paths, &copts) else {
+            panic!("an id outside the declared space must be refused");
+        };
+        let text = err.to_string();
+        assert!(text.contains("row 0 position 1"), "{text}");
+        assert!(text.contains("meta.vocab_size 16"), "{text}");
+    }
+
+    /// The pad id is checked against the id space the corpora declare,
+    /// like every id that comes out of a file. It is the one id that
+    /// does not: it arrives in `opts` and is written into every row
+    /// short of `ctx_len`, so a pad id inside the model's vocabulary
+    /// but outside the corpus's would train the model to emit an id the
+    /// corpus says does not exist, with no shape disagreeing about it.
+    #[test]
+    fn a_pad_id_outside_the_corpora_id_space_is_refused_by_the_option_that_named_it() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let path = corpus_file(&dir, "a.json", "[[1, 2]]");
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&path])).expect("one path");
+
+        // The fixture declares vocab_size 16.
+        let opts = opts_of(&lua, &[("pad_id", LuaValue::Integer(16))]);
+        let copts = extract_corpus_opts(Some(&opts), 1).expect("a pad id within a token id");
+        let Err(err) = build_corpus_dataset(&paths, &copts) else {
+            panic!("a pad id at the declared vocab_size must be refused");
+        };
+        let text = err.to_string();
+        assert!(text.contains("opts.pad_id = 16"), "{text}");
+        assert!(text.contains("meta.vocab_size 16"), "{text}");
+
+        // The last id the corpus declares is still a pad id.
+        let opts = opts_of(&lua, &[("pad_id", LuaValue::Integer(15))]);
+        let copts = extract_corpus_opts(Some(&opts), 1).expect("a pad id within the id space");
+        assert!(
+            build_corpus_dataset(&paths, &copts).is_ok(),
+            "the highest id the corpus declares must still pad"
+        );
+    }
+
+    /// A slot outside the declared table is refused at the option that
+    /// named it, before any row is built.
+    #[test]
+    fn a_condition_outside_the_declared_table_names_the_option_entry() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let path = corpus_file(&dir, "a.json", "[[1, 2]]");
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&path])).expect("one path");
+        let opts = opts_of(
+            &lua,
+            &[
+                ("cond", LuaValue::Integer(5)),
+                ("cond_slots", LuaValue::Integer(2)),
+            ],
+        );
+        let copts = extract_corpus_opts(Some(&opts), 1).expect("one condition for one path");
+        let Err(err) = build_corpus_dataset(&paths, &copts) else {
+            panic!("slot 5 of a 2-row table must be refused");
+        };
+        assert!(err.to_string().contains("opts.cond[1]"), "{err}");
+    }
 }
 
 // ─── alc.nn.trainer ───────────────────────────────────────────────

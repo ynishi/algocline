@@ -870,6 +870,144 @@ embedding space; whether the model's *behaviour* interpolates with it
 is a property of the trained model and something to measure, not
 something this option asserts.
 
+#### `alc.nn.data.corpus(paths, opts?) -> DatasetHandle`
+
+Build a dataset from one or more **corpus files**: JSON files of
+already-tokenized rows. Returns the same handle
+`alc.nn.data.synthetic` / `.jsonl` / `.parquet` return, so every
+trainer entry takes it unchanged.
+
+A producer that tokenizes its own material — a simulator, an export
+from another tool, an earlier stage of the same pipeline — has no text
+left for a tokenizer to read, which is what separates this entry from
+its siblings: no tokenizer is loaded and no `text_field` is consulted.
+
+**Format** (the rustdoc of `algocline_nn::train::corpus` is the
+specification; this is the same statement in short):
+
+```json
+{
+  "meta": { "ctx_len": 48, "vocab_size": 46 },
+  "rows": [[3, 7, 1], [2, 9]]
+}
+```
+
+- `meta.ctx_len` / `meta.vocab_size` — both non-zero. Every id in
+  `rows` is checked against `vocab_size` at load, naming the file, the
+  row and the position; an id past it would otherwise surface much
+  later as an out-of-range embedding lookup.
+- `meta.requires` — optional array of `meta` field names a reader has
+  to understand for the file to mean what its producer intended. An
+  entry this version does not implement is refused by name. This
+  version understands `ctx_len` and `vocab_size`.
+- `meta.<anything else>` — ignored *unless `meta.requires` lists it*,
+  so a producer may record whatever else it wants and a file carrying a
+  bookkeeping field this version has never heard of still loads.
+- `rows` — token id sequences, at least one, none empty, none longer
+  than `meta.ctx_len` (a row past the width its own file declares is
+  refused, naming the file and the row). Rows are not padded in the
+  file: padding to `ctx_len` happens per batch, as for every other
+  dataset.
+
+**Extending the format** is what `meta.requires` is for, and it is why
+the format needs no version number. A field that only records how the
+file was made goes in `meta` and older readers ignore it. A field the
+file's *meaning* depends on is listed in `meta.requires`, so a reader
+that does not implement it refuses the file instead of training on a
+reading its producer did not intend.
+
+**Parameters:**
+
+| name | type | required | notes |
+|------|------|----------|-------|
+| paths | array of string | yes | corpus file paths; a single file is written as `{ "…" }` |
+| opts.batch_size | integer | no | rows per batch (default 8) |
+| opts.pad_id | integer | no | fills rows short of `ctx_len` (default 0); below the corpus `meta.vocab_size`, and refused otherwise |
+| opts.cond | integer or array | no | one conditioning-table row per corpus (a bare integer for a single corpus) |
+| opts.cond_slots | integer | with `cond` | rows of the model's conditioning table |
+| opts.epochs | integer | no | how many times the merged row list is repeated (default 1) |
+
+**`ctx_len` and the id space are not options.** They come from the
+corpus `meta`, and every file of one call has to agree on them
+(disagreement is refused, naming both files). Passing `ctx_len` /
+`vocab_size` / `vocab` / `text_field` / `shuffle` is refused rather
+than ignored — a value that did not take effect would train at a width
+or an id space the corpus was not written for, with every shape
+downstream still agreeing. **Every other key is refused too**, naming
+it: the table is checked against the five options above rather than
+against a list of known mistakes, so `padid` or `batchsize` is refused
+instead of silently leaving the default in place.
+
+**`pad_id`** fills every row short of `ctx_len`, and rows are stored
+unpadded, so it is trained on. It is checked against the
+`meta.vocab_size` the corpora declare — the one id that reaches
+training without coming out of a file — because a pad id inside the
+model's vocabulary but outside the corpus's would train the model to
+emit an id the corpus says does not exist.
+
+**Several files are merged round-robin**, not concatenated: source 1
+row 1, source 2 row 1, source 1 row 2, … with a source dropping out of
+the rotation once drained. Concatenation makes "which corpus" a
+function of how far the run has got, which a conditioned run cannot
+separate from the condition it is supposed to be binding. Nothing is
+duplicated to even the rotation out — that would change the mixture
+that was named.
+
+**`cond`** labels each corpus with the conditioning-table row its rows
+were recorded under, positionally against `paths`; a different count is
+refused naming both. `cond_slots` states the table size the rows are
+checked against and is required alongside `cond` (a slot index and a
+token id overlap without meaning the same thing, and the largest slot a
+corpus happens to use is not the size of the model's table). Given
+without `cond`, it is refused too: a table with nothing selecting a row
+from it conditions nothing.
+
+**`epochs`** repeats the *merged* list, which is what a one-pass
+dataset needs when a run consumes more rows than the corpora hold —
+repeating the merged order keeps the rotation intact across repeats.
+`0` is refused (it builds a dataset with no rows), and a fractional
+count is refused rather than floored. Repetition is not shuffling: the
+row order within an epoch is the merge order every time.
+
+**What `epochs` costs.** The merged rows are held in memory once per
+epoch: the whole dataset is materialised, and peak use is roughly
+`(2 + epochs) ×` the corpora's rows (the loaded files, the merged list,
+and one copy per epoch). `epochs` therefore multiplies the dataset's
+footprint rather than re-reading the files, which is why it is capped
+at 10000 — past that a count is an extra digit rather than a run. A run
+wanting many passes over a large corpus wants a cycling dataset rather
+than a larger `epochs`.
+
+```lua
+-- Two corpora, one condition each, two passes over the merged rows.
+local ds = alc.nn.data.corpus({ "/data/a.json", "/data/b.json" }, {
+    batch_size = 32, cond = { 0, 1 }, cond_slots = 2, epochs = 2,
+})
+
+local handle = alc.nn.preset.gpt2("custom", {
+    pretrained = false, cond_slots = 2,
+})
+local card_id = alc.nn.trainer.run_full_ft(handle, ds, {
+    lr = 3e-3, batch = 32, steps = 250, warmup = 0,
+})
+```
+
+**Errors** (all naming what disagreed): a `paths` that is not an array
+or is empty, an entry that is not a path string, a file that cannot be
+read, bytes that are not the JSON object above, a missing `meta` /
+`meta.ctx_len` / `meta.vocab_size`, a zero dimension (either `meta`
+field, no rows, or an empty row), a token at or past the declared
+`vocab_size` (named with its row and position), a row longer than the
+declared `ctx_len` (named with its row), a `meta.requires` entry this
+version does not implement (named), files disagreeing about `ctx_len` /
+`vocab_size`, a `cond` whose length is not the number of paths, `cond`
+without `cond_slots` or `cond_slots` without `cond`, a slot outside the
+declared table (named as `opts.cond[i]`), a `pad_id` at or past the
+declared `vocab_size`, a `batch_size` or `epochs` of zero, an `epochs`
+past 10000, a numeric option that is not whole or is above 4294967295
+(the same ceiling whichever of Lua's two number carriers it arrives
+in), and any key this entry does not read.
+
 #### `alc.nn.logits.mix(a, b, beta, opts?)`
 
 Combine two logits rows into one, with `beta` the weight on `a`.

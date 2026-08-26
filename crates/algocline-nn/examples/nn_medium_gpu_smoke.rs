@@ -153,6 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
 
     let ckpt_dir = ckpt_path

@@ -47,7 +47,7 @@ use algocline_nn::card::{
 };
 use algocline_nn::merged::{export_merged, MergeError, MergedProvenance};
 use algocline_nn::tokenizer::HfTokenizer;
-use algocline_nn::train::corpus::{interleave, interleave_labelled};
+use algocline_nn::train::corpus::interleave_labelled;
 use algocline_nn::train::{
     run_distill, run_full_ft, run_lora_ft, Batch, CorpusFile, CrossEntropyLoss, Dataset,
     DatasetOpts, DistillSpec, JsonlDataset, ParquetDataset, TeacherCardDataset, TokenizedDataset,
@@ -4607,29 +4607,41 @@ fn build_corpus_dataset(paths: &[String], opts: &CorpusOpts) -> LuaResult<Datase
         _ => None,
     };
 
-    let (rows, conds) = match &per_source {
-        Some(per_source) => {
-            let merged = interleave_labelled(&sources).map_err(corpus_err)?;
-            let total = repeated_rows(merged.len())?;
-            let mut rows = Vec::with_capacity(total);
-            let mut conds = Vec::with_capacity(total);
-            for _ in 0..opts.epochs {
-                for row in &merged {
-                    rows.push(row.ids.clone());
-                    conds.push(per_source[row.source]);
-                }
+    let merged = interleave_labelled(&sources).map_err(corpus_err)?;
+    let total = repeated_rows(merged.len())?;
+
+    // The corpora leave each row's allowed-id sets at its own last
+    // listed position, and the readers of those sets take one width for
+    // the whole batch. The width is therefore settled here, once every
+    // source has been merged: widening with the empty set says
+    // "unconstrained there", which is already what a position nobody
+    // listed means. `None` when no source carried sets at all —
+    // `interleave_labelled` has already refused a mix of the two.
+    let allowed_width = merged
+        .iter()
+        .filter_map(|row| row.allowed.as_ref())
+        .map(Vec::len)
+        .max();
+
+    let mut rows = Vec::with_capacity(total);
+    let mut conds = per_source.as_ref().map(|_| Vec::with_capacity(total));
+    let mut allowed = allowed_width.map(|_| Vec::with_capacity(total));
+    for _ in 0..opts.epochs {
+        for row in &merged {
+            rows.push(row.ids.clone());
+            // Both side channels are pushed at the same index as the row
+            // they came with, in the same iteration, so a repeat cannot
+            // shift one against the other.
+            if let (Some(conds), Some(per_source)) = (conds.as_mut(), per_source.as_ref()) {
+                conds.push(per_source[row.source]);
             }
-            (rows, Some(conds))
-        }
-        None => {
-            let merged = interleave(&sources).map_err(corpus_err)?;
-            let mut rows = Vec::with_capacity(repeated_rows(merged.len())?);
-            for _ in 0..opts.epochs {
-                rows.extend(merged.iter().cloned());
+            if let (Some(allowed), Some(width)) = (allowed.as_mut(), allowed_width) {
+                let mut sets = row.allowed.clone().unwrap_or_default();
+                sets.resize(width, Vec::new());
+                allowed.push(sets);
             }
-            (rows, None)
         }
-    };
+    }
 
     // Every file agreed on the shape — `interleave` refused the call
     // otherwise — so the first one speaks for all of them.
@@ -4662,6 +4674,14 @@ fn build_corpus_dataset(paths: &[String], opts: &CorpusOpts) -> LuaResult<Datase
     if let Some(conds) = conds {
         ds = ds
             .with_conditions(conds)
+            .map_err(|e| LuaError::external(format!("{CORPUS_ERR_PREFIX}: {e}")))?;
+    }
+    if let Some(allowed) = allowed {
+        // This is where a set that excludes the token its own position
+        // holds is refused: the loss would otherwise score that token
+        // among ids the corpus says it was not drawn from.
+        ds = ds
+            .with_allowed_ids(allowed)
             .map_err(|e| LuaError::external(format!("{CORPUS_ERR_PREFIX}: {e}")))?;
     }
     Ok(DatasetHandle {
@@ -5070,6 +5090,88 @@ mod corpus_bridge_tests {
             panic!("slot 5 of a 2-row table must be refused");
         };
         assert!(err.to_string().contains("opts.cond[1]"), "{err}");
+    }
+
+    /// Write a corpus carrying allowed-id sets and return its path.
+    fn allowed_corpus_file(dir: &TempDir, name: &str, rows: &str, allowed: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{ "meta": {{ "ctx_len": 4, "vocab_size": 16,
+                                 "requires": ["per_row_allowed"] }},
+                      "rows": {rows}, "allowed": {allowed} }}"#
+            ),
+        )
+        .expect("write corpus fixture");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// No option carries the sets — they come from the files, like
+    /// `ctx_len` — so what has to be pinned is that they arrive at the
+    /// dataset. Both assertions below fail if they do not: the widths
+    /// here are deliberately ragged, which the dataset refuses unless
+    /// this surface reconciles them first.
+    #[test]
+    fn allowed_sets_reach_the_dataset_and_ragged_widths_are_reconciled() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let a = allowed_corpus_file(
+            &dir,
+            "a.json",
+            "[[1, 2, 3], [4, 5]]",
+            r#"[{ "2": [2, 9], "3": [3] }, { "2": [5] }]"#,
+        );
+        let b = allowed_corpus_file(&dir, "b.json", "[[6, 7]]", r#"[{ "2": [7] }]"#);
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&a, &b])).expect("two paths");
+        let copts = extract_corpus_opts(None, 2).expect("defaults");
+
+        build_corpus_dataset(&paths, &copts).expect("a corpus carrying allowed-id sets builds");
+    }
+
+    /// The set that excludes the token its own position holds is the
+    /// one failure a corpus cannot answer: the loss would score that
+    /// token among ids the file says it was not drawn from. Reaching
+    /// this refusal is also what shows the sets were handed over rather
+    /// than read and dropped.
+    #[test]
+    fn a_set_that_excludes_its_own_token_is_refused_through_this_surface() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let path = allowed_corpus_file(&dir, "a.json", "[[1, 2, 3]]", r#"[{ "2": [9] }]"#);
+        let paths = extract_corpus_paths(&paths_value(&lua, &[&path])).expect("one path");
+        let copts = extract_corpus_opts(None, 1).expect("defaults");
+
+        let Err(err) = build_corpus_dataset(&paths, &copts) else {
+            panic!("a set excluding the token at its own position must be refused");
+        };
+        let text = err.to_string();
+        assert!(text.contains(CORPUS_ERR_PREFIX), "{text}");
+        assert!(text.contains("position 1"), "{text}");
+    }
+
+    /// One constrained corpus and one plain one cannot be merged: the
+    /// plain one's rows would train unconstrained inside a run set up as
+    /// a constrained one.
+    #[test]
+    fn mixing_a_constrained_corpus_with_a_plain_one_reaches_lua_as_a_refusal() {
+        let lua = Lua::new();
+        let dir = TempDir::new().expect("tempdir");
+        let constrained =
+            allowed_corpus_file(&dir, "constrained.json", "[[1, 2]]", r#"[{ "2": [2] }]"#);
+        let plain = corpus_file(&dir, "plain.json", "[[3, 4]]");
+        let paths =
+            extract_corpus_paths(&paths_value(&lua, &[&constrained, &plain])).expect("two paths");
+        let copts = extract_corpus_opts(None, 2).expect("defaults");
+
+        let Err(err) = build_corpus_dataset(&paths, &copts) else {
+            panic!("a mixed merge must be refused");
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("constrained.json") && text.contains("plain.json"),
+            "{text}"
+        );
     }
 }
 

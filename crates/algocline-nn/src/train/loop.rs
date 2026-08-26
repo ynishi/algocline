@@ -27,6 +27,7 @@ use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
 use crate::train::ckpt::{checkpoint_from_path, restore_into, CheckpointStore, RestoreError};
 use crate::train::data::{Batch, Dataset, DatasetError};
+use crate::train::lion::{Lion, ParamsLion};
 use crate::train::loss::Loss;
 use crate::train::mixed::MixedAdamW;
 use crate::train::scheduler::{ScheduleKind, Scheduler};
@@ -48,13 +49,78 @@ use crate::train::DeviceView;
 enum FtOptimizer {
     Stock(AdamW),
     Mixed(MixedAdamW),
+    Lion(Lion),
+}
+
+/// Which optimizer the trainer requested.
+///
+/// The dtype dispatch below is a separate axis: it decides *how* a
+/// chosen optimizer is realised (stock or FP32-master), not which one
+/// the caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum OptimizerKind {
+    /// Decoupled-decay Adam. The default, and what every existing run
+    /// was trained with.
+    #[default]
+    AdamW,
+    /// Sign-momentum, from arXiv:2302.06675. Takes a learning rate
+    /// 3–10× smaller than AdamW's and a weight decay 3–10× larger —
+    /// carrying AdamW's values over unchanged trains at a step size an
+    /// order of magnitude off.
+    Lion,
+}
+
+impl OptimizerKind {
+    /// Parse the wire form written by callers (Lua bridge, JSON config).
+    ///
+    /// `None` on an unknown string, so the caller can name the
+    /// alternatives rather than surface a generic parse error.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "adamw" | "adam_w" | "adam" => Some(Self::AdamW),
+            "lion" => Some(Self::Lion),
+            _ => None,
+        }
+    }
+
+    /// Every wire name this version accepts.
+    pub const NAMES: [&'static str; 4] = ["adamw", "adam_w", "adam", "lion"];
 }
 
 impl FtOptimizer {
-    fn for_vars(vars: Vec<candle_core::Var>, params: ParamsAdamW) -> Result<Self, TrainError> {
+    fn for_vars(
+        kind: OptimizerKind,
+        vars: Vec<candle_core::Var>,
+        params: ParamsAdamW,
+    ) -> Result<Self, TrainError> {
         let mut dtypes: Vec<DType> = vars.iter().map(|v| v.dtype()).collect();
         dtypes.sort_by_key(|d| format!("{d:?}"));
         dtypes.dedup();
+        // Lion keeps its own FP32 master where one is needed, so it
+        // spans both dtypes without a second arm here.
+        if kind == OptimizerKind::Lion {
+            return match dtypes.as_slice() {
+                [DType::F32] | [DType::BF16] => Ok(Self::Lion(Lion::new(
+                    vars,
+                    ParamsLion {
+                        lr: params.lr,
+                        beta1: params.beta1,
+                        beta2: params.beta2,
+                        weight_decay: params.weight_decay,
+                    },
+                )?)),
+                [DType::F16] => Err(TrainError::Candle(
+                    "run_ft_core: f16 parameters need loss scaling, which is not \
+                     implemented — build the model with dtype bf16 (CUDA) or f32"
+                        .into(),
+                )),
+                other => Err(TrainError::Candle(format!(
+                    "run_ft_core: unsupported parameter dtype set {other:?} \
+                     (expected all-f32 or all-bf16)"
+                ))),
+            };
+        }
         match dtypes.as_slice() {
             [DType::F32] => Ok(Self::Stock(AdamW::new(vars, params)?)),
             [DType::BF16] => Ok(Self::Mixed(MixedAdamW::new(vars, params)?)),
@@ -74,6 +140,7 @@ impl FtOptimizer {
         match self {
             Self::Stock(o) => o.set_learning_rate(lr),
             Self::Mixed(o) => o.set_learning_rate(lr),
+            Self::Lion(o) => o.set_learning_rate(lr),
         }
     }
 
@@ -89,6 +156,7 @@ impl FtOptimizer {
         match self {
             Self::Stock(o) => o.step(grads),
             Self::Mixed(o) => o.step(grads),
+            Self::Lion(o) => o.step(grads),
         }
     }
 }
@@ -122,8 +190,36 @@ pub struct FullFtConfig {
     pub warmup: usize,
     /// Schedule variant.
     pub schedule: ScheduleKind,
-    /// AdamW weight decay.
+    /// Floor the decaying schedules land on at `steps` and hold
+    /// afterwards. `0.0` (default) reproduces the decay-to-zero the
+    /// cosine schedule had before this field existed.
+    ///
+    /// Governs the tail only: the warmup ramp climbs from near zero and
+    /// passes below this value on its way up.
+    pub min_lr: f64,
+    /// Length of the decay stretch for
+    /// [`ScheduleKind::WarmupStableDecay`], in steps. `None` leaves it
+    /// at the share [`Scheduler::DEFAULT_DECAY_FRACTION`] names. Read
+    /// by no other schedule.
+    pub decay_steps: Option<usize>,
+    /// Which optimizer runs the steps.
+    pub optimizer: OptimizerKind,
+    /// Weight decay, decoupled from the gradient in both optimizers.
+    ///
+    /// Lion's guidance puts this 3–10× above an AdamW value for the
+    /// same run, because the effective decay is `lr·λ` and Lion's `lr`
+    /// is correspondingly smaller.
     pub weight_decay: f64,
+    /// First-moment / update-blend coefficient. AdamW's `β₁` and Lion's
+    /// alike; the paper defaults differ (0.9 for both here, but Lion's
+    /// `β₂` default is 0.99 against AdamW's 0.999).
+    pub beta1: f64,
+    /// Second-moment coefficient for AdamW, momentum-EMA coefficient
+    /// for Lion.
+    pub beta2: f64,
+    /// AdamW's denominator epsilon. Unread by Lion, which has no
+    /// second moment to divide by.
+    pub eps: f64,
     /// Save a rotating checkpoint every N steps. Set to 0 to disable
     /// mid-run checkpoints (the final `<prefix>.safetensors` is still
     /// written at the end).
@@ -179,7 +275,16 @@ impl Default for FullFtConfig {
             steps: 100,
             warmup: 10,
             schedule: ScheduleKind::CosineWithWarmup,
+            min_lr: 0.0,
+            decay_steps: None,
+            optimizer: OptimizerKind::AdamW,
             weight_decay: 0.1,
+            // candle's `ParamsAdamW` defaults, restated rather than
+            // inherited so a candle bump is a visible change here
+            // instead of a silent one in every run.
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
             init_from: None,
@@ -734,11 +839,19 @@ fn run_ft_core(
     let adamw_params = ParamsAdamW {
         lr: cfg.lr,
         weight_decay: cfg.weight_decay,
-        ..Default::default()
+        beta1: cfg.beta1,
+        beta2: cfg.beta2,
+        eps: cfg.eps,
     };
-    let mut opt = FtOptimizer::for_vars(vars, adamw_params)?;
+    let mut opt = FtOptimizer::for_vars(cfg.optimizer, vars, adamw_params)?;
 
-    let scheduler = Scheduler::new(cfg.schedule, cfg.lr, 0.0, cfg.warmup, cfg.steps);
+    let scheduler = {
+        let s = Scheduler::new(cfg.schedule, cfg.lr, cfg.min_lr, cfg.warmup, cfg.steps);
+        match cfg.decay_steps {
+            Some(n) => s.with_decay_steps(n),
+            None => s,
+        }
+    };
 
     // The store is always constructed: even without mid-run
     // checkpoints (`ckpt_every == 0`) the loop still writes the
@@ -1536,6 +1649,7 @@ mod tests {
             ckpt_keep: 1,
             init_from: None,
             mask_disallowed_logits: false,
+            ..FullFtConfig::default()
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1619,6 +1733,7 @@ mod tests {
             ckpt_keep: 3,
             init_from: None,
             mask_disallowed_logits: false,
+            ..FullFtConfig::default()
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1672,6 +1787,7 @@ mod tests {
             ckpt_keep: 5,
             init_from: None,
             mask_disallowed_logits: false,
+            ..FullFtConfig::default()
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1771,6 +1887,7 @@ mod tests {
             ckpt_keep: 3,
             init_from: None,
             mask_disallowed_logits: false,
+            ..FullFtConfig::default()
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1841,6 +1958,7 @@ mod tests {
             ckpt_keep: 3,
             init_from: None,
             mask_disallowed_logits: false,
+            ..FullFtConfig::default()
         };
         let tmp = TempDir::new().unwrap();
         let lease = Arc::new(TrainingLease::new());
@@ -1890,6 +2008,7 @@ mod tests {
             ckpt_keep: 1,
             init_from: None,
             mask_disallowed_logits: false,
+            ..FullFtConfig::default()
         };
 
         // Run A: baseline (no hook).

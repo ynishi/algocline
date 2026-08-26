@@ -31,7 +31,8 @@
 //!   reader has to understand for the file to mean what its producer
 //!   intended. An entry this version does not implement is refused by
 //!   name ([`CorpusError::UnsupportedRequirement`]) rather than loaded
-//!   without it. This version understands `ctx_len` and `vocab_size`.
+//!   without it. This version understands `ctx_len`, `vocab_size` and
+//!   `per_row_allowed`.
 //! - **`meta.<anything else>`** — ignored unless `meta.requires` lists
 //!   it. A producer records more than a trainer reads, and a file
 //!   carrying a bookkeeping field this version has never heard of still
@@ -40,6 +41,43 @@
 //!   none longer than `meta.ctx_len`. Rows are *not* padded here:
 //!   padding to `ctx_len` is [`crate::train::TokenizedDataset`]'s
 //!   business, per batch.
+//! - **`allowed`** — optional, and opt-in through
+//!   `meta.requires: ["per_row_allowed"]`: which ids each position of
+//!   each row was allowed to take. See *Allowed-id sets* below.
+//!
+//! # Allowed-id sets
+//!
+//! A corpus may state what was available at each position, which a run
+//! reads either as a mask on the loss or as an input to the model. The
+//! field is opt-in and announces itself:
+//!
+//! ```json
+//! {
+//!   "meta": { "ctx_len": 4, "vocab_size": 10, "requires": ["per_row_allowed"] },
+//!   "rows": [[3, 7, 1, 5]],
+//!   "allowed": [{ "2": [7, 8], "4": [5] }]
+//! }
+//! ```
+//!
+//! `allowed` is parallel to `rows`, one entry per row, and each entry is
+//! sparse: it maps a **1-based** position to the ids available there. A
+//! position nobody listed is unconstrained, which is what an empty set
+//! means downstream too — so the padding past the end of a row is left
+//! out rather than spelled.
+//!
+//! The requirement and the field are checked against each other in both
+//! directions ([`CorpusError::AllowedMissing`] /
+//! [`CorpusError::AllowedUnannounced`]). Either way round the run would
+//! otherwise train on rows that do not mean what the producer wrote and
+//! report the numbers of a well-formed one: `allowed` without the
+//! requirement lets a reader that does not implement the field train the
+//! same rows unconstrained, and the requirement without `allowed` is a
+//! producer that meant to write sets and did not.
+//!
+//! Rows are left at their own listed width here. Widening them to the
+//! common width the model's allowed-id input takes belongs with the
+//! merge, because a width can only be settled once every source has been
+//! read.
 //!
 //! # Extending the format
 //!
@@ -197,6 +235,112 @@ pub enum CorpusError {
         /// The `meta` field the file requires a reader to understand.
         field: String,
     },
+    /// `meta.requires` lists `per_row_allowed` and the file carries no
+    /// top-level `allowed` array.
+    ///
+    /// The producer marked the sets as load-bearing and then did not
+    /// write them, so the rows on their own are not the corpus it meant
+    /// to hand over.
+    #[error(
+        "corpus {}: meta.requires lists `per_row_allowed` and there is no top-level \
+         `allowed` array — the requirement says the rows are not the whole corpus, and \
+         the sets it points at are absent",
+        .path.display()
+    )]
+    AllowedMissing {
+        /// File the loader was reading.
+        path: PathBuf,
+    },
+    /// The file carries a top-level `allowed` array without listing
+    /// `per_row_allowed` in `meta.requires`.
+    ///
+    /// Refused rather than read: unannounced, a reader that does not
+    /// implement the field trains the same rows unconstrained and
+    /// reports the same numbers, so the two runs cannot be told apart
+    /// afterwards.
+    #[error(
+        "corpus {}: a top-level `allowed` array is present without `per_row_allowed` in \
+         meta.requires — unannounced, a reader that does not implement the field trains \
+         these rows unconstrained and reports the same numbers",
+        .path.display()
+    )]
+    AllowedUnannounced {
+        /// File the loader was reading.
+        path: PathBuf,
+    },
+    /// `allowed` and `rows` are not the same length.
+    #[error(
+        "corpus {}: `allowed` holds {entries} entr(ies) for {rows} row(s) — the two are \
+         parallel, so it takes exactly one entry per row",
+        .path.display()
+    )]
+    AllowedCountMismatch {
+        /// File the loader was reading.
+        path: PathBuf,
+        /// How many entries `allowed` holds.
+        entries: usize,
+        /// How many rows the file holds.
+        rows: usize,
+    },
+    /// An `allowed` entry is keyed by something that is not a 1-based
+    /// position.
+    #[error(
+        "corpus {}: allowed[{row}] is keyed by {key:?}, which is not a 1-based position \
+         ({why})",
+        .path.display()
+    )]
+    AllowedPositionKey {
+        /// File the loader was reading.
+        path: PathBuf,
+        /// 0-based row index within `rows`.
+        row: usize,
+        /// The key as it was written.
+        key: String,
+        /// Why it could not be read as a position.
+        why: String,
+    },
+    /// An `allowed` set names an id at or past the `meta.vocab_size` its
+    /// own file declares.
+    #[error(
+        "corpus {}: allowed[{row}] position {position} allows token id {token}, outside \
+         the meta.vocab_size {vocab_size} the file declares",
+        .path.display()
+    )]
+    AllowedIdOutOfRange {
+        /// File the loader was reading.
+        path: PathBuf,
+        /// 0-based row index within `rows`.
+        row: usize,
+        /// 1-based position the set was listed at.
+        position: usize,
+        /// The id that was found.
+        token: u64,
+        /// The id space the file declares.
+        vocab_size: usize,
+    },
+    /// Files being combined disagree about whether they carry allowed-id
+    /// sets at all.
+    ///
+    /// Refused rather than merged: the rows of the source without sets
+    /// would train unconstrained inside a run the caller set up as a
+    /// constrained one, and nothing downstream distinguishes "this row
+    /// had no constraint recorded" from "this row was unconstrained".
+    #[error(
+        "corpus {} {} allowed-id sets and {} {} — a merge of the two would train part of \
+         the rows unconstrained inside a run set up as a constrained one",
+        .first.display(),
+        if *.first_has { "carries" } else { "carries no" },
+        .other.display(),
+        if *.first_has { "does not" } else { "does" }
+    )]
+    AllowedPresenceMismatch {
+        /// First file of the combination (the one setting the shape).
+        first: PathBuf,
+        /// Whether that file carries the sets.
+        first_has: bool,
+        /// File that disagreed.
+        other: PathBuf,
+    },
     /// Two files being combined disagree about the shape their rows
     /// were written for.
     ///
@@ -250,6 +394,7 @@ pub struct CorpusFile {
     ctx_len: usize,
     vocab_size: usize,
     rows: Vec<Vec<u32>>,
+    allowed: Option<Vec<Vec<Vec<u32>>>>,
 }
 
 impl CorpusFile {
@@ -279,6 +424,19 @@ impl CorpusFile {
         &self.rows
     }
 
+    /// The allowed-id sets, dense by 0-based position and parallel to
+    /// [`Self::rows`], when the file carries them — `None` when it does
+    /// not, which is the majority of corpora.
+    ///
+    /// Each row runs to its own last listed position and holds the empty
+    /// set, meaning unconstrained, everywhere nobody listed. Rows are
+    /// deliberately left ragged: the common width the model's allowed-id
+    /// input takes cannot be settled until every source of a merge has
+    /// been read, so widening belongs with the merge rather than here.
+    pub fn allowed(&self) -> Option<&[Vec<Vec<u32>>]> {
+        self.allowed.as_deref()
+    }
+
     /// Read and validate the corpus file at `path`.
     ///
     /// # Errors
@@ -294,6 +452,16 @@ impl CorpusFile {
     /// declared `meta.ctx_len`, and
     /// [`CorpusError::UnsupportedRequirement`] when `meta.requires`
     /// names something this reader does not implement.
+    ///
+    /// For a file carrying allowed-id sets, additionally
+    /// [`CorpusError::AllowedMissing`] /
+    /// [`CorpusError::AllowedUnannounced`] when the requirement and the
+    /// field disagree, [`CorpusError::AllowedCountMismatch`] when
+    /// `allowed` is not parallel to `rows`,
+    /// [`CorpusError::AllowedPositionKey`] when an entry is keyed by
+    /// something that is not a 1-based position, and
+    /// [`CorpusError::AllowedIdOutOfRange`] when a set names an id at or
+    /// past the declared `meta.vocab_size`.
     pub fn load(path: &Path) -> Result<Self, CorpusError> {
         let text = std::fs::read_to_string(path).map_err(|e| CorpusError::Io {
             path: path.to_path_buf(),
@@ -329,7 +497,7 @@ impl CorpusFile {
             .ok_or_else(|| parse_err(format!("meta is a JSON {}, not an object", kind(meta))))?;
         let ctx_len = read_dim(path, meta, "ctx_len")?;
         let vocab_size = read_dim(path, meta, "vocab_size")?;
-        check_requirements(path, meta)?;
+        let requires_allowed = check_requirements(path, meta)?;
 
         let rows_val = obj
             .get("rows")
@@ -396,31 +564,165 @@ impl CorpusFile {
             rows.push(ids);
         }
 
+        // The requirement and the field are checked against each other
+        // before either is read, so a file that disagrees with itself is
+        // named for the disagreement rather than for whatever the sets
+        // then fail on.
+        let allowed = match (requires_allowed, obj.get("allowed")) {
+            (true, None) => {
+                return Err(CorpusError::AllowedMissing {
+                    path: path.to_path_buf(),
+                })
+            }
+            (false, Some(_)) => {
+                return Err(CorpusError::AllowedUnannounced {
+                    path: path.to_path_buf(),
+                })
+            }
+            (false, None) => None,
+            (true, Some(value)) => Some(read_allowed(path, value, &rows, vocab_size)?),
+        };
+
         Ok(Self {
             path: path.to_path_buf(),
             ctx_len,
             vocab_size,
             rows,
+            allowed,
         })
     }
 }
 
-/// The `meta` fields this version acts on, and so the entries it
-/// accepts in `meta.requires`.
-const UNDERSTOOD_META: [&str; 2] = ["ctx_len", "vocab_size"];
+/// Read the top-level `allowed` array into the dense `[row][position]`
+/// form, checking it against the rows it is parallel to.
+///
+/// The keys are 1-based positions and the entries are sparse, so a row's
+/// dense list runs to its own last listed position and holds the empty
+/// set — unconstrained — everywhere nobody listed.
+fn read_allowed(
+    path: &Path,
+    value: &Json,
+    rows: &[Vec<u32>],
+    vocab_size: usize,
+) -> Result<Vec<Vec<Vec<u32>>>, CorpusError> {
+    let parse_err = |message: String| CorpusError::Parse {
+        path: path.to_path_buf(),
+        message,
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| parse_err(format!("allowed is a JSON {}, not an array", kind(value))))?;
+    if entries.len() != rows.len() {
+        return Err(CorpusError::AllowedCountMismatch {
+            path: path.to_path_buf(),
+            entries: entries.len(),
+            rows: rows.len(),
+        });
+    }
 
-/// Check `meta.requires`, the format's forward-compatibility list.
+    let mut dense = Vec::with_capacity(entries.len());
+    for (row, entry) in entries.iter().enumerate() {
+        let map = entry.as_object().ok_or_else(|| {
+            parse_err(format!(
+                "allowed[{row}] is a JSON {}, not an object keyed by 1-based position",
+                kind(entry)
+            ))
+        })?;
+
+        // Collected before the row is sized: the width is the largest
+        // position anybody listed, which is not known until the last key
+        // has been read.
+        let mut listed: Vec<(usize, Vec<u32>)> = Vec::with_capacity(map.len());
+        for (key, ids_val) in map {
+            let position = match key.trim().parse::<usize>() {
+                Ok(0) => {
+                    return Err(CorpusError::AllowedPositionKey {
+                        path: path.to_path_buf(),
+                        row,
+                        key: key.clone(),
+                        why: "the positions are 1-based".to_string(),
+                    })
+                }
+                Ok(position) => position,
+                Err(e) => {
+                    return Err(CorpusError::AllowedPositionKey {
+                        path: path.to_path_buf(),
+                        row,
+                        key: key.clone(),
+                        why: e.to_string(),
+                    })
+                }
+            };
+            let ids_val = ids_val.as_array().ok_or_else(|| {
+                parse_err(format!(
+                    "allowed[{row}] position {position} is a JSON {}, not an array of \
+                     token ids",
+                    kind(ids_val)
+                ))
+            })?;
+            let mut ids = Vec::with_capacity(ids_val.len());
+            for id_val in ids_val {
+                let id = id_val.as_u64().ok_or_else(|| {
+                    parse_err(format!(
+                        "allowed[{row}] position {position} names a JSON {}, not a \
+                         non-negative token id",
+                        kind(id_val)
+                    ))
+                })?;
+                if id >= vocab_size as u64 {
+                    return Err(CorpusError::AllowedIdOutOfRange {
+                        path: path.to_path_buf(),
+                        row,
+                        position,
+                        token: id,
+                        vocab_size,
+                    });
+                }
+                // The bound above already places the id below
+                // `vocab_size`; this only fails for a declared id space
+                // wider than a token id can be, which no model reads.
+                ids.push(u32::try_from(id).map_err(|_| {
+                    parse_err(format!(
+                        "allowed[{row}] position {position} names token id {id}, wider \
+                         than a 32-bit token id"
+                    ))
+                })?);
+            }
+            listed.push((position, ids));
+        }
+
+        let width = listed.iter().map(|(p, _)| *p).max().unwrap_or(0);
+        let mut positions = vec![Vec::new(); width];
+        for (position, ids) in listed {
+            positions[position - 1] = ids;
+        }
+        dense.push(positions);
+    }
+    Ok(dense)
+}
+
+/// The fields this version acts on, and so the entries it accepts in
+/// `meta.requires`.
+///
+/// `per_row_allowed` names the top-level `allowed` array rather than a
+/// `meta` field: what the list carries is the name of the thing a reader
+/// has to implement, and a per-row constraint has nowhere to live inside
+/// `meta`.
+const UNDERSTOOD_REQUIREMENTS: [&str; 3] = ["ctx_len", "vocab_size", "per_row_allowed"];
+
+/// Check `meta.requires`, the format's forward-compatibility list, and
+/// report whether it asks for the per-row allowed-id sets.
 ///
 /// Absent or empty is the older behaviour — every unknown `meta` field
-/// is ignored. An entry outside [`UNDERSTOOD_META`] is refused by name
-/// rather than ignored: the producer listed it because the rows do not
-/// mean what they say without it.
+/// is ignored. An entry outside [`UNDERSTOOD_REQUIREMENTS`] is refused
+/// by name rather than ignored: the producer listed it because the rows
+/// do not mean what they say without it.
 fn check_requirements(
     path: &Path,
     meta: &serde_json::Map<String, Json>,
-) -> Result<(), CorpusError> {
+) -> Result<bool, CorpusError> {
     let Some(value) = meta.get("requires") else {
-        return Ok(());
+        return Ok(false);
     };
     let listed = value.as_array().ok_or_else(|| CorpusError::Parse {
         path: path.to_path_buf(),
@@ -429,6 +731,7 @@ fn check_requirements(
             kind(value)
         ),
     })?;
+    let mut per_row_allowed = false;
     for (index, entry) in listed.iter().enumerate() {
         let field = entry.as_str().ok_or_else(|| CorpusError::Parse {
             path: path.to_path_buf(),
@@ -437,14 +740,15 @@ fn check_requirements(
                 kind(entry)
             ),
         })?;
-        if !UNDERSTOOD_META.contains(&field) {
+        if !UNDERSTOOD_REQUIREMENTS.contains(&field) {
             return Err(CorpusError::UnsupportedRequirement {
                 path: path.to_path_buf(),
                 field: field.to_string(),
             });
         }
+        per_row_allowed |= field == "per_row_allowed";
     }
-    Ok(())
+    Ok(per_row_allowed)
 }
 
 /// Read one required non-zero `meta` dimension.
@@ -499,11 +803,20 @@ fn kind(value: &Json) -> &'static str {
 /// them, so the pairing cannot be reconstructed from the row list
 /// afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InterleavedRow {
     /// Index into the `sources` slice this row was taken from.
     pub source: usize,
     /// The row's token ids.
     pub ids: Vec<u32>,
+    /// The row's allowed-id sets, dense by 0-based position, when the
+    /// sources carry them.
+    ///
+    /// Ragged across rows: each runs to its own last listed position.
+    /// The common width the model's allowed-id input takes is applied by
+    /// whoever builds the dataset, which is also where the truncation to
+    /// `ctx_len` happens.
+    pub allowed: Option<Vec<Vec<u32>>>,
 }
 
 /// Merge several corpora round-robin, keeping each row's source.
@@ -515,13 +828,16 @@ pub struct InterleavedRow {
 ///
 /// # Errors
 ///
-/// [`CorpusError::NoSources`] when `sources` is empty, and
+/// [`CorpusError::NoSources`] when `sources` is empty,
 /// [`CorpusError::ShapeMismatch`] when the files disagree about
-/// `ctx_len` / `vocab_size`.
+/// `ctx_len` / `vocab_size`, and
+/// [`CorpusError::AllowedPresenceMismatch`] when they disagree about
+/// whether they carry allowed-id sets.
 pub fn interleave_labelled(sources: &[&CorpusFile]) -> Result<Vec<InterleavedRow>, CorpusError> {
     let Some(first) = sources.first() else {
         return Err(CorpusError::NoSources);
     };
+    let first_has_allowed = first.allowed.is_some();
     for other in sources.iter().skip(1) {
         if other.ctx_len != first.ctx_len || other.vocab_size != first.vocab_size {
             return Err(CorpusError::ShapeMismatch {
@@ -531,6 +847,17 @@ pub fn interleave_labelled(sources: &[&CorpusFile]) -> Result<Vec<InterleavedRow
                 other: other.path.clone(),
                 ctx_len: other.ctx_len,
                 vocab_size: other.vocab_size,
+            });
+        }
+        // A merge of a constrained source with an unconstrained one puts
+        // rows nobody recorded a constraint for into a run set up as a
+        // constrained one, and downstream an absent set and an
+        // unconstrained position are the same value.
+        if other.allowed.is_some() != first_has_allowed {
+            return Err(CorpusError::AllowedPresenceMismatch {
+                first: first.path.clone(),
+                first_has: first_has_allowed,
+                other: other.path.clone(),
             });
         }
     }
@@ -544,6 +871,12 @@ pub fn interleave_labelled(sources: &[&CorpusFile]) -> Result<Vec<InterleavedRow
                 out.push(InterleavedRow {
                     source,
                     ids: ids.clone(),
+                    // Read at the same index as the row, in the same
+                    // iteration, so the rotation cannot shift one
+                    // against the other. The index is in range because
+                    // the loader refuses an `allowed` that is not
+                    // parallel to `rows`, and the row above is present.
+                    allowed: corpus.allowed.as_ref().map(|sets| sets[position].clone()),
                 });
             }
         }
@@ -895,5 +1228,209 @@ mod tests {
     fn interleaving_nothing_is_refused_rather_than_answered_with_no_rows() {
         let err = interleave(&[]).expect_err("no sources");
         assert!(matches!(err, CorpusError::NoSources), "{err:?}");
+    }
+
+    #[test]
+    fn allowed_sets_are_read_sparse_and_come_back_dense_at_their_own_width() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = write(
+            &dir,
+            "allowed.json",
+            r#"{ "meta": { "ctx_len": 4, "vocab_size": 10,
+                          "requires": ["per_row_allowed"] },
+                 "rows": [[3, 7, 1, 5], [2, 9]],
+                 "allowed": [{ "2": [7, 8], "4": [5] }, { "1": [2] }] }"#,
+        );
+        let corpus = CorpusFile::load(&path).expect("a corpus carrying allowed-id sets loads");
+        let allowed = corpus.allowed().expect("the sets are read");
+
+        // Sparse in, dense out: a position nobody listed holds the empty
+        // set, and each row runs to its own last listed position rather
+        // than to a width shared with the other rows.
+        assert_eq!(
+            allowed,
+            [vec![vec![], vec![7, 8], vec![], vec![5]], vec![vec![2]],]
+        );
+    }
+
+    /// The requirement and the field have to agree in both directions:
+    /// each half alone produces a run that reports the numbers of a
+    /// well-formed one while training on something else.
+    #[test]
+    fn the_requirement_and_the_allowed_field_are_checked_against_each_other() {
+        let dir = TempDir::new().expect("tempdir");
+
+        let announced = write(
+            &dir,
+            "announced.json",
+            r#"{ "meta": { "ctx_len": 4, "vocab_size": 10,
+                          "requires": ["per_row_allowed"] },
+                 "rows": [[1, 2]] }"#,
+        );
+        let err = CorpusFile::load(&announced).expect_err("announced but absent");
+        assert!(matches!(err, CorpusError::AllowedMissing { .. }), "{err:?}");
+
+        let unannounced = write(
+            &dir,
+            "unannounced.json",
+            r#"{ "meta": { "ctx_len": 4, "vocab_size": 10 },
+                 "rows": [[1, 2]],
+                 "allowed": [{ "1": [1] }] }"#,
+        );
+        let err = CorpusFile::load(&unannounced).expect_err("present but unannounced");
+        assert!(
+            matches!(err, CorpusError::AllowedUnannounced { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_allowed_array_is_refused_at_the_part_that_disagrees() {
+        let dir = TempDir::new().expect("tempdir");
+        let load = |name: &str, body: &str| {
+            CorpusFile::load(&write(&dir, name, body)).expect_err("malformed allowed")
+        };
+        let head = r#""meta": { "ctx_len": 4, "vocab_size": 10, "requires": ["per_row_allowed"] }"#;
+
+        // One entry per row, no more and no fewer: the two are parallel,
+        // so a length disagreement pairs sets with the wrong rows.
+        let err = load(
+            "count.json",
+            &format!(r#"{{ {head}, "rows": [[1], [2]], "allowed": [{{ "1": [1] }}] }}"#),
+        );
+        match &err {
+            CorpusError::AllowedCountMismatch { entries, rows, .. } => {
+                assert_eq!((*entries, *rows), (1, 2))
+            }
+            other => panic!("expected AllowedCountMismatch, got {other:?}"),
+        }
+
+        // The positions are 1-based, so 0 is a producer that wrote
+        // 0-based indices and would have every set off by one.
+        let err = load(
+            "zero.json",
+            &format!(r#"{{ {head}, "rows": [[1]], "allowed": [{{ "0": [1] }}] }}"#),
+        );
+        match &err {
+            CorpusError::AllowedPositionKey { key, why, .. } => {
+                assert_eq!(key, "0");
+                assert!(why.contains("1-based"), "{why}");
+            }
+            other => panic!("expected AllowedPositionKey, got {other:?}"),
+        }
+
+        let err = load(
+            "key.json",
+            &format!(r#"{{ {head}, "rows": [[1]], "allowed": [{{ "first": [1] }}] }}"#),
+        );
+        assert!(
+            matches!(err, CorpusError::AllowedPositionKey { .. }),
+            "{err:?}"
+        );
+
+        // An id past the declared space is the same fault as one in
+        // `rows`, and is caught in the same place rather than several
+        // layers away at an embedding lookup.
+        let err = load(
+            "id.json",
+            &format!(r#"{{ {head}, "rows": [[1]], "allowed": [{{ "1": [1, 42] }}] }}"#),
+        );
+        match &err {
+            CorpusError::AllowedIdOutOfRange {
+                position,
+                token,
+                vocab_size,
+                ..
+            } => assert_eq!((*position, *token, *vocab_size), (1, 42, 10)),
+            other => panic!("expected AllowedIdOutOfRange, got {other:?}"),
+        }
+
+        let err = load(
+            "shape.json",
+            &format!(r#"{{ {head}, "rows": [[1]], "allowed": [[1]] }}"#),
+        );
+        match &err {
+            CorpusError::Parse { message, .. } => {
+                assert!(message.contains("allowed[0] is a JSON array"), "{message}")
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merging_keeps_each_row_with_its_own_sets() {
+        let dir = TempDir::new().expect("tempdir");
+        let head = r#""meta": { "ctx_len": 4, "vocab_size": 10, "requires": ["per_row_allowed"] }"#;
+        let a = CorpusFile::load(&write(
+            &dir,
+            "a.json",
+            &format!(
+                r#"{{ {head}, "rows": [[1], [2]], "allowed": [{{ "1": [1] }}, {{ "1": [2] }}] }}"#
+            ),
+        ))
+        .expect("corpus a");
+        let b = CorpusFile::load(&write(
+            &dir,
+            "b.json",
+            &format!(r#"{{ {head}, "rows": [[7]], "allowed": [{{ "1": [7] }}] }}"#),
+        ))
+        .expect("corpus b");
+
+        /// One merged row, flattened to what this test compares: the
+        /// ids and the sets that travelled with them.
+        type Paired = (Vec<u32>, Option<Vec<Vec<u32>>>);
+
+        let merged = interleave_labelled(&[&a, &b]).expect("two agreeing corpora");
+        let paired: Vec<Paired> = merged
+            .into_iter()
+            .map(|row| (row.ids, row.allowed))
+            .collect();
+        assert_eq!(
+            paired,
+            vec![
+                (vec![1], Some(vec![vec![1]])),
+                (vec![7], Some(vec![vec![7]])),
+                (vec![2], Some(vec![vec![2]])),
+            ],
+            "the rotation moves the row and its sets together"
+        );
+    }
+
+    #[test]
+    fn merging_a_constrained_corpus_with_an_unconstrained_one_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let constrained = CorpusFile::load(&write(
+            &dir,
+            "constrained.json",
+            r#"{ "meta": { "ctx_len": 4, "vocab_size": 10,
+                          "requires": ["per_row_allowed"] },
+                 "rows": [[1]], "allowed": [{ "1": [1] }] }"#,
+        ))
+        .expect("constrained corpus");
+        let plain = CorpusFile::load(&write(
+            &dir,
+            "plain.json",
+            r#"{ "meta": { "ctx_len": 4, "vocab_size": 10 }, "rows": [[2]] }"#,
+        ))
+        .expect("plain corpus");
+
+        let err = interleave(&[&constrained, &plain]).expect_err("a mixed merge");
+        match &err {
+            CorpusError::AllowedPresenceMismatch { first_has, .. } => assert!(*first_has),
+            other => panic!("expected AllowedPresenceMismatch, got {other:?}"),
+        }
+        let text = err.to_string();
+        assert!(
+            text.contains("constrained.json") && text.contains("plain.json"),
+            "{text}"
+        );
+
+        // Refused from either side, so the answer does not depend on
+        // which file the caller happened to name first.
+        let err = interleave(&[&plain, &constrained]).expect_err("a mixed merge, reversed");
+        match &err {
+            CorpusError::AllowedPresenceMismatch { first_has, .. } => assert!(!*first_has),
+            other => panic!("expected AllowedPresenceMismatch, got {other:?}"),
+        }
     }
 }

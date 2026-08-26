@@ -41,6 +41,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written `io.open` + `alc.json_decode` + manual interleave +
   manual repeat each caller was writing, where the rows and their
   conditions could fall out of step with every shape still agreeing.
+- **Two more learning-rate schedules and a second optimizer, and the
+  knobs that were already in the loop are reachable from Lua.** The
+  schedule axis carried two values and the optimizer axis one, which
+  was a gap in what the surface defines rather than a shortage of
+  demand for it. Added: `Linear` (warmup, then a straight line to
+  `min_lr` — the shape HF Transformers calls `linear` and uses as its
+  own default) and `WarmupStableDecay` (WSD, arXiv:2404.06395 Eq. 1 —
+  warmup, a stable stretch at `lr`, then a decay over the last
+  `decay_steps`; cosine is the decay function, matching the
+  `decay_type` default of HF's `get_wsd_schedule`, since the paper
+  leaves it open). WSD's stable stretch does not know where the run
+  ends, so a checkpoint taken during it can be continued rather than
+  only restarted — the property the schedule exists for, and one the
+  cosine cannot offer. Added `optimizer = "lion"` (arXiv:2302.06675):
+  `u = sign((1-β₁)·g + β₁·m)`, `w ← w − lr·(u + λ·w)`,
+  `m ← (1-β₂)·g + β₂·m`. Every element moves by exactly `lr` because
+  the sign discards magnitude, which is why the paper asks for a
+  learning rate 3–10× smaller and a weight decay 3–10× larger than the
+  AdamW values for the same run; carrying AdamW's numbers over trains
+  at a step size an order of magnitude off. Also newly reachable, all
+  of which the loop already had and no Lua caller could set:
+  `min_lr` (the cosine previously always decayed to a hard zero — the
+  scheduler took the floor as a parameter and the loop passed the
+  literal `0.0`), `decay_steps`, and AdamW's `beta1` / `beta2` / `eps`
+  (previously fixed at candle's defaults through
+  `..Default::default()`). The two surface families keep their separate
+  spellings — `run_full_ft` and siblings take `"Linear"` /
+  `"WarmupStableDecay"`, `full_ft` and siblings take `"linear"` /
+  `"wsd"` — because that split is a Lua-visible part of their
+  contracts. Unknown values are refused by name *and* list the
+  alternatives. (Breaking for direct constructors of
+  `algocline_nn::train::FullFtConfig`, which gains six fields; add
+  `..FullFtConfig::default()`. `ScheduleKind` is now
+  `#[non_exhaustive]`.)
+- **Corpus files can carry per-row allowed-id sets, so a constrained run
+  is expressible from a corpus.** The format gains an optional top-level
+  `allowed` array, opt-in through `meta.requires: ["per_row_allowed"]`:
+  parallel to `rows`, one sparse entry per row, mapping a 1-based
+  position to the ids available there. `alc.nn.data.corpus` attaches
+  them to the dataset it returns, which is what
+  `opts.mask_disallowed_logits` on the trainer and `allowed_input` on
+  the handle already consume — until now only `alc.nn.data.synthetic`
+  could supply them, so a corpus-backed run could not be masked or told
+  what was available, and the two channels were reachable only from rows
+  routed through the Lua VM. No option carries the sets: like `ctx_len`
+  and the id space they come from the files. The requirement and the
+  field are checked against each other in both directions, because
+  either half alone yields a run that reports the numbers of a
+  well-formed one while training on something else — `allowed` without
+  the requirement lets a reader that does not implement the field train
+  the same rows unconstrained, and the requirement without `allowed` is
+  a producer that meant to write sets and did not. Files disagreeing
+  about whether they carry sets are refused naming both, for the same
+  reason: nothing downstream distinguishes "no constraint was recorded
+  for this row" from "this row was unconstrained". Rows describing
+  differing numbers of positions are widened with the empty set at the
+  merge, where the width can first be settled. A set naming an id at or
+  past `meta.vocab_size` is refused with its row and position, and so is
+  a set excluding the token its own position holds — the loss would
+  otherwise score that token among ids the file says it was not drawn
+  from. (Breaking for direct constructors of
+  `algocline_nn::train::corpus::InterleavedRow` only, which gains an
+  `allowed` field and is now `#[non_exhaustive]`; the corpus format,
+  the Lua surface and every file without the requirement are unchanged.)
 - **`alc.nn.logits.mix(a, b, beta, opts?)` — two logits rows combined
   into one.** `beta` is the weight on `a`, and the result is an ordinary
   logits handle, so `argmax` / `top(n)` / the samplers / a constrained

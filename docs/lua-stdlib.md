@@ -908,6 +908,46 @@ specification; this is the same statement in short):
   refused, naming the file and the row). Rows are not padded in the
   file: padding to `ctx_len` happens per batch, as for every other
   dataset.
+- `allowed` — optional, and opt-in through
+  `meta.requires: ["per_row_allowed"]`: which ids each position of each
+  row was allowed to take. See *Allowed-id sets* below.
+
+**Allowed-id sets.** A corpus may state what was available at each
+position, which a run reads either as a mask on the loss
+(`opts.mask_disallowed_logits` on the trainer) or as an input to the
+model (`allowed_input` on the handle) — the two are independent, and at
+least one of them has to consume the sets or the run is a plain one
+wearing the label of a constrained one.
+
+```json
+{
+  "meta": { "ctx_len": 4, "vocab_size": 10, "requires": ["per_row_allowed"] },
+  "rows": [[3, 7, 1, 5]],
+  "allowed": [{ "2": [7, 8], "4": [5] }]
+}
+```
+
+`allowed` is parallel to `rows`, one entry per row, and each entry is
+sparse: it maps a **1-based** position to the ids available there. A
+position nobody listed is unconstrained, which is what an empty set
+means downstream too, so the padding past the end of a row is left out
+rather than spelled. Rows describing differing numbers of positions are
+widened here with the empty set — the readers take one width for the
+whole batch, and the width cannot be settled until every file of the
+call has been read.
+
+The requirement and the field are checked against each other in both
+directions. `allowed` without the requirement is refused because a
+reader that does not implement the field would train the same rows
+unconstrained and report the same numbers; the requirement without
+`allowed` is refused because it is a producer that meant to write sets
+and did not. Files disagreeing about whether they carry sets at all are
+refused for the same reason, naming both: the plain file's rows would
+otherwise train unconstrained inside a run set up as a constrained one.
+A set naming an id at or past `meta.vocab_size` is refused with its row
+and position, and so is a set that excludes the token its own position
+holds — the loss would score that token among ids the file says it was
+not drawn from.
 
 **Extending the format** is what `meta.requires` is for, and it is why
 the format needs no version number. A field that only records how the
@@ -927,8 +967,9 @@ reading its producer did not intend.
 | opts.cond_slots | integer | with `cond` | rows of the model's conditioning table |
 | opts.epochs | integer | no | how many times the merged row list is repeated (default 1) |
 
-**`ctx_len` and the id space are not options.** They come from the
-corpus `meta`, and every file of one call has to agree on them
+**`ctx_len`, the id space and the allowed-id sets are not options.**
+They come from the corpus `meta` and body, and every file of one call
+has to agree on them
 (disagreement is refused, naming both files). Passing `ctx_len` /
 `vocab_size` / `vocab` / `text_field` / `shuffle` is refused rather
 than ignored — a value that did not take effect would train at a width
@@ -1000,7 +1041,14 @@ field, no rows, or an empty row), a token at or past the declared
 `vocab_size` (named with its row and position), a row longer than the
 declared `ctx_len` (named with its row), a `meta.requires` entry this
 version does not implement (named), files disagreeing about `ctx_len` /
-`vocab_size`, a `cond` whose length is not the number of paths, `cond`
+`vocab_size`, an `allowed` array without `per_row_allowed` in
+`meta.requires` or the requirement without the array, an `allowed` that
+is not parallel to `rows`, an entry keyed by something that is not a
+1-based position, a set naming an id at or past the declared
+`vocab_size` (named with its row and position), a set that excludes the
+token its own position holds, files disagreeing about whether they
+carry sets at all, a `cond` whose length is not the number of paths,
+`cond`
 without `cond_slots` or `cond_slots` without `cond`, a slot outside the
 declared table (named as `opts.cond[i]`), a `pad_id` at or past the
 declared `vocab_size`, a `batch_size` or `epochs` of zero, an `epochs`
@@ -1581,9 +1629,34 @@ Checkpoint before assembling the Card.
   - `warmup` (integer, optional, default `0`) — schedule
     warmup step count; must be `>= 0`.
   - `schedule` (string, optional, default `"CosineWithWarmup"`)
-    — one of `"CosineWithWarmup"` / `"Constant"`. Any other
-    value is refused with the caller-supplied value in the
-    error.
+    — one of `"CosineWithWarmup"` / `"Constant"` /
+    `"Linear"` / `"WarmupStableDecay"`. Any other value is
+    refused with the caller-supplied value in the error. See
+    *Schedules* below for what each one does. (The sibling
+    `alc.nn.trainer.full_ft` family spells these in
+    snake_case — `cosine` / `constant` / `linear` / `wsd` —
+    and the two vocabularies stay apart.)
+  - `min_lr` (number, optional, default `0.0`) — the floor a
+    decaying schedule lands on at `steps` and holds
+    afterwards. Governs the tail only: the warmup ramp climbs
+    from near zero and passes below this value on its way up.
+  - `decay_steps` (integer, optional) — length of the decay
+    stretch, read by `"WarmupStableDecay"` and by nothing
+    else. Omitted, the decay takes the last 10% of `steps`
+    (MiniCPM reports 10% as sufficient and 2.5% as short of
+    it). Clamped into `1..=(steps - warmup)`.
+  - `optimizer` (string, optional, default `"adamw"`) — one
+    of `"adamw"` / `"lion"`. See *Optimizers* below; Lion
+    wants a learning rate 3–10× smaller and a
+    `weight_decay` 3–10× larger than the AdamW values for
+    the same run.
+  - `beta1` / `beta2` (number, optional, defaults `0.9` /
+    `0.999`) — AdamW's moment coefficients. Lion reads the
+    same two keys, and its paper defaults are `0.9` / `0.99`,
+    so a Lion run wanting them has to say so.
+  - `eps` (number, optional, default `1e-8`) — AdamW's
+    denominator epsilon. Unread by Lion, which has no second
+    moment to divide by.
   - `name` (string, optional) — user-visible name recorded as
     `NnCardMeta.name`; also `sanitize`d and used as a prefix
     to derive `card_id`. Defaults to `"run_full_ft"` when
@@ -1607,6 +1680,48 @@ Checkpoint before assembling the Card.
     or an equivalent gate), never by raw `argmax()` (measured:
     raw legality fell from 0.71 to 0.08–0.16 under masked
     training while gated-decode play strength improved).
+
+**Schedules.** All three warmup-bearing ones share one ramp and differ
+only in the tail, so switching between them changes the shape of a
+curve rather than the kind of run.
+
+| value | after warmup |
+|---|---|
+| `Constant` | holds `lr`; no warmup ramp at all |
+| `CosineWithWarmup` | half-cosine from `lr` down to `min_lr` |
+| `Linear` | straight line from `lr` down to `min_lr` (HF Transformers calls this `linear` and floors it at zero, which here is the default `min_lr = 0`) |
+| `WarmupStableDecay` | holds `lr`, then half-cosine to `min_lr` over the last `decay_steps` |
+
+`WarmupStableDecay` is WSD from MiniCPM
+([arXiv:2404.06395](https://arxiv.org/abs/2404.06395) Eq. 1), where the
+decay function is left open — cosine is the choice here, matching the
+`decay_type` default of HF's `get_wsd_schedule`. What separates it from
+the cosine is that the stable stretch does not know where the run ends:
+a checkpoint taken during it was trained at the same LR as the one
+before it, so the run can be *continued* rather than only restarted.
+That property is gone the moment the decay begins.
+
+**Optimizers.**
+
+| value | update |
+|---|---|
+| `adamw` (default) | decoupled-decay Adam. F32 parameters use candle's `AdamW`; BF16 goes through an FP32-master variant, because BF16 moments stall silently |
+| `lion` | sign momentum ([arXiv:2302.06675](https://arxiv.org/abs/2302.06675)): `u = sign((1-β₁)·g + β₁·m)`, `w ← w − lr·(u + λ·w)`, `m ← (1-β₂)·g + β₂·m` |
+
+Lion moves **every element by exactly `lr`** — the sign discards
+magnitude, so the learning rate is the step size rather than a bound on
+it. The paper's guidance follows from that: a learning rate 3–10×
+smaller than the AdamW value for the same run, and a `weight_decay`
+3–10× larger so the effective decay `lr·λ` lands in the same place.
+Carrying AdamW's numbers over unchanged trains at a step size an order
+of magnitude off. Lion keeps one state tensor where AdamW keeps two,
+which is the memory argument for it; here that saving holds for F32
+parameters, while BF16 ones still carry an FP32 master (with a sign
+update every element moves by `lr`, and a BF16 ulp above `lr` would
+round every step away).
+
+`f16` parameters are refused by both optimizers — they need loss
+scaling, which does not ship here. Build with `bf16` (CUDA) or `f32`.
 
 **Returns:** `card_id` (string). The Card carries
 `training_path="full_ft"` and `candle.bundle_ref="nn/<card_id>"`

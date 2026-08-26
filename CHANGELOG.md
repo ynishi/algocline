@@ -41,6 +41,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written `io.open` + `alc.json_decode` + manual interleave +
   manual repeat each caller was writing, where the rows and their
   conditions could fall out of step with every shape still agreeing.
+- **Corpus files can carry per-row allowed-id sets, so a constrained run
+  is expressible from a corpus.** The format gains an optional top-level
+  `allowed` array, opt-in through `meta.requires: ["per_row_allowed"]`:
+  parallel to `rows`, one sparse entry per row, mapping a 1-based
+  position to the ids available there. `alc.nn.data.corpus` attaches
+  them to the dataset it returns, which is what
+  `opts.mask_disallowed_logits` on the trainer and `allowed_input` on
+  the handle already consume — until now only `alc.nn.data.synthetic`
+  could supply them, so a corpus-backed run could not be masked or told
+  what was available, and the two channels were reachable only from rows
+  routed through the Lua VM. No option carries the sets: like `ctx_len`
+  and the id space they come from the files. The requirement and the
+  field are checked against each other in both directions, because
+  either half alone yields a run that reports the numbers of a
+  well-formed one while training on something else — `allowed` without
+  the requirement lets a reader that does not implement the field train
+  the same rows unconstrained, and the requirement without `allowed` is
+  a producer that meant to write sets and did not. Files disagreeing
+  about whether they carry sets are refused naming both, for the same
+  reason: nothing downstream distinguishes "no constraint was recorded
+  for this row" from "this row was unconstrained". Rows describing
+  differing numbers of positions are widened with the empty set at the
+  merge, where the width can first be settled. A set naming an id at or
+  past `meta.vocab_size` is refused with its row and position, and so is
+  a set excluding the token its own position holds — the loss would
+  otherwise score that token among ids the file says it was not drawn
+  from. (Breaking for direct constructors of
+  `algocline_nn::train::corpus::InterleavedRow` only, which gains an
+  `allowed` field and is now `#[non_exhaustive]`; the corpus format,
+  the Lua surface and every file without the requirement are unchanged.)
 - **`alc.nn.logits.mix(a, b, beta, opts?)` — two logits rows combined
   into one.** `beta` is the weight on `a`, and the result is an ordinary
   logits handle, so `argmax` / `top(n)` / the samplers / a constrained

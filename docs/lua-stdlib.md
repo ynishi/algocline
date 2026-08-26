@@ -908,6 +908,46 @@ specification; this is the same statement in short):
   refused, naming the file and the row). Rows are not padded in the
   file: padding to `ctx_len` happens per batch, as for every other
   dataset.
+- `allowed` — optional, and opt-in through
+  `meta.requires: ["per_row_allowed"]`: which ids each position of each
+  row was allowed to take. See *Allowed-id sets* below.
+
+**Allowed-id sets.** A corpus may state what was available at each
+position, which a run reads either as a mask on the loss
+(`opts.mask_disallowed_logits` on the trainer) or as an input to the
+model (`allowed_input` on the handle) — the two are independent, and at
+least one of them has to consume the sets or the run is a plain one
+wearing the label of a constrained one.
+
+```json
+{
+  "meta": { "ctx_len": 4, "vocab_size": 10, "requires": ["per_row_allowed"] },
+  "rows": [[3, 7, 1, 5]],
+  "allowed": [{ "2": [7, 8], "4": [5] }]
+}
+```
+
+`allowed` is parallel to `rows`, one entry per row, and each entry is
+sparse: it maps a **1-based** position to the ids available there. A
+position nobody listed is unconstrained, which is what an empty set
+means downstream too, so the padding past the end of a row is left out
+rather than spelled. Rows describing differing numbers of positions are
+widened here with the empty set — the readers take one width for the
+whole batch, and the width cannot be settled until every file of the
+call has been read.
+
+The requirement and the field are checked against each other in both
+directions. `allowed` without the requirement is refused because a
+reader that does not implement the field would train the same rows
+unconstrained and report the same numbers; the requirement without
+`allowed` is refused because it is a producer that meant to write sets
+and did not. Files disagreeing about whether they carry sets at all are
+refused for the same reason, naming both: the plain file's rows would
+otherwise train unconstrained inside a run set up as a constrained one.
+A set naming an id at or past `meta.vocab_size` is refused with its row
+and position, and so is a set that excludes the token its own position
+holds — the loss would score that token among ids the file says it was
+not drawn from.
 
 **Extending the format** is what `meta.requires` is for, and it is why
 the format needs no version number. A field that only records how the
@@ -927,8 +967,9 @@ reading its producer did not intend.
 | opts.cond_slots | integer | with `cond` | rows of the model's conditioning table |
 | opts.epochs | integer | no | how many times the merged row list is repeated (default 1) |
 
-**`ctx_len` and the id space are not options.** They come from the
-corpus `meta`, and every file of one call has to agree on them
+**`ctx_len`, the id space and the allowed-id sets are not options.**
+They come from the corpus `meta` and body, and every file of one call
+has to agree on them
 (disagreement is refused, naming both files). Passing `ctx_len` /
 `vocab_size` / `vocab` / `text_field` / `shuffle` is refused rather
 than ignored — a value that did not take effect would train at a width
@@ -1000,7 +1041,14 @@ field, no rows, or an empty row), a token at or past the declared
 `vocab_size` (named with its row and position), a row longer than the
 declared `ctx_len` (named with its row), a `meta.requires` entry this
 version does not implement (named), files disagreeing about `ctx_len` /
-`vocab_size`, a `cond` whose length is not the number of paths, `cond`
+`vocab_size`, an `allowed` array without `per_row_allowed` in
+`meta.requires` or the requirement without the array, an `allowed` that
+is not parallel to `rows`, an entry keyed by something that is not a
+1-based position, a set naming an id at or past the declared
+`vocab_size` (named with its row and position), a set that excludes the
+token its own position holds, files disagreeing about whether they
+carry sets at all, a `cond` whose length is not the number of paths,
+`cond`
 without `cond_slots` or `cond_slots` without `cond`, a slot outside the
 declared table (named as `opts.cond[i]`), a `pad_id` at or past the
 declared `vocab_size`, a `batch_size` or `epochs` of zero, an `epochs`

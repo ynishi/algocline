@@ -1629,9 +1629,34 @@ Checkpoint before assembling the Card.
   - `warmup` (integer, optional, default `0`) — schedule
     warmup step count; must be `>= 0`.
   - `schedule` (string, optional, default `"CosineWithWarmup"`)
-    — one of `"CosineWithWarmup"` / `"Constant"`. Any other
-    value is refused with the caller-supplied value in the
-    error.
+    — one of `"CosineWithWarmup"` / `"Constant"` /
+    `"Linear"` / `"WarmupStableDecay"`. Any other value is
+    refused with the caller-supplied value in the error. See
+    *Schedules* below for what each one does. (The sibling
+    `alc.nn.trainer.full_ft` family spells these in
+    snake_case — `cosine` / `constant` / `linear` / `wsd` —
+    and the two vocabularies stay apart.)
+  - `min_lr` (number, optional, default `0.0`) — the floor a
+    decaying schedule lands on at `steps` and holds
+    afterwards. Governs the tail only: the warmup ramp climbs
+    from near zero and passes below this value on its way up.
+  - `decay_steps` (integer, optional) — length of the decay
+    stretch, read by `"WarmupStableDecay"` and by nothing
+    else. Omitted, the decay takes the last 10% of `steps`
+    (MiniCPM reports 10% as sufficient and 2.5% as short of
+    it). Clamped into `1..=(steps - warmup)`.
+  - `optimizer` (string, optional, default `"adamw"`) — one
+    of `"adamw"` / `"lion"`. See *Optimizers* below; Lion
+    wants a learning rate 3–10× smaller and a
+    `weight_decay` 3–10× larger than the AdamW values for
+    the same run.
+  - `beta1` / `beta2` (number, optional, defaults `0.9` /
+    `0.999`) — AdamW's moment coefficients. Lion reads the
+    same two keys, and its paper defaults are `0.9` / `0.99`,
+    so a Lion run wanting them has to say so.
+  - `eps` (number, optional, default `1e-8`) — AdamW's
+    denominator epsilon. Unread by Lion, which has no second
+    moment to divide by.
   - `name` (string, optional) — user-visible name recorded as
     `NnCardMeta.name`; also `sanitize`d and used as a prefix
     to derive `card_id`. Defaults to `"run_full_ft"` when
@@ -1655,6 +1680,48 @@ Checkpoint before assembling the Card.
     or an equivalent gate), never by raw `argmax()` (measured:
     raw legality fell from 0.71 to 0.08–0.16 under masked
     training while gated-decode play strength improved).
+
+**Schedules.** All three warmup-bearing ones share one ramp and differ
+only in the tail, so switching between them changes the shape of a
+curve rather than the kind of run.
+
+| value | after warmup |
+|---|---|
+| `Constant` | holds `lr`; no warmup ramp at all |
+| `CosineWithWarmup` | half-cosine from `lr` down to `min_lr` |
+| `Linear` | straight line from `lr` down to `min_lr` (HF Transformers calls this `linear` and floors it at zero, which here is the default `min_lr = 0`) |
+| `WarmupStableDecay` | holds `lr`, then half-cosine to `min_lr` over the last `decay_steps` |
+
+`WarmupStableDecay` is WSD from MiniCPM
+([arXiv:2404.06395](https://arxiv.org/abs/2404.06395) Eq. 1), where the
+decay function is left open — cosine is the choice here, matching the
+`decay_type` default of HF's `get_wsd_schedule`. What separates it from
+the cosine is that the stable stretch does not know where the run ends:
+a checkpoint taken during it was trained at the same LR as the one
+before it, so the run can be *continued* rather than only restarted.
+That property is gone the moment the decay begins.
+
+**Optimizers.**
+
+| value | update |
+|---|---|
+| `adamw` (default) | decoupled-decay Adam. F32 parameters use candle's `AdamW`; BF16 goes through an FP32-master variant, because BF16 moments stall silently |
+| `lion` | sign momentum ([arXiv:2302.06675](https://arxiv.org/abs/2302.06675)): `u = sign((1-β₁)·g + β₁·m)`, `w ← w − lr·(u + λ·w)`, `m ← (1-β₂)·g + β₂·m` |
+
+Lion moves **every element by exactly `lr`** — the sign discards
+magnitude, so the learning rate is the step size rather than a bound on
+it. The paper's guidance follows from that: a learning rate 3–10×
+smaller than the AdamW value for the same run, and a `weight_decay`
+3–10× larger so the effective decay `lr·λ` lands in the same place.
+Carrying AdamW's numbers over unchanged trains at a step size an order
+of magnitude off. Lion keeps one state tensor where AdamW keeps two,
+which is the memory argument for it; here that saving holds for F32
+parameters, while BF16 ones still carry an FP32 master (with a sign
+update every element moves by `lr`, and a BF16 ulp above `lr` would
+round every step away).
+
+`f16` parameters are refused by both optimizers — they need loss
+scaling, which does not ship here. Build with `bf16` (CUDA) or `f32`.
 
 **Returns:** `card_id` (string). The Card carries
 `training_path="full_ft"` and `candle.bundle_ref="nn/<card_id>"`

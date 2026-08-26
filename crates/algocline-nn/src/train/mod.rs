@@ -31,6 +31,7 @@ use std::collections::HashMap;
 pub mod ckpt;
 pub mod corpus;
 pub mod data;
+pub mod lion;
 pub mod loss;
 pub mod mixed;
 pub mod scheduler;
@@ -171,8 +172,9 @@ pub use data::{
 pub use fullft::{
     allowed_input_sets, allowed_logit_mask, run_allowed_ft, run_conditioned_ft, run_distill,
     run_full_ft, run_lora_ft, CkptControl, CkptHook, CkptInfo, DistillLossKind, DistillSpec,
-    FullFtConfig, TrainError, TrainingLease, TrainingLeaseGuard,
+    FullFtConfig, OptimizerKind, TrainError, TrainingLease, TrainingLeaseGuard,
 };
+pub use lion::{Lion, ParamsLion};
 pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};
 pub use mixed::MixedAdamW;
 pub use scheduler::{ScheduleKind, Scheduler};

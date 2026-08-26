@@ -82,6 +82,7 @@ fn run_lora_ft_tinyllama_leaves_base_weights_bit_identical() {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
     // rank = 4 is safely inside `min(in, out)` for every projection on
     // the tiny preset (k/v_proj is narrowest at kv_heads * head_dim =
@@ -209,6 +210,7 @@ fn run_lora_ft_tinyllama_reduces_loss_on_overfit_corpus() {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
@@ -298,6 +300,7 @@ fn run_lora_ft_tinyllama_updates_lora_weights() {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
     let tmp = TempDir::new().unwrap();
     let lease = Arc::new(TrainingLease::new());
@@ -382,6 +385,7 @@ fn run_lora_ft_tinyllama_saves_delta_with_expected_var_count() {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
     let lora_cfg = LoraConfig::with_targets(4, 8.0, TinyLlamaModel::default_lora_targets());
     let tmp = TempDir::new().unwrap();

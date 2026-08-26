@@ -311,6 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
 
     let lora_cfg = LoraConfig::with_targets(lora_rank, lora_alpha, targets.iter().cloned());

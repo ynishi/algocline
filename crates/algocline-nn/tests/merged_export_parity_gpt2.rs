@@ -83,6 +83,7 @@ fn wrap_and_train_briefly() -> (Gpt2Model, VarMap, Gpt2Config) {
         ckpt_keep: 1,
         init_from: None,
         mask_disallowed_logits: false,
+        ..FullFtConfig::default()
     };
     let lora_cfg = LoraConfig::new(4, 8.0);
     let tmp = TempDir::new().unwrap();

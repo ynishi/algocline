@@ -35,7 +35,8 @@ use std::path::PathBuf;
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::train::{
-    CkptControl, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, ScheduleKind, TrainError,
+    CkptControl, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, OptimizerKind, ScheduleKind,
+    TrainError,
 };
 use mlua::prelude::*;
 
@@ -256,6 +257,8 @@ pub(super) fn extract_run_train_cfg(prefix: &str, opts: &LuaTable) -> LuaResult<
     };
 
     // Optional schedule — design §1.2 default "CosineWithWarmup".
+    // CamelCase here, snake_case in the sibling family: see
+    // [`parse_schedule`] on why the two are not merged.
     let schedule = match opts
         .get::<Option<String>>("schedule")?
         .as_deref()
@@ -263,10 +266,13 @@ pub(super) fn extract_run_train_cfg(prefix: &str, opts: &LuaTable) -> LuaResult<
     {
         "CosineWithWarmup" => ScheduleKind::CosineWithWarmup,
         "Constant" => ScheduleKind::Constant,
+        "Linear" => ScheduleKind::Linear,
+        "WarmupStableDecay" => ScheduleKind::WarmupStableDecay,
         other => {
             return Err(LuaError::external(format!(
                 "{prefix}: opts.schedule must be one of \
-                 \"CosineWithWarmup\" / \"Constant\" (got {other:?})"
+                 \"CosineWithWarmup\" / \"Constant\" / \"Linear\" / \
+                 \"WarmupStableDecay\" (got {other:?})"
             )));
         }
     };
@@ -310,6 +316,24 @@ fn apply_optional_overrides(
     if let Some(v) = opts.get::<Option<f64>>("weight_decay")? {
         cfg.weight_decay = v;
     }
+    if let Some(v) = opts.get::<Option<String>>("optimizer")? {
+        cfg.optimizer = parse_optimizer(prefix, &v)?;
+    }
+    if let Some(v) = opts.get::<Option<f64>>("min_lr")? {
+        cfg.min_lr = v;
+    }
+    if let Some(v) = opts.get::<Option<usize>>("decay_steps")? {
+        cfg.decay_steps = Some(v);
+    }
+    if let Some(v) = opts.get::<Option<f64>>("beta1")? {
+        cfg.beta1 = v;
+    }
+    if let Some(v) = opts.get::<Option<f64>>("beta2")? {
+        cfg.beta2 = v;
+    }
+    if let Some(v) = opts.get::<Option<f64>>("eps")? {
+        cfg.eps = v;
+    }
     if let Some(v) = opts.get::<Option<usize>>("ckpt_every")? {
         cfg.ckpt_every = v;
     }
@@ -351,15 +375,31 @@ fn apply_optional_overrides(
 /// (`"CosineWithWarmup"` / `"Constant"`, see
 /// [`extract_run_train_cfg`]) — the two spellings are Lua-visible
 /// contracts and are deliberately kept apart.
+/// The snake_case vocabulary, used by the `full_ft` / `lora` / `distill`
+/// family.
+///
+/// The sibling `run_*` family spells the same values in CamelCase and
+/// keeps its own reader below. The split is a Lua-visible difference
+/// between the two contracts (see the module docs), so a name is added
+/// to both rather than one vocabulary being widened to swallow the
+/// other.
 fn parse_schedule(prefix: &str, s: &str) -> LuaResult<ScheduleKind> {
-    match s {
-        "cosine" | "cosine_with_warmup" => Ok(ScheduleKind::CosineWithWarmup),
-        "constant" => Ok(ScheduleKind::Constant),
-        other => Err(LuaError::external(format!(
-            "{prefix}: unknown schedule '{other}' \
-             (expected 'cosine' or 'constant')"
-        ))),
-    }
+    ScheduleKind::parse(s).ok_or_else(|| {
+        LuaError::external(format!(
+            "{prefix}: unknown schedule '{s}' (expected one of {})",
+            ScheduleKind::NAMES.join(" / ")
+        ))
+    })
+}
+
+/// Read `opts.optimizer`, naming the alternatives on a miss.
+fn parse_optimizer(prefix: &str, s: &str) -> LuaResult<OptimizerKind> {
+    OptimizerKind::parse(s).ok_or_else(|| {
+        LuaError::external(format!(
+            "{prefix}: unknown optimizer '{s}' (expected one of {})",
+            OptimizerKind::NAMES.join(" / ")
+        ))
+    })
 }
 
 /// Extract a validated [`LoraConfig`] from a LoRA opts table.
@@ -736,8 +776,75 @@ mod tests {
             parse_schedule("alc.nn.trainer", "constant").unwrap(),
             ScheduleKind::Constant
         ));
-        let err = parse_schedule("alc.nn.trainer", "linear").expect_err("unknown");
-        assert!(err.to_string().contains("linear"), "message: {err}");
+        assert!(matches!(
+            parse_schedule("alc.nn.trainer", "linear").unwrap(),
+            ScheduleKind::Linear
+        ));
+        assert!(matches!(
+            parse_schedule("alc.nn.trainer", "wsd").unwrap(),
+            ScheduleKind::WarmupStableDecay
+        ));
+        assert!(matches!(
+            parse_schedule("alc.nn.trainer", "warmup_stable_decay").unwrap(),
+            ScheduleKind::WarmupStableDecay
+        ));
+
+        // CamelCase belongs to the sibling `run_*` family and is not
+        // read here — the two vocabularies stay apart.
+        let err = parse_schedule("alc.nn.trainer", "Linear").expect_err("wrong vocabulary");
+        assert!(err.to_string().contains("Linear"), "message: {err}");
+
+        let err = parse_schedule("alc.nn.trainer", "triangular").expect_err("unknown");
+        assert!(err.to_string().contains("triangular"), "message: {err}");
+        // The refusal names the alternatives rather than only the miss.
+        assert!(err.to_string().contains("cosine"), "message: {err}");
+    }
+
+    #[test]
+    fn optimizer_parser_accepts_known_and_names_the_alternatives() {
+        assert!(matches!(
+            parse_optimizer("alc.nn.trainer", "adamw").unwrap(),
+            OptimizerKind::AdamW
+        ));
+        assert!(matches!(
+            parse_optimizer("alc.nn.trainer", "lion").unwrap(),
+            OptimizerKind::Lion
+        ));
+        let err = parse_optimizer("alc.nn.trainer", "sgd").expect_err("unknown");
+        let text = err.to_string();
+        assert!(text.contains("sgd") && text.contains("lion"), "{text}");
+    }
+
+    /// The knobs that were reachable in Rust and not from Lua: every
+    /// one of them now arrives, and the defaults are unchanged when the
+    /// caller says nothing.
+    #[test]
+    fn the_optimizer_and_schedule_knobs_reach_the_config() {
+        let lua = Lua::new();
+        let cfg = extract_full_ft_opts("alc.nn.trainer", None).expect("defaults");
+        assert_eq!(cfg.optimizer, OptimizerKind::AdamW);
+        assert!(cfg.min_lr.abs() < f64::EPSILON);
+        assert_eq!(cfg.decay_steps, None);
+        assert!((cfg.beta1 - 0.9).abs() < 1e-12);
+        assert!((cfg.beta2 - 0.999).abs() < 1e-12);
+        assert!((cfg.eps - 1e-8).abs() < 1e-20);
+
+        let t = lua.create_table().expect("opts");
+        t.set("optimizer", "lion").unwrap();
+        t.set("schedule", "wsd").unwrap();
+        t.set("min_lr", 1e-5).unwrap();
+        t.set("decay_steps", 250usize).unwrap();
+        t.set("beta1", 0.95).unwrap();
+        t.set("beta2", 0.99).unwrap();
+        t.set("eps", 1e-6).unwrap();
+        let cfg = extract_full_ft_opts("alc.nn.trainer", Some(&t)).expect("opts");
+        assert_eq!(cfg.optimizer, OptimizerKind::Lion);
+        assert_eq!(cfg.schedule, ScheduleKind::WarmupStableDecay);
+        assert!((cfg.min_lr - 1e-5).abs() < 1e-20);
+        assert_eq!(cfg.decay_steps, Some(250));
+        assert!((cfg.beta1 - 0.95).abs() < 1e-12);
+        assert!((cfg.beta2 - 0.99).abs() < 1e-12);
+        assert!((cfg.eps - 1e-6).abs() < 1e-20);
     }
 
     #[test]

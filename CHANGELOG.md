@@ -41,6 +41,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand-written `io.open` + `alc.json_decode` + manual interleave +
   manual repeat each caller was writing, where the rows and their
   conditions could fall out of step with every shape still agreeing.
+- **Two more learning-rate schedules and a second optimizer, and the
+  knobs that were already in the loop are reachable from Lua.** The
+  schedule axis carried two values and the optimizer axis one, which
+  was a gap in what the surface defines rather than a shortage of
+  demand for it. Added: `Linear` (warmup, then a straight line to
+  `min_lr` — the shape HF Transformers calls `linear` and uses as its
+  own default) and `WarmupStableDecay` (WSD, arXiv:2404.06395 Eq. 1 —
+  warmup, a stable stretch at `lr`, then a decay over the last
+  `decay_steps`; cosine is the decay function, matching the
+  `decay_type` default of HF's `get_wsd_schedule`, since the paper
+  leaves it open). WSD's stable stretch does not know where the run
+  ends, so a checkpoint taken during it can be continued rather than
+  only restarted — the property the schedule exists for, and one the
+  cosine cannot offer. Added `optimizer = "lion"` (arXiv:2302.06675):
+  `u = sign((1-β₁)·g + β₁·m)`, `w ← w − lr·(u + λ·w)`,
+  `m ← (1-β₂)·g + β₂·m`. Every element moves by exactly `lr` because
+  the sign discards magnitude, which is why the paper asks for a
+  learning rate 3–10× smaller and a weight decay 3–10× larger than the
+  AdamW values for the same run; carrying AdamW's numbers over trains
+  at a step size an order of magnitude off. Also newly reachable, all
+  of which the loop already had and no Lua caller could set:
+  `min_lr` (the cosine previously always decayed to a hard zero — the
+  scheduler took the floor as a parameter and the loop passed the
+  literal `0.0`), `decay_steps`, and AdamW's `beta1` / `beta2` / `eps`
+  (previously fixed at candle's defaults through
+  `..Default::default()`). The two surface families keep their separate
+  spellings — `run_full_ft` and siblings take `"Linear"` /
+  `"WarmupStableDecay"`, `full_ft` and siblings take `"linear"` /
+  `"wsd"` — because that split is a Lua-visible part of their
+  contracts. Unknown values are refused by name *and* list the
+  alternatives. (Breaking for direct constructors of
+  `algocline_nn::train::FullFtConfig`, which gains six fields; add
+  `..FullFtConfig::default()`. `ScheduleKind` is now
+  `#[non_exhaustive]`.)
 - **Corpus files can carry per-row allowed-id sets, so a constrained run
   is expressible from a corpus.** The format gains an optional top-level
   `allowed` array, opt-in through `meta.requires: ["per_row_allowed"]`:

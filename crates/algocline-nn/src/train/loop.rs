@@ -159,6 +159,14 @@ pub struct FullFtConfig {
     /// unused or serving only as model input through
     /// [`run_allowed_ft`], which is what the two independent switches
     /// are for.
+    ///
+    /// A model trained with the mask on receives no gradient pressure
+    /// to suppress disallowed ids, so its unconstrained argmax is not a
+    /// meaningful decision: pair it with a constrained decode path (an
+    /// allow-list sampler or an equivalent gate). Measured on a small
+    /// board-game policy, raw argmax legality fell from 0.71 to
+    /// 0.08–0.16 under masked training while gated-decode play
+    /// strength improved.
     pub mask_disallowed_logits: bool,
 }
 

@@ -1600,7 +1600,13 @@ Checkpoint before assembling the Card.
     allowed instead of among the whole vocabulary. Requires
     the dataset to carry allowed-id sets. Independent of
     whether the model is *handed* those ids, which follows
-    from the handle's own shape.
+    from the handle's own shape. A model trained this way
+    receives no pressure to suppress disallowed ids, so its
+    **unconstrained argmax becomes meaningless** — decode it
+    through a constrained path (`alc.nn.constraint.allow_list`
+    or an equivalent gate), never by raw `argmax()` (measured:
+    raw legality fell from 0.71 to 0.08–0.16 under masked
+    training while gated-decode play strength improved).
 
 **Returns:** `card_id` (string). The Card carries
 `training_path="full_ft"` and `candle.bundle_ref="nn/<card_id>"`

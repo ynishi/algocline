@@ -65,6 +65,7 @@ mod tests {
             train_loss: 0.5,
             val_loss: None,
             metrics: std::collections::HashMap::new(),
+            candidates: Vec::new(),
         };
         NnModelCard::from_training(
             CardId::mint(name),

@@ -7,6 +7,13 @@
 //! rather than by step number so a manual `touch` cannot hide the
 //! trainer's own bookkeeping from `ls -t`.
 //!
+//! A step can be [pinned](CheckpointStore::pin), which lifts it out of
+//! that rotation entirely: pinned files neither count against
+//! `ckpt_keep` nor get dropped by it. That is what lets a checkpoint
+//! search hold on to a candidate it liked at step 40 while the window
+//! keeps turning over around it — without a pin, the file the search
+//! selected is deleted as soon as `ckpt_keep` newer ones are written.
+//!
 //! [`restore_into`] / [`restore_into_partial`] are the other direction:
 //! a checkpoint back into the variables a model was built against, so a
 //! run can continue from weights an earlier run produced. Both verify
@@ -36,6 +43,7 @@ pub struct CheckpointStore {
     dir: PathBuf,
     prefix: String,
     keep: usize,
+    pinned: BTreeSet<usize>,
 }
 
 impl CheckpointStore {
@@ -54,7 +62,33 @@ impl CheckpointStore {
             dir,
             prefix: prefix.into(),
             keep: keep.max(1),
+            pinned: BTreeSet::new(),
         })
+    }
+
+    /// Hold `step`'s checkpoint out of the rotation.
+    ///
+    /// A pinned file is exempt from [`Self::prune`] and does not count
+    /// against `keep`, so pinning never costs the rotation window a
+    /// slot. Pinning is idempotent, and pinning a step that was never
+    /// written is harmless — `prune` only ever looks at files that
+    /// exist.
+    ///
+    /// Nothing un-pins. A run that pins every checkpoint keeps every
+    /// checkpoint; that is the caller's decision to make, and the
+    /// trainer reports what was pinned rather than second-guessing it.
+    pub fn pin(&mut self, step: usize) {
+        self.pinned.insert(step);
+    }
+
+    /// Whether `step` is currently held out of the rotation.
+    pub fn is_pinned(&self, step: usize) -> bool {
+        self.pinned.contains(&step)
+    }
+
+    /// Steps held out of the rotation, ascending.
+    pub fn pinned(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pinned.iter().copied()
     }
 
     /// Directory the writer is targeting.
@@ -119,13 +153,23 @@ impl CheckpointStore {
         Ok(entries.into_iter().map(|(p, _)| p).collect())
     }
 
+    /// Drop the oldest unpinned step checkpoints down to `keep`.
+    ///
+    /// Pinned files are filtered out before the count is taken, so they
+    /// are neither deleted nor counted: `keep` describes the size of the
+    /// rotating window, not the total file count on disk.
     fn prune(&self) -> std::io::Result<()> {
-        let files = self.list()?;
-        if files.len() <= self.keep {
+        let held: BTreeSet<PathBuf> = self.pinned.iter().map(|s| self.path_for_step(*s)).collect();
+        let rotating: Vec<PathBuf> = self
+            .list()?
+            .into_iter()
+            .filter(|p| !held.contains(p))
+            .collect();
+        if rotating.len() <= self.keep {
             return Ok(());
         }
-        let drop_count = files.len() - self.keep;
-        for path in files.into_iter().take(drop_count) {
+        let drop_count = rotating.len() - self.keep;
+        for path in rotating.into_iter().take(drop_count) {
             fs::remove_file(&path)?;
         }
         Ok(())
@@ -159,6 +203,7 @@ pub fn checkpoint_from_path(
         train_loss,
         val_loss,
         metrics,
+        candidates: Vec::new(),
     })
 }
 
@@ -771,6 +816,86 @@ mod tests {
             .collect();
         assert!(names.iter().any(|n| n.contains("step30")));
         assert!(names.iter().any(|n| n.contains("step40")));
+    }
+
+    /// The reason `pin` exists: without it, the checkpoint a search
+    /// selected at step 10 is gone by step 40, and the search has
+    /// nothing to hand back.
+    #[test]
+    fn pinned_step_survives_the_rotation_that_would_have_dropped_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = CheckpointStore::new(tmp.path(), "run", 2).unwrap();
+        let vm = small_varmap();
+
+        store.save_step(&vm, 10).unwrap();
+        store.pin(10);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for step in [20, 30, 40] {
+            store.save_step(&vm, step).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            store.path_for_step(10).exists(),
+            "the pinned checkpoint must outlive three later rotations"
+        );
+        let names: Vec<String> = store
+            .list()
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("step30"))
+                && names.iter().any(|n| n.contains("step40")),
+            "keep=2 still holds the two most recent unpinned files: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("step20")),
+            "the pin must not have bought step20 a reprieve too: {names:?}"
+        );
+    }
+
+    /// A pin does not cost the rotation a slot: `keep` sizes the
+    /// window, and pinned files sit outside it.
+    #[test]
+    fn pinned_files_do_not_count_against_keep() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = CheckpointStore::new(tmp.path(), "run", 2).unwrap();
+        let vm = small_varmap();
+
+        for step in [10, 20] {
+            store.save_step(&vm, step).unwrap();
+            store.pin(step);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for step in [30, 40, 50] {
+            store.save_step(&vm, step).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            store.list().unwrap().len(),
+            4,
+            "2 pinned + keep=2 rotating, not 2 total"
+        );
+        assert_eq!(store.pinned().collect::<Vec<_>>(), vec![10, 20]);
+        assert!(store.is_pinned(10) && !store.is_pinned(30));
+    }
+
+    /// Pinning a step that was never written is a no-op rather than an
+    /// error: `prune` only ever looks at files that exist.
+    #[test]
+    fn pinning_an_unwritten_step_is_harmless() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = CheckpointStore::new(tmp.path(), "run", 1).unwrap();
+        let vm = small_varmap();
+        store.pin(999);
+        store.pin(999);
+        store.save_step(&vm, 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.save_step(&vm, 2).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 
     #[test]

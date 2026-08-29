@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! alc.nn.trainer.run_lora_ft(base_handle, dataset, opts) -> lora_card_id
-//! alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id
+//! alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id, candidates
 //! alc.nn.trainer.run_distill(student_handle, dataset, opts) -> card_id
 //! ```
 //!
@@ -102,8 +102,8 @@ use algocline_nn::card::{
     bundle_ref_for, CardId, NnCustomBranch, NnLoraBranch, NnModelCard, TrainingPath,
 };
 use algocline_nn::train::{
-    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss,
-    DistillLossKind, DistillSpec, TrainingLease,
+    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, Candidate,
+    CrossEntropyLoss, DistillLossKind, DistillSpec, TrainingLease,
 };
 use mlua::prelude::*;
 
@@ -162,7 +162,9 @@ pub(super) fn register_nn_trainer(
     let store_ff = Arc::clone(&card_store);
     let dir_ff = nn_dir.clone();
     let run_full_ft = lua.create_function(
-        move |lua, (base, dataset, opts): (LuaValue, LuaValue, LuaTable)| -> LuaResult<String> {
+        move |lua,
+              (base, dataset, opts): (LuaValue, LuaValue, LuaTable)|
+              -> LuaResult<(String, LuaTable)> {
             run_full_ft_impl(&store_ff, &dir_ff, lua, &base, &dataset, opts)
         },
     )?;
@@ -529,7 +531,7 @@ fn run_full_ft_impl(
     base: &LuaValue,
     dataset: &LuaValue,
     opts: LuaTable,
-) -> LuaResult<String> {
+) -> LuaResult<(String, LuaTable)> {
     // 1. Reject non-userdata base up front.
     let base_ud = match base {
         LuaValue::UserData(u) => u,
@@ -781,8 +783,43 @@ fn run_full_ft_impl(
     // below).
     let _ = ckpt.bundle_ref;
 
-    persist(store, &card)
-        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))
+    // Second return value: the checkpoints the hook asked to hold.
+    // A caller that binds one variable (`local id = run_full_ft(…)`)
+    // is unaffected — Lua drops the extra value — so this is additive
+    // for every consumer that predates the keep surface.
+    let candidates = candidates_to_lua(lua, &ckpt.candidates)?;
+
+    let card_id = persist(store, &card)
+        .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))?;
+    Ok((card_id, candidates))
+}
+
+/// Project the run's held checkpoints into a Lua array.
+///
+/// One entry per [`algocline_nn::train::Candidate`], in the order the
+/// hook asked for them:
+///
+/// ```lua
+/// { step = 40, ckpt_path = "/…/run-step40.safetensors",
+///   train_loss = 1.83, reason = "tier-2" }
+/// ```
+///
+/// `reason` is absent when the hook did not give one. The paths are
+/// pinned for the life of the run, so every entry still resolves when
+/// the caller reads it.
+fn candidates_to_lua(lua: &Lua, candidates: &[Candidate]) -> LuaResult<LuaTable> {
+    let out = lua.create_table()?;
+    for (i, c) in candidates.iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("step", c.step)?;
+        entry.set("ckpt_path", c.ckpt_path.to_string_lossy().into_owned())?;
+        entry.set("train_loss", c.train_loss)?;
+        if let Some(reason) = &c.reason {
+            entry.set("reason", reason.as_str())?;
+        }
+        out.set(i + 1, entry)?;
+    }
+    Ok(out)
 }
 
 // ─── Layer 5c S2 — `alc.nn.trainer.run_distill` ─────────────────────
@@ -1236,9 +1273,9 @@ mod run_ft_bridge_tests {
 
     // ─── Axis B — config schema refusals ──────────────────────────
 
-    fn expect_err(result: LuaResult<String>) -> String {
+    fn expect_err<T: std::fmt::Debug>(result: LuaResult<T>) -> String {
         match result {
-            Ok(id) => panic!("expected run_lora_ft_impl to fail; got card_id {id:?}"),
+            Ok(ok) => panic!("expected the run to fail; got {ok:?}"),
             Err(e) => e.to_string(),
         }
     }
@@ -1476,7 +1513,7 @@ mod run_ft_bridge_tests {
         let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
 
         let opts = opts_table(&lua, base_full_ft_opts());
-        let card_id = run_full_ft_impl(
+        let (card_id, _candidates) = run_full_ft_impl(
             &store,
             &nn_dir,
             &lua,
@@ -1583,7 +1620,7 @@ mod run_ft_bridge_tests {
         let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
 
         let opts = opts_table(&lua, base_full_ft_opts());
-        let card_id = run_full_ft_impl(
+        let (card_id, _candidates) = run_full_ft_impl(
             &store,
             &nn_dir,
             &lua,
@@ -1674,7 +1711,7 @@ mod run_ft_bridge_tests {
         let base_ud = lua.create_userdata(NnHandle::TinyLlama(base)).unwrap();
 
         let opts = opts_table(&lua, base_full_ft_opts());
-        let card_id = run_full_ft_impl(
+        let (card_id, _candidates) = run_full_ft_impl(
             &store,
             &nn_dir,
             &lua,
@@ -1837,7 +1874,7 @@ mod run_ft_bridge_tests {
             .expect("create on_ckpt");
         opts.set("on_ckpt", on_ckpt).unwrap();
 
-        let card_id = run_full_ft_impl(
+        let (card_id, _candidates) = run_full_ft_impl(
             &store,
             &nn_dir,
             &lua,
@@ -1866,6 +1903,92 @@ mod run_ft_bridge_tests {
             store.get(&card_id).unwrap().is_some(),
             "run_full_ft must persist the Card even with a hook attached"
         );
+    }
+
+    /// The Lua surface end to end: a hook that returns `"keep"` gets
+    /// its checkpoint held out of the rotation, and the second return
+    /// value describes what was held.
+    ///
+    /// `ckpt_keep = 1` is the point — the step-2 file is what a
+    /// rotation at step 4 would otherwise delete, so a caller reading
+    /// `candidates[1].ckpt_path` would be holding a dead path.
+    #[test]
+    fn run_full_ft_keep_returns_a_candidate_whose_file_survives() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(4);
+        o["ckpt_every"] = json!(2);
+        o["ckpt_keep"] = json!(1);
+        let opts = opts_table(&lua, o);
+
+        // Keep the first boundary (step 2) and let step 4 pass.
+        let on_ckpt = lua
+            .create_function(move |_, info: LuaTable| -> LuaResult<Option<String>> {
+                let step: i64 = info.get("step")?;
+                Ok((step == 2).then(|| "keep".to_string()))
+            })
+            .expect("create on_ckpt");
+        opts.set("on_ckpt", on_ckpt).unwrap();
+
+        let (card_id, candidates) = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft with a keeping on_ckpt");
+
+        assert_eq!(candidates.raw_len(), 1, "one boundary asked to be kept");
+        let entry: LuaTable = candidates.get(1).unwrap();
+        assert_eq!(entry.get::<i64>("step").unwrap(), 2);
+        let path: String = entry.get("ckpt_path").unwrap();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the kept checkpoint must survive the step-4 rotation at ckpt_keep=1: {path}"
+        );
+        assert!(entry.get::<f32>("train_loss").unwrap().is_finite());
+        assert_eq!(
+            entry.get::<Option<String>>("reason").unwrap(),
+            None,
+            "a bare \"keep\" carries no reason"
+        );
+
+        assert!(
+            store.get(&card_id).unwrap().is_some(),
+            "keeping a checkpoint must not disturb the terminal Card"
+        );
+    }
+
+    /// A run whose hook never keeps anything returns an empty
+    /// candidates table — `local id = run_full_ft(…)` keeps working
+    /// untouched.
+    #[test]
+    fn run_full_ft_without_keeps_returns_an_empty_candidate_list() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(2);
+        let opts = opts_table(&lua, o);
+
+        let (card_id, candidates) = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft without a hook");
+
+        assert_eq!(candidates.raw_len(), 0);
+        assert!(store.get(&card_id).unwrap().is_some());
     }
 
     #[test]
@@ -1898,7 +2021,7 @@ mod run_ft_bridge_tests {
             .expect("create on_ckpt");
         opts.set("on_ckpt", on_ckpt).unwrap();
 
-        let card_id = run_full_ft_impl(
+        let (card_id, _candidates) = run_full_ft_impl(
             &store,
             &nn_dir,
             &lua,

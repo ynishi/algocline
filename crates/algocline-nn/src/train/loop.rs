@@ -508,12 +508,97 @@ pub struct CkptInfo {
 /// from a full-run save without walking the step count against the
 /// requested `cfg.steps`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CkptControl {
+pub enum CkptFlow {
     /// Keep training. Emitted as `nil` / `"continue"` from Lua.
     Continue,
     /// Stop training now (after the current checkpoint). Emitted as
     /// `"break"` from Lua.
     Break,
+}
+
+/// A hook's request to hold the checkpoint it was just handed.
+///
+/// Carries only the caller's own words for why. The trainer neither
+/// parses nor compares the reason — it is written through to the
+/// [`Candidate`] so whoever reads the run outcome can see which
+/// judgment selected which step.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeepMark {
+    /// Free-form note from the hook, e.g. the band label that hit.
+    pub reason: Option<String>,
+}
+
+/// What the hook decided at a checkpoint boundary.
+///
+/// Two independent questions, kept as two fields rather than folded
+/// into one enum, because a checkpoint search asks both at once and
+/// the answers do not constrain each other:
+///
+/// - `flow` — does the run go on?
+/// - `keep` — is this checkpoint worth holding?
+///
+/// All four combinations are reachable and meaningful. "Keep and stop"
+/// is the ordinary end of a successful search; "keep and continue" is
+/// the ordinary middle of one; "drop and continue" is every other
+/// checkpoint; "drop and stop" is a run abandoned on a diverging loss.
+/// Folding the two into a single enum would have made the first case
+/// unsayable, which is what an earlier ABI did — a hook that wanted to
+/// hold a checkpoint had to reach around the trainer and copy the file
+/// out from under the rotation before it turned over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CkptControl {
+    /// Whether the training loop proceeds past this checkpoint.
+    pub flow: CkptFlow,
+    /// `Some` when the hook asked for this checkpoint to be held out
+    /// of the rotation and recorded as a candidate.
+    pub keep: Option<KeepMark>,
+}
+
+impl CkptControl {
+    /// Carry on, holding nothing. What `nil` / `"continue"` means.
+    pub const CONTINUE: Self = Self {
+        flow: CkptFlow::Continue,
+        keep: None,
+    };
+
+    /// Stop now, holding nothing. What `"break"` means.
+    pub const BREAK: Self = Self {
+        flow: CkptFlow::Break,
+        keep: None,
+    };
+
+    /// Hold this checkpoint and carry on. What `"keep"` means.
+    pub fn keep(reason: Option<String>) -> Self {
+        Self {
+            flow: CkptFlow::Continue,
+            keep: Some(KeepMark { reason }),
+        }
+    }
+
+    /// Hold this checkpoint and stop. The end of a successful search.
+    pub fn keep_and_break(reason: Option<String>) -> Self {
+        Self {
+            flow: CkptFlow::Break,
+            keep: Some(KeepMark { reason }),
+        }
+    }
+}
+
+/// A checkpoint the hook asked to hold, as it stood when it was held.
+///
+/// The file at `ckpt_path` is pinned for the rest of the run
+/// ([`super::ckpt::CheckpointStore::pin`]), so it is still there when
+/// the run returns — which is the whole point of recording it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    /// Optimizer step the checkpoint was written at.
+    pub step: usize,
+    /// Absolute path of the pinned checkpoint file.
+    pub ckpt_path: PathBuf,
+    /// Mean per-micro training loss on that step.
+    pub train_loss: f32,
+    /// The hook's own note, verbatim.
+    pub reason: Option<String>,
 }
 
 /// Callback fired at every `ckpt_every` boundary, after the checkpoint
@@ -552,7 +637,7 @@ impl From<candle_core::Error> for TrainError {
 /// `hook` is an optional [`CkptHook`] fired at each `ckpt_every`
 /// boundary (after `save_step`). Passing `None` retains the previous
 /// behaviour bit-identically; passing `Some(_)` lets the caller inspect
-/// per-checkpoint scalars and return [`CkptControl::Break`] to stop
+/// per-checkpoint scalars and return [`CkptControl::BREAK`] to stop
 /// training early. The hook is exclusive to the full-fine-tune surface
 /// today; the LoRA / distillation entries pass `None` internally.
 #[allow(clippy::too_many_arguments)]
@@ -856,12 +941,14 @@ fn run_ft_core(
     // The store is always constructed: even without mid-run
     // checkpoints (`ckpt_every == 0`) the loop still writes the
     // terminal `<prefix>.safetensors` file through it.
-    let ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
+    let mut ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
 
     let device = device.clone();
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
+    // Checkpoints the hook asked to hold, in the order it asked.
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     // Nested loop: outer = one optimizer step per iteration; inner =
     // `cfg.grad_accum` micro-batches whose per-micro losses are scaled
@@ -1039,9 +1126,27 @@ fn run_ft_core(
                     elapsed_ms: train_start.elapsed().as_millis() as u64,
                     min_train_loss: running_min_loss,
                 };
-                match hook_fn(&info).map_err(TrainError::Hook)? {
-                    CkptControl::Continue => {}
-                    CkptControl::Break => {
+                let control = hook_fn(&info).map_err(TrainError::Hook)?;
+
+                // Pin before anything else can rotate the file away.
+                // `save_step` on a later boundary is what prunes, so the
+                // pin has to be in place before the loop comes round
+                // again — and before the `Break` arm returns, since a
+                // candidate selected on the last fire is the one the
+                // caller most wants to still exist.
+                if let Some(mark) = control.keep {
+                    ckpt_store.pin(step + 1);
+                    candidates.push(Candidate {
+                        step: step + 1,
+                        ckpt_path: info.ckpt_path.clone(),
+                        train_loss: mean_loss,
+                        reason: mark.reason,
+                    });
+                }
+
+                match control.flow {
+                    CkptFlow::Continue => {}
+                    CkptFlow::Break => {
                         // Early-return path: write terminal ckpt +
                         // finalize with `early_break = 1.0` marker so
                         // downstream consumers can distinguish an
@@ -1054,14 +1159,11 @@ fn run_ft_core(
                         metrics.insert("min_train_loss".into(), running_min_loss);
                         metrics.insert("final_lr".into(), lr as f32);
                         metrics.insert("early_break".into(), 1.0);
-                        return checkpoint_from_path(
-                            &final_path,
-                            step + 1,
-                            mean_loss,
-                            None,
-                            metrics,
-                        )
-                        .map_err(TrainError::Ckpt);
+                        let mut ckpt =
+                            checkpoint_from_path(&final_path, step + 1, mean_loss, None, metrics)
+                                .map_err(TrainError::Ckpt)?;
+                        ckpt.candidates = candidates;
+                        return Ok(ckpt);
                     }
                 }
             }
@@ -1077,8 +1179,10 @@ fn run_ft_core(
     metrics.insert("min_train_loss".into(), running_min_loss);
     metrics.insert("final_lr".into(), scheduler.lr_at(cfg.steps - 1) as f32);
 
-    checkpoint_from_path(&final_path, cfg.steps, last_train_loss, None, metrics)
-        .map_err(TrainError::Ckpt)
+    let mut ckpt = checkpoint_from_path(&final_path, cfg.steps, last_train_loss, None, metrics)
+        .map_err(TrainError::Ckpt)?;
+    ckpt.candidates = candidates;
+    Ok(ckpt)
 }
 
 /// L2 norm of every trainable parameter's gradient in `opt_vm`.
@@ -1796,7 +1900,7 @@ mod tests {
         let captured_hook = Arc::clone(&captured);
         let hook: CkptHook = Box::new(move |info| {
             captured_hook.lock().unwrap().push(info.clone());
-            Ok(CkptControl::Continue)
+            Ok(CkptControl::CONTINUE)
         });
 
         let ckpt = run_full_ft(
@@ -1865,7 +1969,7 @@ mod tests {
         );
     }
 
-    /// A hook returning [`CkptControl::Break`] stops training after
+    /// A hook returning [`CkptControl::BREAK`] stops training after
     /// the current ckpt, still writes the terminal
     /// `<prefix>.safetensors`, and tags `metrics["early_break"] = 1.0`.
     #[test]
@@ -1900,9 +2004,9 @@ mod tests {
             let mut n = fire_count_hook.lock().unwrap();
             *n += 1;
             if *n >= 2 {
-                Ok(CkptControl::Break)
+                Ok(CkptControl::BREAK)
             } else {
-                Ok(CkptControl::Continue)
+                Ok(CkptControl::CONTINUE)
             }
         });
 
@@ -1936,6 +2040,175 @@ mod tests {
             tmp.path().join("hook_break.safetensors").exists(),
             "save_final must run before returning from an early break"
         );
+    }
+
+    /// The whole point of the keep surface: a checkpoint the hook held
+    /// early in the run is still on disk when the run returns, and the
+    /// run says which one it was.
+    ///
+    /// `ckpt_keep = 1` makes the hazard unambiguous — without the pin
+    /// the step-4 file is deleted at step 8 and every later boundary,
+    /// so a search that liked step 4 would come back holding a path to
+    /// nothing.
+    #[test]
+    fn kept_checkpoint_survives_rotation_and_lands_in_candidates() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 20,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        // Keep the first fire (step 4) and nothing else. Four more
+        // boundaries follow it, each pruning down to keep=1.
+        let fire_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let fire_count_hook = Arc::clone(&fire_count);
+        let hook: CkptHook = Box::new(move |_info| {
+            let mut n = fire_count_hook.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Ok(CkptControl::keep(Some("first-look".to_string())))
+            } else {
+                Ok(CkptControl::CONTINUE)
+            }
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_keep",
+            lease,
+            Some(hook),
+        )
+        .expect("a keep must not disturb the run");
+
+        assert_eq!(*fire_count.lock().unwrap(), 5, "20 steps / ckpt_every 4");
+        assert_eq!(ckpt.step, 20, "keep alone must not stop the run");
+
+        assert_eq!(ckpt.candidates.len(), 1);
+        let candidate = &ckpt.candidates[0];
+        assert_eq!(candidate.step, 4);
+        assert_eq!(candidate.reason.as_deref(), Some("first-look"));
+        assert!(
+            candidate.ckpt_path.exists(),
+            "the candidate's file must outlive four rotations at keep=1: {:?}",
+            candidate.ckpt_path
+        );
+        assert!(candidate.train_loss.is_finite());
+    }
+
+    /// Keep and break together — how a successful search ends. The
+    /// checkpoint that satisfied the judgment is held, and the run
+    /// stops on the same decision.
+    #[test]
+    fn keep_and_break_holds_the_checkpoint_it_stopped_on() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 20,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        let hook: CkptHook =
+            Box::new(move |_info| Ok(CkptControl::keep_and_break(Some("good-enough".into()))));
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_keep_break",
+            lease,
+            Some(hook),
+        )
+        .expect("keep+break must still finalize");
+
+        assert_eq!(ckpt.step, 4, "the run stopped on the first boundary");
+        assert_eq!(
+            ckpt.metrics.get("early_break").copied(),
+            Some(1.0),
+            "a keep alongside a break must not swallow the early_break marker"
+        );
+        assert_eq!(ckpt.candidates.len(), 1);
+        assert_eq!(ckpt.candidates[0].step, 4);
+        assert!(
+            ckpt.candidates[0].ckpt_path.exists(),
+            "the pin has to be in place before the break returns"
+        );
+    }
+
+    /// A run whose hook never keeps anything reports no candidates —
+    /// the field is additive, not a behaviour change.
+    #[test]
+    fn a_run_that_keeps_nothing_reports_no_candidates() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 8,
+            warmup: 1,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 2,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+        let hook: CkptHook = Box::new(move |_info| Ok(CkptControl::CONTINUE));
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_no_keep",
+            lease,
+            Some(hook),
+        )
+        .unwrap();
+        assert!(ckpt.candidates.is_empty());
     }
 
     /// A hook that returns an error surfaces as

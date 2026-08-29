@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A checkpoint the trainer is told to keep is held out of the
+  rotation, and the run reports what it held.** `on_ckpt` can now
+  return `"keep"` (hold this checkpoint, carry on) or a table
+  `{ action = "continue"|"break"|nil, keep = true|"<reason>"|nil }`.
+  A held checkpoint is pinned: it is neither deleted by `ckpt_keep`
+  nor counted against it. `alc.nn.trainer.run_full_ft` returns the
+  held checkpoints as a **second value**, one entry per keep with
+  `step` / `ckpt_path` / `train_loss` / `reason`.
+
+  This closes the gap that made checkpoint search a thing callers did
+  *around* the trainer rather than through it. The hook could measure a
+  checkpoint and could stop the run, but it had no way to say "hold this
+  one" — so a caller that liked step 40 had to bake a Card out of the
+  file inside the hook, racing the rotation that would delete it, and
+  keep `ckpt_keep >= 2` as a written-down promise to give itself the
+  margin to win that race. A promise in prose is not a guarantee; the
+  pin is.
+
+  `{ action = "break", keep = "…" }` is the combination the previous
+  return contract could not express at all, and it is the one a
+  successful search ends on: the checkpoint that satisfied the judgment
+  is held, and the run stops on the same decision.
+
+  Additive for every existing caller. `local card_id = run_full_ft(…)`
+  drops the extra value, `nil` / `"continue"` / `"break"` mean what they
+  meant, and a run whose hook never keeps anything reports no
+  candidates.
+
+  Rust API — **breaking for direct `algocline-nn` consumers.**
+  `CkptControl` is a struct of two independent fields rather than a
+  two-variant enum, because the hook answers two questions and folding
+  them into one made the fourth combination unsayable:
+
+  ```rust
+  // before
+  Ok(CkptControl::Continue)
+  Ok(CkptControl::Break)
+
+  // after
+  Ok(CkptControl::CONTINUE)
+  Ok(CkptControl::BREAK)
+  Ok(CkptControl::keep(Some("tier-2".into())))          // hold, carry on
+  Ok(CkptControl::keep_and_break(Some("cleared".into()))) // hold, stop
+  ```
+
+  `CkptFlow` / `KeepMark` / `Candidate` are new and re-exported from
+  `algocline_nn::train`. `Checkpoint` gains a `candidates` field, and
+  `CheckpointStore` gains `pin` / `is_pinned` / `pinned` — struct
+  literals of either need the new field, and a store that pins needs a
+  `mut` binding.
+
 - **Corpus files are a platform concept: `algocline_nn::train::corpus`
   + `alc.nn.data.corpus(paths, opts?)`.** A corpus file is JSON —
   `{"meta": {"ctx_len": N, "vocab_size": V}, "rows": [[id, …]]}` — of

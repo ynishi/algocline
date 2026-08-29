@@ -61,6 +61,14 @@ pub struct Checkpoint {
     pub val_loss: Option<f32>,
     /// Per-run scalar metrics keyed by name.
     pub metrics: HashMap<String, f32>,
+    /// Mid-run checkpoints the `on_ckpt` hook asked to hold, in the
+    /// order it asked. Each one's file is pinned out of the rotation,
+    /// so every path here still exists when the run returns.
+    ///
+    /// Empty on a run with no hook, and on a run whose hook never
+    /// asked to keep anything — which is every run that predates the
+    /// keep surface.
+    pub candidates: Vec<fullft::Candidate>,
 }
 
 /// Access to the [`candle_core::Device`] a trainable model was built
@@ -171,8 +179,9 @@ pub use data::{
 };
 pub use fullft::{
     allowed_input_sets, allowed_logit_mask, run_allowed_ft, run_conditioned_ft, run_distill,
-    run_full_ft, run_lora_ft, CkptControl, CkptHook, CkptInfo, DistillLossKind, DistillSpec,
-    FullFtConfig, OptimizerKind, TrainError, TrainingLease, TrainingLeaseGuard,
+    run_full_ft, run_lora_ft, Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo,
+    DistillLossKind, DistillSpec, FullFtConfig, KeepMark, OptimizerKind, TrainError, TrainingLease,
+    TrainingLeaseGuard,
 };
 pub use lion::{Lion, ParamsLion};
 pub use loss::{CrossEntropyLoss, HardLabelDistillLoss, Loss, Reduction};

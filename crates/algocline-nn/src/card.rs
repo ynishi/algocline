@@ -1478,6 +1478,7 @@ mod tests {
             train_loss: 1.25,
             val_loss: None,
             metrics: std::collections::HashMap::new(),
+            candidates: Vec::new(),
         }
     }
 

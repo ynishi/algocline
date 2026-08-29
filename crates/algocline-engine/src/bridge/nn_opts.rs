@@ -35,8 +35,8 @@ use std::path::PathBuf;
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::train::{
-    CkptControl, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, OptimizerKind, ScheduleKind,
-    TrainError,
+    CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, KeepMark,
+    OptimizerKind, ScheduleKind, TrainError,
 };
 use mlua::prelude::*;
 
@@ -102,8 +102,11 @@ pub(super) fn extract_full_ft_opts(
 /// `TrainError::Hook` rather than a `panic!`.
 ///
 /// Lua return-value contract (loud on anything else):
-/// - `nil` or `"continue"` → [`CkptControl::Continue`]
-/// - `"break"` → [`CkptControl::Break`]
+/// - `nil` or `"continue"` → carry on, hold nothing
+/// - `"break"` → stop now, hold nothing
+/// - `"keep"` → hold this checkpoint, carry on
+/// - `{ action = …, keep = … }` → the two axes stated separately, for
+///   the one combination the strings cannot say (hold *and* stop)
 /// - any other value → `TrainError::Hook` naming the offending value
 ///
 /// A Lua-side `error(...)` inside the callback also surfaces as
@@ -186,24 +189,89 @@ fn ckpt_info_to_lua(lua: &Lua, info: &CkptInfo) -> LuaResult<LuaTable> {
 ///
 /// Kept out of [`extract_on_ckpt_hook`] so the parser is testable
 /// without spinning up a full trainer run.
+///
+/// The string forms cover the three decisions a hook makes most of the
+/// time. The table form exists because the hook is really answering two
+/// questions — does the run go on, and is this checkpoint worth holding
+/// — and one string cannot say "hold this one and stop", which is how a
+/// successful search ends.
 fn parse_ckpt_control(prefix: &str, value: &LuaValue) -> Result<CkptControl, String> {
     match value {
-        LuaValue::Nil => Ok(CkptControl::Continue),
+        LuaValue::Nil => Ok(CkptControl::CONTINUE),
         LuaValue::String(s) => match s.to_str().as_deref() {
-            Ok("continue") => Ok(CkptControl::Continue),
-            Ok("break") => Ok(CkptControl::Break),
+            Ok("continue") => Ok(CkptControl::CONTINUE),
+            Ok("break") => Ok(CkptControl::BREAK),
+            Ok("keep") => Ok(CkptControl::keep(None)),
             Ok(other) => Err(format!(
-                "{prefix}: on_ckpt must return 'continue' | 'break' | nil, got {other:?}"
+                "{prefix}: on_ckpt must return 'continue' | 'break' | 'keep' | nil \
+                 or a table, got {other:?}"
             )),
             Err(e) => Err(format!(
                 "{prefix}: on_ckpt returned a non-UTF-8 string: {e}"
             )),
         },
+        LuaValue::Table(t) => parse_ckpt_control_table(prefix, t),
         other => Err(format!(
-            "{prefix}: on_ckpt must return string or nil, got {}",
+            "{prefix}: on_ckpt must return string, table or nil, got {}",
             other.type_name()
         )),
     }
+}
+
+/// Parse the table form: `{ action = "continue"|"break"|nil,
+/// keep = true|false|"<reason>"|nil }`.
+///
+/// `keep` as a string carries the caller's own note straight through to
+/// the candidate record, so a band label survives into the run outcome
+/// without the trainer needing to know what a band is.
+fn parse_ckpt_control_table(prefix: &str, t: &LuaTable) -> Result<CkptControl, String> {
+    let action: Option<mlua::String> = t
+        .get("action")
+        .map_err(|e| format!("{prefix}: on_ckpt table field 'action' is unreadable: {e}"))?;
+    let flow = match action.as_ref().map(|s| s.to_str()).transpose() {
+        Ok(None) => CkptFlow::Continue,
+        Ok(Some(s)) => match s.as_ref() {
+            "continue" => CkptFlow::Continue,
+            "break" => CkptFlow::Break,
+            other => {
+                return Err(format!(
+                    "{prefix}: on_ckpt table field 'action' must be \
+                     'continue' | 'break' | nil, got {other:?}"
+                ))
+            }
+        },
+        Err(e) => {
+            return Err(format!(
+                "{prefix}: on_ckpt table field 'action' is not UTF-8: {e}"
+            ))
+        }
+    };
+
+    let keep_value: LuaValue = t
+        .get("keep")
+        .map_err(|e| format!("{prefix}: on_ckpt table field 'keep' is unreadable: {e}"))?;
+    let keep = match keep_value {
+        LuaValue::Nil | LuaValue::Boolean(false) => None,
+        LuaValue::Boolean(true) => Some(KeepMark { reason: None }),
+        LuaValue::String(s) => match s.to_str() {
+            Ok(reason) => Some(KeepMark {
+                reason: Some(reason.to_string()),
+            }),
+            Err(e) => {
+                return Err(format!(
+                    "{prefix}: on_ckpt table field 'keep' is not UTF-8: {e}"
+                ))
+            }
+        },
+        other => {
+            return Err(format!(
+                "{prefix}: on_ckpt table field 'keep' must be boolean, string or nil, got {}",
+                other.type_name()
+            ))
+        }
+    };
+
+    Ok(CkptControl { flow, keep })
 }
 
 /// Extract a validated [`FullFtConfig`] from `opts` for the
@@ -1172,20 +1240,100 @@ mod tests {
     #[test]
     fn parse_ckpt_control_accepts_nil_and_continue_and_break() {
         let lua = Lua::new();
-        assert!(matches!(
+        assert_eq!(
             parse_ckpt_control("prefix", &LuaValue::Nil).unwrap(),
-            CkptControl::Continue
-        ));
+            CkptControl::CONTINUE
+        );
         let s_cont = LuaValue::String(lua.create_string("continue").unwrap());
-        assert!(matches!(
+        assert_eq!(
             parse_ckpt_control("prefix", &s_cont).unwrap(),
-            CkptControl::Continue
-        ));
+            CkptControl::CONTINUE
+        );
         let s_break = LuaValue::String(lua.create_string("break").unwrap());
-        assert!(matches!(
+        assert_eq!(
             parse_ckpt_control("prefix", &s_break).unwrap(),
-            CkptControl::Break
-        ));
+            CkptControl::BREAK
+        );
+    }
+
+    /// `"keep"` holds the checkpoint without stopping the run — the
+    /// ordinary middle of a checkpoint search.
+    #[test]
+    fn parse_ckpt_control_accepts_keep_string() {
+        let lua = Lua::new();
+        let s_keep = LuaValue::String(lua.create_string("keep").unwrap());
+        let control = parse_ckpt_control("prefix", &s_keep).unwrap();
+        assert_eq!(control.flow, CkptFlow::Continue);
+        assert_eq!(control.keep, Some(KeepMark { reason: None }));
+    }
+
+    /// The combination no single string can express: hold this one and
+    /// stop. This is what an earlier ABI had no room for, and why the
+    /// hook used to copy the file out from under the rotation itself.
+    #[test]
+    fn parse_ckpt_control_table_says_keep_and_break_together() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("action", "break").unwrap();
+        t.set("keep", "tier-3").unwrap();
+        let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
+        assert_eq!(control.flow, CkptFlow::Break);
+        assert_eq!(
+            control.keep,
+            Some(KeepMark {
+                reason: Some("tier-3".to_string())
+            }),
+            "a string `keep` carries the caller's own label through"
+        );
+    }
+
+    /// An omitted `action` means continue, and `keep = true` marks the
+    /// checkpoint without a reason.
+    #[test]
+    fn parse_ckpt_control_table_defaults_action_to_continue() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("keep", true).unwrap();
+        let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
+        assert_eq!(control.flow, CkptFlow::Continue);
+        assert_eq!(control.keep, Some(KeepMark { reason: None }));
+
+        let empty = lua.create_table().unwrap();
+        assert_eq!(
+            parse_ckpt_control("prefix", &LuaValue::Table(empty)).unwrap(),
+            CkptControl::CONTINUE,
+            "an empty table is the same decision as nil"
+        );
+    }
+
+    /// `keep = false` is a decision, not a marker: it must not pin.
+    #[test]
+    fn parse_ckpt_control_table_treats_keep_false_as_no_keep() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("keep", false).unwrap();
+        let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
+        assert_eq!(control.keep, None);
+    }
+
+    #[test]
+    fn parse_ckpt_control_table_rejects_bad_action_and_keep_types() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("action", "halt").unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(
+            err.contains("alc.nn.trainer") && err.contains("action") && err.contains("halt"),
+            "message must name prefix + field + offending value: {err}"
+        );
+
+        let t = lua.create_table().unwrap();
+        t.set("keep", 3).unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(
+            err.contains("keep") && err.contains("integer"),
+            "message must name the field and the type it got: {err}"
+        );
     }
 
     #[test]
@@ -1200,13 +1348,13 @@ mod tests {
 
         let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Boolean(true)).unwrap_err();
         assert!(
-            err.contains("must return string or nil") && err.contains("boolean"),
+            err.contains("must return string, table or nil") && err.contains("boolean"),
             "wrong-type message must state the expected shape + observed type: {err}"
         );
 
         let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Integer(1)).unwrap_err();
         assert!(
-            err.contains("must return string or nil") && err.contains("integer"),
+            err.contains("must return string, table or nil") && err.contains("integer"),
             "wrong-type message must state the observed type: {err}"
         );
     }

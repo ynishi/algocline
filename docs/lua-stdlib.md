@@ -1585,7 +1585,7 @@ local base2 = alc.nn.preset("gpt2", "medium", { pretrained = false })
 local wrapped = alc.nn.card.load_wrap(lora_id, base2)
 ```
 
-#### `alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id`
+#### `alc.nn.trainer.run_full_ft(base_handle, dataset, opts) -> card_id, candidates`
 
 Layer 5c S1 — one-call full-fine-tune surface: train the base
 model + save safetensors + write a `training_path="full_ft"`
@@ -1680,6 +1680,75 @@ Checkpoint before assembling the Card.
     or an equivalent gate), never by raw `argmax()` (measured:
     raw legality fell from 0.71 to 0.08–0.16 under masked
     training while gated-decode play strength improved).
+  - `ckpt_every` (integer, optional, default `0`) — write a
+    mid-run checkpoint every N optimizer steps. `0` disables
+    them; only the terminal `<card_id>.safetensors` is written.
+  - `ckpt_keep` (integer, optional) — how many mid-run
+    checkpoints stay on disk. The oldest beyond this count are
+    deleted as newer ones arrive. Clamps to at least `1`.
+  - `on_ckpt` (function, optional) — called once per
+    `ckpt_every` boundary, after the checkpoint has been
+    written, as `on_ckpt(info)`. Requires `ckpt_every > 0`;
+    supplying it without one is refused up front rather than
+    silently never firing. See *Checkpoint search* below.
+
+**Checkpoint search.** `on_ckpt` is where a caller measures the
+model mid-run and decides what to do about what it measured. The
+`info` table carries `step`, `ckpt_path`, `train_loss`, `lr`,
+`grad_norm`, `elapsed_ms` and `min_train_loss`; the checkpoint at
+`info.ckpt_path` is already on disk, so a hook can load it
+(`alc.nn.card.load_ckpt`) and evaluate it while the run waits.
+
+The return value answers two questions — does the run go on, and
+is this checkpoint worth holding:
+
+| return | run | this checkpoint |
+|---|---|---|
+| `nil` / `"continue"` | goes on | released to the rotation |
+| `"break"` | stops here | released to the rotation |
+| `"keep"` | goes on | held |
+| `{ action = …, keep = … }` | per `action` | held when `keep` is truthy |
+
+`action` is `"continue"` / `"break"` / absent (absent means
+continue). `keep` is `true`, or a string carrying your own note —
+a band label, a rank, whatever names why this one was selected.
+The table form exists for the combination no single string can
+say: **hold this one and stop**, which is how a successful search
+ends. Anything else is refused loudly with the offending value in
+the message.
+
+A held checkpoint is pinned out of the rotation for the rest of
+the run: it is neither deleted by `ckpt_keep` nor counted against
+it. This is the whole reason `keep` exists — without it, the file
+a search selected at step 40 is gone once `ckpt_keep` newer ones
+have been written, and the search comes back holding a path to
+nothing.
+
+What was held comes back as the **second return value**, an array
+in the order the hook asked for them:
+
+```lua
+local card_id, candidates = alc.nn.trainer.run_full_ft(h, ds, {
+    lr = 3e-4, batch = 8, steps = 2000,
+    ckpt_every = 100, ckpt_keep = 3,
+    on_ckpt = function(info)
+        local ckpt = alc.nn.card.load_ckpt(info.ckpt_path, { arch = "gpt2-tiny" })
+        local score = my_metric(ckpt)
+        if score >= 0.9 then return { action = "break", keep = "cleared" } end
+        if score >= 0.6 then return "keep" end
+        return "continue"
+    end,
+})
+
+for _, c in ipairs(candidates) do
+    -- c.step / c.ckpt_path / c.train_loss / c.reason (absent if none given)
+    print(c.step, c.reason, c.ckpt_path)
+end
+```
+
+Binding one variable (`local card_id = …`) keeps working
+unchanged — Lua drops the extra value — so every caller written
+before the keep surface behaves exactly as it did.
 
 **Schedules.** All three warmup-bearing ones share one ramp and differ
 only in the tail, so switching between them changes the shape of a

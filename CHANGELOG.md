@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful search ends on: the checkpoint that satisfied the judgment
   is held, and the run stops on the same decision.
 
+  The sibling raw-Checkpoint surface `alc.nn.trainer.full_ft` reads the
+  same hook, so it carries the same list on `ckpt.candidates` — a run
+  that could hold a file but not say which one held it back where it
+  started.
+
   Additive for every existing caller. `local card_id = run_full_ft(…)`
   drops the extra value, `nil` / `"continue"` / `"break"` mean what they
   meant, and a run whose hook never keeps anything reports no

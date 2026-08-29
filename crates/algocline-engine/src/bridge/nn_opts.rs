@@ -35,7 +35,7 @@ use std::path::PathBuf;
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use algocline_nn::train::{
-    CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, KeepMark,
+    Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, KeepMark,
     OptimizerKind, ScheduleKind, TrainError,
 };
 use mlua::prelude::*;
@@ -183,6 +183,35 @@ fn ckpt_info_to_lua(lua: &Lua, info: &CkptInfo) -> LuaResult<LuaTable> {
     t.set("elapsed_ms", info.elapsed_ms)?;
     t.set("min_train_loss", info.min_train_loss)?;
     Ok(t)
+}
+
+/// Project a run's held checkpoints into a Lua array.
+///
+/// The other half of the hook ABI: [`ckpt_info_to_lua`] carries a
+/// checkpoint *into* the hook, this carries back out the ones the hook
+/// asked to keep. One entry per [`Candidate`], in the order it asked:
+///
+/// ```lua
+/// { step = 40, ckpt_path = "/…/run-step40.safetensors",
+///   train_loss = 1.83, reason = "tier-2" }
+/// ```
+///
+/// `reason` is absent when the hook did not give one. Every path is
+/// pinned for the life of the run, so each entry still resolves when
+/// the caller reads it.
+pub(super) fn candidates_to_lua(lua: &Lua, candidates: &[Candidate]) -> LuaResult<LuaTable> {
+    let out = lua.create_table()?;
+    for (i, c) in candidates.iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("step", c.step)?;
+        entry.set("ckpt_path", c.ckpt_path.to_string_lossy().into_owned())?;
+        entry.set("train_loss", c.train_loss)?;
+        if let Some(reason) = &c.reason {
+            entry.set("reason", reason.as_str())?;
+        }
+        out.set(i + 1, entry)?;
+    }
+    Ok(out)
 }
 
 /// Map a Lua-side `on_ckpt` return value to a [`CkptControl`].

@@ -102,8 +102,8 @@ use algocline_nn::card::{
     bundle_ref_for, CardId, NnCustomBranch, NnLoraBranch, NnModelCard, TrainingPath,
 };
 use algocline_nn::train::{
-    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, Candidate,
-    CrossEntropyLoss, DistillLossKind, DistillSpec, TrainingLease,
+    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss,
+    DistillLossKind, DistillSpec, TrainingLease,
 };
 use mlua::prelude::*;
 
@@ -787,39 +787,11 @@ fn run_full_ft_impl(
     // A caller that binds one variable (`local id = run_full_ft(…)`)
     // is unaffected — Lua drops the extra value — so this is additive
     // for every consumer that predates the keep surface.
-    let candidates = candidates_to_lua(lua, &ckpt.candidates)?;
+    let candidates = crate::bridge::nn_opts::candidates_to_lua(lua, &ckpt.candidates)?;
 
     let card_id = persist(store, &card)
         .map_err(|e| LuaError::external(format!("alc.nn.trainer.run_full_ft: {e}")))?;
     Ok((card_id, candidates))
-}
-
-/// Project the run's held checkpoints into a Lua array.
-///
-/// One entry per [`algocline_nn::train::Candidate`], in the order the
-/// hook asked for them:
-///
-/// ```lua
-/// { step = 40, ckpt_path = "/…/run-step40.safetensors",
-///   train_loss = 1.83, reason = "tier-2" }
-/// ```
-///
-/// `reason` is absent when the hook did not give one. The paths are
-/// pinned for the life of the run, so every entry still resolves when
-/// the caller reads it.
-fn candidates_to_lua(lua: &Lua, candidates: &[Candidate]) -> LuaResult<LuaTable> {
-    let out = lua.create_table()?;
-    for (i, c) in candidates.iter().enumerate() {
-        let entry = lua.create_table()?;
-        entry.set("step", c.step)?;
-        entry.set("ckpt_path", c.ckpt_path.to_string_lossy().into_owned())?;
-        entry.set("train_loss", c.train_loss)?;
-        if let Some(reason) = &c.reason {
-            entry.set("reason", reason.as_str())?;
-        }
-        out.set(i + 1, entry)?;
-    }
-    Ok(out)
 }
 
 // ─── Layer 5c S2 — `alc.nn.trainer.run_distill` ─────────────────────

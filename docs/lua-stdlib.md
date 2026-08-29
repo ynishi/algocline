@@ -1750,6 +1750,9 @@ Binding one variable (`local card_id = …`) keeps working
 unchanged — Lua drops the extra value — so every caller written
 before the keep surface behaves exactly as it did.
 
+The sibling `alc.nn.trainer.full_ft` reads the same `on_ckpt` and
+returns the same list on its Checkpoint table as `ckpt.candidates`.
+
 **Schedules.** All three warmup-bearing ones share one ramp and differ
 only in the tail, so switching between them changes the shape of a
 curve rather than the kind of run.

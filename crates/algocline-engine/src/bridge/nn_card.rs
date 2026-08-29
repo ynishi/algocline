@@ -5639,6 +5639,15 @@ fn checkpoint_to_lua(
         metrics.set(k.as_str(), *v)?;
     }
     out.set("metrics", metrics)?;
+    // This surface extracts the same `on_ckpt` hook as its Layer 5c
+    // sibling, so a hook here can ask to keep a checkpoint. Reporting
+    // what was kept belongs with the outcome that pinned it — a run
+    // that could hold a file but not say which one held it back where
+    // it started.
+    out.set(
+        "candidates",
+        super::nn_opts::candidates_to_lua(lua, &ckpt.candidates)?,
+    )?;
     if let Some(lora) = lora_branch {
         out.set("lora", lora)?;
     }

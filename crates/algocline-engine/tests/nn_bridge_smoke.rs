@@ -542,6 +542,74 @@ fn alc_nn_trainer_full_ft_on_ckpt_break_stops_early() {
     assert_eq!(fires, 2, "hook must have fired exactly twice before break");
 }
 
+/// A hook on the raw-Checkpoint surface can hold a checkpoint too, and
+/// the Checkpoint table says which ones it held.
+///
+/// `ckpt_keep = 1` is the point of the test: the step-2 file is exactly
+/// what the step-4 rotation deletes, so without the pin the path the
+/// caller reads back is dead.
+#[test]
+fn alc_nn_trainer_full_ft_keep_pins_the_checkpoint_and_reports_it() {
+    let (lua, _tmp) = production_vm();
+    let (n, step, path, reason) = lua
+        .load(
+            r#"
+            local h = alc.nn.preset.gpt2("custom", {
+                pretrained = false,
+                device = "cpu",
+                vocab = 32,
+            })
+            local rows = {
+                { 1, 5, 12, 20, 30, 3, 8, 15 },
+                { 2, 8, 15, 22, 30, 4, 9, 16 },
+                { 3, 7, 14, 21, 28, 5, 10, 17 },
+                { 4, 6, 13, 19, 27, 6, 11, 18 },
+                { 5, 9, 16, 23, 29, 7, 12, 19 },
+                { 6, 10, 11, 24, 26, 8, 13, 20 },
+                { 7, 11, 17, 25, 31, 9, 14, 21 },
+                { 8, 12, 18, 20, 25, 10, 15, 22 },
+            }
+            local ds = alc.nn.data.synthetic(rows, {
+                batch_size = 1,
+                ctx_len = 8,
+                shuffle = false,
+                pad_id = 0,
+            })
+
+            local ckpt = alc.nn.trainer.full_ft(h, ds, {
+                lr = 3e-4,
+                batch_size = 1,
+                steps = 8,
+                warmup = 0,
+                schedule = "constant",
+                weight_decay = 0.0,
+                ckpt_every = 2,
+                ckpt_keep = 1,
+                ckpt_prefix = "smoke_on_ckpt_keep",
+                on_ckpt = function(info)
+                    if info.step == 2 then
+                        return { keep = "first-look" }
+                    end
+                    return "continue"
+                end,
+            })
+
+            local c = ckpt.candidates[1]
+            return #ckpt.candidates, c.step, c.ckpt_path, c.reason
+        "#,
+        )
+        .eval::<(i64, i64, String, String)>()
+        .expect("full_ft with a keeping on_ckpt");
+
+    assert_eq!(n, 1, "one boundary asked to be kept");
+    assert_eq!(step, 2);
+    assert_eq!(reason, "first-look", "the caller's own label comes back");
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "the kept checkpoint must survive three later rotations at ckpt_keep=1: {path}"
+    );
+}
+
 /// A Lua-side error inside `on_ckpt` surfaces as a Lua error with the
 /// `alc.nn.trainer` prefix (via `TrainError::Hook` → `train_err_to_lua`),
 /// not as a silent PASS or a Rust panic.

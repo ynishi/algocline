@@ -112,22 +112,35 @@ end
 
 alc.nn = alc.nn or {}
 
---- ctx tables the registry was asked to evaluate, in fire order.
+--- ctx tables a metric was called with, in fire order.
 local EVAL_CALLS = {}
 --- metric name -> fn(ctx), swapped per case by `configure`.
 local METRICS = {}
 
 alc.nn.metric = alc.nn.metric or {}
-alc.nn.metric.registry = {
-    register = function() end,
-    evaluate = function(name, ctx)
+
+--- Build one stub ctx adapter. The name is resolved against `METRICS`
+--- at call time, so `configure` can swap a case's metrics long after
+--- the script bound the adapter into its views.
+local function stub_metric(name)
+    return function(ctx)
         EVAL_CALLS[#EVAL_CALLS + 1] = { name = name, ctx = ctx }
         local fn = METRICS[name]
         if fn == nil then
             error("spec: no stub metric named '" .. tostring(name) .. "'", 0)
         end
         return fn(ctx)
-    end,
+    end
+end
+
+-- The script reaches its metrics through the package table, so the fake
+-- package has to be in place before the script runs.
+package.loaded["gameai_metrics"] = {
+    metrics = {
+        level = stub_metric("level"),
+        trickiness = stub_metric("trickiness"),
+        style_distance = stub_metric("style_distance"),
+    },
 }
 
 local duel = require("guardian_duel")

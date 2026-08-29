@@ -274,10 +274,11 @@ if CKPT_EVERY > 0 then
     if type(TEACHER_ALIAS) ~= "string" or #TEACHER_ALIAS == 0 then
         error("train_guardian_npc: ctx.teacher_alias must be a non-empty Card alias")
     end
-    -- Requiring the pkg self-registers style_distance / trickiness /
-    -- level into `alc.nn.metric.registry`, which is where the views
-    -- below reach them by name. Deferred behind the switch so a run
-    -- with observation disabled touches no metric surface at all.
+    -- Requiring the pkg builds the style_distance / trickiness / level
+    -- ctx adapters the views below hold. Deferred behind the switch so
+    -- a run with observation disabled touches no metric surface at all,
+    -- and done here rather than at first use so a missing package fails
+    -- before any training budget is spent.
     require("gameai_metrics")
 end
 
@@ -592,12 +593,17 @@ end
 ---@param prompt_set table `prompt_set_of(checks)` output
 ---@return table views
 local function build_views(style, prompt_set)
+    -- Resolved here rather than at file scope: this is the only path
+    -- that needs the metrics, so a run with observation disabled never
+    -- loads them (the preflight above requires the package for the same
+    -- reason, and this require then hits `package.loaded`).
+    local metrics = require("gameai_metrics").metrics
     return {
         -- Strength: win rate and its Wilson interval from the seat the
         -- Card plays. The seed is fixed for the whole run, so every
         -- fire replays the same openings and the difference between
         -- two fires is the model's rather than the draw's.
-        am.view("level", "level", {
+        am.view("level", metrics.level, {
             seat = "boss",
             style = style,
             opponents = OPPONENTS,
@@ -607,7 +613,7 @@ local function build_views(style, prompt_set)
         }),
         -- Personality: how far the Card has moved from its teacher.
         -- Both Cards are read under the one style basis this run names.
-        am.view("sd_teacher", "style_distance", {
+        am.view("sd_teacher", metrics.style_distance, {
             seat = "boss",
             style = style,
             card_b = TEACHER_ALIAS,
@@ -616,7 +622,7 @@ local function build_views(style, prompt_set)
         }),
         -- Personality: how committed the policy is, normalised by the
         -- legal-move count of each state.
-        am.view("trickiness", "trickiness", {
+        am.view("trickiness", metrics.trickiness, {
             seat = "boss",
             style = style,
             prompt_set = prompt_set,

@@ -70,8 +70,8 @@
 --
 -- ## Why the driver, not `alc_run(code = "...")` inline
 --
--- The runner boots two host bridges (`alc.nn.card.load_handle` and
--- `alc.nn.metric.registry.evaluate`) whose failure mode is easier to
+-- The runner boots the `alc.nn.card.load_handle` host bridge and the
+-- `gameai_metrics` ctx adapters, whose failure mode is easier to
 -- read once with a named driver on the top of the stack than every
 -- time a fresh ad-hoc snippet is pasted. The driver is the same shape
 -- `train_guardian_npc.lua` / `eval_guardian_player_generalization.lua`

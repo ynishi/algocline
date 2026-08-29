@@ -1,9 +1,9 @@
 -- anymetric/spec/anymetric_spec.lua
 --
--- Package-level spec for the AnyMetric domain module. The only host
--- surface the module touches is `alc.nn.metric.registry.evaluate`, so the
--- suite stubs that one function with a name -> fn table and records every
--- ctx the module hands over. No model, no nn feature, no Card.
+-- Package-level spec for the AnyMetric domain module. The module touches
+-- no host surface at all — a view carries the metric function itself —
+-- so the suite hands it plain closures and records every ctx they were
+-- called with. No model, no nn feature, no Card, no `alc`.
 --
 -- The stub metrics stand in for the gameai instances: `scalar_metric`
 -- returns a bare number (exercising the values lifting rule),
@@ -11,27 +11,26 @@
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
 
--- The pkg_test VM installs `alc` before the spec runs; the fallback keeps
--- the file runnable under a bare mlua VM too.
-alc = alc or {}
-alc.nn = alc.nn or {}
-alc.nn.metric = alc.nn.metric or {}
-
---- Every registry.evaluate call the module made since the last reset.
+--- Every metric call the module made since the last reset.
 local EVAL_CALLS = {}
 --- name -> fn(ctx) stub metrics the current test wants to expose.
 local METRICS = {}
 
-alc.nn.metric.registry = {
-    evaluate = function(name, ctx)
+--- Build the metric function a view holds. The name is resolved against
+--- `METRICS` at call time, not at build time, so `reset()` can swap the
+--- stub behind a view that was already constructed — and an entry the
+--- test never defined raises from inside the view, which is where a
+--- caller's own broken metric would raise too.
+local function metric(name)
+    return function(ctx)
         EVAL_CALLS[#EVAL_CALLS + 1] = { name = name, ctx = ctx }
         local fn = METRICS[name]
         if fn == nil then
             error("unknown metric '" .. tostring(name) .. "'", 0)
         end
         return fn(ctx)
-    end,
-}
+    end
+end
 
 local am = require("anymetric")
 
@@ -79,46 +78,52 @@ end
 describe("anymetric.view", function()
     it("binds view_id / metric / config", function()
         reset()
-        local v = am.view("level", "level_metric", { opponents = { "random" }, n_games = 50 })
+        local fn = metric("level_metric")
+        local v = am.view("level", fn, { opponents = { "random" }, n_games = 50 })
         expect(v.view_id).to.equal("level")
-        expect(v.metric).to.equal("level_metric")
+        expect(v.metric).to.equal(fn)
         expect(v.config.n_games).to.equal(50)
     end)
 
     it("copies the config so later caller mutation cannot reach the view", function()
         reset()
         local config = { n_games = 50 }
-        local v = am.view("level", "level_metric", config)
+        local v = am.view("level", metric("level_metric"), config)
         config.n_games = 1
         expect(v.config.n_games).to.equal(50)
     end)
 
     it("defaults config to an empty table", function()
         reset()
-        local v = am.view("t", "trickiness", nil)
+        local v = am.view("t", metric("trickiness"), nil)
         expect(type(v.config)).to.equal("table")
         expect(next(v.config)).to.equal(nil)
     end)
 
     it("rejects an empty or non-string view_id", function()
         reset()
-        expect(pcall(am.view, "", "m", {})).to.equal(false)
-        expect(pcall(am.view, nil, "m", {})).to.equal(false)
-        expect(pcall(am.view, 7, "m", {})).to.equal(false)
+        local fn = metric("m")
+        expect(pcall(am.view, "", fn, {})).to.equal(false)
+        expect(pcall(am.view, nil, fn, {})).to.equal(false)
+        expect(pcall(am.view, 7, fn, {})).to.equal(false)
     end)
 
-    it("rejects an empty or non-string metric name, naming the view", function()
+    it("rejects a metric that is not a function, naming the view", function()
         reset()
-        local ok, err = pcall(am.view, "level", "", {})
+        -- A name is the shape this argument used to take, so it is the
+        -- one a stale caller is most likely to still pass.
+        local ok, err = pcall(am.view, "level", "level_metric", {})
         expect(ok).to.equal(false)
         expect(err:find("level") ~= nil).to.equal(true)
+        expect(pcall(am.view, "level", nil, {})).to.equal(false)
+        expect(pcall(am.view, "level", {}, {})).to.equal(false)
     end)
 
     it("keeps a declared required key that the config supplies", function()
         reset()
         local v = am.view(
             "level",
-            "level_metric",
+            metric("level_metric"),
             { opponents = { "random" }, required = { "opponents" } }
         )
         expect(v.config.opponents[1]).to.equal("random")
@@ -128,7 +133,7 @@ describe("anymetric.view", function()
         reset()
         local v = am.view(
             "level",
-            "level_metric",
+            metric("level_metric"),
             { opponents = { "random" }, required = { "opponents" } }
         )
         expect(v.config.required).to.equal(nil)
@@ -139,7 +144,7 @@ describe("anymetric.view", function()
         local ok, err = pcall(
             am.view,
             "sd_teacher",
-            "style_distance",
+            metric("style_distance"),
             { required = { "card_b", "prompt_set" } }
         )
         expect(ok).to.equal(false)
@@ -149,7 +154,7 @@ describe("anymetric.view", function()
 
     it("rejects a config that sets a reserved key", function()
         reset()
-        local ok, err = pcall(am.view, "level", "level_metric", { card = "handle" })
+        local ok, err = pcall(am.view, "level", metric("level_metric"), { card = "handle" })
         expect(ok).to.equal(false)
         expect(err:find("card") ~= nil).to.equal(true)
         expect(err:find("level") ~= nil).to.equal(true)
@@ -157,15 +162,15 @@ describe("anymetric.view", function()
 
     it("rejects a reserved key declared as required", function()
         reset()
-        local ok, err = pcall(am.view, "level", "level_metric", { required = { "card" } })
+        local ok, err = pcall(am.view, "level", metric("level_metric"), { required = { "card" } })
         expect(ok).to.equal(false)
         expect(err:find("card") ~= nil).to.equal(true)
     end)
 
     it("rejects a non-table config and a non-array required", function()
         reset()
-        expect(pcall(am.view, "level", "m", "nope")).to.equal(false)
-        expect(pcall(am.view, "level", "m", { required = "card_b" })).to.equal(false)
+        expect(pcall(am.view, "level", metric("m"), "nope")).to.equal(false)
+        expect(pcall(am.view, "level", metric("m"), { required = "card_b" })).to.equal(false)
     end)
 end)
 
@@ -173,12 +178,11 @@ describe("anymetric.observe", function()
     it("returns one uniform record per view, in view order", function()
         reset()
         local records = am.observe({
-            am.view("a", "table_metric", {}),
-            am.view("b", "scalar_metric", {}),
+            am.view("a", metric("table_metric"), {}),
+            am.view("b", metric("scalar_metric"), {}),
         }, { card = "handle", step = 120 })
         expect(#records).to.equal(2)
         expect(records[1].view_id).to.equal("a")
-        expect(records[1].metric).to.equal("table_metric")
         expect(records[1].step).to.equal(120)
         expect(records[2].view_id).to.equal("b")
         expect(records[2].step).to.equal(120)
@@ -186,21 +190,27 @@ describe("anymetric.observe", function()
 
     it("passes a table result straight through as values", function()
         reset()
-        local records = am.observe({ am.view("a", "table_metric", {}) }, { card = "h", step = 1 })
+        local records = am.observe(
+            { am.view("a", metric("table_metric"), {}) },
+            { card = "h", step = 1 }
+        )
         expect(records[1].values.win_rate).to.equal(0.62)
         expect(records[1].values.ci_lower).to.equal(0.48)
     end)
 
     it("lifts a scalar result into { value = x }", function()
         reset()
-        local records = am.observe({ am.view("b", "scalar_metric", {}) }, { card = "h", step = 1 })
+        local records = am.observe(
+            { am.view("b", metric("scalar_metric"), {}) },
+            { card = "h", step = 1 }
+        )
         expect(records[1].values.value).to.equal(0.75)
     end)
 
     it("merges config into the ctx and keeps config-only keys", function()
         reset()
         am.observe({
-            am.view("e", "echo_metric", { opponents = { "random" }, n_games = 50 }),
+            am.view("e", metric("echo_metric"), { opponents = { "random" }, n_games = 50 }),
         }, { card = "handle", step = 60 })
         local ctx = last_ctx("echo_metric")
         expect(ctx.n_games).to.equal(50)
@@ -214,7 +224,11 @@ describe("anymetric.observe", function()
         -- A hand-built view can carry keys `am.view` would refuse, which
         -- is exactly the collision the merge rule has to resolve.
         am.observe({
-            { view_id = "e", metric = "echo_metric", config = { card = "stale", seed = 7 } },
+            {
+                view_id = "e",
+                metric = metric("echo_metric"),
+                config = { card = "stale", seed = 7 },
+            },
         }, { card = "fresh", step = 60 })
         local ctx = last_ctx("echo_metric")
         expect(ctx.card).to.equal("fresh")
@@ -224,7 +238,7 @@ describe("anymetric.observe", function()
 
     it("does not leak the merged ctx back into the view config", function()
         reset()
-        local v = am.view("e", "echo_metric", { n_games = 50 })
+        local v = am.view("e", metric("echo_metric"), { n_games = 50 })
         am.observe({ v }, { card = "handle", step = 60 })
         expect(v.config.card).to.equal(nil)
         expect(v.config.step).to.equal(nil)
@@ -232,7 +246,10 @@ describe("anymetric.observe", function()
 
     it("turns a raising metric into an ErrorRecord carrying view_id and message", function()
         reset()
-        local records = am.observe({ am.view("boom", "boom_metric", {}) }, { card = "h", step = 5 })
+        local records = am.observe(
+            { am.view("boom", metric("boom_metric"), {}) },
+            { card = "h", step = 5 }
+        )
         expect(#records).to.equal(1)
         expect(records[1].view_id).to.equal("boom")
         expect(records[1].step).to.equal(5)
@@ -244,9 +261,9 @@ describe("anymetric.observe", function()
     it("keeps evaluating the remaining views after one fails", function()
         reset()
         local records = am.observe({
-            am.view("a", "table_metric", {}),
-            am.view("boom", "boom_metric", {}),
-            am.view("b", "scalar_metric", {}),
+            am.view("a", metric("table_metric"), {}),
+            am.view("boom", metric("boom_metric"), {}),
+            am.view("b", metric("scalar_metric"), {}),
         }, { card = "h", step = 5 })
         expect(#records).to.equal(3)
         expect(records[1].values.win_rate).to.equal(0.62)
@@ -254,23 +271,30 @@ describe("anymetric.observe", function()
         expect(records[3].values.value).to.equal(0.75)
     end)
 
-    it("turns an unknown metric name into an ErrorRecord, not a raise", function()
+    it("turns a metric that cannot resolve its work into an ErrorRecord, not a raise", function()
         reset()
-        local records = am.observe({ am.view("x", "no_such_metric", {}) }, { card = "h", step = 5 })
+        local records = am.observe(
+            { am.view("x", metric("no_such_metric"), {}) },
+            { card = "h", step = 5 }
+        )
         expect(records[1].error:find("no_such_metric") ~= nil).to.equal(true)
     end)
 
-    it("turns a nil metric result into an ErrorRecord", function()
+    it("turns a nil metric result into an ErrorRecord naming the view", function()
         reset()
-        local records = am.observe({ am.view("n", "nil_metric", {}) }, { card = "h", step = 5 })
+        local records = am.observe(
+            { am.view("n", metric("nil_metric"), {}) },
+            { card = "h", step = 5 }
+        )
         expect(records[1].error:find("nil") ~= nil).to.equal(true)
+        expect(records[1].error:find("'n'") ~= nil).to.equal(true)
     end)
 
     it("raises loudly on a duplicate view_id, before any metric runs", function()
         reset()
         local ok, err = pcall(am.observe, {
-            am.view("level", "table_metric", {}),
-            am.view("level", "scalar_metric", {}),
+            am.view("level", metric("table_metric"), {}),
+            am.view("level", metric("scalar_metric"), {}),
         }, { card = "h", step = 1 })
         expect(ok).to.equal(false)
         expect(err:find("duplicate") ~= nil).to.equal(true)
@@ -280,7 +304,11 @@ describe("anymetric.observe", function()
 
     it("raises when shared_ctx has no numeric step", function()
         reset()
-        local ok, err = pcall(am.observe, { am.view("a", "table_metric", {}) }, { card = "h" })
+        local ok, err = pcall(
+            am.observe,
+            { am.view("a", metric("table_metric"), {}) },
+            { card = "h" }
+        )
         expect(ok).to.equal(false)
         expect(err:find("step") ~= nil).to.equal(true)
     end)
@@ -303,8 +331,12 @@ describe("anymetric.run_log", function()
     it("accumulates records across fires in append order", function()
         reset()
         local log = am.run_log.new()
-        log:append(am.observe({ am.view("a", "scalar_metric", {}) }, { card = "h", step = 60 }))
-        log:append(am.observe({ am.view("a", "scalar_metric", {}) }, { card = "h", step = 120 }))
+        log:append(
+            am.observe({ am.view("a", metric("scalar_metric"), {}) }, { card = "h", step = 60 })
+        )
+        log:append(
+            am.observe({ am.view("a", metric("scalar_metric"), {}) }, { card = "h", step = 120 })
+        )
         local all = log:all()
         expect(#all).to.equal(2)
         expect(all[1].step).to.equal(60)
@@ -342,7 +374,6 @@ describe("anymetric.judgment.threshold", function()
             {
                 step = 60,
                 view_id = "level",
-                metric = "level",
                 values = { win_rate = 0.6, ci_lower = ci_lower },
             },
         }
@@ -435,7 +466,7 @@ describe("anymetric.judgment.threshold", function()
         -- the strength gate stays decoupled from the personality axis.
         local records = {
             booby_record("sd_teacher"),
-            { step = 60, view_id = "level", metric = "level", values = { ci_lower = 0.61 } },
+            { step = 60, view_id = "level", values = { ci_lower = 0.61 } },
             booby_record("trickiness"),
         }
         local judge = am.judgment.threshold({
@@ -533,7 +564,6 @@ describe("anymetric.judgment.band", function()
             {
                 step = 180,
                 view_id = "level",
-                metric = "level",
                 values = { ci_lower = ci_lower, win_rate = 0.9 },
             },
         }
@@ -696,7 +726,7 @@ describe("anymetric.judgment.band", function()
         reset()
         local records = {
             booby_record("sd_teacher"),
-            { step = 180, view_id = "level", metric = "level", values = { ci_lower = 0.70 } },
+            { step = 180, view_id = "level", values = { ci_lower = 0.70 } },
             booby_record("trickiness"),
         }
         local judge = am.judgment.band({
@@ -720,7 +750,6 @@ describe("anymetric.judgment.staged", function()
             {
                 step = 240,
                 view_id = "level",
-                metric = "level",
                 values = { ci_lower = ci_lower, win_rate = 0.9 },
             },
         }
@@ -924,7 +953,7 @@ describe("anymetric.judgment.staged", function()
         reset()
         local records = {
             booby_record("sd_teacher"),
-            { step = 240, view_id = "level", metric = "level", values = { ci_lower = 0.90 } },
+            { step = 240, view_id = "level", values = { ci_lower = 0.90 } },
             booby_record("trickiness"),
         }
         local judge = am.judgment.staged({
@@ -955,7 +984,6 @@ describe("anymetric.judgment.staged band require", function()
             {
                 step = 120,
                 view_id = "level",
-                metric = "level",
                 values = { ci_lower = ci_lower, win_rate = 0.93 },
             },
         }
@@ -963,14 +991,12 @@ describe("anymetric.judgment.staged band require", function()
             return records
         end
         if trickiness == "error" then
-            records[#records + 1] =
-                { step = 120, view_id = "trickiness", metric = "trickiness", error = "boom" }
+            records[#records + 1] = { step = 120, view_id = "trickiness", error = "boom" }
             return records
         end
         records[#records + 1] = {
             step = 120,
             view_id = "trickiness",
-            metric = "trickiness",
             values = { value = trickiness, raw_mean = 1.2 },
         }
         return records
@@ -1283,7 +1309,9 @@ describe("anymetric.to_hook_action", function()
     it("keeps earlier records when a harvest marker is appended", function()
         reset()
         local log = am.run_log.new()
-        log:append(am.observe({ am.view("a", "scalar_metric", {}) }, { card = "h", step = 60 }))
+        log:append(
+            am.observe({ am.view("a", metric("scalar_metric"), {}) }, { card = "h", step = 60 })
+        )
         am.to_hook_action({ action = "harvest", reason = "keep this bake" }, log)
         local all = log:all()
         expect(#all).to.equal(2)
@@ -1385,8 +1413,8 @@ describe("anymetric.log_line", function()
     it("renders step, every view id and its values on one line", function()
         reset()
         local records = am.observe({
-            am.view("level", "table_metric", {}),
-            am.view("trickiness", "scalar_metric", {}),
+            am.view("level", metric("table_metric"), {}),
+            am.view("trickiness", metric("scalar_metric"), {}),
         }, { card = "h", step = 120 })
         local line = am.log_line(records)
         expect(type(line)).to.equal("string")
@@ -1401,7 +1429,7 @@ describe("anymetric.log_line", function()
     it("orders the fields of a view deterministically", function()
         reset()
         local records = am.observe(
-            { am.view("level", "table_metric", {}) },
+            { am.view("level", metric("table_metric"), {}) },
             { card = "h", step = 1 }
         )
         local line = am.log_line(records)
@@ -1412,8 +1440,8 @@ describe("anymetric.log_line", function()
     it("marks an ErrorRecord instead of pretending it has values", function()
         reset()
         local records = am.observe({
-            am.view("boom", "boom_metric", {}),
-            am.view("ok", "scalar_metric", {}),
+            am.view("boom", metric("boom_metric"), {}),
+            am.view("ok", metric("scalar_metric"), {}),
         }, { card = "h", step = 7 })
         local line = am.log_line(records)
         expect(line:find("ERROR") ~= nil).to.equal(true)

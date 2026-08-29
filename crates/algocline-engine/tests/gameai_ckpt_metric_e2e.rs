@@ -14,8 +14,8 @@
 //! 2. `alc.nn.card.load_ckpt` turns the mid-run `info.ckpt_path` into a
 //!    live handle from inside that hook — while the trainer still holds
 //!    the model mutex and the dataset lock;
-//! 3. `alc.nn.metric.registry.evaluate("trickiness", …)` consumes that
-//!    handle and returns a number.
+//! 3. `gameai_metrics.metrics.trickiness(…)` consumes that handle and
+//!    returns a number.
 //!
 //! Step 3 is the one the three pieces meet at: the handle is `NnHandle`
 //! **userdata**, and the `gameai_metrics` guards used to accept only a
@@ -119,9 +119,9 @@ fn gameai_vm() -> (Lua, tempfile::TempDir) {
 /// corpus, and evaluates `trickiness` from inside the checkpoint hook.
 const SCRIPT: &str = r#"
 local duel = require("guardian_duel")
--- Requiring the pkg self-registers style_distance / trickiness / level
--- into `alc.nn.metric.registry`; the hook below reaches them by name.
-require("gameai_metrics")
+-- The pkg builds the style_distance / trickiness / level ctx adapters;
+-- the hook below holds one of them directly.
+local gm = require("gameai_metrics")
 
 local VOCAB = duel.player_vocab()
 local PLAYER_MOVES = duel.player_legal_actions()
@@ -219,7 +219,7 @@ local card_id = alc.nn.trainer.run_full_ft(handle, dataset, {
             "load_ckpt must return an NnHandle userdata, got " .. type(ckpt)
         )
 
-        local value = alc.nn.metric.registry.evaluate("trickiness", {
+        local value = gm.metrics.trickiness({
             card = ckpt,
             prompt_set = prompt_set,
             temperature = 1.0,

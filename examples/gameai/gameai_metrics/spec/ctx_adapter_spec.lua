@@ -1,8 +1,8 @@
--- gameai_metrics/spec/registry_adapter_spec.lua
+-- gameai_metrics/spec/ctx_adapter_spec.lua
 --
--- Spec for the registry adapter in `gameai_metrics/init.lua`: the
--- `self_register()` block that wraps each metric module into an
--- `fn(ctx)` and lifts the shared seat options out of the ctx
+-- Spec for the ctx adapters in `gameai_metrics/init.lua`: the
+-- `M.metrics.*` functions that wrap each metric module into an
+-- `fn(ctx)` and lift the shared seat options out of the ctx
 -- (`seat_opts`).
 --
 -- Every other spec in this directory measures a metric module or a
@@ -17,37 +17,14 @@
 -- The three metric modules are replaced with recording fakes *before*
 -- `gameai_metrics` is required, the way `fight_matrix_spec.lua` swaps
 -- `gameai_metrics.level`: `init.lua` binds each module at require time,
--- so a fake installed afterwards would never be seen. The registry is
--- a stub that keeps the registered functions instead of dispatching
--- them, which is what lets a case call one directly.
+-- so a fake installed afterwards would never be seen.
 --
 -- Run it with `examples/gameai` on the search path, e.g.
 --
---     test_launch(code_file = "examples/gameai/gameai_metrics/spec/registry_adapter_spec.lua",
+--     test_launch(code_file = "examples/gameai/gameai_metrics/spec/ctx_adapter_spec.lua",
 --                 search_paths = { "<repo>/examples/gameai" })
 
 local describe, it, expect = lust.describe, lust.it, lust.expect
-
--- ─── Registry stub ──────────────────────────────────────────────────
-
-alc = alc or {}
-alc.nn = alc.nn or {}
-alc.nn.metric = alc.nn.metric or {}
-
---- name -> fn(ctx), captured from `register` at require time.
-local REGISTERED = {}
-
-alc.nn.metric.registry = {
-    register = function(name, fn)
-        REGISTERED[name] = fn
-    end,
-    evaluate = function(name)
-        -- The adapter never evaluates through the registry; the specs
-        -- call the registered fn directly so a failing assertion is not
-        -- routed through a dispatch path that could swallow it.
-        error("registry_adapter_spec: unexpected evaluate('" .. tostring(name) .. "')", 0)
-    end,
-}
 
 -- ─── Metric module fakes ────────────────────────────────────────────
 
@@ -95,7 +72,8 @@ end
 -- Force `init.lua` to run against the fakes above even when an earlier
 -- require in the same VM already loaded the real package.
 package.loaded["gameai_metrics"] = nil
-require("gameai_metrics")
+--- The adapters under test, `name -> fn(ctx)`.
+local REGISTERED = require("gameai_metrics").metrics
 
 local function reset_calls()
     LEVEL_CALLS = {}
@@ -108,7 +86,7 @@ local PROMPT_SET = { { cycle = 0, mode = 0 }, { cycle = 1, mode = 0 } }
 
 -- ─── Specs: registration ────────────────────────────────────────────
 
-describe("gameai_metrics registry adapter — registration", function()
+describe("gameai_metrics ctx adapter — registration", function()
     it("registers level / trickiness / style_distance as functions", function()
         expect(type(REGISTERED.level)).to.equal("function")
         expect(type(REGISTERED.trickiness)).to.equal("function")
@@ -118,7 +96,7 @@ end)
 
 -- ─── Specs: level ctx -> opts transport ─────────────────────────────
 
-describe("gameai_metrics registry adapter — level", function()
+describe("gameai_metrics ctx adapter — level", function()
     it("carries ctx.temperature through seat_opts into the level opts", function()
         reset_calls()
         REGISTERED.level({
@@ -248,7 +226,7 @@ end)
 
 -- ─── Specs: trickiness ctx -> temperature argument ──────────────────
 
-describe("gameai_metrics registry adapter — trickiness", function()
+describe("gameai_metrics ctx adapter — trickiness", function()
     it("defaults the temperature argument to 1.0 when the ctx omits it", function()
         reset_calls()
         REGISTERED.trickiness({
@@ -281,7 +259,7 @@ end)
 
 -- ─── Specs: style_distance card_a fallback ──────────────────────────
 
-describe("gameai_metrics registry adapter — style_distance", function()
+describe("gameai_metrics ctx adapter — style_distance", function()
     it("falls back from ctx.card_a to ctx.card for the measured Card", function()
         reset_calls()
         REGISTERED.style_distance({

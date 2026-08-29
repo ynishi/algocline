@@ -129,11 +129,11 @@ local boss_seat = require("gameai_metrics.boss_seat")
 local fs = require("gameai_metrics._fs")
 
 -- `level` is required directly, not through the parent package. This
--- runner composes the metric as a plain function and never reads
--- alc.nn.metric.registry, so the `require("gameai_metrics")` that
--- audit_matrix needs (its views fire through the registry) would only
--- add a dependency here. If a future view of this runner goes through
--- the registry, that parent require has to come back with it.
+-- runner calls the metric module positionally and never needs a ctx
+-- adapter, so the `require("gameai_metrics")` that audit_matrix needs
+-- (its views hold `gm.metrics.*`) would only add a dependency here. If
+-- a future view of this runner holds an adapter, that parent require
+-- has to come back with it.
 local level = require("gameai_metrics.level")
 
 local M = {}

@@ -7,8 +7,8 @@
 //! (`bridge::register` → `register_nn_metric`) places `alc.nn.metric` on
 //! the `alc` table of a real engine VM, the four primitives round-trip
 //! through Lua, `MetricError` variants surface as `LuaError::external`,
-//! and the Pure-Lua `registry` supports the `register` / `evaluate`
-//! contract the trainer `on_ckpt` hook depends on.
+//! and the cluster bootstrap honours its seed and refuses an empty
+//! sample.
 //!
 //! Uses `install_for_pkg_test` — the same registration path the pkg-test
 //! sandbox uses — so a passing test also means the metric surface is
@@ -104,52 +104,6 @@ fn bridge_error_negative_refused() {
     assert!(
         msg.contains("negative"),
         "error message should mention `negative`, got: {msg}"
-    );
-}
-
-/// Registry round-trip: `register(name, fn)` followed by
-/// `evaluate(name, ctx)` must call the stored closure with the supplied
-/// context and return its result. Exercises the exact call shape the
-/// trainer `on_ckpt` hook will use.
-#[test]
-fn registry_round_trip() {
-    let lua = nn_vm();
-    let got: i64 = lua
-        .load(
-            r#"
-            alc.nn.metric.registry.register("test_metric", function(ctx)
-                return ctx.x * 2
-            end)
-            return alc.nn.metric.registry.evaluate("test_metric", { x = 21 })
-            "#,
-        )
-        .eval()
-        .expect("registry register/evaluate round-trip");
-    assert_eq!(got, 42);
-}
-
-/// `evaluate` on an unregistered name must raise a clear error whose
-/// message names the missing metric — the trainer hook cannot silently
-/// treat "no such metric" as `continue`, or a mis-spelled config would
-/// hide the mistake for the entire training run.
-#[test]
-fn registry_unknown_metric_refused() {
-    let lua = nn_vm();
-    let (ok, msg): (bool, String) = lua
-        .load(
-            r#"
-            local ok, err = pcall(function()
-                return alc.nn.metric.registry.evaluate("nope", {})
-            end)
-            return ok, tostring(err)
-            "#,
-        )
-        .eval()
-        .expect("pcall wrapper should evaluate");
-    assert!(!ok, "evaluate on an unknown name must fail");
-    assert!(
-        msg.contains("nope"),
-        "error message should name the missing metric `nope`, got: {msg}"
     );
 }
 

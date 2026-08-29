@@ -3,7 +3,7 @@
 ---
 --- The module keeps two layers apart on purpose:
 ---
---- - **measurement**: a `View` binds a registered metric name to a fixed
+--- - **measurement**: a `View` binds a metric function to a fixed
 ---   ctx (`config`). `observe(views, shared_ctx)` fires every view once
 ---   per checkpoint and returns one uniform `Record` per view. Views are
 ---   evaluated under `pcall`, so a metric that blows up leaves an
@@ -34,18 +34,20 @@
 --- collection helper can extract the label without a second judgment
 --- call.
 ---
---- Nothing in this module is game-specific: metric names, ctx keys and
---- the fields a judgment reads are all supplied by the caller.
+--- Nothing in this module is game-specific: the metric functions, ctx
+--- keys and the fields a judgment reads are all supplied by the caller.
 ---
 --- ## Usage from a trainer `on_ckpt` hook
 ---
 --- ```lua
 --- local am = require("anymetric")
 --- local run_log = am.run_log.new()
+--- -- `level` / `style_distance` are `fn(ctx) -> table | scalar` supplied
+--- -- by the caller; this module never learns what they measure.
 --- local views = {
----     am.view("level", "level", { opponents = { "random" }, n_games = 50,
----                                 required = { "opponents" } }),
----     am.view("sd_teacher", "style_distance", { card_b = TEACHER, prompt_set = STATES }),
+---     am.view("level", level, { opponents = { "random" }, n_games = 50,
+---                               required = { "opponents" } }),
+---     am.view("sd_teacher", style_distance, { card_b = TEACHER, prompt_set = STATES }),
 --- }
 --- local judgment = am.judgment.threshold({
 ---     view_id = "level", field = "ci_lower", op = ">=", value = 0.55,
@@ -87,19 +89,27 @@ end
 -- View
 -- ---------------------------------------------------------------------
 
---- Bind a registered metric to a fixed ctx.
+--- Bind a metric to a fixed ctx.
+---
+--- `metric` is the function that does the measuring, `fn(ctx) -> table |
+--- scalar`. It is held directly rather than looked up by name: a view is
+--- built in the same Lua chunk that owns the metric, so a name would be
+--- turned into a string and back into the same function with no boundary
+--- in between.
 ---
 --- `view_id` is a first-class field rather than a derived label: the same
 --- metric is routinely observed through several views that differ only in
 --- their `config` (two opponent pools, two teachers), and every record,
---- log line and judgment addresses a view by that id.
+--- log line and judgment addresses a view by that id. It is also what
+--- names the view in an error, which is why the metric itself needs no
+--- name of its own.
 ---
 --- `config` is the per-view half of the ctx the metric receives. The
 --- reserved keys (`card`, `step`) must not appear in it — `observe`
 --- supplies those per fire.
 ---
 --- `config.required` is an optional array of ctx key names the view
---- declares it cannot run without. The metric registry has no
+--- declares it cannot run without. A metric is a bare function and has no
 --- required-key mechanism of its own, so the check lives here: a missing
 --- key raises immediately at view-construction time, naming both the view
 --- and the key, instead of surfacing as an opaque metric error 60 steps
@@ -107,16 +117,19 @@ end
 --- config and never reaches the metric.
 ---
 ---@param view_id string caller label, unique within one `observe` call
----@param metric_name string name registered in `alc.nn.metric.registry`
+---@param metric function `fn(ctx) -> table | scalar`
 ---@param config table|nil fixed ctx for this view (`required` optional)
 ---@return table view `{ view_id, metric, config }`
-function M.view(view_id, metric_name, config)
+function M.view(view_id, metric, config)
     if type(view_id) ~= "string" or view_id == "" then
         error("anymetric.view: view_id must be a non-empty string", 2)
     end
-    if type(metric_name) ~= "string" or metric_name == "" then
+    if type(metric) ~= "function" then
         error(
-            "anymetric.view: metric_name must be a non-empty string (view '" .. view_id .. "')",
+            "anymetric.view: metric must be a function (view '"
+                .. view_id
+                .. "'), got "
+                .. type(metric),
             2
         )
     end
@@ -192,29 +205,21 @@ function M.view(view_id, metric_name, config)
         end
     end
 
-    return { view_id = view_id, metric = metric_name, config = bound }
+    return { view_id = view_id, metric = metric, config = bound }
 end
 
 -- ---------------------------------------------------------------------
 -- observe / Record
 -- ---------------------------------------------------------------------
 
-local function registry()
-    local reg = alc and alc.nn and alc.nn.metric and alc.nn.metric.registry
-    if type(reg) ~= "table" or type(reg.evaluate) ~= "function" then
-        error(
-            "alc.nn.metric.registry is not available on this VM "
-                .. "(build without the nn feature? require the metric pkg first)",
-            0
-        )
-    end
-    return reg
-end
-
 --- Lift whatever the metric returned into the uniform `values` table.
 --- A table passes through as-is (numeric fields assumed); a scalar is
 --- wrapped as `{ value = <x> }` so every record has the same shape.
-local function lift_values(metric_name, raw)
+---
+--- The view id, not a metric name, is what the message blames: a metric
+--- is an anonymous function here, and the id is the only handle the
+--- caller can act on.
+local function lift_values(view_id, raw)
     local kind = type(raw)
     if kind == "table" then
         return raw
@@ -222,11 +227,11 @@ local function lift_values(metric_name, raw)
     if kind == "number" or kind == "string" or kind == "boolean" then
         return { value = raw }
     end
-    error("metric '" .. metric_name .. "' returned " .. kind .. "; expected a table or a scalar", 0)
+    error("view '" .. view_id .. "' returned " .. kind .. "; expected a table or a scalar", 0)
 end
 
 local function evaluate_view(view, ctx)
-    return lift_values(view.metric, registry().evaluate(view.metric, ctx))
+    return lift_values(view.view_id, view.metric(ctx))
 end
 
 --- Merge a view config with the per-fire shared ctx. Shared entries win
@@ -245,7 +250,7 @@ end
 
 --- Fire every view once and return one record per view, in view order.
 ---
---- Records are uniform: `{ step, view_id, metric, values }` on success,
+--- Records are uniform: `{ step, view_id, values }` on success,
 --- `{ step, view_id, error = <message> }` when the metric raised. Each
 --- view is evaluated under its own `pcall`, so one broken metric neither
 --- hides the other views nor propagates into the hook — a hook error
@@ -286,8 +291,14 @@ function M.observe(views, shared_ctx)
         if type(view.view_id) ~= "string" or view.view_id == "" then
             error("anymetric.observe: views[" .. index .. "] has no view_id", 2)
         end
-        if type(view.metric) ~= "string" or view.metric == "" then
-            error("anymetric.observe: view '" .. view.view_id .. "' has no metric name", 2)
+        if type(view.metric) ~= "function" then
+            error(
+                "anymetric.observe: view '"
+                    .. view.view_id
+                    .. "' has no metric function, got "
+                    .. type(view.metric),
+                2
+            )
         end
         if seen[view.view_id] then
             error(
@@ -313,7 +324,6 @@ function M.observe(views, shared_ctx)
             records[#records + 1] = {
                 step = step,
                 view_id = view.view_id,
-                metric = view.metric,
                 values = result,
             }
         else

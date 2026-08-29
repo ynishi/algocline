@@ -194,14 +194,12 @@
 --- surfacing as an obscure `io.open` `No such file or directory` (the
 --- same failure mode `harvest_collection` prevented at ST-0).
 
--- Force gameai_metrics.init to run so its self_register populates
--- alc.nn.metric.registry with `level` / `style_distance` / `trickiness`.
--- Requiring the submodule (this file) directly does not execute the
--- package's init.lua, so without this line the runner would raise
--- "no metric registered as 'style_distance'" on the first pair-wise
--- call. gameai_metrics.init does not require this submodule back, so
--- there is no cycle.
-require("gameai_metrics")
+-- The package init is what builds the ctx adapters this file measures
+-- through (`gm.metrics.style_distance`). Requiring the submodule (this
+-- file) directly does not execute the package's init.lua, so the require
+-- is explicit. gameai_metrics.init does not require this submodule back,
+-- so there is no cycle.
+local gm = require("gameai_metrics")
 
 local am = require("anymetric")
 local duel = require("guardian_duel")
@@ -285,16 +283,22 @@ local function require_nn_card()
     end
 end
 
-local function require_registry()
-    local reg = alc and alc.nn and alc.nn.metric and alc.nn.metric.registry
-    if type(reg) ~= "table" or type(reg.evaluate) ~= "function" then
+--- The `style_distance` adapter this file measures pairs with.
+---
+--- Resolved through a function rather than captured at load time so a
+--- spec that swaps `gm.metrics` after requiring this module still sees
+--- its own stub, and so a missing adapter names itself here instead of
+--- surfacing as an "attempt to call a nil value" inside the matrix loop.
+local function style_distance_metric()
+    local fn = gm.metrics and gm.metrics.style_distance
+    if type(fn) ~= "function" then
         error(
-            "audit_matrix: alc.nn.metric.registry is not available on this VM "
-                .. "(build without the nn feature? require gameai_metrics first)",
+            "audit_matrix: gameai_metrics.metrics.style_distance is not a function "
+                .. "(build without the nn feature? a stale gameai_metrics on the path?)",
             0
         )
     end
-    return reg
+    return fn
 end
 
 --- The RNG bridge both seats of a sampling rollout draw from.
@@ -653,15 +657,14 @@ end
 -- ─── Views ─────────────────────────────────────────────────────────
 
 --- Assemble the per-Card views. `n_games` / `seed` are pushed into
---- the `level` view config so the level registry entry
---- (`alc.nn.metric.registry.register("level", ...)`) picks them up
+--- the `level` view config so `gm.metrics.level` picks them up
 --- per-fire; the trickiness / style_distance views need neither.
 --- The `sd_teacher` view is only added when a `teacher_alias` was
 --- supplied; without one the view would have no reference Card to
 --- measure against.
 ---
 --- `temperature` reaches the `level` view only. `trickiness` reads its
---- own `ctx.temperature or 1.0` in the registry adapter, so putting a
+--- own `ctx.temperature or 1.0` in its ctx adapter, so putting a
 --- key here would move the entropy axis off the scale every earlier
 --- audit measured it on; `style_distance` compares distributions the
 --- same way for the same reason. A `nil` temperature adds no key at
@@ -678,15 +681,15 @@ local function build_views(style, prompt_set, teacher_alias, n_games, seed, temp
         level_config.temperature = temperature
     end
     local views = {
-        am.view("level", "level", level_config),
-        am.view("trickiness", "trickiness", {
+        am.view("level", gm.metrics.level, level_config),
+        am.view("trickiness", gm.metrics.trickiness, {
             seat = "boss",
             style = style,
             prompt_set = prompt_set,
         }),
     }
     if teacher_alias ~= nil then
-        views[#views + 1] = am.view("sd_teacher", "style_distance", {
+        views[#views + 1] = am.view("sd_teacher", gm.metrics.style_distance, {
             seat = "boss",
             style = style,
             prompt_set = prompt_set,
@@ -765,12 +768,12 @@ end
 -- ─── SD matrix ─────────────────────────────────────────────────────
 
 --- Evaluate `style_distance` for the ordered pair `(a, b)`. Any raise
---- from the registry (a mask mismatch, a bad prompt state) propagates
+--- from the metric (a mask mismatch, a bad prompt state) propagates
 --- to the caller so the audit fails loudly rather than silently
 --- publishing a matrix with a zero where a broken metric hid a real
 --- distance.
-local function evaluate_pair(registry, handle_a, handle_b, style, prompt_set)
-    local raw = registry.evaluate("style_distance", {
+local function evaluate_pair(metric, handle_a, handle_b, style, prompt_set)
+    local raw = metric({
         card_a = handle_a,
         card_b = handle_b,
         prompt_set = prompt_set,
@@ -798,7 +801,7 @@ end
 --- The diagonal is filled with `0.0` so a downstream lookup does not
 --- have to special-case the identity pair.
 local function build_sd_matrix(cards, style, prompt_set)
-    local registry = require_registry()
+    local metric = style_distance_metric()
     local matrix = {}
     for _, card in ipairs(cards) do
         matrix[card.alias] = { [card.alias] = 0.0 }
@@ -806,7 +809,7 @@ local function build_sd_matrix(cards, style, prompt_set)
     for i = 1, #cards - 1 do
         for j = i + 1, #cards do
             local a, b = cards[i], cards[j]
-            local sd = evaluate_pair(registry, a.handle, b.handle, style, prompt_set)
+            local sd = evaluate_pair(metric, a.handle, b.handle, style, prompt_set)
             matrix[a.alias][b.alias] = sd
             matrix[b.alias][a.alias] = sd
         end
@@ -995,8 +998,8 @@ end
 ---   Card raises immediately.
 --- - `n_games` — integer, sample size for the `level` view (default
 ---   `200`). Recorded on `meta.n_games` for the report; the actual
----   `level` metric reads it out of its own registry ctx, which is
----   supplied per-fire below via the level view config.
+---   `level` metric reads it out of its own ctx, which is supplied
+---   per-fire below via the level view config.
 --- - `prompt_set_size` — integer, size of the boss-state prompt set
 ---   used by the `trickiness` and `style_distance` views (default
 ---   `16`). Half of it is drawn from mode 0 and half from mode 1 (an

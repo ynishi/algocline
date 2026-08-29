@@ -239,6 +239,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`alc.nn.metric.registry.{register, get, evaluate, list}` — **BREAKING**
+  for callers that looked a metric up by name.** The registry resolved a
+  string to a function so a trainer `on_ckpt` hook could dispatch by
+  name, but the hook takes a Lua function directly
+  (`opts.on_ckpt` is read as a `LuaFunction`), and a view is declared in
+  the same Lua chunk that owns the metric. The name was turned into a
+  string and back into the function the caller already held, with no
+  boundary in between — a name earns its keep only where something other
+  than Lua carries the choice (a config file, a CLI argument, a wire
+  format), and no such boundary exists on this path. `alc.nn.metric`
+  keeps its four primitives (`kl` / `js` / `tvd` / `entropy`) and
+  `bootstrap_ci`; measuring a checkpoint mid-run is the hook's job, not
+  this namespace's.
+
+  Migration — pass the function where the name used to go:
+
+  ```lua
+  -- before
+  alc.nn.metric.registry.register("trickiness", function(ctx) … end)
+  local value = alc.nn.metric.registry.evaluate("trickiness", ctx)
+
+  -- after
+  local trickiness = function(ctx) … end
+  local value = trickiness(ctx)
+  ```
+
+  The bundled `examples/gameai` packages moved with it: `gameai_metrics`
+  exports its three ctx adapters on `M.metrics` instead of self-registering,
+  and `anymetric.view(view_id, metric, config)` takes the function as its
+  second argument. An `anymetric` record no longer carries a `metric`
+  field — a metric is anonymous now, and `view_id` is what addresses a
+  record.
+
 ### Fixed
 
 ### Security

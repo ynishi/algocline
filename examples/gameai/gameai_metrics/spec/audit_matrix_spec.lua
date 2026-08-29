@@ -1,7 +1,7 @@
 -- gameai_metrics/spec/audit_matrix_spec.lua
 --
 -- Package-level spec for `audit_matrix`. Stubs `alc.card`,
--- `alc.nn.card.load_handle`, `alc.nn.metric.registry.evaluate` and
+-- `alc.nn.card.load_handle`, the `gameai_metrics` ctx adapters and
 -- `alc.json_encode` / `alc.json_decode` so the runner logic (option
 -- validation, view assembly, per-Card observation extraction,
 -- symmetric SD matrix build, JSON round-trip through
@@ -239,7 +239,7 @@ alc.nn.card = {
     end,
 }
 
--- Canned metric evaluators. The runner calls the registry with
+-- Canned metric evaluators. The runner calls the adapters with
 -- `{card = handle, ...}` for level / trickiness and
 -- `{card_a = ha, card_b = hb, ...}` for pair-wise style_distance;
 -- the stubs pick the return value off `handle.alias`.
@@ -272,7 +272,7 @@ local function set_level(alias, win_rate, ci_lower, ci_upper)
     }
 end
 
---- Every ctx the registry was evaluated with, in fire order (the
+--- Every ctx a stub adapter was called with, in fire order (the
 --- `EVAL_CALLS` harness `spec/train_guardian_npc_spec.lua` uses for the
 --- same job). A view config is not readable from the outside, so the
 --- view-assembly specs read it where it actually lands: the ctx the
@@ -294,60 +294,74 @@ local function calls_to(name)
 end
 
 alc.nn.metric = alc.nn.metric or {}
-alc.nn.metric.registry = {
-    evaluate = function(name, ctx)
-        EVAL_CALLS[#EVAL_CALLS + 1] = { name = name, ctx = ctx }
-        if name == "level" then
-            local alias = ctx.card and ctx.card.alias
-            local canned = LEVEL_BY_ALIAS[alias]
+
+--- The one dispatcher the three stub adapters share, so the canned
+--- value tables stay keyed in a single place.
+local function evaluate(name, ctx)
+    EVAL_CALLS[#EVAL_CALLS + 1] = { name = name, ctx = ctx }
+    if name == "level" then
+        local alias = ctx.card and ctx.card.alias
+        local canned = LEVEL_BY_ALIAS[alias]
+        if canned == nil then
+            error("spec: level has no canned value for alias " .. tostring(alias), 0)
+        end
+        return canned
+    end
+    if name == "trickiness" then
+        local alias = ctx.card and ctx.card.alias
+        local canned = TRICKY_BY_ALIAS[alias]
+        if canned == nil then
+            error("spec: trickiness has no canned value for alias " .. tostring(alias), 0)
+        end
+        return { value = canned, raw_mean = canned * 1.2 }
+    end
+    if name == "style_distance" then
+        -- Distinguish the per-Card sd_teacher fire (card_b is the
+        -- teacher alias string) from the pair-wise matrix fire
+        -- (card_b is a Card handle table). The per-Card path
+        -- carries the Card under measurement in `ctx.card` (from
+        -- shared_ctx), while the SD-matrix path carries it in
+        -- `ctx.card_a`; the real init.lua compose falls back the
+        -- same way (`ctx.card_a or ctx.card`).
+        if type(ctx.card_b) == "string" then
+            local carrier = ctx.card_a or ctx.card
+            local alias = carrier and carrier.alias
+            local canned = SD_TEACHER_BY_ALIAS[alias]
             if canned == nil then
-                error("spec: level has no canned value for alias " .. tostring(alias), 0)
+                error("spec: sd_teacher has no canned value for alias " .. tostring(alias), 0)
             end
             return canned
         end
-        if name == "trickiness" then
-            local alias = ctx.card and ctx.card.alias
-            local canned = TRICKY_BY_ALIAS[alias]
-            if canned == nil then
-                error("spec: trickiness has no canned value for alias " .. tostring(alias), 0)
-            end
-            return { value = canned, raw_mean = canned * 1.2 }
+        local a = ctx.card_a and ctx.card_a.alias
+        local b = ctx.card_b and ctx.card_b.alias
+        local canned = SD_PAIR[pair_key(a, b)]
+        if canned == nil then
+            error(
+                "spec: SD_PAIR has no canned value for " .. tostring(a) .. " / " .. tostring(b),
+                0
+            )
         end
-        if name == "style_distance" then
-            -- Distinguish the per-Card sd_teacher fire (card_b is the
-            -- teacher alias string) from the pair-wise matrix fire
-            -- (card_b is a Card handle table). The per-Card path
-            -- carries the Card under measurement in `ctx.card` (from
-            -- shared_ctx), while the SD-matrix path carries it in
-            -- `ctx.card_a`; the real init.lua compose falls back the
-            -- same way (`ctx.card_a or ctx.card`).
-            if type(ctx.card_b) == "string" then
-                local carrier = ctx.card_a or ctx.card
-                local alias = carrier and carrier.alias
-                local canned = SD_TEACHER_BY_ALIAS[alias]
-                if canned == nil then
-                    error("spec: sd_teacher has no canned value for alias " .. tostring(alias), 0)
-                end
-                return canned
-            end
-            local a = ctx.card_a and ctx.card_a.alias
-            local b = ctx.card_b and ctx.card_b.alias
-            local canned = SD_PAIR[pair_key(a, b)]
-            if canned == nil then
-                error(
-                    "spec: SD_PAIR has no canned value for " .. tostring(a) .. " / " .. tostring(b),
-                    0
-                )
-            end
-            return canned
-        end
-        error("spec: unexpected metric name " .. tostring(name), 0)
-    end,
-    register = function(_, _)
-        -- The audit runner never registers metrics; supplying `register`
-        -- keeps a bystander require of gameai_metrics/init.lua from
-        -- crashing during the spec run.
-    end,
+        return canned
+    end
+    error("spec: unexpected metric name " .. tostring(name), 0)
+end
+
+-- `audit_matrix` reaches its metrics through the package table
+-- (`gm.metrics.*`), resolved per call, so the fake package must be in
+-- place before the runner is required — and a case that wants to count
+-- fires can swap one entry of this table afterwards.
+package.loaded["gameai_metrics"] = {
+    metrics = {
+        level = function(ctx)
+            return evaluate("level", ctx)
+        end,
+        trickiness = function(ctx)
+            return evaluate("trickiness", ctx)
+        end,
+        style_distance = function(ctx)
+            return evaluate("style_distance", ctx)
+        end,
+    },
 }
 
 -- ─── Prompt-set / seed anchor ───────────────────────────────────────
@@ -686,12 +700,13 @@ describe("gameai_metrics.audit_matrix:run — pair-wise SD count", function()
                 set_sd_pair(aliases[i], aliases[j], 0.1 * (i * 10 + j))
             end
         end
-        local base_evaluate = alc.nn.metric.registry.evaluate
-        alc.nn.metric.registry.evaluate = function(name, ctx)
-            if name == "style_distance" and type(ctx.card_b) == "table" then
+        local metrics = package.loaded["gameai_metrics"].metrics
+        local base_sd = metrics.style_distance
+        metrics.style_distance = function(ctx)
+            if type(ctx.card_b) == "table" then
                 calls = calls + 1
             end
-            return base_evaluate(name, ctx)
+            return base_sd(ctx)
         end
         local audit = audit_matrix.new({
             aliases = aliases,
@@ -970,7 +985,7 @@ describe("gameai_metrics.audit_matrix — temperature view assembly", function()
         local tricky_ctxs = calls_to("trickiness")
         expect(#tricky_ctxs).to.equal(2)
         for _, tricky_ctx in ipairs(tricky_ctxs) do
-            -- The registry adapter reads `ctx.temperature or 1.0`, so an
+            -- The trickiness adapter reads `ctx.temperature or 1.0`, so an
             -- absent key here keeps the entropy axis on the same scale
             -- every earlier audit measured it on.
             expect(tricky_ctx.temperature).to.equal(nil)

@@ -81,7 +81,7 @@
 ---
 --- ## Output
 ---
---- The scalar mean of `alc.nn.metric.js(p_a, p_b)` over every position in
+--- The scalar mean of `alc.math.js_divergence(p_a, p_b)` over every position in
 --- `prompt_set`, where `p_a` / `p_b` are the softmax-over-legal-moves
 --- probability rows read from each Card's next-token logits at the
 --- position (temperature 1.0, so the softmax base matches the sampler's
@@ -131,14 +131,19 @@ local function require_nn_card()
     end
 end
 
---- Assert the shared `alc.nn.metric.js` primitive is present. Loaded on
---- every call rather than cached in a local so a bridge reinstall mid
---- run (the stubs the spec injects) is honoured.
+--- Assert the shared `alc.math.js_divergence` primitive is present.
+--- Loaded on every call rather than cached in a local so a bridge
+--- reinstall mid run (the stubs the spec injects) is honoured.
+---
+--- Jensen-Shannon divergence is general-purpose mathematics, not
+--- something the nn layer owns, so it is read from `alc.math` (which
+--- mlua-mathlib provides) rather than from `alc.nn.metric`. It needs no
+--- `--features nn` build — only the Card handles further down do.
 local function require_js()
-    if not (alc and alc.nn and alc.nn.metric and type(alc.nn.metric.js) == "function") then
-        error("style_distance: alc.nn.metric.js is unavailable; nn metric bridge missing")
+    if not (alc and alc.math and type(alc.math.js_divergence) == "function") then
+        error("style_distance: alc.math.js_divergence is unavailable; mathlib not registered")
     end
-    return alc.nn.metric.js
+    return alc.math.js_divergence
 end
 
 --- True when `card` answers `generate_session` with a callable.

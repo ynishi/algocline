@@ -1,15 +1,18 @@
-//! `alc.nn.metric.*` — distribution distance / entropy primitives plus a
-//! cluster bootstrap (feature `nn`).
+//! `alc.nn.metric.*` — the cluster bootstrap (feature `nn`).
 //!
-//! # Layer boundary
+//! # What is here, and what left
 //!
-//! The four primitives (`kl`, `js`, `tvd`, `entropy`) are thin bridges over
-//! [`algocline_nn::metric`]: Lua tables come in, `Vec<f32>` cross the FFI,
-//! typed [`algocline_nn::metric::MetricError`] variants surface as
-//! [`LuaError::external`] with the primitive name preserved in the display
-//! string. The primitives themselves live in Rust so the (a) validation
-//! contract stays authoritative and (b) composition on the caller's side
-//! reuses them without touching FFI details.
+//! One function: [`bootstrap_ci_impl`]. It answers "how much of this
+//! difference is the draw" for a statistic whose observations arrive in
+//! correlated groups, which is the question a checkpoint search asks
+//! about two candidates.
+//!
+//! `kl` / `js` / `tvd` / `entropy` used to sit here too. They are
+//! general-purpose mathematics rather than anything the nn layer owns,
+//! and `mlua-mathlib` had grown its own information-theory module, so
+//! keeping a second implementation on this namespace meant one
+//! definition of "is this a distribution" per crate. They now live at
+//! `alc.math.{kl_divergence, js_divergence, tvd, entropy}`.
 //!
 //! # What this module is not
 //!
@@ -23,45 +26,15 @@
 
 use mlua::prelude::*;
 
-use algocline_nn::metric;
 use algocline_nn::metric::bootstrap;
 
 /// Register `alc.nn.metric.*` onto the pre-existing `alc.nn` table.
 ///
 /// Called from [`super::register`] after [`super::register_nn`] has
-/// populated `alc.nn`. Installs the four primitives (`kl` / `js` / `tvd`
-/// / `entropy`), then [`bootstrap_ci_impl`].
+/// populated `alc.nn`. Installs [`bootstrap_ci_impl`].
 pub(super) fn register_nn_metric(lua: &Lua, nn_table: &LuaTable) -> LuaResult<()> {
     let metric_ns = lua.create_table()?;
 
-    // ── Primitives ──────────────────────────────────────────────────
-    // Each closure pulls the pairwise / single-distribution arguments
-    // as `Vec<f32>` (mlua's built-in `FromLuaMulti` handles Lua array
-    // tables), delegates to the Rust primitive, and surfaces
-    // `MetricError` via `LuaError::external`. The Display impl of
-    // `MetricError` already prefixes `metric:` so the error string is
-    // self-describing on the Lua side.
-
-    let kl = lua.create_function(|_, (p, q): (Vec<f32>, Vec<f32>)| {
-        metric::kl(&p, &q).map_err(LuaError::external)
-    })?;
-    metric_ns.set("kl", kl)?;
-
-    let js = lua.create_function(|_, (p, q): (Vec<f32>, Vec<f32>)| {
-        metric::js(&p, &q).map_err(LuaError::external)
-    })?;
-    metric_ns.set("js", js)?;
-
-    let tvd = lua.create_function(|_, (p, q): (Vec<f32>, Vec<f32>)| {
-        metric::tvd(&p, &q).map_err(LuaError::external)
-    })?;
-    metric_ns.set("tvd", tvd)?;
-
-    let entropy =
-        lua.create_function(|_, p: Vec<f32>| metric::entropy(&p).map_err(LuaError::external))?;
-    metric_ns.set("entropy", entropy)?;
-
-    // ── Cluster bootstrap ───────────────────────────────────────────
     let bootstrap_ci = lua.create_function(
         |lua, (clusters, opts): (LuaTable, Option<LuaTable>)| -> LuaResult<LuaTable> {
             bootstrap_ci_impl(lua, &clusters, opts.as_ref())

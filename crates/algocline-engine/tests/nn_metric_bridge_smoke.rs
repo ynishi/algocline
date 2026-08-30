@@ -1,14 +1,14 @@
 #![cfg(feature = "nn")]
 //! Engine-level smoke test for the `alc.nn.metric.*` bridge (feature `nn`).
 //!
-//! The `algocline-nn::metric` unit tests cover the primitives themselves
-//! (numeric identities + validation error paths). This test closes the
-//! bridge gap: it confirms the full engine registration path
-//! (`bridge::register` → `register_nn_metric`) places `alc.nn.metric` on
-//! the `alc` table of a real engine VM, the four primitives round-trip
-//! through Lua, `MetricError` variants surface as `LuaError::external`,
-//! and the cluster bootstrap honours its seed and refuses an empty
-//! sample.
+//! One surface is left on this namespace — the cluster bootstrap — and
+//! this test closes the bridge gap for it: the full engine registration
+//! path (`bridge::register` → `register_nn_metric`) puts it on the `alc`
+//! table of a real engine VM, and it honours its seed and refuses an
+//! empty sample through Lua.
+//!
+//! The four distribution primitives that used to be tested here moved to
+//! `alc.math` (mlua-mathlib owns them and their tests now).
 //!
 //! Uses `install_for_pkg_test` — the same registration path the pkg-test
 //! sandbox uses — so a passing test also means the metric surface is
@@ -26,95 +26,8 @@ fn nn_vm() -> Lua {
     lua
 }
 
-/// `alc.nn.metric.kl({0.5, 0.5}, {0.25, 0.75})` should equal the hand
-/// computed value `0.5 * ln(2) + 0.5 * ln(2/3)` within f32 precision.
-#[test]
-fn bridge_kl_round_trip() {
-    let lua = nn_vm();
-    let got: f32 = lua
-        .load("return alc.nn.metric.kl({ 0.5, 0.5 }, { 0.25, 0.75 })")
-        .eval()
-        .expect("alc.nn.metric.kl should evaluate");
-    let expected = 0.5f32 * 2.0f32.ln() + 0.5f32 * (2.0f32 / 3.0f32).ln();
-    assert!(
-        (got - expected).abs() < 1e-5,
-        "kl mismatch: got {got}, expected {expected}"
-    );
-}
-
-/// Entropy of the uniform distribution on N elements is `ln(N)`.
-#[test]
-fn bridge_entropy_uniform_ln_n() {
-    let lua = nn_vm();
-    let got: f32 = lua
-        .load("return alc.nn.metric.entropy({ 0.25, 0.25, 0.25, 0.25 })")
-        .eval()
-        .expect("alc.nn.metric.entropy should evaluate");
-    let expected = 4.0f32.ln();
-    assert!(
-        (got - expected).abs() < 1e-5,
-        "entropy mismatch: got {got}, expected {expected}"
-    );
-}
-
-/// KL against a `q` that assigns zero mass where `p` assigns positive
-/// mass is `+∞` by definition. The bridge must preserve the infinity
-/// (not silently rewrite as an error) because the trainer hook uses
-/// `math.huge` as a sentinel for "distributions disagree on support".
-#[test]
-fn bridge_kl_disjoint_one_hot_infinity() {
-    let lua = nn_vm();
-    let is_infinite: bool = lua
-        .load(
-            r#"
-            local v = alc.nn.metric.kl({ 1, 0 }, { 0, 1 })
-            return v == math.huge
-            "#,
-        )
-        .eval()
-        .expect("alc.nn.metric.kl should evaluate to +inf");
-    assert!(
-        is_infinite,
-        "KL(p=[1,0] || q=[0,1]) must serialize as math.huge on the Lua side"
-    );
-}
-
-/// A distribution containing a strictly negative element must be refused
-/// with a Lua-visible error that names the primitive and the offending
-/// index. `pcall` returns `false, msg` so the test can inspect the
-/// message without unwinding the VM.
-#[test]
-fn bridge_error_negative_refused() {
-    let lua = nn_vm();
-    let (ok, msg): (bool, String) = lua
-        .load(
-            r#"
-            local ok, err = pcall(function()
-                return alc.nn.metric.kl({ -0.5, 1.5 }, { 0.5, 0.5 })
-            end)
-            return ok, tostring(err)
-            "#,
-        )
-        .eval()
-        .expect("pcall wrapper should evaluate");
-    assert!(
-        !ok,
-        "kl with a negative probability must fail (got success, msg={msg})"
-    );
-    assert!(
-        msg.contains("negative"),
-        "error message should mention `negative`, got: {msg}"
-    );
-}
-
-// ─── Cluster bootstrap ────────────────────────────────────────────
-
-/// Every cluster holding the same value leaves nothing for resampling
-/// to vary, so the interval collapses onto the point estimate. That is
-/// the one case whose bounds can be asserted exactly, which makes it
-/// the check that the clusters reached the tally at all — a bridge that
-/// dropped them would have no observations to average and would error
-/// instead.
+/// A sample whose clusters all report the same value has nothing for
+/// the resampler to move, so the interval collapses onto the point.
 #[test]
 fn bootstrap_ci_degenerates_to_a_point_when_every_cluster_agrees() {
     let lua = nn_vm();

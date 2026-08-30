@@ -293,8 +293,6 @@ local function calls_to(name)
     return out
 end
 
-alc.nn.metric = alc.nn.metric or {}
-
 --- The one dispatcher the three stub adapters share, so the canned
 --- value tables stay keyed in a single place.
 local function evaluate(name, ctx)

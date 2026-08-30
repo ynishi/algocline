@@ -1,6 +1,7 @@
 --- gameai_metrics — GameAI-specific metrics for a trainer checkpoint hook
 ---
---- Composes the Rust metric primitives (`alc.nn.metric.js` / `entropy`) with
+--- Composes the shared mathlib primitives (`alc.math.js_divergence` /
+--- `alc.math.entropy`) with
 --- gameai-domain compose logic (Card handles, prompt sets, autoplay) and
 --- exports three ctx adapters on `M.metrics` that the trainer `on_ckpt`
 --- hook (or an `anymetric` view) holds directly.

@@ -117,8 +117,6 @@ local EVAL_CALLS = {}
 --- metric name -> fn(ctx), swapped per case by `configure`.
 local METRICS = {}
 
-alc.nn.metric = alc.nn.metric or {}
-
 --- Build one stub ctx adapter. The name is resolved against `METRICS`
 --- at call time, so `configure` can swap a case's metrics long after
 --- the script bound the adapter into its views.

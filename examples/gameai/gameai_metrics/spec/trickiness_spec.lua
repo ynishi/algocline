@@ -177,8 +177,8 @@ alc.nn.card = {
 
 --- Every entropy call the metric made since the last reset.
 local ENTROPY_CALLS = {}
-alc.nn.metric = alc.nn.metric or {}
-alc.nn.metric.entropy = function(p)
+alc.math = alc.math or {}
+alc.math.entropy = function(p)
     ENTROPY_CALLS[#ENTROPY_CALLS + 1] = { p = p }
     -- Real entropy for a length-4 distribution (natural log), so the
     -- specs can assert 0.0 on a peaked row and log(4) on a uniform one

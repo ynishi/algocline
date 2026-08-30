@@ -241,6 +241,54 @@ fn nested_with_alc_unwinds_in_lifo_order() {
     .expect("nested with_alc must unwind LIFO");
 }
 
+/// `alc.math` carries mlua-mathlib's information-theory functions.
+///
+/// The gameai metrics read `js_divergence` / `entropy` from here since
+/// the nn crate stopped shipping its own copies, and they are the only
+/// thing standing between a Card comparison and a loud "unavailable"
+/// error at the first checkpoint. `alc.math` is registered regardless of
+/// the `nn` feature, which is why this lives on the parity test rather
+/// than beside the bootstrap smoke.
+#[test]
+fn alc_math_carries_the_information_theory_functions() {
+    let lua = pkg_test_vm();
+
+    // Uniform over 4 -> ln(4). Asserting a value rather than the mere
+    // presence of the key: a stub that returned 0 for everything would
+    // satisfy a `type(...) == "function"` check and silently flatten
+    // every trickiness reading.
+    let entropy: f64 = lua
+        .load(r#"return alc.math.entropy({ 0.25, 0.25, 0.25, 0.25 })"#)
+        .eval()
+        .expect("alc.math.entropy usable");
+    assert!(
+        (entropy - std::f64::consts::LN_2 * 2.0).abs() < 1e-9,
+        "entropy of the uniform 4-way distribution must be ln(4), got {entropy}"
+    );
+
+    // Two distributions that never overlap sit at the JS ceiling, ln(2)
+    // in the base-e convention the gameai metrics document.
+    let js: f64 = lua
+        .load(r#"return alc.math.js_divergence({ 1.0, 0.0 }, { 0.0, 1.0 })"#)
+        .eval()
+        .expect("alc.math.js_divergence usable");
+    assert!(
+        (js - std::f64::consts::LN_2).abs() < 1e-9,
+        "JS of two disjoint one-hot rows must be ln(2), got {js}"
+    );
+
+    for name in ["kl_divergence", "tvd", "cross_entropy"] {
+        let _: Function = lua
+            .globals()
+            .get::<Table>("alc")
+            .expect("alc table")
+            .get::<Table>("math")
+            .expect("alc.math table")
+            .get::<Function>(name)
+            .unwrap_or_else(|e| panic!("alc.math.{name} must be registered: {e}"));
+    }
+}
+
 #[test]
 fn pkg_test_sandbox_exposes_fingerprint_and_fuzzy() {
     let lua = pkg_test_vm();

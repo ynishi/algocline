@@ -32,7 +32,7 @@
 ---
 --- ## Output
 ---
---- - `seat = "player"` — the scalar mean of `alc.nn.metric.entropy(p)`
+--- - `seat = "player"` — the scalar mean of `alc.math.entropy(p)`
 ---   (natural log, base e) across every view in `prompt_set`. Zero when
 ---   the Card is fully committed to one move at every position
 ---   (equivalent to greedy), approaches `log(4)` when the four legal
@@ -82,11 +82,14 @@ local function require_nn_card()
     end
 end
 
+--- Shannon entropy is general-purpose mathematics, so it is read from
+--- `alc.math` (mlua-mathlib) rather than from `alc.nn.metric`. See
+--- `style_distance.require_js` for the same reasoning.
 local function require_entropy()
-    if not (alc and alc.nn and alc.nn.metric and type(alc.nn.metric.entropy) == "function") then
-        error("trickiness: alc.nn.metric.entropy is unavailable; nn metric bridge missing")
+    if not (alc and alc.math and type(alc.math.entropy) == "function") then
+        error("trickiness: alc.math.entropy is unavailable; mathlib not registered")
     end
-    return alc.nn.metric.entropy
+    return alc.math.entropy
 end
 
 --- Match `style_distance.has_generate_session`; see that file for why

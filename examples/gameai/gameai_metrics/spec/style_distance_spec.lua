@@ -6,8 +6,8 @@
 -- pre-loaded by the runner.
 --
 -- No real Card and no real model are touched: `alc.card`,
--- `alc.nn.card`, and `alc.nn.metric.js` are replaced by stubs so the
--- specs assert (a) the compose loop calls `js` once per prompt, (b)
+-- `alc.nn.card`, and `alc.math.js_divergence` are replaced by stubs so
+-- the specs assert (a) the compose loop calls it once per prompt, (b)
 -- argument validation refuses the shapes it says it does, (c) the
 -- softmax feeds `js` a length-4 row that sums to 1.0.
 
@@ -207,8 +207,8 @@ alc.nn.card = {
 
 --- Record every `js` call so specs can assert compose behaviour.
 local JS_CALLS = {}
-alc.nn.metric = alc.nn.metric or {}
-alc.nn.metric.js = function(p, q)
+alc.math = alc.math or {}
+alc.math.js_divergence = function(p, q)
     JS_CALLS[#JS_CALLS + 1] = { p = p, q = q }
     -- Return 0 when p == q element-wise, 1 otherwise — a deterministic
     -- stand-in that lets the mean assert on a lossless invariant

@@ -302,6 +302,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`alc.nn.metric.{kl, js, tvd, entropy}` — **BREAKING**. They live at
+  `alc.math.{kl_divergence, js_divergence, tvd, entropy}` now
+  (mlua-mathlib 0.4).** Distribution distance and entropy are
+  general-purpose mathematics, not something the nn layer owns, and
+  mathlib had grown its own information-theory module — so the platform
+  was carrying two implementations that had to agree on the one thing
+  they both decide: how much rounding drift a vector may carry and still
+  count as a distribution. They did not. This crate compared against a
+  fixed `1e-4` at every length; mathlib's bound grows as `32·√n·u`,
+  which is the shape the error actually takes. The fixed bound is looser
+  above n ≈ 2747 — at a 50257-entry vocabulary it would let 0.3% of the
+  mass go missing unnoticed, which is exactly where a top-k mask that
+  forgets to renormalize lands.
+
+  Migration — the names differ for the two divergences:
+
+  ```lua
+  -- before
+  local d = alc.nn.metric.js(p, q)
+  local h = alc.nn.metric.entropy(p)
+
+  -- after
+  local d = alc.math.js_divergence(p, q)
+  local h = alc.math.entropy(p)
+  ```
+
+  Behaviour carries over: same base-e convention (uniform-4 entropy is
+  `ln(4)`, two disjoint one-hot rows are `ln(2)` apart), and a KL over
+  disjoint support still returns infinity rather than raising. The
+  tolerance is the one real difference, and it is stricter below
+  n ≈ 2747 — a 36-way action distribution is checked ~9x more tightly
+  than before (measured drift there is 5e-7, so the margin is ~22x).
+
+  `alc.nn.metric.bootstrap_ci` **stays**: it takes the caller's
+  statistic as a closure and resamples *clusters*, which is a claim
+  about how training-run measurements correlate rather than a claim
+  about probability vectors.
+
+  Rust API — **breaking for direct `algocline-nn` consumers.**
+  `algocline_nn::metric::{kl, js, tvd, entropy, MetricError, NORM_TOL}`
+  are gone; `algocline_nn::metric::bootstrap` is untouched. Nothing in
+  this workspace consumed them from Rust.
+
 - **`alc.nn.metric.registry.{register, get, evaluate, list}` — **BREAKING**
   for callers that looked a metric up by name.** The registry resolved a
   string to a function so a trainer `on_ckpt` hook could dispatch by

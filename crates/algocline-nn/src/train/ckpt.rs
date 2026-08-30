@@ -21,7 +21,7 @@
 //! by name — see [`restore_into`] for what that adds over
 //! `candle_nn::VarMap::load`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -54,6 +54,18 @@ pub struct Candidate {
     /// The hook's own note, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The measurements the judgment read, by name.
+    ///
+    /// The point of recording them here rather than leaving each
+    /// application to keep its own manifest: they exist for the length
+    /// of one hook call and are gone after it, and a record saying only
+    /// `"tier-2"` cannot be re-examined later. Ordered, so two runs that
+    /// measured the same things write byte-identical lines.
+    ///
+    /// Empty when the hook gave none, and omitted from the written
+    /// record in that case rather than serialized as `{}`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, f64>,
 }
 
 /// Rotating checkpoint writer.
@@ -955,6 +967,7 @@ mod tests {
                 ckpt_path: store.path_for_step(4),
                 train_loss: 1.5,
                 reason: Some("tier-2".into()),
+                values: BTreeMap::new(),
             })
             .unwrap();
         store
@@ -963,6 +976,7 @@ mod tests {
                 ckpt_path: store.path_for_step(8),
                 train_loss: 1.25,
                 reason: None,
+                values: BTreeMap::new(),
             })
             .unwrap();
 
@@ -992,6 +1006,7 @@ mod tests {
                 ckpt_path: store.path_for_step(1),
                 train_loss: 1.0,
                 reason: None,
+                values: BTreeMap::new(),
             })
             .unwrap();
         for step in [10, 20, 30] {

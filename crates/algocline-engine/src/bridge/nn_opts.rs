@@ -34,6 +34,8 @@
 use std::path::PathBuf;
 
 use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
+use std::collections::BTreeMap;
+
 use algocline_nn::train::{
     Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, KeepMark,
     OptimizerKind, ScheduleKind, TrainError,
@@ -211,9 +213,107 @@ pub(super) fn candidates_to_lua(lua: &Lua, candidates: &[Candidate]) -> LuaResul
         if let Some(reason) = &c.reason {
             entry.set("reason", reason.as_str())?;
         }
+        if !c.values.is_empty() {
+            let values = lua.create_table()?;
+            for (name, value) in &c.values {
+                values.set(name.as_str(), *value)?;
+            }
+            entry.set("values", values)?;
+        }
         out.set(i + 1, entry)?;
     }
     Ok(out)
+}
+
+/// Parse the long form of `keep`: `{ reason = "…", values = { … } }`.
+///
+/// `values` is what the judgment actually read — the numbers that
+/// selected this checkpoint. They are recorded because they exist for
+/// the length of one hook call and are gone after it, and a record
+/// saying only `"tier-2"` cannot be re-examined. Names are the caller's;
+/// the trainer neither interprets nor compares them.
+///
+/// Unknown keys are refused for the same reason the outer table refuses
+/// them: a misspelled `value` would drop the evidence and leave a
+/// candidate that looks correctly recorded.
+fn parse_keep_mark(prefix: &str, t: &LuaTable) -> Result<KeepMark, String> {
+    for pair in t.pairs::<LuaValue, LuaValue>() {
+        let (key, _) =
+            pair.map_err(|e| format!("{prefix}: on_ckpt 'keep' table is unreadable: {e}"))?;
+        let name = match &key {
+            LuaValue::String(s) => s.to_str().map(|s| s.to_string()).ok(),
+            _ => None,
+        };
+        match name.as_deref() {
+            Some("reason") | Some("values") => {}
+            Some(other) => {
+                return Err(format!(
+                    "{prefix}: on_ckpt 'keep' table has unknown key {other:?}; \
+                     only 'reason' and 'values' are read"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "{prefix}: on_ckpt 'keep' table has a non-string key"
+                ))
+            }
+        }
+    }
+
+    let reason: Option<String> = t
+        .get("reason")
+        .map_err(|e| format!("{prefix}: on_ckpt 'keep'.reason must be a string or nil: {e}"))?;
+
+    let mut values = BTreeMap::new();
+    let raw: LuaValue = t
+        .get("values")
+        .map_err(|e| format!("{prefix}: on_ckpt 'keep'.values is unreadable: {e}"))?;
+    match raw {
+        LuaValue::Nil => {}
+        LuaValue::Table(vt) => {
+            for pair in vt.pairs::<LuaValue, LuaValue>() {
+                let (k, v) = pair
+                    .map_err(|e| format!("{prefix}: on_ckpt 'keep'.values is unreadable: {e}"))?;
+                let name = match &k {
+                    LuaValue::String(s) => s
+                        .to_str()
+                        .map_err(|e| {
+                            format!("{prefix}: on_ckpt 'keep'.values has a non-UTF-8 key: {e}")
+                        })?
+                        .to_string(),
+                    other => {
+                        return Err(format!(
+                            "{prefix}: on_ckpt 'keep'.values keys must be strings, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                // Refused rather than coerced: a value that is not a
+                // number is a measurement that did not happen, and
+                // writing `0` for it would be indistinguishable from
+                // one that did.
+                let number = match v {
+                    LuaValue::Number(n) => n,
+                    LuaValue::Integer(i) => i as f64,
+                    other => {
+                        return Err(format!(
+                            "{prefix}: on_ckpt 'keep'.values[{name:?}] must be a number, got {}",
+                            other.type_name()
+                        ))
+                    }
+                };
+                values.insert(name, number);
+            }
+        }
+        other => {
+            return Err(format!(
+                "{prefix}: on_ckpt 'keep'.values must be a table or nil, got {}",
+                other.type_name()
+            ))
+        }
+    }
+
+    Ok(KeepMark { reason, values })
 }
 
 /// Map a Lua-side `on_ckpt` return value to a [`CkptControl`].
@@ -311,10 +411,11 @@ fn parse_ckpt_control_table(prefix: &str, t: &LuaTable) -> Result<CkptControl, S
         .map_err(|e| format!("{prefix}: on_ckpt table field 'keep' is unreadable: {e}"))?;
     let keep = match keep_value {
         LuaValue::Nil | LuaValue::Boolean(false) => None,
-        LuaValue::Boolean(true) => Some(KeepMark { reason: None }),
+        LuaValue::Boolean(true) => Some(KeepMark::default()),
         LuaValue::String(s) => match s.to_str() {
             Ok(reason) => Some(KeepMark {
                 reason: Some(reason.to_string()),
+                ..KeepMark::default()
             }),
             Err(e) => {
                 return Err(format!(
@@ -322,9 +423,11 @@ fn parse_ckpt_control_table(prefix: &str, t: &LuaTable) -> Result<CkptControl, S
                 ))
             }
         },
+        LuaValue::Table(t) => Some(parse_keep_mark(prefix, &t)?),
         other => {
             return Err(format!(
-                "{prefix}: on_ckpt table field 'keep' must be boolean, string or nil, got {}",
+                "{prefix}: on_ckpt table field 'keep' must be boolean, string, table or nil, \
+                 got {}",
                 other.type_name()
             ))
         }
@@ -1323,7 +1426,7 @@ mod tests {
         let s_keep = LuaValue::String(lua.create_string("keep").unwrap());
         let control = parse_ckpt_control("prefix", &s_keep).unwrap();
         assert_eq!(control.flow, CkptFlow::Continue);
-        assert_eq!(control.keep, Some(KeepMark { reason: None }));
+        assert_eq!(control.keep, Some(KeepMark::default()));
     }
 
     /// The combination no single string can express: hold this one and
@@ -1340,7 +1443,8 @@ mod tests {
         assert_eq!(
             control.keep,
             Some(KeepMark {
-                reason: Some("tier-3".to_string())
+                reason: Some("tier-3".to_string()),
+                ..KeepMark::default()
             }),
             "a string `keep` carries the caller's own label through"
         );
@@ -1355,7 +1459,7 @@ mod tests {
         t.set("keep", true).unwrap();
         let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
         assert_eq!(control.flow, CkptFlow::Continue);
-        assert_eq!(control.keep, Some(KeepMark { reason: None }));
+        assert_eq!(control.keep, Some(KeepMark::default()));
 
         let empty = lua.create_table().unwrap();
         assert_eq!(
@@ -1373,6 +1477,57 @@ mod tests {
         t.set("keep", false).unwrap();
         let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
         assert_eq!(control.keep, None);
+    }
+
+    /// The long `keep` form carries the numbers the judgment read, so
+    /// the record can be re-examined rather than only re-read.
+    #[test]
+    fn parse_ckpt_control_keep_table_carries_reason_and_values() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        let keep = lua.create_table().unwrap();
+        let values = lua.create_table().unwrap();
+        values.set("ci_lower", 0.62).unwrap();
+        values.set("n_games", 200).unwrap(); // integers widen
+        keep.set("reason", "tier-2").unwrap();
+        keep.set("values", values).unwrap();
+        t.set("keep", keep).unwrap();
+
+        let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
+        let mark = control.keep.expect("keep");
+        assert_eq!(mark.reason.as_deref(), Some("tier-2"));
+        assert_eq!(mark.values.get("ci_lower"), Some(&0.62));
+        assert_eq!(mark.values.get("n_games"), Some(&200.0));
+    }
+
+    /// A non-numeric measurement is refused rather than coerced: a `0`
+    /// written for a reading that did not happen cannot be told apart
+    /// from one that did.
+    #[test]
+    fn parse_ckpt_control_keep_values_refuses_non_numbers_and_unknown_keys() {
+        let lua = Lua::new();
+
+        let t = lua.create_table().unwrap();
+        let keep = lua.create_table().unwrap();
+        let values = lua.create_table().unwrap();
+        values.set("ci_lower", "high").unwrap();
+        keep.set("values", values).unwrap();
+        t.set("keep", keep).unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(
+            err.contains("ci_lower") && err.contains("number"),
+            "message must name the reading and what it got: {err}"
+        );
+
+        let t = lua.create_table().unwrap();
+        let keep = lua.create_table().unwrap();
+        keep.set("resaon", "tier-2").unwrap();
+        t.set("keep", keep).unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(
+            err.contains("resaon") && err.contains("unknown key"),
+            "a misspelled key would drop the evidence silently: {err}"
+        );
     }
 
     /// A misspelled key must not read as a decision the caller did not

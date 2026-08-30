@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meant, and a run whose hook never keeps anything reports no
   candidates.
 
+  A keep can carry the numbers the judgment read, not only a note:
+  `keep = { reason = "cleared", values = { ci_lower = 0.62 } }`. They
+  come back on the candidate and go into the written record. Without
+  them a search can be re-read but not re-examined — the measurements
+  exist for the length of one hook call and are gone after it, so this
+  is the one place to capture them without every application inventing
+  a manifest of its own. A non-numeric value is refused rather than
+  coerced, since a `0` written for a reading that never happened cannot
+  be told apart from one that did.
+
   Rust API — **breaking for direct `algocline-nn` consumers.**
   `CkptControl` is a struct of two independent fields rather than a
   two-variant enum, because the hook answers two questions and folding

@@ -12,7 +12,7 @@
 //! candle operation used here already dispatches on the device the
 //! `VarMap` was built with.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -527,14 +527,25 @@ pub enum CkptFlow {
 
 /// A hook's request to hold the checkpoint it was just handed.
 ///
-/// Carries only the caller's own words for why. The trainer neither
-/// parses nor compares the reason — it is written through to the
-/// [`Candidate`] so whoever reads the run outcome can see which
-/// judgment selected which step.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Carries the caller's own account of why, in two registers: a note
+/// for a reader and the numbers the judgment actually read. The trainer
+/// parses neither — both are written through to the [`Candidate`] so
+/// whoever reads the run outcome can see which judgment selected which
+/// step, and on what evidence.
+///
+/// `values` exists because a search record that says only `"tier-2"`
+/// cannot be re-examined. The measurements are in hand at the moment of
+/// the decision and gone immediately after, so this is the one place
+/// they can be captured without every application inventing its own
+/// manifest for them.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct KeepMark {
     /// Free-form note from the hook, e.g. the band label that hit.
     pub reason: Option<String>,
+    /// The measurements behind the decision, by name. Ordered so the
+    /// written record is byte-stable across runs that measured the
+    /// same things.
+    pub values: BTreeMap<String, f64>,
 }
 
 /// What the hook decided at a checkpoint boundary.
@@ -554,7 +565,8 @@ pub struct KeepMark {
 /// unsayable, which is what an earlier ABI did — a hook that wanted to
 /// hold a checkpoint had to reach around the trainer and copy the file
 /// out from under the rotation before it turned over.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: the keep mark carries measured `f64`s.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CkptControl {
     /// Whether the training loop proceeds past this checkpoint.
     pub flow: CkptFlow,
@@ -580,7 +592,10 @@ impl CkptControl {
     pub fn keep(reason: Option<String>) -> Self {
         Self {
             flow: CkptFlow::Continue,
-            keep: Some(KeepMark { reason }),
+            keep: Some(KeepMark {
+                reason,
+                ..KeepMark::default()
+            }),
         }
     }
 
@@ -588,7 +603,18 @@ impl CkptControl {
     pub fn keep_and_break(reason: Option<String>) -> Self {
         Self {
             flow: CkptFlow::Break,
-            keep: Some(KeepMark { reason }),
+            keep: Some(KeepMark {
+                reason,
+                ..KeepMark::default()
+            }),
+        }
+    }
+
+    /// Hold this checkpoint, carry on, and record what was measured.
+    pub fn keep_with(mark: KeepMark) -> Self {
+        Self {
+            flow: CkptFlow::Continue,
+            keep: Some(mark),
         }
     }
 }
@@ -1133,6 +1159,7 @@ fn run_ft_core(
                         ckpt_path: info.ckpt_path.clone(),
                         train_loss: mean_loss,
                         reason: mark.reason,
+                        values: mark.values,
                     };
                     // Written down before it is handed back, because
                     // the returned list only reaches a caller on the
@@ -2356,6 +2383,112 @@ mod tests {
         // so a reader sees the same absence Lua sees.
         assert!(lines[0].contains("early"), "{}", lines[0]);
         assert!(!lines[1].contains("reason"), "{}", lines[1]);
+    }
+
+    /// The measurements behind a keep reach both the returned list and
+    /// the written record — the evidence outlives the hook call it was
+    /// gathered in.
+    #[test]
+    fn a_keeps_measurements_reach_the_list_and_the_record() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 4,
+            warmup: 1,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        let hook: CkptHook = Box::new(move |_info| {
+            let mut values = BTreeMap::new();
+            values.insert("ci_lower".to_string(), 0.62);
+            values.insert("trickiness".to_string(), 0.41);
+            Ok(CkptControl::keep_with(KeepMark {
+                reason: Some("tier-2".to_string()),
+                values,
+            }))
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "keep_values",
+            lease,
+            Some(hook),
+        )
+        .unwrap();
+
+        assert_eq!(ckpt.candidates.len(), 1);
+        assert_eq!(ckpt.candidates[0].values.get("ci_lower"), Some(&0.62));
+
+        let line =
+            std::fs::read_to_string(tmp.path().join("keep_values-candidates.jsonl")).unwrap();
+        assert!(line.contains("\"ci_lower\":0.62"), "{line}");
+        assert!(line.contains("\"trickiness\":0.41"), "{line}");
+        // Ordered, so two runs measuring the same things write the same
+        // bytes: `ci_lower` sorts before `trickiness`.
+        assert!(
+            line.find("ci_lower").unwrap() < line.find("trickiness").unwrap(),
+            "{line}"
+        );
+    }
+
+    /// A keep with no measurements omits the key rather than writing an
+    /// empty object, so absence reads the same as it does for `reason`.
+    #[test]
+    fn a_keep_without_measurements_omits_the_values_key() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 4,
+            warmup: 1,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+        let hook: CkptHook = Box::new(move |_info| Ok(CkptControl::keep(None)));
+
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "keep_bare",
+            lease,
+            Some(hook),
+        )
+        .unwrap();
+
+        let line = std::fs::read_to_string(tmp.path().join("keep_bare-candidates.jsonl")).unwrap();
+        assert!(!line.contains("values"), "{line}");
+        assert!(!line.contains("reason"), "{line}");
     }
 
     /// A hook that returns an error surfaces as

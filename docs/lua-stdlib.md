@@ -1713,8 +1713,19 @@ is this checkpoint worth holding:
 | `{ action = …, keep = … }` | per `action` | held when `keep` is truthy |
 
 `action` is `"continue"` / `"break"` / absent (absent means
-continue). `keep` is `true`, or a string carrying your own note —
-a band label, a rank, whatever names why this one was selected.
+continue). `keep` is `true`, a string carrying your own note — a
+band label, a rank, whatever names why this one was selected — or
+a table `{ reason = "…", values = { <name> = <number>, … } }`.
+
+`values` is what the judgment actually read. Recording it is the
+difference between a search you can re-examine and one you can
+only re-read: the measurements exist for the length of one hook
+call and are gone after it, so this is the one place to capture
+them without every caller inventing its own manifest. Names are
+yours; the trainer neither interprets nor compares them. A
+non-numeric value is refused rather than coerced, since a `0`
+written for a reading that never happened cannot be told apart
+from one that did.
 The table form exists for the combination no single string can
 say: **hold this one and stop**, which is how a successful search
 ends. Anything else is refused loudly with the offending value in
@@ -1740,15 +1751,17 @@ local card_id, candidates = alc.nn.trainer.run_full_ft(h, ds, {
     on_ckpt = function(info)
         local ckpt = alc.nn.card.load_ckpt(info.ckpt_path, { arch = "gpt2-tiny" })
         local score = my_metric(ckpt)
-        if score >= 0.9 then return { action = "break", keep = "cleared" } end
-        if score >= 0.6 then return "keep" end
+        local mark = { reason = "cleared", values = { score = score } }
+        if score >= 0.9 then return { action = "break", keep = mark } end
+        if score >= 0.6 then return { keep = mark } end
         return "continue"
     end,
 })
 
 for _, c in ipairs(candidates) do
-    -- c.step / c.ckpt_path / c.train_loss / c.reason (absent if none given)
-    print(c.step, c.reason, c.ckpt_path)
+    -- c.step / c.ckpt_path / c.train_loss
+    -- c.reason / c.values  (each absent when the keep gave none)
+    print(c.step, c.reason, c.values and c.values.score, c.ckpt_path)
 end
 ```
 

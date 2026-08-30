@@ -1936,6 +1936,55 @@ mod run_ft_bridge_tests {
         );
     }
 
+    /// The numbers a judgment read come back on the candidate, so the
+    /// caller does not have to keep its own manifest to remember why a
+    /// checkpoint was selected.
+    #[test]
+    fn run_full_ft_keep_carries_the_measurements_back_to_lua() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let mut o = base_full_ft_opts();
+        o["steps"] = json!(2);
+        o["ckpt_every"] = json!(2);
+        o["ckpt_keep"] = json!(1);
+        let opts = opts_table(&lua, o);
+
+        let on_ckpt = lua
+            .load(
+                r#"
+                return function(info)
+                    return {
+                        keep = {
+                            reason = "cleared",
+                            values = { ci_lower = 0.62, trickiness = 0.41 },
+                        },
+                    }
+                end
+                "#,
+            )
+            .eval::<LuaFunction>()
+            .expect("build on_ckpt");
+        opts.set("on_ckpt", on_ckpt).unwrap();
+
+        let (_card_id, candidates) = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft with a measuring keep");
+
+        let entry: LuaTable = candidates.get(1).unwrap();
+        assert_eq!(entry.get::<String>("reason").unwrap(), "cleared");
+        let values: LuaTable = entry.get("values").unwrap();
+        assert!((values.get::<f64>("ci_lower").unwrap() - 0.62).abs() < 1e-12);
+        assert!((values.get::<f64>("trickiness").unwrap() - 0.41).abs() < 1e-12);
+    }
+
     /// A run whose hook never keeps anything returns an empty
     /// candidates table — `local id = run_full_ft(…)` keeps working
     /// untouched.

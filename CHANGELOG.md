@@ -316,6 +316,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`alc.nn.metric` — **BREAKING**, the whole namespace. `bootstrap_ci`
+  is `alc.math.cluster_bootstrap_mean` now (mlua-mathlib 0.7).**
+  algocline ships no statistics at all after this: `algocline-nn` drops
+  its `metric` module, the engine drops the bridge that registered it,
+  and the `alc.nn` table has no `metric` sub-table.
+
+  The bootstrap stayed here only because it had nowhere to go — mathlib
+  had no resampling. It has three now (`cluster_bootstrap_mean` /
+  `_diff` / `_ratio`), and the mean form takes the same
+  `(by_cluster, draws, seed)` this one did. Field names differ:
+
+  ```lua
+  -- before
+  local ci = alc.nn.metric.bootstrap_ci(clusters, { draws = 2000, seed = 7 })
+  ci.point, ci.low, ci.high, ci.draws
+
+  -- after
+  local ci = alc.math.cluster_bootstrap_mean(clusters, 2000, 7)
+  ci.point, ci.lower, ci.upper, ci.draws_used
+  ```
+
+  No shim: this surface had no caller in the workspace.
+
+  `cluster_bootstrap_diff` is the one worth knowing about — it puts the
+  interval on the *difference* from a single draw, rather than leaving a
+  caller to eyeball two independent intervals. That is the comparison a
+  checkpoint search actually makes between two candidates.
+
+  Rust API — **breaking for direct `algocline-nn` consumers.**
+  `algocline_nn::metric` is gone, `bootstrap` and `BootstrapError` with
+  it.
+
+- **The gameai example stops carrying its own statistics.** `level.lua`
+  read a hand-rolled Wilson interval, including a clamp keeping the
+  interval around its own estimate; mathlib 0.4.1 does that clamp, so
+  the local copy is now `alc.math.wilson_ci`. The three hand-rolled
+  softmax loops (`boss_seat` / `style_distance` / `trickiness`) are
+  `alc.math.softmax`, which subtracts the max the same way.
+
 - **`alc.nn.metric.{kl, js, tvd, entropy}` — **BREAKING**. They live at
   `alc.math.{kl_divergence, js_divergence, tvd, entropy}` now
   (mlua-mathlib 0.4).** Distribution distance and entropy are

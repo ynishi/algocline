@@ -255,28 +255,9 @@ local function probs_for_view(handle, view)
         error("style_distance: player move id missing from logits ranking")
     end
 
-    -- Numerically stable softmax: subtract the max before exponentiating
-    -- so a large positive logit does not overflow to inf.
-    local max_logit = raw[1]
-    for i = 2, #raw do
-        if raw[i] > max_logit then
-            max_logit = raw[i]
-        end
-    end
-    local probs = {}
-    local sum = 0.0
-    for i, l in ipairs(raw) do
-        local w = math.exp(l - max_logit)
-        probs[i] = w
-        sum = sum + w
-    end
-    if sum <= 0 then
-        error("style_distance: softmax over legal moves normalised to zero")
-    end
-    for i, w in ipairs(probs) do
-        probs[i] = w / sum
-    end
-    return probs
+    -- `alc.math.softmax` subtracts the max before exponentiating, so a
+    -- large positive logit still cannot overflow to inf.
+    return alc.math.softmax(raw)
 end
 
 --- Validate a prompt_set is a non-empty array of positions.

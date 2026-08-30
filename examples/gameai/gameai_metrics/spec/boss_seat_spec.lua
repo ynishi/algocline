@@ -17,6 +17,29 @@ local describe, it, expect = lust.describe, lust.it, lust.expect
 -- See style_distance_spec.lua for rationale.
 alc = alc or {}
 
+--- `alc.math.softmax(logits)` — the host surface the metric reads since
+--- the hand-rolled loop moved to mathlib. Same method: subtract the max
+--- before exponentiating, then normalise.
+alc.math = alc.math or {}
+alc.math.softmax = function(logits)
+    local max_l = logits[1]
+    for i = 2, #logits do
+        if logits[i] > max_l then
+            max_l = logits[i]
+        end
+    end
+    local out, sum = {}, 0.0
+    for i, l in ipairs(logits) do
+        local w = math.exp(l - max_l)
+        out[i] = w
+        sum = sum + w
+    end
+    for i, w in ipairs(out) do
+        out[i] = w / sum
+    end
+    return out
+end
+
 local duel = require("guardian_duel")
 local boss_seat = require("gameai_metrics.boss_seat")
 

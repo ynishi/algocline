@@ -254,9 +254,6 @@ for _, action in ipairs(LEGAL_ACTIONS) do
     LEGAL_ID_LIST[#LEGAL_ID_LIST + 1] = id
 end
 
---- 95% Wilson score interval half-width factor.
-local Z_95 = 1.959964
-
 --- Opponent assumed when the caller names none, per seat.
 local DEFAULT_OPPONENT = { player = "greedy", boss = "random" }
 
@@ -633,40 +630,24 @@ local function decode_int(raw, default, field, must_be_positive)
     return i
 end
 
---- Wilson 95% score interval around `p̂ = wins / n`. Never leaves
---- `[0, 1]`, which is why it is used here rather than the normal
---- approximation.
+--- Wilson 95% score interval around `p̂ = wins / n`, from
+--- `alc.math.wilson_ci`.
+---
+--- Kept as a two-value adapter because the callers below read `lo, hi`
+--- positionally; mathlib answers with `{lower, upper, center}`.
+---
+--- The bound-repair this file used to carry by hand — clamping the
+--- interval so it always contains its own estimate, which the exact
+--- arithmetic guarantees and the floating-point residue does not —
+--- lives in mathlib now (`wilson_ci` clamps `lower` to at most `p̂` and
+--- `upper` to at least `p̂`). `wins` may be fractional here (a draw
+--- counts a half), which that surface takes.
 local function wilson_ci(wins, n)
     if n <= 0 then
         error("level: wilson_ci requires n > 0")
     end
-    local p = wins / n
-    local z = Z_95
-    local z2 = z * z
-    local denom = 1 + z2 / n
-    local center = (p + z2 / (2 * n)) / denom
-    local half = (z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))) / denom
-    local lo = center - half
-    local hi = center + half
-    if lo < 0 then
-        lo = 0
-    end
-    if hi > 1 then
-        hi = 1
-    end
-    -- In exact arithmetic the interval always contains `p̂`, and at the
-    -- endpoints it touches it: at `p̂ = 1` the two halves of the numerator
-    -- sum to the denominator, so `hi` is exactly 1. In floating point the
-    -- residue lands a few ulp short, which would leave a reader of
-    -- `ci_lower` / `ci_upper` with a bound that excludes the estimate it
-    -- brackets. The clamp repairs only that residue.
-    if lo > p then
-        lo = p
-    end
-    if hi < p then
-        hi = p
-    end
-    return lo, hi
+    local ci = alc.math.wilson_ci(wins, n, 0.95)
+    return ci.lower, ci.upper
 end
 
 --- Normalise the two opponent forms into one list of names.

@@ -190,26 +190,9 @@ local function probs_for_view(handle, view, temperature)
     for i, l in ipairs(raw) do
         scaled[i] = l / temperature
     end
-    local max_l = scaled[1]
-    for i = 2, #scaled do
-        if scaled[i] > max_l then
-            max_l = scaled[i]
-        end
-    end
-    local probs = {}
-    local sum = 0.0
-    for i, l in ipairs(scaled) do
-        local w = math.exp(l - max_l)
-        probs[i] = w
-        sum = sum + w
-    end
-    if sum <= 0 then
-        error("trickiness: softmax over legal moves normalised to zero")
-    end
-    for i, w in ipairs(probs) do
-        probs[i] = w / sum
-    end
-    return probs
+    -- Temperature-scaled above; `alc.math.softmax` does the
+    -- max-subtraction the hand-rolled loop used to do here.
+    return alc.math.softmax(scaled)
 end
 
 local function require_prompt_set(prompt_set)

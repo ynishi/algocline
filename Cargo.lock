@@ -2461,9 +2461,9 @@ dependencies = [
 
 [[package]]
 name = "mlua-mathlib"
-version = "0.4.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94c551e80d40714ff70eff810f3dbfc649089f605e8e77a19da604a71c008c0e"
+checksum = "32dd764d67b7902aeb866fd41d15061a84a8bd2e7edd987114368e6cd927b4d6"
 dependencies = [
  "mlua",
  "rand 0.9.5",

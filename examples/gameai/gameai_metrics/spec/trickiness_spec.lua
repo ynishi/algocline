@@ -175,9 +175,31 @@ alc.nn.card = {
     end,
 }
 
+--- `alc.math.softmax(logits)` — the host surface the metric reads since
+--- the hand-rolled loop moved to mathlib. Same method: subtract the max
+--- before exponentiating, then normalise.
+alc.math = alc.math or {}
+alc.math.softmax = function(logits)
+    local max_l = logits[1]
+    for i = 2, #logits do
+        if logits[i] > max_l then
+            max_l = logits[i]
+        end
+    end
+    local out, sum = {}, 0.0
+    for i, l in ipairs(logits) do
+        local w = math.exp(l - max_l)
+        out[i] = w
+        sum = sum + w
+    end
+    for i, w in ipairs(out) do
+        out[i] = w / sum
+    end
+    return out
+end
+
 --- Every entropy call the metric made since the last reset.
 local ENTROPY_CALLS = {}
-alc.math = alc.math or {}
 alc.math.entropy = function(p)
     ENTROPY_CALLS[#ENTROPY_CALLS + 1] = { p = p }
     -- Real entropy for a length-4 distribution (natural log), so the

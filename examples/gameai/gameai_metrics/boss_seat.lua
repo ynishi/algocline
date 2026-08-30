@@ -268,26 +268,11 @@ function M.probs(handle, state, style, temperature)
     for i, l in ipairs(raw) do
         scaled[i] = l / t
     end
-    local max_l = scaled[1]
-    for i = 2, #scaled do
-        if scaled[i] > max_l then
-            max_l = scaled[i]
-        end
-    end
-    local probs = {}
-    local sum = 0.0
-    for i, l in ipairs(scaled) do
-        local w = math.exp(l - max_l)
-        probs[i] = w
-        sum = sum + w
-    end
-    if sum <= 0 then
-        error("boss_seat: softmax over legal boss moves normalised to zero")
-    end
-    for i, w in ipairs(probs) do
-        probs[i] = w / sum
-    end
-    return probs, legal
+    -- `alc.math.softmax` subtracts the max before exponentiating, same
+    -- as the hand-rolled loop it replaces. The temperature is applied
+    -- above rather than passed in: mathlib's takes logits and nothing
+    -- else, which is the right shape for it.
+    return alc.math.softmax(scaled), legal
 end
 
 --- One legal-gated greedy boss decision.

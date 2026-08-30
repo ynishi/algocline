@@ -182,6 +182,36 @@ alc.math.rng_int = function(rng, min, max)
     return min + (s // 65536) % (max - min + 1)
 end
 
+--- `alc.math.wilson_ci(successes, total, confidence)` — mirrors the host
+--- surface `level.lua` reads, including the clamp that keeps the interval
+--- around its own estimate (mathlib does this; exact arithmetic makes the
+--- endpoints touch `p̂` and floating point lands a few ulp short, which
+--- would otherwise hand a reader a bound excluding the estimate it
+--- brackets).
+---
+--- `z` is hard-coded for the one confidence the specs ask for rather than
+--- pulling a normal PPF into a stub. A different `confidence` raises,
+--- so a spec that starts asking for one notices rather than silently
+--- reading a 95% interval.
+alc.math.wilson_ci = function(successes, total, confidence)
+    if confidence ~= 0.95 then
+        error("level_spec stub: wilson_ci only models confidence = 0.95")
+    end
+    local z = 1.959963984540054
+    local p = successes / total
+    local z2 = z * z
+    local denom = 1 + z2 / total
+    local center = (p + z2 / (2 * total)) / denom
+    local margin = (z * math.sqrt((p * (1 - p) + z2 / (4 * total)) / total)) / denom
+    local lower = math.max(center - margin, 0.0)
+    local upper = math.min(center + margin, 1.0)
+    return {
+        lower = math.min(lower, p),
+        upper = math.max(upper, p),
+        center = center,
+    }
+end
+
 -- ─── Sampler stub ───────────────────────────────────────────────────
 --
 -- `opts.temperature` draws through

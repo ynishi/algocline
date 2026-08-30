@@ -207,7 +207,29 @@ alc.nn.card = {
 
 --- Record every `js` call so specs can assert compose behaviour.
 local JS_CALLS = {}
+--- `alc.math.softmax(logits)` — the host surface the metric reads since
+--- the hand-rolled loop moved to mathlib. Same method: subtract the max
+--- before exponentiating, then normalise.
 alc.math = alc.math or {}
+alc.math.softmax = function(logits)
+    local max_l = logits[1]
+    for i = 2, #logits do
+        if logits[i] > max_l then
+            max_l = logits[i]
+        end
+    end
+    local out, sum = {}, 0.0
+    for i, l in ipairs(logits) do
+        local w = math.exp(l - max_l)
+        out[i] = w
+        sum = sum + w
+    end
+    for i, w in ipairs(out) do
+        out[i] = w / sum
+    end
+    return out
+end
+
 alc.math.js_divergence = function(p, q)
     JS_CALLS[#JS_CALLS + 1] = { p = p, q = q }
     -- Return 0 when p == q element-wise, 1 otherwise — a deterministic

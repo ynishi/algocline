@@ -110,9 +110,11 @@ pub(super) fn extract_full_ft_opts(
 /// - any other value → `TrainError::Hook` naming the offending value
 ///
 /// A Lua-side `error(...)` inside the callback also surfaces as
-/// `TrainError::Hook` with the raised message. Either way the trainer
-/// still writes the terminal `<prefix>.safetensors` before returning,
-/// so the caller has last-good weights on disk (see
+/// `TrainError::Hook` with the raised message. Either way the run ends
+/// there: no terminal `<prefix>.safetensors` is written and no
+/// Checkpoint comes back, so the weights a caller can still reach are
+/// the rotating `<prefix>-step<N>.safetensors` files plus any step the
+/// hook had already kept (see
 /// [`algocline_nn::train::TrainError::Hook`] docs).
 ///
 /// # `ckpt_every` cross-check
@@ -253,7 +255,35 @@ fn parse_ckpt_control(prefix: &str, value: &LuaValue) -> Result<CkptControl, Str
 /// `keep` as a string carries the caller's own note straight through to
 /// the candidate record, so a band label survives into the run outcome
 /// without the trainer needing to know what a band is.
+///
+/// A key that is neither of those two is refused. Ignoring it would
+/// make `{ actoin = "break", keep = "cleared" }` a run that holds the
+/// checkpoint and then trains to `steps` anyway, with a candidates list
+/// that looks exactly as the caller intended — nothing downstream could
+/// tell that decision apart from the one that was asked for. A
+/// misspelled *value* is already refused by name; a misspelled *key*
+/// silently inverting a decision is the same defect one level up.
 fn parse_ckpt_control_table(prefix: &str, t: &LuaTable) -> Result<CkptControl, String> {
+    let mut unknown: Vec<String> = Vec::new();
+    for pair in t.pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair.map_err(|e| format!("{prefix}: on_ckpt table is unreadable: {e}"))?;
+        match &key {
+            LuaValue::String(s) => match s.to_str() {
+                Ok(name) if matches!(name.as_ref(), "action" | "keep") => {}
+                Ok(name) => unknown.push(format!("{name:?}")),
+                Err(_) => unknown.push("<non-UTF-8 key>".to_string()),
+            },
+            other => unknown.push(format!("<{} key>", other.type_name())),
+        }
+    }
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(format!(
+            "{prefix}: on_ckpt table has unknown key(s) {}; only 'action' and 'keep' are read",
+            unknown.join(", ")
+        ));
+    }
+
     let action: Option<mlua::String> = t
         .get("action")
         .map_err(|e| format!("{prefix}: on_ckpt table field 'action' is unreadable: {e}"))?;
@@ -1343,6 +1373,36 @@ mod tests {
         t.set("keep", false).unwrap();
         let control = parse_ckpt_control("prefix", &LuaValue::Table(t)).unwrap();
         assert_eq!(control.keep, None);
+    }
+
+    /// A misspelled key must not read as a decision the caller did not
+    /// make. `{ actoin = "break", keep = … }` would otherwise hold the
+    /// checkpoint and train on to `steps`, and the candidates list
+    /// would look exactly right.
+    #[test]
+    fn parse_ckpt_control_table_refuses_unknown_keys() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("actoin", "break").unwrap();
+        t.set("keep", "cleared").unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(
+            err.contains("alc.nn.trainer") && err.contains("actoin") && err.contains("unknown key"),
+            "message must name prefix + the offending key: {err}"
+        );
+
+        // The mirror case: the flow is right, the keep is silently lost.
+        let t = lua.create_table().unwrap();
+        t.set("action", "break").unwrap();
+        t.set("kept", "x").unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+
+        // A non-string key is just as unreadable an intent.
+        let t = lua.create_table().unwrap();
+        t.set(1, "break").unwrap();
+        let err = parse_ckpt_control("alc.nn.trainer", &LuaValue::Table(t)).unwrap_err();
+        assert!(err.contains("unknown key"), "{err}");
     }
 
     #[test]

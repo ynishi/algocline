@@ -1683,9 +1683,12 @@ Checkpoint before assembling the Card.
   - `ckpt_every` (integer, optional, default `0`) — write a
     mid-run checkpoint every N optimizer steps. `0` disables
     them; only the terminal `<card_id>.safetensors` is written.
-  - `ckpt_keep` (integer, optional) — how many mid-run
-    checkpoints stay on disk. The oldest beyond this count are
-    deleted as newer ones arrive. Clamps to at least `1`.
+  - `ckpt_keep` (integer, optional) — how wide the rotating
+    window is: the oldest mid-run checkpoint beyond this count is
+    deleted as newer ones arrive. Clamps to at least `1`. This
+    sizes the *rotation*, not the directory — checkpoints the
+    hook kept sit outside it, so a run can leave more files than
+    this behind (see *Checkpoint search*).
   - `on_ckpt` (function, optional) — called once per
     `ckpt_every` boundary, after the checkpoint has been
     written, as `on_ckpt(info)`. Requires `ckpt_every > 0`;
@@ -1715,7 +1718,10 @@ a band label, a rank, whatever names why this one was selected.
 The table form exists for the combination no single string can
 say: **hold this one and stop**, which is how a successful search
 ends. Anything else is refused loudly with the offending value in
-the message.
+the message — including a key that is neither `action` nor `keep`,
+because `{ actoin = "break", keep = "…" }` would otherwise hold the
+checkpoint, train on to `steps`, and hand back a candidates list
+that looks exactly as intended.
 
 A held checkpoint is pinned out of the rotation for the rest of
 the run: it is neither deleted by `ckpt_keep` nor counted against
@@ -1752,6 +1758,16 @@ before the keep surface behaves exactly as it did.
 
 The sibling `alc.nn.trainer.full_ft` reads the same `on_ckpt` and
 returns the same list on its Checkpoint table as `ckpt.candidates`.
+
+**Known limitation — a failing run loses the list, not the files.**
+The candidates list only comes back when the run returns normally.
+If the run raises — a Lua error inside `on_ckpt`, an exhausted
+dataset, a refused batch shape — the pinned checkpoints stay on
+disk (nothing un-pins them) but the record of which steps they
+were and why they were kept is gone with the error, and so is the
+`card_id` that would have named the run. A hook that both keeps
+checkpoints and can fail should write down what it kept as it
+keeps it, rather than waiting for the run to hand the list back.
 
 **Schedules.** All three warmup-bearing ones share one ramp and differ
 only in the tail, so switching between them changes the shape of a

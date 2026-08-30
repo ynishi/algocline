@@ -394,11 +394,18 @@ pub enum TrainError {
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
-    /// An `on_ckpt` hook returned an error. The trainer writes the
-    /// terminal `<prefix>.safetensors` before propagating so callers
-    /// still have last-good weights on disk, but the returned
-    /// [`Checkpoint`] carries `metrics["hook_error"] = 1.0` so the
-    /// error is discoverable from the bundle side too.
+    /// An `on_ckpt` hook returned an error.
+    ///
+    /// The error propagates immediately: no terminal
+    /// `<prefix>.safetensors` is written, and no [`Checkpoint`] comes
+    /// back — the last-good weights a caller can reach are the
+    /// rotating `<prefix>-step<N>.safetensors` files, plus any step
+    /// the hook had already asked to keep (pins survive, since nothing
+    /// un-pins). Anything the run had collected in
+    /// [`Checkpoint::candidates`] is lost with the error, so a hook
+    /// that keeps checkpoints and can also fail should record what it
+    /// kept as it goes rather than waiting for the run to hand the
+    /// list back.
     #[error("on_ckpt hook: {0}")]
     Hook(String),
     /// [`FullFtConfig::init_from`] named a checkpoint the model's

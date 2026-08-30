@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that could hold a file but not say which one held it back where it
   started.
 
+  KNOWN LIMITATION: the list only comes back from a run that returns
+  normally. A run that raises — a hook error, an exhausted dataset —
+  leaves its pinned checkpoints on disk but loses the record of which
+  steps they were and why, along with the `card_id` that would have
+  named the run. Documented on the Lua surface; a hook that both keeps
+  and can fail should record what it kept as it keeps it.
+
   Additive for every existing caller. `local card_id = run_full_ft(…)`
   drops the extra value, `nil` / `"continue"` / `"break"` mean what they
   meant, and a run whose hook never keeps anything reports no

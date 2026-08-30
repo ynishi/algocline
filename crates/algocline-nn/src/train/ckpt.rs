@@ -32,6 +32,7 @@ use candle_core::DType;
 use candle_nn::VarMap;
 use serde::Serialize;
 
+use super::fullft::CkptInfo;
 use super::Checkpoint;
 
 /// A checkpoint the hook asked to hold, as it stood when it was held.
@@ -45,12 +46,24 @@ use super::Checkpoint;
 /// ([`CheckpointStore::append_candidate`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Candidate {
-    /// Optimizer step the checkpoint was written at.
-    pub step: usize,
-    /// Absolute path of the pinned checkpoint file.
-    pub ckpt_path: PathBuf,
-    /// Mean per-micro training loss on that step.
-    pub train_loss: f32,
+    /// What the trainer knew at that boundary, verbatim — the same
+    /// [`CkptInfo`] the hook was handed.
+    ///
+    /// Embedded rather than copied field by field, so a field added to
+    /// `CkptInfo` reaches the record without a second edit, and so the
+    /// two can never drift into disagreeing about the same step. The
+    /// fields are flattened into the written line: `step`, `ckpt_path`,
+    /// `train_loss`, `lr`, `grad_norm`, `elapsed_ms`, `min_train_loss`
+    /// sit at the top level next to `reason` and `values`.
+    ///
+    /// Carrying all of them, not just the loss, is what lets a later
+    /// reader ask whether a keep was sound: the model-side numbers are
+    /// in `values`, the training-side ones are here, and the question
+    /// "was the run still converging when this was selected" needs both.
+    /// They exist only for the length of the hook call, so a record that
+    /// dropped them could not be repaired short of re-running the sweep.
+    #[serde(flatten)]
+    pub info: CkptInfo,
     /// The hook's own note, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -849,6 +862,21 @@ mod tests {
     use candle_nn::VarBuilder;
     use tempfile::TempDir;
 
+    /// Build a `CkptInfo` for a step, with plausible training-side
+    /// numbers. The store tests care about the record's shape, not the
+    /// numbers, so one helper keeps them out of the way.
+    fn info_for(store: &CheckpointStore, step: usize, train_loss: f32) -> CkptInfo {
+        CkptInfo {
+            step,
+            ckpt_path: store.path_for_step(step),
+            train_loss,
+            lr: 3e-4,
+            grad_norm: 0.5,
+            elapsed_ms: 1_000 * step as u64,
+            min_train_loss: train_loss,
+        }
+    }
+
     fn small_varmap() -> VarMap {
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
@@ -963,18 +991,14 @@ mod tests {
 
         store
             .append_candidate(&Candidate {
-                step: 4,
-                ckpt_path: store.path_for_step(4),
-                train_loss: 1.5,
+                info: info_for(&store, 4, 1.5),
                 reason: Some("tier-2".into()),
                 values: BTreeMap::new(),
             })
             .unwrap();
         store
             .append_candidate(&Candidate {
-                step: 8,
-                ckpt_path: store.path_for_step(8),
-                train_loss: 1.25,
+                info: info_for(&store, 8, 1.25),
                 reason: None,
                 values: BTreeMap::new(),
             })
@@ -1002,9 +1026,7 @@ mod tests {
 
         store
             .append_candidate(&Candidate {
-                step: 1,
-                ckpt_path: store.path_for_step(1),
-                train_loss: 1.0,
+                info: info_for(&store, 1, 1.0),
                 reason: None,
                 values: BTreeMap::new(),
             })

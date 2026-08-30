@@ -1759,11 +1759,22 @@ local card_id, candidates = alc.nn.trainer.run_full_ft(h, ds, {
 })
 
 for _, c in ipairs(candidates) do
-    -- c.step / c.ckpt_path / c.train_loss
-    -- c.reason / c.values  (each absent when the keep gave none)
-    print(c.step, c.reason, c.values and c.values.score, c.ckpt_path)
+    -- every field of the `info` the hook was handed, plus why it kept it:
+    --   c.step / c.ckpt_path / c.train_loss / c.lr / c.grad_norm
+    --   c.elapsed_ms / c.min_train_loss
+    --   c.reason / c.values  (each absent when the keep gave none)
+    print(c.step, c.reason, c.values and c.values.score, c.grad_norm)
 end
 ```
+
+A candidate is the `info` table the hook was handed plus the two
+fields saying why it was kept, so the training-side numbers come
+back alongside the model-side ones. Asking later whether a keep was
+sound needs both — `values` says what the model scored, and
+`grad_norm` / `train_loss` / `lr` say whether the run was still
+converging when it scored it. Neither side survives the hook call on
+its own, so a record holding one of them cannot answer the question
+short of re-running the sweep.
 
 Binding one variable (`local card_id = …`) keeps working
 unchanged — Lua drops the extra value — so every caller written
@@ -1776,10 +1787,12 @@ returns the same list on its Checkpoint table as `ckpt.candidates`.
 comes back when the run returns normally, so the trainer also writes
 each keep down as it happens, to
 `<ckpt_dir>/<card_id>-candidates.jsonl` — one JSON object per line,
-the same four fields, `reason` omitted when there is none:
+the same fields, `reason` / `values` omitted when there are none:
 
 ```json
-{"step":40,"ckpt_path":"/…/run-step40.safetensors","train_loss":1.83,"reason":"tier-2"}
+{"step":40,"ckpt_path":"/…/run-step40.safetensors","train_loss":1.83,
+ "lr":0.0003,"grad_norm":0.42,"elapsed_ms":91230,"min_train_loss":1.79,
+ "reason":"tier-2","values":{"ci_lower":0.62}}
 ```
 
 That file is what a run that raises — a Lua error inside `on_ckpt`,

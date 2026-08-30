@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meant, and a run whose hook never keeps anything reports no
   candidates.
 
+  A candidate is the `info` the hook was handed plus why it was kept,
+  so `lr` / `grad_norm` / `elapsed_ms` / `min_train_loss` come back with
+  it rather than the loss alone. Those five were the trainer's only
+  output that nothing read — hooks took `step` and `ckpt_path` and left
+  the rest — while the question a search asks afterwards ("was the run
+  still converging when this scored well?") needs exactly them beside
+  the model-side readings. `CkptInfo` is embedded rather than copied
+  field by field, so the two can never disagree about the same step and
+  a field added to it reaches the record without a second edit.
+
   A keep can carry the numbers the judgment read, not only a note:
   `keep = { reason = "cleared", values = { ci_lower = 0.62 } }`. They
   come back on the candidate and go into the written record. Without

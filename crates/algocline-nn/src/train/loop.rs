@@ -20,6 +20,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
+use serde::Serialize;
+
 use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
@@ -478,7 +480,7 @@ pub enum TrainError {
 /// into an mlua-side Lua table without borrowing from any tensor. The
 /// checkpoint has already been written to `ckpt_path` by the time the
 /// hook fires — the hook decides whether to keep training or stop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CkptInfo {
     /// Optimizer step index at which this checkpoint fired
     /// (1-indexed, matches the `<prefix>-step<N>.safetensors` filename).
@@ -1155,9 +1157,7 @@ fn run_ft_core(
                 if let Some(mark) = control.keep {
                     ckpt_store.pin(step + 1);
                     let candidate = Candidate {
-                        step: step + 1,
-                        ckpt_path: info.ckpt_path.clone(),
-                        train_loss: mean_loss,
+                        info: info.clone(),
                         reason: mark.reason,
                         values: mark.values,
                     };
@@ -2136,14 +2136,14 @@ mod tests {
 
         assert_eq!(ckpt.candidates.len(), 1);
         let candidate = &ckpt.candidates[0];
-        assert_eq!(candidate.step, 4);
+        assert_eq!(candidate.info.step, 4);
         assert_eq!(candidate.reason.as_deref(), Some("first-look"));
         assert!(
-            candidate.ckpt_path.exists(),
+            candidate.info.ckpt_path.exists(),
             "the candidate's file must outlive four rotations at keep=1: {:?}",
-            candidate.ckpt_path
+            candidate.info.ckpt_path
         );
-        assert!(candidate.train_loss.is_finite());
+        assert!(candidate.info.train_loss.is_finite());
     }
 
     /// Keep and break together — how a successful search ends. The
@@ -2194,9 +2194,9 @@ mod tests {
             "a keep alongside a break must not swallow the early_break marker"
         );
         assert_eq!(ckpt.candidates.len(), 1);
-        assert_eq!(ckpt.candidates[0].step, 4);
+        assert_eq!(ckpt.candidates[0].info.step, 4);
         assert!(
-            ckpt.candidates[0].ckpt_path.exists(),
+            ckpt.candidates[0].info.ckpt_path.exists(),
             "the pin has to be in place before the break returns"
         );
     }
@@ -2375,7 +2375,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for (line, candidate) in lines.iter().zip(ckpt.candidates.iter()) {
             assert!(
-                line.contains(&format!("\"step\":{}", candidate.step)),
+                line.contains(&format!("\"step\":{}", candidate.info.step)),
                 "{line}"
             );
         }
@@ -2446,6 +2446,83 @@ mod tests {
             line.find("ci_lower").unwrap() < line.find("trickiness").unwrap(),
             "{line}"
         );
+    }
+
+    /// The record carries what the *trainer* knew at the boundary, not
+    /// only the loss.
+    ///
+    /// Asking later whether a keep was sound needs both sides: the
+    /// model-side readings are the caller's `values`, and whether the
+    /// run was still converging when they were taken is the trainer's.
+    /// Neither survives the hook call, so a record holding only one of
+    /// them cannot answer the question short of re-running the sweep.
+    #[test]
+    fn the_record_carries_the_training_side_numbers_too() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 4,
+            warmup: 1,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        // Capture what the hook was handed, so the record can be
+        // compared against it rather than against a guess.
+        let seen: Arc<Mutex<Option<CkptInfo>>> = Arc::new(Mutex::new(None));
+        let seen_hook = Arc::clone(&seen);
+        let hook: CkptHook = Box::new(move |info| {
+            *seen_hook.lock().unwrap() = Some(info.clone());
+            Ok(CkptControl::keep(None))
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "train_side",
+            lease,
+            Some(hook),
+        )
+        .unwrap();
+
+        let handed = seen.lock().unwrap().clone().expect("hook fired");
+        assert_eq!(
+            ckpt.candidates[0].info, handed,
+            "the candidate must carry the same frame the hook was handed"
+        );
+
+        let line = std::fs::read_to_string(tmp.path().join("train_side-candidates.jsonl")).unwrap();
+        for key in [
+            "step",
+            "ckpt_path",
+            "train_loss",
+            "lr",
+            "grad_norm",
+            "elapsed_ms",
+            "min_train_loss",
+        ] {
+            assert!(
+                line.contains(&format!("\"{key}\"")),
+                "the written record must name {key}: {line}"
+            );
+        }
     }
 
     /// A keep with no measurements omits the key rather than writing an

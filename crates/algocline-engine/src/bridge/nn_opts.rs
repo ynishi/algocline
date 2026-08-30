@@ -193,23 +193,33 @@ fn ckpt_info_to_lua(lua: &Lua, info: &CkptInfo) -> LuaResult<LuaTable> {
 ///
 /// The other half of the hook ABI: [`ckpt_info_to_lua`] carries a
 /// checkpoint *into* the hook, this carries back out the ones the hook
-/// asked to keep. One entry per [`Candidate`], in the order it asked:
+/// asked to keep. One entry per [`Candidate`], in the order it asked.
+/// The entry is the `info` table the hook was handed, plus why it kept
+/// it:
 ///
 /// ```lua
 /// { step = 40, ckpt_path = "/…/run-step40.safetensors",
-///   train_loss = 1.83, reason = "tier-2" }
+///   train_loss = 1.83, lr = 3e-4, grad_norm = 0.42,
+///   elapsed_ms = 91230, min_train_loss = 1.79,
+///   reason = "tier-2", values = { ci_lower = 0.62 } }
 /// ```
 ///
-/// `reason` is absent when the hook did not give one. Every path is
-/// pinned for the life of the run, so each entry still resolves when
+/// The training-side numbers come along rather than the loss alone,
+/// because asking later whether a keep was sound needs both sides: the
+/// model-side readings are in `values`, and whether the run was still
+/// converging when they were taken is here. Neither survives the hook
+/// call on its own.
+///
+/// `reason` / `values` are absent when the hook gave none. Every path
+/// is pinned for the life of the run, so each entry still resolves when
 /// the caller reads it.
 pub(super) fn candidates_to_lua(lua: &Lua, candidates: &[Candidate]) -> LuaResult<LuaTable> {
     let out = lua.create_table()?;
     for (i, c) in candidates.iter().enumerate() {
-        let entry = lua.create_table()?;
-        entry.set("step", c.step)?;
-        entry.set("ckpt_path", c.ckpt_path.to_string_lossy().into_owned())?;
-        entry.set("train_loss", c.train_loss)?;
+        // Built by the same projection the hook's own `info` argument
+        // goes through, so the two tables cannot disagree about the
+        // same step, and a field added to `CkptInfo` reaches both.
+        let entry = ckpt_info_to_lua(lua, &c.info)?;
         if let Some(reason) = &c.reason {
             entry.set("reason", reason.as_str())?;
         }

@@ -22,7 +22,12 @@
 --- ## Layers
 ---
 --- - **domain (anymetric)** — produces harvest Decision `{action, reason, meta}`
----   and appends the marker into the run log.
+---   and appends the marker into the run log. Its `to_hook_action` also
+---   answers the trainer with a keep, which pins the checkpoint out of
+---   the rotation — that is what makes the `ckpt_path` recorded below
+---   still resolve after the run. Before the keep existed, a manifest
+---   written early in a long run named a file `ckpt_keep` rotations
+---   later had already deleted.
 --- - **caller (train script hook)** — decides on the harvest, bakes the
 ---   Card via `alc.nn.card.save_from_ckpt`, pins the alias, and hands
 ---   the (dec, info, records, extra) tuple to this collection helper.

@@ -678,8 +678,17 @@ describe("train_guardian_npc staged harvest", function()
         expect(#out.stages_harvested).to.equal(1)
         expect(out.stages_harvested[1]).to.equal("weak")
         expect(out.collection_path).to.equal("workspace/gameai-harvest/collection.json")
+        -- A harvesting fire answers the trainer with the keep table
+        -- rather than a bare "continue": the run goes on *and* the
+        -- checkpoint the manifest names is held out of the rotation,
+        -- so `ckpt_path` in the manifest still resolves after the run.
         for _, action in ipairs(HOOK_ACTIONS) do
-            expect(action).to.equal("continue")
+            if type(action) == "table" then
+                expect(action.action).to.equal("continue")
+                expect(action.keep).to.equal("weak")
+            else
+                expect(action).to.equal("continue")
+            end
         end
     end)
 
@@ -718,8 +727,15 @@ describe("train_guardian_npc staged harvest", function()
         expect(SAVE_FROM_CKPT_CALLS[1].name).to.equal("guardian_duel_npc_weak")
         expect(out.stages_harvested[1]).to.equal("weak")
         expect(out.gate_enabled).to.equal(true)
+        -- Same as above: the harvesting fire keeps, the others just
+        -- continue. Neither stops the run under a coexisting gate.
         for _, action in ipairs(HOOK_ACTIONS) do
-            expect(action).to.equal("continue")
+            if type(action) == "table" then
+                expect(action.action).to.equal("continue")
+                expect(action.keep).to.equal("weak")
+            else
+                expect(action).to.equal("continue")
+            end
         end
         expect(out.ckpt_fires).to.equal(PLANNED_FIRES)
     end)

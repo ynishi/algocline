@@ -1295,15 +1295,33 @@ describe("anymetric.to_hook_action", function()
         )
     end)
 
-    it("projects harvest onto continue and appends a marker record", function()
+    it("projects harvest onto a keep that continues, and appends a marker", function()
         reset()
         local log = am.run_log.new()
         local action = am.to_hook_action({ action = "harvest", reason = "band 0.45-0.55 hit" }, log)
-        expect(action).to.equal("continue")
+        -- The table form, not the bare string: the run goes on *and*
+        -- the trainer holds this checkpoint out of the rotation, which
+        -- is what keeps the manifest's ckpt_path alive past the run.
+        expect(type(action)).to.equal("table")
+        expect(action.action).to.equal("continue")
+        expect(action.keep).to.equal("band 0.45-0.55 hit")
         local all = log:all()
         expect(#all).to.equal(1)
         expect(all[1].harvest).to.equal(true)
         expect(all[1].reason).to.equal("band 0.45-0.55 hit")
+    end)
+
+    it("carries the band label as the keep note when the decision has one", function()
+        reset()
+        local log = am.run_log.new()
+        local action = am.to_hook_action({
+            action = "harvest",
+            reason = "band hit",
+            meta = { label = "tier-2" },
+        }, log)
+        -- The label is what the manifest files the entry under, so it
+        -- is the more useful of the two on the candidate list.
+        expect(action.keep).to.equal("tier-2")
     end)
 
     it("keeps earlier records when a harvest marker is appended", function()
@@ -1343,7 +1361,8 @@ describe("anymetric.to_hook_action", function()
             { action = "harvest", reason = "band [0.55, 0.85] hit (mid)", meta = meta },
             log
         )
-        expect(action).to.equal("continue")
+        expect(action.action).to.equal("continue")
+        expect(action.keep).to.equal("mid")
         local all = log:all()
         expect(#all).to.equal(1)
         expect(all[1].harvest).to.equal(true)

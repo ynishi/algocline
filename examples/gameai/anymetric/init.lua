@@ -26,13 +26,15 @@
 ---   never_break) leave it absent so downstream callers see the exact
 ---   same shape they always did.
 ---
---- Only `to_hook_action` knows about the trainer hook ABI (the bridge
---- accepts `"break"` / `"continue"` / `nil` and nothing else), so the
---- domain is free to carry a third action (`harvest`) that the ABI has
---- no room for. When a harvest decision carries `meta`, the marker
---- record appended to the run log carries the same table so a
---- collection helper can extract the label without a second judgment
---- call.
+--- Only `to_hook_action` knows about the trainer hook ABI, and the
+--- domain's third action (`harvest`) now has somewhere to land in it:
+--- the bridge takes `{ action = "continue", keep = "<reason>" }`, and
+--- the trainer holds that checkpoint out of its rotation. Until it did,
+--- a harvest was flattened to `"continue"` and the file the manifest
+--- named could be deleted before the run ended. When a harvest decision
+--- carries `meta`, the marker record appended to the run log carries
+--- the same table so a collection helper can extract the label without
+--- a second judgment call.
 ---
 --- Nothing in this module is game-specific: the metric functions, ctx
 --- keys and the fields a judgment reads are all supplied by the caller.
@@ -910,12 +912,22 @@ end
 
 --- Project a `Decision` onto the trainer hook ABI.
 ---
---- The bridge accepts `"break"` / `"continue"` / `nil` and refuses
---- anything else, so the third domain action lands here: `harvest` keeps
---- the run going and writes a marker record into the run log, which is
---- where the next iteration's tiered-checkpoint collection will read it
---- from. Keeping the projection in one function is what lets the domain
---- grow actions the ABI cannot express.
+--- `break` and `continue` are the ABI's own words and pass through as
+--- strings. `harvest` returns the table form
+--- `{ action = "continue", keep = "<label or reason>" }`: the run goes
+--- on and the trainer holds that checkpoint out of its rotation.
+---
+--- The keep is the point. A harvested checkpoint is the one the
+--- collection manifest names by `ckpt_path`, and before the ABI could
+--- say "hold this one" that file was still in the rotating window —
+--- `ckpt_keep` newer checkpoints later it was gone, and the manifest
+--- pointed at nothing. Holding it costs the window nothing (pinned
+--- files are not counted against `ckpt_keep`).
+---
+--- `keep` carries `meta.label` when the decision has one, because that
+--- is the name the manifest files the entry under; a decision built by
+--- hand falls back to its `reason`. Either way the trainer treats it as
+--- an opaque note and hands it back on the run's candidate list.
 ---
 --- When the harvest decision carries a `meta` table, that table is
 --- copied onto the marker record so a collection helper can extract the
@@ -926,7 +938,7 @@ end
 ---
 ---@param dec table Decision `{ action, reason, meta? }`
 ---@param run_log table|nil run log, required for `harvest`
----@return string action `"break"` or `"continue"`
+---@return string|table action `"break"` / `"continue"`, or the keep table
 function M.to_hook_action(dec, run_log)
     if type(dec) ~= "table" then
         error("anymetric.to_hook_action: decision must be a table, got " .. type(dec), 2)
@@ -958,7 +970,15 @@ function M.to_hook_action(dec, run_log)
             end
         end
         run_log:append({ marker })
-        return "continue"
+        -- The label is what the manifest files this entry under, so it
+        -- is the note worth carrying onto the trainer's candidate list;
+        -- a hand-built decision without one falls back to its reason.
+        local label = dec.meta and dec.meta.label
+        local keep = (type(label) == "string" and label ~= "") and label or dec.reason
+        if type(keep) ~= "string" or keep == "" then
+            keep = true
+        end
+        return { action = "continue", keep = keep }
     end
     error(
         "anymetric.to_hook_action: unknown decision action '"

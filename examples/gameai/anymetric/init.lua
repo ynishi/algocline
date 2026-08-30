@@ -914,8 +914,16 @@ end
 ---
 --- `break` and `continue` are the ABI's own words and pass through as
 --- strings. `harvest` returns the table form
---- `{ action = "continue", keep = "<label or reason>" }`: the run goes
---- on and the trainer holds that checkpoint out of its rotation.
+--- `{ action = "continue", keep = { reason = "<label>", values = {…} } }`:
+--- the run goes on, the trainer holds that checkpoint out of its
+--- rotation, and the readings that made the decision go into its
+--- record beside the training-side numbers it already had.
+---
+--- `values` carries the numeric fields of the record the band read.
+--- Only the numbers: the candidate line is names to numbers, and a view
+--- may also report structure (`level` returns `per_opponent`, and whole
+--- row arrays under `per_game`). Those stay in the run log, which keeps
+--- the record whole.
 ---
 --- The keep is the point. A harvested checkpoint is the one the
 --- collection manifest names by `ckpt_path`, and before the ABI could
@@ -974,11 +982,37 @@ function M.to_hook_action(dec, run_log)
         -- is the note worth carrying onto the trainer's candidate list;
         -- a hand-built decision without one falls back to its reason.
         local label = dec.meta and dec.meta.label
-        local keep = (type(label) == "string" and label ~= "") and label or dec.reason
-        if type(keep) ~= "string" or keep == "" then
-            keep = true
+        local reason = (type(label) == "string" and label ~= "") and label or dec.reason
+        if type(reason) ~= "string" or reason == "" then
+            reason = nil
         end
-        return { action = "continue", keep = keep }
+
+        -- The readings that made the decision go with it. Without this
+        -- the trainer's record says which band hit and nothing about
+        -- what hit it, and the numbers live only in whatever manifest
+        -- the caller keeps — which is the split this closes.
+        --
+        -- Numbers only: the trainer's candidate line is names to
+        -- numbers, while a view may also report structure (`level`
+        -- returns a `per_opponent` table and, under `per_game`, whole
+        -- arrays of rows). Those belong in the run log, which keeps the
+        -- record whole; passing them here would be refused at the ABI
+        -- rather than silently flattened.
+        local values
+        local raw = dec.meta and dec.meta.values
+        if type(raw) == "table" then
+            for key, value in pairs(raw) do
+                if type(key) == "string" and type(value) == "number" then
+                    values = values or {}
+                    values[key] = value
+                end
+            end
+        end
+
+        if reason == nil and values == nil then
+            return { action = "continue", keep = true }
+        end
+        return { action = "continue", keep = { reason = reason, values = values } }
     end
     error(
         "anymetric.to_hook_action: unknown decision action '"

@@ -1304,7 +1304,7 @@ describe("anymetric.to_hook_action", function()
         -- is what keeps the manifest's ckpt_path alive past the run.
         expect(type(action)).to.equal("table")
         expect(action.action).to.equal("continue")
-        expect(action.keep).to.equal("band 0.45-0.55 hit")
+        expect(action.keep.reason).to.equal("band 0.45-0.55 hit")
         local all = log:all()
         expect(#all).to.equal(1)
         expect(all[1].harvest).to.equal(true)
@@ -1321,7 +1321,34 @@ describe("anymetric.to_hook_action", function()
         }, log)
         -- The label is what the manifest files the entry under, so it
         -- is the more useful of the two on the candidate list.
-        expect(action.keep).to.equal("tier-2")
+        expect(action.keep.reason).to.equal("tier-2")
+    end)
+
+    it("passes only the numeric readings onto the keep", function()
+        reset()
+        local log = am.run_log.new()
+        local action = am.to_hook_action({
+            action = "harvest",
+            reason = "band hit",
+            meta = {
+                label = "mid",
+                values = {
+                    ci_lower = 0.7,
+                    win_rate = 0.55,
+                    -- `level` reports these alongside the scalars; the
+                    -- candidate line is names to numbers, so they stay
+                    -- in the run log rather than being flattened.
+                    per_opponent = { greedy = { win_rate = 0.5 } },
+                    label = "not a number",
+                },
+            },
+        }, log)
+        expect(action.keep.values.ci_lower).to.equal(0.7)
+        expect(action.keep.values.win_rate).to.equal(0.55)
+        expect(action.keep.values.per_opponent).to.equal(nil)
+        expect(action.keep.values.label).to.equal(nil)
+        -- The run log still has the whole record.
+        expect(log:all()[1].label).to.equal("mid")
     end)
 
     it("keeps earlier records when a harvest marker is appended", function()
@@ -1362,7 +1389,11 @@ describe("anymetric.to_hook_action", function()
             log
         )
         expect(action.action).to.equal("continue")
-        expect(action.keep).to.equal("mid")
+        expect(action.keep.reason).to.equal("mid")
+        -- The readings that made the decision travel with it, so the
+        -- trainer's own record can say what hit the band, not only
+        -- which band hit.
+        expect(action.keep.values.ci_lower).to.equal(0.70)
         local all = log:all()
         expect(#all).to.equal(1)
         expect(all[1].harvest).to.equal(true)

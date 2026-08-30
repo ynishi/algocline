@@ -683,7 +683,11 @@ describe("train_guardian_npc staged harvest", function()
         for _, action in ipairs(HOOK_ACTIONS) do
             if type(action) == "table" then
                 expect(action.action).to.equal("continue")
-                expect(action.keep).to.equal("weak")
+                expect(action.keep.reason).to.equal("weak")
+                -- The strength reading that put this fire in the band
+                -- travels with the keep, so the trainer's own record
+                -- says what hit it and not just which band did.
+                expect(action.keep.values.ci_lower).to.equal(0.2)
             else
                 expect(action).to.equal("continue")
             end
@@ -730,7 +734,11 @@ describe("train_guardian_npc staged harvest", function()
         for _, action in ipairs(HOOK_ACTIONS) do
             if type(action) == "table" then
                 expect(action.action).to.equal("continue")
-                expect(action.keep).to.equal("weak")
+                expect(action.keep.reason).to.equal("weak")
+                -- The strength reading that put this fire in the band
+                -- travels with the keep, so the trainer's own record
+                -- says what hit it and not just which band did.
+                expect(action.keep.values.ci_lower).to.equal(0.2)
             else
                 expect(action).to.equal("continue")
             end

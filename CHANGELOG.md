@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.49.0] - 2026-08-30
+
+### Added
+
 - **A checkpoint the trainer is told to keep is held out of the
   rotation, and the run reports what it held.** `on_ckpt` can now
   return `"keep"` (hold this checkpoint, carry on) or a table

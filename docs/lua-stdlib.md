@@ -1759,15 +1759,29 @@ before the keep surface behaves exactly as it did.
 The sibling `alc.nn.trainer.full_ft` reads the same `on_ckpt` and
 returns the same list on its Checkpoint table as `ckpt.candidates`.
 
-**Known limitation — a failing run loses the list, not the files.**
-The candidates list only comes back when the run returns normally.
-If the run raises — a Lua error inside `on_ckpt`, an exhausted
-dataset, a refused batch shape — the pinned checkpoints stay on
-disk (nothing un-pins them) but the record of which steps they
-were and why they were kept is gone with the error, and so is the
-`card_id` that would have named the run. A hook that both keeps
-checkpoints and can fail should write down what it kept as it
-keeps it, rather than waiting for the run to hand the list back.
+**The record survives a run that does not.** The returned list only
+comes back when the run returns normally, so the trainer also writes
+each keep down as it happens, to
+`<ckpt_dir>/<card_id>-candidates.jsonl` — one JSON object per line,
+the same four fields, `reason` omitted when there is none:
+
+```json
+{"step":40,"ckpt_path":"/…/run-step40.safetensors","train_loss":1.83,"reason":"tier-2"}
+```
+
+That file is what a run that raises — a Lua error inside `on_ckpt`,
+an exhausted dataset, a killed process — leaves behind. The pinned
+checkpoints stay on disk in that case (nothing un-pins them), and
+without the record they would be anonymous files in a directory. It
+is written through on every keep rather than at the end, because a
+record assembled at the end is exactly the one a crash takes with
+it. Read it with `alc.json_decode` line by line.
+
+What a failed run still loses is the `card_id`: the Card is written
+only after the run returns, so the file names the checkpoints but
+not the run that produced them. The `<card_id>` in its own filename
+is the link, since the trainer uses the pre-minted id as the
+checkpoint prefix.
 
 **Schedules.** All three warmup-bearing ones share one ramp and differ
 only in the tail, so switching between them changes the shape of a

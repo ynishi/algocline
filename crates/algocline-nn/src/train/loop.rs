@@ -25,7 +25,9 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
 
 use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
-use crate::train::ckpt::{checkpoint_from_path, restore_into, CheckpointStore, RestoreError};
+use crate::train::ckpt::{
+    checkpoint_from_path, restore_into, Candidate, CheckpointStore, RestoreError,
+};
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::lion::{Lion, ParamsLion};
 use crate::train::loss::Loss;
@@ -591,23 +593,6 @@ impl CkptControl {
     }
 }
 
-/// A checkpoint the hook asked to hold, as it stood when it was held.
-///
-/// The file at `ckpt_path` is pinned for the rest of the run
-/// ([`super::ckpt::CheckpointStore::pin`]), so it is still there when
-/// the run returns — which is the whole point of recording it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Candidate {
-    /// Optimizer step the checkpoint was written at.
-    pub step: usize,
-    /// Absolute path of the pinned checkpoint file.
-    pub ckpt_path: PathBuf,
-    /// Mean per-micro training loss on that step.
-    pub train_loss: f32,
-    /// The hook's own note, verbatim.
-    pub reason: Option<String>,
-}
-
 /// Callback fired at every `ckpt_every` boundary, after the checkpoint
 /// has been written to disk.
 ///
@@ -1143,12 +1128,23 @@ fn run_ft_core(
                 // caller most wants to still exist.
                 if let Some(mark) = control.keep {
                     ckpt_store.pin(step + 1);
-                    candidates.push(Candidate {
+                    let candidate = Candidate {
                         step: step + 1,
                         ckpt_path: info.ckpt_path.clone(),
                         train_loss: mean_loss,
                         reason: mark.reason,
-                    });
+                    };
+                    // Written down before it is handed back, because
+                    // the returned list only reaches a caller on the
+                    // paths that return. A run that dies later still
+                    // leaves the pinned file, so it has to leave the
+                    // record of it too. A failure to write is loud:
+                    // a search whose record is missing entries is
+                    // worse than one that stopped.
+                    ckpt_store
+                        .append_candidate(&candidate)
+                        .map_err(|e| TrainError::Ckpt(format!("candidate record: {e}")))?;
+                    candidates.push(candidate);
                 }
 
                 match control.flow {
@@ -2216,6 +2212,150 @@ mod tests {
         )
         .unwrap();
         assert!(ckpt.candidates.is_empty());
+    }
+
+    /// The record of a kept checkpoint outlives the run that kept it.
+    ///
+    /// The hook keeps at the first boundary and then raises at the
+    /// second, so `run_full_ft` returns `Err` and the caller never sees
+    /// a `Checkpoint` — but the pinned file is still on disk, and this
+    /// is the case where the in-memory list would have been the only
+    /// record of what it was.
+    #[test]
+    fn a_kept_checkpoint_is_written_down_before_the_run_can_lose_it() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 20,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        let fire_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let fire_count_hook = Arc::clone(&fire_count);
+        let hook: CkptHook = Box::new(move |_info| {
+            let mut n = fire_count_hook.lock().unwrap();
+            *n += 1;
+            match *n {
+                1 => Ok(CkptControl::keep(Some("first-look".to_string()))),
+                _ => Err("measurement blew up".to_string()),
+            }
+        });
+
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "hook_keep_then_die",
+            lease,
+            Some(hook),
+        )
+        .expect_err("the second fire must fail the run");
+        assert!(matches!(err, TrainError::Hook(ref m) if m.contains("measurement blew up")));
+
+        // The pinned file survives — nothing un-pins.
+        let ckpt = tmp.path().join("hook_keep_then_die-step4.safetensors");
+        assert!(ckpt.exists(), "the pinned checkpoint must still be there");
+
+        // And so does the record naming it.
+        let record =
+            std::fs::read_to_string(tmp.path().join("hook_keep_then_die-candidates.jsonl"))
+                .expect("the candidate record must exist after a failed run");
+        let lines: Vec<&str> = record.lines().collect();
+        assert_eq!(lines.len(), 1, "one keep, one line: {record}");
+        assert!(lines[0].contains("\"step\":4"), "{}", lines[0]);
+        assert!(lines[0].contains("first-look"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("hook_keep_then_die-step4.safetensors"),
+            "the line must name the file it is about: {}",
+            lines[0]
+        );
+    }
+
+    /// On a run that returns normally the record and the returned list
+    /// say the same thing — one is not a lossy copy of the other.
+    #[test]
+    fn the_candidate_record_agrees_with_the_returned_list() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            lr: 1e-3,
+            batch_size: 1,
+            grad_accum: 1,
+            steps: 20,
+            warmup: 2,
+            schedule: ScheduleKind::Constant,
+            weight_decay: 0.0,
+            ckpt_every: 4,
+            ckpt_keep: 1,
+            init_from: None,
+            mask_disallowed_logits: false,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let lease = Arc::new(TrainingLease::new());
+
+        // Keep the 1st and 3rd boundaries (steps 4 and 12).
+        let fire_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let fire_count_hook = Arc::clone(&fire_count);
+        let hook: CkptHook = Box::new(move |_info| {
+            let mut n = fire_count_hook.lock().unwrap();
+            *n += 1;
+            match *n {
+                1 => Ok(CkptControl::keep(Some("early".to_string()))),
+                3 => Ok(CkptControl::keep(None)),
+                _ => Ok(CkptControl::CONTINUE),
+            }
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "record_agrees",
+            lease,
+            Some(hook),
+        )
+        .unwrap();
+
+        let record =
+            std::fs::read_to_string(tmp.path().join("record_agrees-candidates.jsonl")).unwrap();
+        let lines: Vec<&str> = record.lines().collect();
+        assert_eq!(lines.len(), ckpt.candidates.len());
+        assert_eq!(lines.len(), 2);
+        for (line, candidate) in lines.iter().zip(ckpt.candidates.iter()) {
+            assert!(
+                line.contains(&format!("\"step\":{}", candidate.step)),
+                "{line}"
+            );
+        }
+        // A keep with no reason omits the key rather than writing null,
+        // so a reader sees the same absence Lua sees.
+        assert!(lines[0].contains("early"), "{}", lines[0]);
+        assert!(!lines[1].contains("reason"), "{}", lines[1]);
     }
 
     /// A hook that returns an error surfaces as

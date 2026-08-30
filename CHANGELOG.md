@@ -37,12 +37,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that could hold a file but not say which one held it back where it
   started.
 
-  KNOWN LIMITATION: the list only comes back from a run that returns
-  normally. A run that raises — a hook error, an exhausted dataset —
-  leaves its pinned checkpoints on disk but loses the record of which
-  steps they were and why, along with the `card_id` that would have
-  named the run. Documented on the Lua surface; a hook that both keeps
-  and can fail should record what it kept as it keeps it.
+  The trainer also writes each keep down as it happens, to
+  `<ckpt_dir>/<ckpt_prefix>-candidates.jsonl` (one JSON object per line,
+  `reason` omitted when absent). The returned list only reaches a caller
+  on the paths that return, and the pinned files outlive every path —
+  so a run that raises, or is killed, leaves anonymous checkpoints in a
+  directory unless the record was already on disk. Write-through on each
+  keep rather than assembled at the end, because a record assembled at
+  the end is the one a crash takes with it. `CheckpointStore` gains
+  `append_candidate` / `candidates_path`; a failure to write it is a
+  `TrainError::Ckpt` rather than a silent gap.
+
+  Not routed through the Card store's samples sidecar, which refuses to
+  write for a Card that does not exist yet ("we refuse to create
+  orphans") — and on a failing run the Card is never written at all,
+  which is the case this exists for.
+
+  KNOWN LIMITATION: a failed run still loses the `card_id`, since the
+  Card is written only after the run returns. The `<ckpt_prefix>` in the
+  record's own filename is the link, the trainer having used the
+  pre-minted id as that prefix.
 
   Additive for every existing caller. `local card_id = run_full_ft(…)`
   drops the extra value, `nil` / `"continue"` / `"break"` mean what they

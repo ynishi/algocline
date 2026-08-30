@@ -23,14 +23,38 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::DType;
 use candle_nn::VarMap;
+use serde::Serialize;
 
 use super::Checkpoint;
+
+/// A checkpoint the hook asked to hold, as it stood when it was held.
+///
+/// The file at `ckpt_path` is pinned for the rest of the run
+/// ([`CheckpointStore::pin`]), so it is still there when the run
+/// returns — which is the whole point of recording it.
+///
+/// Lives here rather than beside the training loop because it describes
+/// a checkpoint file, and because the store is what writes it down
+/// ([`CheckpointStore::append_candidate`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Candidate {
+    /// Optimizer step the checkpoint was written at.
+    pub step: usize,
+    /// Absolute path of the pinned checkpoint file.
+    pub ckpt_path: PathBuf,
+    /// Mean per-micro training loss on that step.
+    pub train_loss: f32,
+    /// The hook's own note, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 /// Rotating checkpoint writer.
 ///
@@ -89,6 +113,41 @@ impl CheckpointStore {
     /// Steps held out of the rotation, ascending.
     pub fn pinned(&self) -> impl Iterator<Item = usize> + '_ {
         self.pinned.iter().copied()
+    }
+
+    /// Path of the candidate record, `<prefix>-candidates.jsonl`.
+    ///
+    /// Deliberately shares the checkpoint prefix so one run's artifacts
+    /// are one glob, and deliberately does *not* end in `.safetensors`
+    /// so [`Self::list`] never mistakes it for a checkpoint.
+    pub fn candidates_path(&self) -> PathBuf {
+        self.dir.join(format!("{}-candidates.jsonl", self.prefix))
+    }
+
+    /// Append one candidate to the record, flushing before returning.
+    ///
+    /// Write-through, one JSON object per line, because the record has
+    /// to outlive the thing that writes it. A run that pins a
+    /// checkpoint at step 40 and then dies at step 800 — a hook that
+    /// raises, a drained dataset, a killed process — leaves the pinned
+    /// *file* on disk either way, since nothing un-pins. Without this
+    /// the surviving file is anonymous: no step, no reason, no run to
+    /// attribute it to, and the caller cannot tell it apart from
+    /// whatever else is in the directory.
+    ///
+    /// Not routed through the Card store, which refuses to write a
+    /// samples sidecar for a Card that does not exist yet ("we refuse
+    /// to create orphans") — and on the failing run that is the whole
+    /// point here, the Card is never written at all.
+    pub fn append_candidate(&self, candidate: &Candidate) -> std::io::Result<()> {
+        let line = serde_json::to_string(candidate).map_err(std::io::Error::other)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.candidates_path())?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()
     }
 
     /// Directory the writer is targeting.
@@ -881,6 +940,81 @@ mod tests {
         );
         assert_eq!(store.pinned().collect::<Vec<_>>(), vec![10, 20]);
         assert!(store.is_pinned(10) && !store.is_pinned(30));
+    }
+
+    /// The record is one JSON object per line, and `reason` is absent
+    /// rather than null when the hook gave none.
+    #[test]
+    fn append_candidate_writes_one_json_line_per_keep() {
+        let tmp = TempDir::new().unwrap();
+        let store = CheckpointStore::new(tmp.path(), "run", 2).unwrap();
+
+        store
+            .append_candidate(&Candidate {
+                step: 4,
+                ckpt_path: store.path_for_step(4),
+                train_loss: 1.5,
+                reason: Some("tier-2".into()),
+            })
+            .unwrap();
+        store
+            .append_candidate(&Candidate {
+                step: 8,
+                ckpt_path: store.path_for_step(8),
+                train_loss: 1.25,
+                reason: None,
+            })
+            .unwrap();
+
+        let text = fs::read_to_string(store.candidates_path()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "append, not overwrite: {text}");
+        assert!(lines[0].contains("\"step\":4") && lines[0].contains("tier-2"));
+        assert!(
+            !lines[1].contains("reason"),
+            "a keep without a reason must omit the key, not write null: {}",
+            lines[1]
+        );
+    }
+
+    /// The record must not read as a checkpoint. `list` drives `prune`,
+    /// so a record counted as a rotating file would push a real
+    /// checkpoint out of the window — and then get deleted itself.
+    #[test]
+    fn the_candidate_record_is_not_mistaken_for_a_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let store = CheckpointStore::new(tmp.path(), "run", 2).unwrap();
+        let vm = small_varmap();
+
+        store
+            .append_candidate(&Candidate {
+                step: 1,
+                ckpt_path: store.path_for_step(1),
+                train_loss: 1.0,
+                reason: None,
+            })
+            .unwrap();
+        for step in [10, 20, 30] {
+            store.save_step(&vm, step).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let listed = store.list().unwrap();
+        assert_eq!(
+            listed.len(),
+            2,
+            "keep=2 counts checkpoints only: {listed:?}"
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|p| p.extension().unwrap() == "safetensors"),
+            "{listed:?}"
+        );
+        assert!(
+            store.candidates_path().exists(),
+            "and the record itself must survive the rotation"
+        );
     }
 
     /// Pinning a step that was never written is a no-op rather than an

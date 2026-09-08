@@ -62,7 +62,8 @@
 //! | `[strategy_params]` | Strategy-tunable parameters surfaced for sweeps / optimizers (e.g. `alpha`, `temperature`, `depth`). Free-form, but `where`-queryable as a first-class section |
 //! | `[scenario]` | `name`, `source`, `case_count`, `grader` |
 //! | `[stats]` | `pass_rate`, `mean_score`, `std`, `median`, `min`, `max`, `n` |
-//! | `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |
+//! | `[stats.by_grader]` | Per-metric aggregate keyed by grader name: `{ [name] = { n, mean, weight } }`. Written by `alc.eval` auto-card; absent when no grader ran |
+//! | `[stats.by_bucket]` | Disaggregated sub-bucket stats keyed by bucket (case tag): `{ [tag] = { n, pass, fail, rate, mean } }`. Absent when no case was tagged |
 //! | `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |
 //! | `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |
 //! | `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`). Recognized training convention: `loss_mask` (`"response"` = `alc.nn.data.from_card` masks the prompt region and returns a mask-carrying teacher dataset) |
@@ -81,6 +82,7 @@
 //! | `get_by_alias(name)` | Resolve alias → full Card |
 //! | `write_samples(card_id, samples)` | Write Tier 2 sidecar (write-once) |
 //! | `read_samples(card_id, opts?)` | Read Tier 2 with `where` filtering + offset/limit paging |
+//! | `compare(card_a, card_b, opts?)` | Welch's t-test over one numeric sample column of two Cards (prelude, delegates to `alc.math`) |
 //! | `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |
 
 #[cfg(feature = "nn")]

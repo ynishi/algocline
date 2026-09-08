@@ -2518,6 +2518,22 @@ sweep / optimize tooling can pick them up without pattern-matching
 Writing these lets future lineage tooling (`alc.card.lineage`, Step 4)
 traverse Card ancestries without guessing field names.
 
+**`[stats]` named metrics** — `alc.eval` with `auto_card = true` writes
+two keyed sub-sections next to the scalar aggregates, so a Card can be
+selected per metric with `find` instead of re-reading its samples:
+
+| Section | Shape | Source |
+|---------|-------|--------|
+| `stats.by_grader` | `{ [grader_name] = { n, mean, weight } }` | per-case `grades[]` from evalframe, one entry per grader that ran |
+| `stats.by_bucket` | `{ [tag] = { n, pass, fail, rate, mean } }` | evalframe `aggregated.by_tag`, one entry per case tag |
+
+Both are keyed maps (not arrays) so dotted paths reach them:
+`order_by = "-stats.by_grader.llm_rubric.mean"`, or
+`where = { stats = { by_bucket = { hard = { rate = { gte = 0.8 } } } } }`.
+A section is **absent** — not empty — when nothing fed it (no grader
+produced a score, no case carried a tag). A value that was never
+measured is not written as `0`.
+
 ```lua
 alc.card.create({
     pkg = { name = "my_sweep" },
@@ -2734,6 +2750,54 @@ local rows = alc.card.read_samples(card_id, {
   offset = 0,
   limit  = 50,
 })
+```
+
+#### `alc.card.compare(card_a, card_b, opts?) -> table`
+
+Compare two Cards on one numeric sample column with Welch's t-test.
+Reads both samples sidecars, extracts the metric from every row, and
+delegates the test and the means to `alc.math` (mlua-mathlib) — the
+function decides *what* to compare, not *how* to test it.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `card_a`, `card_b` | string | yes | Card ids. Order matters only for the sign of `delta` and the `winner` label |
+| `opts.metric` | string \| function | no | Sample field to compare (default `"score"`), or `function(row) -> number` for a derived value |
+| `opts.alpha` | number | no | Significance threshold in `(0, 1)` for `significant` (default `0.05`) |
+| `opts.where` | table | no | `read_samples` predicate applied to both Cards before extraction |
+
+Returns:
+
+```lua
+{
+  metric = "score", alpha = 0.05,
+  a = { card_id = "...", n = 40, mean = 0.83 },
+  b = { card_id = "...", n = 40, mean = 0.71 },
+  delta = 0.12,                -- mean_a - mean_b
+  t_stat = 2.91, df = 77.2, p_value = 0.0047,
+  significant = true,          -- p_value < alpha
+  winner = "a",                -- "a" | "b" | "none"
+}
+```
+
+A row whose metric is missing or non-numeric raises an error rather
+than contributing `0`; so does a Card with no samples. Welch's test
+itself rejects degenerate inputs (fewer than two rows on a side, zero
+variance on both) with an `alc.math` error.
+
+```lua
+-- Did the new prompt beat the alias-pinned baseline on the rubric grader?
+local base = alc.card.get_by_alias("best_gsm8k")
+local r = alc.card.compare(new_id, base.card_id, {
+  metric = function(row)
+    for _, g in ipairs(row.grades or {}) do
+      if g.grader == "llm_rubric" then return g.score end
+    end
+  end,
+})
+if r.significant and r.winner == "a" then
+  alc.card.alias_set("best_gsm8k", new_id)
+end
 ```
 
 #### `alc.card.lineage(query) -> { root, nodes, edges, truncated } | nil`

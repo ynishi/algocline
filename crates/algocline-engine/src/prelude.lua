@@ -1002,8 +1002,64 @@ Reply with ONLY a single number, nothing else.]],
         return suite_spec
     end
 
+    -- Per-grader aggregate for Tier 1: `{ [grader_name] = { n, mean, weight } }`.
+    -- Built from the per-case `grades[]` rows evalframe attaches to each
+    -- result, so the Card can be queried per metric (`stats.by_grader.<name>.mean`)
+    -- without re-reading the samples sidecar. Descriptive statistics are
+    -- delegated to evalframe's `stats.describe` — algocline ships none.
+    -- Returns nil (absent, not empty) when no result carries grades: a
+    -- missing section reads as "not measured", an empty one would not.
+    local function grader_aggregate(ef, results)
+        local by_name, order = {}, {}
+        for _, r in ipairs(results or {}) do
+            for _, g in ipairs(r.grades or {}) do
+                if type(g.grader) == "string" and type(g.score) == "number" then
+                    local acc = by_name[g.grader]
+                    if not acc then
+                        acc = { scores = {}, weight = g.weight }
+                        by_name[g.grader] = acc
+                        order[#order + 1] = g.grader
+                    end
+                    acc.scores[#acc.scores + 1] = g.score
+                end
+            end
+        end
+        if #order == 0 then
+            return nil
+        end
+        local out = {}
+        for _, name in ipairs(order) do
+            local acc = by_name[name]
+            local d = ef.stats.describe(acc.scores)
+            out[name] = { n = d.n, mean = d.mean, weight = acc.weight }
+        end
+        return out
+    end
+
+    -- Per-tag aggregate for Tier 1: `{ [tag] = { n, pass, fail, rate, mean } }`.
+    -- Re-keys evalframe's `aggregated.by_tag` (which already carries
+    -- `describe` output under `stats`) into the `[stats.by_bucket]` section.
+    -- Returns nil when no case was tagged.
+    local function bucket_aggregate(by_tag)
+        if type(by_tag) ~= "table" or next(by_tag) == nil then
+            return nil
+        end
+        local out = {}
+        for tag, data in pairs(by_tag) do
+            local d = data.stats or {}
+            out[tag] = {
+                n = (data.pass or 0) + (data.fail or 0),
+                pass = data.pass,
+                fail = data.fail,
+                rate = data.rate,
+                mean = d.mean,
+            }
+        end
+        return out
+    end
+
     -- Emit Card from eval report (Two-Tier Content Policy).
-    local function emit_eval_card(strategy, scenario_name, report, opts)
+    local function emit_eval_card(ef, strategy, scenario_name, report, opts)
         local pkg_name = opts.card_pkg or strategy
         local agg = report.aggregated or {}
         local scores = agg.scores or {}
@@ -1016,6 +1072,8 @@ Reply with ONLY a single number, nothing else.]],
                 mean_score = scores.mean,
                 n = agg.total,
                 passed = agg.passed,
+                by_grader = grader_aggregate(ef, report.results),
+                by_bucket = bucket_aggregate(agg.by_tag),
             },
         })
 
@@ -1116,11 +1174,115 @@ Reply with ONLY a single number, nothing else.]],
 
         -- 5. Auto-card
         if opts.auto_card then
-            local card_id = emit_eval_card(strategy, scenario_name, report, opts)
+            local card_id = emit_eval_card(ef, strategy, scenario_name, report, opts)
             report.card_id = card_id
             alc.log("info", "alc.eval: card emitted — " .. card_id)
         end
 
         return report
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- alc.card.compare — two Cards, one metric, one test
+-- ═══════════════════════════════════════════════════════════════
+--
+-- Reads the samples sidecar of both Cards, takes one numeric column
+-- from each, and runs Welch's t-test on the two columns. The test and
+-- the means come from `alc.math` (mlua-mathlib); this function only
+-- decides which column to read and how to name the result.
+--
+--   alc.card.compare(card_a, card_b, {
+--       metric = "score",          -- sample field (string) or function(row) -> number
+--       alpha  = 0.05,             -- significance threshold for `significant`
+--       where  = { ... },          -- optional read_samples predicate (both sides)
+--   })
+--
+-- Returns:
+--   { metric, alpha,
+--     a = { card_id, n, mean }, b = { card_id, n, mean },
+--     delta = mean_a - mean_b, t_stat, df, p_value,
+--     significant = p_value < alpha,
+--     winner = "a" | "b" | "none" }
+--
+-- A sample without a numeric value for the metric is an error, not a
+-- zero: a reading that never happened must not be told apart from one
+-- that did only by luck.
+--
+-- Guarded: test harnesses that stub `alc` without a card table still
+-- load this prelude; the function exists wherever `alc.card` does.
+if type(alc.card) == "table" then
+    function alc.card.compare(card_a, card_b, opts)
+        if type(card_a) ~= "string" or type(card_b) ~= "string" then
+            error("alc.card.compare: card_a and card_b must be card_id strings")
+        end
+        opts = opts or {}
+        local metric = opts.metric or "score"
+        local metric_kind = type(metric)
+        if metric_kind ~= "string" and metric_kind ~= "function" then
+            error(
+                "alc.card.compare: metric must be a sample field name or function(row), got "
+                    .. metric_kind
+            )
+        end
+        local alpha = opts.alpha or 0.05
+        if type(alpha) ~= "number" or alpha <= 0 or alpha >= 1 then
+            error("alc.card.compare: alpha must be a number in (0, 1)")
+        end
+        local metric_name = metric_kind == "string" and metric or "<function>"
+
+        local function column(card_id)
+            local rows = alc.card.read_samples(card_id, { where = opts.where })
+            local xs = {}
+            for i, row in ipairs(rows) do
+                local v
+                if metric_kind == "function" then
+                    v = metric(row)
+                else
+                    v = row[metric]
+                end
+                if type(v) ~= "number" then
+                    error(
+                        string.format(
+                            "alc.card.compare: sample #%d of %s has no numeric '%s' (got %s)",
+                            i,
+                            card_id,
+                            metric_name,
+                            type(v)
+                        )
+                    )
+                end
+                xs[#xs + 1] = v
+            end
+            if #xs == 0 then
+                error("alc.card.compare: " .. card_id .. " has no samples to compare")
+            end
+            return xs
+        end
+
+        local xs = column(card_a)
+        local ys = column(card_b)
+        local welch = alc.math.welch_t_test(xs, ys)
+        local mean_a = alc.math.mean(xs)
+        local mean_b = alc.math.mean(ys)
+        local delta = mean_a - mean_b
+        local significant = welch.p_value < alpha
+        local winner = "none"
+        if significant then
+            winner = delta > 0 and "a" or "b"
+        end
+
+        return {
+            metric = metric_name,
+            alpha = alpha,
+            a = { card_id = card_a, n = #xs, mean = mean_a },
+            b = { card_id = card_b, n = #ys, mean = mean_b },
+            delta = delta,
+            t_stat = welch.t_stat,
+            df = welch.df,
+            p_value = welch.p_value,
+            significant = significant,
+            winner = winner,
+        }
     end
 end

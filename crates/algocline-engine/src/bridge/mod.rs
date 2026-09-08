@@ -400,6 +400,127 @@ mod tests {
         .unwrap();
     }
 
+    // ─── alc.card.compare tests (prelude over real card store + alc.math) ───
+
+    /// Two Cards with clearly separated `score` columns: the test must
+    /// call the side with the higher mean the winner and report the
+    /// column sizes it actually read.
+    #[test]
+    fn card_compare_welch_over_score_column() {
+        let lua = setup_with_prelude();
+        let result: LuaTable = lua
+            .load(
+                r#"
+                local a = alc.card.create({ pkg = { name = "cmp" }, params = { side = "a" } })
+                local b = alc.card.create({ pkg = { name = "cmp" }, params = { side = "b" } })
+                alc.card.write_samples(a.card_id, {
+                    { case = "c1", score = 0.9 }, { case = "c2", score = 0.8 },
+                    { case = "c3", score = 1.0 }, { case = "c4", score = 0.7 },
+                    { case = "c5", score = 0.9 },
+                })
+                alc.card.write_samples(b.card_id, {
+                    { case = "c1", score = 0.2 }, { case = "c2", score = 0.3 },
+                    { case = "c3", score = 0.1 }, { case = "c4", score = 0.4 },
+                    { case = "c5", score = 0.2 },
+                })
+                local r = alc.card.compare(a.card_id, b.card_id)
+                assert(r.a.card_id == a.card_id and r.b.card_id == b.card_id)
+                return r
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<String>("metric").unwrap(), "score");
+        assert_eq!(result.get::<String>("winner").unwrap(), "a");
+        assert!(result.get::<bool>("significant").unwrap());
+        assert!(result.get::<f64>("p_value").unwrap() < 0.05);
+        assert!(result.get::<f64>("delta").unwrap() > 0.5);
+        let a: LuaTable = result.get("a").unwrap();
+        let b: LuaTable = result.get("b").unwrap();
+        assert_eq!(a.get::<i64>("n").unwrap(), 5);
+        assert_eq!(b.get::<i64>("n").unwrap(), 5);
+        assert!((a.get::<f64>("mean").unwrap() - 0.86).abs() < 1e-9);
+        assert!((b.get::<f64>("mean").unwrap() - 0.24).abs() < 1e-9);
+    }
+
+    /// A function metric reads a derived value per row; the same
+    /// columns as above, so the same verdict.
+    #[test]
+    fn card_compare_accepts_function_metric() {
+        let lua = setup_with_prelude();
+        let result: LuaTable = lua
+            .load(
+                r#"
+                local a = alc.card.create({ pkg = { name = "cmp" }, params = { side = "a" } })
+                local b = alc.card.create({ pkg = { name = "cmp" }, params = { side = "b" } })
+                alc.card.write_samples(a.card_id, {
+                    { grades = { { grader = "g", score = 0.9 } } },
+                    { grades = { { grader = "g", score = 0.8 } } },
+                    { grades = { { grader = "g", score = 1.0 } } },
+                })
+                alc.card.write_samples(b.card_id, {
+                    { grades = { { grader = "g", score = 0.2 } } },
+                    { grades = { { grader = "g", score = 0.3 } } },
+                    { grades = { { grader = "g", score = 0.1 } } },
+                })
+                return alc.card.compare(a.card_id, b.card_id, {
+                    metric = function(row) return row.grades[1].score end,
+                })
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(result.get::<String>("metric").unwrap(), "<function>");
+        assert_eq!(result.get::<String>("winner").unwrap(), "a");
+    }
+
+    /// A row without a numeric reading is refused, not counted as 0.
+    #[test]
+    fn card_compare_refuses_non_numeric_reading() {
+        let lua = setup_with_prelude();
+        let result: Result<LuaValue, _> = lua
+            .load(
+                r#"
+                local a = alc.card.create({ pkg = { name = "cmp" }, params = { side = "a" } })
+                local b = alc.card.create({ pkg = { name = "cmp" }, params = { side = "b" } })
+                alc.card.write_samples(a.card_id, {
+                    { score = 0.9 }, { score = "n/a" }, { score = 1.0 },
+                })
+                alc.card.write_samples(b.card_id, {
+                    { score = 0.2 }, { score = 0.3 }, { score = 0.1 },
+                })
+                return alc.card.compare(a.card_id, b.card_id)
+                "#,
+            )
+            .eval();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sample #2") && err.contains("no numeric 'score'"),
+            "expected non-numeric refusal, got: {err}"
+        );
+    }
+
+    /// A Card with no samples cannot be compared.
+    #[test]
+    fn card_compare_refuses_empty_side() {
+        let lua = setup_with_prelude();
+        let result: Result<LuaValue, _> = lua
+            .load(
+                r#"
+                local a = alc.card.create({ pkg = { name = "cmp" }, params = { side = "a" } })
+                local b = alc.card.create({ pkg = { name = "cmp" }, params = { side = "b" } })
+                alc.card.write_samples(a.card_id, { { score = 0.9 }, { score = 1.0 } })
+                return alc.card.compare(a.card_id, b.card_id)
+                "#,
+            )
+            .eval();
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("has no samples to compare"),
+            "expected empty-side refusal, got: {err}"
+        );
+    }
+
     // ─── alc.parallel tests (validation) ───
 
     #[test]

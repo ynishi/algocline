@@ -345,6 +345,62 @@ describe("alc.eval integration", function()
             expect(#samples).to.equal(2)
         end)
 
+        it("writes stats.by_grader and stats.by_bucket keyed by name", function()
+            cards = {}
+            card_samples = {}
+            card_counter = 0
+
+            local report = alc.eval({
+                cases = {
+                    { input = "2+2?", expected = "4", tags = { "easy" } },
+                    { input = "Capital of France?", expected = "Paris", tags = { "easy", "geo" } },
+                    { input = "Fail me", expected = "right", tags = { "hard" } },
+                },
+                graders = { "exact_match" },
+            }, "mock_strategy", { auto_card = true })
+
+            local card = cards[report.card_id]
+            expect(card).to.exist()
+
+            -- by_grader: one entry per grader that ran, keyed by name
+            local bg = card.stats.by_grader
+            expect(bg).to.exist()
+            expect(bg.exact_match).to.exist()
+            expect(bg.exact_match.n).to.equal(3)
+            expect(bg.exact_match.weight).to.equal(1)
+            -- two of three cases matched exactly
+            expect(math.abs(bg.exact_match.mean - 2 / 3) < 1e-9).to.equal(true)
+
+            -- by_bucket: one entry per tag, keyed by tag
+            local bb = card.stats.by_bucket
+            expect(bb).to.exist()
+            expect(bb.easy.n).to.equal(2)
+            expect(bb.easy.pass).to.equal(2)
+            expect(bb.easy.fail).to.equal(0)
+            expect(bb.easy.rate).to.equal(1.0)
+            expect(bb.geo.n).to.equal(1)
+            expect(bb.hard.n).to.equal(1)
+            expect(bb.hard.pass).to.equal(0)
+            expect(bb.hard.fail).to.equal(1)
+            expect(bb.hard.rate).to.equal(0.0)
+            expect(bb.hard.mean).to.equal(0.0)
+        end)
+
+        it("leaves by_bucket absent when no case is tagged", function()
+            cards = {}
+            card_samples = {}
+            card_counter = 0
+
+            local report = alc.eval({
+                cases = { { input = "2+2?", expected = "4" } },
+                graders = { "exact_match" },
+            }, "mock_strategy", { auto_card = true })
+
+            local card = cards[report.card_id]
+            expect(card.stats.by_grader).to.exist()
+            expect(card.stats.by_bucket).to.equal(nil)
+        end)
+
         it("uses card_pkg override", function()
             cards = {}
             card_samples = {}

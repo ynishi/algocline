@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `alc.card.compare(card_a, card_b, opts?)` — Welch's t-test over one numeric sample column of two Cards. Reads both samples sidecars, extracts `opts.metric` (a field name, default `"score"`, or a `function(row)`), and delegates the test and the means to `alc.math`. Returns per-side `{ card_id, n, mean }`, `delta`, `t_stat`, `df`, `p_value`, `significant` (against `opts.alpha`, default 0.05) and `winner`. A missing or non-numeric reading is an error, not a zero.
+- `alc.eval` auto-card now writes two keyed sub-sections under `[stats]`: `by_grader = { [name] = { n, mean, weight } }` from the per-case grader rows, and `by_bucket = { [tag] = { n, pass, fail, rate, mean } }` from evalframe's `aggregated.by_tag`. Both are maps so `find` can order or filter on `stats.by_grader.<name>.mean`; each is absent (not empty) when nothing fed it.
+
 ### Changed
 
 ### Deprecated

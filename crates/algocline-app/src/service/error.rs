@@ -117,4 +117,8 @@ pub enum CardPublishError {
     /// `target_repo` is not a valid URL (e.g. a bare pkg slug was supplied).
     #[error("invalid target_repo: {0}")]
     InvalidTarget(String),
+    /// The card backend does not keep Cards as files
+    /// (`CardBackend::as_file_store() == None`), so there is nothing to copy.
+    #[error("card_publish requires a file-backed card store: {0}")]
+    Unsupported(String),
 }

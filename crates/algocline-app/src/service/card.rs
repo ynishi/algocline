@@ -229,8 +229,7 @@ impl AppService {
                 continue;
             }
 
-            let (imported, skipped) =
-                card::import_from_dir_with_store(&*self.card_store, &path, &pkg_name)?;
+            let (imported, skipped) = self.card_store.import_cards_from_dir(&path, &pkg_name)?;
             if !imported.is_empty() || !skipped.is_empty() {
                 packages.push(pkg_name);
             }
@@ -268,7 +267,7 @@ impl AppService {
     /// Called by `pkg_install` when a package contains a `cards/` dir.
     /// Returns imported card_ids (may be empty if all were skipped).
     pub(crate) fn import_pkg_bundled_cards(&self, pkg_name: &str, cards_dir: &Path) -> Vec<String> {
-        match card::import_from_dir_with_store(&*self.card_store, cards_dir, pkg_name) {
+        match self.card_store.import_cards_from_dir(cards_dir, pkg_name) {
             Ok((imported, _)) => imported,
             Err(e) => {
                 tracing::warn!("Failed to import bundled cards for '{pkg_name}': {e}");
@@ -467,9 +466,13 @@ impl AppService {
         // 3. Derive pkg name from on-disk locator (canonical authority,
         //    eliminates body-vs-directory split + "unknown" fallback).
         //    validate_name double-protects against any historical drift.
+        //    Publishing copies files, so it exists only for the file backend.
         let _ = card_value; // body-side name intentionally ignored for security
-        let locator = self
+        let file_store = self
             .card_store
+            .as_file_store()
+            .ok_or_else(|| CardPublishError::Unsupported("backend keeps no Card files".into()))?;
+        let locator = file_store
             .find_card_locator(card_id)
             .map_err(|e| CardPublishError::GitCommand {
                 cmd: "card_store.find_card_locator".into(),
@@ -529,8 +532,8 @@ impl AppService {
         std::fs::create_dir_all(&dest_dir)?;
 
         // Collect card files: {card_id}.toml and optionally {card_id}.samples.jsonl
-        // card_store.root() is already the cards dir (e.g. ~/.algocline/cards)
-        let cards_root = self.card_store.root().join(&pkg_name);
+        // file_store.root() is already the cards dir (e.g. ~/.algocline/cards)
+        let cards_root = file_store.root().join(&pkg_name);
         let card_toml = cards_root.join(format!("{card_id}.toml"));
         let card_samples = cards_root.join(format!("{card_id}.samples.jsonl"));
 

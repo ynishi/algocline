@@ -15,7 +15,7 @@ use mlua_isle::{AsyncIsle, AsyncIsleDriver};
 use mlua_pkg::Registry;
 
 use super::{register, register_env, register_evalframe, BridgeConfig, PRELUDE};
-use crate::card::FileCardStore;
+use crate::card::CardBackend;
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 use crate::resolver_factory::make_resolver;
 use crate::state::JsonFileStore;
@@ -62,7 +62,7 @@ pub(crate) fn register_fork(
     lib_paths: Vec<PathBuf>,
     variant_pkgs: Vec<VariantPkg>,
     state_store: Arc<JsonFileStore>,
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
     card_run_enabled: bool,
     scenarios_dir: PathBuf,
     nn_dir: PathBuf,

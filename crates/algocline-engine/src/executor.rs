@@ -27,7 +27,7 @@ use mlua_isle::{AsyncIsle, AsyncIsleDriver, IsleError};
 use mlua_pkg::Registry;
 
 use crate::bridge;
-use crate::card::FileCardStore;
+use crate::card::CardBackend;
 use crate::llm_bridge::LlmRequest;
 use crate::resolver_factory::make_resolver;
 use crate::session::Session;
@@ -53,7 +53,7 @@ pub struct SessionDirs {
     /// Backing store for `alc.state.*` (typically `<app_dir>/state`).
     pub state_store: Arc<JsonFileStore>,
     /// Backing store for `alc.card.*` (typically `<app_dir>/cards`).
-    pub card_store: Arc<FileCardStore>,
+    pub card_store: Arc<dyn CardBackend>,
     /// Directory exposed to Lua via `alc._dirs.scenarios`.
     pub scenarios_dir: PathBuf,
     /// Store root for `alc.nn.save` / `alc.nn.load` (typically `<app_dir>/nn`).

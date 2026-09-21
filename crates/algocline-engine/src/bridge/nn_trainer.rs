@@ -108,6 +108,8 @@ use algocline_nn::train::{
 use mlua::prelude::*;
 
 use crate::card::nn::persist;
+use crate::card::CardBackend;
+#[cfg(test)]
 use crate::card::FileCardStore;
 
 use super::nn_card::{
@@ -140,7 +142,7 @@ const RUN_DISTILL_ERR_PREFIX: &str = "alc.nn.trainer.run_distill";
 pub(super) fn register_nn_trainer(
     lua: &Lua,
     alc_table: &LuaTable,
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
     nn_dir: PathBuf,
 ) -> LuaResult<()> {
     let nn_table: LuaTable = alc_table.get("nn")?;
@@ -150,7 +152,7 @@ pub(super) fn register_nn_trainer(
     let dir = nn_dir.clone();
     let run_lora_ft = lua.create_function(
         move |_lua, (base, dataset, opts): (LuaValue, LuaValue, LuaTable)| -> LuaResult<String> {
-            run_lora_ft_impl(&store, &dir, &base, &dataset, opts)
+            run_lora_ft_impl(store.as_ref(), &dir, &base, &dataset, opts)
         },
     )?;
     trainer.set("run_lora_ft", run_lora_ft)?;
@@ -165,7 +167,7 @@ pub(super) fn register_nn_trainer(
         move |lua,
               (base, dataset, opts): (LuaValue, LuaValue, LuaTable)|
               -> LuaResult<(String, LuaTable)> {
-            run_full_ft_impl(&store_ff, &dir_ff, lua, &base, &dataset, opts)
+            run_full_ft_impl(store_ff.as_ref(), &dir_ff, lua, &base, &dataset, opts)
         },
     )?;
     trainer.set("run_full_ft", run_full_ft)?;
@@ -180,7 +182,7 @@ pub(super) fn register_nn_trainer(
         move |_lua,
               (student, dataset, opts): (LuaValue, LuaValue, LuaTable)|
               -> LuaResult<String> {
-            run_distill_impl(&store_rd, &dir_rd, &student, &dataset, opts)
+            run_distill_impl(store_rd.as_ref(), &dir_rd, &student, &dataset, opts)
         },
     )?;
     trainer.set("run_distill", run_distill)?;
@@ -189,7 +191,7 @@ pub(super) fn register_nn_trainer(
 }
 
 fn run_lora_ft_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     nn_dir: &std::path::Path,
     base: &LuaValue,
     dataset: &LuaValue,
@@ -525,7 +527,7 @@ fn trained_channel(custom: Option<&NnCustomBranch>) -> TrainedChannel {
 /// optional `on_ckpt` hook holds the Lua callback through a `WeakLua`
 /// — see [`extract_on_ckpt_hook`].
 fn run_full_ft_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     nn_dir: &std::path::Path,
     lua: &Lua,
     base: &LuaValue,
@@ -826,7 +828,7 @@ fn run_full_ft_impl(
 /// L5c S2 core. Mirrors [`run_full_ft_impl`] structurally; see the
 /// section header above for the design divergence.
 fn run_distill_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     nn_dir: &std::path::Path,
     student: &LuaValue,
     dataset: &LuaValue,

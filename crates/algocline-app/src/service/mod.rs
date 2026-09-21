@@ -49,7 +49,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::pool::{registry::with_registry_lock, PoolError, PoolRegistry};
-use algocline_engine::{Executor, FileCardStore, JsonFileStore, SessionRegistry, VariantPkg};
+use algocline_engine::{
+    CardBackend, Executor, FileCardStore, JsonFileStore, SessionRegistry, VariantPkg,
+};
 
 pub use algocline_core::{EngineApi, TokenUsage};
 pub use config::{AppConfig, LogDirSource};
@@ -98,7 +100,7 @@ pub struct AppService {
     /// Card store backing `alc.card.*`.
     ///
     /// Rooted at `log_config.app_dir().cards_dir()`, same `Arc` pattern.
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
     /// session_id → strategy name for eval sessions (cleared on completion).
     eval_sessions: Arc<EvalSessions>,
     /// session_id → strategy name for log/stats tracking (cleared on session completion).
@@ -143,7 +145,7 @@ impl AppService {
 
         let app_dir = log_config.app_dir();
         let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
-        let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
+        let card_store: Arc<dyn CardBackend> = Arc::new(FileCardStore::new(app_dir.cards_dir()));
 
         // V2 execution registry — shares the Executor + AppConfig-derived
         // storage paths with the legacy `start_and_tick` path so a v2 caller

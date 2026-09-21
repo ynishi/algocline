@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CardBackend` trait (`algocline_engine::card`) is the injection surface for the card store: one method per `alc.card.*` verb plus `import_cards_from_dir`, with `as_file_store` / `card_sink_backfill` as file-backend escape hatches. `Executor` / `SessionDirs` / `BridgeConfig` / the service layer now hold `Arc<dyn CardBackend>` instead of `Arc<FileCardStore>`; `FileCardStore` remains the default and the on-disk layout is unchanged. `alc_card_publish` returns `CardPublishError::Unsupported` on a backend that keeps no Card files, and `alc._dirs.cards` is absent there. (breaking for code that constructs `SessionDirs` / `BridgeConfig` from a `&Arc<FileCardStore>` — coerce with `as Arc<dyn CardBackend>`; MCP wire shape is unchanged) (#11)
+
 ### Deprecated
 
 ### Removed

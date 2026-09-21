@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use algocline_core::ExecutionMetrics;
-use algocline_engine::{bridge, FileCardStore, JsonFileStore};
+use algocline_engine::{bridge, CardBackend, FileCardStore, JsonFileStore};
 use mlua::prelude::*;
 use tempfile::TempDir;
 
@@ -51,7 +51,7 @@ fn make_lua_with_bridge(card_run_enabled: bool) -> (Lua, Arc<FileCardStore>, Tem
         lib_paths: vec![],
         variant_pkgs: vec![],
         state_store,
-        card_store: Arc::clone(&card_store),
+        card_store: Arc::clone(&card_store) as Arc<dyn CardBackend>,
         card_run_enabled,
         scenarios_dir: root.join("scenarios"),
         nn_dir: root.join("nn"),

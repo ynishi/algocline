@@ -343,6 +343,7 @@ pub(super) fn register_dirs(
 ///
 /// P0 (minimum viable): create / get / list
 /// P1 (observation-driven additions): append / alias_set / alias_list / find
+/// Lifecycle (optional backend capability): open / close
 ///
 /// Lua usage:
 ///   local c = alc.card.create({ pkg = { name = "cot" }, model = {...}, stats = {...} })
@@ -363,6 +364,8 @@ pub(super) fn register_dirs(
 ///   alc.card.get_by_alias("best_on_gsm8k")  -- resolve alias → full Card
 ///   alc.card.write_samples("cot_...", { {case="c0", passed=true}, ... })  -- write-once
 ///   alc.card.read_samples("cot_...", { offset = 0, limit = 100 })
+///   local o = alc.card.open({ pkg = { name = "cot" }, model = {...} })  -- run starts
+///   alc.card.close(o.card_id, { status = "failed", error = "timeout" })  -- run ends
 pub(super) fn register_card(
     lua: &Lua,
     alc_table: &LuaTable,
@@ -431,6 +434,49 @@ pub(super) fn register_card(
                 .append(&card_id, json)
                 .map_err(LuaError::external)?;
             to_lua_value(lua, &merged)
+        },
+    )?;
+
+    // alc.card.open(table) -> { card_id, path } | nil
+    //
+    // Opens a Card for a run that is starting.  The lifecycle is what
+    // produces a Card's `[run]` section, so the whole pair is gated on
+    // `card_run_enabled` — not just `close`.  Gating only the closing
+    // half would strand every Card that `open` had already minted, so
+    // a disabled gate short-circuits here with `nil` before the store
+    // is touched.
+    let store_open = Arc::clone(&card_store);
+    let open = lua.create_function(move |lua, input: LuaValue| -> LuaResult<LuaValue> {
+        let json: serde_json::Value = lua.from_value(input)?;
+        if !card_run_enabled {
+            return Ok(LuaValue::Nil);
+        }
+        let (card_id, path) = store_open.open(json).map_err(LuaError::external)?;
+        let ret = lua.create_table()?;
+        ret.set("card_id", card_id)?;
+        ret.set("path", path.to_string_lossy().to_string())?;
+        Ok(LuaValue::Table(ret))
+    })?;
+
+    // alc.card.close(card_id, table) -> merged_card | nil
+    //
+    // The closing half of the pair above, and gated with it.  Outcome
+    // validation runs *before* the gate check — same ordering as
+    // `create` / `append` — so an invalid status is a Lua error whether
+    // the gate is on or off, and a typo never hides behind a disabled
+    // setting.
+    let store_close = Arc::clone(&card_store);
+    let close = lua.create_function(
+        move |lua, (card_id, outcome): (String, LuaValue)| -> LuaResult<LuaValue> {
+            let json: serde_json::Value = lua.from_value(outcome)?;
+            let parsed = card::CloseOutcome::from_json(&json).map_err(LuaError::external)?;
+            if !card_run_enabled {
+                return Ok(LuaValue::Nil);
+            }
+            let sealed = store_close
+                .close(&card_id, parsed)
+                .map_err(LuaError::external)?;
+            to_lua_value(lua, &sealed)
         },
     )?;
 
@@ -626,6 +672,8 @@ pub(super) fn register_card(
     card_table.set("get", get)?;
     card_table.set("list", list)?;
     card_table.set("append", append)?;
+    card_table.set("open", open)?;
+    card_table.set("close", close)?;
     card_table.set("get_by_alias", get_by_alias)?;
     card_table.set("alias_set", alias_set)?;
     card_table.set("alias_list", alias_list)?;

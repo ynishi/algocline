@@ -453,6 +453,49 @@ pub trait EngineApi: Send + Sync {
     async fn card_append(&self, card_id: &str, fields: serde_json::Value)
         -> Result<String, String>;
 
+    /// Open a Card at the start of a run.
+    ///
+    /// `input` carries the same seed fields as an `alc.card.create` call
+    /// — everything known before the run produces anything. The Card
+    /// stays open until [`card_close`](Self::card_close) seals it.
+    /// Returns a JSON string with `card_id` and `path`.
+    ///
+    /// The Card lifecycle is an OPTIONAL backend capability: the default
+    /// body returns an error, so a backend that writes finished Cards
+    /// only (the file-backed default) need not implement it. That error
+    /// points at the Lua verb `alc.card.create`, because there is no
+    /// create over the wire — a Card is written from a strategy.
+    async fn card_open(&self, _input: serde_json::Value) -> Result<String, String> {
+        Err(
+            "card_open: this card backend has no Card lifecycle (no open/close). \
+             A Card is written from a strategy via the Lua verb `alc.card.create`, \
+             which writes a finished Card in one call; there is no create over the wire."
+                .into(),
+        )
+    }
+
+    /// Close the Card opened as `card_id`, recording the run's outcome.
+    ///
+    /// `outcome` is `{ status, stats?, cost?, error? }` where `status` is
+    /// one of `succeeded` / `failed` / `skipped`. Called whether the run
+    /// succeeded or not — a failed run closes its Card, it does not leave
+    /// it open. Returns the sealed Card as a JSON string.
+    ///
+    /// Defaults to an error for the same reason as
+    /// [`card_open`](Self::card_open).
+    async fn card_close(
+        &self,
+        _card_id: &str,
+        _outcome: serde_json::Value,
+    ) -> Result<String, String> {
+        Err(
+            "card_close: this card backend has no Card lifecycle (no open/close). \
+             A Card is written from a strategy via the Lua verb `alc.card.create`, \
+             which writes a finished Card in one call; there is no create over the wire."
+                .into(),
+        )
+    }
+
     /// Install Cards from a Card Collection repo (Git URL or local path).
     async fn card_install(&self, url: String) -> Result<String, String>;
 

@@ -93,6 +93,26 @@ impl SettingResolved {
             .and_then(|fields| fields.get(field))
             .and_then(|v| v.as_bool())
     }
+
+    /// Get a field value as a string.
+    ///
+    /// The sibling of [`get_bool`](Self::get_bool), with the same
+    /// contract: `None` when the target is absent, the field is absent,
+    /// or the value is not a string. Callers decide the default.
+    ///
+    /// A value that arrived through the env layer is typed by
+    /// [`parse_env_value`], which prefers `Bool` / `Number` over
+    /// `String` — so `ALC_SETTING_CARD_BACKEND=file` reads back as a
+    /// string, but a field whose value happens to look numeric does
+    /// not. That is the intended behaviour for the fields this serves
+    /// (`card.backend`, `card.cardbox_root`), whose values are never
+    /// numeric.
+    pub fn get_str(&self, target: &str, field: &str) -> Option<&str> {
+        self.resolved
+            .get(target)
+            .and_then(|fields| fields.get(field))
+            .and_then(|v| v.as_str())
+    }
 }
 
 // ─── Internal TOML holder ────────────────────────────────────────────────────

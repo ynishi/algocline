@@ -1,9 +1,13 @@
 ---
 source: tests/e2e.rs
-assertion_line: 306
+assertion_line: 301
 expression: redacted
 ---
 {
+  "card_backend": {
+    "kind": "file",
+    "root": "<ALC_HOME>/cards"
+  },
   "gh_credentials": {
     "gh_auth": {
       "available": "<REDACTED>",

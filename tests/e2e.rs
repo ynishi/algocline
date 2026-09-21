@@ -9618,3 +9618,79 @@ async fn test_nn_mixing_refusals_reach_the_wire() {
         "the error must name both vocabularies: {text}"
     );
 }
+
+/// Error-path: `alc_card_open` against the default file-backed store.
+///
+/// The Card lifecycle is an optional `CardBackend` capability and
+/// `FileCardStore` deliberately has none — a file Card is written once,
+/// complete, so there is no interval in which an open Card exists. The
+/// tool must therefore surface the backend's error, and that error must
+/// name `create` as the one-shot alternative rather than leaving the
+/// caller guessing.
+#[tokio::test]
+async fn test_alc_card_open_errors_on_backend_without_lifecycle() {
+    let client = connect().await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_card_open",
+            json!({ "input": { "pkg": { "name": "e2e_lifecycle" } } }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for card_open on a lifecycle-less backend, \
+                 got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("create"),
+                "error text must point the caller at create, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}
+
+/// Error-path: `alc_card_close` against the default file-backed store.
+/// Same reason as `alc_card_open` above — the pair is one capability and
+/// the file backend implements neither half.
+#[tokio::test]
+async fn test_alc_card_close_errors_on_backend_without_lifecycle() {
+    let client = connect().await;
+
+    let outcome = client
+        .call_tool(call_params(
+            "alc_card_close",
+            json!({
+                "card_id": "e2e_lifecycle_x_20260921T000000_abcdef",
+                "outcome": { "status": "succeeded" },
+            }),
+        ))
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            let is_error = result.is_error.unwrap_or(false);
+            let text = extract_text(&result);
+            assert!(
+                is_error,
+                "expected is_error=true for card_close on a lifecycle-less backend, \
+                 got is_error={is_error:?}, text: {text}"
+            );
+            assert!(
+                text.contains("create"),
+                "error text must point the caller at create, got: {text}"
+            );
+        }
+        Err(e) => panic!("unexpected call_tool Err: {e}"),
+    }
+
+    client.cancel().await.expect("cancel failed");
+}

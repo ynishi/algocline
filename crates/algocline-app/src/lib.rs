@@ -9,6 +9,8 @@
 pub mod pool;
 mod service;
 
+pub use service::card_backend::CardBackendChoice;
+pub use service::cardbox_store::CardboxStore;
 pub use service::hub_dist_preset::load_hub_projection_config;
 pub use service::hub_dist_preset::{
     HubContext7Config, HubDevinConfig, HubProjectionConfig, ResolvedContext7, ResolvedDevin,

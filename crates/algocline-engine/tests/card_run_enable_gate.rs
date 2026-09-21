@@ -1,5 +1,6 @@
 //! Phase 1-B integration tests for the `[setting.card].run` gate on
-//! `alc.card.create` / `alc.card.append`.
+//! `alc.card.create` / `alc.card.append`, and on the Card lifecycle pair
+//! `alc.card.open` / `alc.card.close`.
 //!
 //! The gate is enforced inside `bridge::data::register_card`.  These tests
 //! drive it end-to-end via a Lua VM configured with a tempdir-backed
@@ -18,6 +19,22 @@
 //! | `alc_card_create_run_disabled_returns...`| off   | present   | nil returned, 0 cards         |
 //! | `run_enabled_omits_optional_fields`     | on     | status only | `[run]` has status, no reason/action |
 //! | `run_enabled_rejects_invalid_status`    | on     | invalid   | Lua error naming all 3 statuses |
+//!
+//! Lifecycle matrix (`open` / `close`).  The lifecycle is what produces a
+//! Card's `[run]` section, so the whole pair is gated — not just `close`.
+//! `FileCardStore` has no lifecycle (a file Card is written once,
+//! complete), so with the gate ON the store call itself errors.  That is
+//! exactly what makes the gate observable here: gate OFF short-circuits
+//! before the store and yields `nil`, gate ON reaches the store and
+//! surfaces its "no Card lifecycle" error as a Lua error.
+//!
+//! | Case                                       | Enable | Call    | Expected                        |
+//! |--------------------------------------------|--------|---------|---------------------------------|
+//! | `alc_card_open_run_disabled_returns_nil`   | off    | `open`  | nil returned, no error          |
+//! | `alc_card_open_run_enabled_surfaces...`    | on     | `open`  | Lua error naming `create`       |
+//! | `alc_card_close_run_disabled_returns_nil`  | off    | `close` | nil returned, no error          |
+//! | `alc_card_close_run_enabled_surfaces...`   | on     | `close` | Lua error naming `create`       |
+//! | `alc_card_close_rejects_invalid_status...` | off    | `close` | Lua error naming all 3 statuses |
 
 use std::sync::Arc;
 
@@ -214,6 +231,131 @@ fn alc_card_create_run_enabled_rejects_invalid_status() {
         .load(&script)
         .eval::<LuaValue>()
         .expect_err("invalid status must raise a Lua error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("succeeded") && msg.contains("failed") && msg.contains("skipped"),
+        "error message must enumerate accepted status tokens, got: {msg}"
+    );
+}
+
+// ─── Card lifecycle gate (open / close) ─────────────────────────────
+
+/// Enable=OFF: `alc.card.open` returns `nil` without touching the store.
+/// The short-circuit happens before the backend call, which is why this
+/// case does *not* raise the backend's "no Card lifecycle" error even
+/// though `FileCardStore` has no lifecycle at all.
+#[test]
+fn alc_card_open_run_disabled_returns_nil() {
+    let (lua, card_store, _tmp) = make_lua_with_bridge(false);
+
+    let pkg = "lifecycle_disabled_open_pkg";
+    let script = format!(
+        r#"
+        return alc.card.open({{ pkg = {{ name = "{pkg}" }} }})
+        "#
+    );
+    let value: LuaValue = lua
+        .load(&script)
+        .eval()
+        .expect("enable-off open must not error");
+
+    assert!(
+        value.is_nil(),
+        "enable=off open must return nil, got: {value:?}"
+    );
+
+    let rows = card_store.list(Some(pkg)).expect("list");
+    assert!(
+        rows.is_empty(),
+        "no card file must be written when gate is off, got {} rows",
+        rows.len()
+    );
+}
+
+/// Enable=ON: `alc.card.open` reaches the store, and `FileCardStore`
+/// answers with the trait's default — it has no Card lifecycle.  The
+/// message must name `create`, the verb that writes a finished Card in
+/// one call.
+#[test]
+fn alc_card_open_run_enabled_surfaces_no_lifecycle_error() {
+    let (lua, _card_store, _tmp) = make_lua_with_bridge(true);
+
+    let script = r#"
+        return alc.card.open({ pkg = { name = "lifecycle_enabled_open_pkg" } })
+    "#;
+    let err = lua
+        .load(script)
+        .eval::<LuaValue>()
+        .expect_err("file backend has no lifecycle: open must raise");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("create"),
+        "error must point the caller at `create`, got: {msg}"
+    );
+}
+
+/// Enable=OFF: `alc.card.close` returns `nil` without touching the
+/// store.  Gating `close` together with `open` is the point — gating
+/// only `close` would leave opened Cards stranded.
+#[test]
+fn alc_card_close_run_disabled_returns_nil() {
+    let (lua, _card_store, _tmp) = make_lua_with_bridge(false);
+
+    let script = r#"
+        return alc.card.close("lifecycle_pkg_x_20260921T000000_abcdef", {
+            status = "succeeded",
+        })
+    "#;
+    let value: LuaValue = lua
+        .load(script)
+        .eval()
+        .expect("enable-off close must not error");
+
+    assert!(
+        value.is_nil(),
+        "enable=off close must return nil, got: {value:?}"
+    );
+}
+
+/// Enable=ON: `alc.card.close` reaches the store and surfaces the
+/// backend's "no Card lifecycle" error, naming `create`.
+#[test]
+fn alc_card_close_run_enabled_surfaces_no_lifecycle_error() {
+    let (lua, _card_store, _tmp) = make_lua_with_bridge(true);
+
+    let script = r#"
+        return alc.card.close("lifecycle_pkg_x_20260921T000000_abcdef", {
+            status = "failed",
+            error = "grader timed out",
+        })
+    "#;
+    let err = lua
+        .load(script)
+        .eval::<LuaValue>()
+        .expect_err("file backend has no lifecycle: close must raise");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("create"),
+        "error must point the caller at `create`, got: {msg}"
+    );
+}
+
+/// Outcome validation runs *before* the gate check, mirroring `create`
+/// and `append`.  With the gate OFF an invalid status must still raise —
+/// a typo never hides behind a disabled setting.
+#[test]
+fn alc_card_close_rejects_invalid_status_regardless_of_gate() {
+    let (lua, _card_store, _tmp) = make_lua_with_bridge(false);
+
+    let script = r#"
+        return alc.card.close("lifecycle_pkg_x_20260921T000000_abcdef", {
+            status = "definitely_not_a_valid_status",
+        })
+    "#;
+    let err = lua
+        .load(script)
+        .eval::<LuaValue>()
+        .expect_err("invalid status must raise even with the gate off");
     let msg = err.to_string();
     assert!(
         msg.contains("succeeded") && msg.contains("failed") && msg.contains("skipped"),

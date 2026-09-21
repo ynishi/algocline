@@ -398,6 +398,18 @@ impl EngineApi for AppService {
         AppService::card_append(self, card_id, fields)
     }
 
+    async fn card_open(&self, input: serde_json::Value) -> Result<String, String> {
+        AppService::card_open(self, input)
+    }
+
+    async fn card_close(
+        &self,
+        card_id: &str,
+        outcome: serde_json::Value,
+    ) -> Result<String, String> {
+        AppService::card_close(self, card_id, outcome)
+    }
+
     async fn card_install(&self, url: String) -> Result<String, String> {
         AppService::card_install(self, url).await
     }

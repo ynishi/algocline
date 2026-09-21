@@ -2550,13 +2550,48 @@ alc.card.create({
 
 Strategies driving production Runs (not just eval sweeps) can attach
 per-run outcome data to a Card without leaving the primary
-`alc.card.create` API. The section carries three fields:
+`alc.card.create` API. The section carries four fields:
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
 | `status` | string enum | yes (when `run` is present) | One of `"succeeded"`, `"failed"`, `"skipped"`. Unrecognized values raise a Lua error before the write. |
+| `flow` | string | no | **What ran**: the orchestrator / driver / pipeline that produced this Card (`"coding_orch"`, `"flow_design"`). Distinct from `model.id`, which is reserved for an actual model identifier. Also names the Card — see below. |
 | `reason` | string | no | Free-text explanation. Passed through to the LLM prompt when this Card is later injected via `card_context` (see `alc.llm`), so newlines are stripped there for template safety. |
 | `action` | string | no | Free-form tag for the action tried (e.g. `"write"`, `"read"`, `"refine"`). |
+
+**`flow` vs `model.id`.** `flow` is what ran; `model.id` is what it ran
+on (`"claude-opus-4-6"`, `"cyankiwi/Qwen3.8-27B-AWQ-INT4"`). The two
+were not being kept apart before `flow` existed: across one real store,
+426 of 610 Cards carried an orchestrator name in `model.id` and only
+184 carried a model identifier, which makes a query for "everything
+from this model" wrong by roughly 70%.
+
+The cause was structural. `model.id` was the only field that reached a
+Card's name — `alc.card.create` mints `card_id` as
+`{pkg}_{short name}_{timestamp}_{hash}` — so a strategy that wanted its
+orchestrator visible in the id had exactly one field to put it in.
+**`flow` now feeds that name segment in `model.id`'s stead whenever it
+is present**, so a Card produced by `coding_orch` on Opus is named for
+the flow *and* records the model honestly. A Card that sets no `flow`
+mints exactly the id it always did.
+
+`flow` is not name-validated: it is a data field, and the one place it
+reaches a name is that segment, which is reduced to ASCII
+alphanumerics (`"flow_design"` → `flowdesign`) exactly as a model id
+containing `/` already is.
+
+`run.flow` is a sortable and filterable dotted path like any other, so
+"everything this orchestrator produced" is a query:
+
+```lua
+alc.card.find({
+    where = { run = { flow = "coding_orch" } },
+    order_by = "-created_at",
+})
+```
+
+`alc.card.list` / `alc.card.find` rows carry it as `flow`, beside
+`model`.
 
 The `[run]` section is **gated** by `[setting.card].run` (see
 `README.md` §Global settings). The default is **off**, so existing
@@ -2565,6 +2600,15 @@ strategies that don't populate `run` see zero behavior change.
 - When the gate is **off** and a caller passes `run`, `alc.card.create`
   / `alc.card.append` become a no-op and return `nil`: no file is
   written, no CardEvent is published, and the CardStore is untouched.
+- The same gate covers the Card lifecycle pair `alc.card.open` /
+  `alc.card.close`, and covers it **as one**. Those two carry no `run`
+  field to key on — the lifecycle is what produces a Card's `[run]`
+  section in the first place — so with the gate off *both* halves
+  short-circuit and return `nil` on every call, before the store is
+  touched. Gating only `close` would strand every Card that `open` had
+  already minted. Outcome validation still runs first, exactly as it
+  does for `create`: an invalid `close` status raises a Lua error
+  whether the gate is on or off.
 - When the gate is **on**, the section is written verbatim into
   Tier 1 alongside `pkg` / `stats` / `metadata` etc. and appears in
   `alc.card.get`'s returned table.
@@ -2578,6 +2622,7 @@ alc.card.create({
     stats = { pass_rate = 0.75 },
     run = {
         status = "failed",
+        flow = "coding_orch",
         reason = "grader returned rating < 3",
         action = "write",
     },
@@ -2585,8 +2630,10 @@ alc.card.create({
 -- With [setting.card].run = true: writes a Card whose TOML carries
 --   [run]
 --   status = "failed"
+--   flow = "coding_orch"
 --   reason = "grader returned rating < 3"
 --   action = "write"
+-- ...and whose card_id reads cot_codingorch_<ts>_<hash>.
 -- With [setting.card].run absent or false: returns nil, no write.
 ```
 
@@ -2602,6 +2649,11 @@ errors.
 Auto-injected: `schema_version`, `card_id`, `created_at`, `created_by`,
 `param_fingerprint` (when `params` is present).
 
+A generated `card_id` reads `{pkg}_{short name}_{timestamp}_{hash}`,
+where the short name comes from `run.flow` when the Card sets one and
+from `model.id` otherwise (see the `[run]` section above). Passing
+`card_id` explicitly bypasses this entirely.
+
 ```lua
 local result = alc.card.create({
     pkg = { name = "my_eval" },
@@ -2611,6 +2663,84 @@ local result = alc.card.create({
     stats = { pass_rate = 0.82, ev = 4.2 },
 })
 -- result.card_id, result.path
+```
+
+#### `alc.card.open(table) -> { card_id, path } | nil`
+
+Open a Card at the start of a run, to be sealed later by
+`alc.card.close`. `table` carries the same seed fields as `create` —
+everything known before the run produces anything. Where `create` writes
+a finished Card in one call, `open` / `close` spread that write across
+the run, so the Card exists while the run is still in flight.
+
+**Optional backend capability.** The lifecycle is not part of every
+backend, and the default file-backed store does **not** implement it: a
+file Card is written once, complete, so there is no interval during
+which an open Card exists on disk, and nothing for `close` to seal. On
+that store both halves raise a Lua error naming `alc.card.create` as the
+one-shot alternative. A backend that can hold an open row (a database,
+an event log) is the one that implements the pair.
+
+The **cardbox backend** is that backend: set
+`[setting.card].backend = "cardbox"` (see `README.md` §Global settings)
+and Cards live in a [cardbox](https://github.com/ynishi/cardbox) store,
+where a Card really is opened and later closed. One difference is worth
+knowing before relying on it: cardbox's own states are `open` /
+`closed_ok` / `closed_failed` and it has no flag for a skipped run, so
+`status = "skipped"` closes the Card as ok and records the v0 status in
+a tag that `get` reads back in preference to the state. `skipped`
+therefore round-trips as `skipped` and stays distinguishable in a
+`where` on `run.status` — it is never silently folded into
+`succeeded`.
+
+Gated by `[setting.card].run` together with `close` (see the `[run]`
+section above): with the gate off this returns `nil` without touching
+the store.
+
+`run.flow` is one of those seed fields, and belongs here rather than in
+the `close` outcome: what is running is known when the run *starts* —
+it is the thing that is running — and it is what names the Card that
+`open` mints. `close` reports how the run ended and carries no `flow`
+of its own; one supplied there could only contradict the id already
+minted from the seed.
+
+```lua
+local o = alc.card.open({
+    pkg = { name = "cot" },
+    model = { id = "claude-opus-4-6" },
+    params = { temperature = 0.0 },
+    run = { flow = "coding_orch" },
+})
+-- o.card_id, o.path  — nil when [setting.card].run is off
+```
+
+#### `alc.card.close(card_id, outcome) -> table | nil`
+
+Seal the Card opened as `card_id`, recording how the run ended, and
+return the sealed Card body.
+
+Called **either way** — a run that failed closes its Card with
+`status = "failed"`; it does not leave it open. The three status tokens
+are exhaustive: there is no fourth way for an open Card to end.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `outcome.status` | string enum | yes | One of `"succeeded"`, `"failed"`, `"skipped"`. Unrecognized values raise a Lua error naming all three — raised before the store is touched *and* before the gate check, so a typo never hides behind a disabled setting. |
+| `outcome.stats` | table | no | Aggregate scalars for the finished run. |
+| `outcome.cost` | table | no | Cost accounting for the run. |
+| `outcome.error` | string | no | Failure detail; pairs naturally with `status = "failed"`. |
+
+Optional fields are omitted from the sealed Card entirely when absent —
+never written as an empty or null value. Same optional-capability and
+gate notes as `alc.card.open`.
+
+```lua
+alc.card.close(o.card_id, {
+    status = "failed",
+    stats = { pass_rate = 0.4 },
+    cost = { usd = 0.012 },
+    error = "grader timed out",
+})
 ```
 
 #### `alc.card.append(card_id, fields)`

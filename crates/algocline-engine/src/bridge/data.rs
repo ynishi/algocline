@@ -6,7 +6,7 @@ use algocline_core::{CustomMetricsHandle, LogEntry, LogSink, StatsHandle};
 use mlua::prelude::*;
 use mlua::{LuaSerdeExt, SerializeOptions};
 
-use crate::card::{self, FileCardStore};
+use crate::card::{self, CardBackend};
 use crate::state::{JsonFileStore, StateStore};
 
 /// Converts a `serde_json::Value` to a Lua value with JSON null surfacing as
@@ -319,16 +319,21 @@ pub(super) fn register_state(
 ///
 /// Values are plain strings so Lua can concat/`io.open` them without
 /// additional userdata binding.
+///
+/// `cards_dir` is `None` when the card backend does not keep Cards as
+/// files ([`CardBackend::as_file_store`]); `alc._dirs.cards` is then absent.
 pub(super) fn register_dirs(
     lua: &Lua,
     alc_table: &LuaTable,
     state_dir: &Path,
-    cards_dir: &Path,
+    cards_dir: Option<&Path>,
     scenarios_dir: &Path,
 ) -> LuaResult<()> {
     let dirs = lua.create_table()?;
     dirs.set("state", state_dir.to_string_lossy().into_owned())?;
-    dirs.set("cards", cards_dir.to_string_lossy().into_owned())?;
+    if let Some(cards_dir) = cards_dir {
+        dirs.set("cards", cards_dir.to_string_lossy().into_owned())?;
+    }
     dirs.set("scenarios", scenarios_dir.to_string_lossy().into_owned())?;
     alc_table.set("_dirs", dirs)?;
     Ok(())
@@ -361,7 +366,7 @@ pub(super) fn register_dirs(
 pub(super) fn register_card(
     lua: &Lua,
     alc_table: &LuaTable,
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
     card_run_enabled: bool,
 ) -> LuaResult<()> {
     let card_table = lua.create_table()?;
@@ -752,6 +757,7 @@ pub fn register_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::card::FileCardStore;
     use algocline_core::ExecutionMetrics;
 
     /// Build a fresh [`BridgeConfig`] plus its owning state/card

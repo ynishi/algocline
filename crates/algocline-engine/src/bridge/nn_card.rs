@@ -63,18 +63,20 @@ use super::nn_opts::{
     extract_distill_loss_kind, extract_full_ft_opts, extract_on_ckpt_hook, train_err_to_lua,
 };
 use crate::card::nn::persist;
-use crate::card::{FileCardStore, SamplesQuery};
+#[cfg(test)]
+use crate::card::FileCardStore;
+use crate::card::{CardBackend, SamplesQuery};
 
 /// Register `alc.nn.card.*` onto the pre-existing `alc.nn` table.
 ///
 /// Must be called after [`super::register_nn`]; assumes `alc_table.nn`
 /// is already populated by [`algocline_nn::module`]. Accepts the shared
-/// `Arc<FileCardStore>` from [`super::BridgeConfig::card_store`] so
+/// `Arc<dyn CardBackend>` from [`super::BridgeConfig::card_store`] so
 /// Cards persist through the same store as `alc.card.*`.
 pub(super) fn register_nn_card(
     lua: &Lua,
     alc_table: &LuaTable,
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
     nn_dir: PathBuf,
 ) -> LuaResult<()> {
     let nn_table: LuaTable = alc_table.get("nn")?;
@@ -233,7 +235,7 @@ pub(super) fn register_nn_card(
 /// spike (test invariant: same store, same on-disk layout).
 fn save_impl(
     lua: &Lua,
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     vars: LuaTable,
     name: &str,
     meta: LuaTable,
@@ -294,7 +296,7 @@ fn save_impl(
 ///   [`load_ckpt_impl`] handles Cardless loads.
 fn save_from_ckpt_impl(
     lua: &Lua,
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     nn_dir: &std::path::Path,
     ckpt_path: &str,
     name: &str,
@@ -355,7 +357,7 @@ fn save_from_ckpt_impl(
 /// Refuses partial state: a Card without a resolvable
 /// `metadata.nn.candle.bundle_ref` or with a bundle-not-on-disk
 /// surfaces as a Lua error (invariant #4).
-fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTable> {
+fn load_impl(lua: &Lua, store: &dyn CardBackend, card_id: &str) -> LuaResult<LuaTable> {
     let card_id =
         CardId::parse(card_id).map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))?;
     let card = store
@@ -405,7 +407,7 @@ fn load_impl(lua: &Lua, store: &FileCardStore, card_id: &str) -> LuaResult<LuaTa
 /// #2). Refuses arches whose `build_from_safetensors` slot is
 /// `None` (currently `llama-adapter`).
 fn load_handle_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     card_id: &str,
     nn_dir: &std::path::Path,
 ) -> LuaResult<NnHandle> {
@@ -765,7 +767,7 @@ fn custom_branch_from_spec(spec: &LuaTable) -> LuaResult<Option<NnCustomBranch>>
 /// match those registered by `wrap_lora`, so the base parameters
 /// stay bit-identical.
 fn load_gpt2_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     card_id: &str,
     base_handle: &LuaAnyUserData,
 ) -> LuaResult<Gpt2Handle> {
@@ -1187,7 +1189,7 @@ pub(super) fn wrap_tinyllama_lora_bridge(
 /// `NnModelRegistry`.
 fn register_impl(
     lua: &Lua,
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     card_id: &str,
     model_name: &str,
 ) -> LuaResult<()> {
@@ -1335,7 +1337,7 @@ fn merge_error_to_lua(err: MergeError) -> LuaError {
 ///
 /// Returns the freshly-minted merged card_id string.
 fn merge_lora_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     nn_dir: &std::path::Path,
     base_handle: &LuaAnyUserData,
     opts: LuaTable,
@@ -2230,7 +2232,7 @@ fn wrap_tinyllama_from_card(meta: &NnCardMeta, base: &NnHandle) -> LuaResult<NnH
 /// via the `alc.nn.card.load_wrap` Lua closure registered in
 /// `register_nn_card`).
 pub(super) fn load_wrap_impl(
-    store: &FileCardStore,
+    store: &dyn CardBackend,
     card_id: &str,
     base_handle: &LuaAnyUserData,
 ) -> LuaResult<NnHandle> {
@@ -3469,7 +3471,7 @@ where
 fn register_data_ns(
     lua: &Lua,
     nn_table: &LuaTable,
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
     nn_dir: PathBuf,
 ) -> LuaResult<()> {
     let data = lua.create_table()?;
@@ -8673,7 +8675,7 @@ mod loss_mask_from_card_tests {
         std::fs::create_dir_all(nn_dir.join("tokenizers")).unwrap();
         std::fs::write(nn_dir.join("tokenizers/gpt2.json"), FIXTURE_TOKENIZER).unwrap();
 
-        let store = Arc::new(FileCardStore::new(tmp.path().join("cards")));
+        let store: Arc<dyn CardBackend> = Arc::new(FileCardStore::new(tmp.path().join("cards")));
         let mut metadata = serde_json::Map::new();
         metadata.insert("kind".to_string(), json!("teacher_log"));
         if declare_mask {
@@ -8758,7 +8760,7 @@ mod loss_mask_from_card_tests {
         std::fs::create_dir_all(nn_dir.join("tokenizers")).unwrap();
         std::fs::write(nn_dir.join("tokenizers/gpt2.json"), FIXTURE_TOKENIZER).unwrap();
 
-        let store = Arc::new(FileCardStore::new(tmp.path().join("cards")));
+        let store: Arc<dyn CardBackend> = Arc::new(FileCardStore::new(tmp.path().join("cards")));
         let (card_id, _path) = store
             .create(json!({
                 "pkg": { "name": "alc_nn" },

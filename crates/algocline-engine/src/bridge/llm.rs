@@ -3,7 +3,7 @@ use std::sync::Arc;
 use algocline_core::{BudgetHandle, ProgressHandle, QueryId};
 use mlua::prelude::*;
 
-use crate::card::FileCardStore;
+use crate::card::CardBackend;
 use crate::card_context::{self, CardContextSpec};
 use crate::llm_bridge::{LlmRequest, QueryRequest};
 
@@ -27,7 +27,7 @@ pub(super) fn register_llm(
     alc_table: &LuaTable,
     llm_tx: tokio::sync::mpsc::Sender<LlmRequest>,
     budget: BudgetHandle,
-    card_store: Arc<FileCardStore>,
+    card_store: Arc<dyn CardBackend>,
 ) -> LuaResult<()> {
     // `_lua` is only touched under `#[cfg(feature = "nn")]` (the in-VM
     // role="nn" fast path); on default builds the whole nn block is

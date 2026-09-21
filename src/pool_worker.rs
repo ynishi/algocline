@@ -38,7 +38,9 @@ use algocline_app::pool::registry::with_registry_lock;
 use algocline_app::pool::{PoolError, PoolRegistry, PoolRequest, PoolResponse, PoolResponseData};
 use algocline_app::AppConfig;
 use algocline_core::QueryId;
-use algocline_engine::{Executor, FeedResult, FileCardStore, JsonFileStore, SessionRegistry};
+use algocline_engine::{
+    CardBackend, Executor, FeedResult, FileCardStore, JsonFileStore, SessionRegistry,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixListener;
 use tokio::signal::unix::SignalKind;
@@ -258,7 +260,7 @@ pub async fn run(sid: String, sock: PathBuf) -> anyhow::Result<()> {
     let lock_path = pool_state_dir.join("registry.lock");
 
     let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
-    let card_store = Arc::new(FileCardStore::new(app_dir.cards_dir()));
+    let card_store: Arc<dyn CardBackend> = Arc::new(FileCardStore::new(app_dir.cards_dir()));
     let scenarios_dir = app_dir.scenarios_dir();
     let nn_dir = app_dir.nn_dir();
 
@@ -467,7 +469,7 @@ async fn dispatch(
     registry: &SessionRegistry,
     executor: &Arc<Executor>,
     state_store: &Arc<JsonFileStore>,
-    card_store: &Arc<FileCardStore>,
+    card_store: &Arc<dyn CardBackend>,
     scenarios_dir: &Path,
     nn_dir: &Path,
 ) -> PoolResponse {

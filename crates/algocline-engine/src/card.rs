@@ -110,8 +110,10 @@ pub const SCHEMA_VERSION: &str = "card/v0";
 //
 // The default backend is `FileCardStore`, which preserves the
 // legacy `~/.algocline/cards/{pkg}/{card_id}.toml` layout
-// byte-for-byte. Alternative backends (PathCardStore, SqliteCardStore,
-// MemoryCardStore) can be added by implementing this trait.
+// byte-for-byte. A backend that keeps the TOML-per-Card shape but
+// moves the bytes elsewhere implements this trait; a backend that
+// answers `find` / `lineage` itself implements `CardBackend` (below)
+// instead — that is the trait consumers are injected with.
 //
 // Locators are `PathBuf` values. For FileCardStore they are real
 // filesystem paths; for non-file backends they are synthetic paths
@@ -1962,10 +1964,10 @@ impl FileCardStore {
 
     // ─── Thin `self` delegations to the `*_with_store` free fns ────
     //
-    // These let callers that hold an `Arc<FileCardStore>` (bridge/data
-    // register_card closures, service layer) invoke domain logic via
-    // instance methods without re-importing the `_with_store` free
-    // functions. Semantics are identical to the free-fn variants.
+    // Inherent convenience for code that holds the concrete type
+    // (tests, `card_publish`). Consumers are injected with
+    // `Arc<dyn CardBackend>` and reach the same fns through the trait
+    // impl below. Semantics are identical to the free-fn variants.
 
     pub fn create(&self, input: Json) -> Result<(String, PathBuf), String> {
         create_with_store(self, input)
@@ -2053,6 +2055,134 @@ impl FileCardStore {
             .parent()
             .ok_or_else(|| format!("card '{card_id}' has no parent directory"))?;
         Ok(dir.join(format!("{card_id}.samples.jsonl")))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CardBackend trait — the injection surface for consumers.
+// ═══════════════════════════════════════════════════════════════
+//
+// `CardStore` (above) abstracts only the physical TOML / JSONL layer;
+// `find`, `lineage`, aliases and samples paging all run in this module
+// on top of it. A backend that answers those queries itself (a SQL
+// read model, an event log) cannot be plugged in at that level — it
+// would have to synthesize TOML for this module to re-scan.
+//
+// `CardBackend` is therefore cut one level up, at the shape of the
+// facade consumers already call: the `alc.card.*` verbs plus the
+// service-layer extras. `FileCardStore` is the default implementation;
+// consumers hold `Arc<dyn CardBackend>` and never name the concrete
+// type outside construction sites.
+
+/// Backend-neutral Card API.
+///
+/// One method per `alc.card.*` verb (`create` … `lineage`), plus
+/// `import_cards_from_dir` (used by `alc_card_install`). Two members
+/// are file-layout specific and have defaults so a non-file backend
+/// need not implement them:
+///
+/// - [`as_file_store`](Self::as_file_store) — the escape hatch for
+///   operations that only make sense on files: `alc_card_publish`
+///   copies `{card_id}.toml` out of the store, and `alc._dirs.cards`
+///   hands Lua the directory. `None` by default, so those callers
+///   refuse (or omit the key) on any other backend.
+/// - [`card_sink_backfill`](Self::card_sink_backfill) — replays file
+///   Cards into a registered sink; `Err` by default.
+///
+/// Locators (`PathBuf`) in return values are opaque to callers; see
+/// the note on [`CardStore`].
+pub trait CardBackend: Send + Sync {
+    fn create(&self, input: Json) -> Result<(String, PathBuf), String>;
+    fn get(&self, card_id: &str) -> Result<Option<Json>, String>;
+    fn list(&self, pkg_filter: Option<&str>) -> Result<Vec<Summary>, String>;
+    fn append(&self, card_id: &str, fields: Json) -> Result<Json, String>;
+    fn alias_set(
+        &self,
+        name: &str,
+        card_id: &str,
+        pkg: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<Alias, String>;
+    fn alias_list(&self, pkg_filter: Option<&str>) -> Result<Vec<Alias>, String>;
+    fn get_by_alias(&self, name: &str) -> Result<Option<Json>, String>;
+    fn find(&self, q: FindQuery) -> Result<Vec<Summary>, String>;
+    fn write_samples(&self, card_id: &str, samples: Vec<Json>) -> Result<PathBuf, String>;
+    fn read_samples(&self, card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String>;
+    fn lineage(&self, q: LineageQuery) -> Result<Option<LineageResult>, String>;
+
+    /// Import Card files from `source_dir` under `pkg`; first-writer
+    /// wins. Returns `(imported, skipped)` card_id lists.
+    fn import_cards_from_dir(
+        &self,
+        source_dir: &Path,
+        pkg: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String>;
+
+    /// The file-backed store behind this backend, when it is one.
+    fn as_file_store(&self) -> Option<&FileCardStore> {
+        None
+    }
+
+    /// Replay stored Cards into the sink named `sink`.
+    fn card_sink_backfill(&self, sink: &str, _dry_run: bool) -> Result<SinkBackfillReport, String> {
+        Err(format!(
+            "card_sink_backfill to '{sink}' is not supported by this card backend"
+        ))
+    }
+}
+
+impl CardBackend for FileCardStore {
+    fn create(&self, input: Json) -> Result<(String, PathBuf), String> {
+        FileCardStore::create(self, input)
+    }
+    fn get(&self, card_id: &str) -> Result<Option<Json>, String> {
+        FileCardStore::get(self, card_id)
+    }
+    fn list(&self, pkg_filter: Option<&str>) -> Result<Vec<Summary>, String> {
+        FileCardStore::list(self, pkg_filter)
+    }
+    fn append(&self, card_id: &str, fields: Json) -> Result<Json, String> {
+        FileCardStore::append(self, card_id, fields)
+    }
+    fn alias_set(
+        &self,
+        name: &str,
+        card_id: &str,
+        pkg: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<Alias, String> {
+        FileCardStore::alias_set(self, name, card_id, pkg, note)
+    }
+    fn alias_list(&self, pkg_filter: Option<&str>) -> Result<Vec<Alias>, String> {
+        FileCardStore::alias_list(self, pkg_filter)
+    }
+    fn get_by_alias(&self, name: &str) -> Result<Option<Json>, String> {
+        FileCardStore::get_by_alias(self, name)
+    }
+    fn find(&self, q: FindQuery) -> Result<Vec<Summary>, String> {
+        FileCardStore::find(self, q)
+    }
+    fn write_samples(&self, card_id: &str, samples: Vec<Json>) -> Result<PathBuf, String> {
+        FileCardStore::write_samples(self, card_id, samples)
+    }
+    fn read_samples(&self, card_id: &str, q: SamplesQuery) -> Result<Vec<Json>, String> {
+        FileCardStore::read_samples(self, card_id, q)
+    }
+    fn lineage(&self, q: LineageQuery) -> Result<Option<LineageResult>, String> {
+        FileCardStore::lineage(self, q)
+    }
+    fn import_cards_from_dir(
+        &self,
+        source_dir: &Path,
+        pkg: &str,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        import_from_dir_with_store(self, source_dir, pkg)
+    }
+    fn as_file_store(&self) -> Option<&FileCardStore> {
+        Some(self)
+    }
+    fn card_sink_backfill(&self, sink: &str, dry_run: bool) -> Result<SinkBackfillReport, String> {
+        FileCardStore::card_sink_backfill(self, sink, dry_run)
     }
 }
 

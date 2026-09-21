@@ -2,8 +2,8 @@
 //!
 //! Owns the [`Session`] lifecycle (running / needs_response / completed),
 //! the [`Executor`] loop that drives Lua coroutines and mediates
-//! `alc.llm()` pauses, the [`FileCardStore`] for structured session
-//! artifacts, [`bridge`] modules that expose Rust-backed globals
+//! `alc.llm()` pauses, the [`CardBackend`] (default [`FileCardStore`])
+//! for structured session artifacts, [`bridge`] modules that expose Rust-backed globals
 //! (`alc.*`) to Lua, and the resolver factory that wires strategies
 //! to LLM providers.
 
@@ -18,7 +18,7 @@ pub mod session;
 pub mod state;
 mod variant_pkg;
 
-pub use card::FileCardStore;
+pub use card::{CardBackend, FileCardStore};
 pub use executor::{Executor, SessionDirs};
 pub use llm_bridge::{LlmRequest, QueryRequest};
 pub use session::{

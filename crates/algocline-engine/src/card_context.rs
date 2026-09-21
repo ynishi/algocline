@@ -10,7 +10,7 @@
 //! * [`CardContextSpec`] — 2-form spec (`CardId` or `Query { pkg, limit }`)
 //!   received from the Lua bridge after opts extraction.
 //! * [`resolve`] — spec → `Vec<Json>` full Card resolution against a
-//!   `CardStore`.  Silent Ok(empty) on not-found / empty query.
+//!   [`CardBackend`].  Silent Ok(empty) on not-found / empty query.
 //! * [`format_past_cards`] — infallible fixed-template renderer producing
 //!   the `<past_cards>...</past_cards>` block.
 //!
@@ -36,14 +36,14 @@
 //! ## Error handling
 //!
 //! `resolve` returns `Result<Vec<Json>, String>`.  Underlying
-//! `card::get_with_store` / `card::find_with_store` errors are re-wrapped
+//! [`CardBackend::get`] / [`CardBackend::find`] errors are re-wrapped
 //! with a `"card_context resolve: "` prefix so the bridge layer can
 //! surface them via `tracing::warn!` before silently dropping the inject
 //! (Phase 3-F Done Criteria #4: silent no-op on resolution failure).
 
 use serde_json::Value as Json;
 
-use crate::card::{self, CardStore, FindQuery, OrderKey};
+use crate::card::{CardBackend, FindQuery, OrderKey};
 
 /// Card context specification extracted from the Lua `card_context` opt.
 ///
@@ -74,14 +74,15 @@ pub enum CardContextSpec {
 /// * [`CardContextSpec::Query`] → up to `limit` Card JSON values ordered
 ///   by `created_at` descending; empty result set is Ok.
 ///
-/// The query form loads full TOML for each hit via a second
-/// `get_with_store` call (N+1 fetch).  With the MVP default `limit = 5`
+/// The query form loads the full Card for each hit via a second
+/// `get` call (N+1 fetch).  With the MVP default `limit = 5`
 /// this is well within I/O budget; if a future phase needs to raise the
-/// limit substantially we can add a `find_full_with_store` batching API.
-pub fn resolve(store: &dyn CardStore, spec: CardContextSpec) -> Result<Vec<Json>, String> {
+/// limit substantially we can add a batching method to `CardBackend`.
+pub fn resolve(store: &dyn CardBackend, spec: CardContextSpec) -> Result<Vec<Json>, String> {
     match spec {
         CardContextSpec::CardId(id) => {
-            match card::get_with_store(store, &id)
+            match store
+                .get(&id)
                 .map_err(|e| format!("card_context resolve: {e}"))?
             {
                 Some(j) => Ok(vec![j]),
@@ -99,11 +100,13 @@ pub fn resolve(store: &dyn CardStore, spec: CardContextSpec) -> Result<Vec<Json>
                 limit: Some(limit),
                 offset: None,
             };
-            let summaries = card::find_with_store(store, q)
+            let summaries = store
+                .find(q)
                 .map_err(|e| format!("card_context resolve: {e}"))?;
             let mut out = Vec::with_capacity(summaries.len());
             for s in summaries {
-                if let Some(j) = card::get_with_store(store, &s.card_id)
+                if let Some(j) = store
+                    .get(&s.card_id)
                     .map_err(|e| format!("card_context resolve: {e}"))?
                 {
                     out.push(j);

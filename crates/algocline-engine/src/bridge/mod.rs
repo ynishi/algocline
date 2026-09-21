@@ -36,7 +36,7 @@ mod nn_trainer;
 mod nn_wrap;
 mod text;
 
-use crate::card::FileCardStore;
+use crate::card::{CardBackend, FileCardStore};
 use crate::llm_bridge::LlmRequest;
 use crate::state::JsonFileStore;
 use crate::variant_pkg::VariantPkg;
@@ -68,7 +68,7 @@ pub struct BridgeConfig {
     /// State store for `alc.state.*` (service layer resolves the root).
     pub state_store: Arc<JsonFileStore>,
     /// Card store for `alc.card.*` (service layer resolves the root).
-    pub card_store: Arc<FileCardStore>,
+    pub card_store: Arc<dyn CardBackend>,
     /// Cached `[setting.card].run` value resolved at session start.
     ///
     /// When `false` (default), `alc.card.create` / `alc.card.append` calls
@@ -131,7 +131,7 @@ pub fn register(lua: &Lua, alc_table: &LuaTable, config: BridgeConfig) -> LuaRes
         lua,
         alc_table,
         config.state_store.root(),
-        config.card_store.root(),
+        config.card_store.as_file_store().map(FileCardStore::root),
         &config.scenarios_dir,
     )?;
     text::register_chunk(lua, alc_table)?;

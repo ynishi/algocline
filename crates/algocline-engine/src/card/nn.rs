@@ -13,6 +13,8 @@ use serde_json::json;
 
 use algocline_nn::card::NnModelCard;
 
+use super::CardBackend;
+#[cfg(test)]
 use super::FileCardStore;
 
 /// Card package name under which `nn_model` Cards are stored
@@ -24,7 +26,7 @@ pub const NN_PKG: &str = "alc_nn";
 /// Errors carry no surface prefix — callers (the Lua bridge) wrap the
 /// message under their own `alc.nn.*` prefix so the loud-error
 /// contract per surface is preserved.
-pub fn persist(store: &FileCardStore, card: &NnModelCard) -> Result<String, String> {
+pub fn persist(store: &dyn CardBackend, card: &NnModelCard) -> Result<String, String> {
     let nn_meta_json =
         serde_json::to_value(card.meta()).map_err(|e| format!("serialize meta: {e}"))?;
 

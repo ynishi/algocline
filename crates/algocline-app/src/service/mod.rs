@@ -5,6 +5,8 @@ pub(crate) use error::{
     HubRegistriesError, PkgListError, ProjectFilesError, ServiceError, TranscriptError,
 };
 mod card;
+pub(crate) mod card_backend;
+pub(crate) mod cardbox_store;
 mod config;
 mod dist;
 mod engine_api_impl;
@@ -49,9 +51,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::pool::{registry::with_registry_lock, PoolError, PoolRegistry};
-use algocline_engine::{
-    CardBackend, Executor, FileCardStore, JsonFileStore, SessionRegistry, VariantPkg,
-};
+use algocline_engine::{CardBackend, Executor, JsonFileStore, SessionRegistry, VariantPkg};
 
 pub use algocline_core::{EngineApi, TokenUsage};
 pub use config::{AppConfig, LogDirSource};
@@ -99,8 +99,12 @@ pub struct AppService {
     state_store: Arc<JsonFileStore>,
     /// Card store backing `alc.card.*`.
     ///
-    /// Rooted at `log_config.app_dir().cards_dir()`, same `Arc` pattern.
+    /// Rooted per [`card_backend::CardBackendChoice`], same `Arc` pattern.
     card_store: Arc<dyn CardBackend>,
+    /// What [`card_store`](Self::card_store) was resolved to, kept so
+    /// `alc info` can report the active backend without downcasting a
+    /// trait object.
+    pub(crate) card_backend: card_backend::CardBackendChoice,
     /// session_id → strategy name for eval sessions (cleared on completion).
     eval_sessions: Arc<EvalSessions>,
     /// session_id → strategy name for log/stats tracking (cleared on session completion).
@@ -145,7 +149,11 @@ impl AppService {
 
         let app_dir = log_config.app_dir();
         let state_store = Arc::new(JsonFileStore::new(app_dir.state_dir()));
-        let card_store: Arc<dyn CardBackend> = Arc::new(FileCardStore::new(app_dir.cards_dir()));
+        // Which backend, and where it is rooted, is resolved once and
+        // kept: the pool worker resolves the same choice in its own
+        // process, and `alc info` reports it.
+        let card_backend = card_backend::CardBackendChoice::resolve(&app_dir);
+        let card_store: Arc<dyn CardBackend> = card_backend.build();
 
         // V2 execution registry — shares the Executor + AppConfig-derived
         // storage paths with the legacy `start_and_tick` path so a v2 caller
@@ -210,6 +218,7 @@ impl AppService {
             search_paths,
             state_store,
             card_store,
+            card_backend,
             eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pool_registry: Arc::new(tokio::sync::RwLock::new(pool_registry)),

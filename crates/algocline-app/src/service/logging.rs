@@ -202,6 +202,11 @@ impl AppService {
             .collect();
         info["search_paths"] = serde_json::json!(search_paths_json);
 
+        // Which card backend this process resolved to, and where it is
+        // rooted. Additive: `kind` is "file" unless `[setting.card]`
+        // selects otherwise.
+        info["card_backend"] = self.card_backend.to_json();
+
         // packages dir (kept for backward compatibility)
         let packages = self.log_config.app_dir().packages_dir();
         if packages.is_dir() {

@@ -255,11 +255,21 @@ pkg  = false
 | Target / field | Type | Meaning |
 |---|---|---|
 | `[setting.card].run` | boolean (default `false`) | Gate `alc.card.create` / `alc.card.append` for callers that populate a `run` sub-table. When off, those calls become a silent no-op and return `nil`. When on, the `[run]` section is written verbatim into the Card TOML. Enable per-project via `alc.local.toml`, per-user via `config.toml`, or per-session via `ALC_SETTING_CARD_RUN=true`. See `docs/lua-stdlib.md` §alc.card for the `[run]` shape and §Card context injection for how these Cards feed back into `alc.llm` prompts. |
+| `[setting.card].backend` | string (default `"file"`) | Where Cards are stored. `"file"` writes TOML under `~/.algocline/cards`. `"cardbox"` keeps them in a [cardbox](https://github.com/ynishi/cardbox) store, driven through the `cardbox` binary, which must be on `PATH`. The cardbox backend is the one that implements the Card lifecycle (`alc.card.open` / `close`); on the file backend both verbs error and name `alc.card.create`. An unrecognised value falls back to `"file"`. `alc info` reports what was resolved under `card_backend`. |
+| `[setting.card].cardbox_root` | path (default `~/.algocline/cardbox`) | The cardbox store root, used only when `backend = "cardbox"`. Passed to the binary as `CARDBOX_ROOT`. |
 
 ```toml
 # ~/.algocline/config.toml — opt Run-side Card writes in
 [setting.card]
 run = true
+```
+
+```toml
+# ~/.algocline/config.toml — keep Cards in a cardbox store instead
+[setting.card]
+run = true
+backend = "cardbox"
+cardbox_root = "~/.algocline/cardbox"
 ```
 
 ### Resolution order

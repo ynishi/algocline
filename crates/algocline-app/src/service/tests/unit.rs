@@ -583,6 +583,9 @@ fn log_list_prefers_meta_file() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -656,6 +659,9 @@ fn stats_empty_dir() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -743,6 +749,9 @@ fn stats_aggregates_by_strategy() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -834,6 +843,9 @@ fn stats_legacy_logs_without_strategy() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -898,6 +910,9 @@ fn info_returns_valid_json_with_expected_keys() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -966,6 +981,9 @@ fn info_stderr_only_when_no_log_dir() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -1032,6 +1050,9 @@ fn require_log_dir_returns_path_when_present() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -1090,6 +1111,9 @@ fn require_log_dir_returns_err_when_none() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -1189,6 +1213,9 @@ fn log_list_returns_empty_when_no_log_dir() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],
@@ -1249,6 +1276,9 @@ fn stats_returns_zero_when_no_log_dir() {
         card_store: Arc::new(algocline_engine::FileCardStore::new(
             std::path::PathBuf::from("."),
         )),
+        card_backend: crate::service::card_backend::CardBackendChoice::File {
+            root: std::path::PathBuf::from("."),
+        },
         eval_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         session_strategies: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         search_paths: vec![],

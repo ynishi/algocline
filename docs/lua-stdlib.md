@@ -2681,6 +2681,18 @@ that store both halves raise a Lua error naming `alc.card.create` as the
 one-shot alternative. A backend that can hold an open row (a database,
 an event log) is the one that implements the pair.
 
+The **cardbox backend** is that backend: set
+`[setting.card].backend = "cardbox"` (see `README.md` §Global settings)
+and Cards live in a [cardbox](https://github.com/ynishi/cardbox) store,
+where a Card really is opened and later closed. One difference is worth
+knowing before relying on it: cardbox's own states are `open` /
+`closed_ok` / `closed_failed` and it has no flag for a skipped run, so
+`status = "skipped"` closes the Card as ok and records the v0 status in
+a tag that `get` reads back in preference to the state. `skipped`
+therefore round-trips as `skipped` and stays distinguishable in a
+`where` on `run.status` — it is never silently folded into
+`succeeded`.
+
 Gated by `[setting.card].run` together with `close` (see the `[run]`
 section above): with the gate off this returns `nil` without touching
 the store.

@@ -51,21 +51,36 @@
 //! translated to the tag, so the three statuses stay distinguishable in a
 //! query. Nothing is silently mapped to `succeeded`.
 //!
+//! # Which cardbox this needs
+//!
+//! **0.1.2 or newer.** From 0.1.2 `find` / `list` / `compat find` answer
+//! every row with the Card's current `tags`, and `created_at` /
+//! `run.flow` are tags — so a listing row can carry them, which is what
+//! lets [`Summary`] report both. Before 0.1.2 a row carried no `tags` at
+//! all and neither field could reach a summary. Nothing else in the
+//! mapping depends on the version.
+//!
+//! There is deliberately no runtime version gate. On an older cardbox
+//! the writes and `get` are unaffected — `get` has always had both
+//! fields — and a listing row reports `created_at: None` / `flow: None`,
+//! which is what `None` already means here: not known from this row.
+//! `opened_ms` is still not substituted for `created_at`. So an older
+//! binary yields a thinner projection rather than the total failure a
+//! hard floor would produce, and the cost of the gate (a `cardbox
+//! version` spawn per store, reportable only through a log line the MCP
+//! caller never sees) buys nothing the caller can act on.
+//!
 //! # Stated gaps
 //!
 //! Places where this backend is honestly not the file backend. Each is a
-//! property of cardbox 0.1.1, not an omission here.
+//! property of cardbox 0.1.2, not an omission here.
 //!
-//! * **`list` / `find` rows carry no `created_at` and no `run.flow`.**
-//!   `cardbox compat find` projects `card_id` / `pkg` / `scenario` /
-//!   `state` / `model` / `pass_rate` and no tags, and `created_at` lives
-//!   in a tag. `opened_ms` is in the row but it is a different quantity,
-//!   so it is not substituted. `get` has both fields; only the summary
-//!   projection lacks them.
 //! * **An `append`ed `review` / `caveats` cannot be read back.** It is
-//!   recorded as an eval, and cardbox 0.1.1 has no CLI verb that returns
-//!   eval payloads — `get` reports only a count, surfaced here as
-//!   `cardbox.evals`.
+//!   recorded as an eval, and cardbox 0.1.2 has no read verb that
+//!   returns eval payloads — `get` reports only a count, surfaced here
+//!   as `cardbox.evals`. (`export` writes the whole store's event log to
+//!   a file, and the payload is in there, but that is a store-level
+//!   backup rather than a read of one Card.)
 //! * **`metadata` other than the two lineage fields is close-time data.**
 //!   It lands in `close --stats`, so `open` refuses it rather than
 //!   dropping it; carry it on `create`, or in `close`'s `stats.metadata`.
@@ -107,6 +122,14 @@ const TAG_CREATED_AT: &str = "created_at";
 
 /// Tag holding `metadata.prior_relation`.
 const TAG_PRIOR_RELATION: &str = "lineage.relation";
+
+/// The tag key holding the v0 `run.<field>`. cardbox tags are one flat
+/// map, so the `run` section is one tag per field under a literal `run.`
+/// prefix; this is the single spelling of that key, on both the write
+/// side and every read that goes looking for one.
+fn run_tag(field: &str) -> String {
+    format!("run.{field}")
+}
 
 /// Top-level v0 Card keys `open` knows where to put.
 const OPEN_KEYS: &[&str] = &[
@@ -822,7 +845,7 @@ fn open_plan(input: &Json, now: &str, mode: OpenMode) -> Result<WritePlan, Strin
             .ok_or_else(|| "alc.card.open: run must be a table".to_string())?;
         for field in ["flow", "reason", "action"] {
             if let Some(v) = run.get(field).and_then(|v| v.as_str()) {
-                tags.push((format!("run.{field}"), v.to_string()));
+                tags.push((run_tag(field), v.to_string()));
             }
         }
     }
@@ -891,10 +914,7 @@ fn close_plan(
 
     Ok(WritePlan {
         args,
-        tags: vec![(
-            "run.status".to_string(),
-            status_token(outcome.status).into(),
-        )],
+        tags: vec![(run_tag("status"), status_token(outcome.status).into())],
     })
 }
 
@@ -1068,15 +1088,14 @@ fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
     // `skipped` survives; cardbox's coarser state is the fallback for a
     // Card this backend did not close.
     let state = str_at("state").unwrap_or_default();
-    let status =
-        tag("run.status")
-            .as_deref()
-            .and_then(status_from_token)
-            .or(match state.as_str() {
-                "closed_ok" => Some(RunStatus::Succeeded),
-                "closed_failed" => Some(RunStatus::Failed),
-                _ => None,
-            });
+    let status = tag(&run_tag("status"))
+        .as_deref()
+        .and_then(status_from_token)
+        .or(match state.as_str() {
+            "closed_ok" => Some(RunStatus::Succeeded),
+            "closed_failed" => Some(RunStatus::Failed),
+            _ => None,
+        });
     // `flow` / `reason` / `action` are known when the run starts, so
     // they are present while the Card is still open and a status is
     // not. The section is built from whatever is known rather than
@@ -1087,7 +1106,7 @@ fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
         run.insert("status".into(), json!(status_token(status)));
     }
     for field in ["flow", "reason", "action"] {
-        if let Some(v) = tag(&format!("run.{field}")) {
+        if let Some(v) = tag(&run_tag(field)) {
             run.insert(field.into(), json!(v));
         }
     }
@@ -1127,11 +1146,20 @@ fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
 
 /// A `compat find` row as a v0 [`Summary`].
 ///
-/// `created_at` and `flow` stay `None`: the row carries no tags, which
-/// is where both live, and `opened_ms` — which the row does carry — is a
-/// different quantity (see the module doc).
+/// `created_at` and `flow` are read out of the row's own `tags`, which
+/// is where both are written and which a row carries from cardbox 0.1.2
+/// on (see the module doc). A row with no `tags`, or one whose `tags`
+/// lack the key, leaves the field `None` — `opened_ms` is in the row but
+/// it is the log's event time, a different quantity, so it is no more
+/// substituted here than in [`card_from_cardbox`].
 fn summary_from_row(row: &Json) -> Option<Summary> {
     let card_id = row.get("card_id").and_then(|v| v.as_str())?.to_string();
+    let tag = |k: &str| {
+        row.get("tags")
+            .and_then(|t| t.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
     Some(Summary {
         card_id,
         pkg: row
@@ -1139,12 +1167,12 @@ fn summary_from_row(row: &Json) -> Option<Summary> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        created_at: None,
+        created_at: tag(TAG_CREATED_AT),
         model: row
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        flow: None,
+        flow: tag(&run_tag("flow")),
         scenario: row
             .get("scenario")
             .and_then(|v| v.as_str())
@@ -1288,7 +1316,7 @@ fn translate_card_path(path: &[String]) -> Result<Vec<String>, String> {
         // `run` has no cardbox column; its fields are tags, and the tag
         // key is the dotted name literally (tags are a flat map).
         ["run", field @ ("status" | "flow" | "reason" | "action")] => {
-            vec!["tags".into(), format!("run.{field}")]
+            vec!["tags".into(), run_tag(field)]
         }
         ["run"] => {
             return Err(

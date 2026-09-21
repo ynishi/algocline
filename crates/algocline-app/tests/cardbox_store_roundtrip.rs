@@ -191,6 +191,21 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     assert_eq!(hits[0].card_id, card_id);
     assert_eq!(hits[0].pkg, "demo");
     assert_eq!(hits[0].pass_rate, Some(0.67));
+    assert_eq!(hits[0].model.as_deref(), Some("claude-opus-4-6"));
+    assert_eq!(hits[0].scenario.as_deref(), Some("sc1"));
+    // Both live in tags, which a row carries from cardbox 0.1.2 on. This
+    // is the assertion that was impossible against 0.1.1, where a row
+    // came back with no tags at all.
+    assert_eq!(
+        hits[0].created_at.as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "a find row carries the created_at tag, not opened_ms"
+    );
+    assert_eq!(
+        hits[0].flow.as_deref(),
+        Some("coding_orch"),
+        "a find row carries the run.flow tag"
+    );
 
     // The two translated paths: created_at and run.* are tags.
     for predicate in [
@@ -220,6 +235,11 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     let listed = store.list(Some("demo")).expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].card_id, card_id);
+    assert_eq!(
+        listed[0].created_at.as_deref(),
+        Some("2026-09-01T00:00:00Z")
+    );
+    assert_eq!(listed[0].flow.as_deref(), Some("coding_orch"));
     assert!(store.list(Some("nosuchpkg")).expect("list").is_empty());
 
     // ── alias_set ──────────────────────────────────────────────
@@ -435,6 +455,18 @@ fn create_opens_and_closes_in_one_call() {
         vec![card_id.as_str(), older.as_str()],
         "newest first"
     );
+    assert_eq!(
+        ordered[0].created_at.as_deref(),
+        Some("2026-07-04T01:02:03Z")
+    );
+    assert_eq!(ordered[0].flow.as_deref(), Some("nn_bake"));
+    // The older Card named no flow, so its row has a created_at tag and
+    // no run.flow one — one tag present must not conjure the other.
+    assert_eq!(
+        ordered[1].created_at.as_deref(),
+        Some("2026-01-01T00:00:00Z")
+    );
+    assert_eq!(ordered[1].flow, None);
 
     // A section with nowhere to go is refused, not silently dropped.
     let err = store

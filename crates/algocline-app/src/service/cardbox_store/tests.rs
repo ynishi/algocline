@@ -559,10 +559,11 @@ fn a_second_sort_key_errors_rather_than_being_dropped() {
 // ─── row projections ───────────────────────────────────────────
 
 #[test]
-fn a_compat_row_becomes_a_summary_with_its_gaps_named() {
+fn a_compat_row_becomes_a_summary_carrying_its_tags() {
     let row = json!({
         "card_id": "demo_sc1_x", "pkg": "demo", "scenario": "sc1",
-        "state": "closed_ok", "opened_ms": 1790026907079i64, "pass_rate": 0.8
+        "state": "closed_ok", "opened_ms": 1790026907079i64, "pass_rate": 0.8,
+        "tags": { "created_at": "2026-09-01T00:00:00Z", "run.flow": "coding_orch" }
     });
     let s = summary_from_row(&row).expect("summary");
     assert_eq!(s.card_id, "demo_sc1_x");
@@ -570,10 +571,55 @@ fn a_compat_row_becomes_a_summary_with_its_gaps_named() {
     assert_eq!(s.scenario.as_deref(), Some("sc1"));
     assert_eq!(s.pass_rate, Some(0.8));
     assert_eq!(
-        s.created_at, None,
-        "compat rows carry no tags, and opened_ms is a different quantity"
+        s.created_at.as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "the tag, not opened_ms"
     );
+    assert_eq!(s.flow.as_deref(), Some("coding_orch"));
+}
+
+/// The row shape of a cardbox older than 0.1.2, and of a 0.1.2 Card
+/// that was never tagged. Both leave the fields absent rather than
+/// standing `opened_ms` in for a `created_at` it is not.
+#[test]
+fn a_row_without_the_tags_leaves_both_fields_unknown() {
+    let no_tags_key = json!({
+        "card_id": "demo_sc1_x", "pkg": "demo",
+        "state": "open", "opened_ms": 1790026907079i64
+    });
+    let empty_tags = json!({
+        "card_id": "demo_sc1_x", "pkg": "demo",
+        "state": "open", "opened_ms": 1790026907079i64, "tags": {}
+    });
+    let other_tags = json!({
+        "card_id": "demo_sc1_x", "pkg": "demo",
+        "state": "open", "opened_ms": 1790026907079i64,
+        "tags": { "run.status": "succeeded", "lineage.relation": "sweep_variant" }
+    });
+    for row in [no_tags_key, empty_tags, other_tags] {
+        let s = summary_from_row(&row).unwrap_or_else(|| panic!("summary for {row}"));
+        assert_eq!(s.created_at, None, "{row}");
+        assert_eq!(s.flow, None, "{row}");
+        assert_eq!(s.card_id, "demo_sc1_x");
+    }
+}
+
+/// Either tag can be present without the other — a Card that set no
+/// `run.flow` still carries the `created_at` every open writes.
+#[test]
+fn one_tag_present_does_not_conjure_the_other() {
+    let dated = json!({
+        "card_id": "a", "pkg": "demo",
+        "tags": { "created_at": "2026-09-01T00:00:00Z" }
+    });
+    let s = summary_from_row(&dated).expect("summary");
+    assert_eq!(s.created_at.as_deref(), Some("2026-09-01T00:00:00Z"));
     assert_eq!(s.flow, None);
+
+    let flowed = json!({ "card_id": "a", "pkg": "demo", "tags": { "run.flow": "nn_bake" } });
+    let s = summary_from_row(&flowed).expect("summary");
+    assert_eq!(s.created_at, None);
+    assert_eq!(s.flow.as_deref(), Some("nn_bake"));
 }
 
 #[test]

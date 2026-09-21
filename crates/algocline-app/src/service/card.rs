@@ -143,6 +143,32 @@ impl AppService {
         Ok(merged.to_string())
     }
 
+    /// Open a Card at the start of a run.
+    ///
+    /// Delegates straight to the backend's lifecycle. Backends that write
+    /// finished Cards only — `FileCardStore`, the default — return the
+    /// trait's "no Card lifecycle" error, which surfaces verbatim to the
+    /// MCP caller.
+    pub fn card_open(&self, input: serde_json::Value) -> Result<String, String> {
+        let (card_id, path) = self.card_store.open(input)?;
+        Ok(serde_json::json!({
+            "card_id": card_id,
+            "path": path.to_string_lossy(),
+        })
+        .to_string())
+    }
+
+    /// Close an open Card with the run's outcome.
+    ///
+    /// The outcome table is validated before the backend is touched, so
+    /// an invalid `status` is reported as a malformed-input error rather
+    /// than as a backend failure.
+    pub fn card_close(&self, card_id: &str, outcome: serde_json::Value) -> Result<String, String> {
+        let parsed = card::CloseOutcome::from_json(&outcome)?;
+        let sealed = self.card_store.close(card_id, parsed)?;
+        Ok(sealed.to_string())
+    }
+
     /// Install Cards from a Card Collection repo (Git URL or local path).
     ///
     /// A Card Collection is identified by `alc_cards.toml` at the repo root.

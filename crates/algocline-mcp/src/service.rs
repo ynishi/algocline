@@ -816,6 +816,23 @@ pub struct CardAppendParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardOpenParams {
+    /// Card seed fields, same shape as a `create` input: everything
+    /// known before the run produces anything (`pkg`, `model`, `params`,
+    /// `scenario`, …). The Card stays open until `alc_card_close`.
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CardCloseParams {
+    /// Card ID returned by `alc_card_open`.
+    pub card_id: String,
+    /// Run outcome: `{ status, stats?, cost?, error? }`. `status` is
+    /// required and must be one of `succeeded` / `failed` / `skipped`.
+    pub outcome: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CardSinkBackfillParams {
     /// Subscriber URI (e.g. `file:///path/to/mirror`). Must be registered
     /// via `ALC_CARD_SINKS` at startup.
@@ -1959,6 +1976,43 @@ impl AlcService {
         self.app.card_append(&params.card_id, params.fields).await
     }
 
+    /// Open a Card at the start of a run, to be sealed later by
+    /// `alc_card_close`. Returns `{ card_id, path }`.
+    ///
+    /// The Card lifecycle is an optional backend capability. The default
+    /// file-backed store does not have one — a file Card is written once,
+    /// complete — so on that backend this returns an error pointing at
+    /// the Lua verb `alc.card.create`. There is no create tool: Cards are
+    /// written from a strategy, never over the wire.
+    #[tool(
+        name = "alc_card_open",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn card_open(
+        &self,
+        Parameters(params): Parameters<CardOpenParams>,
+    ) -> Result<String, String> {
+        self.app.card_open(params.input).await
+    }
+
+    /// Close the Card opened as `card_id`, recording the run's outcome.
+    /// Called whether the run succeeded or not — a failed run closes its
+    /// Card with `status = "failed"`, it does not leave it open.
+    ///
+    /// Returns the sealed Card. Errors on a backend without a Card
+    /// lifecycle, and on an outcome whose `status` is not one of
+    /// `succeeded` / `failed` / `skipped`.
+    #[tool(
+        name = "alc_card_close",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn card_close(
+        &self,
+        Parameters(params): Parameters<CardCloseParams>,
+    ) -> Result<String, String> {
+        self.app.card_close(&params.card_id, params.outcome).await
+    }
+
     /// Read per-case samples from a Card's sidecar JSONL file.
     /// Returns `[]` when the Card has no samples sidecar.
     /// Accepts a Prisma-style `where` predicate (same nested-object DSL
@@ -2803,6 +2857,8 @@ impl ServerHandler for AlcService {
                  - alc_card_get_by_alias: Resolve an alias name to the full Card JSON (shortcut for alias_list → filter → get).\n\
                  - alc_card_alias_set: Bind (or rebind) an alias to a Card.\n\
                  - alc_card_append: Append new top-level fields to a Card (additive-only).\n\
+                 - alc_card_open: Open a Card at the start of a run; returns { card_id, path }. Optional backend capability — the default file-backed store has no Card lifecycle (a file Card is written once, complete) and errors, pointing at the Lua verb alc.card.create. There is no create tool: Cards are written from a strategy, never over the wire.\n\
+                 - alc_card_close: Close the Card opened by alc_card_open, recording { status, stats?, cost?, error? }. Called either way — a failed run closes its Card with status=\"failed\". status must be one of succeeded / failed / skipped. Errors on the default file-backed store for the same reason as alc_card_open.\n\
                  - alc_card_samples: Read per-case detail from a Card's {card_id}.samples.jsonl sidecar (auto-emitted by alc_eval auto_card=true). Supports the same `where` DSL as alc_card_find.\n\
                  - alc_card_lineage: Walk a Card's ancestry/descendant tree via metadata.prior_card_id. Direction up/down/both, optional depth + relation_filter.\n\
                  - alc_card_install: Install Cards from a Card Collection repo (Git URL or local path with alc_cards.toml).\n\

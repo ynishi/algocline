@@ -2565,6 +2565,15 @@ strategies that don't populate `run` see zero behavior change.
 - When the gate is **off** and a caller passes `run`, `alc.card.create`
   / `alc.card.append` become a no-op and return `nil`: no file is
   written, no CardEvent is published, and the CardStore is untouched.
+- The same gate covers the Card lifecycle pair `alc.card.open` /
+  `alc.card.close`, and covers it **as one**. Those two carry no `run`
+  field to key on — the lifecycle is what produces a Card's `[run]`
+  section in the first place — so with the gate off *both* halves
+  short-circuit and return `nil` on every call, before the store is
+  touched. Gating only `close` would strand every Card that `open` had
+  already minted. Outcome validation still runs first, exactly as it
+  does for `create`: an invalid `close` status raises a Lua error
+  whether the gate is on or off.
 - When the gate is **on**, the section is written verbatim into
   Tier 1 alongside `pkg` / `stats` / `metadata` etc. and appears in
   `alc.card.get`'s returned table.
@@ -2611,6 +2620,64 @@ local result = alc.card.create({
     stats = { pass_rate = 0.82, ev = 4.2 },
 })
 -- result.card_id, result.path
+```
+
+#### `alc.card.open(table) -> { card_id, path } | nil`
+
+Open a Card at the start of a run, to be sealed later by
+`alc.card.close`. `table` carries the same seed fields as `create` —
+everything known before the run produces anything. Where `create` writes
+a finished Card in one call, `open` / `close` spread that write across
+the run, so the Card exists while the run is still in flight.
+
+**Optional backend capability.** The lifecycle is not part of every
+backend, and the default file-backed store does **not** implement it: a
+file Card is written once, complete, so there is no interval during
+which an open Card exists on disk, and nothing for `close` to seal. On
+that store both halves raise a Lua error naming `alc.card.create` as the
+one-shot alternative. A backend that can hold an open row (a database,
+an event log) is the one that implements the pair.
+
+Gated by `[setting.card].run` together with `close` (see the `[run]`
+section above): with the gate off this returns `nil` without touching
+the store.
+
+```lua
+local o = alc.card.open({
+    pkg = { name = "cot" },
+    model = { id = "claude-opus-4-6" },
+    params = { temperature = 0.0 },
+})
+-- o.card_id, o.path  — nil when [setting.card].run is off
+```
+
+#### `alc.card.close(card_id, outcome) -> table | nil`
+
+Seal the Card opened as `card_id`, recording how the run ended, and
+return the sealed Card body.
+
+Called **either way** — a run that failed closes its Card with
+`status = "failed"`; it does not leave it open. The three status tokens
+are exhaustive: there is no fourth way for an open Card to end.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `outcome.status` | string enum | yes | One of `"succeeded"`, `"failed"`, `"skipped"`. Unrecognized values raise a Lua error naming all three — raised before the store is touched *and* before the gate check, so a typo never hides behind a disabled setting. |
+| `outcome.stats` | table | no | Aggregate scalars for the finished run. |
+| `outcome.cost` | table | no | Cost accounting for the run. |
+| `outcome.error` | string | no | Failure detail; pairs naturally with `status = "failed"`. |
+
+Optional fields are omitted from the sealed Card entirely when absent —
+never written as an empty or null value. Same optional-capability and
+gate notes as `alc.card.open`.
+
+```lua
+alc.card.close(o.card_id, {
+    status = "failed",
+    stats = { pass_rate = 0.4 },
+    cost = { usd = 0.012 },
+    error = "grader timed out",
+})
 ```
 
 #### `alc.card.append(card_id, fields)`

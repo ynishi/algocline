@@ -484,6 +484,49 @@ impl RunSection {
     }
 }
 
+/// Outcome handed to [`CardBackend::close`] when a run finishes.
+///
+/// The lifecycle counterpart of [`RunSection`]: where `RunSection`
+/// validates a `[run]` table supplied up front to `create` / `append`,
+/// `CloseOutcome` carries what is only known once the run is over.
+///
+/// * `status` is REQUIRED — the run either succeeded, failed, or was
+///   skipped; there is no fourth way for an open Card to end.
+/// * `stats` / `cost` / `error` are OPTIONAL. Absent fields are omitted
+///   from serialization entirely (`skip_serializing_if`) so a backend
+///   never has to distinguish "not reported" from "reported as null".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloseOutcome {
+    pub status: RunStatus,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stats: Option<Json>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost: Option<Json>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
+}
+
+impl CloseOutcome {
+    /// Validate a `close` outcome table.
+    ///
+    /// Unlike [`RunSection::from_json`], which digs a `run` key out of a
+    /// whole Card input, this reads `outcome` itself — the second
+    /// argument of `alc.card.close(card_id, outcome)`.
+    ///
+    /// Returns `Err(msg)` when the table is malformed; the message
+    /// always lists the accepted status tokens (`succeeded, failed,
+    /// skipped`) so Lua callers get an actionable diagnostic without
+    /// opening the docs.
+    pub fn from_json(outcome: &Json) -> Result<CloseOutcome, String> {
+        serde_json::from_value::<CloseOutcome>(outcome.clone()).map_err(|e| {
+            format!(
+                "alc.card.close: invalid outcome (status is required and must be \
+                 one of: succeeded, failed, skipped): {e}"
+            )
+        })
+    }
+}
+
 /// Create a new Card backed by `store`.
 pub fn create_with_store(
     store: &dyn CardStore,
@@ -2089,6 +2132,20 @@ impl FileCardStore {
 /// - [`card_sink_backfill`](Self::card_sink_backfill) — replays file
 ///   Cards into a registered sink; `Err` by default.
 ///
+/// # Card lifecycle
+///
+/// [`open`](Self::open) and [`close`](Self::close) are an OPTIONAL
+/// capability on top of the verbs above: `open` mints a Card when a run
+/// starts, `close` seals it with the run's outcome either way. Both
+/// default to `Err`, so a backend opts in by implementing them.
+///
+/// **[`FileCardStore`] deliberately does not.** A file Card is written
+/// once, complete, by `create` — there is no interval during which an
+/// open Card exists on disk, so there is nothing for `close` to seal
+/// and no half-written file for a crash to strand. A backend that can
+/// hold an open row (a database, an event log) is the one that should
+/// implement the pair.
+///
 /// Locators (`PathBuf`) in return values are opaque to callers; see
 /// the note on [`CardStore`].
 pub trait CardBackend: Send + Sync {
@@ -2129,7 +2186,43 @@ pub trait CardBackend: Send + Sync {
             "card_sink_backfill to '{sink}' is not supported by this card backend"
         ))
     }
+
+    /// Open a Card at the start of a run, returning `(card_id, locator)`.
+    ///
+    /// `input` carries the same seed fields as [`create`](Self::create)
+    /// — everything known before the run produces anything. The Card is
+    /// incomplete until [`close`](Self::close) seals it.
+    ///
+    /// Defaults to `Err`: see the lifecycle note on the trait.
+    fn open(&self, _input: Json) -> Result<(String, PathBuf), String> {
+        Err(format!("alc.card.open: {NO_CARD_LIFECYCLE}"))
+    }
+
+    /// Close the Card opened as `card_id`, recording `outcome`.
+    ///
+    /// Called whether the run succeeded or not — a failed run closes
+    /// its Card with `status = failed`, it does not leave it open.
+    /// Returns the sealed Card body.
+    ///
+    /// Defaults to `Err`: see the lifecycle note on the trait.
+    fn close(&self, card_id: &str, _outcome: CloseOutcome) -> Result<Json, String> {
+        Err(format!(
+            "alc.card.close: card '{card_id}': {NO_CARD_LIFECYCLE}"
+        ))
+    }
 }
+
+/// Shared tail of the default [`CardBackend::open`] / [`CardBackend::close`]
+/// error messages.
+///
+/// Names the sibling verb in full as `alc.card.create`: a caller that
+/// reaches for the lifecycle on a backend that has none is not stuck, it
+/// is simply on the wrong verb. The qualified form is deliberate — this
+/// string also reaches MCP callers verbatim through the service layer,
+/// where a bare `create` would read as a tool name, and no such tool
+/// exists (Cards are written from a strategy, never over the wire).
+const NO_CARD_LIFECYCLE: &str = "this card backend has no Card lifecycle \
+     (no open/close). Use `alc.card.create`, which writes a finished Card in one call.";
 
 impl CardBackend for FileCardStore {
     fn create(&self, input: Json) -> Result<(String, PathBuf), String> {
@@ -3591,6 +3684,99 @@ mod tests {
         assert!(
             err.contains("succeeded") && err.contains("failed") && err.contains("skipped"),
             "error message must enumerate accepted status tokens, got: {err}"
+        );
+    }
+
+    // ─── Card lifecycle unit tests (open / close) ──────────────────
+
+    /// Every `RunStatus` token must be accepted as a close outcome — a
+    /// run that was skipped closes its Card just as a run that failed
+    /// does; there is no status that leaves a Card open.
+    #[test]
+    fn close_outcome_accepts_all_three_statuses() {
+        for status in ["succeeded", "failed", "skipped"] {
+            let outcome = json!({ "status": status });
+            let parsed = CloseOutcome::from_json(&outcome)
+                .unwrap_or_else(|e| panic!("status '{status}' should parse: {e}"));
+            let expected = match status {
+                "succeeded" => RunStatus::Succeeded,
+                "failed" => RunStatus::Failed,
+                "skipped" => RunStatus::Skipped,
+                _ => unreachable!(),
+            };
+            assert_eq!(parsed.status, expected);
+            assert!(parsed.stats.is_none());
+            assert!(parsed.cost.is_none());
+            assert!(parsed.error.is_none());
+        }
+    }
+
+    /// The optional payload fields round-trip when supplied.
+    #[test]
+    fn close_outcome_carries_optional_payload() {
+        let outcome = json!({
+            "status": "failed",
+            "stats": { "pass_rate": 0.4 },
+            "cost": { "usd": 0.012 },
+            "error": "grader timed out",
+        });
+        let parsed = CloseOutcome::from_json(&outcome).expect("outcome should parse");
+        assert_eq!(parsed.status, RunStatus::Failed);
+        assert_eq!(
+            parsed.stats.as_ref().and_then(|s| s.get("pass_rate")),
+            Some(&json!(0.4))
+        );
+        assert_eq!(
+            parsed.cost.as_ref().and_then(|c| c.get("usd")),
+            Some(&json!(0.012))
+        );
+        assert_eq!(parsed.error.as_deref(), Some("grader timed out"));
+    }
+
+    /// An unknown status token must be rejected with a message naming
+    /// all three accepted values — same diagnostic discipline as
+    /// `RunSection::from_json`.
+    #[test]
+    fn close_outcome_rejects_invalid_status() {
+        let outcome = json!({ "status": "half_finished" });
+        let err = CloseOutcome::from_json(&outcome).unwrap_err();
+        assert!(
+            err.contains("succeeded") && err.contains("failed") && err.contains("skipped"),
+            "error message must enumerate accepted status tokens, got: {err}"
+        );
+    }
+
+    /// `FileCardStore` has no Card lifecycle: a file Card is written
+    /// once, complete, so both lifecycle verbs fall through to the
+    /// trait defaults. The error must point the caller at `create`.
+    #[test]
+    fn file_card_store_has_no_card_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().join("cards"));
+        let backend: &dyn CardBackend = &store;
+
+        let open_err = backend
+            .open(json!({ "pkg": { "name": "lifecycle_probe" } }))
+            .expect_err("FileCardStore must not implement open");
+        assert!(
+            open_err.contains("create"),
+            "open error must point the caller at `create`, got: {open_err}"
+        );
+
+        let close_err = backend
+            .close(
+                "lifecycle_probe_x_20260921T000000_abcdef",
+                CloseOutcome {
+                    status: RunStatus::Succeeded,
+                    stats: None,
+                    cost: None,
+                    error: None,
+                },
+            )
+            .expect_err("FileCardStore must not implement close");
+        assert!(
+            close_err.contains("create"),
+            "close error must point the caller at `create`, got: {close_err}"
         );
     }
 

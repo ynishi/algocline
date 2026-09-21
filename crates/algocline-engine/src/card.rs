@@ -278,9 +278,16 @@ fn stable_json_into(v: &Json, buf: &mut String) {
     }
 }
 
-/// Derive a short model id (e.g. "claude-opus-4-6" -> "opus46").
-/// v0: best-effort. Falls back to "model" if input is empty.
-fn short_model(id: &str) -> String {
+/// Derive the short name segment of a `card_id` (e.g. "claude-opus-4-6"
+/// -> "opus46", "coding_orch" -> "codingorch").
+///
+/// Takes whichever string names what ran — a `run.flow` when the Card
+/// has one, otherwise a `model.id` — and reduces it to ASCII
+/// alphanumerics, which is what keeps the segment safe to put in a file
+/// name even though neither input is validated as a name (a model id
+/// such as `cyankiwi/Qwen3.8-27B-AWQ-INT4` legitimately contains `/`).
+/// v0: best-effort. Falls back to "model" if nothing survives.
+fn short_name(id: &str) -> String {
     if id.is_empty() {
         return "model".into();
     }
@@ -422,8 +429,9 @@ fn require_pkg_name(input: &Json) -> Result<String, String> {
 // ─── [run] section (Phase 1-B) ─────────────────────────────────────────────
 //
 // Optional strategy run outcome recorded on a Card as `[run].status`,
-// `[run].reason`, `[run].action`.  Serialized as a nested TOML table when
-// present.  Gated at the Lua bridge layer by `[setting.card].run` — when
+// `[run].flow`, `[run].reason`, `[run].action`.  Serialized as a nested
+// TOML table when present.  Gated at the Lua bridge layer by
+// `[setting.card].run` — when
 // the setting is disabled, `alc.card.create` / `alc.card.append` calls
 // carrying a `run` field become no-op and return Lua nil without touching
 // the store or publishing a `CardEvent`.
@@ -445,8 +453,24 @@ pub enum RunStatus {
 /// Optional `[run]` section carrying strategy execution outcome.
 ///
 /// * `status` is REQUIRED when the section is present.
-/// * `reason` / `action` are OPTIONAL free-form strings; when absent they
-///   are omitted from the serialized TOML entirely (`skip_serializing_if`).
+/// * `flow` / `reason` / `action` are OPTIONAL free-form strings; when
+///   absent they are omitted from the serialized TOML entirely
+///   (`skip_serializing_if`).
+///
+/// `flow` names **what ran**: the orchestrator, driver or pipeline that
+/// produced this Card (`coding_orch`, `flow_design`). It is not a model.
+/// `model.id` stays reserved for an actual model identifier
+/// (`claude-opus-4-6`, `cyankiwi/Qwen3.8-27B-AWQ-INT4`).
+///
+/// The distinction exists because it was not being kept: across one
+/// real store, 426 of 610 Cards had an orchestrator name sitting in
+/// `model.id` and only 184 had a model identifier there, which makes a
+/// query for "everything from this model" wrong by roughly 70%. The
+/// cause was structural rather than careless — `model.id` was the only
+/// field that reached a Card's name (see [`create_with_store`]), and
+/// the schema had nowhere else to record what produced the Card. `flow`
+/// is that place, and it feeds the name segment in `model.id`'s stead
+/// when present, so the pressure that drove the misuse is gone.
 ///
 /// Used only for input validation at the Lua bridge boundary — the actual
 /// Card TOML is written via the raw `serde_json::Value` path so that other
@@ -454,6 +478,8 @@ pub enum RunStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSection {
     pub status: RunStatus,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub flow: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -558,16 +584,27 @@ pub fn create_with_store(
     let card_id = match obj.get("card_id").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => {
+            // What ran names the Card: `run.flow` when the Card says
+            // what produced it, `model.id` otherwise. Preferring flow
+            // here is the whole point of the field — while `model.id`
+            // was the only field reaching a Card's name, flow names
+            // ended up stored there instead, and a Card without a flow
+            // still mints exactly the id it always did.
+            let flow = obj
+                .get("run")
+                .and_then(|r| r.get("flow"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
             let model_id = obj
                 .get("model")
                 .and_then(|m| m.get("id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let model_short = short_model(model_id);
+            let name_short = short_name(flow.unwrap_or(model_id));
             let ts = now_compact();
             let fp_seed = stable_json(&Json::Object(obj.clone()));
             let h = hash6(&fp_seed);
-            format!("{pkg_name}_{model_short}_{ts}_{h}")
+            format!("{pkg_name}_{name_short}_{ts}_{h}")
         }
     };
     validate_name(&card_id, "card_id")?;
@@ -617,6 +654,10 @@ pub struct Summary {
     pub pkg: String,
     pub created_at: Option<String>,
     pub model: Option<String>,
+    /// `run.flow` — what produced the Card (see [`RunSection`]).
+    /// Projected alongside `model` so `find` can order on it without
+    /// loading full TOML, exactly as it does for `model.id`.
+    pub flow: Option<String>,
     pub scenario: Option<String>,
     pub pass_rate: Option<f64>,
 }
@@ -631,6 +672,9 @@ impl Summary {
         }
         if let Some(v) = &self.model {
             m.insert("model".into(), json!(v));
+        }
+        if let Some(v) = &self.flow {
+            m.insert("flow".into(), json!(v));
         }
         if let Some(v) = &self.scenario {
             m.insert("scenario".into(), json!(v));
@@ -659,6 +703,11 @@ fn summarize(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Opt
         .and_then(|m| m.get("id"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let flow = val
+        .get("run")
+        .and_then(|r| r.get("flow"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let scenario = val
         .get("scenario")
         .and_then(|s| s.get("name"))
@@ -673,6 +722,7 @@ fn summarize(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Opt
         pkg: pkg.to_string(),
         created_at,
         model,
+        flow,
         scenario,
         pass_rate,
     })
@@ -1272,6 +1322,11 @@ fn load_full(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Opt
         .and_then(|m| m.get("id"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let flow = json
+        .get("run")
+        .and_then(|r| r.get("flow"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let scenario = json
         .get("scenario")
         .and_then(|s| s.get("name"))
@@ -1289,6 +1344,7 @@ fn load_full(store: &dyn CardStore, locator: &std::path::Path, pkg: &str) -> Opt
             pkg: pkg.to_string(),
             created_at,
             model,
+            flow,
             scenario,
             pass_rate,
         },
@@ -1322,6 +1378,7 @@ const SUMMARY_SORT_FIELDS: &[&str] = &[
     "stats.pass_rate",
     "scenario.name",
     "model.id",
+    "run.flow",
 ];
 
 /// Return true when the query can be answered with lightweight Summary
@@ -1349,6 +1406,7 @@ fn order_summaries(a: &Summary, b: &Summary, keys: &[OrderKey]) -> std::cmp::Ord
             },
             "scenario.name" => a.scenario.cmp(&b.scenario),
             "model.id" => a.model.cmp(&b.model),
+            "run.flow" => a.flow.cmp(&b.flow),
             _ => Ordering::Equal,
         };
         let ord = if k.desc { ord.reverse() } else { ord };
@@ -3687,6 +3745,42 @@ mod tests {
         );
     }
 
+    /// `flow` is optional: a `[run]` section without it parses, and
+    /// serializing it back omits the key entirely rather than writing a
+    /// null — so a Card that never named a flow carries no `flow` line.
+    #[test]
+    fn run_section_round_trips_without_flow() {
+        let input = json!({ "run": { "status": "succeeded", "action": "write" } });
+        let section = RunSection::from_json(&input)
+            .expect("run field must parse")
+            .expect("run field present must yield Some");
+        assert_eq!(section.flow, None);
+
+        let back = serde_json::to_value(&section).expect("section must serialize");
+        assert!(
+            back.get("flow").is_none(),
+            "absent flow must be omitted, got: {back}"
+        );
+    }
+
+    /// `flow` round-trips verbatim when supplied, including a value that
+    /// `validate_name` would reject — flow is a data field, and the only
+    /// place it reaches a name is the `card_id` segment, which
+    /// [`short_name`] sanitizes.
+    #[test]
+    fn run_section_round_trips_with_flow() {
+        for flow in ["coding_orch", "flow_design", "team/pipeline"] {
+            let input = json!({ "run": { "status": "succeeded", "flow": flow } });
+            let section = RunSection::from_json(&input)
+                .unwrap_or_else(|e| panic!("flow '{flow}' should parse: {e}"))
+                .expect("run field present must yield Some");
+            assert_eq!(section.flow.as_deref(), Some(flow));
+
+            let back = serde_json::to_value(&section).expect("section must serialize");
+            assert_eq!(back.get("flow").and_then(|v| v.as_str()), Some(flow));
+        }
+    }
+
     // ─── Card lifecycle unit tests (open / close) ──────────────────
 
     /// Every `RunStatus` token must be accepted as a close outcome — a
@@ -4062,10 +4156,92 @@ name = "{pkg}"
     }
 
     #[test]
-    fn short_model_variants() {
-        assert_eq!(short_model("claude-opus-4-6"), "opus46");
-        assert_eq!(short_model("gpt-4o"), "4o");
-        assert_eq!(short_model(""), "model");
+    fn short_name_variants() {
+        assert_eq!(short_name("claude-opus-4-6"), "opus46");
+        assert_eq!(short_name("gpt-4o"), "4o");
+        assert_eq!(short_name(""), "model");
+        // A flow name reaches the same helper.
+        assert_eq!(short_name("coding_orch"), "codingorch");
+        assert_eq!(short_name("flow_design"), "flowdesign");
+    }
+
+    /// Regression guard for `[run].flow`: a Card that does not set
+    /// `run.flow` must mint exactly the id it minted before the field
+    /// existed — `{pkg}_{short model.id}_{ts}_{hash6}`.
+    ///
+    /// Every segment but the clock is pinned. The auto-injected fields
+    /// are supplied up front so the hash seed is fully determined by the
+    /// input, and the timestamp is read back out of the produced id.
+    #[test]
+    fn card_id_without_flow_is_minted_from_the_model_id_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "flow_absent_pkg";
+        let input = json!({
+            "schema_version": SCHEMA_VERSION,
+            "created_at": "2026-09-21T00:00:00Z",
+            "created_by": "test",
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-opus-4-6" },
+            "run": { "status": "succeeded", "action": "write" },
+        });
+        let expected_hash = hash6(&stable_json(&input));
+
+        let (id, _) = create_with_store(&store, input).unwrap();
+        let tail = id.strip_prefix(&format!("{pkg}_")).unwrap();
+        let parts: Vec<&str> = tail.split('_').collect();
+        assert_eq!(parts.len(), 3, "unexpected card_id shape: {id}");
+        assert_eq!(parts[0], "opus46", "name segment must come from model.id");
+        assert_eq!(parts[2], expected_hash, "hash segment must be unchanged");
+        assert_eq!(id, format!("{pkg}_opus46_{}_{expected_hash}", parts[1]));
+    }
+
+    /// With `run.flow` present it, not `model.id`, names the Card — that
+    /// is what relieves the pressure that put flow names into `model.id`
+    /// in the first place.
+    #[test]
+    fn card_id_with_flow_is_minted_from_the_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "flow_present_pkg";
+        let input = json!({
+            "schema_version": SCHEMA_VERSION,
+            "created_at": "2026-09-21T00:00:00Z",
+            "created_by": "test",
+            "pkg": { "name": pkg },
+            "model": { "id": "claude-opus-4-6" },
+            "run": { "status": "succeeded", "flow": "coding_orch" },
+        });
+        let expected_hash = hash6(&stable_json(&input));
+
+        let (id, _) = create_with_store(&store, input).unwrap();
+        let tail = id.strip_prefix(&format!("{pkg}_")).unwrap();
+        let parts: Vec<&str> = tail.split('_').collect();
+        assert_eq!(parts.len(), 3, "unexpected card_id shape: {id}");
+        assert_eq!(parts[0], "codingorch", "flow must win over model.id");
+        assert_eq!(id, format!("{pkg}_codingorch_{}_{expected_hash}", parts[1]));
+    }
+
+    /// A flow whose characters cannot appear in a file name is reduced
+    /// by [`short_name`] like any other input, so the minted `card_id`
+    /// still passes `validate_name` — this is why `flow` itself is not
+    /// name-validated.
+    #[test]
+    fn card_id_from_a_path_like_flow_stays_a_valid_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "flow_pathlike_pkg";
+        let (id, _) = create_with_store(
+            &store,
+            json!({
+                "pkg": { "name": pkg },
+                "run": { "status": "succeeded", "flow": "../team/orch" },
+            }),
+        )
+        .unwrap();
+        assert!(validate_name(&id, "card_id").is_ok(), "bad card_id: {id}");
+        let tail = id.strip_prefix(&format!("{pkg}_")).unwrap();
+        assert_eq!(tail.split('_').next(), Some("teamorch"));
     }
 
     #[test]
@@ -4452,6 +4628,101 @@ name = "{pkg}"
         assert_eq!(rows[2].pass_rate, Some(0.5));
         // Tiebreak by card_id ascending
         assert!(rows[0].card_id < rows[1].card_id);
+    }
+
+    /// `run.flow` orders and filters like any other dotted path, so
+    /// "everything this orchestrator produced" is a query rather than a
+    /// guess made from `model.id`.
+    ///
+    /// Both `find` paths are exercised because they place a Card that
+    /// has no flow differently: the summary fast path sorts `None`
+    /// first ascending, the full-TOML path sorts a missing value last.
+    /// That split is pre-existing and shared with `model.id` /
+    /// `scenario.name` — `run.flow` is wired the same way rather than
+    /// given ordering semantics of its own.
+    #[test]
+    fn find_order_by_run_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileCardStore::new(tmp.path().to_path_buf());
+        let pkg = "find_order_flow_pkg";
+        for (suffix, flow) in [
+            ("a", Some("saas_scan")),
+            ("b", Some("coding_orch")),
+            ("c", None),
+        ] {
+            let mut input = json!({
+                "card_id": format!("{pkg}_{suffix}"),
+                "pkg": { "name": pkg },
+                "model": { "id": "claude-opus-4-6" },
+            });
+            if let Some(flow) = flow {
+                input["run"] = json!({ "status": "succeeded", "flow": flow });
+            }
+            create_with_store(&store, input).unwrap();
+        }
+        let flows_of = |rows: &[Summary]| -> Vec<Option<String>> {
+            rows.iter().map(|r| r.flow.clone()).collect()
+        };
+
+        // Fast path: no `where`, so `run.flow` is served from Summary.
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                order_by: order_from(json!(["run.flow"])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            flows_of(&rows),
+            vec![None, Some("coding_orch".into()), Some("saas_scan".into())]
+        );
+
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                order_by: order_from(json!(["-run.flow"])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            flows_of(&rows),
+            vec![Some("saas_scan".into()), Some("coding_orch".into()), None]
+        );
+
+        // Full path: a `where` clause forces the full-TOML load, where
+        // the same key is read as a dotted path.
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({ "pkg": { "name": pkg } }))),
+                order_by: order_from(json!(["run.flow"])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            flows_of(&rows),
+            vec![Some("coding_orch".into()), Some("saas_scan".into()), None]
+        );
+
+        // And the path filters, which is the query the whole field
+        // exists to make answerable.
+        let rows = find_with_store(
+            &store,
+            FindQuery {
+                pkg: Some(pkg.to_string()),
+                where_: Some(where_from(json!({ "run": { "flow": "coding_orch" } }))),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].flow.as_deref(), Some("coding_orch"));
     }
 
     #[test]

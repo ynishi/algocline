@@ -1016,9 +1016,9 @@ Reply with ONLY a single number, nothing else.]],
                 if type(g.grader) == "string" and type(g.score) == "number" then
                     local acc = by_name[g.grader]
                     if not acc then
-                        acc = { scores = {}, weight = g.weight }
+                        acc = { name = g.grader, scores = {}, weight = g.weight }
                         by_name[g.grader] = acc
-                        order[#order + 1] = g.grader
+                        order[#order + 1] = acc
                     end
                     acc.scores[#acc.scores + 1] = g.score
                 end
@@ -1028,10 +1028,9 @@ Reply with ONLY a single number, nothing else.]],
             return nil
         end
         local out = {}
-        for _, name in ipairs(order) do
-            local acc = by_name[name]
+        for _, acc in ipairs(order) do
             local d = ef.stats.describe(acc.scores)
-            out[name] = { n = d.n, mean = d.mean, weight = acc.weight }
+            out[acc.name] = { n = d.n, mean = d.mean, weight = acc.weight }
         end
         return out
     end

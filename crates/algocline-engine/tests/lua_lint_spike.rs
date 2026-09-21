@@ -67,6 +67,12 @@ fn make_vm() -> Lua {
             find = function() end,
             append = function() end,
         }
+        -- `alc.math` is mlua-mathlib registered by the bridge; stub the
+        -- members the prelude reaches (`alc.card.compare`).
+        alc.math = {
+            mean = function() return 0 end,
+            welch_t_test = function() return {} end,
+        }
         alc._dirs = { scenarios = "/dev/null" }
     "#;
     lua.load(setup)

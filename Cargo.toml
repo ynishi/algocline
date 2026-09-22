@@ -58,6 +58,9 @@ keywords.workspace = true
 categories.workspace = true
 
 readme = "README.md"
+# `examples/gameai` is an application built on the platform, not part of
+# the crate; keep it out of the crates.io tarball.
+exclude = ["/examples/gameai"]
 
 [[bin]]
 name = "alc"

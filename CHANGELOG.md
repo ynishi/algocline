@@ -17,11 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The engine's nn end-to-end tests no longer depend on `examples/gameai`.** `tests/gameai_smoke_test.rs` and `tests/gameai_ckpt_metric_e2e.rs` are replaced by `tests/nn_gate_smoke.rs` and `tests/nn_ckpt_hook_e2e.rs`, and `tests/lua/card_duel_rules_test.lua` by `tests/lua/pick_rules_test.lua`. They fence the same platform contracts — training loss below the uniform baseline, a decode gate that only returns legal ids, two sessions agreeing, `on_ckpt` firing at every boundary, `alc.nn.card.load_ckpt` returning a live handle from inside the hook, and a metric accepting that handle as **userdata** — but over `tests/lua/fixtures/pick/`, a sequential-choice toy with a shrinking legal set and a deterministic teacher, instead of the card-duel demo. The platform's tests now name no game; `just test-nn` runs the new targets.
 - `CardBackend` trait (`algocline_engine::card`) is the injection surface for the card store: one method per `alc.card.*` verb plus `import_cards_from_dir`, with `as_file_store` / `card_sink_backfill` as file-backend escape hatches. `Executor` / `SessionDirs` / `BridgeConfig` / the service layer now hold `Arc<dyn CardBackend>` instead of `Arc<FileCardStore>`; `FileCardStore` remains the default and the on-disk layout is unchanged. `alc_card_publish` returns `CardPublishError::Unsupported` on a backend that keeps no Card files, and `alc._dirs.cards` is absent there. (breaking for code that constructs `SessionDirs` / `BridgeConfig` from a `&Arc<FileCardStore>` — coerce with `as Arc<dyn CardBackend>`; MCP wire shape is unchanged) (#11)
 
 ### Deprecated
 
 ### Removed
+
+- **`examples/gameai/` is no longer part of this repository.** The GameAI application (card-duel and boss-duel NPCs whose play style is a tuned small model, with their bake / harvest / tournament drivers, eval scenarios and play-log data) is an application built on the platform rather than part of it, and it was being shipped inside the `algocline` crate tarball because nothing excluded it. Its history was split off intact with `git subtree split -P examples/gameai` to be published as its own repository; `examples/README.md` says where the platform contracts it exercised are fenced now. Nothing under `crates/` or in the MCP surface changes.
 
 ### Fixed
 

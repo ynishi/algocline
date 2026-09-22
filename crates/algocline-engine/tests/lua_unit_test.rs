@@ -25,19 +25,14 @@ fn prelude_path() -> PathBuf {
         .join("prelude.lua")
 }
 
-/// Absolute path to the workspace-root `examples/gameai/` directory.
+/// Absolute path to `tests/lua/fixtures/`, the Lua modules the nn
+/// tests drive.
 ///
 /// Resolved from `CARGO_MANIFEST_DIR` (which points at
 /// `crates/algocline-engine/`) rather than the process CWD, which
 /// differs between `cargo test` and IDE runners.
-fn gameai_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("engine crate parent (crates/)")
-        .parent()
-        .expect("workspace root")
-        .join("examples")
-        .join("gameai")
+fn fixtures_dir() -> PathBuf {
+    spec_dir().join("fixtures")
 }
 
 /// Execute one spec file and translate per-test results into a single
@@ -86,14 +81,14 @@ fn bridge_spec() {
 }
 
 #[test]
-fn card_duel_rules_spec() {
-    // card_duel_rules_test.lua reads `ALC_TEST_GAMEAI_DIR` to put
-    // `examples/gameai/?/init.lua` on `package.path`. The spec stubs
+fn pick_rules_spec() {
+    // pick_rules_test.lua reads `ALC_TEST_FIXTURES_DIR` to put
+    // `tests/lua/fixtures/?/init.lua` on `package.path`. The spec stubs
     // `alc.math` itself, so no bridge is needed and this runs on the
     // default feature set (the `nn` half is fenced by
-    // `tests/gameai_smoke_test.rs`).
-    std::env::set_var("ALC_TEST_GAMEAI_DIR", gameai_dir());
-    run_spec("card_duel_rules_test.lua");
+    // `tests/nn_gate_smoke.rs` and `tests/nn_ckpt_hook_e2e.rs`).
+    std::env::set_var("ALC_TEST_FIXTURES_DIR", fixtures_dir());
+    run_spec("pick_rules_test.lua");
 }
 
 #[test]

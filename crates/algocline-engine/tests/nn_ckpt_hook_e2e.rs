@@ -1,9 +1,10 @@
 #![cfg(feature = "nn")]
-//! End-to-end smoke for the checkpoint → metric loop the Level Sweep
-//! learner is built on, driven the same way `gameai_smoke_test.rs`
-//! drives the card duel demo: a production-shaped Lua VM over a
-//! tempdir, one embedded script evaluated against it, assertions on the
-//! returned table.
+//! End-to-end smoke for the checkpoint → metric loop a level-sweep
+//! learner is built on, driven the same way `nn_gate_smoke.rs` drives
+//! the gate: a production-shaped Lua VM over a tempdir, one embedded
+//! script evaluated against it, assertions on the returned table.
+//!
+//! The domain is the `pick` fixture under `tests/lua/fixtures/`.
 //!
 //! What it fences, in one training run:
 //!
@@ -14,25 +15,22 @@
 //! 2. `alc.nn.card.load_ckpt` turns the mid-run `info.ckpt_path` into a
 //!    live handle from inside that hook — while the trainer still holds
 //!    the model mutex and the dataset lock;
-//! 3. `gameai_metrics.metrics.trickiness(…)` consumes that handle and
+//! 3. a Lua metric (`pick.legal_entropy`) consumes that handle and
 //!    returns a number.
 //!
-//! Step 3 is the one the three pieces meet at: the handle is `NnHandle`
-//! **userdata**, and the `gameai_metrics` guards used to accept only a
-//! Lua table. The package-level specs cannot build userdata, so this is
-//! the only place the userdata leg of those guards is exercised — a
-//! regression there surfaces here as a loud
-//! `trickiness: card must be a string alias or a handle …` rather than
-//! a silent skip.
+//! Step 3 is where the three pieces meet: the handle is `NnHandle`
+//! **userdata**, and `pick.require_handle` accepts it by capability
+//! (`generate_session` is callable) rather than by Lua type. A bare
+//! spec cannot build userdata, so this is the only place the userdata
+//! leg of that guard is exercised — a regression there surfaces here as
+//! a loud `pick.require_handle: userdata has no generate_session …`
+//! rather than a silent skip.
 //!
 //! What it deliberately does not fence is the *value* of the metric
 //! beyond its mathematical range. Four training steps do not move a
 //! from-scratch model into any particular entropy, and asserting a
 //! threshold would make the test a function of the training budget
-//! rather than of the code under test. `level` is left out for the
-//! same class of reason plus cost: it autoplays N full fights per
-//! call, which is minutes of CPU for a smoke that already proves the
-//! handle reaches a registered metric.
+//! rather than of the code under test.
 //!
 //! Every Card, safetensors bundle and rotating checkpoint the run
 //! writes lands in the per-test tempdir, so the developer's
@@ -47,28 +45,24 @@ use algocline_engine::card::FileCardStore;
 use algocline_engine::state::JsonFileStore;
 use mlua::Lua;
 
-/// Path to the workspace-root `examples/gameai/` directory, resolved
-/// via `CARGO_MANIFEST_DIR` so the test does not depend on the process
-/// CWD.
-fn gameai_dir() -> PathBuf {
+/// Path to `tests/lua/fixtures/`, resolved via `CARGO_MANIFEST_DIR` so
+/// the test does not depend on the process CWD.
+fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("engine crate parent (crates/)")
-        .parent()
-        .expect("workspace root")
-        .join("examples")
-        .join("gameai")
+        .join("tests")
+        .join("lua")
+        .join("fixtures")
 }
 
-/// Build a production-shaped VM with `examples/gameai/` on
-/// `package.path`, mirroring `gameai_smoke_test.rs::gameai_vm`.
+/// Build a production-shaped VM with the fixtures directory on
+/// `package.path`, mirroring `nn_gate_smoke.rs::fixture_vm`.
 ///
 /// The tempdir is returned alongside the VM: dropping it mid-test would
 /// delete the checkpoints the hook loads back.
-fn gameai_vm() -> (Lua, tempfile::TempDir) {
+fn fixture_vm() -> (Lua, tempfile::TempDir) {
     let lua = Lua::new();
     let metrics = ExecutionMetrics::new();
-    let tmp = tempfile::tempdir().expect("gameai ckpt-metric tempdir");
+    let tmp = tempfile::tempdir().expect("nn ckpt-hook tempdir");
     let root: PathBuf = tmp.path().to_path_buf();
 
     // Live sender required for `alc.llm` registration; the receiver is
@@ -101,13 +95,9 @@ fn gameai_vm() -> (Lua, tempfile::TempDir) {
 
     // `lib_paths` only reaches forked child VMs, so the parent's
     // `package.path` is extended here instead.
-    let path_prefix = format!(
-        "{}/?/init.lua;{}/?.lua;",
-        gameai_dir().display(),
-        gameai_dir().display()
-    );
+    let path_prefix = format!("{}/?/init.lua;", fixtures_dir().display());
     lua.load("local prefix = ... package.path = prefix .. package.path")
-        .set_name("@gameai_package_path")
+        .set_name("@fixture_package_path")
         .call::<()>(path_prefix)
         .expect("extend package.path");
 
@@ -115,37 +105,11 @@ fn gameai_vm() -> (Lua, tempfile::TempDir) {
 }
 
 /// Embedded Lua driver. Reads the `SMOKE` config table (set from Rust
-/// below), trains a from-scratch gpt2-tiny on a scripted guardian-duel
-/// corpus, and evaluates `trickiness` from inside the checkpoint hook.
+/// below), trains a from-scratch gpt2-tiny on a fixture corpus, and
+/// evaluates `pick.legal_entropy` from inside the checkpoint hook.
 const SCRIPT: &str = r#"
-local duel = require("guardian_duel")
--- The pkg builds the style_distance / trickiness / level ctx adapters;
--- the hook below holds one of them directly.
-local gm = require("gameai_metrics")
-
-local VOCAB = duel.player_vocab()
-local PLAYER_MOVES = duel.player_legal_actions()
-
--- ─── Corpus: scripted self-play against the teacher boss ────────────
---
--- The player side cycles through the four legal moves rather than
--- following a style: what is being fenced is the checkpoint → metric
--- wiring, and a cycling player reaches a wider spread of views per
--- game than any fixed rule would.
-local moves = {}
-for g = 1, SMOKE.games do
-    local state = duel.new_game(SMOKE.seed + g)
-    local turn = 0
-    while not duel.is_over(state) do
-        local boss_action = duel.policy_guardian(state.boss)
-        local view = duel.player_view(state, "guardian", state.revealed and boss_action or nil)
-        turn = turn + 1
-        local action = PLAYER_MOVES[(turn % #PLAYER_MOVES) + 1]
-        moves[#moves + 1] = { player = view, player_action = action }
-        state = duel.apply(state, action, boss_action)
-    end
-end
-assert(#moves > 0, "scripted self-play produced no logged turns")
+local pick = require("pick")
+local VOCAB = pick.vocab()
 
 local handle = alc.nn.preset.gpt2("tiny", {
     device = "cpu",
@@ -156,11 +120,13 @@ local ctx_len = handle:ctx()
 local model_vocab = handle:vocab()
 assert(
     VOCAB.size <= model_vocab,
-    string.format("player alphabet of %d chars exceeds model vocab %d", VOCAB.size, model_vocab)
+    string.format("alphabet of %d chars exceeds model vocab %d", VOCAB.size, model_vocab)
 )
 
-local base_rows = duel.rows_from_player_moves(moves, {
+local base_rows = pick.build_corpus(pick.teacher, {
     ctx_len = ctx_len,
+    episodes = SMOKE.episodes,
+    seed = SMOKE.seed,
     pad_id = VOCAB.pad_id,
 })
 
@@ -181,11 +147,12 @@ local dataset = alc.nn.data.synthetic(rows, {
     pad_id = VOCAB.pad_id,
 })
 
--- Prompt set for the metric: the first few logged views, in the shape
--- `guardian_duel.player_view` emits (which is what the metric decodes).
+-- Prompt set for the metric: the fixed probe states, which cover the
+-- turn and score-gap branches and have 5 / 4 / 3 legal values.
 local prompt_set = {}
-for i = 1, math.min(SMOKE.prompts, #moves) do
-    prompt_set[i] = moves[i].player
+local states = pick.check_states()
+for i = 1, math.min(SMOKE.prompts, #states) do
+    prompt_set[i] = states[i]
 end
 assert(#prompt_set > 0, "prompt_set is empty")
 
@@ -205,7 +172,7 @@ local card_id = alc.nn.trainer.run_full_ft(handle, dataset, {
     -- Keep every rotating checkpoint; the hook loads the file it is
     -- handed, and rotation during the run would race that read.
     ckpt_keep = SMOKE.steps + 1,
-    name = "gameai-ckpt-metric-e2e",
+    name = "nn-ckpt-hook-e2e",
     on_ckpt = function(info)
         fires = fires + 1
         steps_seen[#steps_seen + 1] = info.step
@@ -219,16 +186,13 @@ local card_id = alc.nn.trainer.run_full_ft(handle, dataset, {
             "load_ckpt must return an NnHandle userdata, got " .. type(ckpt)
         )
 
-        local value = gm.metrics.trickiness({
-            card = ckpt,
-            prompt_set = prompt_set,
-            temperature = 1.0,
-        })
-        assert(
-            type(value) == "number",
-            "trickiness must return a number, got " .. type(value)
-        )
-        values[#values + 1] = value
+        local sum = 0
+        for _, state in ipairs(prompt_set) do
+            local h = pick.legal_entropy(ckpt, state, 1.0)
+            assert(type(h) == "number", "legal_entropy must return a number, got " .. type(h))
+            sum = sum + h
+        end
+        values[#values + 1] = sum / #prompt_set
         return "continue"
     end,
 })
@@ -240,9 +204,7 @@ return {
     values = values,
     prompts = #prompt_set,
     rows = #rows,
-    logged_turns = #moves,
     ctx_len = ctx_len,
-    max_entropy = math.log(#PLAYER_MOVES),
 }
 "#;
 
@@ -254,9 +216,7 @@ struct SmokeOut {
     values: Vec<f64>,
     prompts: i64,
     rows: i64,
-    logged_turns: i64,
     ctx_len: i64,
-    max_entropy: f64,
 }
 
 /// Run the driver with a smoke-sized budget and extract the returned
@@ -265,14 +225,14 @@ struct SmokeOut {
 /// The extraction happens here rather than in the test body because the
 /// returned `mlua::Table` borrows into the VM built above; handing it
 /// back would leave the caller reading through a dropped VM.
-fn run_ckpt_metric_smoke() -> SmokeOut {
-    let (lua, _tmp) = gameai_vm();
+fn run_ckpt_hook_smoke() -> SmokeOut {
+    let (lua, _tmp) = fixture_vm();
 
     // Smoke budget: 4 steps at batch 2, checkpointing every 2 → exactly
     // two hook fires. Small enough that the two extra model builds the
     // hook performs (one per fire) stay negligible on CPU.
     let cfg = lua.create_table().expect("create SMOKE table");
-    cfg.set("games", 4).expect("set games");
+    cfg.set("episodes", 4).expect("set episodes");
     cfg.set("steps", 4).expect("set steps");
     cfg.set("batch", 2).expect("set batch");
     cfg.set("ckpt_every", 2).expect("set ckpt_every");
@@ -283,9 +243,9 @@ fn run_ckpt_metric_smoke() -> SmokeOut {
 
     let out: mlua::Table = lua
         .load(SCRIPT)
-        .set_name("@gameai_ckpt_metric_e2e")
+        .set_name("@nn_ckpt_hook_e2e")
         .eval()
-        .expect("gameai ckpt-metric e2e script");
+        .expect("nn ckpt-hook e2e script");
 
     SmokeOut {
         card_id: out.get("card_id").expect("card_id"),
@@ -294,27 +254,17 @@ fn run_ckpt_metric_smoke() -> SmokeOut {
         values: out.get("values").expect("values"),
         prompts: out.get("prompts").expect("prompts"),
         rows: out.get("rows").expect("rows"),
-        logged_turns: out.get("logged_turns").expect("logged_turns"),
         ctx_len: out.get("ctx_len").expect("ctx_len"),
-        max_entropy: out.get("max_entropy").expect("max_entropy"),
     }
 }
 
 #[test]
-fn on_ckpt_load_ckpt_trickiness_e2e() {
-    let out = run_ckpt_metric_smoke();
+fn on_ckpt_load_ckpt_metric_e2e() {
+    let out = run_ckpt_hook_smoke();
 
     eprintln!(
-        "[gameai-ckpt-metric] card_id={} fires={} steps=[{}] values={:?} \
-         (max_entropy={:.4}) turns={} rows={} ctx_len={}",
-        out.card_id,
-        out.fires,
-        out.steps_seen,
-        out.values,
-        out.max_entropy,
-        out.logged_turns,
-        out.rows,
-        out.ctx_len,
+        "[nn-ckpt-hook] card_id={} fires={} steps=[{}] values={:?} rows={} ctx_len={}",
+        out.card_id, out.fires, out.steps_seen, out.values, out.rows, out.ctx_len,
     );
 
     // (a) the hook actually ran. Asserted before anything else: a
@@ -340,24 +290,20 @@ fn on_ckpt_load_ckpt_trickiness_e2e() {
     assert_eq!(
         out.values.len() as i64,
         out.fires,
-        "each fire must contribute exactly one trickiness reading"
+        "each fire must contribute exactly one metric reading"
     );
     assert_eq!(
         out.prompts, 3,
         "the prompt set must reach the metric intact"
     );
     for (i, v) in out.values.iter().enumerate() {
+        assert!(v.is_finite(), "metric reading {i} must be finite, got {v}");
+        // Normalised entropy lives in [0, 1]. The bounds are the metric's
+        // definition, not a training-budget expectation — four steps do
+        // not pin the value any further.
         assert!(
-            v.is_finite(),
-            "trickiness reading {i} must be finite, got {v}"
-        );
-        // Shannon entropy of a 4-way distribution lives in [0, ln 4].
-        // The bounds are the metric's definition, not a training-budget
-        // expectation — four steps do not pin the value any further.
-        assert!(
-            *v >= 0.0 && *v <= out.max_entropy + 1e-9,
-            "trickiness reading {i} must sit in [0, ln 4 = {:.4}], got {v}",
-            out.max_entropy
+            *v >= 0.0 && *v <= 1.0 + 1e-9,
+            "metric reading {i} must sit in [0, 1], got {v}"
         );
     }
 

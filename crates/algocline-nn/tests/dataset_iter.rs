@@ -27,6 +27,7 @@ fn opts_with_batch_ctx(batch_size: usize, ctx_len: usize) -> DatasetOpts {
         batch_size,
         ctx_len,
         shuffle: false,
+        seed: None,
         pad_id: 0,
         mask_pad: true,
         text_field: "text".into(),
@@ -203,14 +204,50 @@ fn parquet_dataset_shuffle_materializes_all_rows() {
 
     let opts = DatasetOpts {
         shuffle: true,
+        seed: Some(7),
         ..opts_with_batch_ctx(3, 1)
     };
     let mut ds = ParquetDataset::new(&path, opts, tok).expect("open parquet dataset");
     let batch = ds.next_batch().unwrap().expect("single batch");
-    // Deterministic reverse-order "shuffle" placeholder (same as the
-    // JSONL adapter).
-    assert_eq!(batch.input_ids, vec![vec![3], vec![2], vec![1]]);
+    // Every row is present exactly once — which order the seed picks is
+    // the RNG's business, and pinning it here would pin an
+    // implementation detail of `rand`.
+    let mut ids = batch.input_ids.clone();
+    ids.sort();
+    assert_eq!(ids, vec![vec![1], vec![2], vec![3]]);
     assert!(batch.is_last);
+}
+
+#[test]
+fn a_seeded_shuffle_gives_the_same_order_twice_and_an_unseeded_one_need_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("data.parquet");
+    // Long enough that two independent draws agreeing by chance is a
+    // 1-in-10! event rather than a 1-in-6 one.
+    let words: Vec<&str> = vec!["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "w10"];
+    write_parquet_fixture(&path, "text", &[&words]);
+
+    let order_under = |seed: Option<u64>| {
+        let tok = fixture_tokenizer(dir.path());
+        let opts = DatasetOpts {
+            shuffle: true,
+            seed,
+            ..opts_with_batch_ctx(10, 1)
+        };
+        let mut ds = ParquetDataset::new(&path, opts, tok).expect("open parquet dataset");
+        ds.next_batch().unwrap().expect("single batch").input_ids
+    };
+
+    assert_eq!(
+        order_under(Some(42)),
+        order_under(Some(42)),
+        "the same seed has to give the same order, or nothing about a run is repeatable"
+    );
+    assert_ne!(
+        order_under(Some(42)),
+        order_under(Some(43)),
+        "a different seed has to be able to give a different order"
+    );
 }
 
 #[test]

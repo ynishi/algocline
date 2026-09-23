@@ -19,6 +19,7 @@ pub mod custom;
 pub mod gpt2;
 pub mod lora;
 pub mod moe;
+pub mod seeded;
 pub mod tinyllama;
 
 /// Softmax over the last dimension through the backward-safe basic-op
@@ -51,4 +52,5 @@ pub use custom::{
 pub use gpt2::{AllowedSets, CondIndex, CondIndexError, Gpt2Config, Gpt2Model};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear, LoraWrappable};
 pub use moe::MoeConfig;
+pub use seeded::seeded_var_builder;
 pub use tinyllama::{TinyLlamaConfig, TinyLlamaModel};

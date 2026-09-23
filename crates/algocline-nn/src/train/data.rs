@@ -208,7 +208,22 @@ pub struct DatasetOpts {
     pub ctx_len: usize,
     /// Randomly shuffle rows before iteration (in-memory shuffle;
     /// large corpora should stream separately — v2 carry).
+    ///
+    /// The order is decided by [`Self::seed`], so the same seed gives
+    /// the same order and no seed gives a different one each run.
     pub shuffle: bool,
+    /// Seed for the [`Self::shuffle`] draw, or `None` to take one from
+    /// the system.
+    ///
+    /// Row order is one of the two things that make two runs of the
+    /// same config differ; the other is the parameter initialisation
+    /// (see [`crate::arch::seeded_var_builder`]). Setting both is what
+    /// makes a run repeatable, and setting one is what makes it
+    /// possible to vary the other on purpose.
+    ///
+    /// Read only when `shuffle` is on: an unshuffled dataset already
+    /// has one order.
+    pub seed: Option<u64>,
     /// Pad token id used to fill short rows to `ctx_len`.
     /// Defaults to `0` which is the GPT-2 `<|endoftext|>` id and
     /// matches the nanoGPT convention.
@@ -250,6 +265,7 @@ impl Default for DatasetOpts {
             batch_size: 8,
             ctx_len: 128,
             shuffle: false,
+            seed: None,
             pad_id: 0,
             mask_pad: true,
             text_field: "text".into(),
@@ -368,7 +384,7 @@ impl TokenizedDataset {
             cursor: 0,
         };
         if this.opts.shuffle {
-            this.rows.reverse(); // deterministic re-order for now; a later stage wires an RNG
+            shuffle_rows(&mut this.rows, this.opts.seed);
         }
         this
     }
@@ -696,9 +712,7 @@ impl JsonlDataset {
             let ids = self.tokenize_line(&line, idx)?;
             rows.push(ids);
         }
-        // Reverse ordering as a deterministic "shuffle" placeholder;
-        // A later stage wires a real RNG seed once the trainer opts land.
-        rows.reverse();
+        shuffle_rows(&mut rows, self.opts.seed);
         self.total_rows = Some(rows.len());
         self.buffer = rows;
         self.buffer_cursor = 0;
@@ -909,10 +923,7 @@ impl ParquetDataset {
             let text = row_text(&row, &self.opts.text_field, idx)?;
             rows.push(self.tokenizer.encode(text)?);
         }
-        // Reverse ordering as a deterministic "shuffle" placeholder;
-        // a later stage wires a real RNG seed once the trainer opts
-        // land (same placeholder as `JsonlDataset::materialize_all`).
-        rows.reverse();
+        shuffle_rows(&mut rows, self.opts.seed);
         self.total_rows = rows.len();
         self.buffer = rows;
         self.buffer_cursor = 0;
@@ -1056,6 +1067,22 @@ impl Dataset for ParquetDataset {
         // known even on the streaming path (unlike JSONL).
         Some(self.total_rows)
     }
+}
+
+/// Shuffle `rows` in place under `seed`, or under a system-drawn seed
+/// when there is none.
+///
+/// A real draw: this used to reverse the rows, which is a fixed
+/// permutation and so not a shuffle at all — a corpus grouped by source
+/// came out grouped by source, in the opposite order. Every dataset
+/// built with `shuffle` on before this got that.
+fn shuffle_rows(rows: &mut [Vec<u32>], seed: Option<u64>) {
+    use rand::seq::SliceRandom;
+    let mut rng: rand::rngs::StdRng = match seed {
+        Some(seed) => rand::SeedableRng::seed_from_u64(seed),
+        None => rand::make_rng(),
+    };
+    rows.shuffle(&mut rng);
 }
 
 /// Pad `row` up to `ctx` with `pad`, or truncate to `ctx` when longer.
@@ -1249,6 +1276,7 @@ mod tests {
             batch_size: 2,
             ctx_len: 4,
             shuffle: false,
+            seed: None,
             pad_id: 0,
             mask_pad: true,
             text_field: "text".into(),
@@ -1621,6 +1649,7 @@ mod tests {
             batch_size,
             ctx_len,
             shuffle: false,
+            seed: None,
             pad_id: 0,
             mask_pad,
             text_field: "text".into(),

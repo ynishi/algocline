@@ -329,6 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_size: batch,
             ctx_len: ctx,
             shuffle: false,
+            seed: None,
             pad_id: 0,
             mask_pad: true,
             text_field: "text".into(),

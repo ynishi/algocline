@@ -57,6 +57,7 @@ fn opts_for_seq(ctx_len: usize) -> DatasetOpts {
         batch_size: 1,
         ctx_len,
         shuffle: false,
+        seed: None,
         pad_id: 0,
         mask_pad: true,
         text_field: "text".into(),

@@ -38,8 +38,8 @@ use algocline_nn::arch::adapter::{
     InferenceAdapter, LlamaAdapter, LlamaAdapterConfig, LogitsShape,
 };
 use algocline_nn::arch::{
-    Activation, CondIndex, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig, MoeConfig, NormKind,
-    NormPlacement, PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
+    seeded_var_builder, Activation, CondIndex, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig,
+    MoeConfig, NormKind, NormPlacement, PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
 };
 use algocline_nn::card::{
     bundle_ref_for, sanitize_stem, unique_stem, validate_training_path, CardId, NnCandleBranch,
@@ -2651,6 +2651,28 @@ fn parse_llama_dtype(s: &str) -> LuaResult<DType> {
 // (`setup_gpt2_base_scaffold` builds a base handle in-place). Kept
 // module-private otherwise; no production caller outside this module
 // consumes it.
+/// Refuse `seed` on a pretrained load.
+///
+/// A pretrained handle draws nothing: every parameter comes out of the
+/// downloaded bundle. Honouring the key silently would let a caller
+/// believe two pretrained runs differ by their seed, and then read the
+/// difference between them as the seed's doing when it is the data
+/// order's.
+fn guard_seed_against_pretrained(
+    prefix: &str,
+    seed: Option<u64>,
+    pretrained: bool,
+) -> LuaResult<()> {
+    if seed.is_some() && pretrained {
+        return Err(LuaError::external(format!(
+            "{prefix}: opts.seed has nothing to seed on a pretrained handle — every parameter \
+             comes from the downloaded bundle; pass pretrained = false to initialise from the \
+             seed, or drop the key"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn build_gpt2_handle(
     variant: &str,
     opts: Option<&LuaTable>,
@@ -2679,6 +2701,11 @@ pub(super) fn build_gpt2_handle(
     let pretrained = opts
         .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
         .unwrap_or(true);
+    // Read for the random-init path only; a pretrained load has no
+    // draw to seed. Refused rather than ignored when the two are
+    // combined — see `guard_seed_against_pretrained`.
+    let seed = opts.and_then(|t| t.get::<Option<u64>>("seed").ok().flatten());
+    guard_seed_against_pretrained("alc.nn.preset.gpt2", seed, pretrained)?;
 
     cfg.device = parse_device(&device_str)?;
     cfg.dtype = parse_dtype(&dtype_str)?;
@@ -2708,7 +2735,10 @@ pub(super) fn build_gpt2_handle(
         (m, None)
     } else {
         let vm = VarMap::new();
-        let vs = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let vs = match seed {
+            Some(seed) => seeded_var_builder(&vm, seed, cfg.dtype, &cfg.device),
+            None => candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device),
+        };
         let m = Gpt2Model::new(&cfg, vs)
             .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?;
         (m, Some(Arc::new(vm)))
@@ -2998,6 +3028,8 @@ pub(super) fn build_tinyllama_handle(
     let pretrained = opts
         .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
         .unwrap_or(true);
+    let seed = opts.and_then(|t| t.get::<Option<u64>>("seed").ok().flatten());
+    guard_seed_against_pretrained("alc.nn.preset.tinyllama", seed, pretrained)?;
 
     cfg.device = parse_device_for("alc.nn.preset.tinyllama", &device_str)?;
     cfg.dtype = parse_dtype_for("alc.nn.preset.tinyllama", &dtype_str)?;
@@ -3011,7 +3043,10 @@ pub(super) fn build_tinyllama_handle(
         (m, None)
     } else {
         let vm = VarMap::new();
-        let vs = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let vs = match seed {
+            Some(seed) => seeded_var_builder(&vm, seed, cfg.dtype, &cfg.device),
+            None => candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device),
+        };
         let m = TinyLlamaModel::new(&cfg, vs)
             .map_err(|e| LuaError::external(format!("alc.nn.preset.tinyllama: {e}")))?;
         (m, Some(Arc::new(vm)))
@@ -4203,6 +4238,12 @@ fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
         }
         if let Some(v) = t.get::<Option<bool>>("shuffle")? {
             d.shuffle = v;
+        }
+        // Read whether or not `shuffle` is on: the dataset ignores it
+        // for an unshuffled source, and refusing the pair here would
+        // only make a caller that sets both once strip the key again.
+        if let Some(v) = t.get::<Option<u64>>("seed")? {
+            d.seed = Some(v);
         }
         if let Some(v) = t.get::<Option<u32>>("pad_id")? {
             d.pad_id = v;
@@ -6905,6 +6946,61 @@ mod load_dispatch_tests {
 
     // ── arch-neutral preset dispatch ─────────────────────────
 
+    /// `opts.seed` on a from-scratch preset makes two builds identical.
+    #[test]
+    fn a_seeded_preset_builds_the_same_parameters_twice() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let build = || {
+            let opts_val = lua
+                .to_value(&json!({ "pretrained": false, "seed": 123 }))
+                .unwrap();
+            let opts_tbl = match opts_val {
+                LuaValue::Table(t) => t,
+                _ => unreachable!(),
+            };
+            let h = build_gpt2_handle("tiny", Some(&opts_tbl), tmp.path()).expect("gpt2 tiny");
+            let vm = h
+                .varmap()
+                .expect("a from-scratch handle carries its VarMap");
+            let data = vm.data().lock().unwrap();
+            let mut out: Vec<(String, Vec<f32>)> = data
+                .iter()
+                .map(|(name, var)| {
+                    let t = var.as_tensor().flatten_all().unwrap();
+                    (name.clone(), t.to_vec1::<f32>().unwrap())
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+        assert_eq!(build(), build(), "the same seed must build the same model");
+    }
+
+    /// A seed on a pretrained handle is refused rather than accepted
+    /// and ignored: nothing is drawn on that path, so a caller who
+    /// believed otherwise would misread where a difference came from.
+    #[test]
+    fn a_seed_on_a_pretrained_handle_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let opts_val = lua
+            .to_value(&json!({ "pretrained": true, "seed": 1 }))
+            .unwrap();
+        let opts_tbl = match opts_val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let err = match build_gpt2_handle("tiny", Some(&opts_tbl), tmp.path()) {
+            Ok(_) => panic!("seed + pretrained must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("nothing to seed"),
+            "message: {err}"
+        );
+    }
+
     #[test]
     fn neutral_preset_gpt2_returns_gpt2_nn_handle() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7619,6 +7715,7 @@ mod load_ckpt_tests {
                 batch_size: 1,
                 ctx_len: 16,
                 shuffle: false,
+                seed: None,
                 pad_id: 0,
                 mask_pad: true,
                 text_field: "text".into(),

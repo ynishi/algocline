@@ -38,7 +38,7 @@
 //! token keeps the output on a path towards a full pattern match. JSON
 //! schema and GBNF grammars are future additions behind the same trait.
 
-use candle_core::{Result as CandleResult, Tensor};
+use candle_core::{Device, Result as CandleResult, Tensor};
 use regex_automata::{
     dfa::{dense, Automaton, StartKind},
     util::primitives::StateID,
@@ -141,6 +141,8 @@ pub struct ConstrainedSampler<S: Sampler, C: Constraint> {
     inner: S,
     constraint: C,
     prefix: Vec<u32>,
+    /// The bias tensor of the last mask, reused while the mask holds.
+    bias: MaskBias,
 }
 
 impl<S: Sampler, C: Constraint> ConstrainedSampler<S, C> {
@@ -150,6 +152,7 @@ impl<S: Sampler, C: Constraint> ConstrainedSampler<S, C> {
             inner,
             constraint,
             prefix: Vec::new(),
+            bias: MaskBias::default(),
         }
     }
 
@@ -195,7 +198,13 @@ impl<S: Sampler, C: Constraint> Sampler for ConstrainedSampler<S, C> {
             // Free path: hand the caller's tensor straight through.
             TokenMask::AllowAll => self.inner.sample(logits)?,
             _ => {
-                let masked = apply_mask(logits, &mask)?;
+                validate_logits(logits)?;
+                let vocab = logits.dims()[0];
+                let bias = self.bias.bias_for(&mask, vocab, logits.device())?;
+                // The surviving entries come through untouched —
+                // `x + 0.0` is `x` — and the row never leaves the
+                // device it was produced on.
+                let masked = logits.add(&bias)?;
                 self.inner.sample(&masked)?
             }
         };
@@ -266,7 +275,7 @@ impl Constraint for StopTokensConstraint {
 ///
 /// # Empty lists are rejected
 ///
-/// An empty legal set permits nothing, which [`apply_mask`] refuses at
+/// An empty legal set permits nothing, which [`mask_bias`] refuses at
 /// sample time. That is one token too late to be useful: the mistake is
 /// in the caller's legality computation, not in the draw. `new` returns
 /// `Err` instead, the same way [`RegexConstraint::new`] rejects a
@@ -377,7 +386,7 @@ impl Constraint for AllowListConstraint {
 /// state, or an id past the end of `vocab`), and when no token can
 /// continue a viable prefix, `mask` returns [`TokenMask::Allow`] with an
 /// empty list. [`Constraint::mask`] cannot return an error — but an empty
-/// `Allow` is rejected by [`apply_mask`], so the condition surfaces as a
+/// `Allow` is rejected by [`mask_bias`], so the condition surfaces as a
 /// loud `Err` from [`Sampler::sample`] instead of quietly emitting an
 /// off-pattern token.
 #[derive(Debug, Clone)]
@@ -524,24 +533,41 @@ impl Constraint for RegexConstraint {
 
 // ─── helpers ──────────────────────────────────────────────────────────
 
-/// Build a new logits row with the masked-out entries set to `-inf`.
+/// The additive bias a mask applies: `0.0` where a token survives,
+/// `-inf` where it does not.
 ///
-/// Round-trips through host memory (`to_vec1` → mutate → `from_vec`)
-/// rather than composing tensor ops: the mask is sparse and the vocab
-/// row is a single vector, so the scatter is cheaper than materialising
-/// a full-width mask tensor. The result lands on the input's device.
+/// A bias rather than a rewritten row, because addition leaves the
+/// surviving entries as they were (`x + 0.0 == x`) and the whole tensor
+/// stays where it already is.
+///
+/// One value changes its bits and nothing else: a logit of `-0.0` comes
+/// back as `+0.0`, since IEEE-754 addition of two zeros of unlike sign
+/// rounds to `+0.0`. The two compare equal under every operator and
+/// exponentiate to the same number, so no sampler here can tell them
+/// apart — but the claim is "unchanged", not "bit-identical", and the
+/// difference is stated rather than rounded over. The previous form read the logits
+/// back to the host, scattered `-inf` into the copy, and uploaded the
+/// result — on an accelerator that is a device→host→device round trip
+/// of the full vocabulary at every decoded token, against a model whose
+/// forward never left the device.
+///
+/// The bias is still built on the host and uploaded once, which is half
+/// the traffic and, for a constraint whose mask does not change between
+/// steps, is paid once per generation rather than once per token — see
+/// [`MaskBias`].
 ///
 /// Errors on an out-of-range token id and on a mask that leaves no
 /// candidate at all; see the module doc for why neither is recoverable.
-fn apply_mask(logits: &Tensor, mask: &TokenMask) -> CandleResult<Tensor> {
-    validate_logits(logits)?;
-    let mut values = logits.to_vec1::<f32>()?;
-    let vocab = values.len();
-
+/// Both are decided from the id list alone, so neither needs the logits.
+fn mask_bias(mask: &TokenMask, vocab: usize, device: &Device) -> CandleResult<Tensor> {
     // `keep` starts at the variant's default answer and the id list
     // flips the exceptions, so both variants share one scatter loop.
     let (ids, kept_default) = match mask {
-        TokenMask::AllowAll => return Ok(logits.clone()),
+        TokenMask::AllowAll => {
+            return Err(candle_core::Error::Msg(
+                "ConstrainedSampler: AllowAll needs no bias (builder bug)".into(),
+            ))
+        }
         TokenMask::Deny(ids) => (ids, true),
         TokenMask::Allow(ids) => {
             if ids.is_empty() {
@@ -570,13 +596,44 @@ fn apply_mask(logits: &Tensor, mask: &TokenMask) -> CandleResult<Tensor> {
         )));
     }
 
-    for (value, keep) in values.iter_mut().zip(keep) {
-        if !keep {
-            *value = f32::NEG_INFINITY;
-        }
-    }
+    let bias: Vec<f32> = keep
+        .into_iter()
+        .map(|k| if k { 0.0 } else { f32::NEG_INFINITY })
+        .collect();
+    Tensor::from_vec(bias, vocab, device)
+}
 
-    Tensor::from_vec(values, vocab, logits.device())
+/// The bias tensor of the most recent mask, kept so a constraint whose
+/// mask does not change between steps uploads it once.
+///
+/// Which is most of them: an allow-list and a stop-token set answer the
+/// same mask at every position, and a grammar's mask changes only when
+/// the parse state does. The comparison that decides a hit is a host
+/// memcmp over the id list — cheap next to the transfer it avoids, and
+/// free when the lists are short, which is the case an allow-list
+/// decode is.
+#[derive(Debug, Default, Clone)]
+struct MaskBias {
+    cached: Option<(TokenMask, Tensor)>,
+}
+
+impl MaskBias {
+    /// The bias for `mask`, from the cache when it fits.
+    fn bias_for(
+        &mut self,
+        mask: &TokenMask,
+        vocab: usize,
+        device: &Device,
+    ) -> CandleResult<Tensor> {
+        if let Some((cached_mask, bias)) = self.cached.as_ref() {
+            if cached_mask == mask && bias.dims() == [vocab] && bias.device().same_device(device) {
+                return Ok(bias.clone());
+            }
+        }
+        let bias = mask_bias(mask, vocab, device)?;
+        self.cached = Some((mask.clone(), bias.clone()));
+        Ok(bias)
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +644,79 @@ mod tests {
 
     fn cpu_logits(vals: &[f32]) -> Tensor {
         Tensor::from_slice(vals, (vals.len(),), &Device::Cpu).unwrap()
+    }
+
+    /// The mask is applied as an additive bias, so a surviving logit
+    /// comes through bit-identical — `x + 0.0` is `x`, and any other
+    /// arrangement would perturb the values the sampler ranks.
+    #[test]
+    fn a_surviving_logit_is_not_touched_by_the_mask() {
+        let values = [0.1f32, -3.25, 7.5, 0.0, -0.0];
+        let logits = cpu_logits(&values);
+        let bias = mask_bias(&TokenMask::Deny(vec![1, 3]), values.len(), &Device::Cpu).unwrap();
+        let masked: Vec<f32> = logits.add(&bias).unwrap().to_vec1().unwrap();
+        assert_eq!(masked[0].to_bits(), values[0].to_bits());
+        assert_eq!(masked[2].to_bits(), values[2].to_bits());
+        assert!(masked[1].is_infinite() && masked[1].is_sign_negative());
+        assert!(masked[3].is_infinite() && masked[3].is_sign_negative());
+
+        // The one exception, pinned rather than papered over: `-0.0`
+        // comes back `+0.0` because IEEE-754 rounds a sum of unlike
+        // zeros that way. Equal under every comparison the samplers
+        // make, and it exponentiates to the same number, so nothing
+        // downstream can observe it — but it is not bit-identity.
+        assert_eq!(values[4].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(masked[4].to_bits(), 0.0f32.to_bits());
+        assert_eq!(masked[4], values[4], "still equal, and that is what ranks");
+    }
+
+    /// A constraint whose mask does not change between steps uploads
+    /// the bias once. Tensor identity is the observation: a cache hit
+    /// hands back a clone of the same tensor, a miss builds a new one.
+    #[test]
+    fn an_unchanged_mask_reuses_the_bias_it_already_built() {
+        let mut cache = MaskBias::default();
+        let mask = TokenMask::Allow(vec![1, 2]);
+        let first = cache.bias_for(&mask, 4, &Device::Cpu).unwrap();
+        let second = cache.bias_for(&mask, 4, &Device::Cpu).unwrap();
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "an unchanged mask must not rebuild"
+        );
+
+        let third = cache
+            .bias_for(&TokenMask::Allow(vec![1]), 4, &Device::Cpu)
+            .unwrap();
+        assert_ne!(first.id(), third.id(), "a changed mask must rebuild");
+
+        // A different vocabulary is a different bias even under the
+        // same mask, or a row of another width would be added to.
+        let fourth = cache
+            .bias_for(&TokenMask::Allow(vec![1]), 8, &Device::Cpu)
+            .unwrap();
+        assert_ne!(third.id(), fourth.id());
+        assert_eq!(fourth.dims(), &[8]);
+    }
+
+    /// The two refusals are decided from the id list, so they do not
+    /// need the logits and fire before anything reaches the device.
+    #[test]
+    fn the_mask_refusals_are_decided_without_the_logits() {
+        let err = mask_bias(&TokenMask::Allow(vec![9]), 4, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "{err}");
+
+        let err = mask_bias(&TokenMask::Deny(vec![0, 1, 2, 3]), 4, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fully masked"), "{err}");
+
+        let err = mask_bias(&TokenMask::Allow(Vec::new()), 4, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no candidate"), "{err}");
     }
 
     /// Logits used across the mask tests: argmax is index 1.
@@ -1068,7 +1198,7 @@ mod tests {
 
     /// An empty legal set is a caller bug in the *legality* computation,
     /// so it is refused where that computation is wired up rather than
-    /// one token later inside `apply_mask`.
+    /// one token later inside `mask_bias`.
     #[test]
     fn allow_list_rejects_an_empty_list_at_construction() {
         let err = match AllowListConstraint::new(Vec::new()) {
@@ -1079,7 +1209,7 @@ mod tests {
     }
 
     /// An id past the end of the vocab is still caught, just later: the
-    /// constraint cannot know the vocab size, so `apply_mask` is the one
+    /// constraint cannot know the vocab size, so `mask_bias` is the one
     /// place that can tell.
     #[test]
     fn allow_list_out_of_range_id_errors_at_sample_time() {

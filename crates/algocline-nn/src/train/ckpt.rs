@@ -190,6 +190,34 @@ impl CheckpointStore {
         self.keep
     }
 
+    /// Path of the per-step metrics file for this run.
+    ///
+    /// `<prefix>-metrics.jsonl`, beside the checkpoints, so a run's
+    /// curve travels with the weights it describes.
+    pub fn metrics_path(&self) -> PathBuf {
+        self.dir.join(format!("{}-metrics.jsonl", self.prefix))
+    }
+
+    /// Append one step's numbers to the metrics file.
+    ///
+    /// JSON Lines: one object per line, appended and flushed as the run
+    /// goes. An interrupted run therefore leaves a file that is valid up
+    /// to its last complete line, which a single JSON array would not —
+    /// and the point of a curve is most often to look at it while the
+    /// run is still going.
+    ///
+    /// Fields absent rather than null where a run does not have them: a
+    /// `grad_norm` of zero and no gradient norm at all are different
+    /// facts, and a reader that sees the key can rely on it.
+    pub fn append_metrics(&self, point: &MetricPoint) -> std::io::Result<()> {
+        let line = serde_json::to_string(point).map_err(std::io::Error::other)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.metrics_path())?;
+        writeln!(file, "{line}")
+    }
+
     /// Path a `step` checkpoint would be written to.
     pub fn path_for_step(&self, step: usize) -> PathBuf {
         self.dir
@@ -276,6 +304,29 @@ impl CheckpointStore {
         }
         Ok(())
     }
+}
+
+/// One step of a run, as the metrics file records it.
+///
+/// Flat and small on purpose: this is written once per step (or per
+/// `metrics_every` steps) and read by whatever plots it.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricPoint {
+    /// Optimizer step, 1-indexed, matching the checkpoint filenames.
+    pub step: usize,
+    /// Mean per-micro training loss on that step.
+    pub loss: f32,
+    /// Learning rate the step was taken at.
+    pub lr: f64,
+    /// Gradient norm, when the run was computing one (a hook or a
+    /// gradient cap asks for it; a run with neither pays nothing to
+    /// produce a number nobody asked for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grad_norm: Option<f32>,
+    /// Held-out loss at the most recent evaluation, on a run that has
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_loss: Option<f32>,
 }
 
 /// Build a [`Checkpoint`] record from a save path and per-run metrics.

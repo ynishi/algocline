@@ -37,8 +37,8 @@ use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use std::collections::BTreeMap;
 
 use algocline_nn::train::{
-    Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, KeepMark,
-    OptimizerKind, ScheduleKind, TrainError,
+    Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, EarlyStop, FullFtConfig,
+    KeepMark, OptimizerKind, ScheduleKind, TrainError,
 };
 use mlua::prelude::*;
 
@@ -593,6 +593,35 @@ fn apply_optional_overrides(
     // parameters again.
     if let Some(v) = opts.get::<Option<bool>>("save_optimizer_state")? {
         cfg.save_optimizer_state = v;
+    }
+    // Per-step curve. Writes `<card_id>-metrics.jsonl` beside the
+    // checkpoints; `0` (default) writes none.
+    if let Some(v) = opts.get::<Option<usize>>("metrics_every")? {
+        cfg.metrics_every = v;
+    }
+    // `early_stop = { patience = N, min_delta = x }`. Both keys are
+    // required when the table is present: a rule with one of them
+    // defaulted is a rule the caller did not write — `patience = 0`
+    // stops at the first evaluation that fails to improve, and
+    // `min_delta = 0` counts floating-point noise as progress, so
+    // neither is a safe thing to supply on the caller's behalf.
+    if let Some(t) = opts.get::<Option<LuaTable>>("early_stop")? {
+        let patience: usize = t.get::<Option<usize>>("patience")?.ok_or_else(|| {
+            LuaError::external(format!(
+                "{prefix}: opts.early_stop.patience is required — how many evaluations \
+                 without improvement the run tolerates"
+            ))
+        })?;
+        let min_delta: f32 = t.get::<Option<f32>>("min_delta")?.ok_or_else(|| {
+            LuaError::external(format!(
+                "{prefix}: opts.early_stop.min_delta is required — how much lower the \
+                 held-out loss has to be to count as an improvement"
+            ))
+        })?;
+        cfg.early_stop = Some(EarlyStop {
+            patience,
+            min_delta,
+        });
     }
     // Global-norm gradient cap. Absent means uncapped; the loop
     // refuses a value that cannot cap anything.

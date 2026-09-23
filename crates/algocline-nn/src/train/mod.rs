@@ -167,7 +167,7 @@ pub trait AllowedForward {
 
 pub use ckpt::{
     checkpoint_from_path, restore_into, restore_into_partial, ApplyStage, Candidate,
-    CheckpointStore, RestoreError, RestoreReport, TensorMismatch,
+    CheckpointStore, MetricPoint, RestoreError, RestoreReport, TensorMismatch,
 };
 // The types carry their noun and are re-exported; `interleave` /
 // `interleave_labelled` do not, and `train::interleave` would read as
@@ -181,7 +181,7 @@ pub use data::{
 pub use fullft::{
     allowed_input_sets, allowed_logit_mask, run_allowed_ft, run_conditioned_ft, run_distill,
     run_full_ft, run_lora_ft, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind,
-    DistillSpec, FullFtConfig, KeepMark, OptimizerKind, TrainError, TrainingLease,
+    DistillSpec, EarlyStop, FullFtConfig, KeepMark, OptimizerKind, TrainError, TrainingLease,
     TrainingLeaseGuard,
 };
 pub use lion::{Lion, ParamsLion};

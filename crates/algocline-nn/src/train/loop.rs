@@ -29,7 +29,7 @@ use candle_nn::{Module, Optimizer, ParamsAdamW, VarMap};
 
 use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
 use crate::train::ckpt::{
-    checkpoint_from_path, restore_into, Candidate, CheckpointStore, RestoreError,
+    checkpoint_from_path, restore_into, Candidate, CheckpointStore, MetricPoint, RestoreError,
 };
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::lion::{Lion, ParamsLion};
@@ -363,6 +363,34 @@ pub struct FullFtConfig {
     /// measured before this scaling, so it says what the step actually
     /// produced rather than what the cap allowed through.
     pub clip_grad_norm: Option<f64>,
+    /// Append one line per N optimizer steps to a
+    /// `<prefix>-metrics.jsonl` file beside the checkpoints, or `0`
+    /// (default) to write none.
+    ///
+    /// What the run produced used to reach a record only as final
+    /// values on the Card and as `Candidate` rows at keep time — two
+    /// snapshots and no curve. Whether a run converged, stalled,
+    /// diverged, or was still descending when it ran out of steps are
+    /// all different shapes of the same final loss, and none of them is
+    /// legible from it. `tracing` already emits a `train_step` event per
+    /// step, but that is a subscriber's to collect and is gone
+    /// afterwards; this leaves a file the run itself wrote.
+    ///
+    /// One JSON object per line (`{"step":…,"loss":…,"lr":…}`, plus
+    /// `grad_norm` and `val_loss` where the run has them), which is the
+    /// shape every plotting tool reads and which an interrupted run
+    /// leaves valid up to its last complete line.
+    pub metrics_every: usize,
+    /// Stop when the held-out loss has not improved for a while, or
+    /// `None` (default) to run every step asked for.
+    ///
+    /// Requires [`Self::eval_every`] and a validation dataset:
+    /// stopping on the training loss would stop when the model stopped
+    /// fitting the data it is being fitted to, which is not the
+    /// question early stopping asks. Configured without them it is
+    /// [`TrainError::EarlyStopWithoutValidation`] rather than a rule
+    /// that quietly never fires.
+    pub early_stop: Option<EarlyStop>,
     /// Score the held-out set every N optimizer steps, or `0`
     /// (default) to run without one.
     ///
@@ -448,11 +476,71 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            metrics_every: 0,
+            early_stop: None,
             save_optimizer_state: false,
             clip_grad_norm: None,
             eval_every: 0,
             init_from: None,
             mask_disallowed_logits: false,
+        }
+    }
+}
+
+/// When to stop a run that is no longer improving.
+///
+/// Read at every evaluation boundary, against the held-out loss. The
+/// rule is the standard one and both halves of it matter: `patience`
+/// alone stops on noise, and `min_delta` alone never stops a run whose
+/// loss keeps creeping down by nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct EarlyStop {
+    /// Evaluations without an improvement before the run stops.
+    ///
+    /// `0` stops at the first evaluation that fails to improve, which
+    /// is almost always too eager — a loss curve is not monotone at the
+    /// scale of one evaluation period.
+    pub patience: usize,
+    /// How much lower the loss has to be to count as an improvement.
+    ///
+    /// `0.0` counts any decrease, including one indistinguishable from
+    /// floating-point noise, which makes `patience` nearly unreachable
+    /// on a long run.
+    pub min_delta: f32,
+}
+
+/// The best held-out loss seen, and how long since it was beaten.
+#[derive(Debug)]
+struct EarlyStopWatch {
+    rule: EarlyStop,
+    best: f32,
+    /// Evaluations since `best` was last improved on.
+    since: usize,
+}
+
+impl EarlyStopWatch {
+    fn new(rule: EarlyStop) -> Self {
+        Self {
+            rule,
+            best: f32::INFINITY,
+            since: 0,
+        }
+    }
+
+    /// Record one evaluation and answer whether the run should stop.
+    ///
+    /// A non-finite loss is not an improvement and not a reason to keep
+    /// going: it counts against patience like any other failure to
+    /// improve, so a run that diverges into NaN stops on the same rule
+    /// rather than running to the end producing nothing.
+    fn observe(&mut self, value: f32) -> bool {
+        if value.is_finite() && value < self.best - self.rule.min_delta {
+            self.best = value;
+            self.since = 0;
+            false
+        } else {
+            self.since += 1;
+            self.since > self.rule.patience
         }
     }
 }
@@ -611,6 +699,17 @@ pub enum TrainError {
         /// The half it needs.
         missing: &'static str,
     },
+    /// [`FullFtConfig::early_stop`] was set on a run with nothing to
+    /// watch.
+    ///
+    /// The rule reads the held-out loss, and a run without a held-out
+    /// set never produces one. Refused rather than left to never fire,
+    /// which is indistinguishable from a rule that was never reached.
+    #[error(
+        "early_stop needs a held-out set to watch: set eval_every and pass a validation \
+         dataset, or drop the rule"
+    )]
+    EarlyStopWithoutValidation,
     /// A validation dataset was handed over and produced no batch.
     ///
     /// Refused at the start rather than reported as an absent
@@ -1243,6 +1342,9 @@ fn run_ft_core(
     // The two halves of the validation setup, checked against each
     // other before the lease is taken: both mismatches end in a run
     // that looks configured and measures nothing.
+    if cfg.early_stop.is_some() && cfg.eval_every == 0 {
+        return Err(TrainError::EarlyStopWithoutValidation);
+    }
     let val = match (val, cfg.eval_every) {
         (Some(_), 0) => {
             return Err(TrainError::ValidationHalfConfigured {
@@ -1334,6 +1436,7 @@ fn run_ft_core(
     // without a held-out set reports for its whole length.
     let mut last_val_loss: Option<f32> = None;
     let mut min_val_loss = f32::INFINITY;
+    let mut watch = cfg.early_stop.map(EarlyStopWatch::new);
     // Checkpoints the hook asked to hold, in the order it asked.
     let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -1431,6 +1534,7 @@ fn run_ft_core(
 
         // Scored after the step, so the value belongs to the weights
         // the checkpoint written just below actually holds.
+        let mut out_of_patience = false;
         if let Some(batches) = val_batches.as_ref() {
             if (step + 1) % cfg.eval_every == 0 {
                 let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
@@ -1439,7 +1543,55 @@ fn run_ft_core(
                     min_val_loss = v;
                 }
                 tracing::info!(step = step, val_loss = v, "eval_step");
+                if let Some(watch) = watch.as_mut() {
+                    out_of_patience = watch.observe(v);
+                }
             }
+        }
+
+        // The curve, written as the run goes rather than collected at
+        // the end: a run that dies still leaves what it had.
+        if cfg.metrics_every > 0 && (step + 1) % cfg.metrics_every == 0 {
+            let point = MetricPoint {
+                step: step + 1,
+                loss: mean_loss,
+                lr,
+                grad_norm: (will_fire_hook || cfg.clip_grad_norm.is_some()).then_some(grad_norm),
+                val_loss: last_val_loss,
+            };
+            ckpt_store
+                .append_metrics(&point)
+                .map_err(|e| TrainError::Ckpt(format!("metrics: {e}")))?;
+        }
+
+        if out_of_patience {
+            // The run stops where it stopped improving, and says so:
+            // a caller reading `step` against `cfg.steps` would
+            // otherwise have to guess whether the run was cut short or
+            // the config was.
+            tracing::info!(
+                target: "algocline_nn::train",
+                step = step + 1,
+                val_loss = last_val_loss,
+                "early stop: the held-out loss stopped improving"
+            );
+            let final_path = ckpt_store
+                .save_final(save_vm)
+                .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+            save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
+            let mut metrics: HashMap<String, f32> = HashMap::new();
+            metrics.insert("min_train_loss".into(), running_min_loss);
+            metrics.insert("final_lr".into(), lr as f32);
+            metrics.insert("early_stop".into(), 1.0);
+            metrics.insert("min_val_loss".into(), min_val_loss);
+            if resumed_step > 0 {
+                metrics.insert("resumed_from_step".into(), resumed_step as f32);
+            }
+            let mut ckpt =
+                checkpoint_from_path(&final_path, step + 1, mean_loss, last_val_loss, metrics)
+                    .map_err(TrainError::Ckpt)?;
+            ckpt.candidates = candidates;
+            return Ok(ckpt);
         }
 
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
@@ -2738,6 +2890,201 @@ mod tests {
             seen.iter().all(|v| v.is_some()),
             "every fire lands on an evaluation boundary here, so each carries a value: {seen:?}"
         );
+    }
+
+    /// Early stopping ends the run where the held-out loss stopped
+    /// improving, and the record says the run was cut short rather than
+    /// leaving a caller to compare `step` against `steps` and guess.
+    #[test]
+    fn early_stopping_ends_a_run_that_stopped_improving() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            // No learning at all, so the held-out loss cannot improve
+            // and the rule is the only thing that can end the run.
+            lr: 0.0,
+            weight_decay: 0.0,
+            steps: 20,
+            warmup: 0,
+            eval_every: 1,
+            early_stop: Some(EarlyStop {
+                patience: 2,
+                min_delta: 0.0,
+            }),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "stop",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("run");
+
+        assert!(
+            ckpt.step < cfg.steps,
+            "the run should have stopped early, ended at {}",
+            ckpt.step
+        );
+        assert_eq!(
+            ckpt.metrics.get("early_stop").copied(),
+            Some(1.0),
+            "the record has to distinguish a stopped run from a finished one"
+        );
+        assert!(tmp.path().join("stop.safetensors").exists());
+    }
+
+    /// A rule with nothing to watch is refused rather than left never
+    /// to fire.
+    #[test]
+    fn early_stopping_without_a_held_out_set_is_refused() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 4,
+            early_stop: Some(EarlyStop {
+                patience: 1,
+                min_delta: 0.0,
+            }),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "nostop",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::EarlyStopWithoutValidation),
+            "{err}"
+        );
+    }
+
+    /// The patience rule itself, away from a training run: an
+    /// improvement resets the count, a non-improvement spends it, and a
+    /// non-finite loss counts as a failure to improve rather than as a
+    /// reason to keep going.
+    #[test]
+    fn the_patience_rule_counts_what_it_says_it_counts() {
+        let mut watch = EarlyStopWatch::new(EarlyStop {
+            patience: 2,
+            min_delta: 0.1,
+        });
+        assert!(!watch.observe(1.0), "the first value is the best so far");
+        assert!(
+            !watch.observe(0.95),
+            "0.05 is inside min_delta: no improvement (1 of 2)"
+        );
+        assert!(!watch.observe(0.80), "a real improvement resets the count");
+        assert!(!watch.observe(0.80), "no improvement (1 of 2)");
+        assert!(!watch.observe(0.80), "no improvement (2 of 2)");
+        assert!(watch.observe(0.80), "patience spent");
+
+        let mut watch = EarlyStopWatch::new(EarlyStop {
+            patience: 0,
+            min_delta: 0.0,
+        });
+        assert!(!watch.observe(1.0));
+        assert!(
+            watch.observe(f32::NAN),
+            "a diverged run must not outlive the rule"
+        );
+    }
+
+    /// The metrics file is a curve: one line per step, valid JSON on
+    /// each, and the numbers are the ones the run reported.
+    #[test]
+    fn the_metrics_file_records_one_line_per_step() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 6,
+            warmup: 0,
+            metrics_every: 2,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "curve",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+
+        let path = tmp.path().join("curve-metrics.jsonl");
+        let text = std::fs::read_to_string(&path).expect("the metrics file exists");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "6 steps at every 2");
+        let points: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("each line is a JSON object"))
+            .collect();
+        assert_eq!(points[0]["step"], 2);
+        assert_eq!(points[2]["step"], 6);
+        assert!(points[0]["loss"].is_number());
+        assert!(
+            points[0].get("val_loss").is_none(),
+            "a run with no held-out set writes no val_loss key"
+        );
+        assert!(
+            points[0].get("grad_norm").is_none(),
+            "a run computing no gradient norm writes no grad_norm key"
+        );
+        assert_eq!(ckpt.step, 6);
+    }
+
+    /// A run that was not asked for a curve writes no file.
+    #[test]
+    fn no_metrics_file_is_written_unless_one_was_asked_for() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "quiet",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert!(!tmp.path().join("quiet-metrics.jsonl").exists());
     }
 
     /// Without a held-out set the record says so rather than reporting

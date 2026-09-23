@@ -26,6 +26,7 @@ use candle_nn::{
 };
 
 use super::custom::{Activation, Gpt2Custom, NormKind, NormPlacement, PosKind, ResidualKind};
+use super::kv::KvCache;
 use super::tinyllama::{apply_rope, apply_slow_rms_norm, build_rope_cache, repeat_kv};
 
 // `LoraLinear` is imported for the intra-doc links (`[`LoraLinear`]`) in the
@@ -414,14 +415,35 @@ struct Block {
     head_dim: usize,
 }
 
+/// One layer's window onto a [`KvCache`](crate::arch::kv::KvCache).
+///
+/// A block is handed its own layer index alongside the cache rather
+/// than a bare slot, because the cache owns the concatenation and the
+/// bounds check; a `&mut` to one layer's tensors would put both in the
+/// block.
+struct KvSlot<'a> {
+    cache: &'a mut KvCache,
+    layer: usize,
+}
+
 /// Per-forward positional context threaded from [`Gpt2Model`] into
 /// every block: the RoPE cos/sin cache and/or the ALiBi score bias.
 /// Both are `None` on the reference (learned `wpe`) and NoPos paths.
 struct PosContext<'a> {
     /// `[ctx, head_dim/2]` cos / sin tables ([`build_rope_cache`]).
     rope: Option<(&'a Tensor, &'a Tensor)>,
-    /// `[heads, t, t]` additive score bias (already negated).
+    /// `[heads, t, offset + t]` additive score bias (already negated).
     alibi: Option<&'a Tensor>,
+    /// Absolute index the first of this forward's positions sits at.
+    ///
+    /// `0` for a full-sequence pass. Non-zero when a
+    /// [`KvCache`](crate::arch::kv::KvCache) already holds the earlier
+    /// positions, and then it is what makes every position-dependent
+    /// term read the position the token actually occupies rather than
+    /// its index within the step: the rotation, the learned
+    /// positional embedding, the ALiBi distance and the row of the
+    /// causal mask are all functions of the absolute index.
+    offset: usize,
 }
 
 /// The block's feed-forward half — the seam [`Gpt2Config::moe`] /
@@ -542,9 +564,17 @@ impl Block {
         Ok(())
     }
 
-    fn attention(&self, x: &Tensor, mask: &Tensor, pos: &PosContext<'_>) -> CandleResult<Tensor> {
-        // x: [B, T, D]
+    fn attention(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        pos: &PosContext<'_>,
+        kv: Option<KvSlot<'_>>,
+    ) -> CandleResult<Tensor> {
+        // x: [B, T, D] — T is this step's new positions, which is the
+        // whole sequence without a cache and usually one token with.
         let (b, t, _d) = x.dims3()?;
+        let offset = pos.offset;
         let qkv = self.c_attn.forward(x)?; // [B, T, D + 2·kv·Dh]
                                            // Split into Q [B,T,H·Dh] / K,V [B,T,kv·Dh]. For MHA
                                            // (kv == heads) this is byte-identical to the reference
@@ -568,11 +598,27 @@ impl Block {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // RoPE rotates Q and K in-place (backward-safe slow shim; the
-        // cache is narrowed to the active prefix inside `rope_slow`).
+        // RoPE rotates Q and K in-place (backward-safe slow shim). The
+        // tables are narrowed to this step's absolute positions first:
+        // `rope_slow` narrows to the leading `t` rows of what it is
+        // given, which is the right rotation only when the step starts
+        // at position 0.
         let (q, k) = match pos.rope {
-            Some((cos, sin)) => (apply_rope(&q, cos, sin)?, apply_rope(&k, cos, sin)?),
+            Some((cos, sin)) => {
+                let cos = cos.narrow(0, offset, t)?;
+                let sin = sin.narrow(0, offset, t)?;
+                (apply_rope(&q, &cos, &sin)?, apply_rope(&k, &cos, &sin)?)
+            }
             None => (q, k),
+        };
+
+        // The cache holds the rotated, un-broadcast K/V — rotation is a
+        // function of the absolute position and does not change as the
+        // sequence grows, and the GQA repeat below would store
+        // `heads / kv_heads` copies of every entry for no gain.
+        let (k, v) = match kv {
+            Some(slot) => slot.cache.push(slot.layer, &k, &v)?,
+            None => (k, v),
         };
 
         // GQA: share each KV head across `heads / kv_heads` query
@@ -593,8 +639,12 @@ impl Block {
         }
 
         // Causal mask: keep positions j <= i (banded when the sliding
-        // window is on — see `build_causal_mask`).
-        let mask = mask.i((..t, ..t))?; // [T, T]
+        // window is on — see `build_causal_mask`). Rows are this
+        // step's absolute positions and columns run over the whole
+        // history, which without a cache is the same `[..t, ..t]`
+        // square as before.
+        let keys = offset + t;
+        let mask = mask.i((offset..keys, ..keys))?; // [T, offset + T]
         let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
             .to_dtype(scores.dtype())?
             .broadcast_as(scores.shape())?;
@@ -674,13 +724,14 @@ impl Block {
         mask: &Tensor,
         pos: &PosContext<'_>,
         probs_sink: Option<&mut Vec<Tensor>>,
+        kv: Option<KvSlot<'_>>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
         match (self.placement, self.residual) {
             // GPT-2 reference: norm the input, two sequential residual
             // writes.
             (NormPlacement::PreLn, ResidualKind::Sequential) => {
                 let n = self.ln_1.apply(x)?;
-                let a = self.attention(&n, mask, pos)?;
+                let a = self.attention(&n, mask, pos, kv)?;
                 let x = (x + a)?;
                 let n = self.ln_2.apply(&x)?;
                 let (m, aux) = self.feed_forward(&n, probs_sink)?;
@@ -689,14 +740,14 @@ impl Block {
             // GPT-J / PaLM: both halves read the block input; one
             // combined residual write.
             (NormPlacement::PreLn, ResidualKind::Parallel) => {
-                let a = self.attention(&self.ln_1.apply(x)?, mask, pos)?;
+                let a = self.attention(&self.ln_1.apply(x)?, mask, pos, kv)?;
                 let (m, aux) = self.feed_forward(&self.ln_2.apply(x)?, probs_sink)?;
                 Ok((((x + a)? + m)?, aux))
             }
             // Original Transformer: norm the residual sum after each
             // sublayer.
             (NormPlacement::PostLn, ResidualKind::Sequential) => {
-                let a = self.attention(x, mask, pos)?;
+                let a = self.attention(x, mask, pos, kv)?;
                 let x = self.ln_1.apply(&(x + a)?)?;
                 let (m, aux) = self.feed_forward(&x, probs_sink)?;
                 Ok((self.ln_2.apply(&(x + m)?)?, aux))
@@ -1323,7 +1374,98 @@ impl Gpt2Model {
     /// [`Self::forward_allowed`] for why that is refused rather than
     /// run with the channel absent.
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
-        self.forward_inner(xs, None, None, None)
+        self.forward_inner(xs, None, None, None, None)
+            .map(|(logits, _)| logits)
+    }
+
+    /// An empty [`KvCache`] sized to this model.
+    ///
+    /// One per generation: the entries are positions of one particular
+    /// sequence, and a cache shared between two of them would have each
+    /// attending over the other's history with every shape still
+    /// agreeing.
+    pub fn new_cache(&self) -> KvCache {
+        KvCache::new(self.blocks.len())
+    }
+
+    /// Forward only the tokens in `xs`, attending over everything
+    /// `cache` already holds.
+    ///
+    /// The decode form of [`Self::forward`]. The first call takes the
+    /// whole prompt and each later one takes the tokens added since,
+    /// usually a single sampled id; `cache` grows by what each call
+    /// forwards. Output is `[batch, seq_of_this_call, vocab]`, so a
+    /// decoder reads the last row rather than the last row of the whole
+    /// history.
+    ///
+    /// Generating `n` tokens this way runs the model over `n` positions
+    /// instead of `1 + 2 + … + n`. The result is the same: position
+    /// `p`'s attention reads the same keys and values either way, and
+    /// they do not change once computed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`], plus a cache built for a different layer
+    /// count or filled at a different batch size, and a step that would
+    /// carry the sequence past `ctx` counting what the cache holds.
+    pub fn forward_with_cache(&self, xs: &Tensor, cache: &mut KvCache) -> CandleResult<Tensor> {
+        self.forward_inner(xs, None, None, None, Some(cache))
+            .map(|(logits, _)| logits)
+    }
+
+    /// [`Self::forward_conditioned`] against a [`KvCache`].
+    ///
+    /// The condition is added at every position of every step, as it is
+    /// without a cache — including the positions the cache already
+    /// holds, which received it when they were forwarded. A caller that
+    /// changed the condition mid-generation would therefore produce a
+    /// sequence no single forward explains, which is why the session
+    /// surface fixes it for the session's lifetime.
+    pub fn forward_conditioned_with_cache(
+        &self,
+        xs: &Tensor,
+        conds: &[CondIndex],
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        self.forward_inner(
+            xs,
+            Some(CondInput::Rows { conds, per_row: 1 }),
+            None,
+            None,
+            Some(cache),
+        )
+        .map(|(logits, _)| logits)
+    }
+
+    /// [`Self::forward_cond_weighted`] against a [`KvCache`].
+    pub fn forward_cond_weighted_with_cache(
+        &self,
+        xs: &Tensor,
+        weights: &[f32],
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        self.forward_inner(
+            xs,
+            Some(CondInput::Weights(weights)),
+            None,
+            None,
+            Some(cache),
+        )
+        .map(|(logits, _)| logits)
+    }
+
+    /// [`Self::forward_allowed`] against a [`KvCache`].
+    ///
+    /// `allowed` covers this step's positions only — the sets for the
+    /// positions already in the cache were read when those positions
+    /// were forwarded, and cannot be revised now.
+    pub fn forward_allowed_with_cache(
+        &self,
+        xs: &Tensor,
+        allowed: &AllowedSets,
+        cache: &mut KvCache,
+    ) -> CandleResult<Tensor> {
+        self.forward_inner(xs, None, Some(allowed), None, Some(cache))
             .map(|(logits, _)| logits)
     }
 
@@ -1381,7 +1523,7 @@ impl Gpt2Model {
     ///   also reach.
     /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
     pub fn forward_cond_weighted(&self, xs: &Tensor, weights: &[f32]) -> CandleResult<Tensor> {
-        self.forward_inner(xs, Some(CondInput::Weights(weights)), None, None)
+        self.forward_inner(xs, Some(CondInput::Weights(weights)), None, None, None)
             .map(|(logits, _)| logits)
     }
 
@@ -1412,8 +1554,14 @@ impl Gpt2Model {
     ///   which is a crossed pair rather than a typo.
     /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
     pub fn forward_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
-        self.forward_inner(xs, Some(CondInput::Rows { conds, per_row: 1 }), None, None)
-            .map(|(logits, _)| logits)
+        self.forward_inner(
+            xs,
+            Some(CondInput::Rows { conds, per_row: 1 }),
+            None,
+            None,
+            None,
+        )
+        .map(|(logits, _)| logits)
     }
 
     /// [`Self::forward_conditioned`] with `per_row` conditions per row,
@@ -1462,8 +1610,14 @@ impl Gpt2Model {
                     .into(),
             ));
         }
-        self.forward_inner(xs, Some(CondInput::Rows { conds, per_row }), None, None)
-            .map(|(logits, _)| logits)
+        self.forward_inner(
+            xs,
+            Some(CondInput::Rows { conds, per_row }),
+            None,
+            None,
+            None,
+        )
+        .map(|(logits, _)| logits)
     }
 
     /// Forward pass with the ids allowed at each position added to the
@@ -1518,7 +1672,7 @@ impl Gpt2Model {
     /// - Any id is outside the vocabulary.
     /// - Anything [`Self::forward`] rejects, `seq > ctx` included.
     pub fn forward_allowed(&self, xs: &Tensor, allowed: &AllowedSets) -> CandleResult<Tensor> {
-        self.forward_inner(xs, None, Some(allowed), None)
+        self.forward_inner(xs, None, Some(allowed), None, None)
             .map(|(logits, _)| logits)
     }
 
@@ -1527,7 +1681,7 @@ impl Gpt2Model {
     /// composing the total loss). `None` on a dense (non-MoE) model,
     /// so existing callers of [`Self::forward`] see no change.
     pub fn forward_with_aux(&self, xs: &Tensor) -> CandleResult<(Tensor, Option<Tensor>)> {
-        self.forward_inner(xs, None, None, None)
+        self.forward_inner(xs, None, None, None, None)
     }
 
     /// Probe variant of [`Self::forward_with_aux`] that additionally
@@ -1540,7 +1694,7 @@ impl Gpt2Model {
         xs: &Tensor,
     ) -> CandleResult<(Tensor, Option<Tensor>, Vec<Tensor>)> {
         let mut probs = Vec::new();
-        let (logits, aux) = self.forward_inner(xs, None, None, Some(&mut probs))?;
+        let (logits, aux) = self.forward_inner(xs, None, None, Some(&mut probs), None)?;
         Ok((logits, aux, probs))
     }
 
@@ -1550,18 +1704,39 @@ impl Gpt2Model {
         cond: Option<CondInput<'_>>,
         allowed: Option<&AllowedSets>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
+        mut kv: Option<&mut KvCache>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
         let (b, t) = xs.dims2()?;
-        if t > self.cfg.ctx {
+        // Read once, before any layer runs: every position-dependent
+        // term below is a function of it, and the cache only advances
+        // after the last layer.
+        let offset = match kv.as_ref() {
+            Some(cache) => {
+                cache.check_batch(b)?;
+                if cache.layer_count() != self.blocks.len() {
+                    return Err(candle_core::Error::Msg(format!(
+                        "gpt2 forward: kv cache was built for {} layer(s) and this model has {}",
+                        cache.layer_count(),
+                        self.blocks.len()
+                    )));
+                }
+                cache.len()
+            }
+            None => 0,
+        };
+        if offset + t > self.cfg.ctx {
             return Err(candle_core::Error::Msg(format!(
-                "gpt2 forward: seq {t} exceeds ctx {}",
+                "gpt2 forward: seq {t} at position {offset} exceeds ctx {}",
                 self.cfg.ctx
             )));
         }
         let tok_emb = self.wte.forward(xs)?; // [B, T, D]
         let mut h = match &self.wpe {
             Some(wpe) => {
-                let pos_ids = Tensor::arange(0u32, t as u32, xs.device())?; // [T]
+                // The absolute positions, so a cached step's token
+                // reads the embedding of where it sits rather than of
+                // where it sits within the step.
+                let pos_ids = Tensor::arange(offset as u32, (offset + t) as u32, xs.device())?; // [T]
                 let pos_emb = wpe.forward(&pos_ids)?; // [T, D]
                 let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(tok_emb.shape())?;
                 (tok_emb + pos_emb)?
@@ -1617,11 +1792,12 @@ impl Gpt2Model {
             }
             (None, None) => {}
         }
-        // ALiBi score bias for the active prefix: [H, t, t] =
-        // -slopes ⊙ (i - j). Constant tensors — no gradient tracking.
+        // ALiBi score bias for this step against the whole history:
+        // [H, t, offset + t] = -slopes ⊙ (i - j). Constant tensors —
+        // no gradient tracking.
         let alibi_bias = match &self.alibi {
             Some((slopes, dist)) => {
-                let dist_t = dist.i((..t, ..t))?.unsqueeze(0)?; // [1, t, t]
+                let dist_t = dist.i((offset..offset + t, ..offset + t))?.unsqueeze(0)?;
                 Some(slopes.broadcast_mul(&dist_t)?.neg()?)
             }
             None => None,
@@ -1629,11 +1805,18 @@ impl Gpt2Model {
         let pos_ctx = PosContext {
             rope: self.rope.as_ref().map(|(c, s)| (c, s)),
             alibi: alibi_bias.as_ref(),
+            offset,
         };
         let mut aux_sum: Option<Tensor> = None;
-        for block in &self.blocks {
-            let (next, aux) =
-                block.forward(&h, &self.causal_mask, &pos_ctx, probs_sink.as_deref_mut())?;
+        for (layer, block) in self.blocks.iter().enumerate() {
+            let slot = kv.as_deref_mut().map(|cache| KvSlot { cache, layer });
+            let (next, aux) = block.forward(
+                &h,
+                &self.causal_mask,
+                &pos_ctx,
+                probs_sink.as_deref_mut(),
+                slot,
+            )?;
             h = next;
             if let Some(a) = aux {
                 aux_sum = Some(match aux_sum {
@@ -1650,6 +1833,11 @@ impl Gpt2Model {
         };
         let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
+        // After every layer has pushed its entries, so the offset each
+        // of them read was the same one.
+        if let Some(cache) = kv {
+            cache.advance(b, t);
+        }
         Ok((logits, aux_sum))
     }
 
@@ -2490,6 +2678,178 @@ mod tests {
             n
         };
         assert_eq!(names(None), names(Some(Gpt2Custom::default())));
+    }
+
+    /// The claim the cache rests on: decoding step by step over a
+    /// cache produces the logits the full re-forward produces.
+    ///
+    /// Run across every position scheme, because that is where the
+    /// offset enters — the learned embedding reads it directly, RoPE
+    /// rotates by it, ALiBi measures distance from it, and `NoPos`
+    /// ignores it. A cache that got the offset wrong would still return
+    /// correctly-shaped logits under all four.
+    #[test]
+    fn a_cached_decode_matches_the_full_re_forward() {
+        for pos in [
+            PosKind::Learned,
+            PosKind::Rope,
+            PosKind::Alibi,
+            PosKind::NoPos,
+        ] {
+            let cfg = Gpt2Config {
+                custom: Some(Gpt2Custom {
+                    pos,
+                    ..Default::default()
+                }),
+                ..tiny_cfg()
+            };
+            let vm = VarMap::new();
+            // Seeded, so the two models below are the same model and a
+            // difference in the logits is the cache's doing.
+            let vs = crate::arch::seeded_var_builder(&vm, 4242, cfg.dtype, &cfg.device);
+            let model = Gpt2Model::new(&cfg, vs).unwrap();
+
+            let ids: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+            let prompt = 3;
+            let mut cache = model.new_cache();
+
+            // Prompt in one step, then one token at a time.
+            let first = Tensor::from_slice(&ids[..prompt], (1, prompt), &cfg.device).unwrap();
+            let mut cached_rows = vec![last_row(
+                &model.forward_with_cache(&first, &mut cache).unwrap(),
+            )];
+            for (i, id) in ids.iter().enumerate().skip(prompt) {
+                let step = Tensor::from_slice(&[*id], (1, 1), &cfg.device).unwrap();
+                let logits = model.forward_with_cache(&step, &mut cache).unwrap();
+                assert_eq!(
+                    logits.dims(),
+                    &[1, 1, cfg.vocab],
+                    "a cached step returns only its own positions (pos={pos:?}, i={i})"
+                );
+                cached_rows.push(last_row(&logits));
+            }
+            assert_eq!(cache.len(), ids.len());
+
+            // The same sequence, re-forwarded in full at each length.
+            for (step, row) in cached_rows.iter().enumerate() {
+                let upto = prompt + step;
+                let full = Tensor::from_slice(&ids[..upto], (1, upto), &cfg.device).unwrap();
+                let reference = last_row(&model.forward(&full).unwrap());
+                let gap = max_abs(row, &reference);
+                assert!(
+                    gap < 2e-4,
+                    "pos={pos:?} step={step}: cached decode diverged from the full \
+                     re-forward by {gap}"
+                );
+            }
+        }
+    }
+
+    /// The same equivalence with a conditioning table attached: the
+    /// condition has to reach every step, not only the one that carried
+    /// the whole history.
+    #[test]
+    fn a_cached_conditioned_decode_matches_the_full_re_forward() {
+        let cfg = Gpt2Config {
+            custom: Some(Gpt2Custom {
+                cond_slots: Some(2),
+                ..Default::default()
+            }),
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vs = crate::arch::seeded_var_builder(&vm, 77, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let conds = [CondIndex::new(1, 2).unwrap()];
+
+        let ids: Vec<u32> = vec![2, 3, 4, 5];
+        let mut cache = model.new_cache();
+        let first = Tensor::from_slice(&ids[..2], (1, 2), &cfg.device).unwrap();
+        model
+            .forward_conditioned_with_cache(&first, &conds, &mut cache)
+            .unwrap();
+        for id in &ids[2..] {
+            let step = Tensor::from_slice(&[*id], (1, 1), &cfg.device).unwrap();
+            let cached = last_row(
+                &model
+                    .forward_conditioned_with_cache(&step, &conds, &mut cache)
+                    .unwrap(),
+            );
+            let upto = cache.len();
+            let full = Tensor::from_slice(&ids[..upto], (1, upto), &cfg.device).unwrap();
+            let reference = last_row(&model.forward_conditioned(&full, &conds).unwrap());
+            let gap = max_abs(&cached, &reference);
+            assert!(gap < 2e-4, "conditioned cached decode diverged by {gap}");
+        }
+    }
+
+    /// A cache built for another model, or filled by another sequence,
+    /// is refused rather than read as this one's history.
+    #[test]
+    fn a_cache_that_does_not_belong_to_this_forward_is_refused() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+
+        let mut wrong_layers = KvCache::new(cfg.layers + 1);
+        let ids = Tensor::from_slice(&[1u32, 2], (1, 2), &cfg.device).unwrap();
+        let err = model
+            .forward_with_cache(&ids, &mut wrong_layers)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("layer"), "{err}");
+
+        let mut cache = model.new_cache();
+        model.forward_with_cache(&ids, &mut cache).unwrap();
+        let batched = Tensor::from_slice(&[1u32, 2, 3, 4], (2, 2), &cfg.device).unwrap();
+        let err = model
+            .forward_with_cache(&batched, &mut cache)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("batch"), "{err}");
+    }
+
+    /// The context window is counted against what the cache holds, not
+    /// against the step alone — otherwise a decode loop would run past
+    /// `ctx` one token at a time.
+    #[test]
+    fn a_cached_step_past_the_context_window_is_refused() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let mut cache = model.new_cache();
+        let full: Vec<u32> = (0..cfg.ctx as u32).collect();
+        let ids = Tensor::from_slice(&full, (1, cfg.ctx), &cfg.device).unwrap();
+        model.forward_with_cache(&ids, &mut cache).unwrap();
+        let one = Tensor::from_slice(&[1u32], (1, 1), &cfg.device).unwrap();
+        let err = model
+            .forward_with_cache(&one, &mut cache)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds ctx"), "{err}");
+    }
+
+    /// Last position's logits row as a host vector.
+    fn last_row(logits: &Tensor) -> Vec<f32> {
+        let t = logits.dims()[1];
+        logits
+            .i((0, t - 1))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// Largest elementwise gap between two equal-length rows.
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     #[test]

@@ -37,17 +37,20 @@
 //!
 //! # Sessions over trainable arches (GPT-2 / TinyLlama)
 //!
-//! The trainable arch models expose no KV cache — their `forward` is
-//! the training-loop full-sequence pass. Their sessions therefore run
-//! on a **stateless backend**: every `next_logits` re-forwards the full
-//! token history and slices the final position's row. That is O(n²)
-//! over the generation length, which is acceptable for the model sizes
-//! the train side targets (tiny/small presets, smoke-scale ctx) and
-//! buys the same Lua surface as the Llama session — a decode loop
-//! written against one handle kind runs unchanged against the others.
-//! The history is capped at the model's context window; exceeding it is
-//! a loud session-level error rather than a positional-embedding
-//! failure surfacing from candle.
+//! These carry a KV cache of their own
+//! ([`algocline_nn::arch::KvCache`], one per session, obtained from the
+//! model's `new_cache`), so a session forwards only the tokens appended
+//! since its last step and attends over the rest. Generating `n` tokens
+//! runs the model over `n` positions rather than `1 + 2 + … + n`.
+//!
+//! Until this landed they re-forwarded the whole history every step —
+//! quadratic in the generation length, and every step recomputing keys
+//! and values from weights that had not changed. The Lua surface is
+//! unchanged either way; what changed is what it costs.
+//!
+//! The history is still capped at the model's context window, counted
+//! against what the cache holds, and exceeding it is a loud error
+//! rather than a positional-embedding failure surfacing from candle.
 //!
 //! # Optional input channels
 //!
@@ -93,6 +96,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{InferenceAdapter, LlamaAdapter, LlamaCache};
+use algocline_nn::arch::KvCache;
 use algocline_nn::arch::{AllowedSets, CondIndex, Gpt2Model, TinyLlamaModel};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
 use algocline_nn::train::DeviceView;
@@ -122,13 +126,19 @@ enum SessionBackend {
         /// is no real contention on it.
         cache: Mutex<LlamaCache>,
     },
-    /// Stateless full-history re-forward over the shared trainable
-    /// model. Session isolation is trivial here — there is no
-    /// per-session state beyond the token history the session already
-    /// owns.
-    Gpt2(Arc<Mutex<Gpt2Model>>),
-    /// Same stateless discipline as `Gpt2`.
-    TinyLlama(Arc<Mutex<TinyLlamaModel>>),
+    /// Incremental forward over the shared trainable model, through
+    /// this session's own KV cache. Two sessions over one handle share
+    /// the weights and nothing else, the same isolation the Llama arm
+    /// has.
+    Gpt2 {
+        model: Arc<Mutex<Gpt2Model>>,
+        cache: Mutex<KvCache>,
+    },
+    /// Same discipline as `Gpt2`.
+    TinyLlama {
+        model: Arc<Mutex<TinyLlamaModel>>,
+        cache: Mutex<KvCache>,
+    },
 }
 
 /// The optional input channel a session feeds the model on every
@@ -297,15 +307,22 @@ impl GenSession {
         opts: Option<&LuaTable>,
     ) -> LuaResult<Self> {
         let tokens = Self::validate_prompt(prompt, vocab)?;
-        let (device, declared) = {
+        let (device, declared, cache) = {
             let guard = model.lock().map_err(|e| {
                 LuaError::external(format!("alc.nn generate_session: model lock: {e}"))
             })?;
-            (guard.device().clone(), DeclaredChannels::of_gpt2(&guard))
+            (
+                guard.device().clone(),
+                DeclaredChannels::of_gpt2(&guard),
+                guard.new_cache(),
+            )
         };
         let channel = extract_channel(opts, declared, vocab)?;
         Ok(Self {
-            backend: SessionBackend::Gpt2(model),
+            backend: SessionBackend::Gpt2 {
+                model,
+                cache: Mutex::new(cache),
+            },
             channel,
             device,
             vocab,
@@ -333,8 +350,17 @@ impl GenSession {
         // TinyLlama has no channel-table axis, so a channel key here is
         // refused rather than dropped.
         let channel = extract_channel(opts, DeclaredChannels::default(), vocab)?;
+        let cache = {
+            let guard = model.lock().map_err(|e| {
+                LuaError::external(format!("{GEN_SESSION_ERR_PREFIX}: model lock: {e}"))
+            })?;
+            guard.new_cache()
+        };
         Ok(Self {
-            backend: SessionBackend::TinyLlama(model),
+            backend: SessionBackend::TinyLlama {
+                model,
+                cache: Mutex::new(cache),
+            },
             channel,
             device,
             vocab,
@@ -344,33 +370,37 @@ impl GenSession {
         })
     }
 
-    /// Build the `[1, len]` input tensor for the full token history and
-    /// run one stateless forward, returning the final position's
-    /// `[1, vocab]` row.
+    /// Forward this step's pending tokens through the caller's cached
+    /// entry point and return the final position's `[1, vocab]` row.
     ///
     /// Shared by the `Gpt2` / `TinyLlama` arms of `next_logits`; the
-    /// per-arm closure only supplies the model's inherent `forward`.
-    fn full_history_row(
+    /// per-arm closure supplies the model's `*_with_cache` call. The
+    /// context window is checked here rather than left to the model, so
+    /// the message names the session and its history instead of a
+    /// tensor dimension.
+    fn cached_step(
         &self,
         forward: impl FnOnce(&Tensor) -> candle_core::Result<Tensor>,
     ) -> LuaResult<Tensor> {
-        let n = self.tokens.len();
-        if n > self.ctx {
+        let pending = &self.tokens[self.forwarded..];
+        let total = self.tokens.len();
+        if total > self.ctx {
             return Err(LuaError::external(format!(
-                "alc.nn session:next_logits: session history ({n} tokens) exceeds \
-                 the model context window ({ctx}); trainable-arch sessions \
-                 re-forward the full history and cannot generate past ctx",
+                "alc.nn session:next_logits: session history ({total} tokens) exceeds \
+                 the model context window ({ctx}); a session cannot generate past ctx",
                 ctx = self.ctx
             )));
         }
-        let input = Tensor::from_slice(&self.tokens, (1, n), &self.device)
+        let input = Tensor::from_slice(pending, (1, pending.len()), &self.device)
             .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
-        // `[1, n, vocab]` full-sequence logits → keep only the final
-        // position's `[1, vocab]` row, matching the Llama adapter's
-        // LastToken output shape so the common tail below is shared.
-        let full = forward(&input)
+        // `[1, pending, vocab]` — this step's positions only, so the
+        // last row is the next-token distribution. Same shape as the
+        // Llama adapter's LastToken output, which is what lets the tail
+        // of `next_logits` be shared.
+        let step = forward(&input)
             .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
-        full.narrow(1, n - 1, 1)
+        let last = step.dims()[1] - 1;
+        step.narrow(1, last, 1)
             .and_then(|t| t.squeeze(1))
             .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))
     }
@@ -405,45 +435,54 @@ impl GenSession {
                     .forward_with_cache(&input, self.forwarded, &mut cache)
                     .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?
             }
-            SessionBackend::Gpt2(model) => {
+            SessionBackend::Gpt2 { model, cache } => {
                 let guard = model.lock().map_err(|e| {
                     LuaError::external(format!(
                         "alc.nn session:next_logits: model lock poisoned: {e}"
                     ))
                 })?;
-                match &self.channel {
-                    SessionChannel::None => self.full_history_row(|input| guard.forward(input))?,
+                let mut cache = cache.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: kv cache lock poisoned: {e}"
+                    ))
+                })?;
+                self.cached_step(|input| match &self.channel {
+                    SessionChannel::None => guard.forward_with_cache(input, &mut cache),
                     SessionChannel::Cond(index) => {
                         // One row, so one condition. The session is
                         // batch-1 by construction.
                         let conds = [*index];
-                        self.full_history_row(|input| guard.forward_conditioned(input, &conds))?
+                        guard.forward_conditioned_with_cache(input, &conds, &mut cache)
                     }
                     SessionChannel::CondWeights(weights) => {
                         // One combination for the whole forward; the
                         // session is batch-1 either way.
-                        self.full_history_row(|input| guard.forward_cond_weighted(input, weights))?
+                        guard.forward_cond_weighted_with_cache(input, weights, &mut cache)
                     }
-                    SessionChannel::Allowed(ids) => self.full_history_row(|input| {
-                        // The same set at every position of the one
-                        // row, rebuilt each step because the history
-                        // the sets have to cover grows with it. Built
-                        // inside the closure so the context-window
-                        // check runs first.
+                    SessionChannel::Allowed(ids) => {
+                        // The same set at every position of this step's
+                        // tokens. Only this step's: the positions
+                        // already in the cache read their sets when
+                        // they were forwarded.
                         let positions = input.dims()[1];
                         let sets = vec![vec![ids.clone(); positions]];
                         let allowed = AllowedSets::new(&sets, input.device())?;
-                        guard.forward_allowed(input, &allowed)
-                    })?,
-                }
+                        guard.forward_allowed_with_cache(input, &allowed, &mut cache)
+                    }
+                })?
             }
-            SessionBackend::TinyLlama(model) => {
+            SessionBackend::TinyLlama { model, cache } => {
                 let guard = model.lock().map_err(|e| {
                     LuaError::external(format!(
                         "alc.nn session:next_logits: model lock poisoned: {e}"
                     ))
                 })?;
-                self.full_history_row(|input| guard.forward(input))?
+                let mut cache = cache.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: kv cache lock poisoned: {e}"
+                    ))
+                })?;
+                self.cached_step(|input| guard.forward_with_cache(input, &mut cache))?
             }
         };
         // Advance only after a successful forward: a failed step leaves
@@ -1368,6 +1407,7 @@ mod tests {
 
     use super::*;
     use algocline_nn::arch::adapter::LlamaAdapterConfig;
+    use candle_core::IndexOp;
     use candle_nn::{VarBuilder, VarMap};
 
     /// Tiny random-weight adapter (2 layers / vocab 64 / ctx 16). The
@@ -1412,6 +1452,128 @@ mod tests {
             }
         }
         worst
+    }
+
+    /// Vocabulary and context window of [`tiny_gpt2`], restated where
+    /// a session is built because `new_gpt2` takes both from the
+    /// caller (the handle carries them in the bridge proper).
+    const TINY_GPT2_VOCAB: usize = 32;
+    const TINY_GPT2_CTX: usize = 16;
+
+    /// A tiny GPT-2 with fixed weights, so two sessions over it can be
+    /// compared for equality.
+    fn tiny_gpt2() -> Arc<Mutex<Gpt2Model>> {
+        use algocline_nn::arch::Gpt2Config;
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: TINY_GPT2_CTX,
+            vocab: TINY_GPT2_VOCAB,
+            dtype: candle_core::DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: None,
+        };
+        let vm = VarMap::new();
+        let vs = algocline_nn::arch::seeded_var_builder(&vm, 31337, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).expect("build gpt2 tiny");
+        Arc::new(Mutex::new(model))
+    }
+
+    fn run_gpt2(
+        model: Arc<Mutex<Gpt2Model>>,
+        prompt: &[i64],
+        steps: usize,
+    ) -> Vec<(u32, Vec<f32>)> {
+        let mut s = GenSession::new_gpt2(model, TINY_GPT2_VOCAB, TINY_GPT2_CTX, prompt, None)
+            .expect("session");
+        (0..steps).map(|_| step(&mut s)).collect()
+    }
+
+    /// The cached session returns, at every step, the row a full
+    /// re-forward of the history returns. This is the bridge-level
+    /// statement of the claim the cache rests on — the arch-level one
+    /// is `gpt2::tests::a_cached_decode_matches_the_full_re_forward`,
+    /// and this one additionally covers the session's own bookkeeping
+    /// (what it forwards, and which row of the step it reads).
+    #[test]
+    fn a_gpt2_session_returns_what_a_full_re_forward_would() {
+        let model = tiny_gpt2();
+        let prompt: [i64; 3] = [1, 2, 3];
+        let produced = run_gpt2(Arc::clone(&model), &prompt, 4);
+
+        let mut history: Vec<u32> = prompt.iter().map(|id| *id as u32).collect();
+        for (step_index, (sampled, row)) in produced.iter().enumerate() {
+            let n = history.len();
+            let input = Tensor::from_slice(&history, (1, n), &Device::Cpu).expect("input");
+            let full = {
+                let guard = model.lock().unwrap();
+                guard.forward(&input).expect("full forward")
+            };
+            let reference: Vec<f32> = full
+                .i((0, n - 1))
+                .unwrap()
+                .to_vec1()
+                .expect("reference row");
+            let gap = row
+                .iter()
+                .zip(&reference)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                gap < 2e-4,
+                "step {step_index}: session row diverged by {gap}"
+            );
+            history.push(*sampled);
+        }
+    }
+
+    /// Two GPT-2 sessions over one handle hold separate caches: run in
+    /// lockstep they produce exactly what each produces alone. Before
+    /// the cache the arm was stateless and this was trivially true;
+    /// with per-session state it is the property that has to be kept.
+    #[test]
+    fn two_gpt2_sessions_over_one_handle_do_not_mix() {
+        let model = tiny_gpt2();
+        let prompt_a: [i64; 3] = [1, 2, 3];
+        let prompt_b: [i64; 3] = [10, 11, 12];
+
+        let solo_a = run_gpt2(Arc::clone(&model), &prompt_a, 4);
+        let solo_b = run_gpt2(Arc::clone(&model), &prompt_b, 4);
+
+        let mut a = GenSession::new_gpt2(
+            Arc::clone(&model),
+            TINY_GPT2_VOCAB,
+            TINY_GPT2_CTX,
+            &prompt_a,
+            None,
+        )
+        .unwrap();
+        let mut b = GenSession::new_gpt2(
+            Arc::clone(&model),
+            TINY_GPT2_VOCAB,
+            TINY_GPT2_CTX,
+            &prompt_b,
+            None,
+        )
+        .unwrap();
+        let mut mixed_a = Vec::new();
+        let mut mixed_b = Vec::new();
+        for _ in 0..4 {
+            mixed_a.push(step(&mut a));
+            mixed_b.push(step(&mut b));
+        }
+
+        assert!(
+            max_gap(&solo_a, &mixed_a) < 1e-6,
+            "session a saw session b's history"
+        );
+        assert!(
+            max_gap(&solo_b, &mixed_b) < 1e-6,
+            "session b saw session a's history"
+        );
     }
 
     /// Two sessions over one handle advanced in lockstep must produce

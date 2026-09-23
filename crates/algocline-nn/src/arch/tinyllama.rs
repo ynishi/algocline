@@ -53,6 +53,7 @@ use candle_nn::{
     VarBuilder, VarMap,
 };
 
+use super::kv::KvCache;
 // `LoraLinear` is imported for the intra-doc links in `wrap_lora` /
 // `Block::wrap_lora`; the wrap helper itself lives in `arch::lora` since
 // GPT-2 already uses the same swap-in-place idiom.
@@ -452,7 +453,11 @@ impl Block {
         cos: &Tensor,
         sin: &Tensor,
         mask: &Tensor,
+        offset: usize,
+        kv: Option<(&mut KvCache, usize)>,
     ) -> CandleResult<Tensor> {
+        // T is this step's new positions: the whole sequence without a
+        // cache, usually one token with.
         let (b, t, _d) = x.dims3()?;
 
         // Project to Q / K / V.
@@ -476,9 +481,21 @@ impl Block {
 
         // Rotary embeddings on Q and K. `apply_rope` calls the
         // backward-safe `rope_slow` path, so gradients flow through
-        // Q / K back to `q_proj` / `k_proj`.
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
+        // Q / K back to `q_proj` / `k_proj`. The tables are narrowed to
+        // this step's absolute positions: `rope_slow` takes the leading
+        // `t` rows of what it is given, which is the right rotation
+        // only for a step that starts at position 0.
+        let cos = cos.narrow(0, offset, t)?;
+        let sin = sin.narrow(0, offset, t)?;
+        let q = apply_rope(&q, &cos, &sin)?;
+        let k = apply_rope(&k, &cos, &sin)?;
+
+        // The cache holds the rotated, un-broadcast K/V — see
+        // `crate::arch::kv`.
+        let (k, v) = match kv {
+            Some((cache, layer)) => cache.push(layer, &k, &v)?,
+            None => (k, v),
+        };
 
         // GQA: broadcast the KV heads across the query groups.
         let k = repeat_kv(&k, self.n_rep)?; // [B, H, T, Dh]
@@ -489,8 +506,11 @@ impl Block {
         let mut scores = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         scores = (scores / scale)?;
 
-        // Causal mask: keep positions j <= i.
-        let mask = mask.i((..t, ..t))?; // [T, T]
+        // Causal mask: keep positions j <= i. Rows are this step's
+        // absolute positions, columns the whole history — the same
+        // `[..t, ..t]` square as before when there is no cache.
+        let keys = offset + t;
+        let mask = mask.i((offset..keys, ..keys))?; // [T, offset + T]
         let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
             .to_dtype(scores.dtype())?
             .broadcast_as(scores.shape())?;
@@ -529,9 +549,11 @@ impl Block {
         cos: &Tensor,
         sin: &Tensor,
         mask: &Tensor,
+        offset: usize,
+        kv: Option<(&mut KvCache, usize)>,
     ) -> CandleResult<Tensor> {
         let n = apply_slow_rms_norm(&self.input_layernorm, x)?;
-        let a = self.attention(&n, cos, sin, mask)?;
+        let a = self.attention(&n, cos, sin, mask, offset, kv)?;
         let x = (x + a)?;
         let n = apply_slow_rms_norm(&self.post_attention_layernorm, &x)?;
         let m = self.mlp(&n)?;
@@ -723,20 +745,75 @@ impl TinyLlamaModel {
     /// Forward pass. Input `xs` is `[batch, seq]` of `u32` token ids;
     /// output is `[batch, seq, vocab]` — the raw logits.
     pub fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        self.forward_inner(xs, None)
+    }
+
+    /// An empty [`KvCache`] sized to this model. One per generation —
+    /// see [`crate::arch::kv`].
+    pub fn new_cache(&self) -> KvCache {
+        KvCache::new(self.blocks.len())
+    }
+
+    /// Forward only the tokens in `xs`, attending over everything
+    /// `cache` already holds.
+    ///
+    /// The decode form of [`Self::forward`]: the first call takes the
+    /// prompt, each later one the tokens added since. Output is
+    /// `[batch, seq_of_this_call, vocab]`, so a decoder reads the last
+    /// row of the step rather than of the history.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`], plus a cache built for a different layer
+    /// count or filled at a different batch size, and a step that would
+    /// carry the sequence past `ctx` counting what the cache holds.
+    pub fn forward_with_cache(&self, xs: &Tensor, cache: &mut KvCache) -> CandleResult<Tensor> {
+        self.forward_inner(xs, Some(cache))
+    }
+
+    fn forward_inner(&self, xs: &Tensor, mut kv: Option<&mut KvCache>) -> CandleResult<Tensor> {
         let (b, t) = xs.dims2()?;
-        if t > self.cfg.ctx {
+        // Read once, before any layer runs: the cache only advances
+        // after the last one.
+        let offset = match kv.as_ref() {
+            Some(cache) => {
+                cache.check_batch(b)?;
+                if cache.layer_count() != self.blocks.len() {
+                    return Err(candle_core::Error::Msg(format!(
+                        "tinyllama forward: kv cache was built for {} layer(s) and this model \
+                         has {}",
+                        cache.layer_count(),
+                        self.blocks.len()
+                    )));
+                }
+                cache.len()
+            }
+            None => 0,
+        };
+        if offset + t > self.cfg.ctx {
             return Err(candle_core::Error::Msg(format!(
-                "tinyllama forward: seq {t} exceeds ctx {}",
+                "tinyllama forward: seq {t} at position {offset} exceeds ctx {}",
                 self.cfg.ctx
             )));
         }
         let mut h = self.embed_tokens.forward(xs)?; // [B, T, D]
-        for block in &self.blocks {
-            h = block.forward(&h, &self.rope_cos, &self.rope_sin, &self.causal_mask)?;
+        for (layer, block) in self.blocks.iter().enumerate() {
+            let slot = kv.as_deref_mut().map(|cache| (cache, layer));
+            h = block.forward(
+                &h,
+                &self.rope_cos,
+                &self.rope_sin,
+                &self.causal_mask,
+                offset,
+                slot,
+            )?;
         }
         let h = apply_slow_rms_norm(&self.norm, &h)?;
         let logits = self.lm_head.forward(&h)?;
         debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
+        if let Some(cache) = kv {
+            cache.advance(b, t);
+        }
         Ok(logits)
     }
 
@@ -972,6 +1049,81 @@ mod tests {
             "slow-path RMSNorm diverges from fast path: max_abs_diff = {diff}"
         );
         Ok(())
+    }
+
+    /// A cached decode produces the logits the full re-forward
+    /// produces. TinyLlama is GQA + RoPE, so this exercises both the
+    /// rotation offset and the un-broadcast entries the cache holds.
+    #[test]
+    fn a_cached_decode_matches_the_full_re_forward() -> CandleResult<()> {
+        let cfg = TinyLlamaConfig::tiny();
+        let vm = VarMap::new();
+        // Seeded, so a difference between the two paths below is the
+        // cache's doing and not two different models'.
+        let vs = crate::arch::seeded_var_builder(&vm, 909, cfg.dtype, &cfg.device);
+        let model = TinyLlamaModel::new(&cfg, vs)?;
+
+        let ids: Vec<u32> = vec![3, 1, 4, 1, 5, 9];
+        let prompt = 2;
+        let mut cache = model.new_cache();
+        let first = Tensor::from_slice(&ids[..prompt], (1, prompt), &cfg.device)?;
+        let mut rows = vec![last_row(&model.forward_with_cache(&first, &mut cache)?)];
+        for id in &ids[prompt..] {
+            let step = Tensor::from_slice(&[*id], (1, 1), &cfg.device)?;
+            let logits = model.forward_with_cache(&step, &mut cache)?;
+            assert_eq!(logits.dims(), &[1, 1, cfg.vocab]);
+            rows.push(last_row(&logits));
+        }
+        assert_eq!(cache.len(), ids.len());
+
+        for (step, row) in rows.iter().enumerate() {
+            let upto = prompt + step;
+            let full = Tensor::from_slice(&ids[..upto], (1, upto), &cfg.device)?;
+            let reference = last_row(&model.forward(&full)?);
+            let gap = row
+                .iter()
+                .zip(&reference)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(gap < 2e-4, "step {step}: cached decode diverged by {gap}");
+        }
+        Ok(())
+    }
+
+    /// The window is counted against the cache, not against the step.
+    #[test]
+    fn a_cached_step_past_the_context_window_is_refused() -> CandleResult<()> {
+        let cfg = TinyLlamaConfig::tiny();
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = TinyLlamaModel::new(&cfg, vs)?;
+        let mut cache = model.new_cache();
+        let full: Vec<u32> = (0..cfg.ctx as u32).collect();
+        model.forward_with_cache(
+            &Tensor::from_slice(&full, (1, cfg.ctx), &cfg.device)?,
+            &mut cache,
+        )?;
+        let err = model
+            .forward_with_cache(
+                &Tensor::from_slice(&[1u32], (1, 1), &cfg.device)?,
+                &mut cache,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds ctx"), "{err}");
+        Ok(())
+    }
+
+    /// Last position's logits row as a host vector.
+    fn last_row(logits: &Tensor) -> Vec<f32> {
+        let t = logits.dims()[1];
+        logits
+            .i((0, t - 1))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap()
     }
 
     /// `apply_rope` is a thin wrapper around `rope_slow`; verify the

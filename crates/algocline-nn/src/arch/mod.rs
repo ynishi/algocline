@@ -17,6 +17,7 @@
 pub mod adapter;
 pub mod custom;
 pub mod gpt2;
+pub mod kv;
 pub mod lora;
 pub mod moe;
 pub mod seeded;
@@ -50,6 +51,7 @@ pub use custom::{
     ALLOWED_TABLE_TENSOR, COND_TABLE_PREFIX, COND_TABLE_TENSOR,
 };
 pub use gpt2::{AllowedSets, CondIndex, CondIndexError, Gpt2Config, Gpt2Model};
+pub use kv::{KvCache, KvError};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear, LoraWrappable};
 pub use moe::MoeConfig;
 pub use seeded::seeded_var_builder;

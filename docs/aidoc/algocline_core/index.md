@@ -1,4 +1,4 @@
-# algocline-core 0.45.0
+# algocline-core 0.49.0
 
 Core domain types and primitives shared across the algocline workspace.
 

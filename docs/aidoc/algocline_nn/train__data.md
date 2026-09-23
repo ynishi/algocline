@@ -19,10 +19,10 @@ Subtask invariants:
   #5); the `algocline-nn` crate does no filesystem access itself.
   The bridge builds a [`TokenizedDataset`] from the pre-tokenized
   rows and hands it back to the trainer.
-- Parquet reading is scaffolded (see [`ParquetDataset`]); a later
-  stage picks up the concrete reader implementation. Constructing the
-  handle is legal, `next_batch` returns an error so no silent
-  empty iterator is exposed (Rust exception-free discipline).
+- Parquet adapter (see [`ParquetDataset`]) reads the column named
+  [`DatasetOpts::text_field`] through the `parquet` crate's row API
+  (no arrow dependency) and tokenizes it exactly like the JSONL
+  adapter — same field-name convention, same shuffle semantics.
 
 ## Types
 
@@ -30,7 +30,7 @@ Subtask invariants:
 - `DatasetError` — Errors surfaced by dataset iterators.
 - `DatasetOpts` — Iterator config shared across dataset kinds.
 - `JsonlDataset` — JSONL-backed dataset.
-- `ParquetDataset` — Parquet-backed dataset (scaffold).
+- `ParquetDataset` — Parquet-backed dataset.
 - `TeacherCardDataset` — In-memory dataset for hard-label distillation.
 - `TokenizedDataset` — In-memory dataset built from a `Vec<Vec<u32>>` of pre-tokenized
 

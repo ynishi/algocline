@@ -7,10 +7,16 @@ Trainers ask for a scheduler once at construction time and then call
 The loop then passes the value through to the optimizer via
 `AdamW::set_learning_rate`.
 
-Two schedules ship today: a plain constant one (useful for tests and
-sanity checks) and a cosine schedule with linear warmup that matches
-the nanoGPT / HF Trainer default. Both live behind the [`Schedule`]
-enum so a config can pick between them via a plain string field.
+Four schedules ship: a plain constant one (useful for tests and
+sanity checks), cosine with linear warmup (the nanoGPT / HF Trainer
+default), linear with warmup, and warmup-stable-decay. All live
+behind the [`ScheduleKind`] enum so a config can pick between them
+via a plain string field.
+
+The three warmup-bearing schedules share one warmup ramp and differ
+only in what they do afterwards, which is why they sit in one enum
+rather than in separate types: a caller switching between them is
+changing the tail of a curve, not the kind of thing it is.
 
 ## Types
 

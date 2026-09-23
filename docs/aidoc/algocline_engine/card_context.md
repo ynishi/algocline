@@ -12,7 +12,7 @@ wiring lives in `bridge/llm.rs`.
 * [`CardContextSpec`] — 2-form spec (`CardId` or `Query { pkg, limit }`)
   received from the Lua bridge after opts extraction.
 * [`resolve`] — spec → `Vec<Json>` full Card resolution against a
-  `CardStore`.  Silent Ok(empty) on not-found / empty query.
+  [`CardBackend`].  Silent Ok(empty) on not-found / empty query.
 * [`format_past_cards`] — infallible fixed-template renderer producing
   the `<past_cards>...</past_cards>` block.
 
@@ -38,7 +38,7 @@ Card MM/DD pkg=<pkg> card_id=<id> [run.status=<status>] Rating <val> reason=<rea
 ## Error handling
 
 `resolve` returns `Result<Vec<Json>, String>`.  Underlying
-`card::get_with_store` / `card::find_with_store` errors are re-wrapped
+[`CardBackend::get`] / [`CardBackend::find`] errors are re-wrapped
 with a `"card_context resolve: "` prefix so the bridge layer can
 surface them via `tracing::warn!` before silently dropping the inject
 (Phase 3-F Done Criteria #4: silent no-op on resolution failure).

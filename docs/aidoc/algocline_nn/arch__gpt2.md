@@ -24,6 +24,9 @@ Forward output shape is `[batch, seq, vocab]` per subtask invariant
 
 ## Types
 
+- `AllowedSets` — The ids a model may pick from at each position of a batch, in the
+- `CondIndex` — A row of a model's conditioning table.
+- `CondIndexError` — Why a table row could not be wrapped in a [`CondIndex`].
 - `Gpt2Config` — Immutable configuration for a GPT-2 preset.
 - `Gpt2Model` — GPT-2 forward-only model.
 - `PretrainedError` — Errors from [`Gpt2Model::from_pretrained`].

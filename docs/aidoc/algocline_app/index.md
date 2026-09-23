@@ -1,4 +1,4 @@
-# algocline-app 0.45.0
+# algocline-app 0.49.0
 
 Service layer sitting between `algocline-engine` and `algocline-mcp`.
 

@@ -1,5 +1,5 @@
 <!-- algocline/index.md -->
-# algocline 0.45.0
+# algocline 0.49.0
 
 # algocline — LLM amplification engine
 
@@ -50,7 +50,7 @@ in the Rust ecosystem.
 
 
 <!-- algocline_app/index.md -->
-# algocline-app 0.45.0
+# algocline-app 0.49.0
 
 Service layer sitting between `algocline-engine` and `algocline-mcp`.
 
@@ -185,7 +185,7 @@ after acquiring the advisory lock rather than caching across lock cycles.
 
 
 <!-- algocline_core/index.md -->
-# algocline-core 0.45.0
+# algocline-core 0.49.0
 
 Core domain types and primitives shared across the algocline workspace.
 
@@ -459,14 +459,14 @@ unbounded memory growth.
 
 
 <!-- algocline_engine/index.md -->
-# algocline-engine 0.45.0
+# algocline-engine 0.49.0
 
 Lua strategy execution engine.
 
 Owns the [`Session`] lifecycle (running / needs_response / completed),
 the [`Executor`] loop that drives Lua coroutines and mediates
-`alc.llm()` pauses, the [`FileCardStore`] for structured session
-artifacts, [`bridge`] modules that expose Rust-backed globals
+`alc.llm()` pauses, the [`CardBackend`] (default [`FileCardStore`])
+for structured session artifacts, [`bridge`] modules that expose Rust-backed globals
 (`alc.*`) to Lua, and the resolver factory that wires strategies
 to LLM providers.
 
@@ -574,10 +574,11 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 | `[strategy_params]` | Strategy-tunable parameters surfaced for sweeps / optimizers (e.g. `alpha`, `temperature`, `depth`). Free-form, but `where`-queryable as a first-class section |
 | `[scenario]` | `name`, `source`, `case_count`, `grader` |
 | `[stats]` | `pass_rate`, `mean_score`, `std`, `median`, `min`, `max`, `n` |
-| `[stats.by_bucket]` | Disaggregated sub-bucket stats (array of tables) |
+| `[stats.by_grader]` | Per-metric aggregate keyed by grader name: `{ [name] = { n, mean, weight } }`. Written by `alc.eval` auto-card; absent when no grader ran |
+| `[stats.by_bucket]` | Disaggregated sub-bucket stats keyed by bucket (case tag): `{ [tag] = { n, pass, fail, rate, mean } }`. Absent when no case was tagged |
 | `[cost]` | `llm_calls`, `input_tokens`, `output_tokens`, `elapsed_ms`, `usd_estimate` |
 | `[optimize]` | `target`, `search`, `rounds_used`, `top_k` (for optimize Cards) |
-| `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`) |
+| `[metadata]` | Free-form escape hatch. Recognized lineage conventions: `prior_card_id` (parent Card id), `prior_relation` (relation kind, e.g. `"sweep_variant"`, `"reflection_of"`, `"derived_from"`). Recognized training convention: `loss_mask` (`"response"` = `alc.nn.data.from_card` masks the prompt region and returns a mask-carrying teacher dataset) |
 
 ## Lua API (`alc.card.*`)
 
@@ -593,6 +594,7 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 | `get_by_alias(name)` | Resolve alias → full Card |
 | `write_samples(card_id, samples)` | Write Tier 2 sidecar (write-once) |
 | `read_samples(card_id, opts?)` | Read Tier 2 with `where` filtering + offset/limit paging |
+| `compare(card_a, card_b, opts?)` | Welch's t-test over one numeric sample column of two Cards (prelude, delegates to `alc.math`) |
 | `lineage(query)` | Walk ancestry/descendants via `metadata.prior_card_id` |
 
 ## Functions
@@ -630,6 +632,7 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 - `CardEvent` — A Card-level event emitted from the write path.
 - `CardEventBus` — Process-wide fan-out bus. Subscribers are registered once at startup
 - `CardEventKind` — Lightweight discriminant for `CardEvent`. Used as a `HashMap` key in
+- `CloseOutcome` — Outcome handed to [`CardBackend::close`] when a run finishes.
 - `CmpOp` — Single comparison operator.
 - `Comparison` — One parsed comparison: `path` points at a nested field,
 - `FileCardStore` — File-backed implementation of [`CardStore`].
@@ -656,6 +659,7 @@ Alias table: `~/.algocline/cards/_aliases.toml` (global).
 
 ## Traits
 
+- `CardBackend` — Backend-neutral Card API.
 - `CardStore` — Storage backend for Cards.
 - `CardSubscriber` — A downstream backend that receives `CardEvent`s in best-effort,
 
@@ -679,7 +683,7 @@ wiring lives in `bridge/llm.rs`.
 * [`CardContextSpec`] — 2-form spec (`CardId` or `Query { pkg, limit }`)
   received from the Lua bridge after opts extraction.
 * [`resolve`] — spec → `Vec<Json>` full Card resolution against a
-  `CardStore`.  Silent Ok(empty) on not-found / empty query.
+  [`CardBackend`].  Silent Ok(empty) on not-found / empty query.
 * [`format_past_cards`] — infallible fixed-template renderer producing
   the `<past_cards>...</past_cards>` block.
 
@@ -705,7 +709,7 @@ Card MM/DD pkg=<pkg> card_id=<id> [run.status=<status>] Rating <val> reason=<rea
 ## Error handling
 
 `resolve` returns `Result<Vec<Json>, String>`.  Underlying
-`card::get_with_store` / `card::find_with_store` errors are re-wrapped
+[`CardBackend::get`] / [`CardBackend::find`] errors are re-wrapped
 with a `"card_context resolve: "` prefix so the bridge layer can
 surface them via `tracing::warn!` before silently dropping the inject
 (Phase 3-F Done Criteria #4: silent no-op on resolution failure).
@@ -831,7 +835,7 @@ code.  Planned backends:
 
 
 <!-- algocline_mcp/index.md -->
-# algocline-mcp 0.45.0
+# algocline-mcp 0.49.0
 
 MCP (Model Context Protocol) server layer.
 
@@ -942,7 +946,7 @@ Subtask 2.
 
 
 <!-- algocline_nn/index.md -->
-# algocline-nn 0.45.0
+# algocline-nn 0.49.0
 
 algocline-nn — thin candle wrapper for the `alc.nn` Lua surface.
 
@@ -974,14 +978,37 @@ link interference with the mlua-vendored workspace. Later steps add
 ## Modules
 
 - [`arch`](arch.md): Architecture presets for `alc.nn.preset.*`.
+- [`arch::adapter`](arch__adapter.md): Inference-only adapters over `candle-transformers` model
+- [`arch::adapter::llama`](arch__adapter__llama.md): Llama-family inference adapter over `candle_transformers::models::llama`.
+- [`arch::blockwise`](arch__blockwise.md): Driving a model one block at a time.
+- [`arch::custom`](arch__custom.md): Spec-driven customization points for the GPT-2 stack (Phase 1).
 - [`arch::gpt2`](arch__gpt2.md): GPT-2 architecture builder.
+- [`arch::kv`](arch__kv.md): Keys and values a session has already computed.
 - [`arch::lora`](arch__lora.md): Low-rank adaptation ("LoRA") wrap for a candle-nn `Linear`.
+- [`arch::moe`](arch__moe.md): Dense Mixture-of-Experts feed-forward for the GPT-2 stack.
+- [`arch::seeded`](arch__seeded.md): Parameter initialisation a seed decides.
+- [`arch::tinyllama`](arch__tinyllama.md): TinyLlama-1.1B trainable architecture.
 - [`card`](card.md): Card metadata schema for `alc.nn.card.*`.
+- [`export`](export.md): Exporting a Card in the vocabulary other tools read.
+- [`export::mapping`](export__mapping.md): A Card's fields in the vocabulary other tools read.
+- [`gguf`](gguf.md): Writing a model out as GGUF.
+- [`merged`](merged.md): Merged inference checkpoint export (Layer 4a of GH #10).
+- [`pooling`](pooling.md): One vector for a sequence.
+- [`sampling`](sampling.md): Next-token samplers for the inference path.
+- [`sampling::beam`](sampling__beam.md): Beam search.
+- [`sampling::constraint`](sampling__constraint.md): Layer 2 of the sampler plan: constraints that mask logits before a
+- [`sampling::json_schema`](sampling__json_schema.md): JSON-schema-constrained decoding: a [`Constraint`] that admits only
+- [`sampling::penalty`](sampling__penalty.md): Penalties that read what a generation has already produced.
 - [`tokenizer`](tokenizer.md): HuggingFace `tokenizers` wrap with first-use download cache.
 - [`train`](train.md): Training-side scaffolding.
-- [`train::ckpt`](train__ckpt.md): Rotating safetensors checkpoint writer.
+- [`train::checkpointing`](train__checkpointing.md): The forward and backward of a gradient-checkpointed step.
+- [`train::ckpt`](train__ckpt.md): Rotating safetensors checkpoint writer, and the restore side that
+- [`train::corpus`](train__corpus.md): Corpus files: pre-tokenized training rows on disk.
 - [`train::data`](train__data.md): Dataset iterator abstraction.
+- [`train::lion`](train__lion.md): Lion — the sign-momentum optimizer from *Symbolic Discovery of
 - [`train::loss`](train__loss.md): Loss functions used by the training loop.
+- [`train::mixed`](train__mixed.md): Mixed-precision AdamW (design §7.1: BF16 weights / activations +
+- [`train::optstate`](train__optstate.md): Optimizer state that outlives the run that produced it.
 - [`train::scheduler`](train__scheduler.md): Learning-rate schedules for the training loop.
 - [`train::fullft`](train__fullft.md): Full FT training loop.
 
@@ -1004,6 +1031,257 @@ Weight naming convention follows the reference GPT-2 checkpoints
 (nanoGPT / `openai-community/gpt2*`) so a downloaded safetensors
 bundle can be loaded through [`candle_nn::VarBuilder::from_mmaped_safetensors`]
 with the same variable names used at construction time.
+
+
+<!-- algocline_nn/arch__adapter.md -->
+# algocline-nn::arch::adapter
+
+Inference-only adapters over `candle-transformers` model
+implementations.
+
+The Card foundation trained architectures (currently GPT-2) live in
+sibling `arch::*` modules and expose a `VarMap` so
+`algocline_nn::train::*` can drive optimizer steps against them.
+This module holds the **inference-only** counterpart: thin wrappers
+around `candle_transformers::models::*` that answer at the same layer
+boundary as the trainable handles but decline to expose a `VarMap`
+(candle-transformers stacks are loaded from a
+`VarBuilder::from_mmaped_safetensors` reader, not a `VarMap`).
+
+Callers reach these adapters through the engine bridge presets
+(`alc.nn.preset.llama` / `alc.nn.preset.qwen` / ...), which build a
+`<Arch>Handle` `UserData` and expose the same registry / `alc.llm`
+`role="nn"` fast path that GPT-2 handles use. Because the adapters
+do not own a `VarMap`, the trainer bindings (`alc.nn.trainer.*`)
+surface a clear Lua-side error rather than attempting a training
+loop.
+
+# Adapter contract
+
+Every adapter here implements [`InferenceAdapter`], which fixes the
+two members the engine bridge dispatches on:
+
+- [`InferenceAdapter::meta`] — an [`AdapterMeta`] describing the
+  loaded stack (family / variant / shape parameters / device /
+  dtype / logits shape). The bridge builds its Lua-facing handle
+  from this value instead of re-reading the upstream config, so
+  adding an arch does not mean copying nine accessors into a new
+  handle struct.
+- [`InferenceAdapter::forward`] — `(tokens, index_pos) -> logits`,
+  with the caller-visible output shape declared by
+  [`AdapterMeta::logits`] rather than left to per-arch prose.
+
+Construction stays **outside** the trait. Each adapter keeps its own
+`Config` struct, a `load(vb, config)` constructor, and a
+`from_safetensors_files(paths, config)` constructor, because the
+`VarBuilder` origin differs per arch (single file / sharded mmap /
+GGUF) and a `Self: Sized` constructor in the trait would rule out
+holding adapters as `dyn InferenceAdapter`. The engine bridge's
+`ARCH_OPS` table owns that per-arch construction dispatch; this
+trait owns behaviour only.
+
+# Future additions
+
+`arch::adapter::qwen`, `arch::adapter::phi`, and
+`arch::adapter::gemma` will land as sibling modules on the same
+shape once a caller needs each. Each is an `InferenceAdapter` impl
+plus one `ARCH_OPS` entry on the bridge side. HuggingFace-hub
+warm-start (`from_pretrained`) is deliberately deferred out of the
+initial module cut so a downstream caller can drive the adapter from
+local files (or an already-cached HF snapshot) without pulling
+network into the unit-test path.
+
+## Types
+
+- `AdapterMeta` — Architecture-neutral description of a loaded model.
+- `LogitsShape` — Caller-visible shape of the logits an adapter's `forward` returns.
+
+## Traits
+
+- `InferenceAdapter` — An inference-only model handle the engine bridge can drive without
+
+
+<!-- algocline_nn/arch__adapter__llama.md -->
+# algocline-nn::arch::adapter::llama
+
+Llama-family inference adapter over `candle_transformers::models::llama`.
+
+Wraps the upstream `Llama` stack (RMSNorm + RoPE + GQA + SwiGLU) as
+an inference handle at the `alc.nn` layer boundary. The upstream
+implementation is loaded from a `VarBuilder` — no `VarMap` — so
+this adapter deliberately does not participate in the training loop
+(`alc.nn.trainer.*` refuses handles without a `VarMap`).
+
+The adapter owns the mutable KV [`Cache`] alongside the stack so a
+caller who threads through the same handle across successive
+`forward` calls (e.g. token-by-token generation) reuses the same
+cache without exposing candle-transformers types to Lua.
+
+# Built-in cache vs caller-owned cache
+
+Two forward entries exist, and the difference is a concurrency
+invariant rather than a convenience:
+
+- [`LlamaAdapter::forward`] drives the adapter's **built-in** cache.
+  Correct for exactly one generation loop at a time — two loops
+  sharing the handle would interleave their keys and values into the
+  same cache and silently produce cross-contaminated logits.
+- [`LlamaAdapter::forward_with_cache`] drives a **caller-owned**
+  cache obtained from [`LlamaAdapter::new_cache`]. Each generation
+  session holds its own cache, so concurrent sessions over one
+  `Arc<LlamaAdapter>` (weights are read-only and shared) cannot mix
+  state at all — the mixing is prevented structurally rather than by
+  a caller-side convention.
+
+The built-in path is kept as the single-loop legacy entry so existing
+callers keep working unchanged; new multi-session callers (the engine
+bridge's Lua-facing generation session) use the caller-owned path.
+
+## Types
+
+- `LlamaAdapter` — Inference-only Llama handle.
+- `LlamaAdapterConfig` — Build-time configuration for a [`LlamaAdapter`].
+
+
+<!-- algocline_nn/arch__blockwise.md -->
+# algocline-nn::arch::blockwise
+
+Driving a model one block at a time.
+
+The ordinary forward hands back logits and keeps, inside the
+autograd graph, every intermediate that produced them — for a
+transformer that is on the order of ten tensors per block, all of
+them `[batch, seq, ·]`, held until the backward pass reads them.
+Context length and batch size are bounded by that, not by the
+parameters.
+
+Gradient checkpointing trades it back: keep only each block's
+**input**, and recompute the block's insides during the backward
+pass, one block at a time. Memory falls from every intermediate of
+every block to one tensor per block plus the intermediates of
+whichever block is currently being recomputed; the cost is a second
+forward pass, so roughly a third more compute for a fraction of the
+activation memory. The technique is Chen et al. 2016,
+[*Training Deep Nets with Sublinear Memory Cost*](https://arxiv.org/abs/1604.06174).
+
+This trait is what lets the training loop do that: a model that
+implements it can be run embed → block → block → … → head under the
+loop's control instead of in one call.
+
+# Why the loop and not the model
+
+Recomputation has to be interleaved with the backward pass, and the
+backward pass belongs to the training loop. A model that tried to
+own both would have to own the loss as well.
+
+# What cannot be checkpointed here
+
+[`Checkpointable::checkpointable`] answers for each model. The two
+refusals today are both about a forward that carries more than its
+output:
+
+- **A mixture-of-experts block** returns a load-balancing term
+  alongside its activations, and that term is part of the loss. A
+  blockwise driver that dropped it would train without the balancing
+  objective while still reporting a loss — and the routing would
+  collapse onto a few experts with nothing saying so.
+- **An input channel** (a conditioning table, an allowed-id set) is
+  read at the embedding and again at every position; the blockwise
+  surface here takes ids alone. Refused rather than run with the
+  channel dropped, which is the same silent failure the forward path
+  already refuses.
+
+## Traits
+
+- `Checkpointable` — A model the training loop can drive one block at a time.
+
+
+<!-- algocline_nn/arch__custom.md -->
+# algocline-nn::arch::custom
+
+Spec-driven customization points for the GPT-2 stack (Phase 1).
+
+Generalizes the seam the dense-MoE block opened: instead of one
+`Option` field per experiment, [`Gpt2Custom`] collects the
+architecture axes a block can deviate from the GPT-2 reference on,
+and `Block::new` builds from the spec. `Gpt2Config::custom = None`
+keeps the stock GPT-2 behaviour bit-for-bit (same ops, same VarMap
+names).
+
+Phase 1 axes (VarMap-light: names stay identical or only gain
+entries):
+
+- **activation** — GELU (reference) / ReLU / SiLU, plus the gated
+  variants SwiGLU / GeGLU from Shazeer 2020 (arXiv:2002.05202).
+  Gated variants add a `mlp.c_gate` projection (the activated
+  branch; `mlp.c_fc` stays the linear branch, Llama's `up_proj`).
+- **norm** — LayerNorm (reference) / RMSNorm (Zhang & Sennrich
+  2019, arXiv:1910.07467). RMSNorm keeps the `ln_*.weight` names
+  and simply has no bias, and goes through the backward-safe
+  `rms_norm_slow` shim like TinyLlama.
+- **residual topology** — sequential (reference) / parallel
+  attention + MLP (GPT-J / PaLM, arXiv:2204.02311):
+  `y = x + attn(ln_1(x)) + ff(ln_2(x))`.
+- **mlp_ratio** — the MLP expansion factor (reference 4).
+
+Phase 2 axes (VarMap entries move or the attention wiring changes):
+
+- **position** — learned `wpe` (reference) / RoPE (Su 2021,
+  arXiv:2104.09864) / ALiBi (Press 2022, arXiv:2108.12409) / NoPE
+  (Kazemnejad 2023, arXiv:2305.19466). Every non-learned variant
+  drops the `wpe` Var; RoPE reuses TinyLlama's backward-safe
+  `apply_rope` shim, ALiBi adds a constant per-head score bias.
+- **GQA** — `kv_heads` shrinks the fused `c_attn` projection to
+  `[dim + 2·kv·head_dim, dim]` and shares each KV head across
+  `heads / kv_heads` query heads via `repeat_kv` (Ainslie 2023,
+  arXiv:2305.13245).
+- **sliding-window attention** — `window` bands the causal mask so
+  position `i` attends to `(i - w, i]` (Mistral 2023).
+- **untied head** — an independent `lm_head.weight` Var instead of
+  reusing `wte`.
+- **slot conditioning** — `cond_slots` adds a `cond_wte` table
+  (`[slots, dim]`) whose selected row is added to the residual
+  stream at every position, so the condition a row is generated
+  under is an argument of the forward pass rather than a token the
+  caller has to keep at a fixed offset.
+- **allowed-id input** — `allowed_input` adds an `allowed_wte`
+  table (`[vocab, dim]`) whose mean over the ids permitted at a
+  position is added to the residual stream there, so a model over a
+  constrained id space is told what is available instead of having
+  to infer it from the sequence.
+- **Post-LN** — norm after the sublayer + residual add (Xiong et
+  al. 2020, arXiv:2002.04745) instead of the Pre-LN reference. Its
+  known training instability is a probe subject, not a defect.
+  Post-LN combined with the parallel residual topology has no
+  canonical wiring and is rejected at build time.
+
+All axes are experiment equipment, so a config that sets `custom`
+keeps the HuggingFace-hub loaders shut: [`super::gpt2::Gpt2Model::from_pretrained`]
+and the merged exporter refuse it (same guard family as MoE). Bundles
+written by this crate's own trainer (`VarMap::save`) *are* loadable —
+they carry exactly the Vars the spec declares — which is why every
+type in this module is `Serialize` / `Deserialize`: a Card records
+its spec so the load path can rebuild the identical config.
+
+The serde representation is the same lowercase vocabulary the Lua
+bridge accepts (`"swiglu"` / `"rmsnorm"` / `"preln"` / `"nope"` /
+...), so a Card's `custom` table reads the way the caller wrote it.
+
+## Types
+
+- `Activation` — MLP activation. `Gelu` is the GPT-2 reference; the gated variants
+- `Gpt2Custom` — Architecture customization spec. `Default` reproduces the GPT-2
+- `NormKind` — Block / final normalization kind.
+- `NormPlacement` — Where the block norms sit relative to the sublayers (Xiong et al.
+- `PosKind` — How the model injects position information.
+- `ResidualKind` — How the block combines its two halves with the residual stream.
+
+## Constants
+
+- `ALLOWED_TABLE_PREFIX` — `VarBuilder` prefix of the allowed-id table
+- `ALLOWED_TABLE_TENSOR` — Tensor the allowed-id table is stored under: the embedding weight
+- `COND_TABLE_PREFIX` — `VarBuilder` prefix of the conditioning table
+- `COND_TABLE_TENSOR` — Tensor the conditioning table is stored under: the embedding
 
 
 <!-- algocline_nn/arch__gpt2.md -->
@@ -1033,9 +1311,60 @@ Forward output shape is `[batch, seq, vocab]` per subtask invariant
 
 ## Types
 
+- `AllowedSets` — The ids a model may pick from at each position of a batch, in the
+- `CondIndex` — A row of a model's conditioning table.
+- `CondIndexError` — Why a table row could not be wrapped in a [`CondIndex`].
 - `Gpt2Config` — Immutable configuration for a GPT-2 preset.
 - `Gpt2Model` — GPT-2 forward-only model.
 - `PretrainedError` — Errors from [`Gpt2Model::from_pretrained`].
+
+
+<!-- algocline_nn/arch__kv.md -->
+# algocline-nn::arch::kv
+
+Keys and values a session has already computed.
+
+A decode loop over a trainable architecture used to re-forward its
+whole history at every step: generating `n` tokens ran the model
+`1 + 2 + … + n` positions instead of `n`, because each step recomputed
+every earlier position's keys and values from weights that had not
+changed. The arithmetic is quadratic in the length and the work is
+redundant — attention at position `p` reads the same `K`/`V` at every
+earlier position it read the step before.
+
+A cache holds those tensors per layer and grows by the positions each
+step adds. The model then forwards only the new tokens and attends
+over the whole history, which is the same computation the
+full-sequence pass performs at the last row and the standard decode
+arrangement everywhere it appears.
+
+# What is cached, and what is not
+
+The entries are the **post-rotation, pre-broadcast** `K` and `V`:
+`[batch, kv_heads, position, head_dim]`. Post-rotation because RoPE
+is a function of the absolute position, which does not change as the
+sequence grows — rotating once is correct and rotating again would
+not be. Pre-broadcast because grouped-query attention repeats each
+KV head across its query group, and storing the repeats would hold
+`heads / kv_heads` copies of every tensor for no gain.
+
+Queries are not cached: a query belongs to the position being
+answered and is never read again.
+
+# A cache belongs to one sequence
+
+Entries are positions of one particular sequence, so a cache carries
+the batch it was filled at and refuses a forward at another
+([`KvError::BatchChanged`]). Two generations sharing a cache would
+each attend over the other's history with every shape still
+agreeing, which is the failure this refusal exists for — and the
+same reason [`crate::arch::adapter::LlamaAdapter`] hands out a cache
+per session rather than holding one.
+
+## Types
+
+- `KvCache` — Per-layer keys and values for the positions already forwarded.
+- `KvError` — A cache used in a way it cannot answer for.
 
 
 <!-- algocline_nn/arch__lora.md -->
@@ -1064,6 +1393,16 @@ matrix so a caller can construct a plain `Linear` that produces
 identical outputs for the same input. This is what the merge-
 equivalence integration test asserts within 1e-4 element-wise.
 
+# Initialisation
+
+[`LoraLinear::wrap`] follows the canonical LoRA init from
+Hu et al. 2021 §4.1: `lora_a` gets candle-nn's default (Kaiming
+uniform) random weights, while `lora_b` is initialised to **zero**.
+Because `ΔW = scaling * (B · A)` and `B = 0` at `t=0`, the wrap is
+effectively an identity map at construction — `wrap(base).forward(x)`
+equals `base.forward(x)` bit-for-bit. Only training moves `B` off
+zero, at which point `ΔW` starts contributing.
+
 ## Functions
 
 - `max_abs_diff_f32` — Snapshot two tensors as flat f32 vectors and return the maximum
@@ -1072,6 +1411,167 @@ equivalence integration test asserts within 1e-4 element-wise.
 
 - `LoraConfig` — LoRA rank + scaling + wrap-target configuration.
 - `LoraLinear` — A `Linear` layer wrapped with a low-rank additive update.
+
+## Traits
+
+- `LoraWrappable` — A trainable model that can be wrapped with LoRA
+- `MergeableLora` — A model that can export a merged inference-ready weight bundle.
+
+
+<!-- algocline_nn/arch__moe.md -->
+# algocline-nn::arch::moe
+
+Dense Mixture-of-Experts feed-forward for the GPT-2 stack.
+
+Replaces a block's MLP with a router + `n_experts` GPT-2-shaped
+experts (`c_fc → GELU → c_proj`). Routing follows the standard
+top-k recipe (Switch Transformer, Fedus et al. 2021 for top-1;
+Mixtral, Jiang et al. 2024 for the top-2 convention): softmax the
+router logits, keep the top-k probabilities per token, renormalize,
+and mix expert outputs with those weights.
+
+**Dense compute only.** Every expert runs on every token and the
+outputs are combined by weight — no token dispatch / grouped GEMM.
+candle has no expert-dispatch kernel, and a scatter/gather custom op
+would sit in the same no-backward `CustomOp` trap the LayerNorm /
+RoPE slow-path shims exist for (`apply_slow_layer_norm`,
+`arch::tinyllama`). The dense mixture is a composition of
+softmax / linear / GELU / mul / add, all of which carry proper
+backward implementations, so the autograd chain stays intact.
+
+`top_k = n_experts` degenerates into a dense softmax mixture where
+every expert receives gradient on every step — the
+`tests/moe_grad_coverage.rs` gate runs in that mode to check
+structural gradient reachability without tangling with the (normal)
+sparsity of top-k routing.
+
+## Types
+
+- `MoeConfig` — Configuration for the dense-MoE feed-forward.
+
+
+<!-- algocline_nn/arch__seeded.md -->
+# algocline-nn::arch::seeded
+
+Parameter initialisation a seed decides.
+
+Two runs of the same config differ in two places: the order the rows
+arrive in, and the numbers the parameters start at. The first is
+[`DatasetOpts::seed`](crate::train::DatasetOpts::seed). This is the
+second.
+
+# Why not `Device::set_seed`
+
+candle has one, and on CUDA and Metal it works. The CPU backend
+answers `cannot seed the CPU rng with set_seed` and draws from the
+thread RNG (`candle-core 0.11`, `cpu_backend/mod.rs`), so on the
+device most development happens on there is nothing to seed. A run
+whose reproducibility depended on the backend would be repeatable on
+the GPU and not on the laptop, which is the worse of the two
+failures: the discrepancy only shows up once the two are compared.
+
+# What this does instead
+
+[`seeded_var_builder`] hands the model a [`VarBuilder`] whose
+backing store draws the initial values itself, from a seeded
+[`StdRng`], honouring the [`Init`] hint each parameter was declared
+with. The architectures are untouched: they already say what
+distribution each parameter wants — `Randn { stdev: INIT_STDEV }`
+for GPT-2's embeddings, Kaiming for a linear — and this reads that
+declaration rather than restating it. A separate walker that re-drew
+parameters after construction would be a second copy of every
+architecture's initialisation, free to drift from the first.
+
+# What is still not deterministic
+
+Initialisation and row order, both fixed here, are what a caller
+controls. They are not everything:
+
+- **Reduction order on the GPU.** Floating-point addition is not
+  associative, and CUDA kernels do not promise a fixed summation
+  order between runs. Two identically-seeded runs can diverge in the
+  last bits and then, through a few thousand steps, visibly.
+- **cuDNN algorithm selection**, which can vary with available
+  memory.
+- **Dropout and any other sampling inside a forward pass**, which
+  draw from the device RNG this does not reach.
+
+This is the field's ordinary position rather than a shortfall
+peculiar to this crate — PyTorch ships the same knobs and declines
+the same guarantee ("completely reproducible results are not
+guaranteed across PyTorch releases, individual commits, or different
+platforms"). What matters is that the part a caller can control is
+controllable, and that the rest is written down.
+
+## Functions
+
+- `seeded_var_builder` — A [`VarBuilder`] over `vm` whose fresh parameters are drawn from
+
+
+<!-- algocline_nn/arch__tinyllama.md -->
+# algocline-nn::arch::tinyllama
+
+TinyLlama-1.1B trainable architecture.
+
+Layer 1a — primitives (backward-safe shims + RoPE cache + GQA
+`repeat_kv`):
+
+- [`apply_slow_rms_norm`] — RMSNorm forward via
+  [`candle_nn::ops::rms_norm_slow`] to keep the autograd chain
+  intact (candle-nn 0.11 `RmsNorm::forward` is a `CustomOp3` with no
+  backward, see `tests/rms_norm_autograd_gate.rs`).
+- [`apply_rope`] — Rotary embedding forward via
+  [`candle_nn::rotary_emb::rope_slow`] for the same reason
+  (`rotary_emb::rope` uses `apply_op3_no_bwd`).
+- [`build_rope_cache`] — precomputed cos / sin cache using the
+  canonical Llama-family frequency formula
+  `theta_i = base^{-2i/head_dim}` for `i ∈ [0, head_dim/2)`.
+- [`repeat_kv`] — grouped-query-attention KV expansion:
+  `[B, H_kv, S, head_dim] → [B, H, S, head_dim]` via `expand`.
+
+Layer 1b — model:
+
+- [`TinyLlamaConfig`] with presets `tinyllama-1.1b` and
+  `tinyllama-tiny` (CPU-friendly smoke shape).
+- [`TinyLlamaModel`] — pre-RMSNorm decoder stack with GQA + RoPE +
+  SwiGLU MLP, mirroring the HuggingFace `LlamaModel` weight layout
+  so a downloaded `TinyLlama-1.1B-*` safetensors bundle loads
+  through [`candle_nn::VarBuilder::from_mmaped_safetensors`] without
+  any renaming.
+
+HF weight naming (matches
+`TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T`):
+
+```text
+model.embed_tokens.weight                     [vocab, dim]
+model.layers.<i>.input_layernorm.weight       [dim]
+model.layers.<i>.self_attn.q_proj.weight      [heads   *head_dim, dim]
+model.layers.<i>.self_attn.k_proj.weight      [kv_heads*head_dim, dim]
+model.layers.<i>.self_attn.v_proj.weight      [kv_heads*head_dim, dim]
+model.layers.<i>.self_attn.o_proj.weight      [dim, heads*head_dim]
+model.layers.<i>.post_attention_layernorm.weight  [dim]
+model.layers.<i>.mlp.gate_proj.weight         [hidden, dim]
+model.layers.<i>.mlp.up_proj.weight           [hidden, dim]
+model.layers.<i>.mlp.down_proj.weight         [dim, hidden]
+model.norm.weight                             [dim]
+lm_head.weight                                [vocab, dim]
+```
+
+Forward output shape is `[batch, seq, vocab]`. Attention uses a
+causal (lower-triangular) mask cached to `ctx`.
+
+## Functions
+
+- `apply_rope` — Rotary Position Embedding forward using the backward-safe
+- `apply_slow_rms_norm` — RMSNorm forward that always uses the backward-safe basic-op path
+- `build_rope_cache` — Build a canonical Llama-family RoPE cos / sin cache.
+- `repeat_kv` — Grouped-query-attention KV expansion.
+
+## Types
+
+- `PretrainedError` — Errors from [`TinyLlamaModel::from_pretrained`].
+- `TinyLlamaConfig` — Immutable configuration for a TinyLlama preset.
+- `TinyLlamaModel` — TinyLlama forward-only model.
 
 
 <!-- algocline_nn/card.md -->
@@ -1092,12 +1592,540 @@ later LoRA follow-up populates it via the [`NnLoraBranch`]
 sub-struct without breaking foundation serialization
 (`skip_serializing_if = "Option::is_none"`).
 
+## Functions
+
+- `bundle_ref_for` — Logical `"nn/<stem>"` bundle reference.
+- `sanitize_stem` — Collapse a free-form name into the `[A-Za-z0-9_-]` stem alphabet
+- `unique_stem` — Mint a unique, filesystem-safe stem from a free-form `name`.
+- `validate_architecture` — Validate that `arch` starts with a known family prefix from
+- `validate_training_path` — Validate that `training_path` is one of
+
 ## Types
 
+- `CardId` — Validated identifier of an `nn_model` Card.
+- `ChannelAxis` — An optional input channel a custom-architecture run can be trained
+- `ChannelMismatch` — A Card's declared channels and the tensors in its bundle disagree.
 - `NnCandleBranch` — Content of `[metadata.nn.candle]`.
 - `NnCardMeta` — Content of `[metadata.nn]`.
+- `NnCustomBranch` — Content of `[metadata.nn.candle.custom]`.
 - `NnLineage` — Content of `[metadata.nn.lineage]`.
 - `NnLoraBranch` — Content of `[metadata.nn.candle.lora]`.
+- `NnModelCard` — Aggregate tying a [`CardId`] to its [`NnCardMeta`].
+- `NnMoeBranch` — Content of `[metadata.nn.candle.custom.moe]` — the projection of
+- `TrainingPath` — Which training path produced a Card, plus the path-specific
+
+## Constants
+
+- `SUPPORTED_ARCHITECTURE_FAMILIES` — Architecture family prefixes accepted for [`NnCardMeta::architecture`].
+- `SUPPORTED_TRAINING_PATHS` — Training paths accepted for [`NnCardMeta::training_path`].
+
+
+<!-- algocline_nn/export.md -->
+# algocline-nn::export
+
+Exporting a Card in the vocabulary other tools read.
+
+A model trained here is described by its Card, which lives in a card
+store that does not travel with the weights. The readers outside
+algocline each look in their own place: the Hugging Face Hub reads a
+model card's YAML front matter, GGUF runtimes read `general.*`, and
+a safetensors reader has `__metadata__` — whose only shared key is
+`format`. This module maps one Card onto all of them
+([`CardExport`], table in [`mapping`]) and writes the weights with a
+byte-stable header that carries a digest of the tensors
+([`rewrite_with_metadata`]).
+
+The engine's `alc.nn.card.export` drives both; nothing here touches
+a card store.
+
+
+<!-- algocline_nn/export__mapping.md -->
+# algocline-nn::export::mapping
+
+A Card's fields in the vocabulary other tools read.
+
+One Card, four readers, one table:
+
+| Card | README YAML | GGUF | safetensors `__metadata__` |
+|---|---|---|---|
+| `training_path` `full_ft` / `lora` / `merged` | `base_model_relation` `finetune` / `adapter` / `merge` | — | `alc.training_path` |
+| `training_path` `distillation` | not written; stated in the body | — | `alc.training_path` |
+| `lineage.parent`, a Hub repo id | `base_model` | `general.base_model.*` | `alc.lineage.parent` |
+| `lineage.parent`, anything else | body only | — | `alc.lineage.parent` |
+| `lineage.training_data`, a Hub dataset id | `datasets` | `general.dataset.*` | `alc.lineage.training_data` |
+| `lineage.teacher` / `.tokenizer` | body | — | `alc.lineage.teacher` / `.tokenizer` |
+| `name` | body title | `general.name` | — |
+| `architecture` | body | `general.architecture` (the writer's own) | `alc.architecture` |
+| `hyperparams` / `metrics` | body | — | `alc.hyperparams` / `alc.metrics` (JSON strings) |
+| card id | body | — | `alc.card_id` |
+| the export's `license` | `license` | `general.license` | — |
+| fixed | `tags: [algocline, candle]` | `general.tags` | `format = "pt"`, `alc.schema`, `alc.kind = "export"`, `alc.producer` |
+| computed | body: the definition | — | `alc.tensor_sha256` |
+
+Never written: `library_name` (candle is not a registered Hub
+library), `pipeline_tag` (a Card's `task` is free-form, not the Hub's
+task vocabulary), `model-index`, `general.uuid`, and `model_type` /
+`architectures` in `config.json` (the export does not claim
+`transformers` compatibility).
+
+## Functions
+
+- `base_model_relation` — The Hub's `base_model_relation` for a Card's `training_path`.
+- `is_hub_repo_id` — Whether `s` names a Hugging Face Hub repository.
+
+## Types
+
+- `CardExport` — One Card, ready to be written out in the ecosystem's vocabulary.
+
+## Constants
+
+- `KIND_EXPORT` — Value of [`KIND_KEY`] in an exported bundle's header — the key set
+- `TAGS` — Tags every export carries, in the README and in GGUF alike.
+
+
+<!-- algocline_nn/gguf.md -->
+# algocline-nn::gguf
+
+Writing a model out as GGUF.
+
+Everything this crate trains lands in safetensors, which is the
+format the training side reads and writes and nothing else does.
+llama.cpp, Ollama and LM Studio read GGUF, so a model trained here
+could be evaluated here and nowhere else.
+
+This is the writer. It renames the tensors to the
+[GGUF naming convention](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md)
+llama.cpp expects, emits the architecture's key-value metadata,
+optionally embeds the tokenizer, and quantizes on the way out.
+
+# What is verified here, and what is not
+
+Verified by this crate's tests: the file is a GGUF that reads back,
+every tensor survives the round trip with its GGUF name and its
+shape, the metadata says what it was asked to say, and a quantized
+export is within the error its block format allows.
+
+**Not verified here: that llama.cpp loads it.** That takes llama.cpp,
+which this repository does not build or vendor. The naming and the
+key set below are written against its documented convention, and the
+remaining step is one `llama-cli -m <file>` on a machine that has it.
+Said plainly rather than implied, because "exports GGUF" and "runs
+under llama.cpp" are different claims and only the first is fenced.
+
+# Layout
+
+ggml stores a matmul weight with the input dimension first. A candle
+[`candle_nn::Linear`] holds `[out, in]`, and candle's GGUF writer
+emits dimensions reversed, so passing these tensors through
+unchanged writes `ne = [in, out]` — the convention ggml reads. The
+transposition is the writer's, not ours, which is why nothing here
+transposes anything. (candle's reader reverses them again, so a
+round trip through this crate comes back in candle order; the file
+on disk is in ggml's.)
+
+# Quantization has a width requirement
+
+Every ggml block format stores a fixed number of values together —
+32 for the `Q*_0` / `Q*_1` families, 256 for the K-quants — and the
+last dimension of a tensor has to be a multiple of it. A model whose
+hidden size is not is exportable at F32 or F16 and not below; the
+refusal names the tensor and the block size rather than failing
+somewhere inside candle.
+
+## Functions
+
+- `export_gguf` — Write `varmap` to `path` as GGUF.
+- `export_gguf_with_metadata` — [`export_gguf`], with `extra` key-value entries written beside the
+- `parse_precision` — Parse the wire form of a precision (Lua opts, JSON config).
+
+## Types
+
+- `GgufArch` — Which architecture's naming and key set to write.
+- `GgufReport` — What an export wrote.
+- `GgufSpec` — The facts a reader needs to rebuild the computation.
+
+## Constants
+
+- `PRECISION_NAMES` — Every precision name this version accepts, widest first.
+
+
+<!-- algocline_nn/merged.md -->
+# algocline-nn::merged
+
+Merged inference checkpoint export (Layer 4a of GH #10).
+
+After a LoRA-wrapped model has been trained (via
+[`crate::train::run_lora_ft`]), the on-disk delta bundle plus the
+base model can be composed into a single safetensors bundle that
+downstream consumers load as if it were a plain pretrained model.
+This module ships the export half only — a caller-supplied
+[`MergedProvenance`] plus a wrapped model produce a safetensors
+file on disk (via [`export_merged`]) and a matching
+[`NnCardMeta`] describing the merged bundle's provenance.
+
+# Design pattern (§Q0)
+
+[`MergedProvenance`] is the Model-side SoT for what the Card
+metadata layer will record. The `to_card_meta` projection maps
+into existing [`NnCardMeta`] fields only — the Card schema
+itself (`crate::card`) is not modified beyond adding `"merged"`
+to the accepted `training_path` values (Layer 4a S4). Future
+branches (LoRA / distillation / full-FT hyperparams) can adopt
+the same pattern — Model-side struct + `to_card_*` projection —
+so the "which Card field do we invent?" negotiation stays local
+to each branch's Model-side struct.
+
+See the Layer 4 merged-checkpoint design notes §3 Q0 for the
+full pattern rationale.
+
+## Functions
+
+- `export_merged` — Export a merged inference-ready safetensors bundle for a
+
+## Types
+
+- `MergeError` — Errors surfaced by [`export_merged`].
+- `MergedProvenance` — Provenance for a merged inference bundle. This is the Model-side
+
+
+<!-- algocline_nn/pooling.md -->
+# algocline-nn::pooling
+
+One vector for a sequence.
+
+A model's hidden state is `[batch, seq, dim]` — one vector per
+position — and an embedding is one vector per sequence. Pooling is
+the step between, and which pooling is a real choice rather than a
+detail: the three below disagree about what a sequence's meaning
+sits in, and the right answer depends on how the model was trained.
+
+- [`Pooling::Mean`] averages every position. The usual default for a
+  sequence embedding, and what Sentence-BERT's own guidance
+  recommends for models with no pooling head of their own.
+- [`Pooling::Last`] takes the final position. What a decoder-only
+  model's own objective builds: that position is the only one that
+  has read the whole sequence, which is why it is the one the
+  language-model head is asked from.
+- [`Pooling::Max`] takes the elementwise maximum, which keeps the
+  strongest activation of each feature rather than its average.
+
+# Padding
+
+`lengths` says how many positions of each row are real. Without it
+the padded tail is pooled along with the content: a mean over a
+half-padded row is half an embedding of the padding, and a "last"
+pool lands on filler. It is optional because a batch of one — the
+common case for an embedding call — has nothing to pad.
+
+## Functions
+
+- `pool` — Pool a `[batch, seq, dim]` hidden state into `[batch, dim]`.
+
+## Types
+
+- `Pooling` — How a sequence's positions become one vector.
+
+
+<!-- algocline_nn/sampling.md -->
+# algocline-nn::sampling
+
+Next-token samplers for the inference path.
+
+Consumes a `[vocab]`-shaped logits row (one position, one batch item)
+and returns the sampled token id. Callers responsible for the outer
+loop — the sampler holds no cache, no state beyond its own RNG, and
+no dependency on the specific adapter that produced the logits.
+
+# The Sampler 3-layer plan
+
+- **Layer 1 (this module)** — [`Sampler`] trait + Rust default
+  implementations ([`GreedySampler`] / [`TemperatureSampler`] /
+  [`TopKTopPSampler`]). Every consumer starts here.
+- **Layer 2 ([`constraint`] / [`json_schema`])** — filters that mask
+  logits before a Layer 1 sampler picks, wired in through
+  [`ConstrainedSampler`], itself a `Sampler`. Four [`Constraint`]s
+  have landed: [`StopTokensConstraint`] (termination only),
+  [`AllowListConstraint`] (a fixed legal set, masking only),
+  [`RegexConstraint`] (anchored full-match over a tokenizer's surface
+  strings) and [`JsonSchemaConstraint`] (a JSON schema compiled to a
+  regex and enforced through the previous one). GBNF grammars are a
+  future addition behind the same trait — and the one that unlocks
+  recursive schemas, which no regular language can express.
+- **Layer 3 (engine side: `alc.nn.sampler` / `alc.nn.constraint`)** —
+  Lua factories that build the types above, compose them, and let a
+  Lua function *be* a `Sampler`. No scheduling primitive lives here:
+  the generation loop is already Lua-side, so swapping the active
+  sampler per position is plain Lua control flow over two handles.
+  The only thing this layer needed from Layer 1 was the ability to
+  erase the sampler's concrete type — see the
+  `impl Sampler for Box<dyn Sampler + Send>` below.
+
+Layer 2 / 3 attach as additional `impl Sampler` types (including the
+Lua-callback bridge on the engine side) without changing the trait.
+That is the entire point of Layer 1.
+
+# Determinism
+
+Every stochastic sampler carries its own [`StdRng`]. A caller that
+needs save/load reproducibility supplies a fixed seed at
+construction; the RNG state advances by exactly one draw per
+[`Sampler::sample`] call, so two runs with the same seed and same
+logits stream reproduce the same tokens.
+
+[`Sampler::sample`] takes `&mut self` to allow the RNG state to
+advance; a caller sharing a sampler across generation loops (unlikely
+given the state semantics) is expected to serialise access
+themselves.
+
+## Types
+
+- `GreedySampler` — Argmax: pick the highest-scoring token.
+- `TemperatureSampler` — Temperature-scaled multinomial sampler.
+- `TopKTopPSampler` — Nucleus (top-p) + top-k truncation, then temperature-scaled
+
+## Traits
+
+- `Sampler` — Next-token sampler.
+
+
+<!-- algocline_nn/sampling__beam.md -->
+# algocline-nn::sampling::beam
+
+Beam search.
+
+Every sampler in [`super`] commits to one token and never
+reconsiders: the sequence it produces is the product of a chain of
+local choices, and a high-probability continuation reachable only
+through a mediocre first token is unreachable. Beam search keeps `k`
+partial sequences alive, extends all of them, and keeps the `k` best
+of the result — so a token that looked second-best can still lead.
+
+It is not a better sampler; it is a different objective. Sampling
+draws from the model's distribution, and beam search approximates
+the *most likely sequence* under it. That is what you want for a
+translation, a constrained field, a short structured answer — and
+not what you want for open text, where the most likely sequence is
+famously bland and repetitive.
+
+# Scoring
+
+A beam's score is the sum of its tokens' log-probabilities. Summing
+logs rather than multiplying probabilities is not a convenience: the
+product of a few hundred probabilities underflows f32 long before a
+generation ends, and every beam would score zero.
+
+Longer sequences score lower for being longer, since every
+additional term is negative. [`BeamOptions::length_penalty`] divides
+by `length^α`, the normalisation from
+[Wu et al. 2016](https://arxiv.org/abs/1609.08144) §7 — `0.0` leaves
+raw sums and prefers short answers, `1.0` is the mean log-probability
+per token, and the values in use sit near `0.6`–`1.0`.
+
+# What this does not do
+
+Sampling and beam search do not compose: the second explores, and a
+stochastic step would make the exploration unrepeatable and the
+"best" beam a draw. This search is greedy over the top-`k`
+continuations and takes no RNG.
+
+## Functions
+
+- `beam_search` — Search for the most likely continuations of `prompt`.
+
+## Types
+
+- `Beam` — One finished or surviving sequence.
+- `BeamOptions` — How the search runs.
+
+## Traits
+
+- `BeamModel` — A model a beam search can advance.
+
+
+<!-- algocline_nn/sampling__constraint.md -->
+# algocline-nn::sampling::constraint
+
+Layer 2 of the sampler plan: constraints that mask logits before a
+Layer 1 [`Sampler`] picks a token.
+
+A [`Constraint`] answers two questions per generation step, both from
+the generated-token prefix alone: *which tokens may come next*
+([`Constraint::mask`]) and *should generation stop*
+([`Constraint::is_terminal`]). [`ConstrainedSampler`] wires a
+constraint to an arbitrary inner sampler and is itself a [`Sampler`],
+so constrained decoding composes with every Layer 1 impl and with
+future Layer 3 schedules without either side knowing about the other.
+
+# Sparse masks
+
+[`TokenMask`] is deliberately sparse. A dense `Vec<bool>` of vocab
+length (32k–256k entries) would be rebuilt on every single token even
+when the constraint has nothing to say. [`TokenMask::AllowAll`] is the
+common case for prefix-agnostic constraints (stop tokens, most of a
+grammar's interior) and costs *nothing*: the logits tensor is handed
+to the inner sampler untouched, with no device round-trip.
+
+# Failure is loud
+
+A mask that leaves zero candidate tokens is a caller programming
+error, not a situation to paper over. Softmax over an all-`-inf` row
+yields NaNs, and silently falling back to argmax on the *unmasked*
+logits would emit a token the constraint explicitly forbade — the one
+outcome constrained decoding exists to prevent. Both cases return
+`Err` instead.
+
+# Constraints that have landed
+
+[`StopTokensConstraint`] is the termination-only case: it masks
+nothing and only answers [`Constraint::is_terminal`].
+[`AllowListConstraint`] is the masking-only case: a fixed legal set,
+the same at every position. [`RegexConstraint`] is the first
+structural one — it drives an
+anchored DFA over the tokenizer's surface strings so every sampled
+token keeps the output on a path towards a full pattern match. JSON
+schema and GBNF grammars are future additions behind the same trait.
+
+## Types
+
+- `AllowListConstraint` — Restrict every position to a fixed set of legal token ids.
+- `ConstrainedSampler` — A [`Sampler`] that masks logits through a [`Constraint`] before
+- `RegexConstraint` — Restrict generation to token sequences that spell a full match of a
+- `StopTokensConstraint` — Terminate generation when one of a fixed set of token ids is emitted.
+- `TokenBitset` — A token mask as one bit per token id.
+- `TokenMask` — Sparse per-step token mask produced by a [`Constraint`].
+
+## Traits
+
+- `Constraint` — Per-step restriction on the next token.
+
+
+<!-- algocline_nn/sampling__json_schema.md -->
+# algocline-nn::sampling::json_schema
+
+JSON-schema-constrained decoding: a [`Constraint`] that admits only
+token sequences spelling a JSON document valid against a schema.
+
+# Schema → regex → DFA
+
+[`JsonSchemaConstraint`] owns no automaton of its own. It compiles the
+schema into a single regular expression once, at construction, and
+delegates every per-token decision to [`RegexConstraint`] — the same
+shape Outlines (dottxt-ai) uses. The reason is that a schema without
+`$ref` describes a *finite* tree of alternations, concatenations and
+repetitions, which is exactly the class a regular language covers; once
+that translation is done, the hard part (walking a byte DFA over the
+tokenizer's surface strings, rejecting a token the moment it can no
+longer reach a full match) is already solved and does not want a second
+implementation.
+
+# Failure is loud, and that is the whole point
+
+A keyword this version does not interpret is rejected at construction
+rather than ignored. Ignoring one is not a harmless partial
+implementation: every unhandled keyword *widens* the generated
+language, so a caller who wrote `"pattern"` or `"maxLength"` would get
+a constraint that silently permits the documents those keywords exist
+to forbid. Since the sole reason to pay for constrained decoding is the
+guarantee that the output is valid, a quietly weakened guarantee is
+worse than no constraint at all — the caller would stop checking.
+
+The check is an allowlist (see [`reject_unsupported`]): each node
+reports the keys it did *not* interpret, so a JSON Schema draft that
+adds new keywords fails safe instead of being silently under-enforced.
+
+# KNOWN LIMITATION: every property must be required
+
+A schema whose `required` array does not cover every key of
+`properties` is rejected. Optional properties turn a fixed
+concatenation into a set of `2^n` comma placements — the commas sit
+*between* members, so each present/absent combination changes the
+separator layout rather than just deleting a member. Emitting that
+expansion is possible but blows up the pattern and the DFA, and this
+version does not pay that cost. Callers mark every property required,
+or split the schema into the variants they actually intend to
+generate.
+
+# KNOWN LIMITATION: compact output only
+
+The generated pattern permits no whitespace between structural tokens:
+the output is always `{"a":1,"b":[2,3]}`, never `{ "a": 1 }`. JSON
+treats the two as equivalent, but admitting optional whitespace at
+every structural position multiplies the automaton for no gain in
+expressiveness, and a deterministic surface form is easier to diff and
+to assert on. Whitespace *inside* string values is unaffected — it is
+ordinary string content.
+
+Property order is likewise fixed: members are emitted in sorted key
+order (see [`object_to_regex`]).
+
+# Recursive schemas are out of reach, not just unimplemented
+
+`$ref` is rejected like any other unsupported keyword, but it deserves
+a separate note: a self-referential schema (a tree node whose child is
+the same node) describes a context-free language, and no regular
+expression can match balanced nesting of unbounded depth. Supporting
+recursion therefore cannot be done by extending this translation — it
+needs a pushdown automaton, i.e. the grammar-constrained (GBNF) path
+the module plan lists as a separate Layer 2 constraint. Non-recursive
+`$ref` (plain reuse) could be handled here by inlining, and is simply
+not implemented yet.
+
+## Types
+
+- `JsonSchemaConstraint` — Restrict generation to token sequences spelling a JSON document that
+
+
+<!-- algocline_nn/sampling__penalty.md -->
+# algocline-nn::sampling::penalty
+
+Penalties that read what a generation has already produced.
+
+Every sampler in [`super`] reads one logits row and nothing else, so
+none of them can tell a token the model has emitted six times from
+one it has never emitted. Left alone, a model that starts repeating
+keeps repeating — the state that would break the loop is exactly the
+history the sampler cannot see.
+
+Three penalties are in general use and they are not variants of one
+another:
+
+- **Repetition** ([`Penalties::repetition`]) scales the logit of any
+  token already seen, by a factor rather than a subtraction. From
+  CTRL ([Keskar et al. 2019](https://arxiv.org/abs/1909.05858) §4.3,
+  which reports `1.2` as a working value), and it divides positive
+  logits while multiplying negative ones — the same rule on both
+  sides would *raise* a negative logit and reward the repeat it was
+  meant to discourage.
+- **Frequency** ([`Penalties::frequency`]) subtracts in proportion to
+  how many times the token appeared, so pressure accumulates with
+  each repeat.
+- **Presence** ([`Penalties::presence`]) subtracts a flat amount from
+  every token that appeared at all, which pushes towards new
+  vocabulary rather than away from repetition as such.
+
+The last two are OpenAI's, additive and independent of scale; the
+first is multiplicative and interacts with temperature. They compose,
+and the order is fixed here: repetition scales, then the two
+subtractions land on the result.
+
+# Where the history comes from
+
+[`PenalizedSampler`] accumulates the tokens it returns, the same way
+[`ConstrainedSampler`](super::ConstrainedSampler) accumulates its
+prefix. A prompt is not part of that by default — see
+[`PenalizedSampler::with_history`] — because whether the prompt
+counts is a real choice and not one this crate should make silently:
+penalising it discourages a summary from reusing the words it was
+given, which is sometimes exactly wrong and sometimes exactly right.
+
+## Functions
+
+- `apply_penalties` — Apply the penalties to a `[vocab]` logits row against `history`.
+
+## Types
+
+- `PenalizedSampler` — A sampler that pushes down what the generation has already produced.
+- `Penalties` — How hard an already-seen token is pushed down.
 
 
 <!-- algocline_nn/tokenizer.md -->
@@ -1118,6 +2146,16 @@ Preset → HF repo mapping:
 | `gpt2`  | `openai-community/gpt2`                 |
 | `llama` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0`    |
 
+Alongside the tokenizer itself, the first-use fetch also picks up
+the repo's `tokenizer_config.json`, cached as
+`<cache_dir>/<preset>-config.json`. That file is where a chat model
+ships its **chat template** — the Jinja2 program that turns a list of
+`{role, content}` turns into the exact prompt string the model was
+instruction-tuned on. Rendering it is
+[`HfTokenizer::apply_chat_template`]. A repo that ships no
+`tokenizer_config.json` (base models, GPT-2) stays fully usable for
+encode / decode; only chat rendering refuses.
+
 Error handling follows the crate's Service-layer error-propagation
 discipline: every failure surfaces as [`TokenizerError`] rather
 than silently returning an empty result.
@@ -1125,6 +2163,7 @@ than silently returning an empty result.
 ## Types
 
 - `HfTokenizer` — Loaded pre-trained tokenizer keyed by preset name.
+- `Message` — One turn of a conversation handed to
 - `TokenizerError` — Errors returned by [`HfTokenizer`] APIs.
 
 
@@ -1137,28 +2176,120 @@ This module owns four building blocks the trainer entry uses:
 
 - [`data`] — streaming batch abstraction (`Dataset` trait + JSONL /
   Parquet / in-memory implementations).
+- [`corpus`] — the pre-tokenized corpus file format (its module
+  documentation is the spec) plus the loader and the round-robin
+  merge that turn a set of such files into rows a
+  [`data::TokenizedDataset`] takes.
 - [`loss`] — [`loss::Loss`] trait + [`loss::CrossEntropyLoss`], the
   default used by Full FT. A distillation follow-up plugs in the
   same trait.
 - [`scheduler`] — cosine-with-warmup learning-rate schedule.
-- [`ckpt`] — rotating safetensors [`ckpt::CheckpointStore`] and the
-  [`Checkpoint`] record type used by the caller.
+- [`ckpt`] — rotating safetensors [`ckpt::CheckpointStore`], the
+  [`Checkpoint`] record type used by the caller, and the restore
+  side ([`ckpt::restore_into`]) that reads a checkpoint back into a
+  live `VarMap`.
 - [`fullft`] — [`fullft::run_full_ft`] entry point: `forward → loss →
   backward → optimizer step`, with per-step LR from the scheduler
-  and rotating checkpoints from the store.
+  and rotating checkpoints from the store, plus the two entry points
+  that hand the model a side channel per batch
+  ([`fullft::run_conditioned_ft`] / [`fullft::run_allowed_ft`]).
 
-The Lua bridge only reaches for the top-level re-exports; internal
-callers can still pull individual submodule items when needed.
+The Lua bridge mostly reaches for the top-level re-exports; internal
+callers can still pull individual submodule items when needed, as
+the bridge does for [`corpus::interleave`].
 
 ## Types
 
 - `Checkpoint` — Snapshot of a completed training run.
 
+## Traits
+
+- `AllowedForward` — A model that can be told, at every position, which ids the answer
+- `ConditionedForward` — A model that can be told, once per row, which condition that row was
+- `DeviceView` — Access to the [`candle_core::Device`] a trainable model was built
+
+
+<!-- algocline_nn/train__checkpointing.md -->
+# algocline-nn::train::checkpointing
+
+The forward and backward of a gradient-checkpointed step.
+
+See [`crate::arch::blockwise`] for what checkpointing is and which
+models can be driven this way. This module is the other half: the
+two-phase pass the training loop runs in place of
+`forward → loss → backward`.
+
+# The two phases
+
+**Forward.** Embed, then walk the blocks, detaching each block's
+output before it becomes the next block's input. The detach is what
+frees the memory: a detached tensor carries no operation, so the
+graph that produced it — every intermediate inside that block —
+becomes unreachable and is dropped. What is kept is one
+`[batch, seq, dim]` tensor per block, the inputs, which is the
+checkpoint. The head and the loss run on the last one, tracked
+normally.
+
+**Backward.** Run the loss's own backward, which reaches the head's
+parameters and stops at the last checkpoint — leaving, in the grad
+store, the gradient with respect to that checkpoint. Then walk the
+blocks backwards: re-run one block on its stored input (rebuilding
+exactly the intermediates the forward threw away), and push the
+incoming gradient through it.
+
+# Pushing a gradient into a sub-graph
+
+candle's `Tensor::backward` seeds the graph with ones, so it answers
+`∂(Σ y)/∂θ` and there is no argument for "start from this gradient
+instead". The surrogate `Σ(y ⊙ g)` supplies it:
+
+```text
+∂/∂θ Σᵢ yᵢ·gᵢ  =  Σᵢ gᵢ · ∂yᵢ/∂θ  =  Jᵀg
+```
+
+which is exactly the chained gradient, for `g` treated as a
+constant — and it is, having come out of a grad store already
+detached. The same backward also writes `∂/∂x Σ(y ⊙ g)` for the
+block's input `x`, which is the gradient the next block down
+receives.
+
+# Why the checkpoint is re-entered as a `Var`
+
+Because a plain detached tensor does not work, and the difference is
+silent. candle's graph walk marks a node as tracking gradients only
+if a `Var` is reachable below it, and skips the rest entirely — so
+every operation computed from a non-`Var` leaf alone is never
+visited by the backward pass. A gradient does land on such a leaf
+when its immediate consumer is tracked, which makes the arrangement
+look workable on a one-operation example; it stops there. Measured:
+`layer_norm_slow` over a non-`Var` input leaves that input with no
+gradient at all, because the mean and variance it computes first
+depend on nothing else.
+
+Each checkpoint is therefore re-entered as a temporary
+[`Var`](candle_core::Var) during the backward phase. A `Var` is a
+tracked leaf, so the block's recomputation tracks gradients
+throughout and its own gradient — the one the next block down
+receives — is written where it can be read. The `Var` lives for one
+block's recomputation and is dropped with it; it is never registered
+in any `VarMap` and no optimizer ever sees it.
+
+Both halves of that are asserted in this module's tests rather than
+inferred, because a checkpointed run whose gradients quietly stop
+partway produces a loss curve that looks like a slow one.
+
+## Functions
+
+- `checkpointed_step` — Run one checkpointed step and return `(loss value, gradients)`.
+- `grad_coverage` — How many of `vm`'s variables `grads` holds a gradient for.
+- `max_grad_gap` — Sum of `|a - b|`'s maximum over every variable both stores hold, for
+
 
 <!-- algocline_nn/train__ckpt.md -->
 # algocline-nn::train::ckpt
 
-Rotating safetensors checkpoint writer.
+Rotating safetensors checkpoint writer, and the restore side that
+reads one back into a live `VarMap`.
 
 During Full FT the trainer writes an intermediate checkpoint every
 `ckpt_every` steps and keeps only the most recent `ckpt_keep`
@@ -1166,13 +2297,178 @@ files on disk. The older files are dropped by modification time
 rather than by step number so a manual `touch` cannot hide the
 trainer's own bookkeeping from `ls -t`.
 
+A step can be [pinned](CheckpointStore::pin), which lifts it out of
+that rotation entirely: pinned files neither count against
+`ckpt_keep` nor get dropped by it. That is what lets a checkpoint
+search hold on to a candidate it liked at step 40 while the window
+keeps turning over around it — without a pin, the file the search
+selected is deleted as soon as `ckpt_keep` newer ones are written.
+
+[`restore_into`] / [`restore_into_partial`] are the other direction:
+a checkpoint back into the variables a model was built against, so a
+run can continue from weights an earlier run produced. Both verify
+the whole map before writing anything and report what they did, name
+by name — see [`restore_into`] for what that adds over
+`candle_nn::VarMap::load`.
+
 ## Functions
 
 - `checkpoint_from_path` — Build a [`Checkpoint`] record from a save path and per-run metrics.
+- `identity_sidecar_path` — Path of the sidecar describing the bundle at `path`.
+- `producer` — The value written under [`PRODUCER_KEY`]: `algocline <version>`.
+- `read_bundle_header` — Read the header a bundle carries.
+- `restore_into` — Load a checkpoint into a live `VarMap`, refusing anything short of a
+- `restore_into_partial` — Load a checkpoint into a live `VarMap`, accepting that some
 
 ## Types
 
+- `ApplyStage` — Which half of the apply pass failed, for [`RestoreError::Apply`].
+- `BundleIdentity` — What a checkpoint says about itself.
+- `Candidate` — A checkpoint the hook asked to hold, as it stood when it was held.
 - `CheckpointStore` — Rotating checkpoint writer.
+- `MetricPoint` — One step of a run, as the metrics file records it.
+- `RestoreError` — Why a restore refused to run, or stopped part-way.
+- `RestoreReport` — What a restore did, name by name.
+- `TensorMismatch` — One name whose tensor in the checkpoint does not describe the same
+
+## Constants
+
+- `ARCHITECTURE_KEY` — Key holding the architecture preset id.
+- `BUNDLE_SCHEMA` — Value of [`SCHEMA_KEY`] for the key set this version writes.
+- `CARD_ID_KEY` — Key holding the Card id the weights belong to.
+- `FORMAT_KEY` — The one `__metadata__` key safetensors readers share.
+- `FORMAT_PT` — The de-facto value of [`FORMAT_KEY`]: PyTorch's tensor layout,
+- `KIND_CHECKPOINT` — Value of [`KIND_KEY`] in a trainer checkpoint's header.
+- `KIND_KEY` — Key naming which of algocline's files this is. [`SCHEMA_KEY`] says
+- `PRODUCER_KEY` — Key naming the program that wrote the file ([`producer`]).
+- `SCHEMA_KEY` — Key whose presence marks a header as algocline's. Everything else
+
+
+<!-- algocline_nn/train__corpus.md -->
+# algocline-nn::train::corpus
+
+Corpus files: pre-tokenized training rows on disk.
+
+A producer that has already tokenized its material — a simulator, an
+export from another tool, an earlier stage of the same pipeline —
+has no text left for a tokenizer to read, so the JSONL and Parquet
+adapters in [`crate::train::data`] do not apply to it. This module
+is the format such a producer writes and the loader that reads it
+back.
+
+# Format
+
+This documentation is the format's specification. One file is one
+JSON object:
+
+```json
+{
+  "meta": { "ctx_len": 48, "vocab_size": 46 },
+  "rows": [[3, 7, 1], [2, 9]]
+}
+```
+
+- **`meta.ctx_len`** — the sequence length the rows were written
+  for. Both dimensions are non-zero, and no row is longer than it
+  ([`CorpusError::RowTooLong`]).
+- **`meta.vocab_size`** — the id space the rows are drawn from.
+  Every id in `rows` is checked against it at load
+  ([`CorpusError::TokenOutOfRange`]); an id at or past it would
+  otherwise surface several layers away as an out-of-range embedding
+  lookup.
+- **`meta.requires`** — optional array of `meta` field names a
+  reader has to understand for the file to mean what its producer
+  intended. An entry this version does not implement is refused by
+  name ([`CorpusError::UnsupportedRequirement`]) rather than loaded
+  without it. This version understands `ctx_len`, `vocab_size` and
+  `per_row_allowed`.
+- **`meta.<anything else>`** — ignored unless `meta.requires` lists
+  it. A producer records more than a trainer reads, and a file
+  carrying a bookkeeping field this version has never heard of still
+  loads.
+- **`rows`** — token id sequences, at least one, none of them empty,
+  none longer than `meta.ctx_len`. Rows are *not* padded here:
+  padding to `ctx_len` is [`crate::train::TokenizedDataset`]'s
+  business, per batch.
+- **`allowed`** — optional, and opt-in through
+  `meta.requires: ["per_row_allowed"]`: which ids each position of
+  each row was allowed to take. See *Allowed-id sets* below.
+
+# Allowed-id sets
+
+A corpus may state what was available at each position, which a run
+reads either as a mask on the loss or as an input to the model. The
+field is opt-in and announces itself:
+
+```json
+{
+  "meta": { "ctx_len": 4, "vocab_size": 10, "requires": ["per_row_allowed"] },
+  "rows": [[3, 7, 1, 5]],
+  "allowed": [{ "2": [7, 8], "4": [5] }]
+}
+```
+
+`allowed` is parallel to `rows`, one entry per row, and each entry is
+sparse: it maps a **1-based** position to the ids available there. A
+position nobody listed is unconstrained, which is what an empty set
+means downstream too — so the padding past the end of a row is left
+out rather than spelled.
+
+The requirement and the field are checked against each other in both
+directions ([`CorpusError::AllowedMissing`] /
+[`CorpusError::AllowedUnannounced`]). Either way round the run would
+otherwise train on rows that do not mean what the producer wrote and
+report the numbers of a well-formed one: `allowed` without the
+requirement lets a reader that does not implement the field train the
+same rows unconstrained, and the requirement without `allowed` is a
+producer that meant to write sets and did not.
+
+Rows are left at their own listed width here. Widening them to the
+common width the model's allowed-id input takes belongs with the
+merge, because a width can only be settled once every source has been
+read.
+
+# Extending the format
+
+`meta.requires` is the mechanism, and it is the reason the format
+needs no version number. A producer adding a field that only records
+how the file was made writes it into `meta` and older readers ignore
+it. A producer adding a field the file's *meaning* depends on — a
+per-row constraint, say — lists that field in `meta.requires`, so a
+reader that does not implement it refuses the file instead of
+training on a reading its producer did not intend. Unknown-and-
+ignored is therefore a choice the writer makes per field rather than
+a property of every field a reader has not heard of.
+
+# What this module does not do
+
+The loader's responsibility ends at "file → validated rows".
+Batching, padding, the per-row side channels and any repetition of
+the row list belong to [`crate::train::TokenizedDataset`], which
+already implements them; duplicating any of it here would give a
+corpus-backed run different semantics from every other dataset for
+no reason a caller could see.
+
+# Combining several files
+
+[`interleave`] merges sources round-robin rather than concatenating
+them. Concatenation makes the source a function of how far the run
+has got, which a run binding something per source cannot separate
+from the thing it is supposed to be binding. Sources of unequal
+length drop out as they are exhausted, so the tail is whatever the
+largest ones have left; nothing is duplicated to even the rotation
+out, because that would change the mixture the caller named.
+
+## Functions
+
+- `interleave` — [`interleave_labelled`] for a caller that attaches nothing per
+- `interleave_labelled` — Merge several corpora round-robin, keeping each row's source.
+
+## Types
+
+- `CorpusError` — Errors surfaced while reading a corpus file or combining several.
+- `CorpusFile` — One loaded corpus file: the format's two `meta` dimensions plus the
+- `InterleavedRow` — One row of an interleaved corpus, together with the source it came
 
 
 <!-- algocline_nn/train__data.md -->
@@ -1197,10 +2493,10 @@ Subtask invariants:
   #5); the `algocline-nn` crate does no filesystem access itself.
   The bridge builds a [`TokenizedDataset`] from the pre-tokenized
   rows and hands it back to the trainer.
-- Parquet reading is scaffolded (see [`ParquetDataset`]); a later
-  stage picks up the concrete reader implementation. Constructing the
-  handle is legal, `next_batch` returns an error so no silent
-  empty iterator is exposed (Rust exception-free discipline).
+- Parquet adapter (see [`ParquetDataset`]) reads the column named
+  [`DatasetOpts::text_field`] through the `parquet` crate's row API
+  (no arrow dependency) and tokenizes it exactly like the JSONL
+  adapter — same field-name convention, same shuffle semantics.
 
 ## Types
 
@@ -1208,13 +2504,61 @@ Subtask invariants:
 - `DatasetError` — Errors surfaced by dataset iterators.
 - `DatasetOpts` — Iterator config shared across dataset kinds.
 - `JsonlDataset` — JSONL-backed dataset.
-- `ParquetDataset` — Parquet-backed dataset (scaffold).
+- `ParquetDataset` — Parquet-backed dataset.
 - `TeacherCardDataset` — In-memory dataset for hard-label distillation.
 - `TokenizedDataset` — In-memory dataset built from a `Vec<Vec<u32>>` of pre-tokenized
 
 ## Traits
 
 - `Dataset` — Streaming batch iterator.
+
+
+<!-- algocline_nn/train__lion.md -->
+# algocline-nn::train::lion
+
+Lion — the sign-momentum optimizer from *Symbolic Discovery of
+Optimization Algorithms* (Chen et al., arXiv:2302.06675).
+
+# The update
+
+Writing `interp(x, y, a) = (1 - a)·x + a·y`, one step is
+
+```text
+update   = sign(interp(g, m, β₁))
+w        = w - lr·update - lr·λ·w
+m        = interp(g, m, β₂)
+```
+
+Two properties follow from the `sign`, and both matter to a caller
+coming from AdamW:
+
+- **Every element moves by exactly `lr`.** There is no per-parameter
+  scaling, so the learning rate is the step size rather than an
+  upper bound on it. The paper's guidance is a learning rate 3–10×
+  *smaller* than AdamW's and a decoupled weight decay 3–10× *larger*,
+  so that the effective decay `lr·λ` lands in the same place.
+- **One state tensor instead of two.** Lion keeps a momentum and no
+  second moment, which is the memory argument for it.
+
+The momentum update reads the *pre-step* momentum, the same value
+the update direction was computed from — not the one the step just
+produced. Both lines above use `m` on the right-hand side, and
+swapping their order silently changes the algorithm into something
+with no published behaviour.
+
+# Precision
+
+An FP32 master copy is kept for parameters that are not already F32.
+With a sign update every element moves by exactly `lr`, so a BF16
+parameter whose ulp exceeds `lr` would round every step away and
+stall at its initial value while the loss curve looked merely flat.
+F32 parameters are updated in place — the master would be a copy of
+the thing it mirrors.
+
+## Types
+
+- `Lion` — Lion over candle `Var`s.
+- `ParamsLion` — Lion's hyperparameters.
 
 
 <!-- algocline_nn/train__loss.md -->
@@ -1243,6 +2587,93 @@ only the response region contributes to the loss.
 - `Loss` — Loss function on `[batch, seq, vocab]` logits.
 
 
+<!-- algocline_nn/train__mixed.md -->
+# algocline-nn::train::mixed
+
+Mixed-precision AdamW (design §7.1: BF16 weights / activations +
+FP32 optimizer states).
+
+candle-nn's stock [`candle_nn::AdamW`] keeps its first/second
+moments in the *parameter's* dtype, so handing it BF16 `Var`s
+silently runs the whole optimizer state in BF16 — the classic
+mixed-precision failure mode where small updates round to zero at
+the parameter's magnitude and training stalls without erroring.
+[`MixedAdamW`] implements the standard master-weights recipe
+instead:
+
+- the model's `Var`s stay in their low precision (BF16) and keep
+  driving forward / backward,
+- a private FP32 master copy of every parameter plus FP32 moment
+  tensors receive the AdamW update (gradients are upcast per step),
+- the updated master is cast back down and written into the `Var`
+  so the next forward sees the new weights.
+
+The update math mirrors `candle_nn::AdamW::step` term for term
+(decoupled weight decay applied as `θ · (1 − lr·λ)`, bias-corrected
+moments) so the FP32-on-FP32 special case is numerically identical
+to the stock optimizer — pinned by the parity test below.
+
+F16 is deliberately not accepted: its 5-bit exponent needs loss
+scaling to keep gradients from flushing to zero, and no scaler
+ships here. BF16 shares FP32's 8-bit exponent, which is why it
+trains without a scaler.
+
+## Types
+
+- `MixedAdamW` — AdamW with FP32 master weights over low-precision parameters.
+
+
+<!-- algocline_nn/train__optstate.md -->
+# algocline-nn::train::optstate
+
+Optimizer state that outlives the run that produced it.
+
+A checkpoint written by [`CheckpointStore`](super::ckpt::CheckpointStore)
+is `varmap.save()` and nothing else: the parameters, and no trace of
+the optimizer that shaped them. AdamW's two moments and Lion's
+momentum live in memory for the length of a run and are gone when it
+ends, so `init_from` restores weights into a freshly-zeroed
+optimizer — a warm start, not a resume.
+
+The difference shows up immediately and quietly. AdamW's update is
+`m̂ / (√v̂ + ε)` with both moments bias-corrected against the step
+count; starting them at zero makes the first steps after a restart
+behave like the first steps of a run, which is exactly when the
+update is least like the one the schedule assumes. The loss curve
+bends at the restart and nothing in the record says why.
+
+This module writes that state to a sidecar beside the checkpoint,
+reads it back, and refuses anything short of a complete restore —
+the same stance [`restore_into`](super::ckpt::restore_into) takes
+for the weights, and for the same reason: a resume that silently
+kept half the state is indistinguishable from one that worked until
+the run is over.
+
+# Why a sidecar rather than more tensors in the checkpoint
+
+The checkpoint is the artifact everything downstream loads — the
+Card's `bundle_ref`, `alc.nn.load`, an export. Optimizer state is
+roughly three times the size of the parameters for AdamW (an FP32
+master plus two FP32 moments), and it is of no use to anything that
+is not resuming this exact run. Keeping it in `<name>.opt` leaves
+the inference path loading what it loaded before.
+
+## Functions
+
+- `names_by_tensor_id` — Which parameter each tensor id belongs to, by the name the `VarMap`
+- `param_name` — The name a parameter's state is stored under, or a refusal naming
+- `sidecar_path` — Path of the optimizer-state file belonging to `ckpt`.
+- `slot_tensor` — Look one parameter's slot tensor up by name, with the refusal spelt
+
+## Types
+
+- `OptimizerState` — Everything one optimizer needs to carry on where it left off.
+
+## Constants
+
+- `OPT_SIDECAR_SUFFIX` — Suffix of the file holding a checkpoint's optimizer state.
+
+
 <!-- algocline_nn/train__scheduler.md -->
 # algocline-nn::train::scheduler
 
@@ -1253,10 +2684,16 @@ Trainers ask for a scheduler once at construction time and then call
 The loop then passes the value through to the optimizer via
 `AdamW::set_learning_rate`.
 
-Two schedules ship today: a plain constant one (useful for tests and
-sanity checks) and a cosine schedule with linear warmup that matches
-the nanoGPT / HF Trainer default. Both live behind the [`Schedule`]
-enum so a config can pick between them via a plain string field.
+Four schedules ship: a plain constant one (useful for tests and
+sanity checks), cosine with linear warmup (the nanoGPT / HF Trainer
+default), linear with warmup, and warmup-stable-decay. All live
+behind the [`ScheduleKind`] enum so a config can pick between them
+via a plain string field.
+
+The three warmup-bearing schedules share one warmup ramp and differ
+only in what they do afterwards, which is why they sit in one enum
+rather than in separate types: a caller switching between them is
+changing the tail of a curve, not the kind of thing it is.
 
 ## Types
 
@@ -1283,15 +2720,26 @@ candle operation used here already dispatches on the device the
 
 ## Functions
 
+- `allowed_input_sets` — The batch's allowed-id sets as a model input, aligned with the
+- `allowed_logit_mask` — Additive logit mask that removes every id a target may not take.
+- `run_allowed_ft` — Run Full FT training with the ids allowed at every position handed
+- `run_conditioned_ft` — Run Full FT training with a condition supplied per row of every
 - `run_distill` — Run a distillation training loop.
 - `run_full_ft` — Run Full FT training and return the final checkpoint record.
 - `run_lora_ft` — Run LoRA fine-tuning and return the final Δ-only checkpoint record.
 
 ## Types
 
+- `CkptControl` — What the hook decided at a checkpoint boundary.
+- `CkptFlow` — Whether the trainer continues or breaks early after an
+- `CkptHook` — Callback fired at every `ckpt_every` boundary, after the checkpoint
+- `CkptInfo` — Information handed to the [`CkptHook`] at every `ckpt_every` boundary.
 - `DistillLossKind` — Which distillation loss the caller wants for [`run_distill`].
 - `DistillSpec` — Distillation-run configuration.
+- `EarlyStop` — When to stop a run that is no longer improving.
 - `FullFtConfig` — Hyperparameters for [`run_full_ft`].
+- `KeepMark` — A hook's request to hold the checkpoint it was just handed.
+- `OptimizerKind` — Which optimizer the trainer requested.
 - `TrainError` — Errors surfaced by the training loop.
 - `TrainingLease` — One-time guard preventing two Full FT loops from running against
 - `TrainingLeaseGuard` — RAII guard that releases the training lease on drop.

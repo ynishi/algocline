@@ -1674,7 +1674,13 @@ fn alc_nn_handle_beam_search_returns_ranked_beams() {
         .eval()
         .expect("beam_search refusals");
     assert!(errors[0].contains("empty"), "{}", errors[0]);
-    assert!(errors[1].contains("at least 1"), "{}", errors[1]);
+    // Refused at the bridge boundary now, with the range stated, rather
+    // than by the search after the options are already in hand.
+    assert!(
+        errors[1].contains("opts.beams must be between"),
+        "{}",
+        errors[1]
+    );
     assert!(errors[2].contains("vocab"), "{}", errors[2]);
 }
 

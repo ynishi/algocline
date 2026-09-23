@@ -59,7 +59,7 @@ use rand::rngs::StdRng;
 pub use beam::{beam_search, Beam, BeamModel, BeamOptions};
 pub use constraint::{
     AllowListConstraint, ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint,
-    TokenMask,
+    TokenBitset, TokenMask,
 };
 pub use json_schema::JsonSchemaConstraint;
 pub use penalty::{apply_penalties, PenalizedSampler, Penalties};

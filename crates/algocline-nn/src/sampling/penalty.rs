@@ -212,6 +212,17 @@ impl<S: Sampler> PenalizedSampler<S> {
 }
 
 impl<S: Sampler> Sampler for PenalizedSampler<S> {
+    /// Refused, for the reason
+    /// [`ConstrainedSampler`](super::ConstrainedSampler) refuses it:
+    /// one history cannot describe several sequences, and a batch
+    /// sharing one would penalise each row for what the others emitted.
+    fn sample_batch(&mut self, _logits: &Tensor) -> CandleResult<Vec<u32>> {
+        Err(candle_core::Error::Msg(
+            "sample_batch: a penalised sampler tracks one token history, and a batch is              several sequences; use one penalised sampler per row"
+                .into(),
+        ))
+    }
+
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32> {
         let counted = self.counted();
         let token = if self.penalties.is_noop() || counted.is_empty() {

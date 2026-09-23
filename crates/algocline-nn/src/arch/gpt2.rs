@@ -2890,6 +2890,62 @@ mod tests {
         }
     }
 
+    /// A cached decode of a batch is a cached decode of each of its
+    /// rows: the cache holds one entry per row per position, and the
+    /// rows do not read each other's.
+    #[test]
+    fn a_batched_cached_decode_matches_the_rows_decoded_alone() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = crate::arch::seeded_var_builder(&vm, 2024, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+
+        let a: Vec<u32> = vec![1, 2, 3, 4];
+        let b: Vec<u32> = vec![9, 8, 7, 6];
+        let prompt = 2;
+
+        // Both rows in one cache.
+        let mut batched_cache = model.new_cache();
+        let first: Vec<u32> = a[..prompt].iter().chain(&b[..prompt]).copied().collect();
+        model
+            .forward_with_cache(
+                &Tensor::from_slice(&first, (2, prompt), &cfg.device).unwrap(),
+                &mut batched_cache,
+            )
+            .unwrap();
+        let step: Vec<u32> = vec![a[prompt], b[prompt]];
+        let batched = model
+            .forward_with_cache(
+                &Tensor::from_slice(&step, (2, 1), &cfg.device).unwrap(),
+                &mut batched_cache,
+            )
+            .unwrap();
+
+        // Each row on its own.
+        for (row, ids) in [(0usize, &a), (1usize, &b)] {
+            let mut cache = model.new_cache();
+            model
+                .forward_with_cache(
+                    &Tensor::from_slice(&ids[..prompt], (1, prompt), &cfg.device).unwrap(),
+                    &mut cache,
+                )
+                .unwrap();
+            let solo = model
+                .forward_with_cache(
+                    &Tensor::from_slice(&[ids[prompt]], (1, 1), &cfg.device).unwrap(),
+                    &mut cache,
+                )
+                .unwrap();
+            let solo: Vec<f32> = solo.i((0, 0)).unwrap().to_vec1().unwrap();
+            let from_batch: Vec<f32> = batched.i((row, 0)).unwrap().to_vec1().unwrap();
+            let gap = max_abs(&solo, &from_batch);
+            assert!(
+                gap < 2e-4,
+                "row {row} diverged from its solo decode by {gap}"
+            );
+        }
+    }
+
     /// A cache built for another model, or filled by another sequence,
     /// is refused rather than read as this one's history.
     #[test]

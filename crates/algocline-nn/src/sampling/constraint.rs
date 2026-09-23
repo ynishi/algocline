@@ -178,6 +178,17 @@ impl<S: Sampler, C: Constraint> ConstrainedSampler<S, C> {
 }
 
 impl<S: Sampler, C: Constraint> Sampler for ConstrainedSampler<S, C> {
+    /// Refused: this sampler holds one prefix and a batch is several
+    /// sequences. Mixing every row's tokens into one prefix would
+    /// return valid ids in the right shape, constrained against a
+    /// sequence none of the rows is.
+    fn sample_batch(&mut self, _logits: &Tensor) -> CandleResult<Vec<u32>> {
+        Err(candle_core::Error::Msg(
+            "sample_batch: a constrained sampler tracks one prefix, and a batch is several              sequences; use one constrained sampler per row"
+                .into(),
+        ))
+    }
+
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32> {
         let mask = self.constraint.mask(&self.prefix);
         let token = match mask {

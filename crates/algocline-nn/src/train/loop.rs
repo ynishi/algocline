@@ -231,6 +231,31 @@ pub struct FullFtConfig {
     /// Number of rotating checkpoints kept (clamped to at least 1
     /// inside [`CheckpointStore`]).
     pub ckpt_keep: usize,
+    /// Cap the joint L2 norm of the gradient at this value before each
+    /// optimizer step, or `None` (default) for no cap.
+    ///
+    /// Scales every trainable parameter's gradient by
+    /// `max_norm / norm` when the norm exceeds `max_norm`, leaving the
+    /// direction alone and only its length changed — the standard
+    /// global-norm form rather than a per-tensor or per-element clamp,
+    /// which would tilt the update away from the gradient.
+    ///
+    /// What it is for: one bad batch produces a gradient orders of
+    /// magnitude larger than the rest, the step it drives lands far
+    /// outside the region the loss was measured in, and the run either
+    /// returns to a worse place or leaves with non-finite weights. The
+    /// cap bounds how far any single step can move regardless of the
+    /// batch, and `1.0` is where most transformer recipes sit.
+    ///
+    /// A non-finite norm is left unscaled — multiplying by
+    /// `max_norm / NaN` would only spread the NaN into every parameter
+    /// that still had a usable gradient, and the norm still reaches the
+    /// `on_ckpt` hook, which is where a run can notice and stop.
+    ///
+    /// The norm reported through [`CkptInfo::grad_norm`] is the one
+    /// measured before this scaling, so it says what the step actually
+    /// produced rather than what the cap allowed through.
+    pub clip_grad_norm: Option<f64>,
     /// Score the held-out set every N optimizer steps, or `0`
     /// (default) to run without one.
     ///
@@ -306,6 +331,7 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            clip_grad_norm: None,
             eval_every: 0,
             init_from: None,
             mask_disallowed_logits: false,
@@ -414,6 +440,18 @@ pub enum TrainError {
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
+    /// [`FullFtConfig::clip_grad_norm`] was set to a value that cannot
+    /// cap anything.
+    ///
+    /// Zero would erase every gradient and a negative value would
+    /// reverse it, and either produces a run that trains — steps are
+    /// taken, a loss is reported, a checkpoint is written — while
+    /// moving nowhere or backwards.
+    #[error("clip_grad_norm must be a finite positive number (got {value})")]
+    InvalidClipNorm {
+        /// The value the config carried.
+        value: f64,
+    },
     /// One half of the validation setup arrived without the other.
     ///
     /// [`FullFtConfig::eval_every`] and the entry point's validation
@@ -993,6 +1031,11 @@ fn run_ft_core(
     if cfg.grad_accum == 0 {
         return Err(TrainError::ZeroGradAccum);
     }
+    if let Some(max_norm) = cfg.clip_grad_norm {
+        if !(max_norm.is_finite() && max_norm > 0.0) {
+            return Err(TrainError::InvalidClipNorm { value: max_norm });
+        }
+    }
     // The two halves of the validation setup, checked against each
     // other before the lease is taken: both mismatches end in a run
     // that looks configured and measures nothing.
@@ -1119,7 +1162,7 @@ fn run_ft_core(
         // `accum` is always `Some` here because `grad_accum >= 1` is
         // enforced above and the inner loop runs at least once — a
         // mid-micro dataset exhaustion returns early via `?` above.
-        let grads = accum.expect("grad_accum >= 1 guarantees at least one backward");
+        let mut grads = accum.expect("grad_accum >= 1 guarantees at least one backward");
 
         let mean_loss = micro_loss_sum / grad_accum as f32;
         last_train_loss = mean_loss;
@@ -1142,18 +1185,23 @@ fn run_ft_core(
             "train_step"
         );
 
-        // Compute grad norm before `opt.step` consumes / mutates the
-        // per-parameter state. The value is only surfaced through the
-        // `on_ckpt` hook, so the walk is guarded by `hook.is_some()`
-        // and `ckpt_every` — a no-hook run pays nothing beyond the
-        // existing per-step cost.
+        // Computed before `opt.step` consumes / mutates the
+        // per-parameter state. Two consumers want it — the `on_ckpt`
+        // hook and the clip below — and the walk is skipped when
+        // neither does, so a run with no hook and no cap pays nothing
+        // beyond the existing per-step cost.
         let will_fire_hook =
             hook.is_some() && cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0;
-        let grad_norm = if will_fire_hook {
+        let grad_norm = if will_fire_hook || cfg.clip_grad_norm.is_some() {
             grad_l2_norm(opt_vm, &grads)?
         } else {
             0.0
         };
+        // Reported as measured, then capped: `grad_norm` above is what
+        // the step produced, and this is what the optimizer receives.
+        if let Some(max_norm) = cfg.clip_grad_norm {
+            clip_grad_norm_(opt_vm, &mut grads, max_norm, grad_norm)?;
+        }
 
         opt.step(&grads)?;
 
@@ -1260,7 +1308,7 @@ fn run_ft_core(
     // returned record always carries the held-out loss of the weights
     // it names rather than of some earlier step.
     if let Some(batches) = val_batches.as_ref() {
-        if cfg.steps % cfg.eval_every != 0 {
+        if !cfg.steps.is_multiple_of(cfg.eval_every) {
             let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
             last_val_loss = Some(v);
             if v < min_val_loss {
@@ -1280,6 +1328,50 @@ fn run_ft_core(
     .map_err(TrainError::Ckpt)?;
     ckpt.candidates = candidates;
     Ok(ckpt)
+}
+
+/// Scale every trainable parameter's gradient so their joint L2 norm is
+/// at most `max_norm`, given the `norm` already measured over the same
+/// set.
+///
+/// Takes the measured norm rather than computing it, because the caller
+/// wants the pre-clip value for [`CkptInfo::grad_norm`] anyway and the
+/// walk is the expensive part.
+///
+/// Only the gradients of variables registered in `opt_vm` are scaled.
+/// A [`GradStore`] from `backward()` also holds gradients for
+/// intermediate tensors, and those are not part of the update, so
+/// including them would measure and scale against a norm no optimizer
+/// step uses.
+///
+/// Leaves everything alone when the norm is already within the cap, and
+/// when it is not finite — see [`FullFtConfig::clip_grad_norm`].
+/// Returns the scale that was applied (`1.0` when nothing was).
+fn clip_grad_norm_(
+    opt_vm: &VarMap,
+    grads: &mut GradStore,
+    max_norm: f64,
+    norm: f32,
+) -> CandleResult<f64> {
+    if !norm.is_finite() || (norm as f64) <= max_norm {
+        return Ok(1.0);
+    }
+    let scale = max_norm / norm as f64;
+    // Collected first: the walk reads the map while the writes below go
+    // to the store, and holding the map's lock across the writes is not
+    // needed for either.
+    let ids: Vec<candle_core::TensorId> = {
+        let data = opt_vm.data().lock().unwrap();
+        data.values().map(|var| var.as_tensor().id()).collect()
+    };
+    for id in ids {
+        let Some(g) = grads.get_id(id) else {
+            continue;
+        };
+        let scaled = (g * scale)?;
+        grads.insert_id(id, scaled);
+    }
+    Ok(scale)
 }
 
 /// L2 norm of every trainable parameter's gradient in `opt_vm`.
@@ -1914,6 +2006,168 @@ mod tests {
                 text_field: "text".into(),
             },
         )
+    }
+
+    /// The cap scales the gradient down to exactly `max_norm` and
+    /// leaves its direction alone.
+    #[test]
+    fn clipping_shortens_the_gradient_without_turning_it() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(3, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = {
+            let data = vm.data().lock().unwrap();
+            data["w"].clone()
+        };
+        var.set(&Tensor::new(&[3.0f32, 4.0, 0.0], &dev).unwrap())
+            .unwrap();
+        // `sum(w^2)/2` has gradient `w`, so the norm is the length of
+        // the value set above — 5, against a cap of 1.
+        let loss = (var.as_tensor().sqr().unwrap().sum_all().unwrap() * 0.5).unwrap();
+        let mut grads = loss.backward().unwrap();
+
+        let before = grad_l2_norm(&vm, &grads).unwrap();
+        assert!((before - 5.0).abs() < 1e-5, "norm before = {before}");
+
+        let scale = clip_grad_norm_(&vm, &mut grads, 1.0, before).unwrap();
+        assert!((scale - 0.2).abs() < 1e-6, "scale = {scale}");
+        let after = grad_l2_norm(&vm, &grads).unwrap();
+        assert!((after - 1.0).abs() < 1e-5, "norm after = {after}");
+        let g: Vec<f32> = grads
+            .get(var.as_tensor())
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Direction preserved: the original [3, 4, 0] scaled by 1/5.
+        assert!((g[0] - 0.6).abs() < 1e-6 && (g[1] - 0.8).abs() < 1e-6 && g[2].abs() < 1e-6);
+    }
+
+    /// A gradient already inside the cap is handed to the optimizer
+    /// untouched.
+    #[test]
+    fn a_gradient_within_the_cap_is_left_alone() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(2, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = {
+            let data = vm.data().lock().unwrap();
+            data["w"].clone()
+        };
+        var.set(&Tensor::new(&[0.3f32, 0.4], &dev).unwrap())
+            .unwrap();
+        let loss = (var.as_tensor().sqr().unwrap().sum_all().unwrap() * 0.5).unwrap();
+        let mut grads = loss.backward().unwrap();
+        let before = grad_l2_norm(&vm, &grads).unwrap();
+        let scale = clip_grad_norm_(&vm, &mut grads, 1.0, before).unwrap();
+        assert_eq!(scale, 1.0);
+        let after = grad_l2_norm(&vm, &grads).unwrap();
+        assert!((after - before).abs() < 1e-7);
+    }
+
+    /// A non-finite norm is left unscaled rather than multiplied into
+    /// every parameter that still had a usable gradient.
+    #[test]
+    fn a_non_finite_norm_is_not_scaled() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(2, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = {
+            let data = vm.data().lock().unwrap();
+            data["w"].clone()
+        };
+        var.set(&Tensor::new(&[1.0f32, 2.0], &dev).unwrap())
+            .unwrap();
+        let loss = (var.as_tensor().sqr().unwrap().sum_all().unwrap() * 0.5).unwrap();
+        let mut grads = loss.backward().unwrap();
+        let scale = clip_grad_norm_(&vm, &mut grads, 1.0, f32::NAN).unwrap();
+        assert_eq!(scale, 1.0);
+        let g: Vec<f32> = grads
+            .get(var.as_tensor())
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(g, vec![1.0, 2.0], "the gradient must not become NaN");
+    }
+
+    /// A cap that cannot cap anything is refused before the run starts.
+    #[test]
+    fn a_clip_norm_that_erases_or_reverses_the_gradient_is_refused() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut ds = overfit_dataset();
+            let cfg = FullFtConfig {
+                steps: 2,
+                clip_grad_norm: Some(value),
+                ..FullFtConfig::default()
+            };
+            let err = run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &cfg,
+                &loss,
+                tmp.path(),
+                "clip",
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TrainError::InvalidClipNorm { .. }),
+                "clip_grad_norm = {value}: {err}"
+            );
+        }
+    }
+
+    /// The norm the hook is handed is the one the step produced, not
+    /// the one the cap let through.
+    #[test]
+    fn the_hook_sees_the_norm_before_the_cap_applied() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            ckpt_every: 1,
+            // Small enough that a from-scratch step is over it.
+            clip_grad_norm: Some(1e-6),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let seen: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: CkptHook = Box::new(move |info: &CkptInfo| {
+            sink.lock().unwrap().push(info.grad_norm);
+            Ok(CkptControl::CONTINUE)
+        });
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "clipnorm",
+            Arc::new(TrainingLease::new()),
+            Some(hook),
+        )
+        .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|n| *n > 1e-6),
+            "reported norms must be the measured ones, not the cap: {seen:?}"
+        );
     }
 
     /// A run with a held-out set reports its loss on the record, in
@@ -3291,7 +3545,7 @@ mod tests {
             ctx_len: 8,
             shuffle: false,
             pad_id: 0,
-        mask_pad: true,
+            mask_pad: true,
             text_field: "text".into(),
         }
     }

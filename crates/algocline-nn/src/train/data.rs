@@ -1725,7 +1725,9 @@ mod tests {
         let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i]).collect();
         let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 1, true));
         let _ = ds.next_batch().unwrap().unwrap();
-        let err = ds.split_off_holdout(0.2).expect_err("rows already handed out");
+        let err = ds
+            .split_off_holdout(0.2)
+            .expect_err("rows already handed out");
         assert!(matches!(err, DatasetError::HoldoutRefused { .. }), "{err}");
     }
 
@@ -1738,7 +1740,9 @@ mod tests {
         let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 1, true))
             .with_conditions(conds)
             .expect("conditions attach to an unshuffled dataset");
-        let err = ds.split_off_holdout(0.2).expect_err("the pairing is positional");
+        let err = ds
+            .split_off_holdout(0.2)
+            .expect_err("the pairing is positional");
         assert!(matches!(err, DatasetError::HoldoutRefused { .. }), "{err}");
     }
 
@@ -1752,7 +1756,11 @@ mod tests {
             pad_loss_mask(&rows, 3, true),
             Some(vec![vec![1.0, 1.0, 0.0], vec![1.0, 1.0, 1.0]])
         );
-        assert_eq!(pad_loss_mask(&rows, 2, true), None, "nothing is padded at ctx 2");
+        assert_eq!(
+            pad_loss_mask(&rows, 2, true),
+            None,
+            "nothing is padded at ctx 2"
+        );
         assert_eq!(pad_loss_mask(&rows, 3, false), None);
     }
 }

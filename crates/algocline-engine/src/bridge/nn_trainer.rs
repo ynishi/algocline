@@ -648,7 +648,7 @@ fn run_full_ft_impl(
 
     // 5.5. The held-out set, when the caller named one. Paired with
     //      `opts.eval_every`; the loop refuses either half alone.
-    let val_ud = extract_val_dataset(RUN_FULL_FT_ERR_PREFIX, &dataset_ud, &opts)?;
+    let val_ud = extract_val_dataset(RUN_FULL_FT_ERR_PREFIX, dataset_ud, &opts)?;
 
     // 6. Extract + validate train opts (pre-flight so a misconfigured
     //    caller sees a Lua-shaped error rather than a candle back-trace).
@@ -1579,7 +1579,10 @@ mod run_ft_bridge_tests {
             .get("val_loss")
             .and_then(|v| v.as_f64())
             .expect("val_loss is recorded on a run that held rows out");
-        assert!(val_loss.is_finite() && val_loss > 0.0, "val_loss {val_loss}");
+        assert!(
+            val_loss.is_finite() && val_loss > 0.0,
+            "val_loss {val_loss}"
+        );
     }
 
     /// Handing the training dataset in as the held-out one is refused:
@@ -1604,7 +1607,8 @@ mod run_ft_bridge_tests {
         )
         .expect_err("the same handle on both sides");
         assert!(
-            err.to_string().contains("val_dataset is the training dataset"),
+            err.to_string()
+                .contains("val_dataset is the training dataset"),
             "message: {err}"
         );
     }

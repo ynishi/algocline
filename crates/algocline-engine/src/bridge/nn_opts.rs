@@ -587,6 +587,11 @@ fn apply_optional_overrides(
     if let Some(v) = opts.get::<Option<usize>>("ckpt_keep")? {
         cfg.ckpt_keep = v;
     }
+    // Global-norm gradient cap. Absent means uncapped; the loop
+    // refuses a value that cannot cap anything.
+    if let Some(v) = opts.get::<Option<f64>>("clip_grad_norm")? {
+        cfg.clip_grad_norm = Some(v);
+    }
     // Scoring period for the held-out set. The set itself comes in as
     // `opts.val_dataset` (read by the trainer surface, not here); the
     // loop refuses either half without the other.

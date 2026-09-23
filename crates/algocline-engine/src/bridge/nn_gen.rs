@@ -386,9 +386,18 @@ impl GenSession {
     /// context window is checked here rather than left to the model, so
     /// the message names the session and its history instead of a
     /// tensor dimension.
+    ///
+    /// `on_failure` is called when the forward fails, before the error
+    /// is returned: a model that failed part way down its layer stack
+    /// has pushed entries for the layers it reached and not for the
+    /// rest, so the cache no longer describes any sequence. Dropping it
+    /// is what makes the session's "a failed step leaves the session
+    /// where it was" true — otherwise a retry forwards the same tokens
+    /// into already-extended layers.
     fn cached_step(
         &self,
         forward: impl FnOnce(&Tensor) -> candle_core::Result<Tensor>,
+        on_failure: impl FnOnce(),
     ) -> LuaResult<Tensor> {
         let pending = &self.tokens[self.forwarded..];
         let total = self.tokens.len();
@@ -405,8 +414,10 @@ impl GenSession {
         // last row is the next-token distribution. Same shape as the
         // Llama adapter's LastToken output, which is what lets the tail
         // of `next_logits` be shared.
-        let step = forward(&input)
-            .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
+        let step = forward(&input).map_err(|e| {
+            on_failure();
+            LuaError::external(format!("alc.nn session:next_logits: {e}"))
+        })?;
         let last = step.dims()[1] - 1;
         step.narrow(1, last, 1)
             .and_then(|t| t.squeeze(1))
@@ -454,30 +465,41 @@ impl GenSession {
                         "alc.nn session:next_logits: kv cache lock poisoned: {e}"
                     ))
                 })?;
-                self.cached_step(|input| match &self.channel {
-                    SessionChannel::None => guard.forward_with_cache(input, &mut cache),
-                    SessionChannel::Cond(index) => {
-                        // One row, so one condition. The session is
-                        // batch-1 by construction.
-                        let conds = [*index];
-                        guard.forward_conditioned_with_cache(input, &conds, &mut cache)
-                    }
-                    SessionChannel::CondWeights(weights) => {
-                        // One combination for the whole forward; the
-                        // session is batch-1 either way.
-                        guard.forward_cond_weighted_with_cache(input, weights, &mut cache)
-                    }
-                    SessionChannel::Allowed(ids) => {
-                        // The same set at every position of this step's
-                        // tokens. Only this step's: the positions
-                        // already in the cache read their sets when
-                        // they were forwarded.
-                        let positions = input.dims()[1];
-                        let sets = vec![vec![ids.clone(); positions]];
-                        let allowed = AllowedSets::new(&sets, input.device())?;
-                        guard.forward_allowed_with_cache(input, &allowed, &mut cache)
-                    }
-                })?
+                // The cache is behind one `&mut` borrow, so the reset
+                // is expressed as a flag the arm below acts on rather
+                // than as a closure that would need a second one.
+                let mut failed = false;
+                let row = self.cached_step(
+                    |input| match &self.channel {
+                        SessionChannel::None => guard.forward_with_cache(input, &mut cache),
+                        SessionChannel::Cond(index) => {
+                            // One row, so one condition. The session is
+                            // batch-1 by construction.
+                            let conds = [*index];
+                            guard.forward_conditioned_with_cache(input, &conds, &mut cache)
+                        }
+                        SessionChannel::CondWeights(weights) => {
+                            // One combination for the whole forward; the
+                            // session is batch-1 either way.
+                            guard.forward_cond_weighted_with_cache(input, weights, &mut cache)
+                        }
+                        SessionChannel::Allowed(ids) => {
+                            // The same set at every position of this step's
+                            // tokens. Only this step's: the positions
+                            // already in the cache read their sets when
+                            // they were forwarded.
+                            let positions = input.dims()[1];
+                            let sets = vec![vec![ids.clone(); positions]];
+                            let allowed = AllowedSets::new(&sets, input.device())?;
+                            guard.forward_allowed_with_cache(input, &allowed, &mut cache)
+                        }
+                    },
+                    || failed = true,
+                );
+                if failed {
+                    cache.reset();
+                }
+                row?
             }
             SessionBackend::TinyLlama { model, cache } => {
                 let guard = model.lock().map_err(|e| {
@@ -490,7 +512,15 @@ impl GenSession {
                         "alc.nn session:next_logits: kv cache lock poisoned: {e}"
                     ))
                 })?;
-                self.cached_step(|input| guard.forward_with_cache(input, &mut cache))?
+                let mut failed = false;
+                let row = self.cached_step(
+                    |input| guard.forward_with_cache(input, &mut cache),
+                    || failed = true,
+                );
+                if failed {
+                    cache.reset();
+                }
+                row?
             }
         };
         // Advance only after a successful forward: a failed step leaves

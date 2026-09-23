@@ -685,6 +685,22 @@ pub enum TrainError {
     /// Config asked for zero training steps.
     #[error("`steps` must be at least 1")]
     ZeroSteps,
+    /// Config named a learning rate that cannot mean what it says.
+    ///
+    /// A negative rate ascends the loss and a non-finite one poisons
+    /// every parameter on the first update; both run to completion and
+    /// write a checkpoint that looks like any other. **Zero is
+    /// allowed** — it takes no step, which is a real thing to ask for
+    /// (holding the weights while the rest of the loop runs) and is
+    /// what two of this module's own tests do.
+    ///
+    /// Checked in the loop rather than at one bridge surface, so every
+    /// entry point answers the same way.
+    #[error("`lr` must be finite and not negative (got {value})")]
+    InvalidLearningRate {
+        /// The value the config carried.
+        value: f64,
+    },
     /// Config asked for `grad_accum = 0`, which would divide by zero
     /// when scaling per-micro losses. Multi-step accumulation is now
     /// honoured for `grad_accum >= 1`.
@@ -1416,6 +1432,9 @@ fn run_ft_core(
     if cfg.grad_accum == 0 {
         return Err(TrainError::ZeroGradAccum);
     }
+    if !(cfg.lr.is_finite() && cfg.lr >= 0.0) {
+        return Err(TrainError::InvalidLearningRate { value: cfg.lr });
+    }
     if let Some(max_norm) = cfg.clip_grad_norm {
         if !(max_norm.is_finite() && max_norm > 0.0) {
             return Err(TrainError::InvalidClipNorm { value: max_norm });
@@ -1700,6 +1719,20 @@ fn run_ft_core(
                 val_loss = last_val_loss,
                 "early stop: the held-out loss stopped improving"
             );
+            // Score the weights this record names, the way the normal
+            // exit does: `last_val_loss` may be several steps old, and
+            // a record pairing step N's weights with step N-3's
+            // held-out loss is a comparison nobody can make sense of
+            // later.
+            if let Some(batches) = val_batches.as_ref() {
+                if !(step + 1).is_multiple_of(cfg.eval_every) {
+                    let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                    last_val_loss = Some(v);
+                    if v < min_val_loss {
+                        min_val_loss = v;
+                    }
+                }
+            }
             let final_path = ckpt_store
                 .save_final(save_vm, step + 1)
                 .map_err(|e| TrainError::Ckpt(e.to_string()))?;
@@ -1772,6 +1805,17 @@ fn run_ft_core(
                         // downstream consumers can distinguish an
                         // early stop from a full-run save without
                         // walking `step` against `cfg.steps`.
+                        // Same as the early-stop exit: the record's
+                        // `val_loss` belongs to the weights it names.
+                        if let Some(batches) = val_batches.as_ref() {
+                            if !(step + 1).is_multiple_of(cfg.eval_every) {
+                                let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                                last_val_loss = Some(v);
+                                if v < min_val_loss {
+                                    min_val_loss = v;
+                                }
+                            }
+                        }
                         let final_path = ckpt_store
                             .save_final(save_vm, step + 1)
                             .map_err(|e| TrainError::Ckpt(e.to_string()))?;
@@ -2917,6 +2961,65 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(g, vec![1.0, 2.0], "the gradient must not become NaN");
+    }
+
+    /// A learning rate that ascends or poisons is refused; zero, which
+    /// takes no step, is not — holding the weights while the rest of
+    /// the loop runs is a real thing to ask for.
+    #[test]
+    fn a_learning_rate_that_cannot_mean_what_it_says_is_refused() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+        for value in [-1e-3, f64::NAN, f64::INFINITY] {
+            let mut ds = overfit_dataset();
+            let cfg = FullFtConfig {
+                lr: value,
+                steps: 2,
+                ..FullFtConfig::default()
+            };
+            let err = run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &cfg,
+                &loss,
+                tmp.path(),
+                "lr",
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TrainError::InvalidLearningRate { .. }),
+                "lr = {value}: {err}"
+            );
+        }
+
+        let mut ds = overfit_dataset();
+        let zero = FullFtConfig {
+            lr: 0.0,
+            steps: 2,
+            warmup: 0,
+            ..FullFtConfig::default()
+        };
+        assert!(
+            run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &zero,
+                &loss,
+                tmp.path(),
+                "lrzero",
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .is_ok(),
+            "lr = 0 takes no step and is allowed"
+        );
     }
 
     /// A cap that cannot cap anything is refused before the run starts.

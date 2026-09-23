@@ -317,6 +317,24 @@ pub trait Constraint {
         out.fill_from(&self.mask(prefix), vocab)
     }
 
+    /// The same, for a caller whose accepted tokens **are** `prefix`.
+    ///
+    /// [`ConstrainedSampler`] is that caller and the only one: it
+    /// accepts every token it produces and resets with its own prefix,
+    /// so a constraint keeping state can answer from it instead of
+    /// walking. The default ignores the distinction, which is correct
+    /// for a stateless implementation and is why this is a separate
+    /// method rather than a precondition on [`Self::fill_mask`] —
+    /// a precondition the public method cannot check is a trap.
+    fn fill_mask_accepted(
+        &self,
+        prefix: &[u32],
+        vocab: usize,
+        out: &mut TokenBitset,
+    ) -> Result<(), u32> {
+        self.fill_mask(prefix, vocab, out)
+    }
+
     /// Advance by one token the sampler has committed to.
     ///
     /// A no-op by default, which is right for a constraint that reads
@@ -364,6 +382,15 @@ impl Constraint for Box<dyn Constraint + Send> {
     /// the default would quietly re-adapt from `mask` and undo it.
     fn fill_mask(&self, prefix: &[u32], vocab: usize, out: &mut TokenBitset) -> Result<(), u32> {
         (**self).fill_mask(prefix, vocab, out)
+    }
+
+    fn fill_mask_accepted(
+        &self,
+        prefix: &[u32],
+        vocab: usize,
+        out: &mut TokenBitset,
+    ) -> Result<(), u32> {
+        (**self).fill_mask_accepted(prefix, vocab, out)
     }
 
     fn accept(&mut self, token: u32) {
@@ -478,8 +505,10 @@ impl<S: Sampler, C: Constraint> Sampler for ConstrainedSampler<S, C> {
                 )));
             }
         }
+        // The accepted form: this sampler's prefix is exactly what it
+        // has accepted, which is the precondition the fast path needs.
         self.constraint
-            .fill_mask(&self.prefix, vocab, &mut self.allowed)
+            .fill_mask_accepted(&self.prefix, vocab, &mut self.allowed)
             .map_err(|id| {
                 candle_core::Error::Msg(format!(
                     "ConstrainedSampler: mask token id {id} is out of range for vocab {vocab}"
@@ -810,20 +839,69 @@ impl RegexConstraint {
         Some(state)
     }
 
-    /// The state to answer from: the one kept by
-    /// [`Constraint::accept`] when it covers this prefix, and a fresh
-    /// walk otherwise.
+    /// The tokens permitted from `state`, or nothing at all when the
+    /// walk has died.
     ///
-    /// The sampler accepts every token it produces, so the kept walk
-    /// covers the prefix on every ordinary step and the re-walk is not
-    /// taken. It is taken after a rollback, and when a caller asks
-    /// about a prefix this constraint was not advanced through —
-    /// answered correctly rather than refused, because the prefix is
-    /// the contract and the kept walk is the optimisation.
-    fn state_at(&self, prefix: &[u32]) -> Option<StateID> {
+    /// The half of [`Constraint::mask`] that does not depend on how the
+    /// state was reached, so the walked path and the kept-walk fast
+    /// path cannot answer differently.
+    fn mask_from(&self, state: Option<StateID>) -> TokenMask {
+        let Some(state) = state else {
+            // Unreachable prefix. Permitting nothing routes this into
+            // the loud-failure path rather than letting the sampler
+            // improvise.
+            return TokenMask::Allow(Vec::new());
+        };
+        let vocab = self.vocab.len();
+        let mut allowed: Vec<u32> = Vec::new();
+        for (id, piece) in self.vocab.iter().enumerate() {
+            if piece.is_empty() {
+                continue;
+            }
+            if self.alive(self.step(state, piece.as_bytes())) {
+                allowed.push(id as u32);
+            }
+        }
+
+        // Pick whichever variant stays sparse. Mid-pattern the permitted
+        // set is usually tiny (`Allow`), but at a position where the
+        // pattern is permissive — `.*`, a wide character class — the
+        // *denied* set is the small one and `Deny` avoids materialising a
+        // near-full-vocab list on every single token.
+        if allowed.len() == vocab {
+            return TokenMask::AllowAll;
+        }
+        if allowed.len() * 2 > vocab {
+            let mut denied = Vec::with_capacity(vocab - allowed.len());
+            let mut survivors = allowed.iter().copied().peekable();
+            for id in 0..vocab {
+                let id = id as u32;
+                if survivors.peek() == Some(&id) {
+                    survivors.next();
+                } else {
+                    denied.push(id);
+                }
+            }
+            return TokenMask::Deny(denied);
+        }
+        TokenMask::Allow(allowed)
+    }
+
+    /// The kept walk, if it covers a prefix of exactly `len` tokens.
+    ///
+    /// **Length is not identity.** Two prefixes of one length can reach
+    /// different states, so this is only sound for a caller that knows
+    /// the accepted tokens *are* the prefix — which is
+    /// [`ConstrainedSampler`], and nothing else: it accepts every token
+    /// it produces and resets when its prefix is cleared. Every other
+    /// caller goes through [`Self::state_for`], which walks.
+    ///
+    /// Keeping the accepted tokens and comparing them would make the
+    /// check sound for everyone and cost the walk it exists to avoid.
+    fn kept_walk(&self, len: usize) -> Option<Option<StateID>> {
         match self.walked {
-            Walk::Known { state, len } if len == prefix.len() => state,
-            _ => self.state_for(prefix),
+            Walk::Known { state, len: known } if known == len => Some(state),
+            _ => None,
         }
     }
 }
@@ -833,6 +911,21 @@ impl Constraint for RegexConstraint {
     /// [`Self::mask`]'s note on the two vocabularies.
     fn vocab(&self) -> Option<usize> {
         Some(self.vocab.len())
+    }
+
+    /// The mask from the kept walk when it covers this prefix — see
+    /// [`Constraint::fill_mask_accepted`]. Falls back to walking when
+    /// the walk is unknown, which is what a rollback leaves behind.
+    fn fill_mask_accepted(
+        &self,
+        prefix: &[u32],
+        vocab: usize,
+        out: &mut TokenBitset,
+    ) -> Result<(), u32> {
+        match self.kept_walk(prefix.len()) {
+            Some(state) => out.fill_from(&self.mask_from(state), vocab),
+            None => out.fill_from(&self.mask(prefix), vocab),
+        }
     }
 
     /// Advance the kept state by one token.
@@ -907,46 +1000,16 @@ impl Constraint for RegexConstraint {
     /// letting it pass — without that check, an id past the end of the
     /// string list would be permitted without the DFA ever having
     /// looked at it.
+    ///
+    /// Always walks `prefix`. The state kept by [`Self::accept`] is a
+    /// fast path for the sampler alone — see [`Self::kept_walk`].
     fn mask(&self, prefix: &[u32]) -> TokenMask {
-        let Some(state) = self.state_at(prefix) else {
+        let Some(state) = self.state_for(prefix) else {
             // Unreachable prefix. Permitting nothing routes this into the
             // loud-failure path rather than letting the sampler improvise.
             return TokenMask::Allow(Vec::new());
         };
-
-        let vocab = self.vocab.len();
-        let mut allowed: Vec<u32> = Vec::new();
-        for (id, piece) in self.vocab.iter().enumerate() {
-            if piece.is_empty() {
-                continue;
-            }
-            if self.alive(self.step(state, piece.as_bytes())) {
-                allowed.push(id as u32);
-            }
-        }
-
-        // Pick whichever variant stays sparse. Mid-pattern the permitted
-        // set is usually tiny (`Allow`), but at a position where the
-        // pattern is permissive — `.*`, a wide character class — the
-        // *denied* set is the small one and `Deny` avoids materialising a
-        // near-full-vocab list on every single token.
-        if allowed.len() == vocab {
-            return TokenMask::AllowAll;
-        }
-        if allowed.len() * 2 > vocab {
-            let mut denied = Vec::with_capacity(vocab - allowed.len());
-            let mut survivors = allowed.iter().copied().peekable();
-            for id in 0..vocab {
-                let id = id as u32;
-                if survivors.peek() == Some(&id) {
-                    survivors.next();
-                } else {
-                    denied.push(id);
-                }
-            }
-            return TokenMask::Deny(denied);
-        }
-        TokenMask::Allow(allowed)
+        self.mask_from(Some(state))
     }
 
     fn is_terminal(&self, prefix: &[u32]) -> bool {
@@ -1271,6 +1334,36 @@ mod tests {
         let mut s =
             ConstrainedSampler::new(GreedySampler, AllowListConstraint::new(vec![1, 2]).unwrap());
         assert!(s.sample(&cpu_logits(&[0.1, 5.0, 0.3, 0.4, 0.5])).is_ok());
+    }
+
+    /// The public `mask` answers the prefix it is given, whatever has
+    /// been accepted. The kept walk is a fast path for the sampler,
+    /// whose prefix *is* what it accepted; a caller probing another
+    /// branch — a beam search, a speculative decode, the uses
+    /// `rollback` is documented for — must not be answered from a state
+    /// that belongs to a different sequence of the same length.
+    #[test]
+    fn mask_answers_the_prefix_it_is_given_not_the_one_accepted() {
+        let vocab: Vec<String> = ["a", "b", "ab", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut c = RegexConstraint::new("(ab)+", vocab).unwrap();
+        // Accept "a" — a legal opening — then ask about "b", which is
+        // not one. Both prefixes are one token long.
+        c.accept(0);
+        assert_eq!(
+            c.mask(&[1]),
+            TokenMask::Allow(Vec::new()),
+            "an impossible prefix permits nothing, whatever was accepted"
+        );
+        assert!(!c.is_terminal(&[1]));
+        // And the accepted prefix still answers from the kept walk.
+        let mut set = TokenBitset::none(4);
+        c.fill_mask_accepted(&[0], 4, &mut set).unwrap();
+        let mut walked = TokenBitset::none(4);
+        c.fill_mask(&[0], 4, &mut walked).unwrap();
+        assert_eq!(set, walked, "the fast path answers what the walk does");
     }
 
     /// The kept state and the prefix walk must agree at every step —

@@ -140,6 +140,22 @@ impl CheckpointStore {
     /// is no candle entry point that takes some.
     fn write_bundle(&self, varmap: &VarMap, path: &Path, step: usize) -> candle_core::Result<()> {
         let Some(identity) = self.identity.as_ref() else {
+            // No identity to write, and no stale one to leave behind: a
+            // sidecar from an earlier writer would describe a model
+            // this file no longer holds, and `read_bundle_header` would
+            // answer `None` while the `.json` beside it answered
+            // confidently.
+            let sidecar = identity_sidecar_path(path);
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(candle_core::Error::Msg(format!(
+                        "checkpoint save: stale sidecar {}: {e}",
+                        sidecar.display()
+                    )))
+                }
+            }
             return varmap.save(path);
         };
         let header = identity.header(step);
@@ -1450,6 +1466,34 @@ mod tests {
         let path = store.save_final(&vm, 1).unwrap();
         assert_eq!(read_bundle_header(&path).unwrap(), None);
         assert!(!identity_sidecar_path(&path).exists());
+    }
+
+    /// Overwriting an identified bundle from a store that has no
+    /// identity clears the sidecar: leaving it would describe a model
+    /// the file no longer holds, with nothing saying so.
+    #[test]
+    fn an_identity_less_write_clears_a_stale_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let vm = small_varmap();
+        let identified = CheckpointStore::new(tmp.path(), "over", 3)
+            .unwrap()
+            .with_identity(BundleIdentity {
+                architecture: "gpt2-tiny".into(),
+                vocab: 8,
+                ctx: 4,
+                dtype: "f32".into(),
+                run: None,
+            });
+        let path = identified.save_final(&vm, 1).unwrap();
+        assert!(identity_sidecar_path(&path).exists());
+
+        let plain = CheckpointStore::new(tmp.path(), "over", 3).unwrap();
+        plain.save_final(&vm, 2).unwrap();
+        assert_eq!(read_bundle_header(&path).unwrap(), None);
+        assert!(
+            !identity_sidecar_path(&path).exists(),
+            "the sidecar describes a bundle that is no longer there"
+        );
     }
 
     /// A rotated-out checkpoint takes its sidecar with it, the same way
